@@ -28,14 +28,15 @@
 //! vocabulary such a supervisor would report, so it can absorb this instead
 //! of replacing it.
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use super::launch_evidence::{LaunchEvidence, retains_network};
 use super::{BunAgent, BunError, ContainerState, Grill, InstanceId, kill_runtime_instance};
 use crate::grill::oci::OciSpec;
+use crate::grill::runc_intent::NetworkReference;
 
 /// At most this many restarts have a runtime step in flight at once. A node
 /// that lost every container restarts them a batch at a time, rather than
@@ -136,8 +137,15 @@ pub(super) struct RestartInFlight {
 /// How a step ended.
 #[derive(Debug)]
 pub(super) enum StepResult {
-    /// The runtime did it. A start also reports the replacement's address.
-    Done { container_ip: Option<Ipv4Addr> },
+    /// The runtime did it.
+    Done,
+    /// The runtime created the replacement. One that publishes an address
+    /// had its network reference retained too, or the retain failed.
+    Created {
+        retained: Result<Option<NetworkReference>, BunError>,
+    },
+    /// The runtime started the replacement, and said what it started.
+    Started(Box<LaunchEvidence>),
     /// The runtime refused or didn't confirm.
     Failed(BunError),
     /// A stop or retirement took the instance back before the step began.
@@ -156,6 +164,7 @@ async fn run_step<G: Grill>(
     id: InstanceId,
     step: RestartStep,
     oci_spec: Option<OciSpec>,
+    retains_network: bool,
     gate: RestartGate,
     confirmation_timeout: Duration,
 ) -> StepResult {
@@ -168,25 +177,36 @@ async fn run_step<G: Grill>(
             kill_runtime_instance(&grill, &id, confirmation_timeout).await
         }
         RestartStep::Create => match oci_spec {
-            Some(spec) => grill.create(&id, &spec).await.map_err(BunError::from),
+            Some(spec) => match grill.create(&id, &spec).await {
+                Ok(()) => {
+                    let retained = if retains_network {
+                        grill
+                            .retain_network_reference(&id)
+                            .await
+                            .map_err(BunError::from)
+                    } else {
+                        Ok(None)
+                    };
+                    return StepResult::Created { retained };
+                }
+                Err(error) => Err(error.into()),
+            },
             None => Err(BunError::DeployFailed {
                 app_name: id.0.clone(),
                 reason: "restart has no stored OCI spec".into(),
             }),
         },
         RestartStep::Start => match grill.start(&id).await {
-            // A re-created container may get a fresh IP.
+            // A re-created container may get a fresh IP and pid.
             Ok(()) => {
-                return StepResult::Done {
-                    container_ip: grill.container_ip(&id).await,
-                };
+                return StepResult::Started(Box::new(LaunchEvidence::read(&grill, &id).await));
             }
             Err(error) => Err(error.into()),
         },
         RestartStep::Refuse => grill.stop(&id).await.map_err(BunError::from),
     };
     match done {
-        Ok(()) => StepResult::Done { container_ip: None },
+        Ok(()) => StepResult::Done,
         Err(error) => StepResult::Failed(error),
     }
 }
@@ -204,6 +224,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             RestartStep::Create => launch.as_ref().map(|launch| launch.oci_spec.clone()),
             _ => None,
         };
+        let retains_network = step == RestartStep::Create
+            && launch.as_ref().is_some_and(|launch| {
+                retains_network(
+                    self.deployed_specs
+                        .get(&(launch.app_name.clone(), launch.namespace.clone())),
+                )
+            });
         let task = self
             .restart_steps
             .spawn(run_step(
@@ -211,6 +238,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 id.clone(),
                 step,
                 oci_spec,
+                retains_network,
                 gate.clone(),
                 self.stop_confirmation_timeout,
             ))
@@ -309,28 +337,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             step, launch, gate, ..
         } = restart;
         match (step, result, launch) {
-            (RestartStep::Cleanup, StepResult::Done { .. }, _) => {
+            (RestartStep::Cleanup, StepResult::Done, _) => {
                 self.restart_after_cleanup(&id).await;
             }
             (RestartStep::Cleanup, StepResult::Failed(error), _) => {
                 eprintln!("bun: failed restart of {id} awaits runtime cleanup: {error}");
             }
-            (RestartStep::Clear, StepResult::Done { .. }, Some(launch)) => {
+            (RestartStep::Clear, StepResult::Done, Some(launch)) => {
                 self.restart_after_clear(id, launch, gate).await;
             }
             (RestartStep::Clear, StepResult::Failed(error), _) => {
                 eprintln!("bun: restart of {id} awaits runtime cleanup: {error}");
             }
-            (RestartStep::Create, StepResult::Done { .. }, Some(launch)) => {
-                self.restart_after_create(id, launch, gate).await;
+            (RestartStep::Create, StepResult::Created { retained }, Some(launch)) => {
+                self.restart_after_create(id, launch, gate, retained).await;
             }
-            (RestartStep::Start, StepResult::Done { container_ip }, Some(launch)) => {
-                self.restart_after_start(&id, &launch, container_ip).await;
+            (RestartStep::Start, StepResult::Started(evidence), Some(launch)) => {
+                self.restart_after_start(&id, &launch, &evidence).await;
             }
             (RestartStep::Create | RestartStep::Start, StepResult::Failed(error), _) => {
                 self.record_failed_restart(&id, &error.to_string()).await;
             }
-            (RestartStep::Refuse, StepResult::Done { .. }, _) => {
+            (RestartStep::Refuse, StepResult::Done, _) => {
                 if let Some(instance) = self.supervisor.get_instance_mut(&id)
                     && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
                 {
@@ -346,8 +374,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )
                 .await;
             }
-            (step, StepResult::Done { .. }, None) => {
-                eprintln!("bun: restart of {id} lost its launch details after {step:?}");
+            (step, StepResult::Done | StepResult::Created { .. } | StepResult::Started(_), _) => {
+                eprintln!("bun: restart of {id} got an unexpected result after {step:?}");
             }
             (_, StepResult::Cancelled, _) => {}
         }
@@ -425,12 +453,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         id: InstanceId,
         launch: RestartLaunch,
         gate: RestartGate,
+        retained: Result<Option<NetworkReference>, BunError>,
     ) {
         if self
             .supervisor
             .get_instance(&id)
             .is_none_or(|instance| instance.state != ContainerState::Preparing)
         {
+            // A reference the step retained for an instance that moved on
+            // is handed back, as a refused one is.
+            if let Ok(Some(reference)) = retained {
+                self.hand_back_network_reference(reference);
+            }
             return;
         }
         // Close the restart window too: the recreated cgroup gets its egress
@@ -443,13 +477,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .deployed_specs
             .get(&(launch.app_name.clone(), launch.namespace.clone()))
             .cloned();
-        let restart_egress = match launch.oci_spec.linux.host_cgroup_path() {
+        let cgroup_path = launch.oci_spec.linux.host_cgroup_path();
+        if cgroup_path.is_none()
+            && let Ok(Some(reference)) = retained.as_ref()
+        {
+            // Network preparation needs the cgroup path, so nothing records
+            // this hold; give it back rather than leave it untracked.
+            self.hand_back_network_reference(reference.clone());
+        }
+        let restart_egress = match cgroup_path {
             Some(cgroup_path) => {
                 self.apply_network_pre_start(
                     &id,
                     &launch.app_name,
                     restart_spec.as_ref(),
                     &cgroup_path,
+                    retained,
                 )
                 .await
             }
@@ -489,7 +532,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         id: &InstanceId,
         launch: &RestartLaunch,
-        container_ip: Option<Ipv4Addr>,
+        evidence: &LaunchEvidence,
     ) {
         if self
             .supervisor
@@ -499,10 +542,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
         self.spawn_log_forwarder(id, &launch.app_name, &launch.namespace);
-        if let Err(error) = self.persist_instance_record(id).await {
+        if let Err(error) = self.persist_instance_record(id, evidence).await {
             self.record_failed_restart(id, &error.to_string()).await;
             return;
         }
+        let container_ip = evidence.container_ip;
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
             instance.container_ip = container_ip;
         }

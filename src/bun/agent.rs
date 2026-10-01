@@ -127,6 +127,10 @@ const STATUS_RUNTIME_READ_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// deploy worker or the caller tries again.
 const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a runtime read may take when no turn is running: during startup
+/// adoption, which already gives each runtime inspection 10 s.
+const OUTSIDE_TURN_RUNTIME_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// At most this many instances' runtime reads run at once for one status.
 const STATUS_RUNTIME_READ_CONCURRENCY: usize = 8;
 
@@ -869,11 +873,13 @@ enum DeployOp {
     },
     /// Program source and egress policy before create → program → start. On
     /// failure the caller stops the created container and fails the deploy.
+    /// The caller retains the network reference first, off the loop.
     ApplyNetworkPreStart {
         instance_id: InstanceId,
         app_name: String,
         spec: Option<Box<AppSpec>>,
         cgroup_path: PathBuf,
+        retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Transition an instance to a new lifecycle state through the supervisor.
@@ -889,7 +895,7 @@ enum DeployOp {
         instance_id: InstanceId,
         app_name: String,
         namespace: String,
-        container_ip: Option<std::net::Ipv4Addr>,
+        evidence: Box<launch_evidence::LaunchEvidence>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Provision a workload identity (SPIFFE cert + OIDC JWT).
@@ -992,6 +998,7 @@ enum DeployOp {
         job_name: String,
         namespace: String,
         oci_spec: Box<crate::grill::oci::OciSpec>,
+        evidence: Box<launch_evidence::LaunchEvidence>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Rebuild the Wrapper routing table after all instances started.
@@ -1055,6 +1062,8 @@ struct RollingInstance {
     spec: AppSpec,
     oci_spec: crate::grill::oci::OciSpec,
     host_port: Option<u16>,
+    /// What the runtime reported once the replacement started.
+    launch: launch_evidence::LaunchEvidence,
 }
 
 /// The fast pre-create outputs the loop hands back for a fresh instance.
@@ -1426,6 +1435,7 @@ impl DeployOps {
         app_name: &str,
         spec: Option<&AppSpec>,
         cgroup_path: &std::path::Path,
+        retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
     ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::ApplyNetworkPreStart {
@@ -1433,6 +1443,7 @@ impl DeployOps {
                 app_name: app_name.to_string(),
                 spec: spec.cloned().map(Box::new),
                 cgroup_path: cgroup_path.to_path_buf(),
+                retained,
                 reply,
             },
             Err(BunError::InstanceNotFound {
@@ -1463,14 +1474,14 @@ impl DeployOps {
         instance_id: &InstanceId,
         app_name: &str,
         namespace: &str,
-        container_ip: Option<std::net::Ipv4Addr>,
+        evidence: launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinishFreshInstance {
                 instance_id: instance_id.clone(),
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
-                container_ip,
+                evidence: Box::new(evidence),
                 reply,
             },
             Ok(()),
@@ -1708,6 +1719,7 @@ impl DeployOps {
         job_name: &str,
         namespace: &str,
         oci_spec: crate::grill::oci::OciSpec,
+        evidence: launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinishJobInstance {
@@ -1715,6 +1727,7 @@ impl DeployOps {
                 job_name: job_name.to_string(),
                 namespace: namespace.to_string(),
                 oci_spec: Box::new(oci_spec),
+                evidence: Box::new(evidence),
                 reply,
             },
             Ok(()),
@@ -1930,6 +1943,7 @@ mod discovery_recovery;
 mod egress_ownership;
 mod follow_ups;
 mod identity_signing;
+mod launch_evidence;
 mod logs;
 mod producer_release;
 mod restarts;
@@ -2283,12 +2297,15 @@ pub struct BunAgent<G: Grill> {
     restart_steps: tokio::task::JoinSet<restarts::StepResult>,
     /// Work a turn spawned and finishes when it reports back.
     follow_ups: tokio::task::JoinSet<follow_ups::FollowUp>,
-    /// The upgrade or rollback preparing its binary, if one is.
-    upgrade_preparing: Option<follow_ups::UpgradeKind>,
-    /// Whether an `nft` apply of the perimeter ruleset is in flight.
-    firewall_applying: bool,
+    /// The upgrade or rollback preparing its binary, and its task, if one is.
+    upgrade_preparing: Option<(follow_ups::UpgradeKind, tokio::task::Id)>,
+    /// The task applying the perimeter ruleset with `nft`, if one is.
+    firewall_applying: Option<tokio::task::Id>,
     /// When the turn in progress must stop waiting on work it can retry.
     turn_deadline: Option<tokio::time::Instant>,
+    /// Whether the namespace-firewall maps missed a sync (a runtime that
+    /// didn't name a workload's cgroup in time), so the tick retries it.
+    namespace_firewall_stale: bool,
 }
 
 /// The last instance each phase of `drive_pending_restarts` handled.
@@ -2460,8 +2477,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),
             upgrade_preparing: None,
-            firewall_applying: false,
+            firewall_applying: None,
             turn_deadline: None,
+            namespace_firewall_stale: false,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -2606,8 +2624,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),
             upgrade_preparing: None,
-            firewall_applying: false,
+            firewall_applying: None,
             turn_deadline: None,
+            namespace_firewall_stale: false,
             adopted_apps: adopted_placements::AdoptedApps::new(),
         }
     }
@@ -2993,6 +3012,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
+        // Until a sync completes, the tick tries again (#351, stage 3).
+        self.namespace_firewall_stale = true;
+        let deadline = self.turn_deadline();
         for (key, id, being_created) in pairs {
             if let Some(owner) = self.egress_bindings.get(&id)
                 && owner.phase == PolicyPhase::Owned
@@ -3006,14 +3028,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if being_created {
                 continue;
             }
-            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-            match self.supervisor.grill().workload_cgroup(&id).await {
-                Ok(Some(cgroup)) => cgroup_ids.entry(key).or_default().push(cgroup),
-                Ok(None) => {}
-                Err(error) => {
-                    // Unavailable source evidence cannot authorise erasing
-                    // previously installed namespace/firewall bindings.
+            let cgroup =
+                tokio::time::timeout_at(deadline, self.supervisor.grill().workload_cgroup(&id))
+                    .await;
+            match cgroup {
+                Ok(Ok(Some(cgroup))) => cgroup_ids.entry(key).or_default().push(cgroup),
+                Ok(Ok(None)) => {}
+                // Unavailable source evidence cannot authorise erasing
+                // previously installed namespace/firewall bindings.
+                Ok(Err(error)) => {
                     eprintln!("sesame: source identity for {id} is unavailable: {error}");
+                    return;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "sesame: source identity for {id} did not arrive within the turn; the next tick retries"
+                    );
                     return;
                 }
             }
@@ -3039,6 +3069,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &mut self.firewall_bpf_keys,
         ) {
             eprintln!("sesame: firewall reconciliation failed: {error}");
+        } else {
+            self.namespace_firewall_stale = false;
         }
     }
 
@@ -3336,7 +3368,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Write (or refresh) the instance record used for adoption after a bun
     /// restart or self-upgrade exec. Application acknowledgement requires this
     /// metadata; short jobs recover through their separate attempt record.
-    async fn persist_instance_record(&self, instance_id: &InstanceId) -> Result<(), BunError> {
+    async fn persist_instance_record(
+        &self,
+        instance_id: &InstanceId,
+        evidence: &launch_evidence::LaunchEvidence,
+    ) -> Result<(), BunError> {
         let Some(dir) = self.records_dir.clone() else {
             return Ok(());
         };
@@ -3353,8 +3389,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
             Some(std::process::id())
         } else {
-            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-            self.supervisor.grill().pid(instance_id).await
+            evidence.pid
         };
         let Some(pid) = pid else {
             return if instance.is_job {
@@ -3378,13 +3413,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let replica_index = crate::grill::InstanceIdentity::parse(&instance_id.0)
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
-        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-        let rootless_network = self
-            .supervisor
-            .grill()
-            .rootless_network_record(instance_id)
-            .await;
-        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
         let record = crate::grill::records::InstanceRecord {
             schema: 2,
             instance_id: instance_id.0.clone(),
@@ -3399,14 +3427,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // RunC uses the instance id as the container id (see runc.rs).
             runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
                 .then(|| instance_id.0.clone()),
-            log_stem: self.supervisor.grill().log_stem(instance_id).await,
+            log_stem: evidence.log_stem.clone(),
             host_port: instance.host_port,
             app_spec: self
                 .deployed_specs
                 .get(&(instance.app_name.clone(), instance.namespace.clone()))
                 .cloned(),
             oci_spec,
-            rootless_network,
+            rootless_network: evidence.rootless_network.clone(),
         };
         #[cfg(test)]
         self.loop_stalls.hold(LoopStall::Persist).await;
@@ -3427,13 +3455,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             app_name: instance.app_name.clone(),
             reason,
         };
-        let grill = self.supervisor.grill();
-        let runtime = grill.runtime_kind();
+        let runtime = self.supervisor.grill().runtime_kind();
         let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
             Some(std::process::id())
         } else {
-            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-            grill.pid(&instance.instance_id).await
+            instance.launch.pid
         }
         .ok_or_else(|| {
             fail(
@@ -3445,7 +3471,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })?;
         let identity = crate::grill::InstanceIdentity::parse(&instance.instance_id.0)
             .ok_or_else(|| fail("replacement has an invalid instance identity".into()))?;
-        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
         let record = crate::grill::records::InstanceRecord {
             schema: 2,
             instance_id: instance.instance_id.0.clone(),
@@ -3459,11 +3484,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             pid_started_at,
             runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
                 .then(|| instance.instance_id.0.clone()),
-            log_stem: grill.log_stem(&instance.instance_id).await,
+            log_stem: instance.launch.log_stem.clone(),
             host_port: instance.host_port,
             app_spec: Some(instance.spec.clone()),
             oci_spec: instance.oci_spec.clone(),
-            rootless_network: grill.rootless_network_record(&instance.instance_id).await,
+            rootless_network: instance.launch.rootless_network.clone(),
         };
         // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
         tokio::task::spawn_blocking(move || {
@@ -4112,7 +4137,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.apply_state_sweep(sweep).await;
                         turn
                     }
-                    Some(done) = self.follow_ups.join_next(),
+                    Some(done) = self.follow_ups.join_next_with_id(),
                         if !self.follow_ups.is_empty() => {
                         let turn = self.begin_turn(LoopBranch::FollowUp, None);
                         self.apply_follow_up(done).await;
@@ -4161,11 +4186,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// When the turn in progress must give up on a runtime read or other
-    /// work it can retry later. Outside a turn (startup, or a test driving a
-    /// handler directly) every wait gets a fresh budget.
+    /// work it can retry later. Outside a turn (startup adoption, or a test
+    /// driving a handler directly) nothing else is waiting, so each wait gets
+    /// [`OUTSIDE_TURN_RUNTIME_PATIENCE`] instead.
     fn turn_deadline(&self) -> tokio::time::Instant {
         self.turn_deadline
-            .unwrap_or_else(|| tokio::time::Instant::now() + TURN_RUNTIME_BUDGET)
+            .unwrap_or_else(|| tokio::time::Instant::now() + OUTSIDE_TURN_RUNTIME_PATIENCE)
     }
 
     /// The loop's periodic work: health probes, restarts, retirements, jobs,
@@ -4184,6 +4210,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall();
+        if self.namespace_firewall_stale {
+            self.sync_firewall_ebpf().await;
+        }
         self.reresolve_egress().await;
         self.sweep_kernel_networking().await;
         self.check_identity_rotation();
@@ -6058,12 +6087,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .iter()
                         .map(|instance| instance.id.clone())
                         .collect();
-                    for id in ids {
-                        // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-                        if let Err(error) = self.supervisor.grill().kill(&id).await {
-                            eprintln!("smoker: node-kill container {} failed: {error}", id.0);
+                    // The node is meant to look dead, so nothing waits on
+                    // the kills: they run in a task, and the health tick
+                    // sees the exits as it would a real crash (#351).
+                    let grill = self.supervisor.grill().clone();
+                    tokio::spawn(async move {
+                        for id in ids {
+                            if let Err(error) = grill.kill(&id).await {
+                                eprintln!("smoker: node-kill container {} failed: {error}", id.0);
+                            }
                         }
-                    }
+                    });
                 }
                 self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodeQuiesce);
                 Ok(())
@@ -6114,15 +6148,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|i| i.id.clone())
             .collect();
 
-        let mut pids = Vec::new();
-        for id in ids {
-            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
-            if let Some(pid) = self.supervisor.grill().pid(&id).await {
-                pids.push(pid);
-                if count > 0 && pids.len() as u32 >= count {
-                    break;
-                }
-            }
+        // Every target's pid at once, under the turn's runtime budget: a
+        // target the runtime can't name in time is left alone, as one that
+        // has no pid always was (#351, stage 3).
+        let deadline = self.turn_deadline();
+        let grill = self.supervisor.grill();
+        let reads = ids.iter().map(|id| async move {
+            tokio::time::timeout_at(deadline, grill.pid(id))
+                .await
+                .ok()
+                .flatten()
+        });
+        // `timeout_at` polls the reads before its clock, so at the deadline
+        // the reads that finished still count.
+        let mut pids: Vec<u32> =
+            tokio::time::timeout_at(deadline, futures_util::future::join_all(reads))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .collect();
+        if count > 0 {
+            pids.truncate(count as usize);
         }
         pids
     }
@@ -6501,26 +6548,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .retain(|id, _| live.iter().any(|(live_id, ..)| live_id == id));
 
         let mut callers = Vec::with_capacity(live.len());
+        // A caller whose cgroup the runtime doesn't name within the turn is
+        // left out until a later reconcile asks again; the tick reconciles
+        // network faults every second.
+        let deadline = self.turn_deadline();
         for (id, app, namespace, restarts) in live {
             let named_as_source = self.fault_registry.iter().any(|rule| {
                 rule.fault_type.source_app().is_some() && applies_to_caller(rule, &app, &namespace)
             });
-            // LOOP-INLINE: stage 3 of #351: fault apply and reversal leave the loop
             let cgroup_id = match self.network_faults.caller_cgroups.get(&id) {
                 _ if !named_as_source => None,
                 Some((seen_at, cgroup)) if *seen_at == restarts => Some(*cgroup),
-                _ => match self.supervisor.grill().workload_cgroup(&id).await {
-                    Ok(Some(cgroup)) => {
+                _ => match tokio::time::timeout_at(
+                    deadline,
+                    self.supervisor.grill().workload_cgroup(&id),
+                )
+                .await
+                {
+                    Ok(Ok(Some(cgroup))) => {
                         self.network_faults
                             .caller_cgroups
                             .insert(id.clone(), (restarts, cgroup));
                         Some(cgroup)
                     }
-                    Ok(None) => None,
-                    Err(error) => {
+                    Ok(Ok(None)) => None,
+                    Ok(Err(error)) => {
                         eprintln!("smoker: caller {id} has no provable cgroup: {error}");
                         None
                     }
+                    Err(_) => None,
                 },
             };
             callers.push(LocalCaller {
@@ -7101,10 +7157,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         instance_id: &InstanceId,
         app_name: &str,
         namespace: &str,
-        container_ip: Option<std::net::Ipv4Addr>,
+        evidence: &launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
         self.spawn_log_forwarder(instance_id, app_name, namespace);
-        self.persist_instance_record(instance_id).await?;
+        self.persist_instance_record(instance_id, evidence).await?;
+        let container_ip = evidence.container_ip;
 
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.container_ip = container_ip;
@@ -7458,12 +7515,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         job_name: &str,
         namespace: &str,
         oci_spec: crate::grill::oci::OciSpec,
+        evidence: &launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.oci_spec = Some(oci_spec);
         }
         self.spawn_log_forwarder(instance_id, job_name, namespace);
-        self.persist_instance_record(instance_id).await?;
+        self.persist_instance_record(instance_id, evidence).await?;
         {
             let instance = self
                 .supervisor
@@ -7495,8 +7553,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         spec: Option<&AppSpec>,
         cgroup_path: &std::path::Path,
+        retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
     ) -> Result<(), BunError> {
-        self.retain_network_reference(instance_id, spec).await?;
+        self.retain_network_reference(instance_id, spec, retained)
+            .await?;
         use crate::sesame::egress::{self, PreStartEgress};
 
         let has_allowlist = spec
@@ -7551,16 +7611,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Record the network reference the runtime retained for `id` before it
+    /// starts. Whoever created the instance asked the runtime for it, off
+    /// the loop (#351, stage 3); the loop checks it belongs to `id`'s
+    /// generation and journals it.
     async fn retain_network_reference(
         &mut self,
         id: &InstanceId,
         spec: Option<&AppSpec>,
+        retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
     ) -> Result<(), BunError> {
-        if spec.is_none_or(|spec| spec.port.is_none()) {
+        let retained = retained?;
+        if !launch_evidence::retains_network(spec) {
+            // The spec stopped publishing an address after the retain.
+            if let Some(reference) = retained {
+                self.hand_back_network_reference(reference);
+            }
             return Ok(());
         }
-        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-        if let Some(reference) = self.supervisor.grill().retain_network_reference(id).await? {
+        if let Some(reference) = retained {
             if reference.instance_id != *id {
                 return Err(BunError::RetirementState {
                     instance_id: id.clone(),
@@ -7583,12 +7652,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // than leave a hold nothing tracks. After an uncertain write the
                 // journal may record it, so only retirement may release it.
                 if !matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain) {
-                    // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-                    let _ = self
-                        .supervisor
-                        .grill()
-                        .release_network_reference(&reference)
-                        .await;
+                    self.hand_back_network_reference(reference);
                 }
                 return Err(error);
             }
@@ -7597,27 +7661,56 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    /// Give back a hold no journal records, from a task: nothing waits on
+    /// it, and a release names its generation, so it can't touch a later
+    /// retain of the same instance.
+    fn hand_back_network_reference(&self, reference: crate::grill::runc_intent::NetworkReference) {
+        let grill = self.supervisor.grill().clone();
+        tokio::spawn(async move {
+            if let Err(error) = grill.release_network_reference(&reference).await {
+                eprintln!(
+                    "bun: handing back {}'s untracked network reference failed: {error}",
+                    reference.instance_id
+                );
+            }
+        });
+    }
+
     async fn release_network_reference(
         &mut self,
         id: &InstanceId,
         remote: Option<&crate::onion::producer::ProducerReleaseConfirmation>,
     ) -> Result<(), BunError> {
+        // The runtime answers these under the instance's lifecycle lock. One
+        // that can't within the turn fails the retirement, which retries;
+        // a release is idempotent, so a late one that did land is harmless.
+        let deadline = self.turn_deadline();
+        let late = || BunError::RetirementState {
+            instance_id: id.clone(),
+            reason: "the runtime did not answer for the network reference within the turn".into(),
+        };
         let reference = match self.network_references.get(id).cloned() {
             Some(reference) => reference,
             None => {
-                // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-                let Some(held) = self.supervisor.grill().network_reference(id).await? else {
+                let held = tokio::time::timeout_at(
+                    deadline,
+                    self.supervisor.grill().network_reference(id),
+                )
+                .await
+                .map_err(|_| late())??;
+                let Some(held) = held else {
                     return Ok(());
                 };
                 match self.journal_reference(&held) {
                     // The hold was retained but its launch never recorded it, so
                     // no publication ever named the address: nothing to withdraw.
                     JournalReference::Unrecorded => {
-                        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-                        self.supervisor
-                            .grill()
-                            .release_network_reference(&held)
-                            .await?;
+                        tokio::time::timeout_at(
+                            deadline,
+                            self.supervisor.grill().release_network_reference(&held),
+                        )
+                        .await
+                        .map_err(|_| late())??;
                         return Ok(());
                     }
                     // Recorded by a write whose outcome was uncertain at the time.
@@ -7638,11 +7731,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.authorise_local_discovery_release(&reference, remote)
             .await?;
         self.require_discovery_release_permission(&reference)?;
-        // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-        self.supervisor
-            .grill()
-            .release_network_reference(&reference)
-            .await?;
+        tokio::time::timeout_at(
+            deadline,
+            self.supervisor
+                .grill()
+                .release_network_reference(&reference),
+        )
+        .await
+        .map_err(|_| late())??;
         self.forget_released_discovery_reference(&reference).await?;
         self.network_references.remove(id);
         Ok(())
@@ -7656,8 +7752,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         spec: Option<&AppSpec>,
         _cgroup_path: &std::path::Path,
+        retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
     ) -> Result<(), BunError> {
-        self.retain_network_reference(instance_id, spec).await?;
+        self.retain_network_reference(instance_id, spec, retained)
+            .await?;
         if spec
             .and_then(|spec| spec.egress.as_ref())
             .is_some_and(|e| !e.allow.is_empty())
@@ -9679,7 +9777,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `nft` subprocess runs off the loop; until it reports back, the tick
     /// leaves the firewall alone.
     fn reconcile_firewall(&mut self) {
-        if !self.perimeter_config.enabled || self.firewall_applying {
+        if !self.perimeter_config.enabled || self.firewall_applying.is_some() {
             return;
         }
 
@@ -9776,14 +9874,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     async fn retire_initialisers(&mut self, parent: &InstanceId) -> Result<(), BunError> {
         let children = self.initialisers.get(parent).cloned().unwrap_or_default();
+        // An initialiser has normally exited long before its parent retires,
+        // so confirming that is quick. One the runtime can't confirm within
+        // the turn fails the retirement, which retries; the kill is
+        // idempotent.
+        let deadline = self.turn_deadline();
         for child in children {
-            // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-            kill_runtime_instance(
-                self.supervisor.grill(),
-                &child,
-                self.stop_confirmation_timeout,
+            tokio::time::timeout_at(
+                deadline,
+                kill_runtime_instance(
+                    self.supervisor.grill(),
+                    &child,
+                    self.stop_confirmation_timeout,
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| BunError::StopUnconfirmed {
+                instance_id: child.clone(),
+                reason: "initialiser exit was not confirmed within the turn",
+            })??;
             if let Some(remaining) = self.initialisers.get_mut(parent) {
                 remaining.remove(&child);
             }
@@ -11134,21 +11243,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 spec,
                 cgroup_path,
+                retained,
                 reply,
             } => {
                 let result = self
-                    .apply_network_pre_start(&instance_id, &app_name, spec.as_deref(), &cgroup_path)
+                    .apply_network_pre_start(
+                        &instance_id,
+                        &app_name,
+                        spec.as_deref(),
+                        &cgroup_path,
+                        retained,
+                    )
                     .await;
-                // On failure, mirror the fresh path's clean-up: mark Failed and
-                // stop the created container so no half-started workload lingers.
-                if result.is_err() {
-                    if let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
-                        && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
-                    {
-                        instance.state = state;
-                    }
-                    // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-                    let _ = self.supervisor.grill().stop(&instance_id).await;
+                // On failure, mark the instance Failed. The worker stops the
+                // created container, off the loop, so no half-started
+                // workload lingers.
+                if result.is_err()
+                    && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
+                    && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
+                {
+                    instance.state = state;
                 }
                 let _ = reply.send(result);
             }
@@ -11164,11 +11278,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 instance_id,
                 app_name,
                 namespace,
-                container_ip,
+                evidence,
                 reply,
             } => {
                 let result = self
-                    .finish_fresh_instance(&instance_id, &app_name, &namespace, container_ip)
+                    .finish_fresh_instance(&instance_id, &app_name, &namespace, &evidence)
                     .await;
                 let _ = reply.send(result);
             }
@@ -11228,8 +11342,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             DeployOp::RetainRollingInstance { instance, reply } => {
                 let id = instance.instance_id.clone();
-                // LOOP-INLINE: stage 3 of #351: an unbounded runtime call
-                let container_ip = self.supervisor.grill().container_ip(&id).await;
+                let container_ip = instance.launch.container_ip;
                 let result = match self.supervisor.get_instance_mut(&id) {
                     Some(owner)
                         if owner.app_name == instance.app_name
@@ -11318,10 +11431,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 job_name,
                 namespace,
                 oci_spec,
+                evidence,
                 reply,
             } => {
                 let result = self
-                    .finish_job_instance(&instance_id, &job_name, &namespace, *oci_spec)
+                    .finish_job_instance(&instance_id, &job_name, &namespace, *oci_spec, &evidence)
                     .await;
                 let _ = reply.send(result);
             }
@@ -11405,6 +11519,30 @@ async fn captured_stderr_tail(stem: &std::path::Path) -> Option<String> {
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
+    /// Retain a created instance's network reference, have the loop record
+    /// it and program the instance's network before it starts, and stop the
+    /// container if the loop refuses. The runtime calls happen here, on the
+    /// worker, not on the loop (#351, stage 3).
+    async fn prepare_network(
+        &self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        spec: Option<&AppSpec>,
+        cgroup_path: &std::path::Path,
+    ) -> Result<(), BunError> {
+        let retained = launch_evidence::retain_network(&self.grill, instance_id, spec)
+            .await
+            .map_err(BunError::from);
+        let result = self
+            .ops
+            .apply_network_pre_start(instance_id, app_name, spec, cgroup_path, retained)
+            .await;
+        if result.is_err() {
+            let _ = self.grill.stop(instance_id).await;
+        }
+        result
+    }
+
     async fn report_cancellation(&self, events: &mpsc::Sender<ApplyEvent>) -> bool {
         if self
             .operation
@@ -11921,8 +12059,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // Runc can remove the shared cgroup when an init exits. Its
             // successor must receive policy for the new kernel identity
             // before either another init or the main workload executes.
-            self.ops
-                .apply_network_pre_start(instance_id, app_name, Some(spec), cgroup_path)
+            self.prepare_network(instance_id, app_name, Some(spec), cgroup_path)
                 .await?;
         }
         Ok(())
@@ -11951,8 +12088,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
         // create → program → start: the workload never runs ahead of its
         // egress policy (#86). On failure the loop stops the container.
-        self.ops
-            .apply_network_pre_start(instance_id, app_name, Some(spec), &prepared.cgroup_path)
+        self.prepare_network(instance_id, app_name, Some(spec), &prepared.cgroup_path)
             .await?;
 
         if prepared.has_init {
@@ -11971,9 +12107,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
         self.grill.start(instance_id).await?;
 
-        let container_ip = self.grill.container_ip(instance_id).await;
+        let evidence = launch_evidence::LaunchEvidence::read(&self.grill, instance_id).await;
         self.ops
-            .finish_fresh_instance(instance_id, app_name, namespace, container_ip)
+            .finish_fresh_instance(instance_id, app_name, namespace, evidence)
             .await
     }
 
@@ -11997,15 +12133,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
         self.grill.create(instance_id, &oci_spec).await?;
         self.ops.store_oci_spec(instance_id, oci_spec.clone()).await;
-        self.ops
-            .apply_network_pre_start(instance_id, job_name, None, &cgroup_path)
+        self.prepare_network(instance_id, job_name, None, &cgroup_path)
             .await?;
         self.ops
             .transition_state(instance_id, ContainerState::Starting)
             .await?;
         self.grill.start(instance_id).await?;
+        let evidence = launch_evidence::LaunchEvidence::read(&self.grill, instance_id).await;
         self.ops
-            .finish_job_instance(instance_id, job_name, namespace, oci_spec)
+            .finish_job_instance(instance_id, job_name, namespace, oci_spec, evidence)
             .await
     }
 
@@ -12383,8 +12519,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
             // Same create → program → start ordering as the fresh path (#86).
             if let Err(e) = self
-                .ops
-                .apply_network_pre_start(&new_id, app_name, Some(spec), &cgroup_path)
+                .prepare_network(&new_id, app_name, Some(spec), &cgroup_path)
                 .await
             {
                 let _ = events
@@ -12421,6 +12556,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 new_failed = true;
                 break;
             }
+            let launch = launch_evidence::LaunchEvidence::read(&self.grill, &new_id).await;
             if let Err(error) = self
                 .ops
                 .register_rolling_instance(RollingInstance {
@@ -12430,6 +12566,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     spec: spec.clone(),
                     oci_spec: oci_spec.clone(),
                     host_port,
+                    launch,
                 })
                 .await
             {
@@ -12725,6 +12862,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 app_name: app_name.into(),
                 reason: format!("missing launch ownership for {id}"),
             })?;
+            let launch = launch_evidence::LaunchEvidence::read(&self.grill, id).await;
             self.ops
                 .retain_rolling_instance(RollingInstance {
                     instance_id: id.clone(),
@@ -12733,6 +12871,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     spec: spec.clone(),
                     oci_spec: oci_spec.clone(),
                     host_port: ports.get(id).copied().flatten(),
+                    launch,
                 })
                 .await?;
         }
@@ -12870,8 +13009,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 break;
             }
             if let Err(e) = self
-                .ops
-                .apply_network_pre_start(&new_id, app_name, Some(spec), &cgroup_path)
+                .prepare_network(&new_id, app_name, Some(spec), &cgroup_path)
                 .await
             {
                 let _ = events
@@ -12891,6 +13029,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 new_failed = true;
                 break;
             }
+            let launch = launch_evidence::LaunchEvidence::read(&self.grill, &new_id).await;
             if let Err(error) = self
                 .ops
                 .register_rolling_instance(RollingInstance {
@@ -12900,6 +13039,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     spec: spec.clone(),
                     oci_spec: oci_spec.clone(),
                     host_port,
+                    launch,
                 })
                 .await
             {
@@ -24926,6 +25066,11 @@ host = "remote.local"
     async fn refused_reference_record_hands_the_runtime_hold_back() {
         let (mut agent, grill, root, reference) = unpublished_hold_fixture().await;
         let spec = basic_config().app.remove("web").unwrap();
+        // The deploy worker retains the reference off the loop.
+        let retained = grill
+            .retain_network_reference(&reference.instance_id)
+            .await
+            .map_err(BunError::from);
         let (reply, result) = oneshot::channel();
         agent
             .handle_deploy_op(DeployOp::ApplyNetworkPreStart {
@@ -24933,6 +25078,7 @@ host = "remote.local"
                 app_name: "web".into(),
                 spec: Some(Box::new(spec)),
                 cgroup_path: root.path().join("cgroup"),
+                retained,
                 reply,
             })
             .await;
@@ -24941,12 +25087,20 @@ host = "remote.local"
             agent.discovery_ownership,
             DiscoveryOwnership::Ready(_)
         ));
-        assert_eq!(
-            grill
+        // The hand-back runs in a task; nothing on the loop waits for it.
+        let handed_back = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while grill
                 .network_reference(&reference.instance_id)
                 .await
-                .unwrap(),
-            None,
+                .unwrap()
+                .is_some()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            handed_back.is_ok(),
             "a hold nothing records outlived its refused launch"
         );
     }

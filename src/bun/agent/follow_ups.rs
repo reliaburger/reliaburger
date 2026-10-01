@@ -28,6 +28,9 @@ pub(super) enum FollowUp {
     },
 }
 
+/// How a follow-up task ended, as `JoinSet::join_next_with_id` yields it.
+pub(super) type FollowUpOutcome = Result<(tokio::task::Id, FollowUp), tokio::task::JoinError>;
+
 /// Which upgrade command a preparation answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum UpgradeKind {
@@ -81,16 +84,19 @@ async fn read_inventory<G: Grill>(
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Finish whatever a spawned task reported.
-    pub(super) async fn apply_follow_up(&mut self, done: Result<FollowUp, tokio::task::JoinError>) {
+    pub(super) async fn apply_follow_up(&mut self, done: FollowUpOutcome) {
         match done {
-            Ok(FollowUp::UpgradePrepared(preparation)) => {
+            Ok((_, FollowUp::UpgradePrepared(preparation))) => {
                 self.finish_upgrade_preparation(preparation).await;
             }
-            Ok(FollowUp::FirewallApplied {
-                cluster_nodes,
-                result,
-            }) => {
-                self.firewall_applying = false;
+            Ok((
+                _,
+                FollowUp::FirewallApplied {
+                    cluster_nodes,
+                    result,
+                },
+            )) => {
+                self.firewall_applying = None;
                 match result {
                     Ok(()) => self.last_firewall_nodes = Some(cluster_nodes),
                     Err(error) => eprintln!("warning: firewall reconciliation failed: {error}"),
@@ -100,8 +106,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // A panicked task drops its caller's answer, which the caller
                 // sees as a closed channel; say why here.
                 eprintln!("bun: a task the agent loop started failed: {error}");
-                self.upgrade_preparing = None;
-                self.firewall_applying = false;
+                if self
+                    .upgrade_preparing
+                    .as_ref()
+                    .is_some_and(|(_, task)| *task == error.id())
+                {
+                    self.upgrade_preparing = None;
+                    self.draining
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if self.firewall_applying == Some(error.id()) {
+                    self.firewall_applying = None;
+                }
             }
         }
     }
@@ -128,7 +144,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         kind: &UpgradeKind,
         response: oneshot::Sender<Result<(), BunError>>,
     ) -> Option<oneshot::Sender<Result<(), BunError>>> {
-        let Some(preparing) = &self.upgrade_preparing else {
+        let Some((preparing, _)) = &self.upgrade_preparing else {
             return Some(response);
         };
         let answer = match (preparing, kind) {
@@ -177,8 +193,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let entries = self.upgrade_inventory_entries();
         let grill = self.supervisor.grill().clone();
-        self.upgrade_preparing = Some(kind.clone());
-        self.follow_ups.spawn(async move {
+        let preparing = kind.clone();
+        let task = self.follow_ups.spawn(async move {
             let inventory = read_inventory(&grill, entries).await;
             let prepared = manager.prepare(&directive, inventory).await;
             FollowUp::UpgradePrepared(UpgradePreparation {
@@ -187,6 +203,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 response,
             })
         });
+        self.upgrade_preparing = Some((preparing, task.id()));
     }
 
     /// Node-level rollback: the same swap, with no download or re-verify.
@@ -209,8 +226,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let entries = self.upgrade_inventory_entries();
         let grill = self.supervisor.grill().clone();
-        self.upgrade_preparing = Some(kind.clone());
-        self.follow_ups.spawn(async move {
+        let preparing = kind.clone();
+        let task = self.follow_ups.spawn(async move {
             let inventory = read_inventory(&grill, entries).await;
             let prepared = manager.prepare_rollback(version, inventory).await.map(Some);
             FollowUp::UpgradePrepared(UpgradePreparation {
@@ -219,6 +236,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 response,
             })
         });
+        self.upgrade_preparing = Some((preparing, task.id()));
     }
 
     /// Answer the caller, then exec the staged binary. Only the exec, and
@@ -286,10 +304,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         ruleset: String,
         cluster_nodes: crate::firewall::rules::ClusterNodes,
     ) {
-        self.firewall_applying = true;
         #[cfg(test)]
         let stalls = std::sync::Arc::clone(&self.loop_stalls);
-        self.follow_ups.spawn(async move {
+        let task = self.follow_ups.spawn(async move {
             #[cfg(test)]
             if stalls.hold(super::LoopStall::Firewall).await {
                 return FollowUp::FirewallApplied {
@@ -303,5 +320,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 result,
             }
         });
+        self.firewall_applying = Some(task.id());
     }
 }

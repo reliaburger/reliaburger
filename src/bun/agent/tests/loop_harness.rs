@@ -220,7 +220,6 @@ async fn status_answers_while_a_restart_creates_and_starts() {
 /// A deploy's `ApplyNetworkPreStart` step retains the instance's network
 /// reference through the runtime, under its lifecycle lock.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_deploy_step_retains_a_network_reference() {
     let (agent, tx, shutdown, grill) = test_agent_with_grill();
     let running = RunningAgent::start(agent, tx.clone(), shutdown);
@@ -633,7 +632,6 @@ async fn status_answers_while_the_tick_applies_the_firewall() {
 /// Injecting a workload fault reads every target's pid, one at a time, before
 /// it signals or writes a cgroup.
 #[tokio::test]
-#[ignore = "stage 3 of #351"]
 async fn status_answers_while_a_fault_reads_its_targets() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("web", 5)).await);
