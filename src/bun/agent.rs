@@ -9,25 +9,38 @@
 //!
 //! `run_loop` is the only owner of a node's state, so it runs one turn at a
 //! time, and every caller waits for the turn in progress. A turn must be
-//! short: the turn budget is 1 s ([`super::loop_meter::TURN_BUDGET`]). Once
-//! stage 3 of #351 lands, the V02 soak fails a tier whose worst turn exceeds
-//! it. So:
+//! short: the turn budget is 1 s ([`super::loop_meter::TURN_BUDGET`]), and
+//! the V02 soak fails a tier on any turn over it. So:
 //!
 //! 1. An `await` that a turn reaches must not wait on anything slow: a
-//!    runtime call, a council write, a subprocess, the network, a peer, or a
-//!    client draining a channel. Spawn that work and let it report back (as
-//!    stops, identity signings, deploys and probes do), or wrap it in
-//!    `tokio::time::timeout` with a deadline well under the budget.
+//!    runtime call, a council write, a subprocess, the network, a peer, the
+//!    disk beyond one persist, or a client draining a channel. Move the work
+//!    off the loop in one of the ways the agent already does:
+//!    - **Answer from a task** when nothing on the loop needs the result
+//!      (`logs`, `council_requests`, a node-kill's container kills).
+//!    - **Let the task report back** through a `select!` branch when the
+//!      loop has to finish the job: stop waits, identity signings, restart
+//!      steps, state sweeps, and the [`follow_ups`] enum (upgrades, `nft`,
+//!      egress DNS, node pressure).
+//!    - **Have whoever drove the runtime read it**: a deploy worker or a
+//!      restart step hands over the network reference it retained and the
+//!      [`launch_evidence`] of what it started, with the step that records it.
+//!    - **Start it, and collect it on a later turn** ([`off_loop_work`]):
+//!      a step whose disk or runtime work isn't done within the turn fails
+//!      with [`BunError::StillRunning`], and its caller asks again.
+//!    - **Bound it by the turn's runtime budget**: reads a later turn can
+//!      retry wait at most until [`BunAgent::turn_deadline`], which every
+//!      such await in a turn shares (`tokio::time::timeout_at`).
 //! 2. An await that stays inline without a deadline carries a
 //!    `// LOOP-INLINE: <why>` comment on its statement: an in-memory lock,
 //!    an fsync'd persist (allowed, and bounded by the harness's slow-disk
-//!    scenario), or known debt naming its stage of #351.
+//!    scenario), or the short sleep before an upgrade's exec.
 //! 3. `loop_rule::every_inline_await_on_the_agent_loop_has_a_deadline_or_a_reason`
 //!    walks every method a turn can reach and fails on an await with
 //!    neither. Reviewers read the tags, not the whole call graph.
 //! 4. The starvation harness (`tests::loop_harness`) proves it: each
-//!    scenario makes one inline await slow and checks that a queued status
-//!    is answered, and the worst turn ends, within the budget.
+//!    scenario makes one await slow and checks that a queued status is
+//!    answered, and the worst turn ends, within the budget.
 //!
 //! Every turn is timed by branch ([`super::loop_meter`]) and exported as
 //! `bun_agent_loop_turn_seconds`; any turn over 250 ms is logged with the
