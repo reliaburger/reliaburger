@@ -9,10 +9,10 @@ Added when this report landed; the assessment below is unchanged and still descr
 | T01 | Open: [#301](https://github.com/reliaburger/reliaburger/issues/301) |
 | T02 | Open: [#301](https://github.com/reliaburger/reliaburger/issues/301) |
 | T03 | Open: [#302](https://github.com/reliaburger/reliaburger/issues/302) |
-| T04 | Open: [#303](https://github.com/reliaburger/reliaburger/issues/303) |
-| T05 | Open: [#303](https://github.com/reliaburger/reliaburger/issues/303) |
-| T06 | Open: [#304](https://github.com/reliaburger/reliaburger/issues/304) |
-| T07 | Open: [#304](https://github.com/reliaburger/reliaburger/issues/304) |
+| T04 | Fixed in [#380](https://github.com/reliaburger/reliaburger/pull/380) |
+| T05 | Fixed in [#380](https://github.com/reliaburger/reliaburger/pull/380) |
+| T06 | Fixed in [#380](https://github.com/reliaburger/reliaburger/pull/380) |
+| T07 | Fixed in [#380](https://github.com/reliaburger/reliaburger/pull/380) |
 | P1 security contracts and user data | Fixed B-findings and open issues are listed in the [first](2026-09-27-static-release-review.md) and [second](2026-09-27-static-release-review-second-pass.md) reports' status tables |
 | P2 memory autoscaling, drift and refusal tests | Memory: [#299](https://github.com/reliaburger/reliaburger/issues/299); drift: [#305](https://github.com/reliaburger/reliaburger/issues/305); refusal fixed in [#261](https://github.com/reliaburger/reliaburger/pull/261) |
 | P2 supported environment evidence | Tracked by V04: [#288](https://github.com/reliaburger/reliaburger/issues/288) |
