@@ -717,6 +717,11 @@ async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    // Status, inspect, the dashboard and wtf all read this to say what the
+    // app waits for.
+    let desired = observer.client.desired_apps().await.unwrap();
+    let db = desired.iter().find(|app| app.app == "db").unwrap();
+    assert_eq!(db.volume_home_away.as_deref(), Some(home_name));
 
     let restart_token = root.child_token();
     nodes[home_index] = Some(

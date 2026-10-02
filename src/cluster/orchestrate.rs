@@ -656,6 +656,13 @@ fn plan_pass(
             cache.set_node(node);
         }
     }
+    let retired: HashSet<NodeId> = desired
+        .security_state
+        .crl
+        .retired_nodes
+        .keys()
+        .map(NodeId::new)
+        .collect();
     let mut decisions = Vec::new();
     let mut quota_blocked = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
@@ -700,7 +707,16 @@ fn plan_pass(
             .map(|placements| {
                 placements.len() == want
                     && placements.iter().all(|p| {
-                        placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
+                        keeps_volume_home(p, spec, &retired)
+                            || placement_holds(
+                                p,
+                                spec,
+                                cache,
+                                alive,
+                                suspect,
+                                unheard,
+                                dns_required,
+                            )
                     })
             })
             .unwrap_or(false);
@@ -766,7 +782,16 @@ fn plan_pass(
                     placements
                         .iter()
                         .filter(|p| {
-                            placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
+                            keeps_volume_home(p, spec, &retired)
+                                || placement_holds(
+                                    p,
+                                    spec,
+                                    cache,
+                                    alive,
+                                    suspect,
+                                    unheard,
+                                    dns_required,
+                                )
                         })
                         .take(want)
                         .cloned()
@@ -783,6 +808,7 @@ fn plan_pass(
                 alive,
                 suspect,
                 unheard,
+                retired: &retired,
                 dns_required,
             };
             match home.reserve(app_id, spec, desired.last_placed_nodes.get(app_id), want) {
@@ -872,6 +898,10 @@ enum HomeOutcome {
 /// Why an app waits for the node that holds its volumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HomeWait {
+    /// The node is out of the cluster: suspected, Left, Dead or forgotten by
+    /// gossip. That's usually a restart or a reboot, with the data still on
+    /// its disk (#423). Only decommissioning it says the data is gone.
+    Away,
     /// The node is alive but this leader has no fresh report from it: a new
     /// leader, or a report worker that stalled long enough to go stale.
     Unreported,
@@ -885,6 +915,7 @@ enum HomeWait {
 impl std::fmt::Display for HomeWait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            HomeWait::Away => "it is out of the cluster; decommission it to move the app",
             HomeWait::Unreported => "it hasn't reported fresh state",
             HomeWait::NotReady => "it isn't ready",
             HomeWait::NoRoom => "it has no room yet",
@@ -898,6 +929,8 @@ struct VolumeHome<'a> {
     alive: &'a HashSet<NodeId>,
     suspect: &'a HashSet<NodeId>,
     unheard: &'a HashSet<NodeId>,
+    /// Decommissioned nodes, whose volumes the operator has written off.
+    retired: &'a HashSet<NodeId>,
     dns_required: bool,
 }
 
@@ -905,12 +938,12 @@ impl VolumeHome<'_> {
     /// Reserve up to `want` replicas of `app_id` on the nodes it last ran on,
     /// if it has a managed volume.
     ///
-    /// Only two things release a home: the node leaving the cluster (gossip
-    /// no longer has it alive or suspect), which is the documented loss of a local
-    /// volume with its node, and the node no longer matching the app's
-    /// required labels, which is the operator moving the app on purpose.
-    /// Anything else (a stale or missing report, not ready, cordoned for an
-    /// upgrade, full) makes the app wait, because its data is still there.
+    /// Only the operator releases a home: by decommissioning the node, which
+    /// writes off its volumes, or by changing the app's required labels so
+    /// the node no longer matches. Anything else makes the app wait, because
+    /// its data is still there: the node being out of the cluster (a bun
+    /// restart announces Left, a reboot goes Suspect then Dead, #423), a
+    /// stale or missing report, not ready, cordoned for an upgrade, or full.
     fn reserve(
         self,
         app_id: &crate::meat::types::AppId,
@@ -933,11 +966,11 @@ impl VolumeHome<'_> {
                 node: node_id.clone(),
                 reason,
             };
-            if self.suspect.contains(node_id) {
-                return wait(HomeWait::Unreported);
-            }
-            if !self.alive.contains(node_id) {
+            if self.retired.contains(node_id) {
                 continue;
+            }
+            if self.suspect.contains(node_id) || !self.alive.contains(node_id) {
+                return wait(HomeWait::Away);
             }
             let Some(node) = self.cache.get_node(node_id) else {
                 return wait(HomeWait::Unreported);
@@ -978,9 +1011,8 @@ impl VolumeHome<'_> {
 /// to a council member that just died can take longer still; "not heard from
 /// yet" is not evidence of trouble, and moving its replicas would restart
 /// healthy workloads. A node that reported and went stale, or reported not
-/// ready or not capable, does lose them, unless the app keeps a managed
-/// volume there: its replacement would start on an empty volume, so it stays
-/// for as long as the node is alive.
+/// ready or not capable, does lose them. (A managed-volume app's placement
+/// never gets this far: [`keeps_volume_home`] keeps it.)
 fn placement_holds(
     placement: &crate::meat::types::Placement,
     spec: &AppSpec,
@@ -999,12 +1031,59 @@ fn placement_holds(
     if !alive.contains(&placement.node_id) {
         return false;
     }
-    if unheard.contains(&placement.node_id) || has_managed_volume(spec) {
+    if unheard.contains(&placement.node_id) {
         return true;
     }
     cache
         .get_node(&placement.node_id)
         .is_none_or(|node| node_can_run(node, spec, dns_required))
+}
+
+/// Whether a managed-volume app's placement stays put whatever its node is
+/// doing: its replacement would start on an empty volume while the data sits
+/// on that node. Restarting, rebooting, Dead and not-ready nodes all keep it
+/// (#423); only decommissioning the node releases it.
+fn keeps_volume_home(
+    placement: &crate::meat::types::Placement,
+    spec: &AppSpec,
+    retired: &HashSet<NodeId>,
+) -> bool {
+    has_managed_volume(spec) && !retired.contains(&placement.node_id)
+}
+
+/// The node holding `app_id`'s managed volume while that node is out of the
+/// cluster, so the app waits for it: the first of its placements, or with
+/// none, of the nodes it last ran on, that isn't in `live` and hasn't been
+/// decommissioned. `None` for an app without a managed volume, a stopped
+/// app, or one whose homes are all live.
+pub(crate) fn volume_home_away(
+    desired: &crate::council::types::DesiredState,
+    app_id: &crate::meat::types::AppId,
+    spec: &AppSpec,
+    live: &HashSet<String>,
+) -> Option<NodeId> {
+    if !has_managed_volume(spec) || desired.stopped_apps.contains(app_id) {
+        return None;
+    }
+    let placed: Vec<&NodeId> = desired
+        .scheduling
+        .get(app_id)
+        .map(|placements| placements.iter().map(|p| &p.node_id).collect())
+        .unwrap_or_default();
+    let homes = if placed.is_empty() {
+        desired
+            .last_placed_nodes
+            .get(app_id)
+            .map(|nodes| nodes.iter().collect())
+            .unwrap_or_default()
+    } else {
+        placed
+    };
+    let retired = &desired.security_state.crl.retired_nodes;
+    homes
+        .into_iter()
+        .find(|node| !live.contains(&node.0) && !retired.contains_key(&node.0))
+        .cloned()
 }
 
 /// Whether a fixed-size app keeps state in a managed volume, which lives on
@@ -4839,11 +4918,44 @@ image = "busybox:latest"
         assert!(decisions.is_empty(), "{decisions:?}");
     }
 
-    /// A dead home is the documented case of a local volume being lost with
-    /// its node: the app starts elsewhere rather than not at all.
+    /// Retire `node` the way `relish decommission-node` does.
+    fn decommission(desired: &mut DesiredState, node: &str) {
+        desired.security_state.crl.retired_nodes.insert(
+            node.into(),
+            crate::cluster::retirement::NodeRetirement {
+                node_id: node.into(),
+                retired_by: "operator".into(),
+                reason: "disk died".into(),
+                retired_at_unix_ms: 30,
+                released_placements: Default::default(),
+                released_registry_writers: Default::default(),
+                released_node_fault: None,
+                released_endpoint_consumer: false,
+            },
+        );
+    }
+
+    /// #423: a home that left gossip, went Dead, or was reaped from the
+    /// member table entirely is usually a node restarting or rebooting, with
+    /// its data on disk. The app waits for it rather than starting elsewhere
+    /// on an empty volume.
     #[test]
-    fn a_volume_app_whose_node_is_gone_is_placed_elsewhere() {
+    fn a_volume_app_waits_while_the_node_that_holds_its_volume_is_out_of_the_cluster() {
         let (desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let alive = HashSet::from([NodeId::new("busy")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// Decommissioning the home node is the operator saying its data is
+    /// gone: that, and only that, lets the app start somewhere else.
+    #[test]
+    fn a_volume_app_whose_node_was_decommissioned_is_placed_elsewhere() {
+        let (mut desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        decommission(&mut desired, "home");
         let alive = HashSet::from([NodeId::new("busy")]);
 
         let decisions =
@@ -4851,6 +4963,58 @@ image = "busybox:latest"
 
         assert_eq!(decisions.len(), 1, "{decisions:?}");
         assert_eq!(nodes_of(&decisions[0]), ["busy"]);
+    }
+
+    /// #423: the tester's case. `systemctl restart bun` announces Left, and
+    /// a running volume app's placement must survive it, Suspect and Dead
+    /// alike, until the node comes back.
+    #[test]
+    fn a_running_volume_app_keeps_its_placement_while_its_node_restarts() {
+        let (mut desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let app = AppId::new("db", "default");
+        desired.scheduling.insert(app, placed_on(&["home"]));
+        let alive = HashSet::from([NodeId::new("busy")]);
+
+        for suspect in [HashSet::new(), HashSet::from([NodeId::new("home")])] {
+            let decisions = plan_scheduling_pass_with_dns(
+                &mut cache,
+                &desired,
+                &alive,
+                &suspect,
+                &mut QuotaLedger::default(),
+                false,
+                &HashSet::new(),
+            );
+            assert!(decisions.is_empty(), "{decisions:?}");
+        }
+
+        decommission(&mut desired, "home");
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
+    }
+
+    /// Each replica of a volume app has its own volume on its own node, so
+    /// losing one node must not start a fresh replica on an empty volume
+    /// either; the others keep serving.
+    #[test]
+    fn a_volume_replica_on_a_departed_node_is_not_replaced() {
+        let app = AppId::new("db", "default");
+        let mut spec = app_with_volume(100);
+        spec.replicas = Replicas::Fixed(2);
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), spec);
+        desired.scheduling.insert(app, placed_on(&["n1", "n2"]));
+        let mut cache = ClusterStateCache::new();
+        for name in ["n1", "n3"] {
+            cache.set_node(sched_node(name, 4000, BTreeMap::new()));
+        }
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
     }
 
     /// Without a managed volume there's nothing to go back for.
@@ -4937,11 +5101,11 @@ image = "busybox:latest"
 
         assert!(decisions.is_empty(), "{decisions:?}");
 
-        // Gone from gossip is the documented loss: it moves.
+        // Gone from gossip is usually a restart (#423): it still stays.
         let alive = HashSet::from([NodeId::new("busy")]);
         let decisions =
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
-        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
+        assert!(decisions.is_empty(), "{decisions:?}");
     }
 
     /// The operator moving an app with `placement.required` is on purpose.

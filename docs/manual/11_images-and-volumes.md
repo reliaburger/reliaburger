@@ -189,10 +189,17 @@ time it's mounted. It stays on its node, so it's local storage, not a
 network volume. An app with a managed volume stays with it too: after
 `relish stop`, the next `relish apply` starts it again on the node that holds
 its volume, and waits there if that node is short of room, not ready, or in the
-middle of an upgrade. A running app stays put for the same reasons. Only when
-that node is gone (or no longer matches the app's `placement.required` labels)
-does it start elsewhere, on a new, empty volume. A host-path volume is never chowned: make it readable (or
-writable) by the container's mapped user yourself.
+middle of an upgrade. A running app stays put for the same reasons, and also
+while its node is out of the cluster: restarting Bun, rebooting or a crash all
+look the same to gossip, and the data is usually still there. While it waits,
+`relish status` and `relish inspect` say which node it's waiting for, and
+`relish wtf` reports it as critical. Only two things move it: decommissioning
+the node with `relish decommission-node <node> --workloads-stopped --reason
+<why>`, which writes its volumes off, or changing the app's
+`placement.required` labels so that node no longer matches. Either way the app
+starts elsewhere on a new, empty volume (restore a snapshot into it if you have
+one). A host-path volume is never chowned: make it readable (or writable) by
+the container's mapped user yourself.
 
 ## Snapshots
 
