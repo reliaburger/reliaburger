@@ -1308,6 +1308,40 @@ The cost is availability. A three-replica volume app that loses a node runs two 
 
 The gated test `restarting_bun_on_a_volume_apps_node_never_moves_the_app` restarts the home node's agent the way systemd does: it cancels that node's shutdown token, keeps it down for fifteen seconds (well past the suspicion timeout), and checks that no other node runs the app or provisions a volume for it in that time. Then it starts the node again on the same data directory and checks the app comes back there, with the marker it wrote before the restart. Before the fix it failed about two seconds after the stop, with the app running on the other zone-`b` node.
 
+## Changing a running app
+
+An audit of the scheduler after 0.1.3 found three holes, all in what a pass believes about placements it committed earlier.
+
+The first was a lag. A pass starts from the nodes' reports, and a report trails the council by a tick or more. Commit app `a` (600m) to a 1000m node, and the next pass, working from a report that doesn't list `a` yet, sees 1000m free and happily commits app `b` (another 600m) to the same node. Now each pass rebuilds what the reports are missing before it admits anything: for every committed placement beyond the replicas its node reports, it reserves the committed footprint in the pass's cache (#432).
+
+The second was a daemon set paying for itself twice. A daemon's eligibility asked "does this node have room for a copy?", and on a node already running the 600m copy the answer was no (400m left), so the next decision dropped the healthy copy it was asking about. The pass now credits each node's committed copy back before asking (#433), but only in a throwaway view of the cache. The real cache keeps the allocation, so no other app can spend that room.
+
+The third was a spec change slipping past admission. Raise an app's request from 600m to 2000m, or change its `placement.required` to another zone, and the old placement still counted as converged: `placement_holds` asked whether the node was alive and ready, never whether it still admitted the spec. The first fix proposed dropping the app's placements in the state machine whenever its request or selector changed. That would have been correct, and it would have retired every replica at once: each node agent rolls its own replicas to a new spec, and a node with no placement for the app stops it. A memory bump would have been an outage.
+
+So the pass revalidates each placement where it runs instead, in `Liveness::keeps`:
+
+```rust
+if cache
+    .get_node(&placement.node_id)
+    .is_some_and(|node| !node.matches_labels(&required))
+{
+    return false;
+}
+if keeps_volume_home(placement, spec, self.retired) {
+    return true;
+}
+placement_holds(placement, spec, cache, self.alive, self.suspect,
+    self.unheard, self.dns_required) && admits_in_place(placement, spec, cache)
+```
+
+The order is the policy. A changed hard selector is the one spec change that moves a replica, volume or not, because the operator asked for other nodes. After that, a managed-volume app stays on its home whatever else is going on, a new request included, since its data is there. Everything else must also fit: `admits_in_place` credits back the footprint the placement was committed with and checks the new request against what's left, because the resized replica replaces the old one rather than running beside it. A replica that passes keeps its node, and the decision records its new footprint, so a resize rolls in place. One that doesn't fit is placed elsewhere.
+
+The daemon credit had to learn the same lesson. Crediting the copy at the *new* request would let a daemon grown from 600m to 900m claim 900m of room it never had, so the scheduler gets the footprints the copies were committed with (`with_daemon_credit`) and trades each one for the new request. A copy that runs without a committed placement (one on its way out) earns no credit at all.
+
+There is a window this leaves open: a node agent can roll to the new spec before the leader's next pass decides the replica must move. The pass then places it elsewhere and the agent retires it, a tick later. We took one tick of a replica running where it shouldn't over a guaranteed outage for every resize.
+
+The tests in `revalidation_in_place` pin each rule down, including where the fixes meet: a replica no node has reported yet is resized against its rebuilt footprint, not on top of it, and a volume app whose request outgrows its home stays there even while that home is restarting.
+
 ## Two seconds is too eager
 
 Each node's placement reconciler polls the leader every couple of seconds and deploys whatever its share of the placements says. If a deploy failed, the next poll simply tried again. Kubernetes has `CrashLoopBackOff` for exactly this; we had a supervisor back-off for instances that crash after starting, but a deploy that never produces a running instance never reaches the supervisor. The V02 soak found the result: an app whose binary had been truncated by a power cut reached generation `g170` in eight minutes, every attempt a fresh container, a fresh journal entry and a fresh log line.

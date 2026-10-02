@@ -4,7 +4,7 @@
 /// runs iteratively: after placing one replica, the cluster state
 /// cache is updated to reflect the reserved resources before placing
 /// the next. This prevents over-committing a single node.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::config::app::AppSpec;
 use crate::config::types::Replicas;
@@ -43,6 +43,10 @@ pub struct Scheduler {
     /// presence of a fresh capability lease: losing every lease must fail
     /// closed rather than silently switching DNS mode off.
     require_dns: bool,
+    /// The footprint each node's committed copy of the daemon set being
+    /// placed was admitted with. That copy is replaced, not doubled, so its
+    /// room counts towards the copy that replaces it (#433).
+    daemon_credit: HashMap<super::types::NodeId, Resources>,
 }
 
 /// Hard constraints shared by fixed-replica and daemon placement.
@@ -53,12 +57,16 @@ struct WorkloadRequirements<'a> {
     requires_dns: bool,
 }
 
-/// Check a daemon's replacement capacity while crediting its existing copy.
-/// The real cache retains all running allocations; only this eligibility view
-/// subtracts one copy, so other applications cannot spend that capacity.
+/// The nodes a daemon set can run on, crediting back each node's committed
+/// copy at the footprint it was admitted with (`credit`), so a running copy
+/// never needs room for a second one. Only this eligibility view subtracts
+/// it: the real cache keeps every running allocation, so other applications
+/// can't spend that room. A copy the node runs without a committed placement
+/// (one on its way out) earns no credit.
 pub(crate) fn daemon_candidates(
     cluster: &ClusterStateCache,
     app_id: &AppId,
+    credit: &HashMap<super::types::NodeId, Resources>,
     resources: &Resources,
     labels: &BTreeMap<String, String>,
     requires_egress: bool,
@@ -66,8 +74,10 @@ pub(crate) fn daemon_candidates(
 ) -> Vec<super::types::NodeId> {
     let mut available = cluster.clone();
     for node in cluster.nodes() {
-        if node.replicas_of(app_id) > 0 {
-            available.release(&node.node_id, app_id, resources);
+        if node.replicas_of(app_id) > 0
+            && let Some(committed) = credit.get(&node.node_id)
+        {
+            available.release(&node.node_id, app_id, committed);
         }
     }
     filter_nodes(resources, labels, requires_egress, requires_dns, &available)
@@ -79,7 +89,15 @@ impl Scheduler {
         Self {
             cluster,
             require_dns: false,
+            daemon_credit: HashMap::new(),
         }
+    }
+
+    /// Credit each node's committed copy of the daemon set being placed,
+    /// at the footprint it was admitted with (see [`daemon_candidates`]).
+    pub fn with_daemon_credit(mut self, credit: HashMap<super::types::NodeId, Resources>) -> Self {
+        self.daemon_credit = credit;
+        self
     }
 
     /// Require live, workload-reachable internal DNS for every placement.
@@ -183,6 +201,7 @@ impl Scheduler {
         let candidates = daemon_candidates(
             &self.cluster,
             app_id,
+            &self.daemon_credit,
             requirements.resources,
             requirements.labels,
             requirements.requires_egress,
@@ -196,14 +215,16 @@ impl Scheduler {
 
         let mut placements = Vec::with_capacity(candidates.len());
         for node_id in &candidates {
-            if self
+            // A credited copy is replaced: trade its footprint for the new one.
+            let running = self
                 .cluster
                 .get_node(node_id)
-                .is_some_and(|node| node.replicas_of(app_id) == 0)
-            {
-                self.cluster
-                    .reserve(node_id, app_id, requirements.resources);
+                .is_some_and(|node| node.replicas_of(app_id) > 0);
+            if running && let Some(committed) = self.daemon_credit.get(node_id) {
+                self.cluster.release(node_id, app_id, committed);
             }
+            self.cluster
+                .reserve(node_id, app_id, requirements.resources);
             placements.push(Placement {
                 node_id: node_id.clone(),
                 resources: *requirements.resources,

@@ -670,11 +670,24 @@ A managed volume lives on one node, so placement follows the data. Desired state
 - A home node that is out of the cluster (Suspect, Left, Dead, or reaped from gossip) also makes the app wait. A `systemctl restart bun` announces Left, and a reboot goes Suspect then Dead, with the data still on disk (#423).
 - A home node that was decommissioned (`relish decommission-node`), or that no longer matches the labels, is dropped, and that replica goes through the normal pipeline. Both are the operator moving the app on purpose, and the app starts on a new, empty volume.
 
-The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that went stale, reported not ready, was cordoned or left the cluster is replaced elsewhere. For a fixed-replica app with a managed volume (`keeps_volume_home`), the placement holds whatever the node is doing until the node is decommissioned, including for each replica of a multi-replica app. Moving it would restart it on an empty volume while its data sits on the node it left.
+The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that went stale, reported not ready, was cordoned or left the cluster is replaced elsewhere. For a fixed-replica app with a managed volume (`keeps_volume_home`), the placement holds whatever the node is doing until the node is decommissioned or the app's `required` labels stop matching it, including for each replica of a multi-replica app. Moving it would restart it on an empty volume while its data sits on the node it left.
 
 While an app waits for a home that is out of the cluster, the council's per-app evidence (`GET /v1/diagnostics/apps`) carries `volume_home_away`, the node it waits for. `relish status`, `relish inspect` and the dashboard show it, and `relish wtf` reports a critical `volume-home-away` finding naming the node and the decommission command.
 
 `relish delete` forgets the record. Apps without a managed volume are placed by score as usual.
+
+#### Changing a Running App's Spec
+
+A new spec for a running app keeps its committed placements. Each node agent rolls its own replicas to the new spec (rolling or blue-green), so dropping every placement on a resource change would retire all the replicas at once. Instead, every pass revalidates each committed placement against the spec as it is now (#434):
+
+- **A changed hard selector moves the replica** when its node no longer matches `required`. It's the one spec change that moves an app, and it moves a managed-volume app too: the operator asked for other nodes, and the app starts there on an empty volume. A node that still matches keeps its replicas.
+- **A changed resource request is admitted where the replica runs.** The node credits back the footprint the placement was committed with and checks the new request against what's left, because the new replica replaces the old one rather than running beside it. If it fits, the replica stays and the decision records the new footprint. If it doesn't, a replica without a managed volume is placed elsewhere; a managed-volume app stays on its home whatever its new request (its data is there), and runs over its node's budget until someone makes room.
+
+There is a window of one scheduling tick: a node agent can roll to the new spec before the leader's next pass decides that the replica must move. The pass then places it elsewhere and the agent retires it.
+
+#### Reservations between Reports
+
+Node reports lag the council. A placement committed a tick ago isn't in its node's report yet, so the pass that starts from the reports would see free room and place a second app into it. Before admitting anything, each pass rebuilds the missing reservations: for every committed placement beyond the replicas its node reports, it reserves the committed footprint in the pass's cache (#432).
 
 #### Daemon Mode (`replicas = "*"`)
 
@@ -686,6 +699,8 @@ When `replicas = "*"` is specified, Meat does not run the placement pipeline. In
 4. Meat subscribes to Mustard membership events: when a new node joins the cluster and matches the placement constraints, an instance is automatically scheduled. When a node leaves, the instance is removed.
 
 Daemon mode is not bin-packed -- every qualifying node gets exactly one instance regardless of its current load. This is appropriate for system-level workloads (node exporters, log forwarders, caches).
+
+A node already running the daemon's committed copy doesn't need room for a second one. Eligibility credits that copy back at the footprint it was committed with, in a throwaway view of the cache, and the pass trades it for the new request; the real cache keeps the allocation, so no other app can spend the room (#433). A copy the node runs without a committed placement earns no credit.
 
 ### 5.2 Batch Job Allocation (Delegated Model)
 

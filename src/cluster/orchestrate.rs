@@ -656,13 +656,6 @@ fn plan_pass(
             cache.set_node(node);
         }
     }
-    let retired: HashSet<NodeId> = desired
-        .security_state
-        .crl
-        .retired_nodes
-        .keys()
-        .map(NodeId::new)
-        .collect();
     // Reports can lag committed assignments by several ticks. Reconstruct
     // missing reservations before admitting any app, including when all of
     // an earlier app's placements are already converged.
@@ -679,24 +672,20 @@ fn plan_pass(
             }
         }
     }
-    // A daemon can credit a running copy only while its committed assignment
-    // still admits this footprint. After a resource/selector update removed
-    // that assignment, the old copy remains allocated until it retires; the
-    // new assignment must reserve its full request independently.
-    for (app_id, spec) in &desired.apps {
-        if matches!(spec.replicas, Replicas::DaemonSet) {
-            for node_id in cache.node_ids() {
-                let admitted = desired.scheduling.get(app_id).is_some_and(|placements| {
-                    placements
-                        .iter()
-                        .any(|p| p.node_id == node_id && p.resources == scheduler_resources(spec))
-                });
-                if !admitted {
-                    cache.set_replicas(&node_id, app_id, 0);
-                }
-            }
-        }
-    }
+    let retired: HashSet<NodeId> = desired
+        .security_state
+        .crl
+        .retired_nodes
+        .keys()
+        .map(NodeId::new)
+        .collect();
+    let liveness = Liveness {
+        alive,
+        suspect,
+        unheard,
+        retired: &retired,
+        dns_required,
+    };
     let mut decisions = Vec::new();
     let mut quota_blocked = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
@@ -731,27 +720,25 @@ fn plan_pass(
         // A daemon set targets every *eligible* node, so its convergence count
         // is the eligible-node count, not every alive node (M25).
         let want = if override_replicas.is_none() && matches!(spec.replicas, Replicas::DaemonSet) {
-            daemon_eligible_count(cache, app_id, spec, dns_required)
+            daemon_eligible_count(
+                cache,
+                app_id,
+                spec,
+                dns_required,
+                &committed_footprints(desired, app_id),
+            )
         } else {
             effective_replicas(spec, override_replicas, alive.len())
         };
+        let requested = scheduler_resources(spec);
         let converged = desired
             .scheduling
             .get(app_id)
             .map(|placements| {
                 placements.len() == want
-                    && placements.iter().all(|p| {
-                        keeps_volume_home(p, spec, &retired)
-                            || placement_holds(
-                                p,
-                                spec,
-                                cache,
-                                alive,
-                                suspect,
-                                unheard,
-                                dns_required,
-                            )
-                    })
+                    && placements
+                        .iter()
+                        .all(|p| p.resources == requested && liveness.keeps(p, spec, cache))
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -815,18 +802,7 @@ fn plan_pass(
                 .map(|placements| {
                     placements
                         .iter()
-                        .filter(|p| {
-                            keeps_volume_home(p, spec, &retired)
-                                || placement_holds(
-                                    p,
-                                    spec,
-                                    cache,
-                                    alive,
-                                    suspect,
-                                    unheard,
-                                    dns_required,
-                                )
-                        })
+                        .filter(|p| liveness.keeps(p, spec, cache))
                         .take(want)
                         .cloned()
                         .collect()
@@ -834,6 +810,16 @@ fn plan_pass(
                 .unwrap_or_default(),
             Replicas::DaemonSet => Vec::new(),
         };
+        // A kept replica whose request changed is resized where it runs:
+        // its node trades the footprint it was committed with for the new
+        // one, and the decision records the new one.
+        for placement in &mut kept {
+            if placement.resources != per_replica {
+                cache.release(&placement.node_id, app_id, &placement.resources);
+                cache.reserve(&placement.node_id, app_id, &per_replica);
+                placement.resources = per_replica;
+            }
+        }
         // An app with no placement left (it was stopped, or is starting
         // again) goes back to the nodes that hold its managed volumes.
         if kept.is_empty() && matches!(effective_spec.replicas, Replicas::Fixed(_)) {
@@ -881,7 +867,9 @@ fn plan_pass(
         // restore the pre-call cache; only a successful placement's
         // reservations are kept.
         let snapshot = (*cache).clone();
-        let mut scheduler = Scheduler::new(std::mem::take(cache)).with_dns_required(dns_required);
+        let mut scheduler = Scheduler::new(std::mem::take(cache))
+            .with_dns_required(dns_required)
+            .with_daemon_credit(committed_footprints(desired, app_id));
         let result = scheduler.schedule_app(app_id, &effective_spec);
         match result {
             Ok(mut decision) => {
@@ -1046,7 +1034,7 @@ impl VolumeHome<'_> {
 /// yet" is not evidence of trouble, and moving its replicas would restart
 /// healthy workloads. A node that reported and went stale, or reported not
 /// ready or not capable, does lose them. (A managed-volume app's placement
-/// never gets this far: [`keeps_volume_home`] keeps it.)
+/// never gets this far: [`Liveness::keeps`] keeps it.)
 fn placement_holds(
     placement: &crate::meat::types::Placement,
     spec: &AppSpec,
@@ -1056,22 +1044,6 @@ fn placement_holds(
     unheard: &HashSet<NodeId>,
     dns_required: bool,
 ) -> bool {
-    // An assignment admits a specific resource footprint and hard selector.
-    // Do not deliver a changed spec through an assignment that predates it.
-    if placement.resources != scheduler_resources(spec) {
-        return false;
-    }
-    let required = spec
-        .placement
-        .as_ref()
-        .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
-        .unwrap_or_default();
-    if cache
-        .get_node(&placement.node_id)
-        .is_some_and(|node| !node.matches_labels(&required))
-    {
-        return false;
-    }
     // Suspicion is gossip's "missed a probe", not "gone": SWIM gives the
     // node its suspicion timeout to refute it. Moving its replicas now would
     // stop healthy ones for a late ack (#346).
@@ -1087,6 +1059,96 @@ fn placement_holds(
     cache
         .get_node(&placement.node_id)
         .is_none_or(|node| node_can_run(node, spec, dns_required))
+}
+
+/// What a pass knows about the cluster's members, for deciding which
+/// committed placements stay where they are.
+struct Liveness<'a> {
+    alive: &'a HashSet<NodeId>,
+    suspect: &'a HashSet<NodeId>,
+    unheard: &'a HashSet<NodeId>,
+    /// Decommissioned nodes, whose volumes the operator has written off.
+    retired: &'a HashSet<NodeId>,
+    dns_required: bool,
+}
+
+impl Liveness<'_> {
+    /// Whether a committed placement stays on its node this pass.
+    ///
+    /// A changed hard selector is the one spec change that moves a replica,
+    /// volume or not: the operator asked for other nodes. Otherwise a
+    /// managed-volume app stays on its home whatever its node is doing
+    /// (#423), even when its new request no longer fits there. Any other
+    /// replica stays while its node holds it and still has room for the
+    /// request it makes now (#434).
+    fn keeps(
+        &self,
+        placement: &crate::meat::types::Placement,
+        spec: &AppSpec,
+        cache: &ClusterStateCache,
+    ) -> bool {
+        let required = spec
+            .placement
+            .as_ref()
+            .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
+            .unwrap_or_default();
+        if cache
+            .get_node(&placement.node_id)
+            .is_some_and(|node| !node.matches_labels(&required))
+        {
+            return false;
+        }
+        if keeps_volume_home(placement, spec, self.retired) {
+            return true;
+        }
+        placement_holds(
+            placement,
+            spec,
+            cache,
+            self.alive,
+            self.suspect,
+            self.unheard,
+            self.dns_required,
+        ) && admits_in_place(placement, spec, cache)
+    }
+}
+
+/// Whether `placement`'s node has room for the spec's current request once
+/// the footprint the placement was committed with is credited back: a
+/// resized replica replaces the old one rather than running beside it. A
+/// node the leader has no report for keeps it, as [`placement_holds`] does.
+fn admits_in_place(
+    placement: &crate::meat::types::Placement,
+    spec: &AppSpec,
+    cache: &ClusterStateCache,
+) -> bool {
+    let requested = scheduler_resources(spec);
+    if placement.resources == requested {
+        return true;
+    }
+    cache.get_node(&placement.node_id).is_none_or(|node| {
+        let others = node.allocated.saturating_sub(&placement.resources);
+        node.allocatable.saturating_sub(&others).fits(&requested)
+    })
+}
+
+/// The footprint each node's committed placement of `app_id` was admitted
+/// with. A daemon set credits these back when it is re-planned, so its own
+/// running copy doesn't count against the copy that replaces it (#433).
+fn committed_footprints(
+    desired: &crate::council::types::DesiredState,
+    app_id: &crate::meat::types::AppId,
+) -> HashMap<NodeId, Resources> {
+    desired
+        .scheduling
+        .get(app_id)
+        .map(|placements| {
+            placements
+                .iter()
+                .map(|p| (p.node_id.clone(), p.resources))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Whether a managed-volume app's placement stays put whatever its node is
@@ -1193,6 +1255,7 @@ fn daemon_eligible_count(
     app_id: &crate::meat::AppId,
     spec: &AppSpec,
     dns_required: bool,
+    credit: &HashMap<NodeId, Resources>,
 ) -> usize {
     let resources = scheduler_resources(spec);
     let required = spec
@@ -1204,6 +1267,7 @@ fn daemon_eligible_count(
     crate::meat::scheduler::daemon_candidates(
         cache,
         app_id,
+        credit,
         &resources,
         &required,
         requires_egress,
@@ -6560,5 +6624,256 @@ mod audit_placement_revalidation {
                 .cpu_millicores,
             2600
         );
+    }
+}
+
+/// #434 meets #423 and #433: a changed spec is revalidated where it runs.
+/// A replica stays on its node when the node still admits it, so a resource
+/// change rolls in place instead of retiring every replica at once; a
+/// managed-volume app never leaves its home over resources; and only a
+/// changed hard selector moves it.
+#[cfg(test)]
+mod revalidation_in_place {
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::quota::QuotaLedger;
+    use crate::meat::{
+        cluster_state::SchedulerNodeState,
+        types::{AppId, Placement},
+    };
+
+    fn node(name: &str, cpu: u64, zone: &str) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels: BTreeMap::from([("zone".to_string(), zone.to_string())]),
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+
+    fn requesting(cpu: u64, replicas: Replicas) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = replicas;
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu,
+            limit: cpu,
+        });
+        spec
+    }
+
+    fn with_volume(mut spec: AppSpec) -> AppSpec {
+        spec.volumes.push(crate::config::types::VolumeSpec {
+            path: "/data".into(),
+            source: None,
+            size: None,
+        });
+        spec
+    }
+
+    fn requiring(mut spec: AppSpec, zone: &str) -> AppSpec {
+        let with_selector: AppSpec = toml::from_str(&format!(
+            "image = 'x:1'\n[placement]\nrequired = ['zone={zone}']"
+        ))
+        .unwrap();
+        spec.placement = with_selector.placement;
+        spec
+    }
+
+    /// `home` runs one 600m replica of `app`; `busy` is fuller, so the
+    /// bin-packing scheduler would pick it for anything placed afresh.
+    fn running_on_home(app: &AppId, home_cpu: u64) -> ClusterStateCache {
+        let mut home = node("home", home_cpu, "east");
+        home.allocated = Resources::new(600, 0, 0);
+        home.app_replicas.insert(app.clone(), 1);
+        let mut busy = node("busy", 4000, "west");
+        busy.allocated = Resources::new(2000, 0, 0);
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(home);
+        cache.set_node(busy);
+        cache
+    }
+
+    fn committed_on_home(desired: &mut DesiredState, app: &AppId) {
+        desired.scheduling.insert(
+            app.clone(),
+            vec![Placement {
+                node_id: NodeId::new("home"),
+                resources: Resources::new(600, 0, 0),
+            }],
+        );
+        desired
+            .last_placed_nodes
+            .insert(app.clone(), vec![NodeId::new("home")]);
+    }
+
+    fn alive() -> HashSet<NodeId> {
+        HashSet::from([NodeId::new("home"), NodeId::new("busy")])
+    }
+
+    fn placements_of(
+        decisions: &[crate::meat::types::SchedulingDecision],
+        app: &AppId,
+    ) -> Vec<(String, u64)> {
+        decisions
+            .iter()
+            .find(|d| &d.app_id == app)
+            .map(|d| {
+                d.placements
+                    .iter()
+                    .map(|p| (p.node_id.0.clone(), p.resources.cpu_millicores))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_resource_change_that_still_fits_keeps_the_replica_on_its_node() {
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(app.clone(), requesting(900, Replicas::Fixed(1)));
+        committed_on_home(&mut desired, &app);
+        let mut cache = running_on_home(&app, 1000);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive(), &mut QuotaLedger::default());
+
+        assert_eq!(placements_of(&decisions, &app), [("home".to_string(), 900)]);
+        let home = cache.get_node(&NodeId::new("home")).unwrap();
+        assert_eq!(home.allocated.cpu_millicores, 900);
+        assert_eq!(home.replicas_of(&app), 1);
+    }
+
+    #[test]
+    fn a_resource_increase_that_no_longer_fits_moves_a_stateless_replica() {
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(app.clone(), requesting(1500, Replicas::Fixed(1)));
+        committed_on_home(&mut desired, &app);
+        let mut cache = running_on_home(&app, 1000);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive(), &mut QuotaLedger::default());
+
+        assert_eq!(
+            placements_of(&decisions, &app),
+            [("busy".to_string(), 1500)]
+        );
+    }
+
+    #[test]
+    fn a_volume_apps_resource_change_never_moves_it_off_its_home() {
+        let app = AppId::new("db", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(
+            app.clone(),
+            with_volume(requesting(1500, Replicas::Fixed(1))),
+        );
+        committed_on_home(&mut desired, &app);
+
+        // Too big for home, and home restarting: neither moves it.
+        for alive in [alive(), HashSet::from([NodeId::new("busy")])] {
+            let mut cache = running_on_home(&app, 1000);
+            let decisions =
+                plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+            assert_eq!(
+                placements_of(&decisions, &app),
+                [("home".to_string(), 1500)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_hard_selector_moves_a_running_volume_app() {
+        let app = AppId::new("db", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(
+            app.clone(),
+            requiring(with_volume(requesting(600, Replicas::Fixed(1))), "west"),
+        );
+        committed_on_home(&mut desired, &app);
+        let mut cache = running_on_home(&app, 1000);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive(), &mut QuotaLedger::default());
+
+        assert_eq!(placements_of(&decisions, &app), [("busy".to_string(), 600)]);
+    }
+
+    #[test]
+    fn a_hard_selector_the_node_still_matches_moves_nothing() {
+        let app = AppId::new("db", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(
+            app.clone(),
+            requiring(with_volume(requesting(600, Replicas::Fixed(1))), "east"),
+        );
+        committed_on_home(&mut desired, &app);
+        let mut cache = running_on_home(&app, 1000);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive(), &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    #[test]
+    fn a_daemon_resource_change_credits_the_copy_it_replaces() {
+        let app = AppId::new("agent", "default");
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(app.clone(), requesting(900, Replicas::DaemonSet));
+        committed_on_home(&mut desired, &app);
+        let mut cache = ClusterStateCache::new();
+        let mut home = node("home", 1000, "east");
+        home.allocated = Resources::new(600, 0, 0);
+        home.app_replicas.insert(app.clone(), 1);
+        cache.set_node(home);
+
+        let decisions = plan_scheduling_pass(
+            &mut cache,
+            &desired,
+            &HashSet::from([NodeId::new("home")]),
+            &mut QuotaLedger::default(),
+        );
+
+        assert_eq!(placements_of(&decisions, &app), [("home".to_string(), 900)]);
+        let home = cache.get_node(&NodeId::new("home")).unwrap();
+        assert_eq!(home.allocated.cpu_millicores, 900);
+    }
+
+    /// #432's reconstruction meets the revalidation: home hasn't reported
+    /// the replica yet, so its old footprint is reconstructed, credited and
+    /// replaced by the new one, not stacked on top of it.
+    #[test]
+    fn an_unreported_replica_is_revalidated_against_its_reconstructed_footprint() {
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(app.clone(), requesting(900, Replicas::Fixed(1)));
+        committed_on_home(&mut desired, &app);
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(node("home", 1000, "east"));
+        let mut busy = node("busy", 4000, "west");
+        busy.allocated = Resources::new(2000, 0, 0);
+        cache.set_node(busy);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive(), &mut QuotaLedger::default());
+
+        assert_eq!(placements_of(&decisions, &app), [("home".to_string(), 900)]);
+        let home = cache.get_node(&NodeId::new("home")).unwrap();
+        assert_eq!(home.allocated.cpu_millicores, 900);
     }
 }

@@ -1740,29 +1740,6 @@ impl StateMachineInner {
         app_id: &crate::meat::types::AppId,
         spec: &crate::config::app::AppSpec,
     ) {
-        // Workers fetch the desired spec directly from committed assignments.
-        // Withhold changed admission constraints until the scheduler has
-        // checked them; otherwise a worker can deploy before the next tick.
-        let admission_changed = self.state.apps.get(app_id).is_some_and(|old| {
-            let resources = |s: &crate::config::app::AppSpec| {
-                (
-                    s.cpu.as_ref().map(|r| r.request).unwrap_or(0),
-                    s.memory.as_ref().map(|r| r.request).unwrap_or(0),
-                    s.gpu.unwrap_or(0),
-                )
-            };
-            let required = |s: &crate::config::app::AppSpec| {
-                s.placement
-                    .as_ref()
-                    .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
-                    .unwrap_or_default()
-            };
-            resources(old) != resources(spec) || required(old) != required(spec)
-        });
-        if admission_changed {
-            self.state.scheduling.remove(app_id);
-            self.state.quota_blocked.remove(app_id);
-        }
         // A redeploy that changes the replica baseline invalidates any
         // autoscale override: the operator has re-declared the desired count.
         let baseline_changed = self
@@ -7092,8 +7069,12 @@ mod tests {
         }));
         assert_eq!(inner.state.security_state.crl.updated_at, revoked_at);
     }
+    /// A changed request or hard selector keeps the app's assignments: the
+    /// node agents roll each replica in place, and the scheduler moves only
+    /// the ones whose node no longer admits the spec (#434). Dropping them
+    /// here would retire every replica at once.
     #[tokio::test]
-    async fn audit_spec_admission_changes_withhold_old_assignments() {
+    async fn a_spec_change_keeps_its_assignments_so_replicas_roll_in_place() {
         let app_id = AppId::new("web", "default");
         let old: crate::config::app::AppSpec =
             toml::from_str("image='web:v1'\ncpu='600m'\n[placement]\nrequired=['zone=east']")
@@ -7140,9 +7121,9 @@ mod tests {
             .await
             .unwrap();
             let state = sm.desired_state().await;
-            assert_eq!(
+            assert!(
                 state.scheduling.contains_key(&app_id),
-                constraint == "image"
+                "a {constraint} change retired every replica at once"
             );
             assert!(state.last_placed_nodes.contains_key(&app_id));
         }
