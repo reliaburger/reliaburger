@@ -14,16 +14,19 @@ pub(super) const RUNTIME_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const LOOP_RUNTIME_INVENTORY_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Read the runtime's launch inventory within `deadline`.
+    /// Read the runtime's launch inventory, waiting at most `patience`, and
+    /// inside a turn no later than the turn's deadline: a caller on the
+    /// loop retries on a later turn (#418).
     ///
     /// `Ok(None)` means the runtime cannot enumerate its launches. A timeout
     /// returns the error `refuse` builds from a short description.
     pub(super) async fn runtime_inventory(
         &self,
-        deadline: Duration,
+        patience: Duration,
         refuse: impl FnOnce(String) -> BunError,
     ) -> Result<Option<Vec<RuntimeLaunch>>, BunError> {
-        match tokio::time::timeout(deadline, self.supervisor.grill().launch_inventory()).await {
+        let deadline = (tokio::time::Instant::now() + patience).min(self.turn_deadline());
+        match tokio::time::timeout_at(deadline, self.supervisor.grill().launch_inventory()).await {
             Ok(launches) => Ok(launches?),
             Err(_) => Err(refuse("runtime inventory timed out".into())),
         }
@@ -33,12 +36,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// error too, built by `refuse`.
     pub(super) async fn complete_runtime_inventory(
         &self,
-        deadline: Duration,
+        patience: Duration,
         refuse: impl Fn(String) -> BunError,
     ) -> Result<Vec<RuntimeLaunch>, BunError> {
-        self.runtime_inventory(deadline, &refuse)
+        self.runtime_inventory(patience, &refuse)
             .await?
             .ok_or_else(|| refuse("runtime inventory is incomplete".into()))
+    }
+
+    /// Like [`Self::runtime_inventory`], but waits its whole
+    /// [`RUNTIME_INVENTORY_TIMEOUT`] even inside a turn. Only journalling a
+    /// backend publication uses it: failing that on the turn's deadline
+    /// fails a restart or a deploy step, not just a read a later turn
+    /// repeats.
+    pub(super) async fn publication_runtime_inventory(
+        &self,
+        refuse: impl FnOnce(String) -> BunError,
+    ) -> Result<Option<Vec<RuntimeLaunch>>, BunError> {
+        // LOOP-INLINE: runc reads its intent files from local disk, like a persist; TODO(#419) move it off the loop
+        let read = tokio::time::timeout(
+            RUNTIME_INVENTORY_TIMEOUT,
+            self.supervisor.grill().launch_inventory(),
+        )
+        .await;
+        match read {
+            Ok(launches) => Ok(launches?),
+            Err(_) => Err(refuse("runtime inventory timed out".into())),
+        }
     }
 }
 

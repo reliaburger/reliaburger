@@ -98,7 +98,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return Ok(());
         }
         let launches = self
-            .runtime_inventory(super::RUNTIME_INVENTORY_TIMEOUT, |reason| {
+            .publication_runtime_inventory(|reason| {
                 BunError::AdoptionState(format!("publication {reason}"))
             })
             .await?;

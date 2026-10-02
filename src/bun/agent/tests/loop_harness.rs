@@ -937,3 +937,135 @@ async fn status_answers_while_a_follow_tail_waits_on_a_client_that_never_reads()
         .assert_responsive("a follow's tail waited on a client that never reads")
         .await;
 }
+
+// ---- startup recovery -------------------------------------------------------
+
+/// An agent that has just restarted after a whole-cluster stop. No runtime
+/// survived, so adoption deferred the one record's cleanup as a startup
+/// retirement, which the first health tick drives: it reads the runtime
+/// inventory and asks the leader to release the instance's address.
+/// Returns the running agent, the grill, the retired host port, and the
+/// leader's confirmation for [`crate::cluster::producer::test_delayed_fixture`].
+async fn restarted_with_a_startup_retirement() -> (
+    BunAgent<MockGrill>,
+    MockGrill,
+    tempfile::TempDir,
+    u16,
+    String,
+) {
+    let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+    crate::grill::records::remove_record(&root.path().join("records"), &reference.instance_id.0)
+        .unwrap();
+    let journal =
+        crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+            .unwrap();
+    let mut inventory = journal.inventory().clone();
+    let identity = crate::bun::consumer_owners::ConsumerIdentity {
+        node_id: crate::meat::NodeId::new("test"),
+        cluster_identity: [42; 32],
+    };
+    inventory.consumer = Some(crate::bun::consumer_owners::ConsumerOwnership {
+        identity: identity.clone(),
+        publications: vec![],
+        phase: crate::bun::consumer_owners::ConsumerPhase::Withdrawn,
+        receipts: Default::default(),
+    });
+    drop(journal.persist(inventory).await.unwrap());
+    let (mut clustered, _, _) = test_cluster_fault_agent().await;
+    agent.cluster = clustered.cluster.take();
+    agent
+        .recover_consumer_ownership(&root.path().join("discovery"), identity)
+        .await
+        .unwrap();
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+    assert!(agent.startup_cleanup_pending);
+    let launch = grill.launch_inventory().await.unwrap().unwrap().remove(0);
+    let host_port = launch.spec.port_mapping.unwrap().host_port;
+    let confirmation = serde_json::json!({
+        "node_id": "test",
+        "execution": {"instance_id": reference.instance_id, "generation": launch.generation},
+    })
+    .to_string();
+    (agent, grill, root, host_port, confirmation)
+}
+
+/// Start `agent`'s loop with a command channel a scenario can use.
+fn run_restarted(mut agent: BunAgent<MockGrill>) -> RunningAgent {
+    let (tx, rx) = mpsc::channel(32);
+    agent.command_rx = rx;
+    let shutdown = agent.shutdown.clone();
+    RunningAgent::start(boxed(agent), tx, shutdown)
+}
+
+/// Wait until the startup retirement has released its host port.
+async fn wait_for_release(allocator: &PortAllocator, host_port: u16, within: std::time::Duration) {
+    tokio::time::timeout(within, async {
+        while allocator.is_allocated(host_port).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the startup retirement never released its port");
+}
+
+/// The 0.1.3 final tier (#418): after a graceful whole-cluster stop, the
+/// first node back ran its first health tick for 1008 ms. Its startup
+/// retirement asked the remembered leader, still booting, to release an
+/// address, and waited the producer release's whole second for an answer.
+/// The tick now waits only until the turn's deadline; the request carries
+/// on in its task, and a later tick collects the leader's answer.
+#[tokio::test]
+async fn the_tick_waits_out_a_startup_retirement_whose_leader_answers_late() {
+    let (mut agent, _grill, _root, host_port, confirmation) =
+        restarted_with_a_startup_retirement().await;
+    let allocator = agent.supervisor.port_allocator.clone();
+    let (client, server) = crate::cluster::producer::test_delayed_fixture(
+        axum::http::StatusCode::OK,
+        confirmation,
+        STALL,
+    )
+    .await;
+    agent.set_producer_release_client(client);
+    let running = run_restarted(agent);
+    running.measure_from_here();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        allocator.is_allocated(host_port).await,
+        "the port was released before the leader confirmed"
+    );
+    // Retirement isn't abandoned: once the leader answers, a tick finishes it.
+    wait_for_release(&allocator, host_port, STALL * 3).await;
+    running
+        .assert_responsive("a startup retirement waited for a leader that answered late")
+        .await;
+    server.abort();
+}
+
+/// The same retirement reads the runtime inventory first, which runc
+/// answers from disk: on a cold boot, slowly. The tick waits only until the
+/// turn's deadline, and retries on a later tick.
+#[tokio::test]
+async fn the_tick_waits_out_a_startup_retirement_whose_inventory_is_slow() {
+    let (mut agent, grill, _root, host_port, confirmation) =
+        restarted_with_a_startup_retirement().await;
+    let allocator = agent.supervisor.port_allocator.clone();
+    let (client, server) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
+    agent.set_producer_release_client(client);
+    grill.set_inventory_delay(Some(STALL));
+    let running = run_restarted(agent);
+    running.measure_from_here();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(allocator.is_allocated(host_port).await);
+    let latency = running.status_latency().await;
+    assert!(
+        latency.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {latency:?} while the startup retirement read a slow inventory"
+    );
+    grill.set_inventory_delay(None);
+    wait_for_release(&allocator, host_port, STALL * 2).await;
+    running
+        .assert_responsive("a startup retirement read a slow runtime inventory")
+        .await;
+    server.abort();
+}
