@@ -30,9 +30,9 @@ var SENDER = 'mark@sreday.com';
 var SENDER_NAME = 'Reliaburger feedback';
 var LABEL = 'Reliaburger feedback';
 var DAILY_MAX = 300;                      // submissions per day (a full room is ~100)
-var LIMITS = { name: 80, email: 254, linkedin: 300, company: 120, role: 120, event: 60, answer: 2000, broke: 2000 };
+var LIMITS = { platform_other: 80, name: 80, email: 254, linkedin: 300, company: 120, role: 120, event: 60, answer: 2000, broke: 2000 };
 var PLATFORMS = ['macOS', 'Linux', 'Other'];
-var STEPS = ['1 Install', '2 Deploy', '3 Sick version + rollback', '4 Break it', '5 Manual + source', '6 Feedback'];
+var STEPS = ['Install', 'Deploy an app', 'Sick version + rollback', 'Break it on purpose', 'Manual and source', 'Submitted a PR'];
 var QUESTIONS = [
   ['q1', 'What is your BIGGEST problem with the Kubernetes stack?'],
   ['q2', 'What would Reliaburger need to do so that your team can use it at work?'],
@@ -86,6 +86,7 @@ function normalize(d) {
     company:     clean(d.company, LIMITS.company),
     role:        clean(d.role, LIMITS.role),
     platform:    PLATFORMS.indexOf(d.platform) !== -1 ? d.platform : '',
+    platform_other: d.platform === 'Other' ? clean(d.platform_other, LIMITS.platform_other) : '',
     steps:       pick(d.steps, STEPS),
     q1:          cleanMultiline(d.q1, LIMITS.answer),
     q2:          cleanMultiline(d.q2, LIMITS.answer),
@@ -113,10 +114,10 @@ function compose(s) {
     ['Happy to share their information with the Reliaburger team', 'yes']
   ];
   var answers = QUESTIONS.map(function (q) { return [q[1], s[q[0]]]; });
+  if (s.broke) answers.push(['What broke?', s.broke]);
   var more = [
-    ['Company', s.company], ['Role', s.role], ['Platform', s.platform],
+    ['Company', s.company], ['Role', s.role], ['Platform', platformText(s)],
     ['Steps completed', s.steps.length ? s.steps.join(', ') : ''],
-    ['What broke', s.broke],
     ['Wants to contribute / be a burger ambassador', s.contributor ? 'yes' : 'no'],
     ['Event', s.event]
   ].filter(function (r) { return r[1]; });
@@ -138,6 +139,10 @@ function compose(s) {
     '<h3 style="color:#a83b15;margin:0 0 12px">Reliaburger feedback - ' + esc(s.event) + '</h3>' +
     table(who) + table(answers) + (more.length ? table(more) : '') + '</div>';
   return { subject: subject, text: text, html: html };
+}
+
+function platformText(s) {
+  return s.platform === 'Other' && s.platform_other ? 'Other: ' + s.platform_other : s.platform;
 }
 
 // ---- the sheet -------------------------------------------------------------------------
@@ -162,7 +167,7 @@ function feedbackSheet() {
 function record(s) {
   try {
     feedbackSheet().appendRow([new Date().toISOString(), s.event, s.name, s.email, s.linkedin, s.consent ? 'yes' : 'no',
-                               s.company, s.role, s.platform, s.steps.join(', '), s.q1, s.q2, s.q3, s.broke,
+                               s.company, s.role, platformText(s), s.steps.join(', '), s.q1, s.q2, s.q3, s.broke,
                                s.contributor ? 'yes' : 'no', s.page].map(sheetSafe));
   } catch (err) {
     Logger.log('Emailed, but could not add the sheet row: ' + err);    // the email is the backup
@@ -229,7 +234,7 @@ function pick(values, allowed) {
 function sample(dryRun) {
   return { postData: { contents: JSON.stringify({
     dry_run: dryRun, name: 'Test Burger', email: SENDER, linkedin: 'https://www.linkedin.com/in/marek-pawlikowski/',
-    consent: true, company: 'SREday', role: 'Organizer', platform: 'macOS', steps: ['1 Install', '2 Deploy', '4 Break it'],
+    consent: true, company: 'SREday', role: 'Organizer', platform: 'Other', platform_other: 'Fedora on a ThinkPad', steps: ['Install', 'Deploy an app', 'Break it on purpose', 'Submitted a PR'],
     q1: 'Too many moving parts.\nUpgrades eat a week every quarter.', q2: 'A stable 1.0 and a migration path from Helm.',
     q3: 'Windows support', broke: 'relish wtf printed nothing the first time.', contributor: true,
     event: 'sreday-sf-2026-q4', page: 'https://reliaburger.com/feedback/?event=sreday-sf-2026-q4'
