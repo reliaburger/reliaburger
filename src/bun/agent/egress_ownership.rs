@@ -87,9 +87,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         {
             let mut owners = owners;
+            let resolver = self.egress_resolver();
             for owner in owners.values_mut() {
                 if owner.phase == PolicyPhase::Owned {
-                    owner.resolved = Self::resolve_owned_egress(&owner.allow).await;
+                    owner.resolved = resolver.resolve_allowlist(&owner.allow).await;
                 }
             }
             if let Some(handle) = self.onion_ebpf.clone() {
@@ -205,31 +206,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         _id: &crate::grill::InstanceId,
     ) -> Result<(), BunError> {
         Ok(())
-    }
-
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    /// Resolve within a bounded wait, denying all destinations on failure.
-    pub(super) async fn resolve_owned_egress(
-        allow: &[String],
-    ) -> Vec<crate::sesame::egress::EgressDestination> {
-        let allow = allow.to_vec();
-        // LOOP-INLINE: a pre-start's DNS; on timeout it starts deny-all, which re-resolution repairs; TODO(#419) move it off the loop
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                crate::sesame::egress::resolve_egress_entries(&allow)
-            }),
-        )
-        .await
-        {
-            Ok(Ok(Ok(resolved))) => resolved,
-            _ => {
-                eprintln!(
-                    "sesame: egress resolution unavailable; retaining deny-all until re-resolution"
-                );
-                Vec::new()
-            }
-        }
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
