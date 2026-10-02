@@ -2513,6 +2513,7 @@ async fn cluster_lease_delete_waits_for_system_retirement_acknowledgements() {
             placements: vec![Placement {
                 node_id: NodeId::new("worker"),
                 resources: Resources::new(500, 1024, 0),
+                ordinal: 0,
             }],
         }),
     ] {
@@ -5432,6 +5433,7 @@ fn council_app_evidence_names_the_volume_home_an_app_waits_for() {
         vec![crate::meat::types::Placement {
             node_id: crate::meat::NodeId::new("node-2"),
             resources: crate::meat::Resources::new(100, 0, 0),
+            ordinal: 0,
         }],
     );
     let live: std::collections::HashSet<String> = ["node-1".to_string()].into();

@@ -204,6 +204,10 @@ pub struct Placement {
     pub node_id: NodeId,
     /// Resources reserved for this replica.
     pub resources: Resources,
+    /// The replica's ordinal, unique within the app across the whole
+    /// cluster. The node names the instance after it (`{app}-{ordinal}`),
+    /// and the replica keeps it for as long as it lives (#398).
+    pub ordinal: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -432,10 +436,12 @@ mod tests {
                 Placement {
                     node_id: NodeId::new("node-1"),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 0,
                 },
                 Placement {
                     node_id: NodeId::new("node-2"),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 1,
                 },
             ],
         };
@@ -453,14 +459,17 @@ mod tests {
                 Placement {
                     node_id: NodeId::new("node-1"),
                     resources: Resources::default(),
+                    ordinal: 0,
                 },
                 Placement {
                     node_id: NodeId::new("node-2"),
                     resources: Resources::default(),
+                    ordinal: 1,
                 },
                 Placement {
                     node_id: NodeId::new("node-3"),
                     resources: Resources::default(),
+                    ordinal: 2,
                 },
             ],
         };

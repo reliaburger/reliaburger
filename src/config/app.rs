@@ -49,6 +49,13 @@ pub struct AppSpec {
     /// Replica count or daemon mode.
     #[serde(default)]
     pub replicas: Replicas,
+    /// The cluster-wide ordinals of the replicas one node runs, which the
+    /// leader assigned in its placements (#398). Only the placement
+    /// reconciler sets it, on the share of the app it hands its own agent;
+    /// a config file can't, and a standalone node leaves it unset and
+    /// numbers its replicas from 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinals: Option<Vec<u32>>,
     /// Container-internal port.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
@@ -111,6 +118,19 @@ pub struct AppSpec {
 }
 
 impl AppSpec {
+    /// The ordinals this node's replicas take: the ones the leader assigned,
+    /// or `0..replicas` on a standalone node. A daemon set runs one replica
+    /// per node, so without an assignment it is ordinal 0.
+    pub fn replica_ordinals(&self) -> Vec<u32> {
+        if let Some(ordinals) = &self.ordinals {
+            return ordinals.clone();
+        }
+        match self.replicas {
+            Replicas::Fixed(count) => (0..count).collect(),
+            Replicas::DaemonSet => vec![0],
+        }
+    }
+
     /// Every explicitly declared main or init image; omitted init images inherit the main image.
     pub fn image_references(&self) -> impl Iterator<Item = &str> {
         self.image

@@ -125,9 +125,12 @@ mod tests {
     fn desired_with_placements(placements: Vec<(AppId, NodeId)>) -> DesiredState {
         let mut scheduling: HashMap<AppId, Vec<Placement>> = HashMap::new();
         for (app_id, node_id) in placements {
-            scheduling.entry(app_id).or_default().push(Placement {
+            let placements = scheduling.entry(app_id).or_default();
+            let ordinal = placements.len() as u32;
+            placements.push(Placement {
                 node_id,
                 resources: Resources::new(100, 128 * 1024 * 1024, 0),
+                ordinal,
             });
         }
         DesiredState {

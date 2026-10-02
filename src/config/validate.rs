@@ -227,6 +227,16 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    // Ordinals come from the leader's placements, never from a config file.
+    if app.ordinals.is_some() {
+        return Err(ConfigError::Validation {
+            field: "ordinals".to_string(),
+            context: format!("app {name:?}"),
+            reason: "ordinals are assigned by the cluster's placements, not set in config"
+                .to_string(),
+        });
+    }
+
     // exec and image are mutually exclusive
     if app.exec.is_some() && app.image.is_some() {
         return Err(ConfigError::Validation {
@@ -678,6 +688,16 @@ mod tests {
 
     fn app_with_metrics(extra: &str) -> AppSpec {
         toml::from_str(&format!("image = \"test:v1\"\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn a_config_cannot_choose_instance_ordinals() {
+        let config = config_with_app("web", app_with_metrics("replicas = 2\nordinals = [4, 7]"));
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "ordinals"),
+            "{err:?}"
+        );
     }
 
     #[test]

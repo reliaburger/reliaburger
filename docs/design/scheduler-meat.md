@@ -432,8 +432,9 @@ pub enum NodeStatus {
 ### Scheduling Decisions
 
 The shipped `SchedulingDecision` (in `meat::types`) is deliberately minimal: it
-carries the app being scheduled and one `Placement` (node + reserved resources)
-per replica. The richer shape below — a per-decision `decision_id`, a
+carries the app being scheduled and one `Placement` (node, reserved resources
+and the replica's ordinal) per replica. Instance ordinals are covered in
+§5.1. The richer shape below — a per-decision `decision_id`, a
 `spec_version`, an allocated port, and a timestamp — is **planned — not yet
 implemented**; those fields back the replay-protection design in Section 8.4,
 which the current struct cannot enforce.
@@ -685,6 +686,44 @@ A new spec for a running app keeps its committed placements. Each node agent rol
 
 There is a window of one scheduling tick: a node agent can roll to the new spec before the leader's next pass decides that the replica must move. The pass then places it elsewhere and the agent retires it.
 
+#### Instance Ordinals
+
+An instance is named `{namespace}__{app}-{ordinal}`, or
+`{namespace}__{app}-g{generation}-{ordinal}` once a rolling or blue-green deploy
+has replaced it. The leader picks the ordinal, not the node: each `Placement`
+carries one, distinct within the app across the whole cluster, so three
+replicas on three nodes are `frontend-0`, `frontend-1` and `frontend-2`. Until
+#398 every node counted its own replicas from 0 and all three were
+`frontend-0`. The council refuses a decision in which two placements share an
+ordinal.
+
+Ordinals stay put. Every pass numbers an app's placements with
+`number_placements`:
+
+- A placement the pass keeps keeps its ordinal.
+- A fixed-replica app that shrinks keeps its lowest ordinals, so a scale-down
+  retires the highest.
+- A new placement takes the lowest free ordinal. After a node loss that's the
+  ordinal the lost replica had, so the replacement takes over its name on
+  another node; on a scale-up it's the next ones up.
+- A daemon set is re-placed whole when its eligible nodes change, so a new
+  placement first takes back the ordinal its node held before. A node keeps
+  its daemon's number while it stays eligible, and a joining node takes the
+  lowest free one. We considered naming a daemon's instance after its node
+  instead, but cluster-wide ordinals keep one naming rule for every app, and
+  the node is already in every place an instance is shown.
+- A managed-volume app returning from `relish stop` goes back to its home
+  nodes in the order `last_placed_nodes` records them, which is ordinal
+  order, so each home gets its old ordinal back.
+
+`/v1/placements/{node}` hands each node its ordinals for an app
+(`NodeAssignment::ordinals`), and the placement reconciler passes them to the
+agent in the app spec's `ordinals` field, which a config file may not set. The
+agent creates exactly those instances. A share that grows starts only the new
+ordinals beside the running ones, and a rolling deploy starts generation
+`g{n}` under the same ordinals. A standalone node, with no leader, numbers its
+replicas from 0.
+
 #### Reservations between Reports
 
 Node reports lag the council. A placement committed a tick ago isn't in its node's report yet, so the pass that starts from the reports would see free room and place a second app into it. Before admitting anything, each pass rebuilds the missing reservations: for every committed placement beyond the replicas its node reports, it reserves the committed footprint in the pass's cache (#432).
@@ -695,7 +734,8 @@ When `replicas = "*"` is specified, Meat does not run the placement pipeline. In
 
 1. It queries all nodes from the cluster state cache.
 2. If placement `required` labels are specified, it filters to matching nodes.
-3. One instance is scheduled on every qualifying node.
+3. One instance is scheduled on every qualifying node, with a cluster-wide
+   ordinal like any other replica (see Instance Ordinals).
 4. Meat subscribes to Mustard membership events: when a new node joins the cluster and matches the placement constraints, an instance is automatically scheduled. When a node leaves, the instance is removed.
 
 Daemon mode is not bin-packed -- every qualifying node gets exactly one instance regardless of its current load. This is appropriate for system-level workloads (node exporters, log forwarders, caches).

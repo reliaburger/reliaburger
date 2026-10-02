@@ -49,7 +49,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 }
 
 /// When `wanted` is `previous` with more fixed replicas and nothing else
-/// changed: the previous count and how many more `wanted` asks for.
+/// changed: the previous count and how many more `wanted` asks for. The
+/// replicas already running keep their ordinals, so every one of them must
+/// still be among the ordinals `wanted` assigns.
 fn replicas_added(previous: &AppSpec, wanted: &AppSpec) -> Option<(u32, u32)> {
     let (Replicas::Fixed(before), Replicas::Fixed(after)) = (previous.replicas, wanted.replicas)
     else {
@@ -58,8 +60,17 @@ fn replicas_added(previous: &AppSpec, wanted: &AppSpec) -> Option<(u32, u32)> {
     if after <= before {
         return None;
     }
+    let assigned = wanted.replica_ordinals();
+    if !previous
+        .replica_ordinals()
+        .iter()
+        .all(|ordinal| assigned.contains(ordinal))
+    {
+        return None;
+    }
     let mut grown = previous.clone();
     grown.replicas = wanted.replicas;
+    grown.ordinals.clone_from(&wanted.ordinals);
     (grown == *wanted).then_some((before, after - before))
 }
 
@@ -81,6 +92,28 @@ mod tests {
         );
         assert_eq!(replicas_added(&spec("web:v1", 3), &spec("web:v1", 3)), None);
         assert_eq!(replicas_added(&spec("web:v1", 3), &spec("web:v1", 2)), None);
+    }
+
+    fn assigned(replicas: u32, ordinals: &[u32]) -> AppSpec {
+        let mut spec = spec("web:v1", replicas);
+        spec.ordinals = Some(ordinals.to_vec());
+        spec
+    }
+
+    #[test]
+    fn a_grown_assignment_adds_replicas_beside_the_ordinals_it_keeps() {
+        assert_eq!(
+            replicas_added(&assigned(2, &[0, 2]), &assigned(3, &[0, 1, 2])),
+            Some((2, 1))
+        );
+    }
+
+    #[test]
+    fn an_assignment_that_drops_a_running_ordinal_rolls() {
+        assert_eq!(
+            replicas_added(&assigned(2, &[0, 2]), &assigned(3, &[0, 1, 3])),
+            None
+        );
     }
 
     #[test]

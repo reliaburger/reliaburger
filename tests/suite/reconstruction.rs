@@ -135,6 +135,7 @@ async fn reconstruction_matching_state_no_corrections() {
             placements: vec![Placement {
                 node_id: NodeId::new("worker-1"),
                 resources: Resources::new(100, 128 * 1024 * 1024, 0),
+                ordinal: 0,
             }],
         }))
         .await
@@ -195,6 +196,7 @@ async fn reconstruction_missing_app_detected() {
             placements: vec![Placement {
                 node_id: NodeId::new("worker-1"),
                 resources: Resources::new(100, 128 * 1024 * 1024, 0),
+                ordinal: 0,
             }],
         }))
         .await
@@ -205,6 +207,7 @@ async fn reconstruction_missing_app_detected() {
             placements: vec![Placement {
                 node_id: NodeId::new("worker-2"),
                 resources: Resources::new(200, 256 * 1024 * 1024, 0),
+                ordinal: 0,
             }],
         }))
         .await

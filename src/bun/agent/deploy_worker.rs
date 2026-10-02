@@ -855,10 +855,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return std::ops::ControlFlow::Break(());
             }
         };
-        let replica_count = match spec.replicas {
-            crate::config::types::Replicas::Fixed(n) => n,
-            crate::config::types::Replicas::DaemonSet => 1,
-        };
+        // A new generation keeps the ordinals the leader assigned (#398):
+        // `{app}-g{gen}-{ordinal}` replaces `{app}-{ordinal}`.
+        let ordinals = spec.replica_ordinals();
+        let replica_count = ordinals.len() as u32;
 
         let mut new_ids: Vec<InstanceId> = Vec::new();
         let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
@@ -882,7 +882,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // is given only what's left, and its own retire loop is an idempotent
         // catch-up for anything the planner didn't reach.
         let mut retired: usize = 0;
-        let mut next_replica_index: u32 = 0;
+        let mut next_replica_index: usize = 0;
         loop {
             if self.report_cancellation(events).await {
                 new_failed = true;
@@ -988,10 +988,11 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 crate::meat::deploy_types::RollingStep::StartNew => {}
             }
 
-            let i = next_replica_index;
+            let ordinal = ordinals[next_replica_index];
             next_replica_index += 1;
-            let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
-                .instance_id();
+            let new_id =
+                crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, ordinal)
+                    .instance_id();
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("starting new instance {}", new_id.0),
@@ -1457,10 +1458,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return std::ops::ControlFlow::Break(());
             }
         };
-        let replica_count = match spec.replicas {
-            crate::config::types::Replicas::Fixed(n) => n,
-            crate::config::types::Replicas::DaemonSet => 1,
-        };
+        // A new generation keeps the ordinals the leader assigned (#398):
+        // `{app}-g{gen}-{ordinal}` replaces `{app}-{ordinal}`.
+        let ordinals = spec.replica_ordinals();
+        let replica_count = ordinals.len() as u32;
 
         let mut new_ids: Vec<InstanceId> = Vec::new();
         let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
@@ -1476,13 +1477,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // Start and health check the entire green fleet before touching blue.
         // Unlike the rolling planner, nothing retires here and nothing is
         // published to routing yet: green comes up dark, alongside blue.
-        for i in 0..replica_count {
+        for &ordinal in &ordinals {
             if self.report_cancellation(events).await {
                 new_failed = true;
                 break;
             }
-            let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
-                .instance_id();
+            let new_id =
+                crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, ordinal)
+                    .instance_id();
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("starting green instance {}", new_id.0),

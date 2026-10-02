@@ -8937,6 +8937,51 @@ async fn raising_the_replica_count_starts_only_the_new_replicas() {
     );
 }
 
+/// This node's share of `web`, under the cluster-wide ordinals the leader
+/// assigned, the way the placement reconciler hands it over (#398).
+fn web_with_ordinals(ordinals: &[u32]) -> Config {
+    let mut config = web_with_replicas(ordinals.len() as u32);
+    config.app.get_mut("web").unwrap().ordinals = Some(ordinals.to_vec());
+    config
+}
+
+/// #398: every node used to number its own replicas from 0, so three
+/// replicas on three nodes were all `web-0`. An instance takes the ordinal
+/// its placement was assigned, keeps it through a rolling deploy, and a
+/// node whose share grows starts the new ordinal beside the old ones.
+#[tokio::test]
+async fn instances_are_created_with_their_assigned_ordinals() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[2, 5])).await);
+    assert_eq!(live_web_ids(&agent), ["default__web-2", "default__web-5"]);
+
+    // A replacement for a lost replica lands here and takes its ordinal.
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[2, 4, 5])).await);
+    assert_eq!(
+        live_web_ids(&agent),
+        ["default__web-2", "default__web-4", "default__web-5"]
+    );
+
+    // A rolling deploy moves every replica to a new generation under the
+    // same ordinals.
+    let mut changed = web_with_ordinals(&[2, 4, 5]);
+    changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    expect_complete(&drain_deploy(&mut agent, changed).await);
+    let rolled = live_web_ids(&agent);
+    assert_eq!(rolled.len(), 3, "{rolled:?}");
+    let ordinals: Vec<u32> = rolled
+        .iter()
+        .map(|id| {
+            let identity = crate::grill::InstanceIdentity::parse(id).unwrap();
+            assert!(identity.generation.is_some(), "{id} was not rolled");
+            identity.ordinal
+        })
+        .collect();
+    assert_eq!(ordinals, [2, 4, 5], "{rolled:?}");
+}
+
 #[tokio::test]
 async fn redeploy_does_not_overwrite_a_stopped_or_failed_cleanup_owner() {
     for state in [ContainerState::Stopped, ContainerState::Failed] {
