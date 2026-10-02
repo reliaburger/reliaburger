@@ -125,6 +125,11 @@ relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
 
+In a cluster, `relish stop` and `relish delete` return as soon as the council
+has recorded the change. Each node then retires its instances on its own, and
+a node that's unreachable does so when it comes back. Run `relish status` (or
+`relish inspect web`) to watch the instances go.
+
 Commands that take an app name also take `--namespace` (default `default`).
 
 ## Many files
