@@ -85,11 +85,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await;
         match cleanup {
             Ok(()) => {
+                // Journalling the release took two writes. The discovery
+                // recovery that follows the last retirement takes two more,
+                // so it waits for the next tick: four in one turn come near
+                // two runtime budgets on a slow disk (#422).
                 self.startup_retirements.pop_front();
             }
             // Its disk cleanup is running off the loop; the next tick
             // collects it. Nothing is wrong, so readiness stays as it is.
-            Err(BunError::StillRunning { .. }) => return,
+            Err(BunError::StillRunning { .. }) => {}
             Err(error) => {
                 // Rotate ownership so one unavailable producer does not starve others.
                 if let Some(pending) = self.startup_retirements.pop_front() {
@@ -101,10 +105,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .degraded("discovery:startup-cleanup", error.to_string())
                         .await;
                 }
-                return;
             }
         }
-        self.finish_startup_retirements().await;
     }
 
     async fn finish_startup_retirements(&mut self) {

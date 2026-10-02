@@ -23,6 +23,9 @@ pub(super) struct DeployWorker<G: Grill> {
     pub(super) operation: Option<crate::bun::deploy_operations::DeployOperationHandle>,
     /// The agent's `[runtime] stop_confirmation_timeout_secs`.
     pub(super) stop_confirmation_timeout: std::time::Duration,
+    /// Resolves an instance's egress allowlist before the loop programs
+    /// it, so the loop never waits on DNS (#419).
+    pub(super) egress: launch_evidence::EgressResolver,
 }
 
 /// The last few hundred bytes of a runtime's captured stderr (`{stem}.stderr`),
@@ -68,9 +71,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let retained = launch_evidence::retain_network(&self.grill, instance_id, spec)
             .await
             .map_err(BunError::from);
+        let egress = self.egress.resolve(spec).await;
         let result = self
             .ops
-            .apply_network_pre_start(instance_id, app_name, spec, cgroup_path, retained)
+            .apply_network_pre_start(instance_id, app_name, spec, cgroup_path, retained, egress)
             .await;
         if result.is_err() {
             let _ = self.grill.stop(instance_id).await;

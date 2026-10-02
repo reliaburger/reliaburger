@@ -112,6 +112,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Returns an error — failing the deploy closed — when enforcement is
     /// required but cannot be guaranteed (connect6 missing, cgroup id
     /// unresolvable, map programming failed).
+    ///
+    /// `egress` is the allowlist whoever prepared the start resolved, off
+    /// the loop (#419).
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn apply_network_pre_start(
         &mut self,
@@ -120,6 +123,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: Option<&AppSpec>,
         cgroup_path: &std::path::Path,
         retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
+        egress: launch_evidence::EgressResolution,
     ) -> Result<(), BunError> {
         self.retain_network_reference(instance_id, spec, retained)
             .await?;
@@ -162,7 +166,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     app_name: app_name.into(),
                     reason: "source namespace cgroup could not be prepared".into(),
                 })?;
-                self.program_egress_pre_start(instance_id, app_name, spec, cgroup_id)
+                self.program_egress_pre_start(instance_id, app_name, spec, cgroup_id, egress)
                     .await
             }
             PreStartEgress::NoPolicy => Ok(()),
@@ -171,7 +175,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reason: format!("egress enforcement for {}: {reason}", instance_id.0),
             }),
             PreStartEgress::Program { cgroup_id } => {
-                self.program_egress_pre_start(instance_id, app_name, spec, cgroup_id)
+                self.program_egress_pre_start(instance_id, app_name, spec, cgroup_id, egress)
                     .await
             }
         }
@@ -354,6 +358,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: Option<&AppSpec>,
         _cgroup_path: &std::path::Path,
         retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
+        _egress: launch_evidence::EgressResolution,
     ) -> Result<(), BunError> {
         self.retain_network_reference(instance_id, spec, retained)
             .await?;
@@ -374,6 +379,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// instance start (the re-resolve loop fills the allowlist in later),
     /// but a programming or representation error fails the deploy — a
     /// workload must never start ahead of a policy we could not install.
+    ///
+    /// The DNS happened before this turn, wherever the start was prepared
+    /// (#419). A resolution of a different allowlist than the one being
+    /// programmed is refused rather than programmed deny-all: it means the
+    /// spec changed while the start was being prepared.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn program_egress_pre_start(
         &mut self,
@@ -381,13 +391,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         spec: Option<&AppSpec>,
         cgroup_id: u64,
+        egress: launch_evidence::EgressResolution,
     ) -> Result<(), BunError> {
         let allow = spec
             .and_then(|spec| spec.egress.as_ref())
             .map(|policy| policy.allow.as_slice())
             .unwrap_or_default();
+        if egress.allow.as_slice() != allow {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!(
+                    "egress allowlist for {} changed while its start was prepared",
+                    instance_id.0
+                ),
+            });
+        }
         self.clear_egress(instance_id).await?;
-        let resolved = Self::resolve_owned_egress(allow).await;
+        let resolved = egress.destinations;
         let union: Vec<_> = self
             .egress_bindings
             .values()

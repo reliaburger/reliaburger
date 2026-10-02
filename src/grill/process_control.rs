@@ -690,6 +690,17 @@ fn dropped_connection(error: &io::Error) -> bool {
 /// safe. A failure after the request is sent is never retried: by then the
 /// command may be running.
 async fn deliver_exec_request(path: &Path, request: &str) -> io::Result<tokio::net::UnixStream> {
+    deliver_exec_request_observed(path, request, |_| {}).await
+}
+
+/// [`deliver_exec_request`], calling `before_retry` with the attempt number
+/// just before each attempt after the first. A test uses it to bring its
+/// owner up at a known point instead of racing the retry interval (#448).
+async fn deliver_exec_request_observed(
+    path: &Path,
+    request: &str,
+    mut before_retry: impl FnMut(u32),
+) -> io::Result<tokio::net::UnixStream> {
     use tokio::io::AsyncWriteExt;
     let mut attempt = 1;
     loop {
@@ -703,6 +714,7 @@ async fn deliver_exec_request(path: &Path, request: &str) -> io::Result<tokio::n
             Err(error) if dropped_connection(&error) && attempt < OWNER_REQUEST_ATTEMPTS => {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(20)).await;
+                before_retry(attempt);
             }
             delivered => return delivered,
         }
@@ -853,26 +865,34 @@ mod tests {
         // A socket file nobody listens on refuses connections, the way an
         // owner's socket does while it is busy dropping a slow client.
         drop(UnixListener::bind(&socket).unwrap());
-        let owner = {
-            let socket = socket.clone();
-            let listening = root.path().join("listening.sock");
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+        // The live owner is listening before delivery starts, under another
+        // name. It takes the socket's place only once delivery has been
+        // refused and is about to try again, so the test never races the
+        // retry interval on a loaded runner (#448).
+        let listening = root.path().join("listening.sock");
+        let listener = UnixListener::bind(&listening).unwrap();
+        let owner = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&connection)
+                .read_line(&mut line)
+                .unwrap();
+            line
+        });
+        let mut retries = 0;
+        deliver_exec_request_observed(&socket, "exec\n", |_| {
+            retries += 1;
+            if retries == 1 {
                 // Swap the live socket in with one rename: removing the dead
-                // file first opened a window where connect saw NotFound, which
-                // correctly means "no owner" and is never retried.
-                let listener = UnixListener::bind(&listening).unwrap();
+                // file first opened a window where connect saw NotFound,
+                // which correctly means "no owner" and is never retried.
                 std::fs::rename(&listening, &socket).unwrap();
-                let (connection, _) = listener.accept().unwrap();
-                let mut line = String::new();
-                std::io::BufReader::new(&connection)
-                    .read_line(&mut line)
-                    .unwrap();
-                line
-            })
-        };
-        deliver_exec_request(&socket, "exec\n").await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(owner.join().unwrap(), "exec\n");
+        assert_eq!(retries, 1, "delivery was refused once, then sent again");
     }
 
     #[tokio::test(flavor = "multi_thread")]

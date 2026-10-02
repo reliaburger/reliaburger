@@ -43,27 +43,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await?
             .ok_or_else(|| refuse("runtime inventory is incomplete".into()))
     }
-
-    /// Like [`Self::runtime_inventory`], but waits its whole
-    /// [`RUNTIME_INVENTORY_TIMEOUT`] even inside a turn. Only journalling a
-    /// backend publication uses it: failing that on the turn's deadline
-    /// fails a restart or a deploy step, not just a read a later turn
-    /// repeats.
-    pub(super) async fn publication_runtime_inventory(
-        &self,
-        refuse: impl FnOnce(String) -> BunError,
-    ) -> Result<Option<Vec<RuntimeLaunch>>, BunError> {
-        // LOOP-INLINE: runc reads its intent files from local disk, like a persist; TODO(#419) move it off the loop
-        let read = tokio::time::timeout(
-            RUNTIME_INVENTORY_TIMEOUT,
-            self.supervisor.grill().launch_inventory(),
-        )
-        .await;
-        match read {
-            Ok(launches) => Ok(launches?),
-            Err(_) => Err(refuse("runtime inventory timed out".into())),
-        }
-    }
 }
 
 #[cfg(test)]

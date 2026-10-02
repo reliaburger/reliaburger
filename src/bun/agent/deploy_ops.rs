@@ -147,6 +147,8 @@ pub(super) enum DeployOp {
         spec: Option<Box<AppSpec>>,
         cgroup_path: PathBuf,
         retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
+        /// The allowlist the worker resolved, so the loop never waits on DNS.
+        egress: Box<launch_evidence::EgressResolution>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Transition an instance to a new lifecycle state through the supervisor.
@@ -750,6 +752,7 @@ impl DeployOps {
         spec: Option<&AppSpec>,
         cgroup_path: &std::path::Path,
         retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
+        egress: launch_evidence::EgressResolution,
     ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::ApplyNetworkPreStart {
@@ -758,6 +761,7 @@ impl DeployOps {
                 spec: spec.cloned().map(Box::new),
                 cgroup_path: cgroup_path.to_path_buf(),
                 retained,
+                egress: Box::new(egress),
                 reply,
             },
             Err(BunError::InstanceNotFound {
@@ -1372,6 +1376,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 spec,
                 cgroup_path,
                 retained,
+                egress,
                 reply,
             } => {
                 let result = self
@@ -1381,6 +1386,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         spec.as_deref(),
                         &cgroup_path,
                         retained,
+                        *egress,
                     )
                     .await;
                 // On failure, mark the instance Failed. The worker stops the
@@ -1458,7 +1464,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(result);
             }
             DeployOp::RegisterRollingInstance { instance, reply } => {
-                let result = self.persist_rolling_instance(&instance).await;
+                let result = match self
+                    .record_launch_execution(&instance.instance_id, &instance.launch.execution)
+                {
+                    Ok(()) => self.persist_rolling_instance(&instance).await,
+                    Err(error) => Err(error),
+                };
                 if result.is_ok() {
                     self.spawn_log_forwarder(
                         &instance.instance_id,

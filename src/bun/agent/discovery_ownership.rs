@@ -87,6 +87,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Keep the execution whoever started `id` read from the runtime, for
+    /// the discovery journal's next publication. An inventory that couldn't
+    /// be read fails the step while the journal is on, as the publication
+    /// that read it inside the turn used to: the journal can't name the
+    /// execution without it.
+    pub(super) fn record_launch_execution(
+        &mut self,
+        id: &crate::grill::InstanceId,
+        execution: &super::launch_evidence::LaunchExecution,
+    ) -> Result<(), BunError> {
+        use super::launch_evidence::LaunchExecution;
+        match execution {
+            LaunchExecution::Generation(generation) => {
+                self.launch_executions
+                    .insert(id.clone(), generation.clone());
+            }
+            LaunchExecution::Unrecorded => {
+                self.launch_executions.remove(id);
+            }
+            LaunchExecution::Unknown(reason) => {
+                self.launch_executions.remove(id);
+                if !matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+                    return Err(BunError::AdoptionState(format!("publication {reason}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Preserve attempted publications before any kernel or userspace acknowledgement.
     pub(super) async fn persist_discovery_publication(
         &mut self,
@@ -97,11 +126,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
-        let launches = self
-            .publication_runtime_inventory(|reason| {
-                BunError::AdoptionState(format!("publication {reason}"))
-            })
-            .await?;
+        // What each backend's launch ran, as whoever started it read it:
+        // no runtime read here, inside the turn (#419).
+        let executions = self.launch_executions.clone();
         self.update_discovery_inventory(id, |next| {
             // Absence from the candidate is not withdrawal proof. Preserve
             // earlier allocations until their confirmed retirement removes them.
@@ -111,16 +138,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .backends
                         .iter()
                         .filter_map(|backend| {
-                            launches
-                                .as_ref()?
-                                .iter()
-                                .find(|launch| {
-                                    launch.instance_id.0 == backend.instance_id
-                                        && launch.network_reference.is_none()
-                                })
-                                .map(|launch| {
-                                    (backend.instance_id.clone(), launch.generation.clone())
-                                })
+                            let id = crate::grill::InstanceId(backend.instance_id.clone());
+                            executions
+                                .get(&id)
+                                .map(|generation| (backend.instance_id.clone(), generation.clone()))
                         })
                         .collect(),
                     entry: entry.clone(),

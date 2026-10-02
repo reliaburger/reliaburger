@@ -4298,6 +4298,177 @@ waited out the slow work, or sat out a fixed one-second timeout, fails by a
 wide margin. A slow disk under the completion turn no longer has a
 31 ms gap to fall into.
 
+#### The last two tags
+
+That left the two five-second waits tagged for #419. The obvious move was
+the one we'd just made everywhere else: wait until the turn's deadline, fail
+with `StillRunning`, and let the caller ask again. Look at the callers,
+though, and it gets ugly. The publication's inventory read sits at the end of
+`finish_fresh_instance` and `restart_after_start`, after they've moved the
+instance to `HealthWait` and added its backend to the service map. Asking
+again means redoing half a step that was never meant to run twice, and a
+restart that fails here goes through `record_failed_restart`, which spends
+one of the instance's attempts. We'd be trading a slow turn for a burned
+restart.
+
+So we asked a different question. What does the publication actually need
+from the inventory? One fact per backend: the generation of the execution
+the runtime ran, for launches that hold no address of their own (process
+workloads and rootless runc). The discovery journal records it so recovery
+can tell that execution from a later one. And that fact only changes when
+something starts the instance. Whatever starts it, a deploy worker or a
+restart step, has just talked to the runtime and can wait as long as it
+likes. It's the "whoever drove the runtime asks it" pattern again, so
+`LaunchEvidence` grows one more field:
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum LaunchExecution {
+    #[default]
+    Unrecorded,
+    Generation(RuntimeGeneration),
+    Unknown(String),
+}
+```
+
+`#[default]` on a variant tells `#[derive(Default)]` which variant
+`LaunchExecution::default()` returns. A fieldless variant is the only kind
+it accepts. `LaunchEvidence` derives `Default` too, and it can only do that
+if every field's type implements `Default`, so the enum has to.
+
+The three variants are the three answers the old read could give: nothing to
+record (the runtime can't list its launches, or this one holds an address
+the journal tracks separately), a generation, or "couldn't tell". The loop
+keeps the generations in a `HashMap<InstanceId, RuntimeGeneration>` when it
+records the launch, and adoption fills it from the inventory it reads at
+startup anyway. `persist_discovery_publication` looks backends up in that
+map. It doesn't touch the runtime at all now.
+
+Failure stays where it was. An inventory the step couldn't read within its
+five seconds comes back as `Unknown`, and while the journal is on,
+`record_launch_execution` refuses the step with the same "publication
+runtime inventory timed out" the old read produced. A wedged runtime still
+fails the deploy or the restart. What changed is *where* the five seconds
+are spent: in the step's task, not inside a turn everyone else is waiting
+behind.
+
+The egress allowlist went the same way. The deploy worker resolves it right
+after it retains the network reference, and the restart's Create step does
+the same after `create`. Both hand the loop an `EgressResolution`:
+
+```rust
+pub(super) struct EgressResolution {
+    pub(super) allow: Vec<String>,
+    pub(super) destinations: Vec<crate::sesame::egress::EgressDestination>,
+}
+```
+
+It carries the allowlist it resolved, not just the answer. A redeploy could
+change the spec between the worker's lookup and the loop's turn, and
+programming the new allowlist with the old answer would start the instance
+deny-all for no reason anyone could see later. So `program_egress_pre_start`
+compares the two and refuses a mismatch outright. A DNS failure still starts
+the instance deny-all, as it always did, because that's a choice the
+re-resolution loop is there to repair. A timing miss on the loop no longer
+can.
+
+Both payloads travel inside enum variants, `DeployOp::ApplyNetworkPreStart`
+and `StepResult::Created`, as `Box<EgressResolution>`. An enum in Rust is as
+big as its largest variant, so one variant with two `Vec`s inline would make
+every `DeployOp` that big, including the many that carry a reply channel and
+little else. `Box` puts the payload on the heap and leaves a pointer in the
+variant. Clippy's `large_enum_variant` lint exists to point this out.
+
+There's a small trick in how the harness reaches the lookup. The resolver
+the worker gets is a struct with one field, and that field only exists in
+test builds:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub(super) struct EgressResolver {
+    #[cfg(test)]
+    pub(super) stalls: std::sync::Arc<super::LoopStalls>,
+}
+```
+
+`#[cfg(test)]` works on a single field as well as on a whole item. In a
+release build `EgressResolver` is an empty struct, which costs nothing, and
+the code that builds one also writes `#[cfg(test)]` on the matching field
+initialiser. In a test build the scenario sets `LoopStall::EgressDns` and
+the worker's lookup takes 2.5 s.
+
+Each move has its scenario. `status_answers_while_a_restart_reads_a_slow_launch_inventory`
+crashes a replica with the journal on and the inventory taking 2.5 s, then
+waits long enough for the restart step's read *and* the publication after
+it. Put the old inline read back and it fails with `the worst loop turn took
+2.520421584s in restart_step`. `status_answers_while_a_deploy_resolves_an_egress_allowlist`
+deploys an allowlisted app with DNS taking 2.5 s. That one can't fail on the
+old code in this harness: the loop only reached the lookup with eBPF hooks
+attached, which the mock agent doesn't have. What it guards is the new
+design, that the lookup stays in the worker. The loop rule guards the rest,
+and with both tags gone it has nothing left to excuse but locks, persists
+and one short sleep.
+
+#### Four writes, two ticks
+
+The 663 ms completion turn from the slow-disk scenario had a follow-up
+(#422): at 250 ms a write, four persists would pass the budget. Turning the
+scenario up to 250 ms should have failed. It passed, twice in a row, at
+530 ms a turn.
+
+The turn's deadline was hiding it. Releasing the network reference journals
+two writes, then the artifact cleanup starts off the loop and waits only
+until the deadline. Two 250 ms writes use up the 500 ms runtime budget, so
+the cleanup misses it and answers `StillRunning`, and the other two writes
+land on the next tick. The split was an accident of arithmetic. At 240 ms a
+write the first two leave a few milliseconds, the cleanup makes it, and all
+four share a turn of nearly a second. No timing in a test would pin that
+down reliably.
+
+So the new test doesn't time anything. `LoopStalls` counts how often each
+stall's await is reached, slow or not, and
+`a_startup_retirement_journals_at_most_two_writes_a_tick` drives the
+retirement by hand, one simulated turn at a time, counting persists per
+tick. Before the fix it printed `[4]`. The fix is one line in spirit: the
+tick that completes the last retirement returns, and the discovery recovery
+(the other two writes) runs on the next tick, where `drive_startup_retirements`
+already called it for an empty queue. Now it's `[2, 2]` whatever the disk
+does. The slow-disk scenario stays at 250 ms, and it now waits for the
+`discovery:startup-cleanup` readiness to turn ready before judging, because
+the port goes back a tick before the last writes.
+
+#### A test that raced the clock
+
+One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`
+failed once on a coverage run: delivery gave up with "connection refused".
+The product retries a refused exec request ten times, 20 ms apart, about
+180 ms in all. That's sized to the process owner's 100 ms read timeout, the
+time it takes to drop one slow client, and it's right. The test was the
+problem. Its fake owner started a thread, slept 50 ms, then bound a socket
+and renamed it into place, and on an instrumented, loaded runner that took
+longer than 180 ms. We couldn't make it fail on a laptop under 24 copies of
+`yes`, which tells you how narrow the window was. It wasn't zero.
+
+The fix takes the clock out. The live listener is bound before delivery
+starts, under another name, and delivery takes a hook that runs just before
+each retry:
+
+```rust
+deliver_exec_request_observed(&socket, "exec\n", |_| {
+    retries += 1;
+    if retries == 1 {
+        std::fs::rename(&listening, &socket).unwrap();
+    }
+})
+```
+
+The closure borrows `retries` mutably, which is why the parameter is
+`impl FnMut(u32)` rather than `Fn`. `FnMut` is the trait for closures that
+change what they capture. The first attempt is refused, the hook swaps the
+live socket in, and the second attempt connects. There's no sleep left to
+lose a race with, and the production path calls the same function with
+`|_| {}`.
+
 ### Two commands, two answers
 
 Issue #241 had one more complaint in it. With three replicas of `hello`

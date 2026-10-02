@@ -150,6 +150,8 @@ pub async fn open_raft_storage(
     bool,
     CouncilStateMachine,
 )> {
+    let _opening_guard = crate::council::recovery_storage::lock(raft_dir)?;
+    crate::council::recovery_storage::finish_pending(raft_dir)?;
     std::fs::create_dir_all(raft_dir)?;
     let log_path = raft_dir.join("log.redb");
     let log_store =
