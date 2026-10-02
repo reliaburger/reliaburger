@@ -51,6 +51,7 @@ mod pickle_cluster;
 mod pickle_integrity;
 mod process_owner;
 mod reconstruction;
+mod recovery_seeds;
 mod recovery_transaction;
 mod registry_authority;
 mod registry_capability;
