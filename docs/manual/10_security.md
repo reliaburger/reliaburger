@@ -161,6 +161,12 @@ names the offenders, while any stored secret still needs the old key. Plain
 `secret pubkey` follows the rotation; the offline form reads the file from
 `init`, which still holds the original key.
 
+Finalising retires the old keys, except the very first one: `relish init`
+sealed the root CA's private key to it, in `<cluster>-root-ca.age`, so that key
+stays (read-only, never used for new secrets) and the root backup keeps
+opening. Keep that file with the master key; together they're how you'd
+recover the root.
+
 ## Workload identity
 
 Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`
