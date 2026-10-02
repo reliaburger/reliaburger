@@ -438,7 +438,9 @@ async fn stop_with_client(
     client: &BunClient,
 ) -> Result<(), RelishError> {
     client.stop(app, namespace).await?;
-    println!("stopped {app}; `relish apply` starts it again");
+    println!(
+        "stop requested for {app}; check `relish status` for completion; `relish apply` starts it again"
+    );
     Ok(())
 }
 
@@ -453,7 +455,7 @@ async fn delete_with_client(
     client: &BunClient,
 ) -> Result<(), RelishError> {
     client.delete(app, namespace).await?;
-    println!("deleted {app}");
+    println!("delete requested for {app}; check `relish status` for remaining instances");
     Ok(())
 }
 

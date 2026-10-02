@@ -65,6 +65,7 @@ mod runtime_executor;
 mod security_integration;
 mod server_idle_connections;
 mod service_endpoints;
+mod stop_confirmation;
 mod tls_connection_lifetime;
 mod uninstall;
 mod website;
