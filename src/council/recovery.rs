@@ -66,7 +66,7 @@ pub enum RecoveryError {
 ///
 /// Refuses unless the persisted fence record says the node is fenced, or
 /// `force` is set. Returns the epoch that fenced it, when one was recorded.
-/// The node must be stopped: redb holds exclusive locks on these files.
+/// Refuses while a running node holds the stores open.
 pub fn reenrol_data_dir(data_dir: &Path, force: bool) -> Result<Option<u64>, RecoveryError> {
     let raft_dir = data_dir.join("raft");
     let fenced_by = crate::council::fence::RecoveryFence::read_fenced_by(&raft_dir)
@@ -76,10 +76,8 @@ pub fn reenrol_data_dir(data_dir: &Path, force: bool) -> Result<Option<u64>, Rec
             path: raft_dir.display().to_string(),
         });
     }
-    if raft_dir.exists() {
-        std::fs::remove_dir_all(&raft_dir)
-            .map_err(|e| RecoveryError::Persist(format!("remove {}: {e}", raft_dir.display())))?;
-    }
+    super::recovery_storage::remove(&raft_dir)
+        .map_err(|e| RecoveryError::Persist(format!("remove {}: {e}", raft_dir.display())))?;
     Ok(fenced_by)
 }
 
@@ -159,48 +157,20 @@ async fn load_state_from_data_dir(data_dir: &Path) -> Result<DesiredState, Recov
     Ok(state_machine.desired_state().await)
 }
 
-/// Offline recovery: stamp `state` into the node's durable snapshot store and
-/// wipe the dead cluster's log, so the next normal start re-bootstraps a fresh
+/// Offline recovery: replace the node's Raft directory with one holding only
+/// `state` as its snapshot, so the next normal start re-bootstraps a fresh
 /// single-voter Raft from the restored state.
 ///
 /// This is what `relish council recover` runs against a *stopped* survivor.
-/// The node must not be running (redb takes an exclusive lock), which is the
-/// operator's responsibility.
+/// Refuses live stores. Installation is journalled and resumed at startup;
+/// the previous directory remains beside the replacement for inspection.
 pub fn recover_data_dir(data_dir: &Path, state: DesiredState) -> Result<(), RecoveryError> {
     crate::compatibility::ensure_state_compatible(data_dir)
         .map_err(|e| RecoveryError::Persist(e.to_string()))?;
-    let raft_dir = data_dir.join("raft");
-    std::fs::create_dir_all(&raft_dir)
-        .map_err(|e| RecoveryError::Persist(format!("create raft dir: {e}")))?;
-
-    // Wipe the dead cluster's log first: its term line and membership belong to
-    // the council that died. A fresh (absent) log makes the node bootstrap.
-    let log_path = raft_dir.join("log.redb");
-    if log_path.exists() {
-        std::fs::remove_file(&log_path)
-            .map_err(|e| RecoveryError::Persist(format!("remove stale log: {e}")))?;
-    }
-
-    // The old fence record holds the dead council's epoch claim; the
-    // recovered snapshot is now the only source of this node's epoch.
-    let fence_path = raft_dir.join(crate::council::fence::FENCE_FILE);
-    if fence_path.exists() {
-        std::fs::remove_file(&fence_path)
-            .map_err(|e| RecoveryError::Persist(format!("remove stale fence record: {e}")))?;
-    }
-
-    let snapshot_path = raft_dir.join("snapshot.redb");
-    // Replace any existing snapshot store so the recovered state is the only
-    // state the node loads.
-    if snapshot_path.exists() {
-        std::fs::remove_file(&snapshot_path)
-            .map_err(|e| RecoveryError::Persist(format!("remove stale snapshot: {e}")))?;
-    }
-    let db = redb::Database::create(&snapshot_path)
-        .map_err(|e| RecoveryError::Persist(format!("create snapshot store: {e}")))?;
-    CouncilStateMachine::persist_recovered_snapshot(&db, state)
-        .map_err(|e| RecoveryError::Persist(format!("write recovered snapshot: {e}")))?;
-    Ok(())
+    // The whole old directory moves aside, the fence record included: the
+    // recovered snapshot is then the only source of this node's epoch.
+    super::recovery_storage::replace(&data_dir.join("raft"), state)
+        .map_err(|e| RecoveryError::Persist(e.to_string()))
 }
 
 /// In-process recovery: build a `CouncilNode` seeded from a restored
@@ -301,6 +271,21 @@ mod tests {
         assert!(dir.path().join("raft").join("log.redb").exists());
         assert_eq!(reenrol_data_dir(dir.path(), true).unwrap(), None);
         assert!(!dir.path().join("raft").exists());
+    }
+
+    #[tokio::test]
+    async fn reenrol_refuses_a_store_a_running_node_holds_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let raft = dir.path().join("raft");
+        write_fence(&raft, true).await;
+        std::fs::remove_file(raft.join("log.redb")).unwrap();
+        let _live = redb::Database::create(raft.join("log.redb")).unwrap();
+        assert!(matches!(
+            reenrol_data_dir(dir.path(), false),
+            Err(RecoveryError::Persist(_))
+        ));
+        assert!(raft.join("log.redb").exists());
+        assert!(raft.join(crate::council::fence::FENCE_FILE).exists());
     }
 
     #[test]
