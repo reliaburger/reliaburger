@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -134,11 +134,28 @@ async fn artefact(
     (state.log)(format!("http: {client}: {arch}/{file}"));
     let stream = ReaderStream::new(opened);
     let body = if file == "installer.efi" {
-        // Remember the machine once the whole installer has gone out; a
-        // download that stops halfway never reaches the tail.
-        let remember = futures_util::stream::once(remember(state.clone(), client))
-            .filter_map(|()| async { None::<std::io::Result<Bytes>> });
-        Body::from_stream(stream.chain(remember))
+        // Remember the machine as the installer's last chunk goes out; a
+        // download that stops halfway never gets there. It has to happen
+        // *before* that chunk is yielded: with Content-Length set, hyper
+        // stops polling the body once the last byte is sent, so anything
+        // chained after it would never run.
+        let size = served.size;
+        let mut sent = 0u64;
+        let state = state.clone();
+        Body::from_stream(stream.then(move |chunk| {
+            let last = chunk.as_ref().is_ok_and(|bytes| {
+                sent += bytes.len() as u64;
+                sent >= size
+            });
+            let state = state.clone();
+            let client = client.clone();
+            async move {
+                if last {
+                    remember(state, client).await;
+                }
+                chunk
+            }
+        }))
     } else {
         Body::from_stream(stream)
     };
@@ -352,6 +369,25 @@ mod tests {
             lines.iter().any(|l| l.contains("has the installer")),
             "{lines:?}"
         );
+    }
+
+    /// Over a real connection, as iPXE fetches it: hyper stops polling a
+    /// body with a Content-Length once the last byte is out, which a
+    /// `oneshot` test never shows.
+    #[tokio::test]
+    async fn a_machine_is_remembered_after_downloading_the_installer_over_tcp() {
+        let f = fixture_with(vec![], false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(f.state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let response = reqwest::get(format!("http://{address}/x86_64/installer.efi?mac={MAC}"))
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        response.bytes().await.unwrap();
+        let record = std::fs::read_to_string(f.dir.path().join(RECORD_FILE)).unwrap();
+        assert!(record.contains(MAC), "{record}");
     }
 
     #[tokio::test]
