@@ -656,6 +656,22 @@ fn plan_pass(
             cache.set_node(node);
         }
     }
+    // Reports can lag committed assignments by several ticks. Reconstruct
+    // missing reservations before admitting any app, including when all of
+    // an earlier app's placements are already converged.
+    for (app_id, placements) in &desired.scheduling {
+        let mut counts = HashMap::<NodeId, u32>::new();
+        for placement in placements {
+            let committed = counts.entry(placement.node_id.clone()).or_default();
+            *committed += 1;
+            let reported = cache
+                .get_node(&placement.node_id)
+                .map_or(0, |node| node.replicas_of(app_id));
+            if *committed > reported {
+                cache.reserve(&placement.node_id, app_id, &placement.resources);
+            }
+        }
+    }
     let mut decisions = Vec::new();
     let mut quota_blocked = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
@@ -5965,16 +5981,11 @@ image = "busybox:latest"
 
 #[cfg(test)]
 mod audit_pending_reservations {
-    use crate::meat::quota::QuotaLedger;
     use super::*;
     use crate::config::Replicas;
     use crate::council::types::DesiredState;
-    use crate::meat::{
-        cluster_state::SchedulerNodeState,
-        types::{AppId, Placement},
-    };
-    use crate::reporting::types::*;
-    use std::time::{Instant, SystemTime};
+    use crate::meat::quota::QuotaLedger;
+    use crate::meat::{cluster_state::SchedulerNodeState, types::AppId};
     fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
         SchedulerNodeState {
             node_id: NodeId::new(name),
