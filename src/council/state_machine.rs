@@ -7174,4 +7174,63 @@ mod tests {
         }));
         assert_eq!(inner.state.security_state.crl.updated_at, revoked_at);
     }
+    /// A changed request or hard selector keeps the app's assignments: the
+    /// node agents roll each replica in place, and the scheduler moves only
+    /// the ones whose node no longer admits the spec (#434). Dropping them
+    /// here would retire every replica at once.
+    #[tokio::test]
+    async fn a_spec_change_keeps_its_assignments_so_replicas_roll_in_place() {
+        let app_id = AppId::new("web", "default");
+        let old: crate::config::app::AppSpec =
+            toml::from_str("image='web:v1'\ncpu='600m'\n[placement]\nrequired=['zone=east']")
+                .unwrap();
+        for constraint in ["resources", "labels", "image"] {
+            let mut sm = CouncilStateMachine::new();
+            sm.apply([normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(old.clone()),
+                },
+            )])
+            .await
+            .unwrap();
+            sm.apply([normal_entry(
+                1,
+                2,
+                RaftRequest::SchedulingDecision(crate::meat::types::SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: vec![crate::meat::types::Placement {
+                        node_id: crate::meat::NodeId::new("east"),
+                        resources: crate::meat::types::Resources::new(600, 0, 0),
+                    }],
+                }),
+            )])
+            .await
+            .unwrap();
+            let mut updated = old.clone();
+            match constraint {
+                "resources" => updated.cpu.as_mut().unwrap().request = 2000,
+                "labels" => updated.placement.as_mut().unwrap().required = vec!["zone=west".into()],
+                _ => updated.image = Some("web:v2".into()),
+            }
+            sm.apply([normal_entry(
+                1,
+                3,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(updated),
+                },
+            )])
+            .await
+            .unwrap();
+            let state = sm.desired_state().await;
+            assert!(
+                state.scheduling.contains_key(&app_id),
+                "a {constraint} change retired every replica at once"
+            );
+            assert!(state.last_placed_nodes.contains_key(&app_id));
+        }
+    }
 }

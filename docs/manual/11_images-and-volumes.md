@@ -198,7 +198,8 @@ the node with `relish decommission-node <node> --workloads-stopped --reason
 <why>`, which writes its volumes off, or changing the app's
 `placement.required` labels so that node no longer matches. Either way the app
 starts elsewhere on a new, empty volume (restore a snapshot into it if you have
-one). A host-path volume is never chowned: make it readable (or writable) by
+one). A bigger `cpu` or `memory` request doesn't move it, even when its node is
+now short of room. A host-path volume is never chowned: make it readable (or writable) by
 the container's mapped user yourself.
 
 ## Snapshots
