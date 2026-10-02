@@ -392,7 +392,7 @@ The other half is `systemd-bless-boot`, which removes the counter (renaming the 
 ```ini
 [Unit]
 Description=Reliaburger boot check
-After=reliaburger.service
+After=network-online.target
 Wants=reliaburger.service
 Before=boot-complete.target
 
@@ -407,7 +407,7 @@ WantedBy=multi-user.target
 RequiredBy=boot-complete.target
 ```
 
-`Before=` is ordering only; `RequiredBy=` makes the target fail if this unit fails. The script behind it polls bun's `/v1/health` for up to 300 s. On success it prints `reliaburger: bun healthy` to the console, which every boot test in CI and the lab waits for. On failure:
+`Before=` is ordering only; `RequiredBy=` makes the target fail if this unit fails. It isn't ordered after `reliaburger.service`, though it once was: a machine with no seed waits for a claim instead of starting bun (see [Becoming a node](#becoming-a-node)), and a unit ordered after bun would wait with it, forever. So the script itself waits while `bun appliance prepare` is still running, counts the claim API answering as healthy, and starts bun's clock only once prepare is done. The script behind it polls bun's `/v1/health` for up to 300 s. On success it prints `reliaburger: bun healthy` to the console, which every boot test in CI and the lab waits for. On failure:
 
 ```sh
 counted() {
