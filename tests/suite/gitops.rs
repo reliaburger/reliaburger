@@ -677,7 +677,13 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
     let clone = data_dir.path().join("gitops-repo");
     reliaburger::lettuce::git::GitRepo::clone_or_open(&url, &clone, "main").unwrap();
     let pid_file = data_dir.path().join("upload-pack.pid");
-    let hang = format!("echo $$ > {}; exec sleep 300 #", pid_file.display());
+    // The shell creates a redirection's target before it writes to it, so
+    // the pid goes to a temporary name and is renamed into place: the pid
+    // file never exists half-written (#461).
+    let hang = format!(
+        "echo $$ > {pid}.tmp && mv {pid}.tmp {pid}; exec sleep 300 #",
+        pid = pid_file.display()
+    );
     git(&clone, &["config", "remote.origin.uploadpack", &hang]);
 
     let council = single_node_leader().await;
@@ -693,15 +699,11 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
 
     let stuck = wait_for(Duration::from_secs(15), || {
         let pid_file = pid_file.clone();
-        Box::pin(async move { pid_file.exists() })
+        Box::pin(async move { read_pid(&pid_file).is_some() })
     })
     .await;
     assert!(stuck, "the sync never reached the hanging fetch");
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = read_pid(&pid_file).expect("the pid file was complete a moment ago");
 
     shutdown.cancel();
     let stopped = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -709,17 +711,40 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
         stopped.is_ok(),
         "the sync loop kept waiting on a stuck fetch after shutdown"
     );
+    // SIGKILL lands asynchronously: the process can still show as running
+    // for a moment after the loop returns, so wait (bounded) for it to go
+    // rather than taking one look.
+    let gone = wait_for(Duration::from_secs(5), || {
+        Box::pin(async move { !is_running(pid) })
+    })
+    .await;
+    assert!(
+        gone,
+        "the stuck upload-pack is still running ({})",
+        process_state(pid)
+    );
+
+    council.shutdown().await.ok();
+}
+
+/// The pid in `path`, once the file exists and holds a whole pid.
+fn read_pid(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// `ps`'s state letters for `pid`, empty once the process is gone.
+fn process_state(pid: i32) -> String {
     let ps = Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()
         .unwrap();
-    let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
-    assert!(
-        stat.is_empty() || stat.starts_with('Z'),
-        "the stuck upload-pack is still running ({stat})"
-    );
+    String::from_utf8_lossy(&ps.stdout).trim().to_string()
+}
 
-    council.shutdown().await.ok();
+/// Whether `pid` names a live process; a zombie has already been killed.
+fn is_running(pid: i32) -> bool {
+    let state = process_state(pid);
+    !state.is_empty() && !state.starts_with('Z')
 }
 
 fn which_git() -> Option<()> {
