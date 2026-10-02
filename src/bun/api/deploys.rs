@@ -245,30 +245,32 @@ pub(super) async fn rollback_handler(
     {
         return resp;
     }
-    let Some(history) = &state.deploy_history else {
+    if state.deploy_history.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "deploy history unavailable"})),
         )
             .into_response();
-    };
+    }
 
-    // Successful deploys for this app, newest first, that carry a spec.
-    let target_spec = {
-        let all = history.read().await;
-        let mut successful: Vec<&DeployHistoryEntry> = all
-            .iter()
-            .filter(|e| {
-                e.app_id.name == app
-                    && e.app_id.namespace == namespace
-                    && e.result == crate::meat::deploy_types::DeployResult::Completed
-                    && e.spec.is_some()
-            })
-            .collect();
-        successful.reverse(); // newest first
-        // [0] is the current version; [1] is the rollback target.
-        successful.get(1).and_then(|e| e.spec.clone()).map(|s| *s)
+    // Every node's records, not just this one's: the node asked may never
+    // have run the app. The spec in Raft is the current version.
+    let history: Vec<DeployHistoryEntry> = cluster_deploy_history(&state, &app, &namespace, false)
+        .await
+        .history
+        .into_iter()
+        .map(|tagged| tagged.row)
+        .collect();
+    let current = match &state.council {
+        Some(council) => council
+            .desired_state()
+            .await
+            .apps
+            .get(&crate::meat::AppId::new(&app, &namespace))
+            .cloned(),
+        None => None,
     };
+    let target_spec = crate::bun::cluster_view::rollback_target(&history, current.as_ref());
 
     let Some(spec) = target_spec else {
         return (
