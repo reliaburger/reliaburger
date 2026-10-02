@@ -288,6 +288,71 @@ async fn status_answers_while_a_deploy_step_retains_a_network_reference() {
         .await;
 }
 
+/// An egress-protected instance's pre-start resolved its allowlist inside
+/// the turn, under a fixed 5 s timeout (#419). The deploy worker resolves
+/// it now, before it asks the loop to program it.
+#[tokio::test]
+async fn status_answers_while_a_deploy_resolves_an_egress_allowlist() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    // Admit the allowlist. The mock has no kernel hooks, so the loop then
+    // refuses to program it, but only after the worker's lookup.
+    agent
+        .supervisor
+        .set_egress_capability(crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        });
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    running.stalls.set(LoopStall::EgressDns, STALL);
+    running.measure_from_here();
+    let (events, _progress) = mpsc::channel(64);
+    let config = Config::parse(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\n[app.web.egress]\nallow = ['203.0.113.9:443']\n",
+    )
+    .unwrap();
+    tx.send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    wait_for_calls(&grill, "retain_network_reference", 0, 1).await;
+    // The lookup comes straight after the retain; queue the status while
+    // it is under way.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    running
+        .assert_responsive("a deploy resolved its egress allowlist")
+        .await;
+}
+
+/// Journalling a restarted backend's publication read the runtime's whole
+/// launch inventory inside the turn, under a fixed 5 s timeout (#419).
+/// The restart step reads the instance's execution now, with the rest of
+/// what it started, and the publication takes it from there.
+#[tokio::test]
+async fn status_answers_while_a_restart_reads_a_slow_launch_inventory() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let running = RunningAgent::start(agent, tx, shutdown);
+    grill.set_inventory_delay(Some(STALL));
+    let before = calls_of(&grill, "start");
+    running.measure_from_here();
+    crash(&grill);
+    wait_for_calls(&grill, "start", before, 1).await;
+    // The step reads the inventory right after the start, then the loop
+    // journals the publication. Judge the turns once both had time to meet
+    // the slow inventory.
+    tokio::time::sleep(STALL * 2 + std::time::Duration::from_millis(500)).await;
+    running
+        .assert_responsive("a restart read a slow launch inventory for its publication")
+        .await;
+}
+
 /// `Logs` reads every instance's whole capture into memory, on the loop. A
 /// 56 MB capture (#278) takes hundreds of milliseconds; a slow disk longer.
 #[tokio::test]
@@ -1008,6 +1073,36 @@ async fn wait_for_release(allocator: &PortAllocator, host_port: u16, within: std
     .expect("the startup retirement never released its port");
 }
 
+/// The readiness subsystem a startup retirement reports through.
+const STARTUP_CLEANUP: &str = "discovery:startup-cleanup";
+
+/// Wait until every startup retirement has finished, the discovery
+/// recovery after them included.
+async fn wait_for_startup_cleanup(
+    readiness: &crate::bun::readiness::ReadinessTracker,
+    within: std::time::Duration,
+) {
+    tokio::time::timeout(within, async {
+        loop {
+            let ready = readiness
+                .snapshot()
+                .await
+                .subsystems
+                .iter()
+                .any(|subsystem| {
+                    subsystem.name == STARTUP_CLEANUP
+                        && subsystem.state == crate::bun::readiness::SubsystemState::Ready
+                });
+            if ready {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the startup retirement never finished");
+}
+
 /// How far past the turn's runtime budget a turn that gave up at that
 /// deadline may end: the bookkeeping after the wait, with room for a loaded
 /// coverage runner. Well inside the 1 s [`TURN_BUDGET`], so a turn that
@@ -1124,25 +1219,73 @@ async fn the_tick_waits_out_a_startup_retirement_whose_inventory_is_slow() {
     server.abort();
 }
 
+/// The four journal writes that complete a startup retirement never share a
+/// tick (#422). Whether they did used to depend on the disk: writes that
+/// left time before the turn's deadline let the artifact cleanup finish in
+/// the same turn, and then the discovery recovery's two writes followed it,
+/// so a write just under 250 ms put the turn near two runtime budgets.
+/// Counting the writes per tick makes that independent of the disk.
+#[tokio::test]
+async fn a_startup_retirement_journals_at_most_two_writes_a_tick() {
+    let (mut agent, _grill, _root, _host_port, confirmation) =
+        restarted_with_a_startup_retirement().await;
+    let (client, server) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
+    agent.set_producer_release_client(client);
+    let mut writes_per_tick = Vec::new();
+    for _ in 0..10 {
+        if !agent.startup_cleanup_pending {
+            break;
+        }
+        let before = agent.loop_stalls.reached(LoopStall::Persist);
+        agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+        agent.drive_startup_retirements().await;
+        agent.turn_deadline = None;
+        writes_per_tick.push(agent.loop_stalls.reached(LoopStall::Persist) - before);
+    }
+    assert!(
+        !agent.startup_cleanup_pending,
+        "the startup retirement never finished: {writes_per_tick:?}"
+    );
+    assert_eq!(
+        writes_per_tick.iter().sum::<usize>(),
+        4,
+        "journal writes per tick: {writes_per_tick:?}"
+    );
+    assert!(
+        writes_per_tick.iter().all(|writes| *writes <= 2),
+        "a tick journalled more than two writes: {writes_per_tick:?}"
+    );
+    server.abort();
+}
+
 /// Completing a startup retirement journals it: the network reference's
-/// release, then the discovery service's retirement, four fsync'd persists
-/// in one turn. Persists may stay inline (#351, decision 2) only while a
-/// disk taking 150 ms a write keeps every turn in budget, and the
-/// harness's slow disk didn't reach the discovery journal until now.
+/// release, then the discovery service's retirement, four fsync'd persists.
+/// Persists may stay inline (#351, decision 2) only while a slow disk keeps
+/// every turn in budget. In one turn the four came to about 663 ms at
+/// 150 ms a write, and would pass the budget at the 250 ms a write a loaded
+/// coverage runner measured (#421), so the release and the service's
+/// retirement now journal on different ticks (#422).
 #[tokio::test]
 async fn a_startup_retirement_completes_within_the_budget_on_a_slow_disk() {
     let (mut agent, _grill, _root, host_port, confirmation) =
         restarted_with_a_startup_retirement().await;
     let allocator = agent.supervisor.port_allocator.clone();
+    let readiness = crate::bun::readiness::ReadinessTracker::new();
+    readiness.register(STARTUP_CLEANUP, true).await;
+    agent.set_readiness_tracker(readiness.clone());
     let (client, server) =
         crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
     agent.set_producer_release_client(client);
     let running = run_restarted(agent);
     running
         .stalls
-        .set(LoopStall::Persist, std::time::Duration::from_millis(150));
+        .set(LoopStall::Persist, std::time::Duration::from_millis(250));
     running.measure_from_here();
     wait_for_release(&allocator, host_port, std::time::Duration::from_secs(10)).await;
+    // The port goes back before the retirement's last journal writes, so
+    // judge only once the whole retirement has finished.
+    wait_for_startup_cleanup(&readiness, std::time::Duration::from_secs(10)).await;
     running
         .assert_responsive("a startup retirement journalled its release to a slow disk")
         .await;
