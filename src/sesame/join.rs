@@ -783,4 +783,74 @@ mod tests {
         // the internal master secret. This test just verifies
         // init completes without error.
     }
+    #[tokio::test]
+    async fn audit_enrolled_epoch_survives_identity_storage_and_runtime_restart() {
+        let (state, token, secret) = setup_with_known_key();
+        let (issued, key) = issue(&state, &token, "node-02", SerialNumber(6), &secret).unwrap();
+        // The authenticated recovered council must be able to enrol this
+        // genuinely fresh node into its new epoch without accepting old RPCs.
+        let mut wire = serde_json::to_value(JoinBundle::from_result(&issued)).unwrap();
+        wire["recovery_epoch"] = serde_json::json!(1);
+        let bundle: JoinBundle = serde_json::from_value(wire).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let identity_dir = root.path().join("identity");
+        crate::sesame::identity_store::save(&identity_dir, &bundle.into_identity(key).unwrap())
+            .unwrap();
+        for _ in 0..2 {
+            let identity =
+                crate::sesame::credentials::LiveNodeIdentity::load(&identity_dir).unwrap();
+            let free = || {
+                std::net::TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+            };
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let (handle, runtime) = crate::cluster::runtime::start(
+                crate::cluster::runtime::ClusterParams {
+                    node_name: "node-02".into(),
+                    gossip_addr: free(),
+                    raft_port: free().port(),
+                    reporting_port: free().port(),
+                    api_port: free().port(),
+                    reporting_config: Default::default(),
+                    seeds: vec!["127.0.0.1:9".parse().unwrap()],
+                    wrapping_ikm: None,
+                    bootstrap_security_state: None,
+                    data_dir: root.path().into(),
+                    mayo: None,
+                    rollup_interval: Duration::from_secs(60),
+                    identity: Some(identity),
+                    backup: Default::default(),
+                    labels: Default::default(),
+                    self_disk_pressured_rx: None,
+                    readiness: None,
+                },
+                shutdown.clone(),
+            )
+            .await
+            .unwrap();
+            let council = handle.council.as_ref().unwrap();
+            let epoch = council.desired_state().await.recovery_epoch;
+            let voters = council
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count();
+            shutdown.cancel();
+            council.shutdown().await.unwrap();
+            drop(handle);
+            drop(runtime);
+            assert_eq!(
+                epoch, 1,
+                "fresh enrolment lost its recovery epoch before Raft startup"
+            );
+            assert_eq!(
+                voters, 0,
+                "an enrolled joiner must not bootstrap a competing council"
+            );
+        }
+    }
 }
