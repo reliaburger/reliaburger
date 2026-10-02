@@ -346,3 +346,12 @@ memory charts on a node's own page. The tests live in
 ephemeral port, and the tests check the merge, the warning for a member that
 doesn't answer, that a `local=true` request never fans out, and that a scoped
 token's rows stay inside its namespace.
+
+The NODE column exposed one thing the views hadn't been ready for. Pressing
+Enter on a job opened `View::JobDetail { name, namespace }`, and the page
+showed the first job with that name. Before the merge there was only ever one;
+now node 2's failed run and node 1's finished one share a name, and choosing
+node 2's row showed node 1's. The view now carries the node and instance too,
+the same identity the row has, and the page looks up exactly that. When a view
+is keyed by less than the row it was opened from, it will eventually show the
+wrong row. `job_detail_shows_the_selected_nodes_instance` pins it.
