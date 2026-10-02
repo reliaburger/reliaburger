@@ -2228,27 +2228,47 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// List API tokens from SecurityState via the agent.
-pub async fn token_list() -> Result<(), RelishError> {
-    let tokens = BunClient::default_local().token_list().await?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    print!("{}", render_token_list(&tokens, now));
+/// List API tokens via the agent, with every node's last use merged in.
+pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
+    let listing = BunClient::default_local().token_list().await?;
+    // A member that didn't answer may hold a more recent use; say so on
+    // stderr so `-o json` stays parseable.
+    for warning in &listing.warnings {
+        eprintln!("warning: last use incomplete: {warning}");
+    }
+    match output {
+        OutputFormat::Human => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            print!("{}", render_token_list(&listing.tokens, now));
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&listing).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&listing).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
     Ok(())
 }
 
 /// The `relish token list` table: UTC creation and expiry times, with how
-/// long a live token has left.
+/// long a live token has left, when it was last used and its scope.
+///
+/// New columns go on the right, so a script that cuts the older ones out
+/// by position keeps working.
 fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String {
     use std::fmt::Write as _;
     if tokens.is_empty() {
         return "no tokens\n".to_string();
     }
     let mut out = format!(
-        "{:<20} {:<12} {:<21} {}\n",
-        "NAME", "ROLE", "CREATED", "EXPIRES"
+        "{:<20} {:<12} {:<21} {:<31} {:<21} {}\n",
+        "NAME", "ROLE", "CREATED", "EXPIRES", "LAST USED", "SCOPE"
     );
     for token in tokens {
         let expires = match token.expires_at {
@@ -2256,17 +2276,39 @@ fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String
             Some(at) if at <= now => format!("{} (expired)", format_utc(at)),
             Some(at) => format!("{} (in {})", format_utc(at), format_duration(at - now)),
         };
+        let last_used = token
+            .last_used
+            .map_or_else(|| "never".to_string(), format_utc);
         // Writing to a String can't fail.
         let _ = writeln!(
             out,
-            "{:<20} {:<12} {:<21} {}",
+            "{:<20} {:<12} {:<21} {:<31} {:<21} {}",
             token.name,
             token.role,
             format_utc(token.created_at),
-            expires
+            expires,
+            last_used,
+            render_token_scope(&token.scope),
         );
     }
     out
+}
+
+/// A token's scope for the table: `all`, or the apps and namespaces it's
+/// confined to.
+fn render_token_scope(scope: &super::client::TokenScopeSummary) -> String {
+    let mut parts = Vec::new();
+    if let Some(apps) = &scope.apps {
+        parts.push(format!("apps={}", apps.join(",")));
+    }
+    if let Some(namespaces) = &scope.namespaces {
+        parts.push(format!("namespaces={}", namespaces.join(",")));
+    }
+    if parts.is_empty() {
+        "all".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
@@ -2648,43 +2690,70 @@ mod tests {
     }
 
     #[test]
-    fn token_list_renders_human_times_and_expiry() {
-        use super::super::client::TokenSummary;
+    fn token_list_renders_human_times_expiry_last_use_and_scope() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
         // 2026-09-25 12:00:00 UTC.
         let now = 1_790_337_600;
         let tokens = vec![
             TokenSummary {
                 name: "ci-bot".to_string(),
                 role: "deployer".to_string(),
+                scope: TokenScopeSummary {
+                    apps: None,
+                    namespaces: Some(vec!["shop".to_string()]),
+                },
                 created_at: now - 86_400,
                 expires_at: Some(now + 30 * 86_400),
+                last_used: Some(now - 600),
             },
             TokenSummary {
                 name: "admin".to_string(),
                 role: "admin".to_string(),
+                scope: TokenScopeSummary::default(),
                 created_at: now - 3 * 86_400,
                 expires_at: None,
+                last_used: Some(now),
             },
             TokenSummary {
                 name: "old-reader".to_string(),
                 role: "read-only".to_string(),
+                scope: TokenScopeSummary {
+                    apps: Some(vec!["web".to_string(), "api".to_string()]),
+                    namespaces: Some(vec!["shop".to_string()]),
+                },
                 created_at: now - 90 * 86_400,
                 expires_at: Some(now - 3_600),
+                last_used: None,
             },
             TokenSummary {
                 name: "short".to_string(),
                 role: "read-only".to_string(),
+                scope: TokenScopeSummary::default(),
                 created_at: now,
                 expires_at: Some(now + 5_400),
+                last_used: None,
             },
         ];
         insta::assert_snapshot!(render_token_list(&tokens, now), @r"
-        NAME                 ROLE         CREATED               EXPIRES
-        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)
-        admin                admin        2026-09-22 12:00 UTC  never
-        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)
-        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)
+        NAME                 ROLE         CREATED               EXPIRES                         LAST USED             SCOPE
+        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)   2026-09-25 11:50 UTC  namespaces=shop
+        admin                admin        2026-09-22 12:00 UTC  never                           2026-09-25 12:00 UTC  all
+        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)  never                 apps=web,api namespaces=shop
+        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)    never                 all
         ");
+    }
+
+    /// An older agent's answer has no scope or last use; it still parses,
+    /// as unscoped and never used.
+    #[test]
+    fn token_listing_parses_an_answer_without_scope_or_last_use() {
+        let listing: super::super::client::TokenListing = serde_json::from_str(
+            r#"{"tokens":[{"name":"a","role":"admin","created_at":1,"expires_at":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listing.tokens[0].last_used, None);
+        assert_eq!(listing.tokens[0].scope, Default::default());
+        assert!(listing.warnings.is_empty());
     }
 
     #[test]

@@ -16,16 +16,45 @@ use crate::config::Config;
 use super::RelishError;
 
 /// One API token as `GET /v1/token/list` describes it; never the secret.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenSummary {
     /// Token name, as given to `relish token create`.
     pub name: String,
     /// Role the token grants.
     pub role: String,
+    /// The apps and namespaces the token is confined to.
+    #[serde(default)]
+    pub scope: TokenScopeSummary,
     /// Creation time, Unix seconds.
     pub created_at: u64,
     /// Expiry, Unix seconds; `None` for a token that never expires.
     pub expires_at: Option<u64>,
+    /// The latest request any node authenticated with it, Unix seconds;
+    /// `None` when no node has seen it used since that node started.
+    #[serde(default)]
+    pub last_used: Option<u64>,
+}
+
+/// A token's confinement; `None` for either list means no restriction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenScopeSummary {
+    /// The apps it may act on.
+    #[serde(default)]
+    pub apps: Option<Vec<String>>,
+    /// The namespaces it may act in.
+    #[serde(default)]
+    pub namespaces: Option<Vec<String>>,
+}
+
+/// `GET /v1/token/list`: the tokens, and the members whose last-use times
+/// are missing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenListing {
+    /// Every token in the cluster.
+    pub tokens: Vec<TokenSummary>,
+    /// One line per member that didn't answer.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// The build a Bun agent reports on `/v1/version`.
@@ -2099,16 +2128,10 @@ impl BunClient {
         response.json().await.map_err(classify_error)
     }
 
-    /// List API tokens from SecurityState (names, roles and times only).
-    pub async fn token_list(&self) -> Result<Vec<TokenSummary>, RelishError> {
-        #[derive(serde::Deserialize)]
-        struct TokenList {
-            tokens: Vec<TokenSummary>,
-        }
-        Ok(self
-            .get_typed_json::<TokenList>("/v1/token/list")
-            .await?
-            .tokens)
+    /// List API tokens: names, roles, scopes, times and last use; never a
+    /// secret.
+    pub async fn token_list(&self) -> Result<TokenListing, RelishError> {
+        self.get_typed_json::<TokenListing>("/v1/token/list").await
     }
 
     /// Create an API token via the agent (persisted in Raft). Returns the

@@ -61,6 +61,65 @@ pub struct ClusterJobs {
     pub warnings: Vec<String>,
 }
 
+/// One API token as `GET /v1/token/list` describes it: never the secret
+/// or its hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenSummary {
+    /// The name given to `relish token create`.
+    pub name: String,
+    /// The stable principal id audit events name (`token:<digest>`). Names
+    /// can be reused after a revoke; this can't, so merging joins on it.
+    pub principal: String,
+    /// The role the token grants (`admin`, `deployer`, `read-only`).
+    pub role: String,
+    /// The apps and namespaces the token is confined to; `None` for each
+    /// means no restriction.
+    pub scope: crate::sesame::types::TokenScope,
+    /// Creation time, Unix seconds.
+    pub created_at: u64,
+    /// Expiry, Unix seconds; `None` for a token that never expires.
+    pub expires_at: Option<u64>,
+    /// When any node last authenticated a request with this token, Unix
+    /// seconds; `None` if no node has since it last started.
+    pub last_used: Option<u64>,
+}
+
+/// `GET /v1/token/list`: the cluster's API tokens, with the latest use any
+/// node saw for each.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClusterTokens {
+    /// Tokens in the answering node's store order.
+    pub tokens: Vec<TokenSummary>,
+    /// One line per member whose last-use times are missing.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Fold every peer's last-use times into this node's token list.
+///
+/// `local` decides which tokens exist: it comes from this node's Raft
+/// state. A peer's row joins on the principal, not the name, so a token
+/// revoked and re-created under the same name never inherits the old
+/// one's use. Each token keeps the latest time any node saw.
+pub fn merge_token_last_used(
+    mut local: Vec<TokenSummary>,
+    peers: Vec<Vec<TokenSummary>>,
+) -> Vec<TokenSummary> {
+    let mut latest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for row in peers.into_iter().flatten() {
+        if let Some(seen) = row.last_used {
+            let entry = latest.entry(row.principal).or_insert(seen);
+            *entry = (*entry).max(seen);
+        }
+    }
+    for token in &mut local {
+        if let Some(&seen) = latest.get(&token.principal) {
+            token.last_used = token.last_used.max(Some(seen));
+        }
+    }
+    local
+}
+
 /// Tag every row of each node's answer with that node.
 pub fn tag_rows<T>(answers: Vec<(String, Vec<T>)>) -> Vec<NodeTagged<T>> {
     answers

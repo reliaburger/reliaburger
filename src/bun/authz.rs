@@ -294,6 +294,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/identity/sign", Admin, Cluster(ADMIN)),
     // Credential and trust management additionally requires an unscoped user.
     gated(Post, "/v1/token/create", Admin, Cluster(ADMIN)),
+    // With `local=true` the system principal may also read it: that's the
+    // node fan-out asking a peer for its last-use times (F05 I2).
     gated(Get, "/v1/token/list", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),

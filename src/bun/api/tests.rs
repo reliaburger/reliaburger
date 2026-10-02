@@ -455,6 +455,54 @@ async fn router_stays_open_when_no_user_tokens_exist() {
     shutdown.cancel();
 }
 
+/// The bootstrap window opens only when the store is *empty*. A store whose
+/// every token has expired is not empty, so it still refuses a caller with
+/// no token: expiry must never quietly reopen the API (F05 I2).
+#[tokio::test]
+async fn a_store_whose_every_token_has_expired_still_refuses_an_anonymous_request() {
+    let expired_at = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    let tokens = [
+        ("admin", crate::sesame::types::ApiRole::Admin),
+        ("ci", crate::sesame::types::ApiRole::Deployer),
+    ]
+    .into_iter()
+    .map(|(name, role)| {
+        crate::sesame::token::create_token(
+            name,
+            role,
+            crate::sesame::types::TokenScope::default(),
+            Some(expired_at),
+        )
+        .unwrap()
+        .token
+    })
+    .collect();
+    let (app, shutdown) = setup_with_auth(tokens, None).await;
+    assert_eq!(
+        get_status(app, "/v1/status", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn an_expired_token_gets_401() {
+    let (live, _) = named_user_token("admin", crate::sesame::types::ApiRole::Admin);
+    let expired = crate::sesame::token::create_token(
+        "old-ci",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope::default(),
+        Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60)),
+    )
+    .unwrap();
+    let (app, shutdown) = setup_with_auth(vec![live, expired.token], None).await;
+    assert_eq!(
+        get_status(app, "/v1/status", Some(&expired.plaintext)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn protected_route_returns_401_without_a_token_once_a_user_token_exists() {
     let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);

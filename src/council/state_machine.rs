@@ -712,6 +712,21 @@ impl StateMachineInner {
                     .api_tokens
                     .retain(|t| t.name != *name);
             }
+            RaftRequest::SweepExpiredApiTokens { now_unix_ms } => {
+                // The entry carries the leader's clock, so replicas never
+                // consult their own: all of them remove the same tokens.
+                // `tokens_to_sweep` keeps the last Admin and never empties
+                // the store, for the reason the revoke above refuses to.
+                let removed = crate::sesame::token::tokens_to_sweep(
+                    &self.state.security_state.api_tokens,
+                    *now_unix_ms,
+                );
+                self.state
+                    .security_state
+                    .api_tokens
+                    .retain(|token| !removed.contains(&token.name));
+                return Some(CouncilResponse::ApiTokensSwept { removed });
+            }
             RaftRequest::AllocateSerial => {
                 // Return the pre-increment value as this entry's serial.
                 let serial = self.state.security_state.next_serial;
@@ -5297,6 +5312,147 @@ mod tests {
             name: "ci".to_string(),
         });
         assert!(inner.state.security_state.api_tokens.is_empty());
+    }
+
+    fn expiring_api_token(
+        name: &str,
+        role: crate::sesame::types::ApiRole,
+        expires_unix_ms: Option<u64>,
+    ) -> crate::sesame::types::ApiToken {
+        crate::sesame::types::ApiToken {
+            name: name.to_string(),
+            token_hash: name.as_bytes().to_vec(),
+            token_salt: vec![4, 5, 6],
+            role,
+            scope: crate::sesame::types::TokenScope::default(),
+            expires_at: expires_unix_ms
+                .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+            created_at: std::time::UNIX_EPOCH,
+        }
+    }
+
+    const SWEEP_DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const SWEEP_NOW_MS: u64 = 2_000 * SWEEP_DAY_MS;
+
+    fn token_names(inner: &StateMachineInner) -> Vec<String> {
+        inner
+            .state
+            .security_state
+            .api_tokens
+            .iter()
+            .map(|token| token.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn sweep_removes_an_expired_token_past_the_grace_and_keeps_one_inside_it() {
+        use crate::sesame::types::ApiRole;
+        let mut inner = StateMachineInner::default();
+        for token in [
+            expiring_api_token("admin", ApiRole::Admin, None),
+            expiring_api_token(
+                "stale",
+                ApiRole::Deployer,
+                Some(SWEEP_NOW_MS - 2 * SWEEP_DAY_MS),
+            ),
+            expiring_api_token("recent", ApiRole::ReadOnly, Some(SWEEP_NOW_MS - 1_000)),
+        ] {
+            inner.apply_request(&RaftRequest::CreateApiToken(token));
+        }
+
+        let response = inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS,
+        });
+
+        assert_eq!(
+            response,
+            Some(CouncilResponse::ApiTokensSwept {
+                removed: vec!["stale".to_string()]
+            })
+        );
+        assert_eq!(token_names(&inner), ["admin", "recent"]);
+    }
+
+    #[test]
+    fn sweep_keeps_the_last_admin_even_when_it_has_expired() {
+        use crate::sesame::types::ApiRole;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(expiring_api_token(
+            "admin",
+            ApiRole::Admin,
+            Some(SWEEP_NOW_MS - 30 * SWEEP_DAY_MS),
+        )));
+        inner.apply_request(&RaftRequest::CreateApiToken(expiring_api_token(
+            "ci",
+            ApiRole::Deployer,
+            Some(SWEEP_NOW_MS - 30 * SWEEP_DAY_MS),
+        )));
+
+        inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS,
+        });
+
+        assert_eq!(token_names(&inner), ["admin"]);
+    }
+
+    #[test]
+    fn sweep_never_empties_the_token_store() {
+        use crate::sesame::types::ApiRole;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(expiring_api_token(
+            "only",
+            ApiRole::ReadOnly,
+            Some(SWEEP_NOW_MS - 30 * SWEEP_DAY_MS),
+        )));
+
+        let response = inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS,
+        });
+
+        assert_eq!(
+            response,
+            Some(CouncilResponse::ApiTokensSwept { removed: vec![] })
+        );
+        assert_eq!(token_names(&inner), ["only"]);
+    }
+
+    #[test]
+    fn sweep_is_deterministic_given_now() {
+        use crate::sesame::types::ApiRole;
+        let tokens = [
+            expiring_api_token("a", ApiRole::Admin, Some(SWEEP_NOW_MS - 3 * SWEEP_DAY_MS)),
+            expiring_api_token("b", ApiRole::Admin, Some(SWEEP_NOW_MS - 3 * SWEEP_DAY_MS)),
+            expiring_api_token(
+                "c",
+                ApiRole::Deployer,
+                Some(SWEEP_NOW_MS - 3 * SWEEP_DAY_MS),
+            ),
+            expiring_api_token("d", ApiRole::ReadOnly, Some(SWEEP_NOW_MS + SWEEP_DAY_MS)),
+        ];
+        let replica = || {
+            let mut inner = StateMachineInner::default();
+            for token in &tokens {
+                inner.apply_request(&RaftRequest::CreateApiToken(token.clone()));
+            }
+            inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+                now_unix_ms: SWEEP_NOW_MS,
+            });
+            inner
+        };
+        let (first, second) = (replica(), replica());
+        assert_eq!(token_names(&first), token_names(&second));
+        assert_eq!(token_names(&first), ["b", "d"]);
+
+        // An earlier `now` leaves everything in place: the clock that
+        // decides is the one in the entry, not the replica's.
+        let mut early = StateMachineInner::default();
+        for token in &tokens {
+            early.apply_request(&RaftRequest::CreateApiToken(token.clone()));
+        }
+        early.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS - 3 * SWEEP_DAY_MS,
+        });
+        assert_eq!(token_names(&early), ["a", "b", "c", "d"]);
     }
 
     #[test]

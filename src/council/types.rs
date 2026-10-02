@@ -330,6 +330,12 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
+    /// Remove the API tokens that expired more than
+    /// [`crate::sesame::token::EXPIRED_TOKEN_GRACE`] before `now_unix_ms`.
+    /// The leader proposes it on a timer; the state machine decides what to
+    /// remove from `now_unix_ms` alone, so every replica removes the same
+    /// tokens. It never removes the last Admin and never empties the store.
+    SweepExpiredApiTokens { now_unix_ms: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +384,9 @@ pub enum CouncilResponse {
     RegistryPublicationStale,
     /// The execution fence committed; release requires all original consumer obligations to finish.
     EndpointExecutionRetired { released: bool },
+    /// A `SweepExpiredApiTokens` entry was applied; carries the names of the
+    /// tokens it removed, in store order (empty when nothing was due).
+    ApiTokensSwept { removed: Vec<String> },
 }
 
 // ---------------------------------------------------------------------------
