@@ -10,9 +10,7 @@ on it's a node.
 It's a **preview**, and the rough edges are part of what it's for:
 - The images come from CI runs of the appliance branch, kept for a day, each
   signed with a throwaway key.
-- A shell script from the repository, `image/tools/seed-fleet.sh`, and a USB
-  stick stand in for claiming machines over the LAN, which relish can't do
-  yet.
+- Seeds on a USB stick stand in for claiming machines over the LAN.
 - We've run all of it in QEMU VMs, both aarch64 and x86_64. Real hardware (a
   fleet of Dell Wyse 3040s) comes next, so expect firmware surprises.
 
@@ -144,33 +142,33 @@ too.)
 
 ## Create the cluster
 
-Back on your laptop, create the cluster and the first node's *seed*: its
-configuration, its keys and its identity, in one small file. List the machine
-that will be node 1 first:
+Back on your laptop, create the cluster and a *seed* for every machine: a
+small file that tells it who it is. List the machine that will be node 1
+first:
 
 ```sh
-image/tools/seed-fleet.sh init ~/home-cluster --cluster home --operator 192.168.1.10 \
+relish cluster create --bare-metal ~/home-cluster --name home \
+  --operator 192.168.1.10 --network 192.168.1.0/24 \
   d8:9e:f3:12:34:56@192.168.1.51 \
   d8:9e:f3:12:34:57@192.168.1.52 \
   d8:9e:f3:12:34:58@192.168.1.53
 ```
 
-`--operator` is your laptop's address, the one relish connects from. Only
-that address can reach the nodes' API. The first run builds a small helper
-from the repository, which takes a few minutes.
+- `--operator` is your laptop's address, the one relish connects from. Only
+  that address can reach the nodes' API.
+- `--network` is your LAN. Each node's firewall lets machines on it reach the
+  cluster ports before they've joined (those ports all need the cluster's
+  certificates). Without it, only the machines listed here get through.
+- The machines become `home-1`, `home-2` and `home-3`.
 
-List every machine you have now. A node's firewall only lets in the listed
-addresses until they've joined, so a machine added later can't reach the
-others. With a bun that takes networks in `bootstrap_peers` (releases up to
-0.1.2 don't), `--network 192.168.1.0/24` lets in any machine on your LAN
-instead (only to the cluster ports, which all need the cluster's
-certificates). Then add a machine by appending `N MAC IP` to
-`~/home-cluster/fleet` and running `seed-fleet.sh join` again.
-
-`~/home-cluster/init` now holds the cluster's master key and its sealed root
-CA key. Back them up: `relish council recover` needs them if the cluster ever
-loses its quorum. `~/home-cluster/stick/seeds/` holds node 1's seed, named
-after its MAC address.
+The cluster's keys are made here, on your laptop, and never anywhere else
+until node 1's seed carries them. `~/home-cluster/secrets` holds the master
+key and the sealed root CA key: back them up, because `relish council
+recover` needs them if the cluster ever loses its quorum. Every other
+machine's seed holds only a join token: single-use, bound to that machine's
+name, and good for a week (`--ttl` to change). Each machine fetches its
+certificate and the master key from the cluster itself when it joins. relish
+now points at node 1, with an admin token.
 
 Make the USB stick: a FAT filesystem labelled `RBSEED`, then copy the `seeds`
 folder onto it. On macOS, check the disk number with `diskutil list` first,
@@ -184,52 +182,53 @@ cp -R ~/home-cluster/stick/seeds /Volumes/RBSEED/
 On Linux, use `mkfs.vfat -n RBSEED /dev/sdX1`, then mount the stick and copy
 the folder.
 
-## Start node 1
+## Start the machines
 
 Plug the stick into node 1 and restart it (a power cycle is fine). While it
 boots, it finds the seed with its own MAC address on the stick and becomes
-the cluster's first node:
+the cluster's first node. Node 1's seed is the one that carries the cluster's
+keys, so the machine wipes it from the stick once it has copied it:
 
 ```
-reliaburger: seed installed from the RBSEED stick (for d8:9e:f3:12:34:56): name = "node-01"
-reliaburger: bun healthy (bun 0.1.0) on OS 2026.40.32
+reliaburger: seed from the RBSEED stick (seeds/d8-9e-f3-12-34-56.seed)
+reliaburger: /etc/reliaburger/node.toml is ready to create home as home-1 on 192.168.1.51
+reliaburger: wiped seeds/d8-9e-f3-12-34-56.seed from the RBSEED stick: it held the master key
+reliaburger: bun healthy (bun 0.3.0) on OS 2026.41.0
 ```
 
-Then, from your laptop:
+Then take the stick to the others, restarting each with it in. Each picks its
+own seed, enrols with its token and fetches the master key:
 
-```sh
-. ~/home-cluster/env.sh
-relish nodes
+```
+reliaburger: enrolled as home-2 through 192.168.1.51
+reliaburger: fetched the master key from 192.168.1.51
 ```
 
-`env.sh` points relish at node 1, with the cluster's CA and an admin token.
-You'll see one node, alive, and the leader.
-
-## Add the others
-
-Now that node 1 is up, it can enrol the rest:
-
-```sh
-image/tools/seed-fleet.sh join ~/home-cluster
-cp -R ~/home-cluster/stick/seeds /Volumes/RBSEED/
-```
-
-For each node, `join` asks node 1 for a single-use join token, enrols the node
-with it, and writes its seed. It checks node 1's CA against the fingerprint
-from `init`. One stick now carries every seed. Take it from machine to
-machine, restarting each with the stick in. Each picks the seed with its own
-MAC address. Then:
+The order doesn't matter: a machine that boots before node 1 is up waits for
+it. From your laptop:
 
 ```sh
 relish nodes
 relish wtf
 ```
 
-All of them alive, in the council, and nothing to fix.
+All of them alive, in the council, and nothing to fix. Each machine's
+monitor shows its name, address and whether bun is running.
 
 A machine only looks for a seed until it has one, and waits up to ten
-seconds for the stick. So a stick left in later changes nothing. Keep it
-somewhere safe all the same: it holds every node's keys.
+seconds for the stick. So a stick left in later changes nothing.
+
+## Add machines later
+
+```sh
+relish image seed ~/home-cluster d8:9e:f3:12:34:59@192.168.1.54
+cp -R ~/home-cluster/stick/seeds /Volumes/RBSEED/
+```
+
+The new machine becomes `home-4`, with a join token the cluster mints for
+it. If its address is outside the `--network` you created the cluster with,
+the existing nodes' firewalls drop it until you add it to their `[security]
+bootstrap_peers`.
 
 ## Take the tour
 
@@ -251,8 +250,9 @@ itself after the third try.
 
 Eventually bun will do all of this across the cluster, one node at a time. In
 the preview you stage each node by hand, which needs root SSH. Pass
-`--ssh-key ~/.ssh/id_ed25519.pub` to `seed-fleet.sh init` when you create the
-cluster, and every seed carries your key. Then serve a newer run's artefacts
+`--ssh-key ~/.ssh/id_ed25519.pub` to `relish cluster create` when you create
+the cluster, and every seed carries your key (only the lab images, from pull
+requests, have sshd). Then serve a newer run's artefacts
 over HTTP, and on each node in turn (node 1 last):
 
 ```sh
@@ -294,10 +294,6 @@ from the new image; reinstall them to start clean.
   enrols it.
 - **No OS updates run by bun.** Staging by hand over SSH stands in for them.
 - **Secure Boot** has to be off.
-- **Adding machines later needs `--network`**, and so a bun that takes
-  networks in `bootstrap_peers` (releases up to 0.1.2 don't). Without it, seeds carry only the addresses from `seed-fleet.sh
-  init`, and adding a machine means editing `bootstrap_peers` in
-  `/etc/reliaburger/node.toml` on every node and restarting bun.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and
   upgrading one would leave the other without a majority, so
   `relish upgrade start` refuses. Use three or more.

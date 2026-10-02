@@ -138,12 +138,12 @@ mod tests {
         let index = find_chapter(&chapters, "appliance").unwrap();
         assert_eq!(chapters[index].file, "14_appliance.md");
         assert_eq!(find_chapter(&chapters, "netboot").unwrap(), index);
-        // relish netboot serves the images; the preview's one remaining
-        // stand-in tool seeds the machines.
+        // relish serves the images, creates the cluster and seeds the fleet.
         let markdown = &chapters[index].markdown;
         assert!(markdown.contains("sudo relish netboot os"));
         assert!(!markdown.contains("image/tools/netboot-server.sh"));
-        assert!(markdown.contains("image/tools/seed-fleet.sh"));
+        assert!(markdown.contains("relish cluster create --bare-metal"));
+        assert!(markdown.contains("relish image seed"));
     }
 
     #[test]
