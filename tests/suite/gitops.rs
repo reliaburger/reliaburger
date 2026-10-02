@@ -691,17 +691,19 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
         shutdown.clone(),
     );
 
+    // The shell creates the file for the redirection before `echo` writes
+    // the pid into it, so on a loaded host the file can exist and still be
+    // empty (#461). Wait for a pid, not for the file.
+    let read_pid = |pid_file: &std::path::Path| -> Option<i32> {
+        std::fs::read_to_string(pid_file).ok()?.trim().parse().ok()
+    };
     let stuck = wait_for(Duration::from_secs(15), || {
-        let pid_file = pid_file.clone();
-        Box::pin(async move { pid_file.exists() })
+        let pid = read_pid(&pid_file);
+        Box::pin(async move { pid.is_some() })
     })
     .await;
     assert!(stuck, "the sync never reached the hanging fetch");
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = read_pid(&pid_file).expect("the pid was readable a moment ago");
 
     shutdown.cancel();
     let stopped = tokio::time::timeout(Duration::from_secs(5), handle).await;
