@@ -135,35 +135,13 @@ async fn load_state_from_data_dir(data_dir: &Path) -> Result<DesiredState, Recov
 /// single-voter Raft from the restored state.
 ///
 /// This is what `relish council recover` runs against a *stopped* survivor.
-/// The node must not be running (redb takes an exclusive lock), which is the
-/// operator's responsibility.
+/// Refuses live stores. Installation is journalled and resumed at startup;
+/// the previous directory remains beside the replacement for inspection.
 pub fn recover_data_dir(data_dir: &Path, state: DesiredState) -> Result<(), RecoveryError> {
     crate::compatibility::ensure_state_compatible(data_dir)
         .map_err(|e| RecoveryError::Persist(e.to_string()))?;
-    let raft_dir = data_dir.join("raft");
-    std::fs::create_dir_all(&raft_dir)
-        .map_err(|e| RecoveryError::Persist(format!("create raft dir: {e}")))?;
-
-    // Wipe the dead cluster's log first: its term line and membership belong to
-    // the council that died. A fresh (absent) log makes the node bootstrap.
-    let log_path = raft_dir.join("log.redb");
-    if log_path.exists() {
-        std::fs::remove_file(&log_path)
-            .map_err(|e| RecoveryError::Persist(format!("remove stale log: {e}")))?;
-    }
-
-    let snapshot_path = raft_dir.join("snapshot.redb");
-    // Replace any existing snapshot store so the recovered state is the only
-    // state the node loads.
-    if snapshot_path.exists() {
-        std::fs::remove_file(&snapshot_path)
-            .map_err(|e| RecoveryError::Persist(format!("remove stale snapshot: {e}")))?;
-    }
-    let db = redb::Database::create(&snapshot_path)
-        .map_err(|e| RecoveryError::Persist(format!("create snapshot store: {e}")))?;
-    CouncilStateMachine::persist_recovered_snapshot(&db, state)
-        .map_err(|e| RecoveryError::Persist(format!("write recovered snapshot: {e}")))?;
-    Ok(())
+    super::recovery_storage::replace(&data_dir.join("raft"), state)
+        .map_err(|e| RecoveryError::Persist(e.to_string()))
 }
 
 /// In-process recovery: build a `CouncilNode` seeded from a restored
