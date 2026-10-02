@@ -330,9 +330,15 @@ pub(super) async fn events_handler(
 
 /// Upgrade an authenticated request to the live event stream.
 pub(super) async fn ws_events_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    // The same events as `/v1/events`, live: they span every namespace, so a
+    // scoped token is refused before the upgrade, as it is there (C3).
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     upgrade
         .on_upgrade(move |socket| ws_events_session(socket, state.events))
         .into_response()

@@ -4351,6 +4351,51 @@ async fn scoped_token_is_refused_streaming_another_namespaces_logs() {
     let _ = server.await;
 }
 
+/// Audit events span every namespace, so `/v1/events` refuses a scoped
+/// token (C3). The live stream of the same events, `/v1/ws/events`, checked
+/// nothing: route authorisation lets any token through, and the handler
+/// upgraded straight away, so a token scoped to `team-a` streamed every
+/// tenant's events. It must refuse the upgrade the same way.
+#[tokio::test]
+async fn scoped_token_is_refused_the_live_event_stream() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+    assert_eq!(
+        get_status(app.clone(), "/v1/events", Some(&tok)).await,
+        StatusCode::FORBIDDEN,
+        "the HTTP route already refuses"
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+
+    let mut request = format!("ws://{address}/v1/ws/events")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {tok}").parse().unwrap());
+    let error = tokio_tungstenite::connect_async(request)
+        .await
+        .expect_err("the event stream upgraded for a scoped token");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        other => panic!("expected an HTTP refusal, got {other:?}"),
+    }
+
+    shutdown.cancel();
+    let _ = server.await;
+}
+
 /// `/v1/logs/sql` takes no app or namespace to check a scope against, and
 /// arbitrary SQL can't be rewritten into a tenant-filtered query. A scoped
 /// token is refused outright rather than served every tenant's logs (C3).
