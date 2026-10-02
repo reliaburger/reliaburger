@@ -1054,11 +1054,23 @@ mod tests {
             },
         };
 
+        // Read the first instance's spec while it still owns its bundle: once
+        // the DNS client exits, cleanup deletes `config.json` (it holds the
+        // decrypted environment).
+        let config_path = tmp
+            .path()
+            .join("bundles")
+            .join(&ids[0].0)
+            .join("config.json");
+        let mut first_config = None;
         for id in &ids {
             grill
                 .create(id, &spec)
                 .await
                 .expect("create a rootful runc workload and netns");
+            if first_config.is_none() {
+                first_config = Some(std::fs::read(&config_path).unwrap());
+            }
             grill.start(id).await.expect("start a DNS client");
         }
 
@@ -1105,16 +1117,8 @@ mod tests {
             );
         }
 
-        let config: crate::grill::oci::OciSpec = serde_json::from_slice(
-            &std::fs::read(
-                tmp.path()
-                    .join("bundles")
-                    .join(&ids[0].0)
-                    .join("config.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let config: crate::grill::oci::OciSpec =
+            serde_json::from_slice(&first_config.expect("the first spec was read")).unwrap();
         let resolver_mount = config
             .mounts
             .iter()
