@@ -448,7 +448,7 @@ pub fn spawn_leader_scheduler(
                 use super::capacity::CapacityAdmissionError;
                 use crate::meat::scheduler::{ScheduleError, Scheduler};
 
-                let ready = reports.stale_nodes.is_empty()
+                let ready = !has_stale_member(&members, &reports)
                     && members
                         .iter()
                         .all(|member| member.state == NodeState::Alive)
@@ -1025,6 +1025,16 @@ fn node_can_run(
     node.ready
         && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!dns_required || node.capabilities.dns.can_resolve_internal())
+}
+
+/// Whether any member the scheduler plans over has a stale report. Only
+/// members count: the aggregator keeps a deadline for every gossip member,
+/// including retired ones the scheduler has already filtered out, and a node
+/// that never reports again mustn't block capacity admission for good.
+fn has_stale_member(members: &[MembershipSnapshot], reports: &AggregatedState) -> bool {
+    members
+        .iter()
+        .any(|member| reports.stale_nodes.contains(&member.node_id))
 }
 
 /// The members gossip currently puts in `state`.
@@ -6027,19 +6037,63 @@ mod audit_stale_endpoints {
                 }],
             },
         );
+        let backends = |catalog: &crate::onion::catalog::EndpointCatalog| {
+            catalog
+                .services
+                .values()
+                .flat_map(|s| s.backends.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A stale report publishes nothing, healthy or not.
         let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
-        let unhealthy = catalog
-            .services
-            .values()
-            .flat_map(|s| &s.backends)
-            .all(|b| !b.healthy);
-        desired.endpoint_catalog = catalog;
-        let evicted =
-            build_endpoint_catalog(&members, &AggregatedState::default(), &desired).unwrap();
-        eprintln!("backends after report eviction: {:?}", evicted.services);
         assert!(
-            unhealthy,
-            "stale report still publishes a healthy backend, then report eviction preserves it indefinitely"
+            backends(&catalog).is_empty(),
+            "a stale report must not publish its last backends"
         );
+
+        // The committed catalogue still holds a healthy backend from when the
+        // report was fresh.
+        let mut fresh = reports.clone();
+        fresh.stale_nodes.clear();
+        desired.endpoint_catalog = build_endpoint_catalog(&members, &fresh, &desired).unwrap();
+        assert_eq!(backends(&desired.endpoint_catalog).len(), 1);
+
+        // Its payload is evicted but the node stays stale: withdrawn, not carried.
+        let mut evicted = AggregatedState::default();
+        evicted.stale_nodes.push(NodeId::new("n1"));
+        let catalog = build_endpoint_catalog(&members, &evicted, &desired).unwrap();
+        assert!(
+            backends(&catalog).is_empty(),
+            "report eviction must not resurrect an expired backend"
+        );
+
+        // Within a new leader's first window (no report, not yet stale) the
+        // committed backend is kept.
+        let catalog =
+            build_endpoint_catalog(&members, &AggregatedState::default(), &desired).unwrap();
+        assert_eq!(backends(&catalog).len(), 1);
+    }
+
+    #[test]
+    fn only_a_stale_planned_member_blocks_capacity_admission() {
+        let member = |name: &str| MembershipSnapshot {
+            node_id: NodeId::new(name),
+            address: "10.1.1.1:9116".parse().unwrap(),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: Default::default(),
+            first_seen: Instant::now(),
+            resources: None,
+        };
+        let members = vec![member("planned")];
+        let mut reports = AggregatedState::default();
+        assert!(!has_stale_member(&members, &reports));
+        reports.stale_nodes.push(NodeId::new("retired"));
+        assert!(!has_stale_member(&members, &reports));
+        reports.stale_nodes.push(NodeId::new("planned"));
+        assert!(has_stale_member(&members, &reports));
     }
 }
