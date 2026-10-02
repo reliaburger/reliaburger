@@ -3,9 +3,8 @@ use std::collections::BTreeMap;
 use super::WTF_SCHEMA_VERSION;
 use super::model::{
     ApplicationEvidence, BuildObservation, ClusterEvidence, CorrelatedEvent, CouncilObservation,
-    DeployObservation, Evidence, LogObservation, ReplicaObservation, RestartObservation, WtfFinding,
-    WtfInputs, WtfOk,
-    WtfReport, WtfSummary, WtfUnknown,
+    DeployObservation, Evidence, LogObservation, ReplicaObservation, RestartObservation,
+    WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
 };
 
 const CRASHLOOP_WINDOW_SECONDS: u64 = 15 * 60;
