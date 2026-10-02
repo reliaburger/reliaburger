@@ -1769,6 +1769,84 @@ async fn refused_restart_keeps_cleanup_owed_when_stop_fails() {
     );
 }
 
+/// The journal names a published backend's execution from what the
+/// restart step read after starting it, and a publication never reads the
+/// runtime's inventory inside the turn (#419).
+#[tokio::test]
+async fn publication_journals_the_execution_the_restart_step_read() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let directory = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&directory.path().join("discovery"))
+        .await
+        .unwrap();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    let generation = crate::grill::RuntimeGeneration::process("restarted-execution");
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: id.clone(),
+            spec: agent
+                .supervisor
+                .get_instance(&id)
+                .unwrap()
+                .oci_spec
+                .clone()
+                .unwrap(),
+            generation: generation.clone(),
+            network_reference: None,
+        }])
+        .await;
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.drive_pending_restarts_to_completion().await;
+    let journalled = |agent: &TestAgent| {
+        let DiscoveryOwnership::Ready(journal) = &agent.discovery_ownership else {
+            panic!("discovery ownership is not ready");
+        };
+        journal.inventory().services[0]
+            .executions
+            .get(&id.0)
+            .cloned()
+    };
+    assert_eq!(journalled(&agent), Some(generation.clone()));
+
+    // A wedged inventory can't hold up a publication any more: it isn't read.
+    grill.set_inventory_delay(Some(std::time::Duration::from_secs(300)));
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.publish_backend_ebpf(&service),
+    )
+    .await
+    .expect("the publication waited on the runtime's inventory")
+    .unwrap();
+    assert_eq!(journalled(&agent), Some(generation));
+}
+
+/// A restart step that couldn't read the inventory fails the restart while
+/// the discovery journal is on, as the publication that read it used to.
+#[tokio::test]
+async fn an_unreadable_execution_fails_the_restart_while_discovery_is_journalled() {
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let directory = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&directory.path().join("discovery"))
+        .await
+        .unwrap();
+    let id = InstanceId("default__web-0".into());
+    let unknown =
+        super::launch_evidence::LaunchExecution::Unknown("runtime inventory timed out".into());
+    let refused = agent.record_launch_execution(&id, &unknown).unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        BunError::AdoptionState("publication runtime inventory timed out".into()).to_string()
+    );
+    // Without the journal there is nothing to name, so nothing fails.
+    let (mut plain, _, _, _) = test_agent_with_grill();
+    plain.record_launch_execution(&id, &unknown).unwrap();
+}
+
 #[tokio::test]
 async fn automatic_restart_releases_original_address_before_successor_creation() {
     let (mut agent, _, _, grill) = test_agent_with_grill();
@@ -2263,6 +2341,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             drains: self.drains.clone(),
             operation: None,
             stop_confirmation_timeout: self.stop_confirmation_timeout,
+            egress: self.egress_resolver(),
         };
         let events = events.clone();
         let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -11587,6 +11666,7 @@ async fn refused_reference_record_hands_the_runtime_hold_back() {
             spec: Some(Box::new(spec)),
             cgroup_path: root.path().join("cgroup"),
             retained,
+            egress: Box::default(),
             reply,
         })
         .await;
@@ -11713,6 +11793,10 @@ async fn clustered_startup_retains_orphan_ports_until_api_driven_cleanup_can_fin
     let (client, server) =
         crate::cluster::producer::test_fixture(reqwest::StatusCode::OK, confirmation).await;
     agent.set_producer_release_client(client);
+    agent.drive_startup_retirements().await;
+    // The retirement is done; the discovery recovery after it journals on
+    // the next tick (#422).
+    assert!(agent.startup_cleanup_pending);
     agent.drive_startup_retirements().await;
     assert!(!agent.startup_cleanup_pending);
     assert!(

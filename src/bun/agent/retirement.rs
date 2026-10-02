@@ -193,6 +193,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reason,
             })?;
         self.forget_retired_egress_owner(instance_id).await?;
+        self.launch_executions.remove(instance_id);
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.identity = None;
             instance.identity_mount = None;
