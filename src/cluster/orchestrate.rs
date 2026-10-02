@@ -656,6 +656,24 @@ fn plan_pass(
             cache.set_node(node);
         }
     }
+    // A daemon can credit a running copy only while its committed assignment
+    // still admits this footprint. After a resource/selector update removed
+    // that assignment, the old copy remains allocated until it retires; the
+    // new assignment must reserve its full request independently.
+    for (app_id, spec) in &desired.apps {
+        if matches!(spec.replicas, Replicas::DaemonSet) {
+            for node_id in cache.node_ids() {
+                let admitted = desired.scheduling.get(app_id).is_some_and(|placements| {
+                    placements
+                        .iter()
+                        .any(|p| p.node_id == node_id && p.resources == scheduler_resources(spec))
+                });
+                if !admitted {
+                    cache.set_replicas(&node_id, app_id, 0);
+                }
+            }
+        }
+    }
     let mut decisions = Vec::new();
     let mut quota_blocked = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
@@ -990,6 +1008,22 @@ fn placement_holds(
     unheard: &HashSet<NodeId>,
     dns_required: bool,
 ) -> bool {
+    // An assignment admits a specific resource footprint and hard selector.
+    // Do not deliver a changed spec through an assignment that predates it.
+    if placement.resources != scheduler_resources(spec) {
+        return false;
+    }
+    let required = spec
+        .placement
+        .as_ref()
+        .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
+        .unwrap_or_default();
+    if cache
+        .get_node(&placement.node_id)
+        .is_some_and(|node| !node.matches_labels(&required))
+    {
+        return false;
+    }
     // Suspicion is gossip's "missed a probe", not "gone": SWIM gives the
     // node its suspicion timeout to refute it. Moving its replicas now would
     // stop healthy ones for a late ack (#346).
@@ -5965,16 +5999,14 @@ image = "busybox:latest"
 
 #[cfg(test)]
 mod audit_placement_revalidation {
-    use crate::meat::quota::QuotaLedger;
     use super::*;
     use crate::config::Replicas;
     use crate::council::types::DesiredState;
+    use crate::meat::quota::QuotaLedger;
     use crate::meat::{
         cluster_state::SchedulerNodeState,
         types::{AppId, Placement},
     };
-    use crate::reporting::types::*;
-    use std::time::{Instant, SystemTime};
     fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
         SchedulerNodeState {
             node_id: NodeId::new(name),
@@ -6055,6 +6087,39 @@ mod audit_placement_revalidation {
         assert!(
             !decisions.is_empty(),
             "a new hard placement constraint is ignored"
+        );
+    }
+    #[test]
+    fn audit_changed_daemon_request_keeps_old_running_capacity_reserved() {
+        let app = AppId::new("a-daemon", "default");
+        let other = AppId::new("z-other", "default");
+        let mut desired = DesiredState::default();
+        let mut spec = app_spec(2000, 1);
+        spec.replicas = Replicas::DaemonSet;
+        desired.apps.insert(app.clone(), spec);
+        desired.apps.insert(other.clone(), app_spec(1000, 1));
+        // AppSpec removed the old assignment, but its 600m execution has not
+        // stopped yet. It cannot pay for a newly admitted 2000m assignment.
+        let mut node = sched_node("solo", 3000, BTreeMap::new());
+        node.allocated = Resources::new(600, 0, 0);
+        node.app_replicas.insert(app.clone(), 1);
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(node);
+        let decisions = plan_scheduling_pass(
+            &mut cache,
+            &desired,
+            &HashSet::from([NodeId::new("solo")]),
+            &mut QuotaLedger::default(),
+        );
+        assert!(decisions.iter().any(|d| d.app_id == app));
+        assert!(!decisions.iter().any(|d| d.app_id == other));
+        assert_eq!(
+            cache
+                .get_node(&NodeId::new("solo"))
+                .unwrap()
+                .allocated
+                .cpu_millicores,
+            2600
         );
     }
 }

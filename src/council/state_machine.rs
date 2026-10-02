@@ -1740,6 +1740,29 @@ impl StateMachineInner {
         app_id: &crate::meat::types::AppId,
         spec: &crate::config::app::AppSpec,
     ) {
+        // Workers fetch the desired spec directly from committed assignments.
+        // Withhold changed admission constraints until the scheduler has
+        // checked them; otherwise a worker can deploy before the next tick.
+        let admission_changed = self.state.apps.get(app_id).is_some_and(|old| {
+            let resources = |s: &crate::config::app::AppSpec| {
+                (
+                    s.cpu.as_ref().map(|r| r.request).unwrap_or(0),
+                    s.memory.as_ref().map(|r| r.request).unwrap_or(0),
+                    s.gpu.unwrap_or(0),
+                )
+            };
+            let required = |s: &crate::config::app::AppSpec| {
+                s.placement
+                    .as_ref()
+                    .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
+                    .unwrap_or_default()
+            };
+            resources(old) != resources(spec) || required(old) != required(spec)
+        });
+        if admission_changed {
+            self.state.scheduling.remove(app_id);
+            self.state.quota_blocked.remove(app_id);
+        }
         // A redeploy that changes the replica baseline invalidates any
         // autoscale override: the operator has re-declared the desired count.
         let baseline_changed = self
@@ -7068,5 +7091,60 @@ mod tests {
             expires_at: None,
         }));
         assert_eq!(inner.state.security_state.crl.updated_at, revoked_at);
+    }
+    #[tokio::test]
+    async fn audit_spec_admission_changes_withhold_old_assignments() {
+        let app_id = AppId::new("web", "default");
+        let old: crate::config::app::AppSpec =
+            toml::from_str("image='web:v1'\ncpu='600m'\n[placement]\nrequired=['zone=east']")
+                .unwrap();
+        for constraint in ["resources", "labels", "image"] {
+            let mut sm = CouncilStateMachine::new();
+            sm.apply([normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(old.clone()),
+                },
+            )])
+            .await
+            .unwrap();
+            sm.apply([normal_entry(
+                1,
+                2,
+                RaftRequest::SchedulingDecision(crate::meat::types::SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: vec![crate::meat::types::Placement {
+                        node_id: crate::meat::NodeId::new("east"),
+                        resources: crate::meat::types::Resources::new(600, 0, 0),
+                    }],
+                }),
+            )])
+            .await
+            .unwrap();
+            let mut updated = old.clone();
+            match constraint {
+                "resources" => updated.cpu.as_mut().unwrap().request = 2000,
+                "labels" => updated.placement.as_mut().unwrap().required = vec!["zone=west".into()],
+                _ => updated.image = Some("web:v2".into()),
+            }
+            sm.apply([normal_entry(
+                1,
+                3,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(updated),
+                },
+            )])
+            .await
+            .unwrap();
+            let state = sm.desired_state().await;
+            assert_eq!(
+                state.scheduling.contains_key(&app_id),
+                constraint == "image"
+            );
+            assert!(state.last_placed_nodes.contains_key(&app_id));
+        }
     }
 }
