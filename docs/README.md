@@ -1089,7 +1089,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/deploys/history/{app}` | Per-app version/spec history used by rollback |
 | `GET` | `/v1/status` | List all instances |
 | `GET` | `/v1/status/{app}/{namespace}` | Status for a specific app |
-| `POST` | `/v1/stop/{app}/{namespace}` | Stop an app |
+| `POST` | `/v1/stop/{app}/{namespace}` | Stop an app. In a cluster it answers `202 Accepted` with `{"status":"stopping"}` once the council records the stop; poll `/v1/status` for the instances to go. A standalone node answers `200` with `stopped` after the local stop completes |
+| `POST` | `/v1/delete/{app}/{namespace}` | Remove an app. In a cluster it answers `202 Accepted` with `{"status":"deleting"}`; cleanup on the workers follows asynchronously |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |

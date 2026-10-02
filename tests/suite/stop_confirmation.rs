@@ -1,3 +1,6 @@
+//! A clustered stop or delete answers as an accepted request (#435): the
+//! council has recorded it, but no worker has confirmed the cleanup yet.
+
 use reliaburger::config::{Replicas, app::AppSpec};
 use reliaburger::council::types::RaftRequest;
 use reliaburger::meat::types::{AppId, NodeId, Placement, Resources};
@@ -8,7 +11,7 @@ use std::time::Duration;
 fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
     let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
     spec.replicas = Replicas::Fixed(replicas);
-    spec.cpu = Some(crate::config::types::ResourceRange {
+    spec.cpu = Some(config::types::ResourceRange {
         request: cpu_request,
         limit: cpu_request,
     });
@@ -144,4 +147,22 @@ async fn stop_must_not_claim_cleanup_before_any_worker_has_seen_it() {
         !body.contains("\"stopped\""),
         "the operation reports stopped while the only worker has received no stop instruction"
     );
+}
+
+#[tokio::test]
+async fn delete_reports_an_accepted_request_not_completed_cleanup() {
+    let network = council::network::InMemoryRaftRouter::new();
+    let leader = initialized_leader(&network).await;
+    let (url, server, _commands) = api_for(leader.clone(), None).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/delete/web/default"))
+        .send()
+        .await
+        .unwrap();
+    let code = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    server.abort();
+    leader.shutdown().await.unwrap();
+    assert_eq!(code, reqwest::StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "deleting");
 }
