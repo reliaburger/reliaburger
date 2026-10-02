@@ -1,8 +1,7 @@
 # bun on the appliance. The same restart and kill policy as the quickstart's
 # unit (src/relish/quickstart/provision.rs): owners outlive bun restarts.
-# bun runs standalone on loopback until a seed (spike S3,
-# reliaburger-seed.service) installs a cluster config; appliance mode (claim,
-# seed) replaces this in Phase 1.
+# It starts once reliaburger-seed.service has turned the machine's seed or
+# claim into a cluster config.
 [Unit]
 Description=Reliaburger node
 After=network-online.target reliaburger-seed.service
