@@ -4454,6 +4454,53 @@ async fn logs_export_without_a_store_is_service_unavailable() {
     shutdown.cancel();
 }
 
+/// F07 part 2: `grep` is a regular expression. One that won't compile is the
+/// caller's mistake, so both query routes answer 400 with the reason, not a
+/// 500 that reads like a broken store.
+#[tokio::test]
+async fn an_invalid_grep_pattern_is_a_bad_request() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    let app = router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    for uri in [
+        "/v1/logs/entries/web/default?grep=%28unclosed",
+        "/v1/logs/query/web/default?grep=%28unclosed",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("regular expression"), "{uri}: {body}");
+    }
+}
+
 /// The export endpoint ships the store's Parquet files to the requested
 /// destination under the node's name and persists the Bun-owned export
 /// checkpoint (X8), so a repeat export ships nothing new.

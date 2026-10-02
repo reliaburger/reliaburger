@@ -280,6 +280,16 @@ This isn't a full-text search engine. If you need to search millions of unique l
 
 A future improvement: Parquet supports bloom filters per column. Writing a bloom filter on the `line` column during flush would let DataFusion skip row groups that definitely don't contain the search term.
 
+### From LIKE to a regular expression
+
+`relish logs --grep` started as that `LIKE '%…%'`, a substring. People typed `--grep 'error|warn'` anyway, because that's what grep means everywhere else, and got nothing back. So `--grep` is now a regular expression, and the store's condition is `regexp_like(line, '…')`.
+
+Two details made it more than a one-word change. First, a pattern like `(unclosed` doesn't compile, and DataFusion reports that as a planning error, which the API used to pass on as a 500. That reads as "the log store is broken" when the user only mistyped. So the store checks the pattern first with the `regex` crate and returns `KetchupError::QueryRejected`, which the handlers turn into a 400 with the reason, and `relish logs` checks it again before sending anything. It's the same engine DataFusion runs underneath `regexp_like`, so the check and the query can't disagree about what's valid. A cluster-wide query checks once, before the fan-out. Otherwise every node would refuse the pattern separately, and you'd get an empty result buried under one warning per node.
+
+Second, the client filters too, for `-f` and for `--json-field`, which the server can't do. A follow can carry thousands of lines, and compiling the pattern for each one would be silly, so `LogOptions::line_filter` compiles it once into a `LineFilter`. `regex::Regex` holds the compiled automaton and `is_match` borrows it immutably, so one value can serve every line without a lock. If you're coming from Python, it's `re.compile` hoisted out of the loop, except that the compiler makes you decide where it lives.
+
+`--instance` and `--until` came with it. Both are plain conditions in the same `WHERE` (`instance = '…'`, `timestamp <= …`), and both travel with the fan-out to every node. `--instance` also works with `-f`: the agent's `FollowLogs` keeps only that instance's capture. The agent's plain-text fallback, used when the store has nothing yet, can't tell instances or times apart, so with either filter set, `relish logs` skips it rather than print lines the filter should have hidden.
+
 ### The unified query path
 
 Both the flushed Parquet files and the unflushed in-memory buffer are included in every DataFusion query. Same trick we use for metrics. There's no blind spot — you see logs from 30 seconds ago in the same SQL query as logs from last week. No merging, no separate code paths, no seams.

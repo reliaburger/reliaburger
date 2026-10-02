@@ -134,6 +134,8 @@ impl Demo {
             follow: false,
             grep: Some("cache".to_string()),
             start: None,
+            end: None,
+            instance: None,
             json_field: None,
         };
         self.client()
@@ -764,6 +766,8 @@ async fn diagnostics(root: &Path, api: std::net::SocketAddr, last: &str) -> Stri
             follow: false,
             grep: None,
             start: None,
+            end: None,
+            instance: None,
             json_field: None,
         };
         let logs = match tokio::time::timeout(

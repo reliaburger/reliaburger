@@ -66,6 +66,9 @@ argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
 datafusion = "55"
+# `relish logs --grep` patterns: validated with the same engine DataFusion's
+# `regexp_like` runs, so the server and the client agree on the syntax.
+regex = "1"
 # DataFusion declares `TableProvider` with `#[async_trait]`; Mayo's streamed
 # Parquet table (#377) implements it, so it needs the same attribute.
 async-trait = "0.1"

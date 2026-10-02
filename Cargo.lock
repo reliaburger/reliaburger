@@ -5254,6 +5254,7 @@ dependencies = [
  "ratatui",
  "rcgen",
  "redb",
+ "regex",
  "reqwest 0.12.28",
  "ring",
  "rust-embed",

@@ -162,43 +162,72 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
     Ok(())
 }
 
+/// The `relish logs` flags, as typed.
+#[derive(Debug, Clone, Default)]
+pub struct LogFlags {
+    pub tail: Option<usize>,
+    pub follow: bool,
+    /// A regular expression.
+    pub grep: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub instance: Option<String>,
+    pub json_field: Option<String>,
+}
+
 /// Stream logs from an app or job.
-#[allow(clippy::too_many_arguments)]
-pub async fn logs(
-    name: &str,
-    tail: Option<usize>,
-    follow: bool,
-    grep: Option<String>,
-    since: Option<String>,
-    json_field: Option<String>,
-    namespace: &str,
-) -> Result<(), RelishError> {
-    let options = build_log_options(tail, follow, grep, since, json_field, unix_now())?;
+pub async fn logs(name: &str, namespace: &str, flags: LogFlags) -> Result<(), RelishError> {
+    let options = build_log_options(flags, unix_now())?;
     logs_with_client(name, namespace, &options, &BunClient::default_local()).await
 }
 
 /// Translate the CLI flags into [`LogOptions`], validating as we go.
 fn build_log_options(
-    tail: Option<usize>,
-    follow: bool,
-    grep: Option<String>,
-    since: Option<String>,
-    json_field: Option<String>,
+    flags: LogFlags,
     now_epoch: u64,
 ) -> Result<super::client::LogOptions, RelishError> {
-    let start = match since {
-        Some(s) => Some(parse_since(&s, now_epoch)?),
+    let start = match &flags.since {
+        Some(s) => Some(parse_since(s, now_epoch)?),
         None => None,
     };
-    let json_field = match json_field {
-        Some(s) => Some(parse_json_field(&s)?),
+    let end = match &flags.until {
+        Some(s) => Some(parse_time("until", s, now_epoch)?),
+        None => None,
+    };
+    if end.is_some() && flags.follow {
+        return Err(RelishError::InvalidFlag {
+            flag: "until".to_string(),
+            reason: "a followed stream has no end; drop --until or --follow".to_string(),
+        });
+    }
+    if let (Some(start), Some(end)) = (start, end)
+        && end < start
+    {
+        return Err(RelishError::InvalidFlag {
+            flag: "until".to_string(),
+            reason: "the window ends before it starts; --until must be later than --since"
+                .to_string(),
+        });
+    }
+    if let Some(grep) = &flags.grep {
+        crate::ketchup::log_store::validate_grep(grep).map_err(|error| {
+            RelishError::InvalidFlag {
+                flag: "grep".to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    let json_field = match &flags.json_field {
+        Some(s) => Some(parse_json_field(s)?),
         None => None,
     };
     Ok(super::client::LogOptions {
-        tail,
-        follow,
-        grep,
+        tail: flags.tail,
+        follow: flags.follow,
+        grep: flags.grep,
         start,
+        end,
+        instance: flags.instance,
         json_field,
     })
 }
@@ -206,9 +235,15 @@ fn build_log_options(
 /// Parse a `--since` value: raw epoch seconds, or a duration like
 /// `30s`, `5m`, `2h`, `1d` subtracted from now.
 fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
+    parse_time("since", value, now_epoch)
+}
+
+/// Parse a point in time for `--flag`: raw epoch seconds, or a duration like
+/// `30s`, `5m`, `2h`, `1d` before now.
+fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
     if value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty() {
         return value.parse::<u64>().map_err(|e| RelishError::InvalidFlag {
-            flag: "since".to_string(),
+            flag: flag.to_string(),
             reason: e.to_string(),
         });
     }
@@ -225,19 +260,19 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
         "d" => 86_400,
         _ => {
             return Err(RelishError::InvalidFlag {
-                flag: "since".to_string(),
+                flag: flag.to_string(),
                 reason: format!("{value:?} — use epoch seconds or a duration like 30s, 5m, 2h, 1d"),
             });
         }
     };
     let amount: u64 = number.parse().map_err(|_| RelishError::InvalidFlag {
-        flag: "since".to_string(),
+        flag: flag.to_string(),
         reason: format!("{value:?} — use epoch seconds or a duration like 30s, 5m, 2h, 1d"),
     })?;
     let seconds = amount
         .checked_mul(multiplier)
         .ok_or_else(|| RelishError::InvalidFlag {
-            flag: "since".to_string(),
+            flag: flag.to_string(),
             reason: format!("duration {value:?} exceeds the supported seconds range"),
         })?;
     Ok(now_epoch.saturating_sub(seconds))
@@ -2876,22 +2911,55 @@ spec:
 
     #[test]
     fn log_options_carry_all_flags() {
-        let options = build_log_options(
-            Some(50),
-            false,
-            Some("error".to_string()),
-            Some("5m".to_string()),
-            Some("level=warn".to_string()),
-            1_750_000_000,
-        )
-        .unwrap();
+        let flags = LogFlags {
+            tail: Some(50),
+            grep: Some("error|warn".to_string()),
+            since: Some("5m".to_string()),
+            until: Some("1m".to_string()),
+            instance: Some("default__web-2".to_string()),
+            json_field: Some("level=warn".to_string()),
+            ..LogFlags::default()
+        };
+        let options = build_log_options(flags, 1_750_000_000).unwrap();
         assert_eq!(options.tail, Some(50));
-        assert_eq!(options.grep.as_deref(), Some("error"));
+        assert_eq!(options.grep.as_deref(), Some("error|warn"));
         assert_eq!(options.start, Some(1_750_000_000 - 300));
+        assert_eq!(options.end, Some(1_750_000_000 - 60));
+        assert_eq!(options.instance.as_deref(), Some("default__web-2"));
         assert_eq!(
             options.json_field,
             Some(("level".to_string(), "warn".to_string()))
         );
+    }
+
+    /// F07 part 2: `--grep` is a regular expression, checked before any
+    /// request goes out.
+    #[test]
+    fn an_invalid_grep_pattern_is_a_flag_error() {
+        let flags = LogFlags {
+            grep: Some("(unclosed".to_string()),
+            ..LogFlags::default()
+        };
+        let error = build_log_options(flags, 1_750_000_000).unwrap_err();
+        assert!(error.to_string().contains("grep"), "{error}");
+    }
+
+    /// `--until` ends a window: it can't follow new lines, and it can't come
+    /// before `--since`.
+    #[test]
+    fn until_refuses_follow_and_a_window_that_ends_before_it_starts() {
+        let following = LogFlags {
+            until: Some("1m".to_string()),
+            follow: true,
+            ..LogFlags::default()
+        };
+        assert!(build_log_options(following, 1_750_000_000).is_err());
+        let backwards = LogFlags {
+            since: Some("1m".to_string()),
+            until: Some("5m".to_string()),
+            ..LogFlags::default()
+        };
+        assert!(build_log_options(backwards, 1_750_000_000).is_err());
     }
 
     fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
