@@ -529,6 +529,10 @@ impl super::Grill for RuncGrill {
         self.owned_state(instance).await
     }
 
+    async fn has_exited(&self, instance: &InstanceId) -> Result<bool, GrillError> {
+        self.owned_has_exited(instance).await
+    }
+
     async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
         self.owned_exit_code(instance).await
     }
