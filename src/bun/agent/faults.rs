@@ -1481,6 +1481,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // running at the deadline wait in `late_cuts` for whoever answers for
         // the fault (#450): reporting it applied while they ran let a
         // frontend's pool reach redis through a partition.
+        // LOOP-INLINE: every cut waits at most until the turn's runtime deadline
         let late =
             crate::smoker::network::cut_until(cuts, self.turn_deadline(), cut_open_connections)
                 .await;
