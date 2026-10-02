@@ -884,6 +884,7 @@ mod tests {
                 raft_id: index as u64,
                 name: name.clone(),
                 address: "192.168.104.1:9444".into(),
+                voter: true,
             })
             .collect();
         assert!(quorum_ready(&names, &council));

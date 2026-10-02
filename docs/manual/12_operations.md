@@ -233,7 +233,50 @@ council's Raft directory aside (to `.raft-recovery-*/previous` in the data
 directory, where you can delete it once the cluster is healthy) and stamps a
 new recovery epoch. It refuses while the node is still running, and the next
 start finishes a recovery that crashed part-way. Starting the node brings up a
-one-voter council that grows again as nodes rejoin. Anything written after the
-backup is lost. It refuses while it can still see a live council; `--force`
-skips that check, and using it against a cluster that's still alive splits
-the brain.
+one-voter council that grows again as nodes rejoin, even if its config still
+lists `cluster.join` seeds. New members receive the whole restored state.
+Anything written after the backup is lost. It refuses while it can still see a
+live council; `--force` skips that check, and using it against a cluster
+that's still alive splits the brain.
+
+You need `--force` when a majority is gone but not every voter, say two of
+three. The survivor can't regrow the council alone (changing membership needs
+a quorum too), so you stop it and recover it as above.
+
+### When the old voters come back
+
+The voters you gave up on still hold the old council in their data
+directories. Two of three old voters are a majority of it, so on their own
+they would elect a leader and take writes: a second council. The recovery
+epoch stops that, as long as they can reach the recovered side:
+
+- A restarted voter waits a few seconds for gossip to show its peers'
+  epochs before it serves Raft. If any peer holds a newer epoch, it fences
+  itself.
+- A voter that talks to the recovered council, or to an already fenced
+  peer, is refused with the newer epoch and fences itself on the spot.
+- A fenced node serves no Raft, refuses writes, claims no leader, and stays
+  fenced across restarts. It keeps running its workloads as a worker.
+
+`relish council status` shows such a node as `fenced`, `relish status` prints
+a warning line, and `relish wtf` reports it as CRITICAL until you re-enrol it.
+Stop the node, then:
+
+```sh
+relish council re-enrol --data-dir /var/lib/reliaburger/data
+```
+
+That removes the replaced council's Raft state (its log, snapshot and fence
+record) and nothing else. Start the node with `cluster.join` pointing at the
+current council: it joins as a fresh member, adopts the council's epoch, and
+the reconciler can promote it to voter. `re-enrol` refuses on a node that
+isn't fenced; `--force` overrides that for an old voter that never heard of the
+recovery.
+
+The fence has one gap. An old voter learns of the new epoch only from a node
+that holds it. **After `council recover --force`, don't start the old voters
+where they can reach each other but not the recovered side.** Wipe them with
+`relish council re-enrol` first, or keep them stopped until they can see the
+recovered council. If two of them do come back cut off from it, they form a
+council of their own; `relish council status` and `relish wtf` show it as two
+recovery epochs and two leaders.

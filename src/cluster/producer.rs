@@ -149,6 +149,7 @@ mod tests {
             leader: Some(crate::mustard::message::LeaderHint {
                 node_id: crate::meat::NodeId::new("leader"),
                 term: 1,
+                recovery_epoch: 0,
                 api_address: address,
                 reporting_address: address,
             }),

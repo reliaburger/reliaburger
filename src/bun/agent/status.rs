@@ -124,9 +124,51 @@ pub struct CouncilMemberInfo {
     pub name: String,
     /// Raft RPC address.
     pub address: String,
+    /// Whether the member votes; `false` for a learner still catching up.
+    #[serde(default)]
+    pub voter: bool,
 }
 
-/// Status of the Raft council, as returned by the council API.
+/// The part a node plays in the council, as the node itself sees it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CouncilRole {
+    /// Leads the council.
+    Leader,
+    /// A voter following the leader.
+    Follower,
+    /// A voter campaigning for leadership.
+    Candidate,
+    /// A non-voting member catching up before promotion.
+    Learner,
+    /// A voter of a council `relish council recover` replaced (#424). It
+    /// serves no Raft and refuses writes until it is re-enrolled.
+    Fenced,
+    /// A restarted voter waiting for its peers' recovery epochs before it
+    /// serves Raft.
+    Starting,
+    /// Not a council member: a worker.
+    #[default]
+    Worker,
+}
+
+impl CouncilRole {
+    /// The lowercase name the CLI prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Follower => "follower",
+            Self::Candidate => "candidate",
+            Self::Learner => "learner",
+            Self::Fenced => "fenced",
+            Self::Starting => "starting",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+/// Status of the Raft council, as returned by the council API. Every field is
+/// the answering node's own view: ask each node to compare them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CouncilStatus {
     /// Council member nodes.
@@ -139,6 +181,81 @@ pub struct CouncilStatus {
     pub last_applied_log: Option<u64>,
     /// Number of registered apps in desired state.
     pub app_count: usize,
+    /// The answering node's own role.
+    #[serde(default)]
+    pub role: CouncilRole,
+    /// The recovery epoch the answering node holds, `None` before any
+    /// council has admitted it (#424).
+    #[serde(default)]
+    pub recovery_epoch: Option<u64>,
+    /// The newer epoch that fenced the answering node, when it is fenced.
+    #[serde(default)]
+    pub fenced_by: Option<u64>,
+    /// Index of the last entry in the answering node's log.
+    #[serde(default)]
+    pub last_log_index: Option<u64>,
+}
+
+/// Work out a node's council role from its Raft metrics and recovery fence.
+pub fn council_role(
+    metrics: &openraft::RaftMetrics<u64, crate::council::types::CouncilNodeInfo>,
+    fence: Option<crate::council::fence::FenceSnapshot>,
+) -> CouncilRole {
+    use crate::council::fence::FenceState;
+    match fence.map(|fence| fence.state) {
+        Some(FenceState::Fenced { .. }) => return CouncilRole::Fenced,
+        Some(FenceState::Probing) => return CouncilRole::Starting,
+        _ => {}
+    }
+    let membership = metrics.membership_config.membership();
+    if membership.get_node(&metrics.id).is_none() {
+        return CouncilRole::Worker;
+    }
+    if !membership.voter_ids().any(|id| id == metrics.id) {
+        return CouncilRole::Learner;
+    }
+    match metrics.state {
+        openraft::ServerState::Leader => CouncilRole::Leader,
+        openraft::ServerState::Candidate => CouncilRole::Candidate,
+        openraft::ServerState::Follower | openraft::ServerState::Learner => CouncilRole::Follower,
+        openraft::ServerState::Shutdown => CouncilRole::Follower,
+    }
+}
+
+/// This node's own council status, from its council and Raft `metrics`.
+/// Reads only local state: no quorum round trip.
+pub async fn council_status(
+    council: &crate::council::node::CouncilNode,
+    metrics: &openraft::RaftMetrics<u64, crate::council::types::CouncilNodeInfo>,
+) -> CouncilStatus {
+    let desired = council.desired_state().await;
+    let membership = metrics.membership_config.membership();
+    let leader_name = metrics
+        .current_leader
+        .and_then(|leader_id| membership.get_node(&leader_id))
+        .map(|info| info.name.clone());
+    let members = membership
+        .nodes()
+        .map(|(id, info)| CouncilMemberInfo {
+            raft_id: *id,
+            name: info.name.clone(),
+            address: info.addr.to_string(),
+            voter: membership.voter_ids().any(|voter| voter == *id),
+        })
+        .collect();
+    let fence = council.recovery_fence().map(|fence| fence.snapshot());
+
+    CouncilStatus {
+        members,
+        leader: leader_name,
+        term: metrics.current_term,
+        last_applied_log: metrics.last_applied.map(|l| l.index),
+        app_count: desired.apps.len(),
+        role: council_role(metrics, fence),
+        recovery_epoch: fence.and_then(|fence| fence.claimed_epoch()),
+        fenced_by: fence.and_then(|fence| fence.fenced_by()),
+        last_log_index: metrics.last_log_index,
+    }
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -357,43 +474,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let metrics = metrics_rx.borrow().clone();
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
-        let desired = council.desired_state().await;
-
-        let leader_name = metrics.current_leader.and_then(|leader_id| {
-            metrics
-                .membership_config
-                .membership()
-                .get_joint_config()
-                .iter()
-                .flat_map(|ids| ids.iter())
-                .find(|&&id| id == leader_id)
-                .and_then(|_| {
-                    metrics
-                        .membership_config
-                        .membership()
-                        .get_node(&leader_id)
-                        .map(|info| info.name.clone())
-                })
-        });
-
-        let members = metrics
-            .membership_config
-            .membership()
-            .nodes()
-            .map(|(id, info)| CouncilMemberInfo {
-                raft_id: *id,
-                name: info.name.clone(),
-                address: info.addr.to_string(),
-            })
-            .collect();
-
-        CouncilStatus {
-            members,
-            leader: leader_name,
-            term: metrics.current_term,
-            last_applied_log: metrics.last_applied.map(|l| l.index),
-            app_count: desired.apps.len(),
-        }
+        council_status(council, &metrics).await
     }
 
     /// Collect cluster node IPs from the gossip membership table.

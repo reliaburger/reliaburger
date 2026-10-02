@@ -1,0 +1,18 @@
+---
+source: src/relish/council_view.rs
+expression: "render_council_status(&nodes, &summarise(&nodes))"
+---
+Epoch:   1
+Leader:  node-1
+Quorum:  1/1 voters, quorum ok
+
+NODE    ROLE       EPOCH        TERM   APPLIED       LOG  MEMBER   REACHABLE
+node-1  leader     1               2         7         7  voter    yes
+node-2  fenced     0 < 1           4       120       120  -        yes
+node-3  fenced     0 < 1           4       120       120  -        yes
+node-4  ?          ?               ?         ?         ?  ?        no
+
+Did not answer:
+  node-4: timed out after 5s
+
+WARNING: fenced: node-2 (epoch 0, replaced by 1), node-3 (epoch 0, replaced by 1); re-enrol each with `relish council re-enrol`

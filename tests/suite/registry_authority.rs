@@ -475,6 +475,7 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
         leader: Some(LeaderHint {
             node_id: reliaburger::meat::NodeId::new("node"),
             term: 100,
+            recovery_epoch: 0,
             api_address: address,
             reporting_address: address,
         }),
@@ -1125,6 +1126,7 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
         leader: Some(LeaderHint {
             node_id: reliaburger::meat::NodeId::new(format!("node-{}", index + 1)),
             term: nodes[index].metrics().borrow().current_term,
+            recovery_epoch: 0,
             api_address: addresses[index],
             reporting_address: addresses[index],
         }),
