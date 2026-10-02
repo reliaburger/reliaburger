@@ -980,6 +980,48 @@ async fn fetch_from_peer<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// Record an audited action, attributed to the credential that asked for it
+/// (F05 I1). The principal is the caller's stable `principal_id`, and the
+/// token's name goes in the details for people; a node with no token store
+/// yet (the bootstrap window) records `local-bootstrap`. Never pass a secret
+/// in `details` or `message`.
+pub(super) async fn record_caller_audit(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    kind: crate::bun::events::EventKind,
+    action: &str,
+    mut details: std::collections::BTreeMap<String, String>,
+    message: String,
+) {
+    let Some(events) = &state.events else {
+        return;
+    };
+    let (principal, token_name) = match auth {
+        Some(auth) => (auth.principal_id.clone(), auth.token_name.clone()),
+        None => ("local-bootstrap".to_string(), "local-bootstrap".to_string()),
+    };
+    details.insert("token_name".to_string(), token_name);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    events
+        .write()
+        .await
+        .record_audit(crate::bun::events::AuditEvent {
+            timestamp,
+            kind,
+            severity: crate::bun::events::EventSeverity::Info,
+            action: action.to_string(),
+            principal,
+            app: None,
+            namespace: None,
+            node: Some(local_node_name(state)),
+            details,
+            message,
+        });
+}
+
 /// Ask every live member except this node for `path`.
 ///
 /// Returns each member's answer beside its name, and one sorted warning per
