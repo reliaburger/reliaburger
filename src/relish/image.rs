@@ -123,7 +123,7 @@ pub async fn download(
     Ok(())
 }
 
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, RelishError> {
+pub(crate) async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, RelishError> {
     let response = client
         .get(url)
         .send()

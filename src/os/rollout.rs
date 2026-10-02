@@ -346,6 +346,194 @@ pub fn resume(mut rollout: OsRollout, now: u64) -> OsRollout {
     rollout
 }
 
+/// [`OsControl`] over each node's bun API.
+#[derive(Clone)]
+pub struct HttpOsControl {
+    http: crate::cluster::ClusterHttp,
+    /// The cluster's service token, so nodes accept the leader as the
+    /// system principal.
+    service_token: Option<String>,
+}
+
+impl HttpOsControl {
+    pub fn new(http: crate::cluster::ClusterHttp, service_token: Option<String>) -> Self {
+        Self {
+            http,
+            service_token,
+        }
+    }
+}
+
+/// Read a node's OS version and update state from its `/v1/version`.
+pub fn probe_from_version(value: &serde_json::Value, healthy: bool) -> OsProbe {
+    OsProbe {
+        os_version: value["os_version"].as_str().map(str::to_string),
+        healthy,
+        update: serde_json::from_value(value["os_update"].clone()).unwrap_or_default(),
+    }
+}
+
+impl OsControl for HttpOsControl {
+    async fn probe(&self, address: &str) -> Option<OsProbe> {
+        let client = self.http.client();
+        let value: serde_json::Value = client
+            .get(self.http.url(address, "/v1/version"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let healthy = matches!(
+            client
+                .get(self.http.url(address, "/v1/health"))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await,
+            Ok(response) if response.status().is_success()
+        );
+        Some(probe_from_version(&value, healthy))
+    }
+
+    async fn direct_stage(
+        &self,
+        address: &str,
+        directive: &OsDirective,
+    ) -> Result<(), DirectiveError> {
+        let mut request = self
+            .http
+            .client()
+            .post(self.http.url(address, "/v1/os/stage"))
+            .timeout(Duration::from_secs(30))
+            .json(directive);
+        if let Some(token) = &self.service_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| DirectiveError::Transient(e.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let reason = format!("{status}: {}", response.text().await.unwrap_or_default());
+        if crate::upgrade::is_transient_status(status) {
+            Err(DirectiveError::Transient(reason))
+        } else {
+            Err(DirectiveError::Refused(reason))
+        }
+    }
+}
+
+/// The nodes that still hold workloads the scheduler could move: any
+/// placement of an app without a managed volume. Volume apps stay with
+/// their data and wait for the node to come back.
+pub fn undrained(desired: &crate::council::types::DesiredState) -> BTreeSet<String> {
+    desired
+        .scheduling
+        .iter()
+        .filter(|(app, _)| {
+            desired
+                .apps
+                .get(app)
+                .is_none_or(|spec| !crate::cluster::orchestrate::has_managed_volume(spec))
+        })
+        .flat_map(|(_, placements)| placements.iter().map(|p| p.node_id.0.clone()))
+        .collect()
+}
+
+/// The leader's rollout loop: dormant unless this node leads and a rollout
+/// is running. Each tick runs [`step`] and writes the result to Raft if it
+/// changed; a finished rollout is archived. Like the bun upgrade
+/// orchestrator, a leader change just moves which node runs the loop.
+pub async fn run_rollout(
+    council: std::sync::Arc<crate::council::CouncilNode>,
+    control: HttpOsControl,
+    self_node_id: String,
+    membership_rx: tokio::sync::watch::Receiver<
+        Vec<crate::mustard::membership::MembershipSnapshot>,
+    >,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use crate::council::types::RaftRequest;
+
+    let self_raft_id = crate::cluster::identity::raft_id_from_name(&self_node_id);
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        if !council.is_leader().await {
+            continue;
+        }
+        let desired = council.desired_state().await;
+        let Some(rollout) = desired.os_rollout.clone() else {
+            continue;
+        };
+        if rollout.phase.is_terminal() {
+            // Normally cleared by whoever ended it; this covers a leader
+            // that stopped in between.
+            let _ = council
+                .write(RaftRequest::OsRolloutClear {
+                    rollout_id: rollout.rollout_id.clone(),
+                })
+                .await;
+            continue;
+        }
+        if rollout.phase != OsRolloutPhase::Running {
+            continue;
+        }
+        let (configured, live) = {
+            let membership = membership_rx.borrow();
+            crate::upgrade::orchestrator::count_live_voters(&council, &membership, self_raft_id)
+        };
+        let context = RolloutContext {
+            quorum_ok: crate::upgrade::orchestrator::live_quorum_headroom_ok(configured, live),
+            undrained: undrained(&desired),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default(),
+        };
+        let next = step(rollout.clone(), &control, &context).await;
+        if next == rollout {
+            continue;
+        }
+        match &next.phase {
+            OsRolloutPhase::Completed => {
+                println!(
+                    "bun: OS rollout {} to {} complete",
+                    next.rollout_id, next.target
+                )
+            }
+            OsRolloutPhase::Paused { reason } => {
+                eprintln!("bun: OS rollout {} paused: {reason}", next.rollout_id)
+            }
+            _ => {}
+        }
+        let finished = next.phase.is_terminal();
+        let rollout_id = next.rollout_id.clone();
+        if let Err(error) = council
+            .write(RaftRequest::OsRolloutUpdate {
+                rollout: Box::new(next),
+            })
+            .await
+        {
+            eprintln!("bun: OS rollout {rollout_id}: recording progress: {error}");
+            continue;
+        }
+        if finished {
+            let _ = council
+                .write(RaftRequest::OsRolloutClear { rollout_id })
+                .await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

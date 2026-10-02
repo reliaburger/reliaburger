@@ -435,6 +435,12 @@ enum Command {
         #[arg(long, hide = true)]
         trust_key: Option<String>,
     },
+    /// The appliance OS across the cluster: what each node runs, and
+    /// rolling a new version out node by node.
+    Os {
+        #[command(subcommand)]
+        action: OsAction,
+    },
     /// Manage short-lived node-enrolment tokens.
     JoinToken {
         #[command(subcommand)]
@@ -855,6 +861,35 @@ enum ImageAction {
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
     },
+}
+
+#[derive(Subcommand)]
+enum OsAction {
+    /// Each node's OS version, and the newest release.
+    List {
+        /// Channel to read instead of the published one.
+        #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
+        channel: String,
+    },
+    /// Roll an OS version across the cluster, one node at a time: workers,
+    /// then the council, the leader last. Each node's workloads move off
+    /// before it reboots.
+    Upgrade {
+        /// The version (default: the newest release).
+        version: Option<String>,
+        /// Channel the nodes read the release from.
+        #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
+        channel: String,
+        /// Allow a version older than what nodes run.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
+    /// The rollout in progress, or the last one.
+    Status,
+    /// Carry on with a paused rollout, retrying the node that stopped it.
+    Resume,
+    /// Stop the rollout; nodes keep the version they're on.
+    Abort,
 }
 
 #[derive(Subcommand)]
@@ -1979,6 +2014,17 @@ async fn main() -> ExitCode {
             )
             .await
         }
+        Command::Os { action } => match action {
+            OsAction::List { channel } => reliaburger::relish::os::list(&channel).await,
+            OsAction::Upgrade {
+                version,
+                channel,
+                allow_downgrade,
+            } => reliaburger::relish::os::upgrade(version, &channel, allow_downgrade).await,
+            OsAction::Status => reliaburger::relish::os::status().await,
+            OsAction::Resume => reliaburger::relish::os::resume().await,
+            OsAction::Abort => reliaburger::relish::os::abort().await,
+        },
         Command::JoinToken { action } => match &action {
             JoinTokenAction::List => commands::join_token_list().await,
             JoinTokenAction::Revoke { node_id } => commands::join_token_revoke(node_id).await,

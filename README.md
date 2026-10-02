@@ -85,6 +85,12 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network
   - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them)
 - `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node
+  - `relish os list`: Each node's OS version, and the newest release
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots
+  - `relish os status`: The rollout in progress, or the last one
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node

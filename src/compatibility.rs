@@ -15,7 +15,9 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including the per-node `directive_retry` record in a
+/// Supported formats, including the appliance OS rollout
+/// (`DesiredState::os_rollout` and its history, `RaftRequest::OsRolloutUpdate`
+/// and `OsRolloutClear`), the per-node `directive_retry` record in a
 /// cluster upgrade, the 503 a node answers a directive with when the
 /// binary's registry is unavailable (the orchestrator retries it), and the
 /// nodes each app last ran on (`DesiredState::last_placed_nodes`), the
@@ -30,8 +32,8 @@ pub struct Compatibility {
 /// deploy history, events and jobs for themselves on `local=true`, and the
 /// WebSocket log stream sends `LogFrame` JSON (F07).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 30,
-    state: 48,
+    protocol: 31,
+    state: 49,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

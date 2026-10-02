@@ -56,6 +56,7 @@ mod logs;
 mod metrics;
 mod node_info;
 mod nodes;
+mod os;
 mod registry;
 mod secrets;
 mod snapshots;
@@ -105,6 +106,10 @@ use node_info::{
 use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
     nodes_handler,
+};
+use os::{
+    os_rollout_abort_handler, os_rollout_handler, os_rollout_resume_handler,
+    os_rollout_start_handler, os_stage_handler,
 };
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
@@ -680,6 +685,11 @@ pub fn router_with_upgrade(
             "/v1/upgrade/cluster-rollback",
             post(upgrade_cluster_rollback_handler),
         )
+        .route("/v1/os/stage", post(os_stage_handler))
+        .route("/v1/os/rollout", get(os_rollout_handler))
+        .route("/v1/os/rollout/start", post(os_rollout_start_handler))
+        .route("/v1/os/rollout/resume", post(os_rollout_resume_handler))
+        .route("/v1/os/rollout/abort", post(os_rollout_abort_handler))
         .route("/v1/cluster/elect", post(cluster_elect_handler))
         .route("/v1/chaos/reserve", post(node_fault_reserve_handler))
         .route("/v1/chaos/fence", post(node_fault_fence_handler))

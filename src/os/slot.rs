@@ -28,6 +28,21 @@ use crate::upgrade::signing::PublicKey;
 /// them, so they're also how bun knows it's running on one.
 pub const DEFINITIONS: &str = "/usr/lib/reliaburger/sysupdate.d";
 
+/// This machine's slot, once bun has looked. A machine runs one OS, so
+/// the slot is process-wide: bun installs it at start-up (an appliance
+/// only), and the API's handlers read it.
+static INSTALLED: std::sync::OnceLock<Arc<OsSlot>> = std::sync::OnceLock::new();
+
+/// Make `slot` this process's slot. Only the first call counts.
+pub fn install(slot: Arc<OsSlot>) {
+    let _ = INSTALLED.set(slot);
+}
+
+/// This process's slot, if it runs on an appliance.
+pub fn installed() -> Option<Arc<OsSlot>> {
+    INSTALLED.get().cloned()
+}
+
 /// The version of the running image, from `os-release`'s `IMAGE_VERSION`.
 pub fn image_version(os_release: &str) -> Option<String> {
     os_release

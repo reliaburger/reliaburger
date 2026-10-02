@@ -2514,6 +2514,48 @@ impl BunClient {
         Ok(response["upgrade_id"].as_str().unwrap_or("?").to_string())
     }
 
+    /// This node's `/v1/version`, as JSON (it carries the appliance OS
+    /// fields `os_version` and `os_update`).
+    pub async fn version_json(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/version").await
+    }
+
+    /// The OS rollout in progress and the finished ones.
+    pub async fn os_rollout(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/os/rollout").await
+    }
+
+    /// Start rolling `version` across the cluster.
+    pub async fn os_rollout_start(
+        &self,
+        version: &str,
+        channel_url: &str,
+        allow_downgrade: bool,
+    ) -> Result<serde_json::Value, RelishError> {
+        self.post_json(
+            "/v1/os/rollout/start",
+            serde_json::json!({
+                "version": version,
+                "channel_url": channel_url,
+                "allow_downgrade": allow_downgrade,
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    /// Resume a paused OS rollout.
+    pub async fn os_rollout_resume(&self) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/os/rollout/resume", "{}".to_string())
+            .await
+    }
+
+    /// Abort the OS rollout.
+    pub async fn os_rollout_abort(&self) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/os/rollout/abort", "{}".to_string())
+            .await
+    }
+
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}{path}", self.base_url);
         let response = self

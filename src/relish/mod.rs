@@ -37,6 +37,7 @@ pub mod manifest;
 pub mod manual;
 pub mod metrics_cmd;
 pub mod netboot;
+pub mod os;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;

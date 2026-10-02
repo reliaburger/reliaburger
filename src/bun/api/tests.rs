@@ -1810,6 +1810,12 @@ async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_caller
             "/v1/upgrade/cluster-rollback",
             r#"{"target_version":"v0.1.0"}"#,
         ),
+        (
+            "/v1/os/rollout/start",
+            r#"{"version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        ),
+        ("/v1/os/rollout/resume", ""),
+        ("/v1/os/rollout/abort", ""),
     ];
     for (path, body) in calls {
         let (status, reply) =
@@ -3566,7 +3572,11 @@ async fn setup_scoped_with_role(
 }
 
 /// Every route that upgrades, rolls back or re-elects the cluster.
-const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
+const CLUSTER_ADMIN_ROUTES: [&str; 11] = [
+    "/v1/os/stage",
+    "/v1/os/rollout/start",
+    "/v1/os/rollout/resume",
+    "/v1/os/rollout/abort",
     "/v1/upgrade/apply",
     "/v1/upgrade/rollback",
     "/v1/upgrade/start",
@@ -6787,5 +6797,22 @@ async fn an_admin_opens_a_join_window_of_up_to_an_hour() {
         .await;
         assert_eq!(status, expected, "{minutes} minutes");
     }
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let (status, body) = post_authenticated(
+        app,
+        "/v1/os/stage",
+        &plaintext,
+        r#"{"rollout_id":"r","version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&body).contains("isn't an appliance"));
     shutdown.cancel();
 }

@@ -1485,6 +1485,32 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Appliance OS updates (W6): on an appliance, the slot this node stages
+    // updates into, and the leader's rollout loop beside the orchestrator.
+    match reliaburger::upgrade::keys::release_keys(&config.upgrades) {
+        Ok(keys) => {
+            if let Some(slot) = reliaburger::os::slot::OsSlot::detect(keys) {
+                reliaburger::os::slot::install(slot);
+            }
+        }
+        Err(error) => eprintln!("bun: OS updates disabled: {error}"),
+    }
+    if let (Some(council), Some(membership_rx)) =
+        (api_council.clone(), upgrade_membership_rx.clone())
+    {
+        let control = reliaburger::os::rollout::HttpOsControl::new(
+            cluster_http.clone(),
+            service_token.clone(),
+        );
+        tokio::spawn(reliaburger::os::rollout::run_rollout(
+            council,
+            control,
+            node_name.clone(),
+            membership_rx,
+            shutdown.clone(),
+        ));
+    }
+
     // Rolling-upgrade orchestrator: dormant unless this node is the Raft
     // leader with an active upgrade in DesiredState (Phase 14). Needs the
     // gossip membership watch to count live voters for quorum (UPG1); it
