@@ -527,6 +527,7 @@ for backend in &service.backends {
             && member.address.ip() == std::net::IpAddr::V4(backend.node_ip)
     });
     if still_there
+        && !reports.stale_nodes.contains(&node_id)
         && !reports.reports.contains_key(&node_id)
         && !desired.producer_retirements.blocks(&backend.node_id, backend.execution.as_ref())
     {
@@ -538,6 +539,10 @@ for backend in &service.backends {
 `matches!` is the boolean form of `match`: it's true when the value fits the pattern, and `Alive | Suspect` is one pattern with two alternatives. It saves a four-line `match` that returns `true` or `false`.
 
 Everything that should still remove a backend still does. The node's own report is authoritative the moment it arrives, even when it names nothing. A Dead or Left member, or one that came back at a different address, can't be serving there. A producer retirement (the node asking to release an address) still withdraws the backend, so carrying it forward never blocks an address release for longer than the retirement protocol already does. What we gave up is a small window in which a node that silently lost an instance *and* hasn't reported yet keeps advertising it. A connection there gets `ECONNREFUSED` from a closed port, which is what a crashed backend looks like anyway, rather than `EPERM` from a hook refusing a service that's alive.
+
+That rule had a hole of its own, and an audit found it (#431). "Hasn't reported under this leader" covered two very different nodes: one the leader hasn't heard from *yet*, and one it stopped hearing from long ago. A node whose reports went stale kept publishing its last backends as healthy, because the catalogue build never looked at `stale_nodes`. Worse, once the aggregator evicted the stale payload three windows later, the node looked exactly like one that simply hadn't reported, so the carry-forward rule kept its backends forever. Expired evidence was being renewed into healthy routing indefinitely.
+
+The fix gives silence a deadline. The aggregator now keeps a receive deadline per node that outlives the report payload, and a stale node publishes nothing, either from its old report or from the carried-forward catalogue. That's the `!reports.stale_nodes.contains(&node_id)` line above. A new leader still needs grace, though, or every leader change would withdraw every backend the moment the aggregator compared "never heard from" against the clock. So when the term changes, the aggregator starts a fresh deadline for every member gossip knows about. Each one gets one stale window (30 seconds by default, six report intervals) to reach the new leader. Reports arrive every five seconds, so a healthy node lands well inside it, and only a node that stays silent for a whole window loses its backends.
 
 ### Why userspace DNS, not eBPF?
 

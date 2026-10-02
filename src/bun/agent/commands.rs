@@ -924,7 +924,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 match self.apply_fault(&rule).await {
                     Ok(()) => {
                         let summary = crate::smoker::types::FaultSummary::from(&rule);
-                        let _ = response.send(Ok(summary));
+                        // A partition is applied once the connections it cut
+                        // are gone, not when its map key is written (#450).
+                        // Cuts that outlasted the turn finish in a task, and
+                        // the caller hears after them.
+                        let late = std::mem::take(&mut self.network_faults.late_cuts);
+                        if late.is_empty() {
+                            let _ = response.send(Ok(summary));
+                        } else {
+                            tokio::spawn(async move {
+                                faults::finish_late_cuts(late).await;
+                                let _ = response.send(Ok(summary));
+                            });
+                        }
                     }
                     Err(reason) => {
                         self.fault_registry.remove(rule.id);
