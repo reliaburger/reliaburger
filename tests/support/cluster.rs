@@ -564,6 +564,9 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         None => app,
     };
     let app = app.layer(axum::Extension(known_members));
+    // Like `bun`, every node finds the leader through the gossip directory,
+    // which also names it to workers outside Raft.
+    let app = app.layer(axum::Extension(api::LeaderDirectory(directory_rx.clone())));
     let api_shutdown = shutdown.clone();
     tasks.push(tokio::spawn(async move {
         axum::serve(listener, app)
