@@ -132,6 +132,21 @@ a node that's unreachable does so when it comes back. Run `relish status` (or
 
 Commands that take an app name also take `--namespace` (default `default`).
 
+## Instance names
+
+Every replica gets a name you'll see in `status`, `inspect`, logs and metrics:
+`default__web-0`, `default__web-1`, and so on, namespace first. The number is
+the replica's ordinal, and the leader hands them out across the whole cluster,
+so three replicas on three nodes are `-0`, `-1` and `-2` and no two share a
+name. A replica keeps its ordinal for as long as it lives. If its node dies,
+the replacement on another node takes the same name. Scaling up adds the
+lowest free ordinals, scaling down retires the highest, and a daemon set's
+replica keeps its number while its node stays eligible.
+
+A rolling or blue-green deploy names the new instances after their generation
+and keeps the ordinal: `default__web-1` becomes `default__web-g1-1`. A
+standalone node with no cluster numbers its replicas from 0.
+
 ## Many files
 
 `relish apply` takes one file (or, with `-f`, a Kubernetes manifest or an

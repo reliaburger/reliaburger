@@ -143,7 +143,7 @@ impl Scheduler {
     ) -> Result<SchedulingDecision, ScheduleError> {
         let mut placements = Vec::with_capacity(replica_count as usize);
 
-        for _ in 0..replica_count {
+        for ordinal in 0..replica_count {
             // Phase 1: Filter
             let candidates = filter_nodes(
                 requirements.resources,
@@ -183,6 +183,7 @@ impl Scheduler {
             placements.push(Placement {
                 node_id: selected_node.clone(),
                 resources: *requirements.resources,
+                ordinal,
             });
         }
 
@@ -214,7 +215,7 @@ impl Scheduler {
         }
 
         let mut placements = Vec::with_capacity(candidates.len());
-        for node_id in &candidates {
+        for (ordinal, node_id) in (0u32..).zip(&candidates) {
             // A credited copy is replaced: trade its footprint for the new one.
             let running = self
                 .cluster
@@ -228,6 +229,7 @@ impl Scheduler {
             placements.push(Placement {
                 node_id: node_id.clone(),
                 resources: *requirements.resources,
+                ordinal,
             });
         }
 

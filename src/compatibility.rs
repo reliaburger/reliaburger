@@ -30,12 +30,15 @@ pub struct Compatibility {
 /// deploy history, events and jobs for themselves on `local=true` and the
 /// WebSocket log stream sends `LogFrame` JSON (F07); the volume home a
 /// managed-volume app waits for (`DesiredAppEvidence::volume_home_away`, #423);
-/// and the recovery fence (#424): gossip advertises each node's recovery
+/// the recovery fence (#424): gossip advertises each node's recovery
 /// epoch, leader hints order by epoch then term, and a Raft peer refuses a
-/// fenced RPC with a `Fenced` reply.
+/// fenced RPC with a `Fenced` reply; and cluster-wide instance ordinals:
+/// each placement's `Placement::ordinal` in council state, the ordinals a
+/// placement poll hands a node (`NodeAssignment::ordinals`) and the
+/// instance ids named after them (#398).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 32,
-    state: 48,
+    protocol: 33,
+    state: 49,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

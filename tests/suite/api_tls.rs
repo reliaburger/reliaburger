@@ -234,7 +234,7 @@ async fn consumer_reconciler_retries_lost_receipts_after_tls_leader_change() {
                     assignments.endpoint_withdrawals.clear();
                 }
                 assignments.apps = vec![reliaburger::cluster::orchestrate::NodeAssignment {
-                    name: "pending".into(), namespace: "default".into(), replicas: 1,
+                    name: "pending".into(), namespace: "default".into(), ordinals: vec![0],
                     spec: reliaburger::config::Config::parse("[app.pending]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]").unwrap().app.remove("pending").unwrap(),
                 }];
                 async move { axum::Json(assignments) }

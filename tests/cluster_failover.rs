@@ -530,6 +530,7 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
             placements: vec![Placement {
                 node_id: NodeId::new(&nodes[2].name),
                 resources: Resources::new(500, 1024 * 1024, 0),
+                ordinal: 0,
             }],
         }),
     ] {
@@ -709,6 +710,7 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
             placements: vec![Placement {
                 node_id: NodeId::new(&nodes[2].name),
                 resources: Resources::new(500, 1024 * 1024, 0),
+                ordinal: 0,
             }],
         }),
     ] {

@@ -122,6 +122,7 @@ async fn stop_must_not_claim_cleanup_before_any_worker_has_seen_it() {
                 placements: vec![Placement {
                     node_id: NodeId::new("unreachable-worker"),
                     resources: Resources::default(),
+                    ordinal: 0,
                 }],
             },
         ))

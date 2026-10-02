@@ -146,8 +146,9 @@
               </li>
               <li>
                 <pre><code data-tour>relish status</code></pre>
-                <p>Give it half a minute. Three frontend replicas, one on each node. The scheduler
-                  spread them, not you.</p>
+                <p>Give it half a minute. Three frontend replicas, one on each node, named
+                  <code>frontend-0</code>, <code>-1</code> and <code>-2</code>. The scheduler
+                  spread them and numbered them, not you.</p>
               </li>
               <li>
                 <pre><code>open http://podinfo.localhost:18080</code></pre>
@@ -212,7 +213,8 @@
 <code data-tour>relish inspect frontend</code></pre>
                 <p>Now lose a whole machine. About a minute later there are three running frontends
                   again, spread over the two nodes that are left: each keeps the one it had, and one
-                  of them starts a replacement. Nobody had to notice first. <code>inspect</code>
+                  of them starts a replacement under the lost one’s name. Nobody had to notice
+                  first. <code>inspect</code>
                   asks every node, lists each instance, running or stopped, with the node it’s on,
                   and names the node that didn’t answer.</p>
               </li>

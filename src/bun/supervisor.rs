@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use crate::config::app::AppSpec;
 use crate::config::job::JobSpec;
-use crate::config::types::Replicas;
 use crate::grill::oci::OciSpec;
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
@@ -416,8 +415,9 @@ impl<G: Grill> WorkloadSupervisor<G> {
 
     /// Deploy an app, creating workload instances in Pending state.
     ///
-    /// Creates one instance per replica. For `DaemonSet` mode, creates
-    /// a single instance (correct for single-node Phase 1).
+    /// Creates one instance per replica, named after the ordinal the
+    /// leader assigned it ([`AppSpec::replica_ordinals`]). A standalone
+    /// node numbers them from 0, and runs one replica of a daemon set.
     pub async fn deploy_app(
         &mut self,
         app_name: &str,
@@ -425,11 +425,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &AppSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
-        let replica_count = match spec.replicas {
-            Replicas::Fixed(n) => n,
-            Replicas::DaemonSet => 1,
-        };
-        let indices: Vec<u32> = (0..replica_count).collect();
+        let indices = spec.replica_ordinals();
         let instance_ids = self
             .create_app_instances(app_name, namespace, spec, &indices, now)
             .await?;
@@ -442,7 +438,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
 
     /// Add `count` Pending replicas to an app that already runs, beside its
     /// existing ones, for a deploy that only raises the replica count. They
-    /// take the lowest ordinals no owned instance uses.
+    /// take the assigned ordinals no owned instance uses, or on a standalone
+    /// node the lowest unused ones.
     pub async fn add_app_replicas(
         &mut self,
         app_name: &str,
@@ -451,12 +448,24 @@ impl<G: Grill> WorkloadSupervisor<G> {
         count: u32,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
-        let indices: Vec<u32> = (0..u32::MAX)
-            .filter(|index| {
-                let id =
-                    crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
-                !self.instances.contains_key(&id)
-            })
+        // An ordinal is in use whatever generation its instance is in: after
+        // a rolling deploy the replicas are `{app}-g{gen}-{ordinal}`.
+        let used: std::collections::HashSet<u32> = self
+            .instances
+            .values()
+            .filter(|instance| instance.app_name == app_name && instance.namespace == namespace)
+            .filter_map(|instance| crate::grill::InstanceIdentity::parse(&instance.id.0))
+            .map(|identity| identity.ordinal)
+            .collect();
+        // Without an assignment, `count` of the first `used + count`
+        // ordinals are always free.
+        let candidates: Vec<u32> = match &spec.ordinals {
+            Some(ordinals) => ordinals.clone(),
+            None => (0..used.len() as u32 + count).collect(),
+        };
+        let indices: Vec<u32> = candidates
+            .into_iter()
+            .filter(|index| !used.contains(index))
             .take(count as usize)
             .collect();
         let added = self
@@ -825,6 +834,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
 mod tests {
     use super::*;
     use crate::config::app::{HealthProtocol, HealthSpec};
+    use crate::config::types::Replicas;
     use crate::grill::mock::MockGrill;
     use std::time::Duration;
 
@@ -894,6 +904,7 @@ mod tests {
             exec: None,
             script: None,
             replicas: Replicas::Fixed(1),
+            ordinals: None,
             port,
             health: None,
             memory: None,
