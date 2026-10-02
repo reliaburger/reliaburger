@@ -2010,6 +2010,22 @@ impl CouncilStateMachine {
         persist_snapshot(snapshot_db, &data, 1)
     }
 
+    /// An offline recovery snapshot has no old log boundary or membership.
+    /// Ordinary fresh joiners have no snapshot and must still await their seed.
+    pub async fn recovered_bootstrap_pending(&self) -> bool {
+        let guard = self.inner.read().await;
+        guard.snapshot_data.is_some()
+            && guard.state.recovery_epoch > 0
+            && guard.state.last_applied_log.is_none()
+            && guard
+                .state
+                .last_membership
+                .membership()
+                .nodes()
+                .next()
+                .is_none()
+    }
+
     /// Read the current desired state.
     pub async fn desired_state(&self) -> DesiredState {
         self.inner.read().await.state.clone()

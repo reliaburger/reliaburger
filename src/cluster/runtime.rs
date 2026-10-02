@@ -345,6 +345,7 @@ pub async fn start(
     // offline operation, so it is constant for the process). Stamped on Raft
     // RPCs and enforced by the accept side to fence a recovered survivor off
     // from the dead cluster's peers (C5).
+    let recovered_bootstrap = state_machine.recovered_bootstrap_pending().await;
     let recovery_epoch = state_machine.desired_state().await.recovery_epoch;
     let factory = match raft_tls_material {
         Some(material) => TcpRaftNetworkFactory::new_tls_bound(raft_id, material),
@@ -432,12 +433,15 @@ pub async fn start(
         .await;
     });
 
-    // Bootstrap ONLY a genuinely new cluster: no seeds AND a fresh durable
+    // Bootstrap a new cluster or an explicitly recovered snapshot. Recovery
+    // deliberately replaced the old membership; configured join seeds must
+    // not prevent its new single-voter council from forming.
+    // A genuinely new cluster has no seeds AND a fresh durable
     // store. A restarted seed node has a populated store, so it resumes its
     // existing cluster from durable state instead of re-initialising into a
     // fresh single-node cluster (which would elect itself a second leader —
     // the split-brain bug this stage fixes).
-    if params.seeds.is_empty() && store_fresh {
+    if store_fresh && (params.seeds.is_empty() || recovered_bootstrap) {
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
         initialise_bootstrap(
