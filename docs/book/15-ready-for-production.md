@@ -4142,6 +4142,37 @@ connections being gone. So the cuts run side by side under the turn's budget,
 before the answer, like the delays, and only one that's cut short is retried
 from a task.
 
+That "only" still left a hole, and the same test found it twice more (#450).
+On a loaded runner `ip netns exec ... ss -K` for three frontends doesn't
+always fit in what's left of a 500 ms turn, and the log said so: `agent loop
+turn took 502 ms in command (inject_fault)`. The cuts that missed the deadline
+went to the retry task, and the answer went out straight away, so the test
+fired its cache calls while two frontends' pools were still connected. The
+fix is the node-pressure rule again: whoever answers waits. The reconcile now
+hands back the cuts that missed the deadline instead of detaching them
+(`smoker::network::cut_until` returns a `LateCuts`), and `InjectFault` gives
+them, together with its reply, to a task that finishes the cuts and only then
+answers. The loop never waits past its budget. The caller waits until the
+partition is really in place. A reconcile nobody is waiting on, such as a
+health tick picking up a restarted caller, still sends its late cuts off to
+finish on their own.
+
+The helper that runs one cut has a signature worth a second look:
+
+```rust
+fn cut_open_connections(
+    cut: &ConnectionCut,
+) -> impl Future<Output = ()> + Send + use<> {
+```
+
+In Rust 2024, a function returning `impl Trait` is assumed to capture every
+lifetime in its arguments, so the future would count as borrowing `cut` and
+couldn't outlive it. `use<>` is the capture list, and an empty one says the
+future borrows nothing. It holds its own copies of the instance id and the
+`ss` arguments, so a task can keep running it after the turn's `cut` is
+gone. Go has no equivalent because a goroutine's closure can keep anything
+alive. Rust makes you say it.
+
 Node pressure got the most machinery, because its helper takes up to four
 seconds to say it's ready and the controller has to stay the single owner of
 the helper. The controller moved behind a `tokio::sync::Mutex` shared with the

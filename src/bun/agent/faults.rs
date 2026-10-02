@@ -36,6 +36,40 @@ pub(super) struct InstalledNetworkFaults {
     /// Whether this Bun has swept delay trees a previous Bun left behind.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) delays_swept: bool,
+    /// Connection cuts a reconcile started but its turn couldn't wait for.
+    /// Whoever answers for the fault that landed them finishes them first:
+    /// an injection before it replies, any other reconcile from a task.
+    pub(super) late_cuts: crate::smoker::network::LateCuts,
+}
+
+/// Run the cuts a reconcile left in [`InstalledNetworkFaults::late_cuts`].
+pub(super) async fn finish_late_cuts(late: crate::smoker::network::LateCuts) {
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    late.finish(cut_open_connections).await;
+    // Only the eBPF connect hook lands cuts, so there are none to run.
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    drop(late);
+}
+
+/// Destroy one caller's established connections to the faulted backends.
+///
+/// `use<>` says the future borrows nothing from `cut`: it owns copies of what
+/// it needs, so it can outlive the turn that started it.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn cut_open_connections(
+    cut: &crate::smoker::network::ConnectionCut,
+) -> impl std::future::Future<Output = ()> + Send + use<> {
+    let instance_id = cut.instance_id.clone();
+    let args = crate::smoker::network::socket_destroy_args(&cut.backends);
+    async move {
+        match crate::smoker::network::run_in_instance_netns(&instance_id, "ss", &args).await {
+            // Process and host-network workloads have no namespace of their
+            // own; their sockets live in the host's, among every other
+            // caller's, so they are left alone.
+            Ok(_) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }) => {}
+            Err(error) => eprintln!("smoker: cutting open connections: {error}"),
+        }
+    }
 }
 
 /// The network-byte-order VIP and port of a fault's target service, if this
@@ -1072,14 +1106,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             && self.network_faults.connect.is_empty()
             && self.network_faults.delays.is_empty()
         {
+            self.spawn_late_cuts();
             return;
         }
         if let Err(error) = self.reconcile_connect_faults().await {
             eprintln!("smoker: network fault reconcile: {error}");
         }
+        // Nobody is waiting on this reconcile's answer, so its late cuts (and
+        // any a failed injection left) finish from a task.
+        self.spawn_late_cuts();
         #[cfg(target_os = "linux")]
         for (instance, error) in self.reconcile_delays().await {
             eprintln!("smoker: delay on {instance}: {error}");
+        }
+    }
+
+    /// Finish the connection cuts no caller is waiting for from a task, so
+    /// they land late rather than never.
+    pub(super) fn spawn_late_cuts(&mut self) {
+        let late = std::mem::take(&mut self.network_faults.late_cuts);
+        if !late.is_empty() {
+            tokio::spawn(finish_late_cuts(late));
         }
     }
 
@@ -1430,53 +1477,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         });
         // The cuts must land before the fault is reported installed, or a
         // pooled client's next request still goes through. Every caller's
-        // `ss` runs at once under the turn's runtime budget; one cut short
-        // is run again from a task, so it lands late rather than never.
-        let deadline = self.turn_deadline();
-        let attempts = cuts.iter().map(|cut| async move {
-            let args = crate::smoker::network::socket_destroy_args(&cut.backends);
-            tokio::time::timeout_at(
-                deadline,
-                crate::smoker::network::run_in_instance_netns(&cut.instance_id, "ss", &args),
-            )
-            .await
-        });
-        // `timeout_at` polls the cuts before its clock, so at the deadline
-        // the ones that finished still count.
-        let outcomes = tokio::time::timeout_at(deadline, futures_util::future::join_all(attempts))
-            .await
-            .unwrap_or_default();
-        let mut outcomes = outcomes.into_iter();
-        let mut late = Vec::new();
-        for cut in cuts {
-            match outcomes.next() {
-                // Process and host-network workloads have no namespace of
-                // their own; their sockets live in the host's, among every
-                // other caller's, so they are left alone.
-                Some(Ok(
-                    Ok(_) | Err(crate::smoker::network::NetnsCommandError::NoNamespace { .. }),
-                )) => {}
-                Some(Ok(Err(error))) => eprintln!("smoker: cutting open connections: {error}"),
-                Some(Err(_)) | None => late.push(cut),
-            }
-        }
-        if !late.is_empty() {
-            tokio::spawn(async move {
-                for cut in late {
-                    let args = crate::smoker::network::socket_destroy_args(&cut.backends);
-                    if let Err(error) =
-                        crate::smoker::network::run_in_instance_netns(&cut.instance_id, "ss", &args)
-                            .await
-                        && !matches!(
-                            error,
-                            crate::smoker::network::NetnsCommandError::NoNamespace { .. }
-                        )
-                    {
-                        eprintln!("smoker: cutting open connections: {error}");
-                    }
-                }
-            });
-        }
+        // `ss` runs at once under the turn's runtime budget. The ones still
+        // running at the deadline wait in `late_cuts` for whoever answers for
+        // the fault (#450): reporting it applied while they ran let a
+        // frontend's pool reach redis through a partition.
+        // LOOP-INLINE: every cut waits at most until the turn's runtime deadline
+        let late =
+            crate::smoker::network::cut_until(cuts, self.turn_deadline(), cut_open_connections)
+                .await;
+        self.network_faults.late_cuts.extend(late);
         if failures.is_empty() {
             Ok(())
         } else {
