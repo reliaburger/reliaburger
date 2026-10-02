@@ -163,7 +163,9 @@ async fn stream_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<u
     Ok(total)
 }
 
-fn sha256_file(path: &Path) -> Result<String, RelishError> {
+/// The hex SHA-256 of a file, read in 1 MiB pieces (disk images are
+/// bigger than some machines' memory).
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut file = std::fs::File::open(path)?;
     let mut buffer = vec![0u8; 1 << 20];
