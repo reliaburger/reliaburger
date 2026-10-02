@@ -231,15 +231,17 @@ async fn complete_entry<G: Grill>(
     // has its own timeout, so one that misses the deadline doesn't take the
     // others' answers with it: runc serialises an instance's calls, and a
     // liveness check stuck behind the health sweep's must not hide a pid
-    // that answered (#358). `timeout_at` polls once even past the deadline,
-    // so a read that answers at once is never marked unknown.
+    // that answered (#358). The liveness check is `has_exited`, not
+    // `state`, so runc can answer it for a live launcher without that queue
+    // (#456). `timeout_at` polls once even past the deadline, so a read that
+    // answers at once is never marked unknown.
     let exited = async {
         if !alive {
             return Ok(false);
         }
-        tokio::time::timeout_at(deadline, grill.state(&id))
+        tokio::time::timeout_at(deadline, grill.has_exited(&id))
             .await
-            .map(|state| matches!(state, Ok(ContainerState::Stopped)))
+            .map(|exited| matches!(exited, Ok(true)))
     };
     // `None` when the pid is unknown: the read missed the deadline, or the
     // runtime failed to answer, which never means "no process".
