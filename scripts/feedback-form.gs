@@ -101,6 +101,7 @@ function normalize(d) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s.email)) s.errors.push('email');
   if (!/^https?:\/\/([a-z]{2,3}\.)?(www\.)?linkedin\.com\/.+/i.test(s.linkedin)) s.errors.push('linkedin');
   if (!s.consent) s.errors.push('consent');
+  ['broke', 'company', 'role'].forEach(function (k) { if (!s[k]) s.errors.push(k); });
   QUESTIONS.forEach(function (q) { if (!s[q[0]]) s.errors.push(q[0]); });
   return s;
 }
@@ -114,7 +115,7 @@ function compose(s) {
     ['Happy to share their information with the Reliaburger team', 'yes']
   ];
   var answers = QUESTIONS.map(function (q) { return [q[1], s[q[0]]]; });
-  if (s.broke) answers.push(['What broke?', s.broke]);
+  answers.push(['What broke? (if anything)', s.broke]);
   var more = [
     ['Company', s.company], ['Role', s.role], ['Platform', platformText(s)],
     ['Steps completed', s.steps.length ? s.steps.join(', ') : ''],
