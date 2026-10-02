@@ -81,6 +81,12 @@ struct StateMachineInner {
     state: DesiredState,
     snapshot_index: u64,
     snapshot_data: Option<Vec<u8>>,
+    /// The log id and membership `snapshot_data` covers. The live `state`
+    /// moves on as entries apply; a snapshot handed to a learner must
+    /// describe its own contents, or the learner records a log position its
+    /// state doesn't hold.
+    snapshot_last_log_id: Option<LogId<u64>>,
+    snapshot_membership: StoredMembership<u64, CouncilNodeInfo>,
     /// When set, snapshots are persisted here so applied state survives a
     /// restart (the durable log replays only the post-snapshot tail).
     db: Option<Arc<Database>>,
@@ -1946,6 +1952,8 @@ impl CouncilStateMachine {
                 // start so an operator can restore from backup instead.
                 inner.state = serde_json::from_slice::<DesiredState>(&bytes)?;
                 inner.snapshot_data = Some(bytes);
+                inner.snapshot_last_log_id = inner.state.last_applied_log;
+                inner.snapshot_membership = inner.state.last_membership.clone();
             }
             if let Some(idx) = t.get(SNAP_INDEX_KEY)?
                 && let Ok(le) = <[u8; 8]>::try_from(idx.value())
@@ -2027,7 +2035,7 @@ impl CouncilStateMachine {
     pub async fn snapshot_last_applied(&self) -> Option<LogId<u64>> {
         let guard = self.inner.read().await;
         if guard.snapshot_data.is_some() {
-            guard.state.last_applied_log
+            guard.snapshot_last_log_id
         } else {
             None
         }
@@ -2115,6 +2123,8 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             guard.state.last_membership = meta.last_membership.clone();
             guard.snapshot_index += 1;
             guard.snapshot_data = Some(data.clone());
+            guard.snapshot_last_log_id = meta.last_log_id;
+            guard.snapshot_membership = meta.last_membership.clone();
             (guard.db.clone(), guard.snapshot_index)
         };
 
@@ -2133,8 +2143,8 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         match &guard.snapshot_data {
             Some(data) => {
                 let meta = SnapshotMeta {
-                    last_log_id: guard.state.last_applied_log,
-                    last_membership: guard.state.last_membership.clone(),
+                    last_log_id: guard.snapshot_last_log_id,
+                    last_membership: guard.snapshot_membership.clone(),
                     snapshot_id: format!("mem-{}", guard.snapshot_index),
                 };
                 Ok(Some(Snapshot {
@@ -2165,6 +2175,8 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
                 .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
             guard.snapshot_index += 1;
             guard.snapshot_data = Some(data.clone());
+            guard.snapshot_last_log_id = guard.state.last_applied_log;
+            guard.snapshot_membership = guard.state.last_membership.clone();
             (
                 data,
                 guard.snapshot_index,
@@ -4219,6 +4231,47 @@ mod tests {
             stored_membership.membership().get_joint_config().len(),
             membership.get_joint_config().len()
         );
+    }
+
+    /// #426: a learner joining after the snapshot was built must be told
+    /// the log position the snapshot holds, not where the live state has
+    /// moved on to since. Otherwise it records entries it never received.
+    #[tokio::test]
+    async fn current_snapshot_describes_its_own_contents_not_the_live_state() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::ConfigSet {
+                key: "in-snapshot".to_string(),
+                value: "yes".to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.build_snapshot().await.unwrap();
+
+        // The live state moves on past the snapshot.
+        sm.apply(vec![normal_entry(
+            1,
+            2,
+            RaftRequest::ConfigSet {
+                key: "after-snapshot".to_string(),
+                value: "yes".to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        let current = sm.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta.last_log_id, Some(log_id(1, 1)));
+        let mut data = Vec::new();
+        let mut cursor = *current.snapshot;
+        cursor.read_to_end(&mut data).unwrap();
+        let held: DesiredState = serde_json::from_slice(&data).unwrap();
+        assert!(held.config.contains_key("in-snapshot"));
+        assert!(!held.config.contains_key("after-snapshot"));
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ mod batch;
 mod bun_auth_startup;
 mod compatibility;
 mod council_persistence;
+mod council_snapshot_install;
 mod council_tcp;
 mod declarative_resources;
 mod dependency_audit;
