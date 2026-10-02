@@ -113,9 +113,27 @@ migration and no feature gate
     [#391](https://github.com/reliaburger/reliaburger/pull/391)), and the execution fence waiting out a slow network-reference
     read ([#393](https://github.com/reliaburger/reliaburger/issues/393), [#400](https://github.com/reliaburger/reliaburger/pull/400));
   - [x] the installers showing what they're downloading instead of staying
-    silent for minutes ([#395](https://github.com/reliaburger/reliaburger/issues/395), [#397](https://github.com/reliaburger/reliaburger/pull/397)).
+    silent for minutes ([#395](https://github.com/reliaburger/reliaburger/issues/395), [#397](https://github.com/reliaburger/reliaburger/pull/397));
+  - [x] data safety: restarting Bun no longer moves a managed-volume app onto
+    an empty volume, and `relish wtf` reports an app waiting for its volume's
+    node ([#423](https://github.com/reliaburger/reliaburger/issues/423), [#425](https://github.com/reliaburger/reliaburger/pull/425));
+  - [x] council recovery without split brain: old voters are fenced on the old
+    epoch, snapshots install every entry, recovery keeps the old state until
+    the new one is safe, and `relish council status`, a status header line and
+    `wtf` findings show the council from any node ([#424](https://github.com/reliaburger/reliaburger/issues/424), [#426](https://github.com/reliaburger/reliaburger/issues/426)–[#430](https://github.com/reliaburger/reliaburger/issues/430),
+    [#438](https://github.com/reliaburger/reliaburger/pull/438), [#439](https://github.com/reliaburger/reliaburger/pull/439), [#447](https://github.com/reliaburger/reliaburger/pull/447));
+  - [x] audit fixes for the scheduler and the API: capacity reservations held
+    between ticks, daemons not crowded out by their own copy, spec changes
+    readmitted, stale endpoints expired, `cluster stop` and diagnostics that
+    wait for real answers ([#431](https://github.com/reliaburger/reliaburger/issues/431)–[#436](https://github.com/reliaburger/reliaburger/issues/436), [#440](https://github.com/reliaburger/reliaburger/pull/440)–[#445](https://github.com/reliaburger/reliaburger/pull/445));
+  - [x] cluster-wide instance ordinals, so three replicas on three nodes are
+    `app-0`, `app-1` and `app-2` ([#398](https://github.com/reliaburger/reliaburger/issues/398), [#462](https://github.com/reliaburger/reliaburger/pull/462));
+  - [x] the last fixed-timeout awaits off the agent loop, and the flakes and
+    turn-budget misses found while qualifying the first 0.1.3 candidates
+    ([#419](https://github.com/reliaburger/reliaburger/issues/419), [#422](https://github.com/reliaburger/reliaburger/issues/422), [#448](https://github.com/reliaburger/reliaburger/issues/448), [#450](https://github.com/reliaburger/reliaburger/issues/450), [#456](https://github.com/reliaburger/reliaburger/issues/456), [#461](https://github.com/reliaburger/reliaburger/issues/461), [#420](https://github.com/reliaburger/reliaburger/pull/420), [#421](https://github.com/reliaburger/reliaburger/pull/421),
+    [#449](https://github.com/reliaburger/reliaburger/pull/449), [#453](https://github.com/reliaburger/reliaburger/pull/453), [#464](https://github.com/reliaburger/reliaburger/pull/464), [#465](https://github.com/reliaburger/reliaburger/pull/465)).
 
-  0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 30 and 48
+  0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 33 and 49
   now), so a 0.1.2 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.2](releasing.md#upgrading-from-012)). 0.1.2's leader
   refuses the upgrade before it records a run.
@@ -129,10 +147,7 @@ migration and no feature gate
   of F07: separate stderr capture, richer log filters, a merged live event
   stream and rollback over merged history
   ([#392](https://github.com/reliaburger/reliaburger/issues/392)). The
-  security work comes before real fleets in 0.3.0. Also a data-loss fix:
-  restarting Bun no longer moves a managed-volume app onto an empty volume,
-  and `relish wtf` reports an app waiting for its volume's node
-  ([#423](https://github.com/reliaburger/reliaburger/issues/423)).
+  security work comes before real fleets in 0.3.0.
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
