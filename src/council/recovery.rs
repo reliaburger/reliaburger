@@ -152,6 +152,14 @@ pub fn recover_data_dir(data_dir: &Path, state: DesiredState) -> Result<(), Reco
             .map_err(|e| RecoveryError::Persist(format!("remove stale log: {e}")))?;
     }
 
+    // The old fence record holds the dead council's epoch claim; the
+    // recovered snapshot is now the only source of this node's epoch.
+    let fence_path = raft_dir.join(crate::council::fence::FENCE_FILE);
+    if fence_path.exists() {
+        std::fs::remove_file(&fence_path)
+            .map_err(|e| RecoveryError::Persist(format!("remove stale fence record: {e}")))?;
+    }
+
     let snapshot_path = raft_dir.join("snapshot.redb");
     // Replace any existing snapshot store so the recovered state is the only
     // state the node loads.

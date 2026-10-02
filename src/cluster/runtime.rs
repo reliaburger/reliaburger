@@ -341,16 +341,34 @@ pub async fn start(
         None => (None, None, None),
     };
 
-    // This node's recovery epoch, captured once at startup (recovery is an
-    // offline operation, so it is constant for the process). Stamped on Raft
-    // RPCs and enforced by the accept side to fence a recovered survivor off
-    // from the dead cluster's peers (C5).
-    let recovery_epoch = state_machine.desired_state().await.recovery_epoch;
+    // Bootstrap ONLY a genuinely new cluster: no seeds AND a fresh durable
+    // store. A restarted seed node has a populated store, so it resumes its
+    // existing cluster from durable state instead of re-initialising into a
+    // fresh single-node cluster (which would elect itself a second leader —
+    // the split-brain bug this stage fixes). The one other fresh store that
+    // bootstraps is a survivor `relish council recover` just stamped with a
+    // newer recovery epoch: it must re-form its council even when its config
+    // still lists join seeds.
+    let snapshot_epoch = state_machine.desired_state().await.recovery_epoch;
+    let bootstrapping = store_fresh && (params.seeds.is_empty() || snapshot_epoch > 0);
+
+    // The recovery fence (C5, #424): this node's epoch claim, stamped on
+    // every Raft RPC and enforced in both directions. A node holding Raft
+    // state starts probing (no Raft until gossip shows its peers' epochs); a
+    // fresh joiner claims nothing and adopts the epoch of the council that
+    // admits it.
+    let fence = crate::council::fence::RecoveryFence::load(
+        &raft_dir,
+        snapshot_epoch,
+        !store_fresh,
+        bootstrapping,
+    )
+    .await?;
     let factory = match raft_tls_material {
         Some(material) => TcpRaftNetworkFactory::new_tls_bound(raft_id, material),
         None => TcpRaftNetworkFactory::new(raft_id),
     }
-    .with_recovery_epoch(recovery_epoch)
+    .with_fence(fence.clone())
     .with_node_gate(node_gate.clone());
     // Same for the Raft RPC blocklist — a partition must cut both the
     // gossip and Raft transports or SWIM half-detects the peer.
@@ -364,8 +382,10 @@ pub async fn start(
         params.wrapping_ikm,
     )
     .await
-    .map_err(|e| std::io::Error::other(format!("council init failed: {e}")))?;
+    .map_err(|e| std::io::Error::other(format!("council init failed: {e}")))?
+    .with_recovery_fence(fence.clone());
     let council = Arc::new(council);
+    node.set_recovery_fence_watch(fence.subscribe());
     let shutdown_council = Arc::clone(&council);
     let council_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -420,24 +440,27 @@ pub async fn start(
     let rpc_shutdown = shutdown.clone();
     let rpc_acceptor = raft_acceptor.clone();
     let rpc_node_gate = node_gate.clone();
+    let rpc_fence = fence.clone();
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
         serve_raft_rpc_with_node_gate(
             raft_listener,
             raft,
             rpc_shutdown,
             rpc_acceptor,
-            recovery_epoch,
+            rpc_fence,
             rpc_node_gate,
         )
         .await;
     });
+    crate::cluster::recovery_fence::spawn_recovery_fence_supervisor(
+        fence.clone(),
+        Arc::clone(&council),
+        directory_rx.clone(),
+        params.node_name.clone(),
+        shutdown.clone(),
+    );
 
-    // Bootstrap ONLY a genuinely new cluster: no seeds AND a fresh durable
-    // store. A restarted seed node has a populated store, so it resumes its
-    // existing cluster from durable state instead of re-initialising into a
-    // fresh single-node cluster (which would elect itself a second leader —
-    // the split-brain bug this stage fixes).
-    if params.seeds.is_empty() && store_fresh {
+    if bootstrapping {
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
         initialise_bootstrap(
@@ -446,6 +469,9 @@ pub async fn start(
             params.bootstrap_security_state.as_deref(),
         )
         .await?;
+        if snapshot_epoch > 0 {
+            compact_recovered_log(&council).await?;
+        }
     }
 
     let raft_metrics_rx = council.metrics();
@@ -464,9 +490,18 @@ pub async fn start(
         shutdown.clone(),
     );
 
+    // Fenced voters of a replaced council refuse every Raft RPC, so they can
+    // never catch up as learners: keep them out of the reconciler's view.
+    let reconciler_membership_rx =
+        crate::cluster::recovery_fence::spawn_reconciler_membership_filter(
+            membership_rx.clone(),
+            directory_rx.clone(),
+            fence.clone(),
+            shutdown.clone(),
+        );
     spawn_council_reconciler_with_pressure(
         Arc::clone(&council),
-        membership_rx.clone(),
+        reconciler_membership_rx,
         disk_pressured_rx,
         port_offset,
         raft_id,
@@ -507,8 +542,8 @@ pub async fn start(
     // council learn the leader without Raft metrics.
     spawn_leader_hint_publisher(
         raft_metrics_rx.clone(),
+        fence.clone(),
         leader_hint_tx,
-        raft_id,
         NodeId::new(&params.node_name),
         api_addr,
         reporting_addr,
@@ -691,18 +726,19 @@ fn spawn_supervised(
 
 /// Publish a [`LeaderHint`] naming THIS node while it is the Raft leader,
 /// and `None` otherwise. The gossip node stamps the hint (or the best
-/// relayed one) onto every outgoing datagram; term ordering lets the whole
-/// cluster converge on the newest leader.
+/// relayed one) onto every outgoing datagram; ordering by recovery epoch,
+/// then term, lets the whole cluster converge on the newest leader.
 fn spawn_leader_hint_publisher(
     mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    fence: crate::council::fence::RecoveryFence,
     hint_tx: watch::Sender<Option<LeaderHint>>,
-    self_id: u64,
     node_id: NodeId,
     api_address: SocketAddr,
     reporting_address: SocketAddr,
     supervision: TaskSupervision,
 ) {
     let shutdown = supervision.shutdown.clone();
+    let self_id = identity::raft_id_from_name(&node_id.0);
     spawn_supervised("cluster:leader-hint", supervision, async move {
         loop {
             let hint = {
@@ -710,6 +746,7 @@ fn spawn_leader_hint_publisher(
                 (m.current_leader == Some(self_id)).then(|| LeaderHint {
                     node_id: node_id.clone(),
                     term: m.current_term,
+                    recovery_epoch: fence.snapshot().epoch,
                     api_address,
                     reporting_address,
                 })
@@ -872,6 +909,61 @@ async fn initialise_bootstrap(
     })
     .await
     .map_err(|_| std::io::Error::other("council bootstrap timed out"))?
+}
+
+/// Snapshot a freshly recovered council and purge its log (#424).
+///
+/// Recovery seeds the state machine directly from the restored state; no log
+/// entry carries it. A new member replicating the log from index zero would
+/// get only what was written after recovery: no apps, no CAs, no tokens. Once
+/// the log's head is purged behind a snapshot, Raft has to send new members
+/// that snapshot instead, and it holds the whole restored state.
+async fn compact_recovered_log(council: &CouncilNode) -> std::io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        // A committed no-op proves leadership and gives the snapshot an index.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Err(error) = council
+            .write(crate::council::types::RaftRequest::Noop)
+            .await
+        {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(std::io::Error::other(format!(
+                    "recovered council never committed: {error}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let applied = council
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|log_id| log_id.index)
+            .unwrap_or_default();
+        council
+            .raft()
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| std::io::Error::other(format!("snapshot recovered state: {e}")))?;
+        let mut metrics = council.metrics();
+        metrics
+            .wait_for(|m| m.snapshot.is_some_and(|s| s.index >= applied))
+            .await
+            .map_err(|e| std::io::Error::other(format!("await recovered snapshot: {e}")))?;
+        council
+            .raft()
+            .trigger()
+            .purge_log(applied)
+            .await
+            .map_err(|e| std::io::Error::other(format!("purge recovered log: {e}")))?;
+        metrics
+            .wait_for(|m| m.purged.is_some_and(|p| p.index >= applied))
+            .await
+            .map_err(|e| std::io::Error::other(format!("await recovered purge: {e}")))?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| std::io::Error::other("compacting the recovered council's log timed out"))?
 }
 
 /// Seed the initial `SecurityState` into Raft on a freshly bootstrapped

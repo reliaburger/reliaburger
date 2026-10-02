@@ -40,7 +40,10 @@ pub struct NodeDirectory {
     /// replaced. A node drops out of the set the moment it re-advertises a
     /// healthy disk.
     pub disk_pressured: HashSet<NodeId>,
-    /// Best known leader; terms only grow, so highest term wins.
+    /// Each node's advertised recovery epoch (#424); `None` for a node that
+    /// holds none yet.
+    pub recovery_epochs: HashMap<NodeId, Option<u64>>,
+    /// Best known leader: newest recovery epoch first, then highest term.
     pub leader: Option<LeaderHint>,
 }
 
@@ -80,19 +83,25 @@ impl NodeDirectory {
             self.disk_pressured.remove(&extension.node_id);
             changed = true;
         }
+        changed |= self
+            .recovery_epochs
+            .insert(extension.node_id.clone(), extension.recovery_epoch)
+            != Some(extension.recovery_epoch);
         if let Some(hint) = &extension.leader {
             changed |= self.observe_hint(hint);
         }
         changed
     }
 
-    /// Adopt `hint` if it is newer (higher term) than the current one, or
-    /// same-term with different content (a leader re-advertising moved
-    /// endpoints). Returns `true` if adopted.
+    /// Adopt `hint` if it is newer than the current one (a newer recovery
+    /// epoch, or a higher term in the same epoch), or the same epoch and term
+    /// with different content (a leader re-advertising moved endpoints).
+    /// Returns `true` if adopted.
     pub fn observe_hint(&mut self, hint: &LeaderHint) -> bool {
         let newer = match &self.leader {
             Some(current) => {
-                hint.term > current.term || (hint.term == current.term && hint != current)
+                let order = |h: &LeaderHint| (h.recovery_epoch, h.term);
+                order(hint) > order(current) || (order(hint) == order(current) && hint != current)
             }
             None => true,
         };
@@ -136,6 +145,7 @@ impl NodeDirectory {
             self.endpoints.remove(node_id);
             self.labels.remove(node_id);
             self.disk_pressured.remove(node_id);
+            self.recovery_epochs.remove(node_id);
         }
         self.endpoints.len() != before
     }
@@ -161,6 +171,7 @@ mod tests {
             leader,
             labels: BTreeMap::new(),
             disk_pressured: false,
+            recovery_epoch: None,
             hmac: [0u8; 32],
         }
     }
@@ -176,6 +187,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             disk_pressured: false,
+            recovery_epoch: None,
             hmac: [0u8; 32],
         }
     }
@@ -188,6 +200,7 @@ mod tests {
             leader: None,
             labels: BTreeMap::new(),
             disk_pressured: pressured,
+            recovery_epoch: None,
             hmac: [0u8; 32],
         }
     }
@@ -196,6 +209,7 @@ mod tests {
         LeaderHint {
             node_id: NodeId::new(node),
             term,
+            recovery_epoch: 0,
             api_address: addr(9117),
             reporting_address: addr(9445),
         }
@@ -324,5 +338,46 @@ mod tests {
         dir.observe(&extension_with_disk_pressure("n1", 9117, true));
         dir.prune(&[NodeId::new("n1")]);
         assert!(!dir.disk_pressured.contains(&NodeId::new("n1")));
+    }
+
+    /// #424: a recovered council restarts its term line, so the replaced
+    /// council's last hint carries a higher term. Epoch must outrank term, or
+    /// every node keeps following the fenced old leader.
+    #[test]
+    fn a_recovered_leader_outranks_a_stale_higher_term_hint() {
+        let mut dir = NodeDirectory::default();
+        let mut stale = hint("old-leader", 40);
+        stale.recovery_epoch = 0;
+        let mut recovered = hint("survivor", 2);
+        recovered.recovery_epoch = 1;
+
+        assert!(dir.observe_hint(&stale));
+        assert!(dir.observe_hint(&recovered));
+        assert_eq!(
+            dir.leader.as_ref().unwrap().node_id,
+            NodeId::new("survivor")
+        );
+        // The stale hint, relayed again, loses.
+        assert!(!dir.observe_hint(&stale));
+        assert_eq!(
+            dir.leader.as_ref().unwrap().node_id,
+            NodeId::new("survivor")
+        );
+    }
+
+    #[test]
+    fn observe_records_each_nodes_recovery_epoch_and_prune_drops_it() {
+        let mut dir = NodeDirectory::default();
+        let mut claimed = extension("n1", 9117, None);
+        claimed.recovery_epoch = Some(1);
+        assert!(dir.observe(&claimed));
+        assert!(dir.observe(&extension("n2", 9127, None)));
+        assert_eq!(dir.recovery_epochs.get(&NodeId::new("n1")), Some(&Some(1)));
+        assert_eq!(dir.recovery_epochs.get(&NodeId::new("n2")), Some(&None));
+        // The same advertisement again changes nothing.
+        assert!(!dir.observe(&claimed));
+
+        dir.prune(&[NodeId::new("n1")]);
+        assert!(!dir.recovery_epochs.contains_key(&NodeId::new("n1")));
     }
 }

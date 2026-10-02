@@ -11823,6 +11823,7 @@ async fn leader_transport(silent: bool) -> crate::cluster::workload_identity::Wo
         leader: Some(crate::mustard::message::LeaderHint {
             node_id: crate::meat::NodeId::new("leader"),
             term: 0,
+            recovery_epoch: 0,
             api_address: address,
             reporting_address: address,
         }),

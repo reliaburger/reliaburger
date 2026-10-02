@@ -2305,6 +2305,7 @@ mod tests {
             leader: Some(crate::mustard::message::LeaderHint {
                 node_id: NodeId::new("leader"),
                 term: 1,
+                recovery_epoch: 0,
                 api_address: address,
                 reporting_address: address,
             }),
@@ -3533,6 +3534,7 @@ command = ["false"]
             leader: Some(crate::mustard::message::LeaderHint {
                 node_id: NodeId::new("leader"),
                 term: 1,
+                recovery_epoch: 0,
                 api_address: address,
                 reporting_address: address,
             }),
@@ -3626,6 +3628,7 @@ image = "busybox:latest"
             leader: Some(crate::mustard::message::LeaderHint {
                 node_id: NodeId::new("leader"),
                 term: 1,
+                recovery_epoch: 0,
                 api_address: address,
                 reporting_address: address,
             }),
@@ -3761,6 +3764,7 @@ namespace = "rbtest-interrupted"
             leader: Some(crate::mustard::message::LeaderHint {
                 node_id: NodeId::new("leader"),
                 term: 1,
+                recovery_epoch: 0,
                 api_address: address,
                 reporting_address: address,
             }),
