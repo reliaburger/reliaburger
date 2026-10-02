@@ -211,7 +211,7 @@ enum Command {
         #[arg(long)]
         reason: String,
     },
-    /// Show council (Raft) composition and status, or recover from full loss.
+    /// Show the council (Raft) on every node, or recover from full loss.
     Council {
         #[command(subcommand)]
         action: Option<CouncilCommand>,
@@ -585,6 +585,14 @@ enum ManualAction {
 
 #[derive(Subcommand)]
 enum CouncilCommand {
+    /// Show every node's view of the council (the default).
+    ///
+    /// One row per node: role, recovery epoch, term, log position,
+    /// membership and reachability, asked through this node's relay. Above
+    /// it: the newest epoch, the leader and quorum. Nodes that didn't answer
+    /// are listed, and fenced nodes, split epochs or a second leader are
+    /// called out.
+    Status,
     /// Recover a cluster whose entire council was lost.
     ///
     /// Run this against a STOPPED surviving node. It restores the desired
@@ -609,6 +617,20 @@ enum CouncilCommand {
         /// Skip the "is a council still alive?" safety check. Only pass this
         /// when you are certain every voter is gone; recovering a live cluster
         /// splits the brain.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Re-enrol a voter fenced out by `council recover`.
+    ///
+    /// Run this against the STOPPED fenced node. It removes the replaced
+    /// council's Raft state from the data directory, so the next start joins
+    /// the current council as a fresh member.
+    ReEnrol {
+        /// The node's data directory (`[storage] data`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+        /// Re-enrol even though the node isn't fenced: for an old voter on a
+        /// stale epoch that never heard of the recovery.
         #[arg(long)]
         force: bool,
     },
@@ -1320,7 +1342,10 @@ async fn main() -> ExitCode {
             reason,
         } => commands::decommission_node(&node_id, workloads_stopped, &reason, cli.output).await,
         Command::Council { ref action } => match action {
-            None => commands::council(cli.output).await,
+            None | Some(CouncilCommand::Status) => commands::council(cli.output).await,
+            Some(CouncilCommand::ReEnrol { data_dir, force }) => {
+                commands::council_reenrol(data_dir, *force)
+            }
             Some(CouncilCommand::Recover {
                 data_dir,
                 from,
@@ -2539,6 +2564,31 @@ mod tests {
     fn parse_council_command() {
         let cli = parse(&["relish", "council"]).unwrap();
         assert!(matches!(cli.command, Command::Council { action: None }));
+        let cli = parse(&["relish", "council", "status", "--output", "json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Council {
+                action: Some(CouncilCommand::Status)
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_council_reenrol_command() {
+        let cli = parse(&[
+            "relish",
+            "council",
+            "re-enrol",
+            "--data-dir",
+            "/var/lib/reliaburger/data",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Council {
+                action: Some(CouncilCommand::ReEnrol { force: false, .. })
+            }
+        ));
     }
 
     #[test]

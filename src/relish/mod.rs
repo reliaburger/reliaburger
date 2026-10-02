@@ -8,6 +8,7 @@ pub mod client;
 pub mod command_reference;
 pub mod commands;
 pub mod compile;
+pub mod council_view;
 pub mod dashboard;
 pub mod dev;
 pub mod diff;

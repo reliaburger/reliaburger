@@ -13,6 +13,7 @@
 pub mod apply;
 pub mod backup;
 pub mod durable_log;
+pub mod fence;
 pub mod log_store;
 pub mod network;
 pub mod node;
@@ -81,6 +82,12 @@ pub enum CouncilError {
     Network(String),
     #[error("security operation failed: {0}")]
     SecurityError(String),
+    /// This node's council was replaced by `relish council recover` (#424).
+    #[error(
+        "this node is fenced: its council (recovery epoch {epoch}) was replaced by a recovery at \
+         epoch {newer_epoch}; re-enrol it with a fresh data directory"
+    )]
+    Fenced { epoch: u64, newer_epoch: u64 },
 }
 
 #[cfg(test)]

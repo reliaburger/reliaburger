@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio_util::sync::CancellationToken;
 
+use reliaburger::council::fence::RecoveryFence;
 use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{TcpRaftNetworkFactory, serve_raft_rpc};
 use reliaburger::council::node::CouncilNode;
@@ -123,7 +124,7 @@ async fn make_node_tls(
     let raft = council.raft().clone();
     let sd = shutdown.clone();
     tokio::spawn(async move {
-        serve_raft_rpc(listener, raft, sd, acceptor, 0).await;
+        serve_raft_rpc(listener, raft, sd, acceptor, RecoveryFence::serving(0)).await;
     });
     (council, bound)
 }
@@ -324,7 +325,12 @@ async fn raft_rpc_connection_permits_are_released() {
     let serving = shutdown.clone();
     tokio::spawn(async move {
         reliaburger::council::network::serve_raft_rpc_with_limit(
-            listener, raft, serving, None, 0, 1,
+            listener,
+            raft,
+            serving,
+            None,
+            RecoveryFence::serving(0),
+            1,
         )
         .await;
     });

@@ -1,0 +1,6 @@
+---
+source: src/relish/council_view.rs
+expression: render_status_header(&summarise(&after_recovery()))
+---
+council: epoch 1, leader node-1, 1/1 voters
+warning: fenced: node-2 (epoch 0, replaced by 1), node-3 (epoch 0, replaced by 1); re-enrol each with `relish council re-enrol`

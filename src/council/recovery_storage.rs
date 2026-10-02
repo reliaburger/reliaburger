@@ -127,6 +127,24 @@ pub(crate) fn finish_pending(raft: &Path) -> io::Result<()> {
     sync_dir(parent)
 }
 
+/// Remove the Raft directory of a stopped node (`relish council re-enrol`),
+/// under the same lock as recovery and startup. Refuses a store a running
+/// node holds open, and finishes any interrupted recovery first so it can't
+/// resurrect the removed state on the next start.
+pub(crate) fn remove(raft: &Path) -> io::Result<()> {
+    let _guard = lock(raft)?;
+    finish_pending(raft)?;
+    if !raft.exists() {
+        return Ok(());
+    }
+    drop(lock_existing(raft)?);
+    fs::remove_dir_all(raft)?;
+    let parent = raft
+        .parent()
+        .ok_or_else(|| io_error("Raft directory needs a parent"))?;
+    sync_dir(parent)
+}
+
 pub(crate) fn replace(raft: &Path, state: DesiredState) -> io::Result<()> {
     let _guard = lock(raft)?;
     finish_pending(raft)?;

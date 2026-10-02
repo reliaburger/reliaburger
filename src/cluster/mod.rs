@@ -21,6 +21,7 @@ pub mod http;
 pub mod identity;
 pub mod orchestrate;
 pub mod producer;
+pub mod recovery_fence;
 pub mod retirement;
 pub mod runtime;
 pub mod workload_identity;

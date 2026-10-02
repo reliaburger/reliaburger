@@ -469,3 +469,354 @@ async fn full_council_loss_recovers_from_backup() {
     let _ = recovered.shutdown().await;
     let _ = nodes[4].shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Recovery-epoch fence: old voters returning after `council recover --force`.
+// ---------------------------------------------------------------------------
+
+/// First port of the split-brain test's blocks: gossip, +1 Raft, +2
+/// reporting, +3 API, one block of ten per node.
+const FENCE_BASE_PORT: u16 = 19710;
+
+fn fence_gossip(index: usize) -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], FENCE_BASE_PORT + (index as u16) * 10))
+}
+
+fn fence_data_dir(index: usize) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rb-recovery-fence-{}-{index}", std::process::id()))
+}
+
+/// One running node of the split-brain test: the real cluster runtime, as
+/// `bun --cluster` starts it, on a data directory that survives restarts.
+struct FenceNode {
+    council: Arc<reliaburger::council::node::CouncilNode>,
+    shutdown: CancellationToken,
+    _handle: reliaburger::bun::agent::ClusterHandle,
+    _runtime: reliaburger::cluster::runtime::ClusterRuntime,
+}
+
+impl FenceNode {
+    /// Start node `index` on its persistent data directory. A restarted node
+    /// may find its previous incarnation's redb files still locked for a
+    /// moment while the old tasks wind down, so retry for a few seconds.
+    async fn start(index: usize, seeds: Vec<std::net::SocketAddr>) -> Self {
+        use reliaburger::cluster::runtime::{ClusterParams, start};
+        let gossip = fence_gossip(index);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let shutdown = CancellationToken::new();
+            let params = ClusterParams {
+                node_name: format!("fence{index}"),
+                gossip_addr: gossip,
+                raft_port: gossip.port() + 1,
+                reporting_port: gossip.port() + 2,
+                api_port: gossip.port() + 3,
+                reporting_config: Default::default(),
+                seeds: seeds.clone(),
+                wrapping_ikm: None,
+                bootstrap_security_state: None,
+                data_dir: fence_data_dir(index),
+                mayo: None,
+                rollup_interval: Duration::from_secs(60),
+                identity: None,
+                backup: Default::default(),
+                labels: Default::default(),
+                self_disk_pressured_rx: None,
+                readiness: None,
+            };
+            match start(params, shutdown.clone()).await {
+                Ok((mut handle, runtime)) => {
+                    let council = handle.council.clone().expect("cluster mode has a council");
+                    // Nothing answers the report worker's snapshot requests in
+                    // this harness; drain them so its channel never fills.
+                    let (_unused_tx, unused_rx) = tokio::sync::mpsc::channel(1);
+                    let mut snapshot_rx = std::mem::replace(&mut handle.snapshot_rx, unused_rx);
+                    tokio::spawn(async move { while snapshot_rx.recv().await.is_some() {} });
+                    return Self {
+                        council,
+                        shutdown,
+                        _handle: handle,
+                        _runtime: runtime,
+                    };
+                }
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "node {index} did not start: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
+
+    fn voters(&self) -> BTreeSet<u64> {
+        self.council
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    async fn stop(self) {
+        self.shutdown.cancel();
+        let _ = self.council.shutdown().await;
+        drop(self);
+        // Let the cancelled tasks release the redb files and sockets.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Write `key` through whichever of `nodes` will take it, within `timeout`.
+/// Returns the index of the node that committed it, if any did.
+async fn commit_on_any(nodes: &[&FenceNode], key: &str, timeout: Duration) -> Option<usize> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for (index, node) in nodes.iter().enumerate() {
+            let write = node.council.write(RaftRequest::ConfigSet {
+                key: key.to_string(),
+                value: "written".to_string(),
+            });
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), write).await {
+                return Some(index);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+/// The external report (split brain after `council recover --force`): two of
+/// three voters stop, the operator recovers the survivor, and later the two
+/// stopped voters come back. They still hold the old three-voter membership,
+/// so between them they are a majority of it. The recovery-epoch fence must
+/// keep them from forming or serving that quorum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn old_voters_returning_after_recovery_cannot_form_a_quorum() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    for index in 0..3 {
+        let _ = std::fs::remove_dir_all(fence_data_dir(index));
+        // Bun stamps the state format before it starts the runtime.
+        reliaburger::compatibility::ensure_state_compatible(&fence_data_dir(index)).unwrap();
+    }
+
+    // 1. A three-voter council on real transports and durable storage.
+    let n0 = FenceNode::start(0, Vec::new()).await;
+    let n1 = FenceNode::start(1, vec![fence_gossip(0)]).await;
+    let n2 = FenceNode::start(2, vec![fence_gossip(0)]).await;
+    let all_ids: BTreeSet<u64> = (0..3)
+        .map(|i| reliaburger::cluster::identity::raft_id_from_name(&format!("fence{i}")))
+        .collect();
+    let formed = wait_until(Duration::from_secs(60), || {
+        [&n0, &n1, &n2].iter().all(|n| n.voters() == all_ids)
+    })
+    .await;
+    assert!(formed, "the council never grew to three voters");
+    assert!(
+        commit_on_any(&[&n0, &n1, &n2], "before-loss", Duration::from_secs(20))
+            .await
+            .is_some(),
+        "the healthy council never committed a write"
+    );
+    let backup = n0.council.desired_state().await;
+
+    // 2. Two voters stop: the majority is lost. The operator stops the
+    //    survivor too and runs `council recover --force` against it offline.
+    n1.stop().await;
+    n2.stop().await;
+    n0.stop().await;
+    reliaburger::council::recovery::recover_data_dir(&fence_data_dir(0), backup).unwrap();
+
+    // 3. The recovered survivor comes back alone on a new epoch and commits.
+    let recovered = FenceNode::start(0, Vec::new()).await;
+    assert!(
+        commit_on_any(&[&recovered], "after-recovery", Duration::from_secs(20))
+            .await
+            .is_some(),
+        "the recovered council never committed a write"
+    );
+    assert_eq!(recovered.council.desired_state().await.recovery_epoch, 1);
+
+    // 4. The two old voters return, with their pre-recovery data and seeds.
+    let old1 = FenceNode::start(1, vec![fence_gossip(0)]).await;
+    let old2 = FenceNode::start(2, vec![fence_gossip(0)]).await;
+
+    // Between them they are two of the old membership's three voters, a
+    // majority. They must never commit on it.
+    let split = commit_on_any(&[&old1, &old2], "split-brain", Duration::from_secs(20)).await;
+    assert_eq!(
+        split, None,
+        "an old-epoch voter committed a write after recovery: the old council formed a quorum"
+    );
+
+    // Both know they are fenced, and neither claims a leader any more.
+    let fenced = wait_until(Duration::from_secs(20), || {
+        [&old1, &old2].iter().all(|node| {
+            node.council
+                .recovery_fence()
+                .is_some_and(|fence| fence.snapshot().fenced_by() == Some(1))
+                && node.council.metrics().borrow().current_leader.is_none()
+        })
+    })
+    .await;
+    assert!(fenced, "the old voters never learned they were fenced");
+    let refused = old1
+        .council
+        .write(RaftRequest::ConfigSet {
+            key: "refused".to_string(),
+            value: "never".to_string(),
+        })
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(reliaburger::council::CouncilError::Fenced {
+                epoch: 0,
+                newer_epoch: 1
+            })
+        ),
+        "a fenced voter must refuse writes with the fence error, got {refused:?}"
+    );
+
+    // Every node's own council status, compared the way `relish council
+    // status`, the `relish status` header and `relish wtf` compare them,
+    // shows the recovered council healthy and both old voters fenced.
+    let mut observations = Vec::new();
+    for (name, node) in [("fence0", &recovered), ("fence1", &old1), ("fence2", &old2)] {
+        let metrics = node.council.metrics().borrow().clone();
+        let status = reliaburger::bun::agent::council_status(&node.council, &metrics).await;
+        observations.push(
+            reliaburger::relish::council_view::CouncilNodeObservation::answered(name, &status),
+        );
+    }
+    let summary = reliaburger::relish::council_view::summarise(&observations);
+    assert_eq!(summary.epoch, Some(1));
+    assert_eq!(summary.leaders, vec!["fence0".to_string()]);
+    assert_eq!(summary.voters, vec!["fence0".to_string()]);
+    assert!(summary.quorum_ok());
+    let fenced: Vec<&str> = summary.fenced.iter().map(|n| n.node_id.as_str()).collect();
+    assert_eq!(fenced, vec!["fence1", "fence2"]);
+    assert_eq!(
+        summary.epochs.len(),
+        1,
+        "fenced voters must not count as a council"
+    );
+    let table = reliaburger::relish::council_view::render_council_status(&observations, &summary);
+    assert!(table.contains("fence1  fenced"), "council status:\n{table}");
+    let header = reliaburger::relish::council_view::render_status_header(&summary);
+    assert!(
+        header.contains("warning: fenced: fence1"),
+        "status header:\n{header}"
+    );
+
+    // The fence survives a restart: the old voter comes back still fenced.
+    old2.stop().await;
+    let old2 = FenceNode::start(2, vec![fence_gossip(0)]).await;
+    assert_eq!(
+        old2.council
+            .recovery_fence()
+            .and_then(|fence| fence.snapshot().fenced_by()),
+        Some(1),
+        "a restarted old voter forgot its fence"
+    );
+
+    // The recovered council is unaffected and still commits.
+    assert!(
+        commit_on_any(&[&recovered], "still-serving", Duration::from_secs(10))
+            .await
+            .is_some(),
+        "the recovered council stopped committing once the old voters returned"
+    );
+
+    old1.stop().await;
+    old2.stop().await;
+    recovered.stop().await;
+    for index in 0..3 {
+        let _ = std::fs::remove_dir_all(fence_data_dir(index));
+    }
+}
+
+/// After recovery the council must be able to regrow onto a node with a
+/// fresh data directory: that is both how the reconciler replaces the lost
+/// voters and how an operator re-enrols a wiped old voter. The fresh node
+/// starts with no recovery epoch of its own, so it must accept the recovered
+/// council's RPCs and adopt its epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn recovered_council_regrows_onto_a_fresh_node() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    // Node slots 3 and 4 of the fence port range, clear of the test above.
+    for index in 3..5 {
+        let _ = std::fs::remove_dir_all(fence_data_dir(index));
+        reliaburger::compatibility::ensure_state_compatible(&fence_data_dir(index)).unwrap();
+    }
+
+    // A single-voter council, recovered offline from its own state.
+    let first = FenceNode::start(3, Vec::new()).await;
+    assert!(
+        commit_on_any(&[&first], "before-loss", Duration::from_secs(20))
+            .await
+            .is_some(),
+        "the council never committed a write"
+    );
+    let backup = first.council.desired_state().await;
+    first.stop().await;
+    reliaburger::council::recovery::recover_data_dir(&fence_data_dir(3), backup).unwrap();
+    // Its config still lists a join seed, as most nodes' do: recovery must
+    // re-bootstrap it anyway.
+    let recovered = FenceNode::start(3, vec![fence_gossip(4)]).await;
+    assert!(
+        commit_on_any(&[&recovered], "after-recovery", Duration::from_secs(20))
+            .await
+            .is_some(),
+        "the recovered council never committed a write"
+    );
+
+    // A fresh node joins and the reconciler grows the council onto it.
+    let fresh = FenceNode::start(4, vec![fence_gossip(3)]).await;
+    let fresh_id = reliaburger::cluster::identity::raft_id_from_name("fence4");
+    let grew = wait_until(Duration::from_secs(60), || {
+        recovered.voters().contains(&fresh_id) && fresh.voters().contains(&fresh_id)
+    })
+    .await;
+    assert!(
+        grew,
+        "the recovered council never grew onto a fresh node (voters {:?})",
+        recovered.voters()
+    );
+
+    // The joined node holds the recovered state, the restored keys included.
+    let replicated = wait_until(Duration::from_secs(20), || {
+        fresh
+            .council
+            .recovery_fence()
+            .is_some_and(|fence| fence.snapshot().claimed_epoch() == Some(1) && !fence.is_fenced())
+    })
+    .await;
+    assert!(
+        replicated,
+        "the fresh node never adopted the recovered epoch"
+    );
+    let state = fresh.council.desired_state().await;
+    for key in ["before-loss", "after-recovery"] {
+        assert!(
+            state.config.contains_key(key),
+            "the fresh voter is missing {key:?}: it never received the recovered state"
+        );
+    }
+
+    fresh.stop().await;
+    recovered.stop().await;
+    for index in 3..5 {
+        let _ = std::fs::remove_dir_all(fence_data_dir(index));
+    }
+}
