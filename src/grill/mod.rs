@@ -348,6 +348,19 @@ pub trait Grill: Send + Sync {
         instance: &InstanceId,
     ) -> impl std::future::Future<Output = Result<ContainerState, GrillError>> + Send;
 
+    /// Whether the instance's process has exited, and nothing more.
+    ///
+    /// Status asks this to confirm that an instance the loop last saw alive
+    /// still is. Unlike [`Grill::state`], it never supervises anything, so a
+    /// runtime may answer it without queueing behind its own lifecycle work
+    /// (#456). The default asks `state`.
+    fn has_exited(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<bool, GrillError>> + Send {
+        async move { Ok(self.state(instance).await? == ContainerState::Stopped) }
+    }
+
     /// Attempt to adopt a previously started instance from its on-disk
     /// record (after a bun restart or self-upgrade exec).
     ///
@@ -623,6 +636,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.state(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.state(instance).await,
+        }
+    }
+
+    async fn has_exited(&self, instance: &InstanceId) -> Result<bool, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.has_exited(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.has_exited(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.has_exited(instance).await,
         }
     }
 
