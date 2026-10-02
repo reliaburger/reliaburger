@@ -1375,7 +1375,8 @@ impl BunClient {
         self.ws_connect("/v1/ws/events").await
     }
 
-    /// Stop an app.
+    /// Request a stop. In cluster mode, success means accepted desired state;
+    /// workers retire asynchronously and may still be unreachable.
     pub async fn stop(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/stop/{}/{}", self.base_url, app, namespace);
         let response = self
@@ -1394,7 +1395,8 @@ impl BunClient {
         Ok(())
     }
 
-    /// Remove an app from the cluster (`POST /v1/delete/{app}/{namespace}`).
+    /// Request removal (`POST /v1/delete/{app}/{namespace}`). Cluster cleanup
+    /// is asynchronous; success does not confirm that every instance stopped.
     pub async fn delete(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/delete/{}/{}", self.base_url, app, namespace);
         let response = self
