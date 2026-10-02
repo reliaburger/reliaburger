@@ -96,3 +96,9 @@ U1 first (about a week): it fixes the drift on its own and everything else build
 2. **Upstream down at apply:** fail (this plan), or store the unbound tag and bind at the first successful pull?
 3. **Policy in `node.toml` only?** It keeps trust roots off the API, at the cost of nodes being able to disagree.
 4. **Cosign format:** classic `.sig` tags first (this plan), or the Sigstore bundle as an OCI referrer?
+5. **Images nobody pulls.** Under ProcessGrill (a Mac dev cluster, and most cluster tests) an app's `image` is a placeholder such as `proc-grill:image-ignored`: it's never pulled, and binding it would ask Docker Hub and fail the apply. The leader can't see which runtime each node runs. Options: bind only when the leader's own runtime pulls images (a mixed cluster would then bind or not depending on which node leads), add a cluster-level runtime setting the leader can read, or bind lazily on the first node that actually pulls (question 1's alternative). Our pick would be the last if the cluster's runtime can be mixed, the first otherwise.
+
+## Progress
+
+- The reference parser reads `repo:tag@sha256:…`, and the trust-policy lookup drops the tag before its digest lookup. Without that second fix, an unsigned Pickle image written as `app:v1@sha256:…` would have counted as external and skipped `require_signatures` once the pull worked.
+- `pickle::binding::bind_image` resolves a tag from the catalogue, upstream, or the cached copy, with unit tests. It isn't wired into apply until questions 1, 2 and 5 are settled.
