@@ -10,6 +10,8 @@
 //! whole release, and nothing is trusted on its name alone.
 
 pub mod channel;
+pub mod rollout;
+pub mod slot;
 
 pub use channel::{
     ChannelArch, OsChannel, OsError, OsVersion, SumsEntry, check_asset, signed_sums,
