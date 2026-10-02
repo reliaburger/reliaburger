@@ -4351,6 +4351,26 @@ and the `3 desired, 3 running` line. Its siblings check the warning for the
 silent node, the dead node that isn't asked at all, and a standalone agent,
 which answers for itself as `local`.
 
+`inspect` and `wtf` were careful to ask the leader for desired state. Other
+callers weren't. `relish status` asks whichever node it's connected to, and
+so does the dashboard, and an audit (#436) caught what a worker said back. A
+worker outside the council runs a Raft state machine that nothing replicates
+into, so its desired state is empty, and `/v1/diagnostics/apps` answered
+`200 []`: no apps, nothing blocked, nothing waiting. That's worse than an
+error, because it looks like an answer.
+
+Now only a leader that can still confirm its quorum answers from its own
+state. Every other node forwards the read to the leader, found through the
+gossip directory (the same one upgrade calls use), and passes the leader's
+answer back. With no leader to ask, the node answers `503` and says so. A
+forwarded read carries an `x-reliaburger-desired-apps-forwarded` header, and
+a node that receives one and isn't the leader refuses it rather than
+forwarding it again, so two nodes that each think the other leads can't
+bounce the request between them. Council followers forward too, even though
+their state is replicated: a follower can lag, and a quota reason or a volume
+home that changed a second ago is exactly what someone running `relish
+status` wants to see.
+
 ### Is everyone running the same build?
 
 The same issue started with a harder question: were the three nodes even

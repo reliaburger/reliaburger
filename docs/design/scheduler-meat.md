@@ -1094,7 +1094,7 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 **Response:**
 
-- **New deploys:** `relish apply` succeeds and the app is committed, but Meat leaves it unplaced. The pass records why: the leader proposes a `RaftRequest::QuotaBlocked` carrying every blocked app and its `QuotaError`, which replaces `DesiredState::quota_blocked`. Every node serves that reason in its desired-app evidence (`GET /v1/diagnostics/apps`, field `blocked`), so it shows wherever an operator looks:
+- **New deploys:** `relish apply` succeeds and the app is committed, but Meat leaves it unplaced. The pass records why: the leader proposes a `RaftRequest::QuotaBlocked` carrying every blocked app and its `QuotaError`, which replaces `DesiredState::quota_blocked`. Every node serves that reason in its desired-app evidence (a node that isn't the leader fetches it from the leader) (`GET /v1/diagnostics/apps`, field `blocked`), so it shows wherever an operator looks:
   ```
   $ relish status
   new-service (namespace prod) is not placed, blocked: namespace "prod" would exceed CPU quota: 3000+2000 > 4000m

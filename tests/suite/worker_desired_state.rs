@@ -1,3 +1,5 @@
+//! Desired-app diagnostics come from the current leader on every node (#436).
+
 use reliaburger::config::{Replicas, app::AppSpec};
 use reliaburger::council::types::RaftRequest;
 use reliaburger::meat::types::{AppId, NodeId};
@@ -8,7 +10,7 @@ use std::time::Duration;
 fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
     let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
     spec.replicas = Replicas::Fixed(replicas);
-    spec.cpu = Some(crate::config::types::ResourceRange {
+    spec.cpu = Some(config::types::ResourceRange {
         request: cpu_request,
         limit: cpu_request,
     });
@@ -108,14 +110,12 @@ async fn initialized_leader(
         .unwrap();
     leader
 }
-#[tokio::test]
-async fn worker_desired_apps_must_not_report_an_empty_cluster() {
-    let network = council::network::InMemoryRaftRouter::new();
-    let leader = initialized_leader(&network).await;
-    let worker = memory_council(2, &network).await;
-    let (leader_url, leader_server, _) = api_for(leader.clone(), None).await;
+
+fn directory_naming(
+    leader_url: &str,
+) -> tokio::sync::watch::Receiver<mustard::directory::NodeDirectory> {
     let leader_address = leader_url.trim_start_matches("http://").parse().unwrap();
-    let (_send, directory) = tokio::sync::watch::channel(mustard::directory::NodeDirectory {
+    let (send, directory) = tokio::sync::watch::channel(mustard::directory::NodeDirectory {
         leader: Some(mustard::message::LeaderHint {
             node_id: NodeId::new("leader"),
             term: 1,
@@ -124,7 +124,21 @@ async fn worker_desired_apps_must_not_report_an_empty_cluster() {
         }),
         ..Default::default()
     });
-    let (worker_url, worker_server, _) = api_for(worker.clone(), Some(directory)).await;
+    // The receiver only reads; keeping the sender alive isn't needed.
+    drop(send);
+    directory
+}
+
+/// A worker outside Raft has an empty state machine. It must answer with the
+/// leader's desired apps, not with its own empty view (#436).
+#[tokio::test]
+async fn worker_desired_apps_come_from_the_leader() {
+    let network = council::network::InMemoryRaftRouter::new();
+    let leader = initialized_leader(&network).await;
+    let worker = memory_council(2, &network).await;
+    let (leader_url, leader_server, _) = api_for(leader.clone(), None).await;
+    let (worker_url, worker_server, _) =
+        api_for(worker.clone(), Some(directory_naming(&leader_url))).await;
     let client = reqwest::Client::new();
     let expected: serde_json::Value = client
         .get(format!("{leader_url}/v1/diagnostics/apps"))
@@ -134,11 +148,6 @@ async fn worker_desired_apps_must_not_report_an_empty_cluster() {
         .json()
         .await
         .unwrap();
-    assert_eq!(
-        expected.as_array().unwrap().len(),
-        1,
-        "leader control must expose the committed app"
-    );
     let response = client
         .get(format!("{worker_url}/v1/diagnostics/apps"))
         .send()
@@ -150,10 +159,53 @@ async fn worker_desired_apps_must_not_report_an_empty_cluster() {
     worker_server.abort();
     leader.shutdown().await.unwrap();
     worker.shutdown().await.unwrap();
-    eprintln!("leader={expected}; worker={code} {actual}");
-    assert!(
-        code == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            || (code.is_success() && actual == expected),
-        "worker must return authoritative state or explicit unavailability; got {code} {actual}"
+    assert_eq!(
+        expected.as_array().unwrap().len(),
+        1,
+        "leader control must expose the committed app"
     );
+    assert_eq!(code, reqwest::StatusCode::OK, "worker answered {actual}");
+    assert_eq!(actual, expected);
+}
+
+/// With no leader to ask, a worker says so instead of claiming the cluster
+/// runs nothing.
+#[tokio::test]
+async fn worker_without_a_known_leader_reports_unavailable() {
+    let network = council::network::InMemoryRaftRouter::new();
+    let worker = memory_council(2, &network).await;
+    let (worker_url, worker_server, _) = api_for(worker.clone(), None).await;
+    let response = reqwest::Client::new()
+        .get(format!("{worker_url}/v1/diagnostics/apps"))
+        .send()
+        .await
+        .unwrap();
+    let code = response.status();
+    worker_server.abort();
+    worker.shutdown().await.unwrap();
+    assert_eq!(code, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A read another node already forwarded is never forwarded again, so two
+/// nodes that each think the other leads can't bounce it between them.
+#[tokio::test]
+async fn forwarded_desired_apps_read_is_not_forwarded_twice() {
+    let network = council::network::InMemoryRaftRouter::new();
+    let leader = initialized_leader(&network).await;
+    let worker = memory_council(2, &network).await;
+    let (leader_url, leader_server, _) = api_for(leader.clone(), None).await;
+    let (worker_url, worker_server, _) =
+        api_for(worker.clone(), Some(directory_naming(&leader_url))).await;
+    let response = reqwest::Client::new()
+        .get(format!("{worker_url}/v1/diagnostics/apps"))
+        .header("x-reliaburger-desired-apps-forwarded", "1")
+        .send()
+        .await
+        .unwrap();
+    let code = response.status();
+    leader_server.abort();
+    worker_server.abort();
+    leader.shutdown().await.unwrap();
+    worker.shutdown().await.unwrap();
+    assert_eq!(code, reqwest::StatusCode::SERVICE_UNAVAILABLE);
 }
