@@ -81,6 +81,8 @@ struct StateMachineInner {
     state: DesiredState,
     snapshot_index: u64,
     snapshot_data: Option<Vec<u8>>,
+    snapshot_last_applied: Option<LogId<u64>>,
+    snapshot_membership: StoredMembership<u64, CouncilNodeInfo>,
     /// When set, snapshots are persisted here so applied state survives a
     /// restart (the durable log replays only the post-snapshot tail).
     db: Option<Arc<Database>>,
@@ -1945,6 +1947,8 @@ impl CouncilStateMachine {
                 // security state (app specs, CA material, tokens). Refuse to
                 // start so an operator can restore from backup instead.
                 inner.state = serde_json::from_slice::<DesiredState>(&bytes)?;
+                inner.snapshot_last_applied = inner.state.last_applied_log;
+                inner.snapshot_membership = inner.state.last_membership.clone();
                 inner.snapshot_data = Some(bytes);
             }
             if let Some(idx) = t.get(SNAP_INDEX_KEY)?
@@ -2027,7 +2031,7 @@ impl CouncilStateMachine {
     pub async fn snapshot_last_applied(&self) -> Option<LogId<u64>> {
         let guard = self.inner.read().await;
         if guard.snapshot_data.is_some() {
-            guard.state.last_applied_log
+            guard.snapshot_last_applied
         } else {
             None
         }
@@ -2114,6 +2118,8 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             guard.state.last_applied_log = meta.last_log_id;
             guard.state.last_membership = meta.last_membership.clone();
             guard.snapshot_index += 1;
+            guard.snapshot_last_applied = meta.last_log_id;
+            guard.snapshot_membership = meta.last_membership.clone();
             guard.snapshot_data = Some(data.clone());
             (guard.db.clone(), guard.snapshot_index)
         };
@@ -2133,8 +2139,8 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         match &guard.snapshot_data {
             Some(data) => {
                 let meta = SnapshotMeta {
-                    last_log_id: guard.state.last_applied_log,
-                    last_membership: guard.state.last_membership.clone(),
+                    last_log_id: guard.snapshot_last_applied,
+                    last_membership: guard.snapshot_membership.clone(),
                     snapshot_id: format!("mem-{}", guard.snapshot_index),
                 };
                 Ok(Some(Snapshot {
@@ -2164,6 +2170,8 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
             let data = serde_json::to_vec(&guard.state)
                 .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
             guard.snapshot_index += 1;
+            guard.snapshot_last_applied = guard.state.last_applied_log;
+            guard.snapshot_membership = guard.state.last_membership.clone();
             guard.snapshot_data = Some(data.clone());
             (
                 data,
