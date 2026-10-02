@@ -16,18 +16,22 @@ pub const SPEC_FILE: &str = "config.json";
 // Only the Linux runc runtime writes bundles. The helpers stay portable so
 // their tests run on every development machine.
 
-/// Create the instance's bundle directory, owner-only (0700).
+/// Create the instance's bundle directory: 0711, traversable but not listable.
 ///
-/// An existing directory, perhaps left by an older release with the default
-/// 0755, is tightened too.
+/// Not 0700: a container with a user namespace runs its init as a mapped,
+/// non-host-root user, and runc remounts the rootfs under this directory from
+/// inside that namespace, which needs search permission on every directory
+/// above it (0700 fails with `remount-private …: permission denied`). The
+/// secret is the 0600 `config.json`, not the directory. An existing directory,
+/// perhaps left by an older release with the default 0755, is tightened too.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn create_private_directory(bundle: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
-        .mode(0o700)
+        .mode(0o711)
         .create(bundle)?;
-    std::fs::set_permissions(bundle, std::fs::Permissions::from_mode(0o700))
+    std::fs::set_permissions(bundle, std::fs::Permissions::from_mode(0o711))
 }
 
 /// Atomically replace the bundle's `config.json` with an owner-only (0600) file.
@@ -76,7 +80,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bundle = root.path().join("bundles").join("default__web-0");
         create_private_directory(&bundle).unwrap();
-        assert_eq!(mode(&bundle), 0o700);
+        assert_eq!(mode(&bundle), 0o711);
     }
 
     #[test]
@@ -86,7 +90,7 @@ mod tests {
         std::fs::create_dir(&bundle).unwrap();
         std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o755)).unwrap();
         create_private_directory(&bundle).unwrap();
-        assert_eq!(mode(&bundle), 0o700);
+        assert_eq!(mode(&bundle), 0o711);
     }
 
     #[test]

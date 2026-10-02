@@ -688,7 +688,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode =
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(bundle), 0o700, "bundle directory mode");
+        assert_eq!(mode(bundle), 0o711, "bundle directory mode");
         assert_eq!(mode(&bundle.join("config.json")), 0o600, "config.json mode");
     }
 

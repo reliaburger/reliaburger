@@ -84,7 +84,7 @@ timeout escalation, explicit kill and rejected adoption all converge on the
 same cleanup path. Cleanup deletes stale runc state and releases the overlay,
 port map and network namespace, but does not delete the shared lower. It also
 deletes the bundle's `config.json`, which carries decrypted secret env; Grill
-writes that file 0600 inside a 0700 bundle directory. A real
+writes that file 0600 inside a 0711 bundle directory (searchable, not listable: runc's init in a user namespace needs to traverse it). A real
 rootful-runc suite covers two-replica isolation, restart persistence, failed
 create rollback, process-death adoption and absence of leaked mountpoints.
 
