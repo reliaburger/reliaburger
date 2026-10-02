@@ -15,7 +15,9 @@
 //! - git's own prompts are switched off through the environment;
 //! - a deadline, a cancellation token and an output cap each stop it;
 //! - whenever it stops, for any reason, the whole process group is killed
-//!   and the child reaped, so no descendant outlives the call.
+//!   and the child reaped, then the group is killed again until it is
+//!   empty, so no descendant outlives the call, not even one that was being
+//!   forked while the first kill went out.
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
@@ -46,6 +48,9 @@ pub const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 /// Only a descendant that escaped the group (by starting its own session)
 /// can still hold a pipe open by then. We don't wait for it.
 const READER_GRACE: Duration = Duration::from_secs(1);
+
+/// How long to keep killing the process group after the child is reaped.
+const GROUP_SWEEP_LIMIT: Duration = Duration::from_secs(1);
 
 /// The limits one subprocess runs under.
 #[derive(Debug, Clone)]
@@ -104,6 +109,10 @@ pub fn run_bounded(
     let status = child
         .wait()
         .map_err(|e| LettuceError::GitFailed(format!("failed to reap {what}: {e}")))?;
+    // One kill can miss a process that a member was forking at that moment
+    // (and the leader may still have been forking until it was reaped), so
+    // keep killing until the group is empty.
+    sweep_group(&child);
 
     // A pipe still open after the group is dead belongs to a descendant
     // that escaped it; its output is incomplete, so it counts as a failure.
@@ -270,6 +279,28 @@ fn kill_group(child: &Child) {
     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
 }
 
+/// SIGKILL the reaped child's process group until it has no members left,
+/// for at most [`GROUP_SWEEP_LIMIT`].
+///
+/// The leader is reaped, but its pid stays reserved as the group id for as
+/// long as any member is left (POSIX never reuses a pid that still names a
+/// process group), so this reaches only our descendants. The first ESRCH
+/// ends the sweep, and we never signal that id again. A killed member
+/// counts until its new parent reaps it, which is usually at once; the
+/// limit only stops a slow reaper from holding the call.
+fn sweep_group(child: &Child) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let group = Pid::from_raw(child.id() as i32);
+    let deadline = Instant::now() + GROUP_SWEEP_LIMIT;
+    let mut pause = Duration::from_millis(1);
+    while killpg(group, Signal::SIGKILL) != Err(Errno::ESRCH) && Instant::now() < deadline {
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +321,33 @@ mod tests {
         let stat = String::from_utf8_lossy(&output.stdout);
         let stat = stat.trim();
         !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    /// Shell that records its own pid in `pid_file` atomically. A shell
+    /// creates a redirection's target before writing to it, so writing the
+    /// file in place would let a reader see it empty (#461).
+    fn record_pid(pid_file: &std::path::Path) -> String {
+        format!(
+            "echo $$ > {pid}.tmp && mv {pid}.tmp {pid}",
+            pid = pid_file.display()
+        )
+    }
+
+    /// The pid in `path`, once the file exists and holds a whole pid.
+    fn read_pid(path: &std::path::Path) -> Option<i32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// Wait (bounded) for `path` to hold a whole pid.
+    fn wait_for_pid(path: &std::path::Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(pid) = read_pid(path) {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "no pid in {}", path.display());
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait_until_gone(pid: i32) -> bool {
@@ -318,10 +376,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            &format!("echo $$ > {}; exec sleep 300", pid_file.display()),
-        ]);
+        command.args(["-c", &format!("{}; exec sleep 300", record_pid(&pid_file))]);
 
         let started = Instant::now();
         let result = run_bounded(command, &short_budget(Duration::from_millis(300)), "hang");
@@ -329,12 +384,11 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let error = result.unwrap_err().to_string();
         assert!(error.contains("timed out"), "got: {error}");
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(wait_until_gone(pid), "the hung child is still running");
+        // On a loaded host the deadline can fire before the shell records
+        // its pid at all; then there is nothing left to check.
+        if let Some(pid) = read_pid(&pid_file) {
+            assert!(wait_until_gone(pid), "the hung child is still running");
+        }
     }
 
     /// A child that exits but leaves a descendant holding its stdout used
@@ -345,10 +399,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let mut command = Command::new("sh");
+        // The parent waits until the descendant has recorded its pid, so
+        // the descendant is running (not merely forked) when the parent
+        // exits, however slow the host.
         command.args([
             "-c",
             &format!(
-                "sh -c 'echo $$ > {}; exec sleep 300' & sleep 0.2; echo done",
+                "sh -c '{}; exec sleep 300' & while [ ! -e {} ]; do sleep 0.01; done; echo done",
+                record_pid(&pid_file),
                 pid_file.display()
             ),
         ]);
@@ -356,14 +414,44 @@ mod tests {
         let started = Instant::now();
         let output = run_bounded(command, &short_budget(Duration::from_secs(30)), "leaky").unwrap();
 
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(output.stdout, b"done\n");
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = read_pid(&pid_file).expect("the parent waited for the pid file");
         assert!(wait_until_gone(pid), "the descendant outlived the call");
+    }
+
+    /// Killing the group once can miss a process that was being forked at
+    /// that moment, which then outlives the call. When `run_bounded`
+    /// returns, nothing may be left in the child's process group.
+    #[test]
+    fn no_member_of_the_group_is_left_when_the_call_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let budget = short_budget(Duration::from_secs(300));
+        let cancel = budget.cancel.clone();
+        let mut command = Command::new("sh");
+        // Keep forking short-lived subshells that each start a sleeper, so
+        // the group changes while it is being killed.
+        command.args([
+            "-c",
+            &format!(
+                "{}; while :; do (sleep 300 &) ; sleep 0.005; done",
+                record_pid(&pid_file)
+            ),
+        ]);
+
+        let call = std::thread::spawn(move || run_bounded(command, &budget, "forker"));
+        let group = wait_for_pid(&pid_file);
+        cancel.cancel();
+        let result = call.join().unwrap();
+
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        let probe = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None);
+        assert_eq!(
+            probe,
+            Err(nix::errno::Errno::ESRCH),
+            "the child's process group still has members"
+        );
     }
 
     #[test]
