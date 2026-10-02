@@ -82,6 +82,10 @@ struct ReadinessEntry {
 pub struct ReportAggregator<T: ReportingTransport> {
     transport: T,
     entries: HashMap<NodeId, ReportEntry>,
+    // Receive deadlines outlive payload eviction. Unknown members get one
+    // stale window to report to a new leader, rather than unlimited grace.
+    report_freshness: HashMap<NodeId, Instant>,
+    freshness_epoch: u64,
     capability_entries: HashMap<NodeId, CapabilityEntry>,
     readiness_entries: HashMap<NodeId, ReadinessEntry>,
     watch_tx: watch::Sender<AggregatedState>,
@@ -113,6 +117,8 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         let aggregator = Self {
             transport,
             entries: HashMap::new(),
+            report_freshness: HashMap::new(),
+            freshness_epoch: epoch_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0),
             capability_entries: HashMap::new(),
             readiness_entries: HashMap::new(),
             watch_tx,
@@ -267,6 +273,9 @@ impl<T: ReportingTransport> ReportAggregator<T> {
     }
 
     fn store_report(&mut self, report: StateReport) {
+        self.refresh_report_deadlines();
+        self.report_freshness
+            .insert(report.node_id.clone(), Instant::now());
         self.entries.insert(
             report.node_id.clone(),
             ReportEntry {
@@ -338,7 +347,28 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             || self.readiness_entries.len() != readiness_before
     }
 
-    fn publish(&self) {
+    fn refresh_report_deadlines(&mut self) {
+        let epoch = self.current_epoch();
+        if epoch != self.freshness_epoch {
+            self.report_freshness.clear();
+            self.freshness_epoch = epoch;
+        }
+        if let Some(rx) = &self.membership_rx {
+            let members = rx.borrow();
+            if !members.is_empty() {
+                self.report_freshness
+                    .retain(|node, _| members.iter().any(|m| &m.node_id == node));
+                for member in members.iter() {
+                    self.report_freshness
+                        .entry(member.node_id.clone())
+                        .or_insert_with(Instant::now);
+                }
+            }
+        }
+    }
+
+    fn publish(&mut self) {
+        self.refresh_report_deadlines();
         let _ = self.watch_tx.send(self.build_aggregated_state());
     }
 
@@ -350,13 +380,22 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         let epoch = self.current_epoch();
 
         let mut reports = HashMap::new();
-        let mut stale_nodes = Vec::new();
+        let mut stale_nodes: Vec<_> = self
+            .report_freshness
+            .iter()
+            .filter(|(_, received)| {
+                self.freshness_epoch == epoch && now.duration_since(**received) > stale_timeout
+            })
+            .map(|(node, _)| node.clone())
+            .collect();
         for (node_id, entry) in &self.entries {
             if entry.epoch != epoch {
                 continue; // a previous leadership epoch — not current truth
             }
             reports.insert(node_id.clone(), entry.report.clone());
-            if now.duration_since(entry.received_at) > stale_timeout {
+            if now.duration_since(entry.received_at) > stale_timeout
+                && !stale_nodes.contains(node_id)
+            {
                 stale_nodes.push(node_id.clone());
             }
         }
@@ -938,5 +977,41 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn audit_expired_and_missing_reports_remain_stale_after_eviction() {
+        let net = InMemoryReportingNetwork::new();
+        let (_members, membership) = watch::channel(vec![member("reported"), member("missing")]);
+        let (epoch, epoch_rx) = watch::channel(1);
+        let (mut aggregator, _view) = ReportAggregator::new(
+            net.register(addr(2)).await,
+            test_config(),
+            CancellationToken::new(),
+            None,
+            Some(epoch_rx),
+            Some(membership),
+        );
+        aggregator.store_report(report("reported"));
+        aggregator.publish();
+        assert!(aggregator.build_aggregated_state().stale_nodes.is_empty());
+        tokio::time::advance(Duration::from_secs(91)).await;
+        aggregator.evict_expired(Duration::from_secs(30));
+        let expired = aggregator.build_aggregated_state();
+        assert!(expired.reports.is_empty());
+        for name in ["reported", "missing"] {
+            assert!(expired.stale_nodes.contains(&NodeId::new(name)));
+        }
+        aggregator.store_report(report("reported"));
+        assert!(
+            !aggregator
+                .build_aggregated_state()
+                .stale_nodes
+                .contains(&NodeId::new("reported"))
+        );
+        epoch.send(2).unwrap();
+        aggregator.publish();
+        assert!(aggregator.build_aggregated_state().stale_nodes.is_empty());
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(aggregator.build_aggregated_state().stale_nodes.len(), 2);
     }
 }

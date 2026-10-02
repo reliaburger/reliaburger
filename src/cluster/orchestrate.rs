@@ -448,7 +448,7 @@ pub fn spawn_leader_scheduler(
                 use super::capacity::CapacityAdmissionError;
                 use crate::meat::scheduler::{ScheduleError, Scheduler};
 
-                let ready = reports.stale_nodes.is_empty()
+                let ready = !has_stale_member(&members, &reports)
                     && members
                         .iter()
                         .all(|member| member.state == NodeState::Alive)
@@ -1218,6 +1218,16 @@ fn node_can_run(
         && (!dns_required || node.capabilities.dns.can_resolve_internal())
 }
 
+/// Whether any member the scheduler plans over has a stale report. Only
+/// members count: the aggregator keeps a deadline for every gossip member,
+/// including retired ones the scheduler has already filtered out, and a node
+/// that never reports again mustn't block capacity admission for good.
+fn has_stale_member(members: &[MembershipSnapshot], reports: &AggregatedState) -> bool {
+    members
+        .iter()
+        .any(|member| reports.stale_nodes.contains(&member.node_id))
+}
+
 /// The members gossip currently puts in `state`.
 fn nodes_in_state(members: &[MembershipSnapshot], state: NodeState) -> HashSet<NodeId> {
     members
@@ -1497,6 +1507,9 @@ fn build_endpoint_catalog(
         })
         .collect();
     for (node_id, report) in &reports.reports {
+        if reports.stale_nodes.contains(node_id) {
+            continue;
+        }
         let Some(&node_ip) = node_ips.get(node_id) else {
             continue; // no known IP (departed, or IPv6-only) — can't route to it
         };
@@ -1551,6 +1564,7 @@ fn build_endpoint_catalog(
                     && member.address.ip() == std::net::IpAddr::V4(backend.node_ip)
             });
             if still_there
+                && !reports.stale_nodes.contains(&node_id)
                 && !reports.reports.contains_key(&node_id)
                 && !desired
                     .producer_retirements
@@ -6284,6 +6298,127 @@ image = "busybox:latest"
             1,
             "an app within its namespace budget must be admitted"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_stale_endpoints {
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::AppId;
+    use crate::reporting::types::*;
+    use std::time::{Instant, SystemTime};
+    fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(replicas);
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu_request,
+            limit: cpu_request,
+        });
+        spec
+    }
+    #[test]
+    fn stale_reports_must_not_publish_healthy_endpoints() {
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        let mut spec = app_spec(100, 1);
+        spec.port = Some(8080);
+        desired.apps.insert(app, spec);
+        let id = NodeId::new("n1");
+        let members = vec![MembershipSnapshot {
+            node_id: id.clone(),
+            address: "10.1.1.1:9116".parse().unwrap(),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: Default::default(),
+            first_seen: Instant::now(),
+            resources: None,
+        }];
+        let mut reports = AggregatedState::default();
+        reports.stale_nodes.push(id.clone());
+        reports.reports.insert(
+            id.clone(),
+            StateReport {
+                has_buildah: false,
+                node_id: id,
+                timestamp: SystemTime::now(),
+                cached_specs: vec![],
+                resource_usage: ResourceUsage::default(),
+                event_log: vec![],
+                running_apps: vec![RunningApp {
+                    execution: None,
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    instance_id: 0,
+                    image: "x:1".into(),
+                    port: Some(30000),
+                    health_status: ReportHealthStatus::Healthy,
+                    uptime: Duration::ZERO,
+                    resource_usage: AppResourceUsage::default(),
+                }],
+            },
+        );
+        let backends = |catalog: &crate::onion::catalog::EndpointCatalog| {
+            catalog
+                .services
+                .values()
+                .flat_map(|s| s.backends.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A stale report publishes nothing, healthy or not.
+        let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+        assert!(
+            backends(&catalog).is_empty(),
+            "a stale report must not publish its last backends"
+        );
+
+        // The committed catalogue still holds a healthy backend from when the
+        // report was fresh.
+        let mut fresh = reports.clone();
+        fresh.stale_nodes.clear();
+        desired.endpoint_catalog = build_endpoint_catalog(&members, &fresh, &desired).unwrap();
+        assert_eq!(backends(&desired.endpoint_catalog).len(), 1);
+
+        // Its payload is evicted but the node stays stale: withdrawn, not carried.
+        let mut evicted = AggregatedState::default();
+        evicted.stale_nodes.push(NodeId::new("n1"));
+        let catalog = build_endpoint_catalog(&members, &evicted, &desired).unwrap();
+        assert!(
+            backends(&catalog).is_empty(),
+            "report eviction must not resurrect an expired backend"
+        );
+
+        // Within a new leader's first window (no report, not yet stale) the
+        // committed backend is kept.
+        let catalog =
+            build_endpoint_catalog(&members, &AggregatedState::default(), &desired).unwrap();
+        assert_eq!(backends(&catalog).len(), 1);
+    }
+
+    #[test]
+    fn only_a_stale_planned_member_blocks_capacity_admission() {
+        let member = |name: &str| MembershipSnapshot {
+            node_id: NodeId::new(name),
+            address: "10.1.1.1:9116".parse().unwrap(),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: Default::default(),
+            first_seen: Instant::now(),
+            resources: None,
+        };
+        let members = vec![member("planned")];
+        let mut reports = AggregatedState::default();
+        assert!(!has_stale_member(&members, &reports));
+        reports.stale_nodes.push(NodeId::new("retired"));
+        assert!(!has_stale_member(&members, &reports));
+        reports.stale_nodes.push(NodeId::new("planned"));
+        assert!(has_stale_member(&members, &reports));
     }
 }
 
