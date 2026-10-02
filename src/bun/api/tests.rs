@@ -455,6 +455,54 @@ async fn router_stays_open_when_no_user_tokens_exist() {
     shutdown.cancel();
 }
 
+/// The bootstrap window opens only when the store is *empty*. A store whose
+/// every token has expired is not empty, so it still refuses a caller with
+/// no token: expiry must never quietly reopen the API (F05 I2).
+#[tokio::test]
+async fn a_store_whose_every_token_has_expired_still_refuses_an_anonymous_request() {
+    let expired_at = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    let tokens = [
+        ("admin", crate::sesame::types::ApiRole::Admin),
+        ("ci", crate::sesame::types::ApiRole::Deployer),
+    ]
+    .into_iter()
+    .map(|(name, role)| {
+        crate::sesame::token::create_token(
+            name,
+            role,
+            crate::sesame::types::TokenScope::default(),
+            Some(expired_at),
+        )
+        .unwrap()
+        .token
+    })
+    .collect();
+    let (app, shutdown) = setup_with_auth(tokens, None).await;
+    assert_eq!(
+        get_status(app, "/v1/status", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn an_expired_token_gets_401() {
+    let (live, _) = named_user_token("admin", crate::sesame::types::ApiRole::Admin);
+    let expired = crate::sesame::token::create_token(
+        "old-ci",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope::default(),
+        Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60)),
+    )
+    .unwrap();
+    let (app, shutdown) = setup_with_auth(vec![live, expired.token], None).await;
+    assert_eq!(
+        get_status(app, "/v1/status", Some(&expired.plaintext)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn protected_route_returns_401_without_a_token_once_a_user_token_exists() {
     let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
@@ -4351,6 +4399,51 @@ async fn scoped_token_is_refused_streaming_another_namespaces_logs() {
     let _ = server.await;
 }
 
+/// Audit events span every namespace, so `/v1/events` refuses a scoped
+/// token (C3). The live stream of the same events, `/v1/ws/events`, checked
+/// nothing: route authorisation lets any token through, and the handler
+/// upgraded straight away, so a token scoped to `team-a` streamed every
+/// tenant's events. It must refuse the upgrade the same way.
+#[tokio::test]
+async fn scoped_token_is_refused_the_live_event_stream() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+    assert_eq!(
+        get_status(app.clone(), "/v1/events", Some(&tok)).await,
+        StatusCode::FORBIDDEN,
+        "the HTTP route already refuses"
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+
+    let mut request = format!("ws://{address}/v1/ws/events")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {tok}").parse().unwrap());
+    let error = tokio_tungstenite::connect_async(request)
+        .await
+        .expect_err("the event stream upgraded for a scoped token");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        other => panic!("expected an HTTP refusal, got {other:?}"),
+    }
+
+    shutdown.cancel();
+    let _ = server.await;
+}
+
 /// `/v1/logs/sql` takes no app or namespace to check a scope against, and
 /// arbitrary SQL can't be rewritten into a tenant-filtered query. A scoped
 /// token is refused outright rather than served every tenant's logs (C3).
@@ -4907,6 +5000,101 @@ async fn identity_jwks_returns_503_without_council() {
     // Single-node mode (no council) is untouched: the endpoint 503s cleanly.
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     shutdown.cancel();
+}
+
+/// F05 I1: the routes that change who can do what leave an audit event
+/// naming the credential that called them. Before, only fault inject and
+/// clear did; a token could be minted or a secret key rotated with no trace.
+#[tokio::test]
+async fn trust_changing_routes_record_who_called_them() {
+    let (admin, plaintext) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let council = seeded_council_with_ikm("audit-trust").await;
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+
+    let mut minted = Vec::new();
+    for (uri, body) in [
+        ("/v1/token/create", r#"{"name":"ci-bot","role":"deployer"}"#),
+        ("/v1/token/revoke", r#"{"name":"ci-bot"}"#),
+        ("/v1/join-token/create", r#"{"node_id":"node-7"}"#),
+        ("/v1/secret/rotate", ""),
+        ("/v1/secret/rotate", r#"{"finalize":true}"#),
+    ] {
+        let (status, response) = post_authenticated(app.clone(), uri, &plaintext, body, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        minted.push(String::from_utf8_lossy(&response).into_owned());
+    }
+
+    let recorded = events.read().await.recent(20, None, None);
+    let actions: Vec<&str> = recorded
+        .iter()
+        .filter_map(|event| event.action.as_deref())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "token.created",
+            "token.revoked",
+            "join_token.created",
+            "secret.rotated",
+            "secret.rotation_finalised",
+        ]
+    );
+    for event in &recorded {
+        assert!(
+            event
+                .principal
+                .as_deref()
+                .is_some_and(|principal| principal.starts_with("token:")),
+            "{event:?}"
+        );
+        assert_eq!(
+            event.details.get("token_name").map(String::as_str),
+            Some("root-op"),
+            "{event:?}"
+        );
+    }
+    assert_eq!(
+        recorded[0].details.get("token").map(String::as_str),
+        Some("ci-bot")
+    );
+    assert_eq!(
+        recorded[2].details.get("node_id").map(String::as_str),
+        Some("node-7")
+    );
+    // No credential the routes handed back appears in any event.
+    let all_events = serde_json::to_string(&recorded).unwrap();
+    for response in &minted {
+        let json: serde_json::Value = serde_json::from_str(response).unwrap_or_default();
+        for field in ["token", "join_token", "token_plaintext"] {
+            if let Some(secret) = json.get(field).and_then(|value| value.as_str()) {
+                assert!(!all_events.contains(secret), "{field} leaked into an event");
+            }
+        }
+    }
 }
 
 #[tokio::test]

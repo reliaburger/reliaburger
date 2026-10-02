@@ -158,7 +158,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 - `relish token`: Manage API tokens
   - `relish token create --name <NAME>`: Create a new API token
-  - `relish token list`: List all API tokens
+  - `relish token list`: List all API tokens with their scope, expiry and last use
   - `relish token revoke <NAME>`: Revoke an API token by name
 - `relish secret`: Manage secrets (encrypt values for use in app configs)
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)

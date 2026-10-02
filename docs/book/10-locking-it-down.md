@@ -418,7 +418,35 @@ API tokens live in `SecurityState.api_tokens` and are managed through Raft. `rel
 
 `relish token list` used to print `created_at` exactly as the API sent it, Unix seconds, and ignored `expires_at` altogether, so the one thing you most want to know about a CI token (when does it stop working?) was missing. The client now deserialises the response into a typed `TokenSummary` with `expires_at: Option<u64>` instead of poking at a `serde_json::Value`, and the table shows UTC times plus `never`, `(in 30d)` or `(expired)`. The `time` crate, already a dependency for certificate validity windows, does the calendar arithmetic: `OffsetDateTime::from_unix_timestamp` returns a `Result`, because an `i64` of seconds can land outside the years it can represent. The rendering is a pure function of the token list and "now", so an `insta` inline snapshot pins the whole table, and a change in the output shows up as a diff in the test source rather than a vague assertion failure.
 
-Both list and revoke endpoints read from or write to the council's security state directly. The list endpoint formats each token's name, role, and creation timestamp. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
+Both list and revoke endpoints read from or write to the council's security state directly. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
+
+### When was this token last used?
+
+The question you ask before revoking a CI token is "is anything still using it?", and for a long time the list couldn't answer it. It now shows each token's scope and when it was last used. The obvious place to keep "last used" is next to the token, in `SecurityState`. We didn't, and it's worth saying why.
+
+`SecurityState` lives in Raft. Every change to it is a log entry: proposed to the leader, replicated to a majority, applied on every council member, and eventually written into a snapshot. Recording a use there would turn every authenticated request (including every `relish status`, every dashboard refresh) into a replicated write. Reads would cost as much as deploys, and a follower answering a request would have to forward a write to the leader just to say "I saw this". That's a lot of machinery for a timestamp nobody needs to be exact.
+
+So each node keeps its own, in memory:
+
+```rust
+pub type TokenLastUsed = Arc<RwLock<std::collections::HashMap<String, u64>>>;
+```
+
+`type` here declares an *alias*, not a new type: `TokenLastUsed` is just a shorter name for that nesting of `Arc` (shared ownership), `RwLock` (many readers or one writer) and `HashMap`. The map is keyed by the token's principal id, `token:<sha256 of its hash>`, not its name, because a name can be revoked and reused while the principal can't. When `auth_middleware` authenticates a token, it takes the write lock for one insert and lets go. `GET /v1/token/list` then does what the other cluster views do: it asks every live member for its share with `local=true` (so they don't fan out again), keeps the latest time per principal, and names any member that didn't answer. A node that restarts forgets what it saw, so the answer can under-report a token's last use but never invent one. For a question like "can I revoke this?", that's the safe direction to be wrong in.
+
+The peers ask each other with the cluster's internal service token, and the token routes refuse that principal outright (it exists for node-to-node fan-out, not user management). The list makes one exception: with `local=true`, the service principal may read a node's own answer. It still can't ask for the cluster-wide list, and it still can't mint or revoke anything.
+
+### Sweeping expired tokens, but never the last Admin
+
+An expired token gets a `401` the moment its expiry passes, so removing it from the store isn't about security. It's about not keeping dead credentials around forever. Every hour the leader proposes `SweepExpiredApiTokens { now_unix_ms }`, and the state machine removes tokens that expired more than a day ago (the day of grace means `token list` still shows *why* a client started failing).
+
+Notice that the request carries the time. The state machine doesn't read the clock, because each replica applies the entry at a slightly different moment, and a token right on the boundary could vanish on one member and survive on another. With `now` in the entry, `tokens_to_sweep(tokens, now)` is a pure function, so every replica removes exactly the same tokens. Ties (two tokens expiring in the same millisecond) are broken by name for the same reason.
+
+The rule that took the most thought is what the sweep must *not* remove. Remember the bootstrap window: an empty token store means "this cluster hasn't been set up yet", and the middleware lets everyone in. `RevokeApiToken` already refuses to remove the last Admin for that reason. A sweep that dutifully deleted every expired token would undo that protection on a timer. A cluster whose only tokens had all expired would wake up one night with an empty store and an open API.
+
+So the sweep keeps the last Admin, even an expired one (the one that expired most recently, if there are several), and it never empties the store, even if there's no Admin left at all. The token it keeps can't authenticate anyone, but its presence keeps the store non-empty, and a non-empty store means the API stays closed. A test pins that from the other side: a store whose every token has expired still answers an anonymous request with `401`.
+
+Each removal is audited like a revoke. The leader records a `token.expired_swept` event per token, with principal `system`, since no person asked for it.
 
 ## Enforcing what the tokens promise
 
@@ -517,6 +545,8 @@ statuses.retain(|status| visible(&status.instance.app_name, &status.instance.nam
 ```
 
 `visible` is a closure: an anonymous function written `|arguments| body`, much like a Python `lambda` or a Go function literal. It captures `auth` from the surrounding scope by reference, so both branches of the handler can share one rule. `Vec::retain` keeps only the elements for which the closure returns `true`, filtering in place without building a second vector. The regression serves one peer and one local agent, each with an instance in `team-a` and one in `team-b`, and checks that a `team-a` token sees only the two `team-a` instances.
+
+The live event stream, `/v1/ws/events`, slipped past for the same reason. Its path names no app, the route matrix lets any token through, and the handler took no `AuthContext`, so a token scoped to `team-a` that `/v1/events` refused could open the WebSocket and watch every tenant's audit events arrive. Events can't be filtered the way instances are (an event about a node or the council belongs to no tenant), so the stream refuses a scoped token before the upgrade, as the listing does. A WebSocket route needs a real handshake in its test: `WebSocketUpgrade` is an extractor that rejects a hand-built request before the handler runs, so `scoped_token_is_refused_the_live_event_stream` binds a port and connects. `both_event_routes_refuse_scoped_tokens` adds the two handlers to the source checks, the same blunt instrument as above, pointed at routes the `{app}` scan can't see.
 
 The deploy-history endpoint had a quieter version of the same bug. It filtered on the bare app name, and since instance identity gained namespaces (chapter 2), two apps called `web` can live in different namespaces quite happily. Filtering by name alone returned both. The namespace now rides in as a query parameter, and the handler filters and scope-checks on it.
 

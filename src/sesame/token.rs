@@ -3,7 +3,7 @@
 //! Tokens are 256-bit random values, hashed with Argon2id before storage.
 //! Each token has a role (Admin, Deployer, ReadOnly) and optional scope.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
@@ -148,6 +148,71 @@ pub fn find_valid_token<'a>(
     Err(TokenError::ValidationFailed)
 }
 
+/// How long a token stays in the store after it expires, before the expiry
+/// sweep removes it. An expired token already gets 401; the grace keeps it
+/// visible in `relish token list` for a day, so an operator can see why a
+/// client started failing.
+pub const EXPIRED_TOKEN_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Names of the tokens the expiry sweep removes at `now_unix_ms`, in store
+/// order.
+///
+/// A token is due once `now_unix_ms` is past its expiry plus
+/// [`EXPIRED_TOKEN_GRACE`]; a token without an expiry never is. Two rules
+/// override that, because an empty store reopens the API to everyone (the
+/// bootstrap window in [`super::auth::auth_middleware`]):
+///
+/// - the store never loses its last Admin. If every Admin is due, the one
+///   that expired most recently stays;
+/// - the store is never emptied. With no Admin at all, the token that
+///   expired most recently stays.
+///
+/// Ties go to the greater name. The answer depends only on the tokens and
+/// `now_unix_ms`, so every Raft replica applying the same entry removes the
+/// same tokens.
+pub fn tokens_to_sweep(tokens: &[ApiToken], now_unix_ms: u64) -> Vec<String> {
+    let grace_ms = EXPIRED_TOKEN_GRACE.as_millis() as u64;
+    let is_due = |token: &ApiToken| {
+        token
+            .expires_at
+            .is_some_and(|at| unix_millis(at).saturating_add(grace_ms) < now_unix_ms)
+    };
+    // The survivor among `candidates`: the latest expiry, then the greater name.
+    let latest = |candidates: Vec<&ApiToken>| {
+        candidates
+            .into_iter()
+            .max_by_key(|token| (token.expires_at.map(unix_millis), token.name.clone()))
+            .map(|token| token.name.clone())
+    };
+
+    let due: Vec<&ApiToken> = tokens.iter().filter(|token| is_due(token)).collect();
+    let admins = tokens.iter().filter(|t| t.role == ApiRole::Admin).count();
+    let due_admins: Vec<&ApiToken> = due
+        .iter()
+        .copied()
+        .filter(|t| t.role == ApiRole::Admin)
+        .collect();
+    let keep = if admins > 0 && due_admins.len() == admins {
+        latest(due_admins)
+    } else if !due.is_empty() && due.len() == tokens.len() {
+        latest(due.clone())
+    } else {
+        None
+    };
+
+    due.into_iter()
+        .filter(|token| Some(&token.name) != keep.as_ref())
+        .map(|token| token.name.clone())
+        .collect()
+}
+
+/// Milliseconds since the Unix epoch; zero for a time before it.
+fn unix_millis(at: SystemTime) -> u64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Length of the hex body of a well-formed token (`rbrg_` + 64 hex chars).
 const TOKEN_HEX_LEN: usize = 64;
 
@@ -190,7 +255,6 @@ pub fn derive_service_token(ikm: &[u8; 32]) -> Result<String, TokenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn service_token_is_deterministic_for_the_same_ikm() {
@@ -317,5 +381,99 @@ mod tests {
         assert!(!looks_like_token(&format!("rbrg_{}", "z".repeat(64))));
         // No prefix.
         assert!(!looks_like_token(&"a".repeat(64)));
+    }
+
+    /// A token with a fixed expiry, `expires_ms` after the epoch.
+    fn expiring(name: &str, role: ApiRole, expires_ms: Option<u64>) -> ApiToken {
+        ApiToken {
+            name: name.to_string(),
+            token_hash: name.as_bytes().to_vec(),
+            token_salt: Vec::new(),
+            role,
+            scope: TokenScope::default(),
+            expires_at: expires_ms.map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms)),
+            created_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const NOW_MS: u64 = 1_000 * DAY_MS;
+
+    #[test]
+    fn sweep_removes_a_token_expired_for_longer_than_the_grace() {
+        let tokens = [
+            expiring("admin", ApiRole::Admin, None),
+            expiring("ci", ApiRole::Deployer, Some(NOW_MS - DAY_MS - 1)),
+        ];
+        assert_eq!(tokens_to_sweep(&tokens, NOW_MS), ["ci"]);
+    }
+
+    #[test]
+    fn sweep_keeps_a_token_still_inside_the_grace() {
+        let tokens = [
+            expiring("admin", ApiRole::Admin, None),
+            expiring("ci", ApiRole::Deployer, Some(NOW_MS - 60 * 60 * 1000)),
+            expiring("edge", ApiRole::ReadOnly, Some(NOW_MS - DAY_MS)),
+        ];
+        assert!(tokens_to_sweep(&tokens, NOW_MS).is_empty());
+    }
+
+    #[test]
+    fn sweep_never_removes_a_token_without_an_expiry() {
+        let tokens = [
+            expiring("admin", ApiRole::Admin, None),
+            expiring("reader", ApiRole::ReadOnly, None),
+        ];
+        assert!(tokens_to_sweep(&tokens, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_the_last_admin_even_when_it_has_expired() {
+        let tokens = [
+            expiring("admin", ApiRole::Admin, Some(NOW_MS - 10 * DAY_MS)),
+            expiring("ci", ApiRole::Deployer, None),
+        ];
+        assert!(tokens_to_sweep(&tokens, NOW_MS).is_empty());
+    }
+
+    #[test]
+    fn sweep_removes_an_expired_admin_while_a_live_admin_remains() {
+        let tokens = [
+            expiring("old-admin", ApiRole::Admin, Some(NOW_MS - 10 * DAY_MS)),
+            expiring("admin", ApiRole::Admin, Some(NOW_MS + DAY_MS)),
+        ];
+        assert_eq!(tokens_to_sweep(&tokens, NOW_MS), ["old-admin"]);
+    }
+
+    #[test]
+    fn sweep_keeps_the_most_recently_expiring_admin_when_every_admin_has_expired() {
+        let tokens = [
+            expiring("first", ApiRole::Admin, Some(NOW_MS - 30 * DAY_MS)),
+            expiring("latest", ApiRole::Admin, Some(NOW_MS - 5 * DAY_MS)),
+            expiring("middle", ApiRole::Admin, Some(NOW_MS - 10 * DAY_MS)),
+            expiring("ci", ApiRole::Deployer, Some(NOW_MS - 10 * DAY_MS)),
+        ];
+        assert_eq!(tokens_to_sweep(&tokens, NOW_MS), ["first", "middle", "ci"]);
+    }
+
+    #[test]
+    fn sweep_never_empties_a_store_without_an_admin() {
+        let tokens = [
+            expiring("old", ApiRole::Deployer, Some(NOW_MS - 30 * DAY_MS)),
+            expiring("newer", ApiRole::ReadOnly, Some(NOW_MS - 5 * DAY_MS)),
+        ];
+        assert_eq!(tokens_to_sweep(&tokens, NOW_MS), ["old"]);
+    }
+
+    #[test]
+    fn sweep_breaks_an_expiry_tie_by_name_so_every_replica_agrees() {
+        let tokens = [
+            expiring("b", ApiRole::Admin, Some(NOW_MS - 5 * DAY_MS)),
+            expiring("a", ApiRole::Admin, Some(NOW_MS - 5 * DAY_MS)),
+        ];
+        let mut reversed = tokens.clone();
+        reversed.reverse();
+        assert_eq!(tokens_to_sweep(&tokens, NOW_MS), ["a"]);
+        assert_eq!(tokens_to_sweep(&reversed, NOW_MS), ["a"]);
     }
 }

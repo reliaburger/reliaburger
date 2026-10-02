@@ -193,6 +193,13 @@ fn verify_snapshot_checksum(
     Ok(())
 }
 
+/// Whether `keypair` is the age key `relish init` sealed the root CA backup
+/// to: the cluster-wide key of generation 0. Nothing else seals to it, so
+/// finalising a rotation keeps it, read-only.
+fn opens_root_ca_backup(keypair: &crate::sesame::types::AgeKeypair) -> bool {
+    keypair.scope == crate::sesame::types::AgeKeyScope::ClusterWide && keypair.generation == 0
+}
+
 impl StateMachineInner {
     fn registry_publication_is_current(
         &self,
@@ -712,6 +719,21 @@ impl StateMachineInner {
                     .api_tokens
                     .retain(|t| t.name != *name);
             }
+            RaftRequest::SweepExpiredApiTokens { now_unix_ms } => {
+                // The entry carries the leader's clock, so replicas never
+                // consult their own: all of them remove the same tokens.
+                // `tokens_to_sweep` keeps the last Admin and never empties
+                // the store, for the reason the revoke above refuses to.
+                let removed = crate::sesame::token::tokens_to_sweep(
+                    &self.state.security_state.api_tokens,
+                    *now_unix_ms,
+                );
+                self.state
+                    .security_state
+                    .api_tokens
+                    .retain(|token| !removed.contains(&token.name));
+                return Some(CouncilResponse::ApiTokensSwept { removed });
+            }
             RaftRequest::AllocateSerial => {
                 // Return the pre-increment value as this entry's serial.
                 let serial = self.state.security_state.next_serial;
@@ -805,10 +827,14 @@ impl StateMachineInner {
                         ),
                     });
                 }
+                // The cluster-wide generation-0 key stays, read-only: `relish
+                // init` sealed the root CA's private key to it
+                // (`<cluster>-root-ca.age`), and no seal record knows that, so
+                // retiring it would leave the root backup unopenable (F04 R0).
                 self.state
                     .security_state
                     .age_keypairs
-                    .retain(|kp| kp.scope != *scope || !kp.read_only);
+                    .retain(|kp| kp.scope != *scope || !kp.read_only || opens_root_ca_backup(kp));
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
@@ -4823,26 +4849,108 @@ mod tests {
     fn finalize_secret_rotation_retires_old_keys_once_a_replacement_exists() {
         use crate::sesame::types::AgeKeyScope;
         let mut inner = StateMachineInner::default();
-        // The rotation flow: mark gen 0 read-only, add the active gen 1.
-        inner
-            .state
-            .security_state
-            .age_keypairs
-            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, true));
-        inner
-            .state
-            .security_state
-            .age_keypairs
-            .push(test_age_keypair(AgeKeyScope::ClusterWide, 1, false));
+        // Two rotations: gens 0 and 1 are read-only, gen 2 is active.
+        for (generation, read_only) in [(0, true), (1, true), (2, false)] {
+            inner
+                .state
+                .security_state
+                .age_keypairs
+                .push(test_age_keypair(
+                    AgeKeyScope::ClusterWide,
+                    generation,
+                    read_only,
+                ));
+        }
 
         inner.apply_request(&RaftRequest::FinalizeSecretRotation {
             scope: AgeKeyScope::ClusterWide,
         });
 
-        let remaining = &inner.state.security_state.age_keypairs;
-        assert_eq!(remaining.len(), 1, "the retiring gen 0 key is dropped");
-        assert_eq!(remaining[0].generation, 1);
-        assert!(!remaining[0].read_only);
+        let remaining: Vec<(u64, bool)> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| (kp.generation, kp.read_only))
+            .collect();
+        // Gen 1 is retired; gen 0 stays, read-only, because it opens the
+        // root CA backup `relish init` wrote (F04 R0).
+        assert_eq!(remaining, [(0, true), (2, false)]);
+    }
+
+    /// Only the cluster-wide generation-0 key opens the root CA backup; a
+    /// namespace's old keys are retired as before.
+    #[test]
+    fn finalize_retires_a_namespaces_generation_zero() {
+        use crate::sesame::types::AgeKeyScope;
+        let scope = AgeKeyScope::Namespace("team-a".into());
+        let mut inner = StateMachineInner::default();
+        for (generation, read_only) in [(0, true), (1, false)] {
+            inner
+                .state
+                .security_state
+                .age_keypairs
+                .push(test_age_keypair(scope.clone(), generation, read_only));
+        }
+        inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: scope.clone(),
+        });
+        let remaining: Vec<u64> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| kp.generation)
+            .collect();
+        assert_eq!(remaining, [1]);
+    }
+
+    /// F04 R0: `relish init` seals the root CA's private key to the cluster's
+    /// generation-0 age key, in `<cluster>-root-ca.age`. Finalising a secret
+    /// rotation used to drop that key, after which nothing the cluster holds
+    /// could open the root backup.
+    #[test]
+    fn the_root_backup_still_opens_after_a_finalised_secret_rotation() {
+        use crate::sesame::types::AgeKeyScope;
+        let dir = tempfile::tempdir().unwrap();
+        let init = crate::sesame::init::initialize_cluster("prod", "node-1", dir.path()).unwrap();
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(
+            init.security_state.clone(),
+        )));
+        let (next, _) = crate::sesame::secret::generate_age_keypair(
+            AgeKeyScope::ClusterWide,
+            &init.master_secret,
+            1,
+        )
+        .unwrap();
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: next,
+        });
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+
+        let sealed = std::fs::read(&init.sealed_root_ca_path).unwrap();
+        let opened = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .filter(|kp| kp.scope == AgeKeyScope::ClusterWide)
+            .filter_map(|kp| {
+                crate::sesame::secret::unwrap_age_identity(kp, &init.master_secret).ok()
+            })
+            .find_map(|identity| crate::sesame::secret::unseal_with_age(&sealed, &identity).ok());
+        assert!(
+            opened.is_some(),
+            "no key left in the state opens the root CA backup"
+        );
     }
 
     #[test]
@@ -4962,9 +5070,16 @@ mod tests {
             !matches!(response, Some(CouncilResponse::Refused { .. })),
             "finalize proceeds once everything is re-sealed: {response:?}"
         );
-        let remaining = &inner.state.security_state.age_keypairs;
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].generation, 1);
+        let remaining: Vec<(u64, bool)> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| (kp.generation, kp.read_only))
+            .collect();
+        // Gen 1 is the only active key; gen 0 stays read-only for the root
+        // CA backup (F04 R0).
+        assert_eq!(remaining, [(0, true), (1, false)]);
     }
 
     /// PKI8: a second rotation while one is un-finalised is refused; the
@@ -5297,6 +5412,147 @@ mod tests {
             name: "ci".to_string(),
         });
         assert!(inner.state.security_state.api_tokens.is_empty());
+    }
+
+    fn expiring_api_token(
+        name: &str,
+        role: crate::sesame::types::ApiRole,
+        expires_unix_ms: Option<u64>,
+    ) -> crate::sesame::types::ApiToken {
+        crate::sesame::types::ApiToken {
+            name: name.to_string(),
+            token_hash: name.as_bytes().to_vec(),
+            token_salt: vec![4, 5, 6],
+            role,
+            scope: crate::sesame::types::TokenScope::default(),
+            expires_at: expires_unix_ms
+                .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+            created_at: std::time::UNIX_EPOCH,
+        }
+    }
+
+    const SWEEP_DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const SWEEP_NOW_MS: u64 = 2_000 * SWEEP_DAY_MS;
+
+    fn token_names(inner: &StateMachineInner) -> Vec<String> {
+        inner
+            .state
+            .security_state
+            .api_tokens
+            .iter()
+            .map(|token| token.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn sweep_removes_an_expired_token_past_the_grace_and_keeps_one_inside_it() {
+        use crate::sesame::types::ApiRole;
+        let mut inner = StateMachineInner::default();
+        for token in [
+            expiring_api_token("admin", ApiRole::Admin, None),
+            expiring_api_token(
+                "stale",
+                ApiRole::Deployer,
+                Some(SWEEP_NOW_MS - 2 * SWEEP_DAY_MS),
+            ),
+            expiring_api_token("recent", ApiRole::ReadOnly, Some(SWEEP_NOW_MS - 1_000)),
+        ] {
+            inner.apply_request(&RaftRequest::CreateApiToken(token));
+        }
+
+        let response = inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS,
+        });
+
+        assert_eq!(
+            response,
+            Some(CouncilResponse::ApiTokensSwept {
+                removed: vec!["stale".to_string()]
+            })
+        );
+        assert_eq!(token_names(&inner), ["admin", "recent"]);
+    }
+
+    #[test]
+    fn sweep_keeps_the_last_admin_even_when_it_has_expired() {
+        use crate::sesame::types::ApiRole;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(expiring_api_token(
+            "admin",
+            ApiRole::Admin,
+            Some(SWEEP_NOW_MS - 30 * SWEEP_DAY_MS),
+        )));
+        inner.apply_request(&RaftRequest::CreateApiToken(expiring_api_token(
+            "ci",
+            ApiRole::Deployer,
+            Some(SWEEP_NOW_MS - 30 * SWEEP_DAY_MS),
+        )));
+
+        inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS,
+        });
+
+        assert_eq!(token_names(&inner), ["admin"]);
+    }
+
+    #[test]
+    fn sweep_never_empties_the_token_store() {
+        use crate::sesame::types::ApiRole;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(expiring_api_token(
+            "only",
+            ApiRole::ReadOnly,
+            Some(SWEEP_NOW_MS - 30 * SWEEP_DAY_MS),
+        )));
+
+        let response = inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS,
+        });
+
+        assert_eq!(
+            response,
+            Some(CouncilResponse::ApiTokensSwept { removed: vec![] })
+        );
+        assert_eq!(token_names(&inner), ["only"]);
+    }
+
+    #[test]
+    fn sweep_is_deterministic_given_now() {
+        use crate::sesame::types::ApiRole;
+        let tokens = [
+            expiring_api_token("a", ApiRole::Admin, Some(SWEEP_NOW_MS - 3 * SWEEP_DAY_MS)),
+            expiring_api_token("b", ApiRole::Admin, Some(SWEEP_NOW_MS - 3 * SWEEP_DAY_MS)),
+            expiring_api_token(
+                "c",
+                ApiRole::Deployer,
+                Some(SWEEP_NOW_MS - 3 * SWEEP_DAY_MS),
+            ),
+            expiring_api_token("d", ApiRole::ReadOnly, Some(SWEEP_NOW_MS + SWEEP_DAY_MS)),
+        ];
+        let replica = || {
+            let mut inner = StateMachineInner::default();
+            for token in &tokens {
+                inner.apply_request(&RaftRequest::CreateApiToken(token.clone()));
+            }
+            inner.apply_request(&RaftRequest::SweepExpiredApiTokens {
+                now_unix_ms: SWEEP_NOW_MS,
+            });
+            inner
+        };
+        let (first, second) = (replica(), replica());
+        assert_eq!(token_names(&first), token_names(&second));
+        assert_eq!(token_names(&first), ["b", "d"]);
+
+        // An earlier `now` leaves everything in place: the clock that
+        // decides is the one in the entry, not the replica's.
+        let mut early = StateMachineInner::default();
+        for token in &tokens {
+            early.apply_request(&RaftRequest::CreateApiToken(token.clone()));
+        }
+        early.apply_request(&RaftRequest::SweepExpiredApiTokens {
+            now_unix_ms: SWEEP_NOW_MS - 3 * SWEEP_DAY_MS,
+        });
+        assert_eq!(token_names(&early), ["a", "b", "c", "d"]);
     }
 
     #[test]

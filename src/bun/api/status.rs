@@ -263,6 +263,11 @@ pub(super) struct EventsQuery {
     /// so a peer never fans out again.
     #[serde(default)]
     pub(super) local: bool,
+    /// Stream this node's new events over SSE instead of listing. The feed a
+    /// cluster-wide live stream reads from each member; always this node's
+    /// own events.
+    #[serde(default)]
+    pub(super) follow: bool,
 }
 
 /// The request a peer gets for its share of `/v1/events`: the same filters,
@@ -300,7 +305,35 @@ pub(super) async fn events_handler(
     if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
         return resp;
     }
+    if query.follow {
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let Some(relay) = spawn_local_event_relay(&state, events_tx).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let stream = ReceiverStream::new(events_rx).filter_map(|event| async move {
+            let json = serde_json::to_string(&event).ok()?;
+            Some(Ok::<_, std::convert::Infallible>(
+                Event::default().data(json),
+            ))
+        });
+        // The relay ends when the client goes: its sender's receiver is
+        // dropped with the response stream.
+        drop(relay);
+        return Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response();
+    }
     let limit = query.limit.unwrap_or(100);
+    Json(cluster_recent_events(&state, &query, limit).await).into_response()
+}
+
+/// The newest `limit` events matching `query`, from this node and, unless
+/// the query is `local`, every live member, oldest first.
+async fn cluster_recent_events(
+    state: &ApiState,
+    query: &EventsQuery,
+    limit: usize,
+) -> crate::bun::cluster_view::ClusterEvents {
     let local = match &state.events {
         Some(events) => events
             .read()
@@ -308,12 +341,12 @@ pub(super) async fn events_handler(
             .recent(limit, query.app.as_deref(), query.severity),
         None => Vec::new(),
     };
-    let mut answers = vec![(local_node_name(&state), local)];
+    let mut answers = vec![(local_node_name(state), local)];
     let mut warnings = Vec::new();
     if !query.local {
-        let path = peer_events_path(&query, limit);
+        let path = peer_events_path(query, limit);
         let (peers, failures) = fan_out_to_peers::<crate::bun::cluster_view::ClusterEvents>(
-            &state,
+            state,
             &path,
             CLUSTER_STATUS_TIMEOUT,
         )
@@ -321,53 +354,213 @@ pub(super) async fn events_handler(
         answers.extend(peers.into_iter().map(|(node, view)| (node, view.events)));
         warnings = failures;
     }
-    Json(crate::bun::cluster_view::ClusterEvents {
+    crate::bun::cluster_view::ClusterEvents {
         events: crate::bun::cluster_view::merge_events(answers, limit),
         warnings,
-    })
-    .into_response()
+    }
+}
+
+/// Copy this node's new events into `events`, each tagged with this node's
+/// name, until `events` closes. `None` when the node keeps no events.
+/// Subscribes before it returns, so nothing recorded afterwards is missed.
+async fn spawn_local_event_relay(
+    state: &ApiState,
+    events: mpsc::Sender<crate::bun::events::ClusterEvent>,
+) -> Option<tokio::task::AbortHandle> {
+    let mut receiver = state.events.as_ref()?.read().await.subscribe();
+    let node = local_node_name(state);
+    Some(
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = events.closed() => return,
+                    event = receiver.recv() => match event {
+                        Ok(mut event) => {
+                            event.node.get_or_insert_with(|| node.clone());
+                            if events.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    },
+                }
+            }
+        })
+        .abort_handle(),
+    )
+}
+
+/// Relay every other live member's new events into `events` until it
+/// closes. Every [`super::logs::LOG_FOLLOW_REFRESH`] it re-reads the
+/// membership, opens a feed to each member it isn't reading yet, and drops
+/// the feeds of members that left; a feed that ends is reopened on the next
+/// pass.
+async fn relay_peer_events(
+    state: ApiState,
+    events: mpsc::Sender<crate::bun::events::ClusterEvent>,
+) {
+    let Some(membership) = state.membership.clone() else {
+        return;
+    };
+    let self_name = local_node_name(&state);
+    let mut feeds: std::collections::HashMap<String, tokio::task::AbortHandle> =
+        std::collections::HashMap::new();
+    loop {
+        let members = membership.read().await.clone();
+        feeds.retain(|node, feed| {
+            let alive = members.iter().any(|member| &member.node_id.0 == node);
+            if !alive {
+                feed.abort();
+            }
+            alive && !feed.is_finished()
+        });
+        for member in members {
+            let node = member.node_id.0.clone();
+            if node == self_name || feeds.contains_key(&node) {
+                continue;
+            }
+            let url = state.cluster_http.url(
+                &member.address.to_string(),
+                "/v1/events?follow=true&local=true",
+            );
+            let mut request = state.cluster_http.client().get(url);
+            if let Some(token) = &state.service_token {
+                request = request.bearer_auth(token);
+            }
+            let events = events.clone();
+            let name = node.clone();
+            let feed = tokio::spawn(async move {
+                let _ = relay_one_peer_feed(request, &name, &events).await;
+            });
+            feeds.insert(node, feed.abort_handle());
+        }
+        tokio::select! {
+            () = events.closed() => break,
+            () = tokio::time::sleep(super::logs::LOG_FOLLOW_REFRESH) => {}
+        }
+    }
+    for feed in feeds.into_values() {
+        feed.abort();
+    }
+}
+
+/// Read one member's SSE feed of new events into `events`, tagging each
+/// with `node` when the member didn't.
+async fn relay_one_peer_feed(
+    request: reqwest::RequestBuilder,
+    node: &str,
+    events: &mpsc::Sender<crate::bun::events::ClusterEvent>,
+) -> Result<(), String> {
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), request.send())
+        .await
+        .map_err(|_| format!("node {node}: event feed did not start within 5s"))?
+        .map_err(|error| format!("node {node}: event feed failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "node {node}: event feed refused: {}",
+            response.status()
+        ));
+    }
+    let mut decoder = crate::ketchup::sse::SseDecoder::default();
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| format!("node {node}: event feed broke: {error}"))?;
+        for frame in decoder.push(&chunk) {
+            let Ok(mut event) =
+                serde_json::from_str::<crate::bun::events::ClusterEvent>(&frame.data)
+            else {
+                continue;
+            };
+            event.node.get_or_insert_with(|| node.to_string());
+            if events.send(event).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Upgrade an authenticated request to the live event stream.
 pub(super) async fn ws_events_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    // The same events as `/v1/events`, live: they span every namespace, so a
+    // scoped token is refused before the upgrade, as it is there (C3).
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     upgrade
-        .on_upgrade(move |socket| ws_events_session(socket, state.events))
+        .on_upgrade(move |socket| ws_events_session(socket, state))
         .into_response()
 }
 
-pub(super) async fn ws_events_session(
-    mut socket: WebSocket,
-    events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
-) {
-    let Some(events) = events else { return };
-    let (recent, mut receiver) = {
-        let store = events.read().await;
-        (store.recent(50, None, None), store.subscribe())
+/// How many recent events a live stream opens with.
+const LIVE_EVENTS_BACKLOG: usize = 50;
+
+/// The live event stream: the cluster's recent events, oldest first, then
+/// every member's new ones as they happen, each tagged with its node.
+///
+/// This node's feed subscribes before the backlog is read, so an event that
+/// lands in between arrives in both; it's dropped from the live half by its
+/// node, sequence and time. A member's events are relayed from its own
+/// `follow=true&local=true` feed, so a peer never fans out again.
+pub(super) async fn ws_events_session(mut socket: WebSocket, state: ApiState) {
+    let (events_tx, mut events_rx) = mpsc::channel::<crate::bun::events::ClusterEvent>(256);
+    let Some(local_feed) = spawn_local_event_relay(&state, events_tx.clone()).await else {
+        return;
     };
-    for event in recent {
-        let Ok(json) = serde_json::to_string(&event) else {
-            continue;
-        };
-        if socket.send(Message::Text(json.into())).await.is_err() {
-            return;
+    let backlog_query = EventsQuery {
+        limit: Some(LIVE_EVENTS_BACKLOG),
+        app: None,
+        severity: None,
+        local: false,
+        follow: false,
+    };
+    let backlog = cluster_recent_events(&state, &backlog_query, LIVE_EVENTS_BACKLOG)
+        .await
+        .events;
+    // Sequences are per process, so a member that restarts reuses them; the
+    // timestamp keeps its new events from passing as the backlog's.
+    let identity = |event: &crate::bun::events::ClusterEvent| {
+        (event.node.clone(), event.sequence, event.timestamp)
+    };
+    let sent: std::collections::HashSet<_> = backlog.iter().map(identity).collect();
+    let peers = tokio::spawn(relay_peer_events(state.clone(), events_tx));
+    let send = |event: &crate::bun::events::ClusterEvent| {
+        serde_json::to_string(event)
+            .ok()
+            .map(|json| Message::Text(json.into()))
+    };
+    'session: {
+        for event in &backlog {
+            if let Some(message) = send(event)
+                && socket.send(message).await.is_err()
+            {
+                break 'session;
+            }
         }
-    }
-    loop {
-        tokio::select! {
-            event = receiver.recv() => match event {
-                Ok(event) => {
-                    let Ok(json) = serde_json::to_string(&event) else { continue };
-                    if socket.send(Message::Text(json.into())).await.is_err() { return; }
+        loop {
+            tokio::select! {
+                event = events_rx.recv() => {
+                    let Some(event) = event else { break 'session };
+                    if sent.contains(&identity(&event)) {
+                        continue;
+                    }
+                    if let Some(message) = send(&event)
+                        && socket.send(message).await.is_err()
+                    {
+                        break 'session;
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            },
-            message = socket.recv() => if message.is_none() { return; },
+                message = socket.recv() => if message.is_none() { break 'session; },
+            }
         }
     }
+    local_feed.abort();
+    peers.abort();
 }
 
 /// Status for a specific app.

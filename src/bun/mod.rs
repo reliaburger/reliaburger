@@ -28,6 +28,7 @@ mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
+pub mod token_sweep;
 pub mod top;
 pub mod volume_maintenance;
 
