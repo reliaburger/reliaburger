@@ -34,8 +34,8 @@ pub struct Compatibility {
 /// epoch, leader hints order by epoch then term, and a Raft peer refuses a
 /// fenced RPC with a `Fenced` reply; and cluster-wide instance ordinals:
 /// each placement's `Placement::ordinal` in council state, the ordinals a
-/// placement poll hands a node (`NodeAssignment::ordinals`) and the instance
-/// ids named after them (#398).
+/// placement poll hands a node (`NodeAssignment::ordinals`) and the
+/// instance ids named after them (#398).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 33,
     state: 49,
