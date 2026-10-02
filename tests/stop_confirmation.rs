@@ -1,16 +1,10 @@
-use reliaburger::config::Replicas;
-use reliaburger::config::app::AppSpec;
-use reliaburger::council::types::{DesiredState, RaftRequest};
-use reliaburger::meat::cluster_state::{ClusterStateCache, SchedulerNodeState};
-use reliaburger::meat::quota::QuotaLedger;
+use reliaburger::config::{Replicas, app::AppSpec};
+use reliaburger::council::types::RaftRequest;
 use reliaburger::meat::types::{AppId, NodeId, Placement, Resources};
-use reliaburger::mustard::membership::MembershipSnapshot;
-use reliaburger::mustard::state::NodeState;
-use reliaburger::reporting::aggregator::AggregatedState;
-use reliaburger::reporting::types::*;
-use reliaburger::{bun, cluster, config, council, meat, mustard};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, Instant, SystemTime};
+use reliaburger::{bun, config, council, meat, mustard};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
     let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
     spec.replicas = Replicas::Fixed(replicas);
@@ -145,6 +139,7 @@ async fn stop_must_not_claim_cleanup_before_any_worker_has_seen_it() {
     eprintln!(
         "stop response={code} {body}; placements={scheduling:?}; command_dispatched={dispatched}"
     );
+    assert_eq!(code, reqwest::StatusCode::ACCEPTED);
     assert!(
         !body.contains("\"stopped\""),
         "the operation reports stopped while the only worker has received no stop instruction"
