@@ -4454,6 +4454,50 @@ async fn an_invalid_grep_pattern_is_a_bad_request() {
     }
 }
 
+/// `stream` is `stdout` or `stderr`; anything else is refused on both query
+/// routes, and following with a stream filter is refused too, since the
+/// raw tail can't honour it.
+#[tokio::test]
+async fn an_unknown_stream_or_a_followed_stream_filter_is_a_bad_request() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    let app = router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    for uri in [
+        "/v1/logs/entries/web/default?stream=stdin",
+        "/v1/logs/query/web/default?stream=stdin",
+        "/v1/logs/web/default?follow=true&stream=stderr",
+    ] {
+        let status = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
 /// The export endpoint ships the store's Parquet files to the requested
 /// destination under the node's name and persists the Bun-owned export
 /// checkpoint (X8), so a repeat export ships nothing new.

@@ -94,6 +94,8 @@ pub struct LogOptions {
     pub end: Option<u64>,
     /// Keep only this instance's lines (`default__web-0`).
     pub instance: Option<String>,
+    /// Keep only lines written to this stream.
+    pub stream: Option<crate::ketchup::types::LogStream>,
     /// Keep only lines that parse as JSON where `field == value`.
     pub json_field: Option<(String, String)>,
 }
@@ -153,6 +155,9 @@ impl LogOptions {
         }
         if let Some(ref i) = self.instance {
             params.push(("instance".to_string(), i.clone()));
+        }
+        if let Some(s) = self.stream {
+            params.push(("stream".to_string(), s.as_str().to_string()));
         }
         params
     }
@@ -1609,7 +1614,7 @@ impl BunClient {
         // The agent's own endpoint answers plain text with no instance or
         // time on each line, so it can't honour these filters: an empty
         // answer is the answer.
-        if options.instance.is_some() || options.end.is_some() {
+        if options.instance.is_some() || options.end.is_some() || options.stream.is_some() {
             return Ok(String::new());
         }
         // Fall back to the local agent endpoint (process logs that

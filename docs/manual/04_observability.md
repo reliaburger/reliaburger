@@ -14,6 +14,7 @@ relish logs web --tail 20 -f     # last 20 per replica, then follow
 relish logs web --grep error --since 1h
 relish logs web --grep 'GET /(healthz|ready)' --since 2h --until 1h
 relish logs web --instance default__web-2      # one replica
+relish logs web --stream stderr                # only what it wrote to stderr
 relish logs web --json-field level=warn
 ```
 
@@ -21,7 +22,8 @@ relish logs web --json-field level=warn
 for your shell. A pattern that won't compile is refused before anything is
 asked. `--since` and `--until` take epoch seconds or a duration before now
 (`30s`, `5m`, `2h`, `1d`); `--until` can't be combined with `-f`, since a
-followed stream has no end. `--instance` takes an id as `relish status`
+followed stream has no end. `--stream` takes `stdout` or `stderr` and,
+for now, isn't offered with `-f` either. `--instance` takes an id as `relish status`
 shows it, and works with `-f` too. With `-f` on a cluster, each line arrives
 as `[node instance] line`, and `--grep` sees that prefix, so anchor a
 pattern with `$` rather than `^`.

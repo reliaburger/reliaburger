@@ -190,6 +190,7 @@ pub async fn fan_out_query(
         let namespace = query.namespace.clone();
         let grep = query.grep.clone();
         let instance = query.instance.clone();
+        let stream = query.stream;
         let token = service_token.map(str::to_string);
         let tail = query.tail;
         let start = query.start;
@@ -219,6 +220,9 @@ pub async fn fan_out_query(
                 }
                 if let Some(ref i) = instance {
                     params.push(("instance", i.clone()));
+                }
+                if let Some(s) = stream {
+                    params.push(("stream", s.as_str().to_string()));
                 }
                 if let Some(s) = start {
                     params.push(("start", s.to_string()));
@@ -702,6 +706,7 @@ mod tests {
         let query = LogQuery {
             instance: Some("default__web-2".into()),
             end: Some(1_700_000_000),
+            stream: Some(crate::ketchup::types::LogStream::Stderr),
             ..log_query(None)
         };
 
@@ -715,6 +720,7 @@ mod tests {
             Some("default__web-2")
         );
         assert_eq!(params.get("end").map(String::as_str), Some("1700000000"));
+        assert_eq!(params.get("stream").map(String::as_str), Some("stderr"));
     }
 
     /// An unreachable node is reported as a partial failure, not folded into

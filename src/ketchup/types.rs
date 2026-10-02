@@ -9,6 +9,26 @@ pub enum LogStream {
     Stderr,
 }
 
+impl LogStream {
+    /// The name the store's `stream` column holds, and that query
+    /// parameters and `relish logs --stream` use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogStream::Stdout => "stdout",
+            LogStream::Stderr => "stderr",
+        }
+    }
+
+    /// The stream called `name`, or `None` for anything else.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "stdout" => Some(LogStream::Stdout),
+            "stderr" => Some(LogStream::Stderr),
+            _ => None,
+        }
+    }
+}
+
 /// Where a captured line ended in the runtime's capture file.
 ///
 /// Capture files are append-only for as long as they exist, so the byte
@@ -105,6 +125,8 @@ pub struct LogQuery {
     pub grep: Option<String>,
     /// Only this instance's lines.
     pub instance: Option<String>,
+    /// Only lines written to this stream.
+    pub stream: Option<LogStream>,
     /// JSON field filter (key=value).
     pub json_field: Option<(String, String)>,
     /// Return only the last N lines.

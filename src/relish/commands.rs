@@ -159,6 +159,8 @@ pub struct LogFlags {
     pub since: Option<String>,
     pub until: Option<String>,
     pub instance: Option<String>,
+    /// `stdout` or `stderr`.
+    pub stream: Option<String>,
     pub json_field: Option<String>,
 }
 
@@ -196,6 +198,25 @@ fn build_log_options(
                 .to_string(),
         });
     }
+    let stream = match flags.stream.as_deref() {
+        None => None,
+        Some(name) => Some(
+            crate::ketchup::types::LogStream::parse(name).ok_or_else(|| {
+                RelishError::InvalidFlag {
+                    flag: "stream".to_string(),
+                    reason: format!("{name:?} — use stdout or stderr"),
+                }
+            })?,
+        ),
+    };
+    if stream.is_some() && flags.follow {
+        return Err(RelishError::InvalidFlag {
+            flag: "stream".to_string(),
+            reason: "can't be combined with --follow yet: a followed tail doesn't say which \
+                     stream each line came from"
+                .to_string(),
+        });
+    }
     if let Some(grep) = &flags.grep {
         crate::ketchup::log_store::validate_grep(grep).map_err(|error| {
             RelishError::InvalidFlag {
@@ -215,6 +236,7 @@ fn build_log_options(
         start,
         end,
         instance: flags.instance,
+        stream,
         json_field,
     })
 }
@@ -2862,6 +2884,32 @@ spec:
             options.json_field,
             Some(("level".to_string(), "warn".to_string()))
         );
+    }
+
+    /// F07 part 2: `--stream` names stdout or stderr, and isn't offered
+    /// with `-f` yet.
+    #[test]
+    fn stream_takes_stdout_or_stderr_and_not_with_follow() {
+        let flags = LogFlags {
+            stream: Some("stderr".to_string()),
+            ..LogFlags::default()
+        };
+        let options = build_log_options(flags, 1_750_000_000).unwrap();
+        assert_eq!(
+            options.stream,
+            Some(crate::ketchup::types::LogStream::Stderr)
+        );
+        let unknown = LogFlags {
+            stream: Some("stdin".to_string()),
+            ..LogFlags::default()
+        };
+        assert!(build_log_options(unknown, 1_750_000_000).is_err());
+        let following = LogFlags {
+            stream: Some("stderr".to_string()),
+            follow: true,
+            ..LogFlags::default()
+        };
+        assert!(build_log_options(following, 1_750_000_000).is_err());
     }
 
     /// F07 part 2: `--grep` is a regular expression, checked before any
