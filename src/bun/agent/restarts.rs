@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::launch_evidence::{LaunchEvidence, retains_network};
+use super::launch_evidence::{EgressResolution, EgressResolver, LaunchEvidence, retains_network};
 use super::*;
 use super::{BunAgent, BunError, ContainerState, Grill, InstanceId, kill_runtime_instance};
 use crate::grill::oci::OciSpec;
@@ -141,9 +141,11 @@ pub(super) enum StepResult {
     /// The runtime did it.
     Done,
     /// The runtime created the replacement. One that publishes an address
-    /// had its network reference retained too, or the retain failed.
+    /// had its network reference retained too, or the retain failed, and
+    /// its egress allowlist was resolved for the loop to program (#419).
     Created {
         retained: Result<Option<NetworkReference>, BunError>,
+        egress: Box<EgressResolution>,
     },
     /// The runtime started the replacement, and said what it started.
     Started(Box<LaunchEvidence>),
@@ -159,13 +161,22 @@ pub(super) type Restarts = std::collections::HashMap<InstanceId, RestartInFlight
 /// The outcome of one step task, as `JoinSet::join_next_with_id` yields it.
 pub(super) type RestartStepOutcome = Result<(tokio::task::Id, StepResult), tokio::task::JoinError>;
 
+/// What the Create step needs to recreate an instance and prepare its start.
+struct CreateInput {
+    /// The stored runtime specification to create it from.
+    oci_spec: OciSpec,
+    /// The app's deployed spec: whether it holds an address, and the egress
+    /// allowlist the loop will program before the start.
+    app_spec: Option<AppSpec>,
+    egress: EgressResolver,
+}
+
 /// Run one step against the runtime, unless the restart was cancelled.
 async fn run_step<G: Grill>(
     grill: G,
     id: InstanceId,
     step: RestartStep,
-    oci_spec: Option<OciSpec>,
-    retains_network: bool,
+    create: Option<CreateInput>,
     gate: RestartGate,
     confirmation_timeout: Duration,
 ) -> StepResult {
@@ -177,10 +188,10 @@ async fn run_step<G: Grill>(
         RestartStep::Cleanup | RestartStep::Clear => {
             kill_runtime_instance(&grill, &id, confirmation_timeout).await
         }
-        RestartStep::Create => match oci_spec {
-            Some(spec) => match grill.create(&id, &spec).await {
+        RestartStep::Create => match create {
+            Some(create) => match grill.create(&id, &create.oci_spec).await {
                 Ok(()) => {
-                    let retained = if retains_network {
+                    let retained = if retains_network(create.app_spec.as_ref()) {
                         grill
                             .retain_network_reference(&id)
                             .await
@@ -188,7 +199,11 @@ async fn run_step<G: Grill>(
                     } else {
                         Ok(None)
                     };
-                    return StepResult::Created { retained };
+                    let egress = create.egress.resolve(create.app_spec.as_ref()).await;
+                    return StepResult::Created {
+                        retained,
+                        egress: Box::new(egress),
+                    };
                 }
                 Err(error) => Err(error.into()),
             },
@@ -221,25 +236,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         launch: Option<RestartLaunch>,
         gate: RestartGate,
     ) {
-        let oci_spec = match step {
-            RestartStep::Create => launch.as_ref().map(|launch| launch.oci_spec.clone()),
+        let create = match (step, launch.as_ref()) {
+            (RestartStep::Create, Some(launch)) => Some(CreateInput {
+                oci_spec: launch.oci_spec.clone(),
+                app_spec: self
+                    .deployed_specs
+                    .get(&(launch.app_name.clone(), launch.namespace.clone()))
+                    .cloned(),
+                egress: self.egress_resolver(),
+            }),
             _ => None,
         };
-        let retains_network = step == RestartStep::Create
-            && launch.as_ref().is_some_and(|launch| {
-                retains_network(
-                    self.deployed_specs
-                        .get(&(launch.app_name.clone(), launch.namespace.clone())),
-                )
-            });
         let task = self
             .restart_steps
             .spawn(run_step(
                 self.supervisor.grill().clone(),
                 id.clone(),
                 step,
-                oci_spec,
-                retains_network,
+                create,
                 gate.clone(),
                 self.stop_confirmation_timeout,
             ))
@@ -350,8 +364,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             (RestartStep::Clear, StepResult::Failed(error), _) => {
                 eprintln!("bun: restart of {id} awaits runtime cleanup: {error}");
             }
-            (RestartStep::Create, StepResult::Created { retained }, Some(launch)) => {
-                self.restart_after_create(id, launch, gate, retained).await;
+            (RestartStep::Create, StepResult::Created { retained, egress }, Some(launch)) => {
+                self.restart_after_create(id, launch, gate, retained, *egress)
+                    .await;
             }
             (RestartStep::Start, StepResult::Started(evidence), Some(launch)) => {
                 self.restart_after_start(&id, &launch, &evidence).await;
@@ -455,6 +470,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         launch: RestartLaunch,
         gate: RestartGate,
         retained: Result<Option<NetworkReference>, BunError>,
+        egress: EgressResolution,
     ) {
         if self
             .supervisor
@@ -494,6 +510,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     restart_spec.as_ref(),
                     &cgroup_path,
                     retained,
+                    egress,
                 )
                 .await
             }
@@ -540,6 +557,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .get_instance(id)
             .is_none_or(|instance| instance.state != ContainerState::Starting)
         {
+            return;
+        }
+        if let Err(error) = self.record_launch_execution(id, &evidence.execution) {
+            self.record_failed_restart(id, &error.to_string()).await;
             return;
         }
         self.spawn_log_forwarder(id, &launch.app_name, &launch.namespace);

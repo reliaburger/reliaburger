@@ -597,6 +597,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.supervisor
                 .instances
                 .insert(instance_id.clone(), instance);
+            // Startup read the inventory once, for every adopted launch;
+            // publication takes the execution from here (#419).
+            if let Some(launches) = &launch_inventory {
+                self.record_launch_execution(
+                    &instance_id,
+                    &super::launch_evidence::LaunchExecution::of(launches, &instance_id),
+                )?;
+            }
             self.supervisor
                 .app_instances
                 .entry(key.clone())
