@@ -229,6 +229,67 @@ pub fn connections_to_cut(
         .collect()
 }
 
+/// Connection cuts that were still running when their turn's deadline came.
+///
+/// A fault must not report itself applied while a pooled client can still
+/// ride one of these connections, so whoever answers for the fault finishes
+/// them first ([`LateCuts::finish`]), off the agent loop.
+#[derive(Debug, Default)]
+pub struct LateCuts(Vec<ConnectionCut>);
+
+impl LateCuts {
+    /// Whether every cut finished in time.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The caller instances whose cuts are still to run.
+    pub fn instances(&self) -> Vec<&str> {
+        self.0.iter().map(|cut| cut.instance_id.as_str()).collect()
+    }
+
+    /// Add another turn's late cuts to these.
+    pub fn extend(&mut self, other: LateCuts) {
+        self.0.extend(other.0);
+    }
+
+    /// Run every remaining cut to the end, all at once.
+    pub async fn finish<F, Fut>(self, cut: F)
+    where
+        F: Fn(&ConnectionCut) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        futures_util::future::join_all(self.0.iter().map(cut)).await;
+    }
+}
+
+/// Run every cut at once until `deadline`, and hand back the ones that
+/// hadn't finished. A cut that ran out of time is dropped mid-way and runs
+/// again from the start in [`LateCuts::finish`]; destroying sockets that are
+/// already gone is a no-op, so running a cut twice is harmless.
+pub async fn cut_until<F, Fut>(
+    cuts: Vec<ConnectionCut>,
+    deadline: tokio::time::Instant,
+    cut: F,
+) -> LateCuts
+where
+    F: Fn(&ConnectionCut) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // `timeout_at` polls the cut before its clock, so one that finishes
+    // right at the deadline still counts as done.
+    let attempts = cuts
+        .iter()
+        .map(|one| tokio::time::timeout_at(deadline, cut(one)));
+    let outcomes = futures_util::future::join_all(attempts).await;
+    LateCuts(
+        cuts.into_iter()
+            .zip(outcomes)
+            .filter_map(|(one, outcome)| outcome.is_err().then_some(one))
+            .collect(),
+    )
+}
+
 /// `ss` arguments that destroy every established TCP connection to one of
 /// `backends` (`ss -K` needs a kernel built with `CONFIG_INET_DIAG_DESTROY`).
 pub fn socket_destroy_args(backends: &[SocketAddrV4]) -> Vec<String> {
@@ -713,6 +774,47 @@ mod tests {
             }]
         );
         assert!(connections_to_cut(&[key(11)], &callers, |_, _| Vec::new()).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_that_outlasts_its_deadline_comes_back_to_finish() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let cut = |id: &str| ConnectionCut {
+            instance_id: id.to_string(),
+            backends: vec![address("10.1.0.5:6379")],
+        };
+        let finished = Rc::new(RefCell::new(Vec::new()));
+        let run = |one: &ConnectionCut| {
+            let id = one.instance_id.clone();
+            let finished = Rc::clone(&finished);
+            let takes = if id.ends_with("slow") {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(10)
+            };
+            async move {
+                tokio::time::sleep(takes).await;
+                finished.borrow_mut().push(id);
+            }
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let late = cut_until(
+            vec![cut("default/frontend-quick"), cut("default/frontend-slow")],
+            deadline,
+            run,
+        )
+        .await;
+        assert_eq!(*finished.borrow(), ["default/frontend-quick"]);
+        assert_eq!(late.instances(), ["default/frontend-slow"]);
+
+        late.finish(run).await;
+        assert_eq!(
+            *finished.borrow(),
+            ["default/frontend-quick", "default/frontend-slow"]
+        );
     }
 
     #[test]
