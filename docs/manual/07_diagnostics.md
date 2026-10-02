@@ -47,6 +47,15 @@ the nodes that answered run and names the one that didn't. If the nodes that
 answered disagree, the `version-skew` warning carries the silent node in its
 details.
 
+`wtf` also asks every node for its own view of the council, because a split
+brain looks healthy from either half. It reports CRITICAL when a node is
+fenced out of a council `relish council recover` replaced, when nodes serve
+different recovery epochs, or when more than one node is named leader. Each
+finding names the nodes and the way back (`relish council re-enrol`, see
+`operations`). A voter that doesn't answer is a warning while quorum holds,
+naming the missing voter, and CRITICAL once quorum is gone. `relish council
+status` shows the same comparison as a table.
+
 `relish inspect <app>` uses the same relay to list every instance of an app on
 every node, with the node it runs on, under a `desired` vs `running` replica
 count. A node that doesn't answer, or that gossip already considers dead, gets

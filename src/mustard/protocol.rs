@@ -139,6 +139,9 @@ pub struct MustardNode<T: MustardTransport> {
     /// outgoing extension so the leader learns this voter should resign.
     /// `None` until wired — then the bit is always `false`.
     disk_pressured_rx: Option<watch::Receiver<bool>>,
+    /// This node's recovery fence (#424), whose claimed epoch every outgoing
+    /// extension advertises. `None` until wired: then no epoch is claimed.
+    recovery_fence_rx: Option<watch::Receiver<crate::council::fence::FenceSnapshot>>,
     /// Live council voter set and leader by name, published by the cluster
     /// runtime from Raft metrics. Applied to the membership table each publish
     /// cycle so `is_council`/`is_leader` are correct. `None` on a single-node
@@ -200,6 +203,7 @@ impl<T: MustardTransport> MustardNode<T> {
             advertised_labels: BTreeMap::new(),
             leader_hint_rx: None,
             disk_pressured_rx: None,
+            recovery_fence_rx: None,
             council_roles_rx: None,
             directory: NodeDirectory::default(),
             directory_watch: None,
@@ -266,6 +270,16 @@ impl<T: MustardTransport> MustardNode<T> {
         self.disk_pressured_rx = Some(rx);
     }
 
+    /// Wire this node's recovery fence (#424): every outgoing extension then
+    /// advertises the epoch it claims, so restarted voters can tell whether a
+    /// recovery replaced their council before they serve Raft.
+    pub fn set_recovery_fence_watch(
+        &mut self,
+        rx: watch::Receiver<crate::council::fence::FenceSnapshot>,
+    ) {
+        self.recovery_fence_rx = Some(rx);
+    }
+
     /// Wire the live council roles (voter set + leader by name) the cluster
     /// runtime derives from Raft metrics. Applied to the membership table on
     /// each publish so `is_council`/`is_leader` reflect reality. Without a
@@ -300,9 +314,19 @@ impl<T: MustardTransport> MustardNode<T> {
             .and_then(|rx| rx.borrow().clone());
         let relayed = self.directory.leader.clone();
         let leader = match (own, relayed) {
-            (Some(a), Some(b)) => Some(if a.term >= b.term { a } else { b }),
+            (Some(a), Some(b)) => Some(
+                if (a.recovery_epoch, a.term) >= (b.recovery_epoch, b.term) {
+                    a
+                } else {
+                    b
+                },
+            ),
             (a, b) => a.or(b),
         };
+        let recovery_epoch = self
+            .recovery_fence_rx
+            .as_ref()
+            .and_then(|rx| rx.borrow().claimed_epoch());
         let disk_pressured = self
             .disk_pressured_rx
             .as_ref()
@@ -315,6 +339,7 @@ impl<T: MustardTransport> MustardNode<T> {
             leader,
             labels: super::message::bounded_labels(&self.advertised_labels),
             disk_pressured,
+            recovery_epoch,
             hmac: [0u8; 32],
         })
     }
@@ -2293,6 +2318,7 @@ mod tests {
         let hint = LeaderHint {
             node_id: NodeId::new("n1"),
             term: 4,
+            recovery_epoch: 0,
             api_address: addr(9117),
             reporting_address: addr(9445),
         };
@@ -2335,12 +2361,14 @@ mod tests {
         let old = LeaderHint {
             node_id: NodeId::new("old-leader"),
             term: 3,
+            recovery_epoch: 0,
             api_address: addr(9117),
             reporting_address: addr(9445),
         };
         let new = LeaderHint {
             node_id: NodeId::new("new-leader"),
             term: 4,
+            recovery_epoch: 0,
             api_address: addr(9217),
             reporting_address: addr(9545),
         };
@@ -2352,6 +2380,7 @@ mod tests {
             leader: Some(hint.clone()),
             labels: BTreeMap::new(),
             disk_pressured: false,
+            recovery_epoch: None,
             hmac: [0u8; 32],
         };
 
@@ -2408,6 +2437,7 @@ mod tests {
             leader: None,
             labels: BTreeMap::new(),
             disk_pressured: false,
+            recovery_epoch: None,
             hmac: [0u8; 32],
         });
         node.handle_message(addr(2), msg).await;

@@ -130,6 +130,19 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
 
     match output {
         OutputFormat::Human => {
+            // One line of council health first: a split or fenced council
+            // must not hide behind a healthy-looking instance list (#424).
+            // A node list that can't be read just drops the header.
+            if let Ok(nodes) = client.nodes().await
+                && !nodes.is_empty()
+            {
+                let observations = crate::relish::council_view::survey_nodes(client, &nodes).await;
+                let summary = crate::relish::council_view::summarise(&observations);
+                print!(
+                    "{}",
+                    crate::relish::council_view::render_status_header(&summary)
+                );
+            }
             // The council knows why an app isn't placed. That is extra
             // detail: an agent that can't say still shows its instances.
             let desired = client.desired_apps().await.unwrap_or_default();
@@ -845,23 +858,54 @@ pub async fn council(output: OutputFormat) -> Result<(), RelishError> {
 }
 
 async fn council_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
-    let council = client.council().await?;
+    use crate::relish::council_view;
 
+    let nodes = client.nodes().await?;
+    if nodes.is_empty() {
+        // Standalone: one node, no relay, and no council to compare.
+        let council = client.council().await?;
+        return print_standalone_council(output, &council);
+    }
+    let observations = council_view::survey_nodes(client, &nodes).await;
+    let summary = council_view::summarise(&observations);
+    let report = council_view::CouncilReport {
+        summary: &summary,
+        nodes: &observations,
+    };
     match output {
         OutputFormat::Human => {
-            print_council_human(&council);
+            print!(
+                "{}",
+                council_view::render_council_status(&observations, &summary)
+            );
         }
         OutputFormat::Json => {
-            let json =
-                serde_json::to_string_pretty(&council).map_err(RelishError::SerialiseJson)?;
+            let json = serde_json::to_string_pretty(&report).map_err(RelishError::SerialiseJson)?;
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&council).map_err(RelishError::SerialiseYaml)?;
+            let yaml = serde_yaml::to_string(&report).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
+    Ok(())
+}
 
+fn print_standalone_council(
+    output: OutputFormat,
+    council: &CouncilStatus,
+) -> Result<(), RelishError> {
+    match output {
+        OutputFormat::Human => print_council_human(council),
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(council).map_err(RelishError::SerialiseJson)?;
+            println!("{json}");
+        }
+        OutputFormat::Yaml => {
+            let yaml = serde_yaml::to_string(council).map_err(RelishError::SerialiseYaml)?;
+            print!("{yaml}");
+        }
+    }
     Ok(())
 }
 
@@ -933,6 +977,30 @@ pub async fn council_recover(
     println!();
     println!("Start this node to re-bootstrap a single-voter council; the reconciler");
     println!("will regrow it from surviving members. Writes after the last backup are lost.");
+    println!();
+    println!("The voters this council replaces still hold the old one. If they come back where");
+    println!("they can see this node, they fence themselves; if they can see each other but not");
+    println!("this node, nothing can tell them. Re-enrol each one before starting it:");
+    println!("  relish council re-enrol --data-dir <its data directory>");
+    Ok(())
+}
+
+/// Re-enrol a voter fenced out by `council recover` (#424): offline, against
+/// a stopped node.
+pub fn council_reenrol(data_dir: &std::path::Path, force: bool) -> Result<(), RelishError> {
+    let fenced_by = crate::council::recovery::reenrol_data_dir(data_dir, force)
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    match fenced_by {
+        Some(epoch) => {
+            println!("Removed the Raft state of a council replaced at recovery epoch {epoch}.")
+        }
+        None => println!("Removed this node's Raft state."),
+    }
+    println!("  Data directory:  {}", data_dir.display());
+    println!();
+    println!("Start the node with `cluster.join` pointing at the current council. It joins as");
+    println!("a fresh member, adopts the council's recovery epoch, and the reconciler may");
+    println!("promote it to voter.");
     Ok(())
 }
 

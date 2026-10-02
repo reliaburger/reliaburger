@@ -457,6 +457,7 @@ mod tests {
                 api_address: address,
                 reporting_address: address,
                 term: 1,
+                recovery_epoch: 0,
             }),
             ..Default::default()
         }

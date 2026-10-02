@@ -119,6 +119,7 @@ fn directory_naming(
         leader: Some(mustard::message::LeaderHint {
             node_id: NodeId::new("leader"),
             term: 1,
+            recovery_epoch: 0,
             api_address: leader_address,
             reporting_address: leader_address,
         }),

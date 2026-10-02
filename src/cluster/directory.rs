@@ -184,6 +184,7 @@ mod tests {
         LeaderHint {
             node_id: NodeId::new(name),
             term,
+            recovery_epoch: 0,
             api_address: addr(api),
             reporting_address: addr(reporting),
         }
