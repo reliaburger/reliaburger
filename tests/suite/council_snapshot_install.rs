@@ -56,6 +56,24 @@ async fn write(node: &CouncilNode, key: &str) {
     .unwrap();
 }
 
+/// The leader's applied log id once its metrics have caught up with its
+/// log. A write returns when the entry is applied, but the metrics watch is
+/// published a moment later, so reading it straight after a write can still
+/// see the previous position (or none at all).
+async fn settled_applied(node: &CouncilNode) -> openraft::LogId<u64> {
+    let mut metrics = node.metrics();
+    let settled = tokio::time::timeout(
+        Duration::from_secs(10),
+        metrics.wait_for(|m| {
+            m.last_log_index.is_some() && m.last_applied.map(|l| l.index) == m.last_log_index
+        }),
+    )
+    .await
+    .expect("the leader's metrics never caught up with its log")
+    .unwrap();
+    settled.last_applied.unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
     let router = InMemoryRaftRouter::new();
@@ -75,7 +93,7 @@ async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
 
     // Compact: snapshot after "before", then purge the log it covers.
     write(&leader, "before").await;
-    let snapshot_index = leader.metrics().borrow().last_applied.unwrap().index;
+    let snapshot_index = settled_applied(&leader).await.index;
     leader.raft().trigger().snapshot().await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -109,7 +127,7 @@ async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
         .await
         .expect("adding the learner timed out")
         .unwrap();
-    let leader_applied = leader.metrics().borrow().last_applied;
+    let leader_applied = Some(settled_applied(&leader).await);
     let mut learner_metrics = learner.metrics();
     tokio::time::timeout(
         Duration::from_secs(10),
