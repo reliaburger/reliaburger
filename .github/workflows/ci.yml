@@ -54,8 +54,8 @@ jobs:
         run: cargo nextest run --profile ci --features ebpf --no-run
       - name: Loop the rootless adoption test (#456)
         env:
-          FILTER: test(rootless_pid_answers_while_state_reads_hold_the_instance)
-          LOOPS: 3
+          FILTER: test(rootless_pid_answers_while_state_reads_hold_the_instance) | test(normal_rootless_bun)
+          LOOPS: 30
         run: |
           pass=0; fail=0
           for i in $(seq 1 ${LOOPS}); do
