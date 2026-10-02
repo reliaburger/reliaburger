@@ -188,6 +188,36 @@ impl DurableLogStore {
         self.last_purged()
     }
 
+    /// Bind this log to one recovery epoch before it can vote or replicate.
+    /// An existing log cannot be re-enrolled into a different term line.
+    pub fn bind_recovery_epoch(
+        &self,
+        snapshot_epoch: u64,
+        enrolled_epoch: u64,
+        pristine_snapshot: bool,
+    ) -> Result<u64, StorageError<u64>> {
+        let requested = snapshot_epoch.max(enrolled_epoch);
+        if let Some(bytes) = self.get_meta("recovery_epoch")? {
+            let epoch: u64 = bincode::deserialize(&bytes).map_err(read_err)?;
+            if requested > epoch || (!pristine_snapshot && snapshot_epoch != epoch) {
+                return Err(read_err(std::io::Error::other(
+                    "identity/snapshot epoch conflicts with existing Raft log; offline recovery is required",
+                )));
+            }
+            return Ok(epoch);
+        }
+        if enrolled_epoch > snapshot_epoch && (!self.is_fresh()? || !pristine_snapshot) {
+            return Err(read_err(std::io::Error::other(
+                "cannot enrol an existing Raft store into a newer recovery epoch",
+            )));
+        }
+        self.put_meta(
+            "recovery_epoch",
+            &bincode::serialize(&requested).map_err(write_err)?,
+        )?;
+        Ok(requested)
+    }
+
     // -- redb helpers ------------------------------------------------------
 
     fn put_meta(&self, key: &str, value: &[u8]) -> Result<(), StorageError<u64>> {
@@ -667,5 +697,21 @@ mod tests {
         let mut store = DurableLogStore::open(&path).unwrap();
         let mut reader = store.get_log_reader().await;
         assert!(reader.try_get_log_entries(1..2).await.is_err());
+    }
+    #[test]
+    fn audit_enrolment_epoch_is_durable_and_cannot_rebind_an_old_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.redb");
+        let store = DurableLogStore::open(&path).unwrap();
+        assert_eq!(store.bind_recovery_epoch(0, 1, true).unwrap(), 1);
+        drop(store);
+        let store = DurableLogStore::open(&path).unwrap();
+        assert_eq!(store.bind_recovery_epoch(0, 1, true).unwrap(), 1);
+        assert!(store.bind_recovery_epoch(0, 2, true).is_err());
+        drop(store);
+        let old = DurableLogStore::open(dir.path().join("old.redb")).unwrap();
+        assert!(old.bind_recovery_epoch(0, 1, false).is_err());
+        assert_eq!(old.bind_recovery_epoch(0, 0, true).unwrap(), 0);
+        assert!(old.bind_recovery_epoch(0, 1, true).is_err());
     }
 }

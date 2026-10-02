@@ -1010,6 +1010,7 @@ fn node_identity(
     )
     .unwrap();
     reliaburger::sesame::identity_store::NodeIdentity {
+        recovery_epoch: 0,
         node_id: node.into(),
         certificate_der,
         private_key_der,

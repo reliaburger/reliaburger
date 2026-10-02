@@ -54,6 +54,7 @@ impl TlsSetup {
         .unwrap();
         let now = SystemTime::now();
         NodeIdentity {
+            recovery_epoch: 0,
             node_id: node_id.to_string(),
             certificate_der: cert_der,
             private_key_der: key_der,

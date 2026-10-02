@@ -451,6 +451,7 @@ fn identity_from(
     private_key_der: Vec<u8>,
 ) -> reliaburger::sesame::identity_store::NodeIdentity {
     reliaburger::sesame::identity_store::NodeIdentity {
+        recovery_epoch: 0,
         node_id: "node".into(),
         certificate_der,
         private_key_der,

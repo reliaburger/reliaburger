@@ -163,6 +163,7 @@ fn issued_node_identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> 
     .unwrap();
     let now = SystemTime::now();
     NodeIdentity {
+        recovery_epoch: 0,
         node_id: node_id.to_string(),
         certificate_der,
         private_key_der,

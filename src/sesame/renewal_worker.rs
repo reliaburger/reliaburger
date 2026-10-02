@@ -264,9 +264,12 @@ impl NodeRenewalWorker {
         }
         let bundle: super::join::JoinBundle = serde_json::from_slice(&body)
             .map_err(|error| format!("invalid renewal response: {error}"))?;
-        let replacement = bundle
+        let mut replacement = bundle
             .into_identity(key)
             .map_err(|error| error.to_string())?;
+        // Renewal rotates credentials, never enrols an old Raft store into
+        // a new term line. Keep the epoch established by the original join.
+        replacement.recovery_epoch = self.identity.snapshot().recovery_epoch;
         self.identity
             .replace(replacement)
             .await

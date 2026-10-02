@@ -76,7 +76,8 @@ impl LiveNodeIdentity {
             let _guard = guard;
             let replacement = ValidatedIdentity::new(identity)?;
             let previous = current.borrow().clone();
-            if replacement.identity.node_id != previous.identity.node_id
+            if replacement.identity.recovery_epoch != previous.identity.recovery_epoch
+                || replacement.identity.node_id != previous.identity.node_id
                 || replacement.identity.node_ca_der != previous.identity.node_ca_der
                 || replacement.identity.root_ca_der != previous.identity.root_ca_der
                 || replacement.identity.ca_generation != previous.identity.ca_generation
@@ -146,6 +147,7 @@ mod tests {
             )
             .unwrap();
             NodeIdentity {
+                recovery_epoch: 0,
                 node_id: "node".into(),
                 certificate_der,
                 private_key_der,

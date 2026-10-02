@@ -84,7 +84,9 @@ async fn issue_join_bundle(
     )
     .map_err(|e| security_error(format!("join signing failed: {e}")))?;
 
-    Ok(crate::sesame::join::JoinBundle::from_result(&join_result))
+    let mut bundle = crate::sesame::join::JoinBundle::from_result(&join_result);
+    bundle.recovery_epoch = council.desired_state().await.recovery_epoch;
+    Ok(bundle)
 }
 
 /// Verify an operator's detached signature and attach it to the manifest

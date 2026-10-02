@@ -43,6 +43,8 @@ pub enum IdentityStoreError {
 /// certificates a peer verifier needs.
 #[derive(Debug, Clone)]
 pub struct NodeIdentity {
+    /// Recovery epoch authenticated by the enrolment ceremony.
+    pub recovery_epoch: u64,
     /// The node's unique identifier (the certificate's CN).
     pub node_id: String,
     /// DER-encoded node certificate, signed by the Node CA.
@@ -66,6 +68,8 @@ pub struct NodeIdentity {
 /// Sidecar metadata persisted beside the PEM files.
 #[derive(Debug, Serialize, Deserialize)]
 struct IdentityMeta {
+    #[serde(default)]
+    recovery_epoch: u64,
     node_id: String,
     serial: SerialNumber,
     ca_generation: u64,
@@ -92,6 +96,7 @@ impl IdentityBundle {
         Self {
             schema: 2,
             meta: IdentityMeta {
+                recovery_epoch: identity.recovery_epoch,
                 node_id: identity.node_id.clone(),
                 serial: identity.serial,
                 ca_generation: identity.ca_generation,
@@ -110,6 +115,7 @@ impl IdentityBundle {
             return Err(inconsistent("unsupported identity snapshot schema"));
         }
         validate_identity(NodeIdentity {
+            recovery_epoch: self.meta.recovery_epoch,
             node_id: self.meta.node_id,
             serial: self.meta.serial,
             ca_generation: self.meta.ca_generation,
@@ -182,6 +188,7 @@ pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreErro
     let root_ca_pem = cert::der_to_pem(&identity.root_ca_der, "CERTIFICATE");
 
     let meta = IdentityMeta {
+        recovery_epoch: identity.recovery_epoch,
         node_id: identity.node_id.clone(),
         serial: identity.serial,
         ca_generation: identity.ca_generation,
@@ -373,6 +380,7 @@ mod tests {
         .unwrap();
         let now = SystemTime::now();
         NodeIdentity {
+            recovery_epoch: 0,
             node_id: "node-01".to_string(),
             certificate_der: cert_der,
             private_key_der: key_der,

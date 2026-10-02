@@ -345,7 +345,18 @@ pub async fn start(
     // offline operation, so it is constant for the process). Stamped on Raft
     // RPCs and enforced by the accept side to fence a recovered survivor off
     // from the dead cluster's peers (C5).
-    let recovery_epoch = state_machine.desired_state().await.recovery_epoch;
+    let recovery_epoch = log_store
+        .bind_recovery_epoch(
+            state_machine.desired_state().await.recovery_epoch,
+            params
+                .identity
+                .as_ref()
+                .map_or(0, |identity| identity.snapshot().recovery_epoch),
+            state_machine.has_no_snapshot().await,
+        )
+        .map_err(|e| std::io::Error::other(format!("Raft recovery epoch: {e}")))?;
+    let enrolled_without_snapshot = recovery_epoch > 0 && state_machine.has_no_snapshot().await;
+    state_machine.seed_enrolled_epoch(recovery_epoch).await;
     let factory = match raft_tls_material {
         Some(material) => TcpRaftNetworkFactory::new_tls_bound(raft_id, material),
         None => TcpRaftNetworkFactory::new(raft_id),
@@ -437,7 +448,7 @@ pub async fn start(
     // existing cluster from durable state instead of re-initialising into a
     // fresh single-node cluster (which would elect itself a second leader —
     // the split-brain bug this stage fixes).
-    if params.seeds.is_empty() && store_fresh {
+    if params.seeds.is_empty() && store_fresh && !enrolled_without_snapshot {
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
         initialise_bootstrap(

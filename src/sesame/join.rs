@@ -98,6 +98,9 @@ pub struct JoinRequest {
 /// its identity from this bundle and the private key it kept locally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinBundle {
+    /// Council epoch authenticated by this pinned-TLS enrolment response.
+    #[serde(default)]
+    pub recovery_epoch: u64,
     /// Required cluster protocol and state generations.
     pub compatibility: crate::compatibility::Compatibility,
     /// The node id the certificate was issued for.
@@ -136,6 +139,7 @@ impl JoinBundle {
     /// Build a wire bundle from an issuer-side [`JoinResult`].
     pub fn from_result(result: &JoinResult) -> Self {
         Self {
+            recovery_epoch: 0,
             compatibility: crate::compatibility::CURRENT,
             node_id: result.node_id.clone(),
             serial: result.serial.0,
@@ -168,6 +172,7 @@ impl JoinBundle {
 
         let now = SystemTime::now();
         Ok(NodeIdentity {
+            recovery_epoch: self.recovery_epoch,
             node_id: self.node_id,
             certificate_der,
             private_key_der,

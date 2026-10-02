@@ -17,6 +17,7 @@ fn identity(hierarchy: &ca::CaHierarchy, node: &str, serial: u64) -> NodeIdentit
     )
     .unwrap();
     NodeIdentity {
+        recovery_epoch: 0,
         node_id: node.into(),
         certificate_der,
         private_key_der,

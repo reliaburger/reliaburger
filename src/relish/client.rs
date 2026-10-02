@@ -2840,6 +2840,7 @@ mod tests {
         .unwrap();
         let now = SystemTime::now();
         crate::sesame::identity_store::NodeIdentity {
+            recovery_epoch: 0,
             node_id: node_id.to_string(),
             certificate_der: cert_der,
             private_key_der: key_der,

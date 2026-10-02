@@ -616,6 +616,7 @@ pub(super) fn node_identity_from_init(
 
     let cert = &init_result.node_certificate;
     Ok(crate::sesame::identity_store::NodeIdentity {
+        recovery_epoch: 0,
         node_id: cert.node_id.clone(),
         certificate_der: cert.certificate_der.clone(),
         private_key_der: cert.private_key_der.clone(),

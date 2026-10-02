@@ -2010,6 +2010,17 @@ impl CouncilStateMachine {
         persist_snapshot(snapshot_db, &data, 1)
     }
 
+    /// Whether no snapshot has ever established state for this node.
+    pub async fn has_no_snapshot(&self) -> bool {
+        self.inner.read().await.snapshot_data.is_none()
+    }
+
+    /// Seed the epoch bound to the durable log before openraft starts. This
+    /// is local enrolment metadata, not a recovered bootstrap snapshot.
+    pub async fn seed_enrolled_epoch(&self, epoch: u64) {
+        self.inner.write().await.state.recovery_epoch = epoch;
+    }
+
     /// Read the current desired state.
     pub async fn desired_state(&self) -> DesiredState {
         self.inner.read().await.state.clone()
