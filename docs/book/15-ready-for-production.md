@@ -4191,6 +4191,87 @@ suffers; a budget decides that nobody does. The single owner survived all of
 it, and so did every invariant that leans on it, because in every case above
 the loop still makes the decision and only the waiting moved.
 
+#### A timeout is not a budget
+
+The gate caught its first one in the 0.1.3 final tier, eight hours into the
+soak, during the graceful whole-cluster stop and start: `1 health_tick
+turn(s) over the 1 s budget, the worst between 1 and 2.5 s`. Node 1's own log
+was more precise: `agent loop turn took 1008 ms in health_tick`, three
+seconds after the process started. That made it the first tick of the new
+process.
+
+Nothing survives a reboot, so adoption found every record's runtime gone and
+deferred each cleanup as a startup retirement. The first tick drives the
+first one, and part of a retirement is asking the leader to confirm that no
+node still routes to the instance's address. Node 1 came back first. Raft
+remembered node 2 as leader, and node 2's VM was still booting, so the
+request had nobody to answer it. The agent already sent that request from a
+task, so a slow leader couldn't hold the loop for the client's whole 10 s.
+But a fresh request still waited a while for its answer, in case the leader
+was quick:
+
+```rust
+outcome = tokio::time::timeout(PRODUCER_RELEASE_WAIT, &mut *pending) => outcome,
+```
+
+`PRODUCER_RELEASE_WAIT` is one second, and so is the turn budget. One second
+of waiting plus 8 ms of work is the turn the gate saw. The harness scenario
+that reproduces it starts an agent with one startup retirement and a leader
+that takes 2.5 s to answer. Before the fix its worst turn was 1006 ms.
+
+The inline-await rule had let this through, along with two inventory reads
+on the same path (one second and five). Each had a `tokio::time::timeout`
+around it, and the rule accepted any timeout at all. That's the hole: a
+timeout bounds one await, but a budget bounds the whole turn. So the rule now
+accepts only `timeout_at` whose deadline expression names a deadline, which
+in practice means the turn's. A fixed `timeout`, even a short one, needs a
+`LOOP-INLINE` tag that says why it fits. The rule also looks inside `select!`
+now, because the producer release's wait sat in one of its arms, where the
+checker never looked.
+
+The fix is a pattern we already had. The wait ends at whichever comes first,
+its own patience or the turn's deadline:
+
+```rust
+let deadline = (tokio::time::Instant::now() + PRODUCER_RELEASE_WAIT)
+    .min(self.turn_deadline());
+```
+
+`Instant` implements `Ord`, so `.min` works on it as it would on two
+integers. Outside a turn, during startup adoption, `turn_deadline()` is ten
+seconds away and the old one-second wait still applies. The inventory read
+does the same inside `runtime_inventory`, so every caller on the loop gets
+it. A wait that runs out returns "producer release awaits leader
+confirmation". The request carries on in its task, the next tick collects
+the answer instead of asking again, and the retirement finishes. The
+scenario checks both halves: no turn reaches the second, and the port comes
+back once the leader answers.
+
+One line had to move for the borrow checker. The first version computed the
+deadline right before the `select!`, after this:
+
+```rust
+let pending = self.producer_releases.entry(execution.clone()).or_insert_with(..);
+```
+
+`pending` is a mutable borrow into `self.producer_releases`, and it lives
+until the `select!` awaits it. `self.turn_deadline()` is a method on `&self`,
+so it borrows *all* of `self`, including the map that `pending` points into.
+Rust refused (error E0502), because a shared borrow of the whole would
+overlap a mutable borrow of a part. Reading a field directly, as
+`self.shutdown.cancelled()` does in the same `select!`, is fine: the compiler
+tracks disjoint fields separately, but it can't see inside a method call. So
+the deadline is now computed before the `entry` call, while nothing is
+borrowed. In C or Go that ordering wouldn't matter. In Rust, the order of
+borrows is part of the code.
+
+The stricter rule found two more five-second waits that a turn can reach.
+One journals a backend publication and the other resolves an egress
+allowlist before an instance starts. Moving either one onto the turn's
+deadline would change what a miss *does*: a failed publication costs a
+restart attempt, and a DNS timeout starts the instance deny-all. So they
+carry tags naming #419, which moves them off the loop properly.
+
 ### Two commands, two answers
 
 Issue #241 had one more complaint in it. With three replicas of `hello`

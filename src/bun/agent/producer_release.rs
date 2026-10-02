@@ -149,6 +149,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // can't hold the agent loop for the client's whole timeout. Callers
         // treat the refusal as "retry later"; the next attempt collects the
         // answer instead of asking again.
+        // Inside a turn the wait ends with the turn's deadline. A whole
+        // `PRODUCER_RELEASE_WAIT` was the 0.1.3 final tier's 1008 ms health
+        // tick (#418): a node back first after a whole-cluster stop asked
+        // its remembered leader, still booting, to release a startup
+        // retirement's address.
+        let deadline =
+            (tokio::time::Instant::now() + PRODUCER_RELEASE_WAIT).min(self.turn_deadline());
         let requested = self.producer_releases.contains_key(&execution);
         let pending = self
             .producer_releases
@@ -176,7 +183,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             _ = self.shutdown.cancelled() => {
                 return Err(refuse("producer release interrupted; ownership retained".into()));
             }
-            outcome = tokio::time::timeout(PRODUCER_RELEASE_WAIT, &mut *pending) => outcome,
+            outcome = tokio::time::timeout_at(deadline, &mut *pending) => outcome,
         };
         let Ok(joined) = outcome else {
             return Err(awaiting("producer release awaits leader confirmation"));
@@ -196,5 +203,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
 /// How long a caller waits for the leader before retiring on a later attempt.
 /// A healthy leader answers well within it; a slow one no longer stalls the
-/// single agent loop for every pending retirement.
+/// single agent loop for every pending retirement. Inside a turn the wait
+/// also ends at the turn's deadline, which comes sooner.
 const PRODUCER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);

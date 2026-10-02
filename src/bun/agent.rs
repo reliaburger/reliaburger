@@ -30,8 +30,10 @@
 //!      with [`BunError::StillRunning`], and its caller asks again.
 //!    - **Bound it by the turn's runtime budget**: reads a later turn can
 //!      retry wait at most until [`BunAgent::turn_deadline`], which every
-//!      such await in a turn shares (`tokio::time::timeout_at`).
-//! 2. An await that stays inline without a deadline carries a
+//!      such await in a turn shares (`tokio::time::timeout_at`). A fixed
+//!      `tokio::time::timeout` is not this: a 1 s one is the whole turn
+//!      budget, and the 0.1.3 final tier failed on one (#418).
+//! 2. An await that stays inline without the turn's deadline carries a
 //!    `// LOOP-INLINE: <why>` comment on its statement: an in-memory lock,
 //!    an fsync'd persist (allowed, and bounded by the harness's slow-disk
 //!    scenario), or the short sleep before an upgrade's exec.

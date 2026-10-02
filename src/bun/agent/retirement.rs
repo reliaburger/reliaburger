@@ -360,6 +360,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // A pressure helper stops in a task; this last turn waits for every
         // one, a start still in flight included, for a few seconds at most.
         let pressure = Arc::clone(&self.node_pressure);
+        // LOOP-INLINE: shutdown's last turn; no caller waits for another
         let _ = tokio::time::timeout(SHUTDOWN_PRESSURE_CLEAR, async move {
             pressure.lock().await.clear_all().await;
         })

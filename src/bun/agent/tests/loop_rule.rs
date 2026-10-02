@@ -1,9 +1,13 @@
 //! The agent loop's inline-await rule (#351), checked mechanically.
 //!
-//! Every `.await` a turn of `run_loop` can reach must either sit under a
-//! deadline (`tokio::time::timeout`) or carry a `// LOOP-INLINE: <why>`
-//! comment on the statement that awaits. The check parses `agent.rs` and its
-//! submodules with `syn`, starts at `run_loop`, and follows every directly
+//! Every `.await` a turn of `run_loop` can reach must either sit under the
+//! turn's deadline (`tokio::time::timeout_at(deadline, ..)`) or carry a
+//! `// LOOP-INLINE: <why>` comment on the statement that awaits. A fixed
+//! `tokio::time::timeout` isn't enough on its own: one of 1 s is already the
+//! whole turn budget (#418), so a short one says why it fits in a tag.
+//!
+//! The check parses `agent.rs` and its submodules with `syn`, starts at
+//! `run_loop`, and follows every directly
 //! awaited `self.method(..)` call into that method's body. Any other await it
 //! meets is a leaf: a runtime call, a council write, a channel send, a
 //! `spawn_blocking` join. A leaf without a deadline or a tag fails the test.
@@ -114,17 +118,39 @@ fn called_method(expr: &syn::Expr) -> Option<String> {
     }
 }
 
-/// Whether an awaited expression carries its own deadline or is a lock.
+/// Whether an expression names a deadline: a `deadline` or `turn_deadline`
+/// variable or field, `self.turn_deadline()`, or `deadline.min(..)`.
+fn names_deadline(expr: &syn::Expr) -> bool {
+    let named = |ident: &syn::Ident| ident.to_string().ends_with("deadline");
+    match expr {
+        syn::Expr::Path(path) => path.path.segments.last().is_some_and(|s| named(&s.ident)),
+        syn::Expr::Field(field) => match &field.member {
+            syn::Member::Named(ident) => named(ident),
+            syn::Member::Unnamed(_) => false,
+        },
+        syn::Expr::MethodCall(call) => named(&call.method) || names_deadline(&call.receiver),
+        syn::Expr::Paren(inner) => names_deadline(&inner.expr),
+        syn::Expr::Reference(inner) => names_deadline(&inner.expr),
+        _ => false,
+    }
+}
+
+/// Whether an awaited expression is bounded by the turn's deadline, or is
+/// a lock. A fixed `timeout(..)` doesn't count: it bounds the await, but
+/// not by what's left of the turn, so it needs a tag saying why it fits.
 fn is_bounded(expr: &syn::Expr) -> bool {
     match expr {
-        syn::Expr::Call(call) => {
-            match call.func.as_ref() {
-                syn::Expr::Path(function) => function.path.segments.last().is_some_and(|segment| {
-                    segment.ident == "timeout" || segment.ident == "timeout_at"
-                }),
-                _ => false,
+        syn::Expr::Call(call) => match call.func.as_ref() {
+            syn::Expr::Path(function) => {
+                function
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "timeout_at")
+                    && call.args.first().is_some_and(names_deadline)
             }
-        }
+            _ => false,
+        },
         syn::Expr::MethodCall(call) => {
             call.args.is_empty()
                 && matches!(call.method.to_string().as_str(), "lock" | "read" | "write")
@@ -235,6 +261,28 @@ impl<'ast> Visit<'ast> for BodyVisitor<'_> {
         // thing a turn does inside one is call agent methods, so follow those.
         use proc_macro2::TokenTree;
         let tokens = flatten(mac.tokens.clone());
+        // A fixed `timeout(..)` raced in a `select!` arm is awaited inline
+        // too, and needs the same tag as one outside it.
+        for window in tokens.windows(2) {
+            if let [TokenTree::Ident(timeout), TokenTree::Group(_)] = window
+                && timeout == "timeout"
+            {
+                let line = timeout.span().start().line;
+                let start = self.statements.last().copied().unwrap_or(line);
+                if !self.tagged(start, line) {
+                    self.violations.push(Violation {
+                        path: self.source.path.display().to_string(),
+                        line,
+                        awaited: self
+                            .source
+                            .lines
+                            .get(line - 1)
+                            .map(|text| text.trim().to_string())
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+        }
         for window in tokens.windows(4) {
             if let [
                 TokenTree::Ident(this),
@@ -361,8 +409,9 @@ fn every_inline_await_on_the_agent_loop_has_a_deadline_or_a_reason() {
     assert!(
         violations.is_empty(),
         "{} awaits on the agent loop have no deadline and no `// {TAG} <why>` comment. \
-         Move the work off the loop, wrap it in `tokio::time::timeout`, or say why it \
-         may run inline (see the rule in src/bun/agent.rs's module doc):\n{}",
+         Move the work off the loop, bound it by the turn's deadline \
+         (`tokio::time::timeout_at(deadline, ..)`), or say why it may run inline \
+         (see the rule in src/bun/agent.rs's module doc):\n{}",
         violations.len(),
         violations
             .iter()
@@ -387,7 +436,10 @@ fn the_rule_follows_agent_methods_and_flags_only_untagged_leaves() {
                 self.grill.state(&id).await;
                 // LOOP-INLINE: an fsync'd persist, bounded by the harness
                 persist(&dir).await;
-                tokio::time::timeout(LIMIT, self.grill.kill(&id)).await;
+                tokio::time::timeout_at(deadline, self.grill.kill(&id)).await;
+                tokio::time::timeout_at(self.turn_deadline(), self.grill.kill(&id)).await;
+                tokio::time::timeout(Duration::from_secs(5), self.grill.kill(&id)).await;
+                tokio::time::timeout_at(Instant::now() + LIMIT, self.grill.kill(&id)).await;
                 let _guard = self.lock.lock().await;
                 tokio::spawn(async move { never_flagged().await });
                 // LOOP-INLINE:
@@ -396,6 +448,10 @@ fn the_rule_follows_agent_methods_and_flags_only_untagged_leaves() {
                 self.stalls.hold(Stall::Persist).await;
                 self.helper().await;
                 let result = async { self.grill.start(&id).await }.await;
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => {}
+                    _ = tokio::time::timeout(LIMIT, self.grill.kill(&id)) => {}
+                }
             }
             async fn helper(&self) {
                 self.grill.logs(&id).await;
@@ -414,14 +470,28 @@ fn the_rule_follows_agent_methods_and_flags_only_untagged_leaves() {
         lines,
         vec![
             (11, "self.grill.state(&id).await;"),
+            // A fixed timeout bounds the await, but not by the turn.
+            (
+                16,
+                "tokio::time::timeout(Duration::from_secs(5), self.grill.kill(&id)).await;"
+            ),
+            (
+                17,
+                "tokio::time::timeout_at(Instant::now() + LIMIT, self.grill.kill(&id)).await;"
+            ),
             // A tag with no reason doesn't count.
-            (18, "self.council.write(request).await;"),
+            (21, "self.council.write(request).await;"),
             // An async block awaited in place is inline code.
             (
-                22,
+                25,
                 "let result = async { self.grill.start(&id).await }.await;"
             ),
-            (25, "self.grill.logs(&id).await;"),
+            // So does one raced in a `select!` arm.
+            (
+                28,
+                "_ = tokio::time::timeout(LIMIT, self.grill.kill(&id)) => {}"
+            ),
+            (32, "self.grill.logs(&id).await;"),
         ]
     );
 }

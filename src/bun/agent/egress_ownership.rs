@@ -211,6 +211,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         allow: &[String],
     ) -> Vec<crate::sesame::egress::EgressDestination> {
         let allow = allow.to_vec();
+        // LOOP-INLINE: a pre-start's DNS; on timeout it starts deny-all, which re-resolution repairs; TODO(#419) move it off the loop
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
