@@ -373,7 +373,7 @@ jobs:
           start=$(date +%s)
           result=timeout
           while [ $(( $(date +%s) - start )) -lt "$deadline" ]; do
-            if grep -q "reliaburger: bun healthy" "$log" 2>/dev/null; then result=pass; break; fi
+            if grep -q -e "reliaburger: bun healthy" -e "reliaburger: unclaimed" "$log" 2>/dev/null; then result=pass; break; fi
             if grep -q "reliaburger: bun not healthy" "$log" 2>/dev/null; then result=fail; break; fi
             if ! kill -0 "$qemu" 2>/dev/null; then result=exited; break; fi
             sleep 5

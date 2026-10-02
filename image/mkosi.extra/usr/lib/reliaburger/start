@@ -6,8 +6,9 @@
 # one: neither an OS update nor a bun upgrade can move bun backwards.
 #
 # With /etc/reliaburger/node.toml (written by `bun appliance prepare` from
-# the node's seed) bun runs as a cluster node; without one it runs standalone
-# on loopback, which is what the CI boot tests check. `start prepare` and
+# the node's seed) bun runs as a cluster node. A machine with no seed waits
+# in `start prepare` until it's claimed, so bun only gets here without one if
+# prepare failed; it then runs standalone on loopback. `start prepare` and
 # `start console` run bun's appliance steps (reliaburger-seed and
 # reliaburger-console).
 set -eu

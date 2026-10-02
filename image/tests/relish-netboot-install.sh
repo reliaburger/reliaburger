@@ -69,7 +69,7 @@ qemu=$!
 start=$(date +%s)
 result=timeout
 while [ $(( $(date +%s) - start )) -lt 900 ]; do
-    if grep -q "reliaburger: bun healthy" "$log" 2>/dev/null; then result=pass; break; fi
+    if grep -q -e "reliaburger: bun healthy" -e "reliaburger: unclaimed" "$log" 2>/dev/null; then result=pass; break; fi
     if grep -q -e "reliaburger-install: FAILED" -e "reliaburger: bun not healthy" "$log" 2>/dev/null; then result=fail; break; fi
     if ! kill -0 "$qemu" 2>/dev/null; then result=exited; break; fi
     if ! sudo kill -0 "$server" 2>/dev/null; then result="relish netboot stopped"; break; fi
