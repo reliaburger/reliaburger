@@ -2239,6 +2239,42 @@ mod tests {
         }
     }
 
+    /// #429: only an offline recovery snapshot (no log boundary, no
+    /// membership) may bootstrap past join seeds. A joiner that installed the
+    /// recovered council's snapshot holds the same epoch but a log position,
+    /// and must never bootstrap a council of its own.
+    #[tokio::test]
+    async fn only_an_offline_recovery_snapshot_is_a_pending_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path().join("snapshot.redb")).unwrap());
+        CouncilStateMachine::persist_recovered_snapshot(&db, DesiredState::default()).unwrap();
+        let mut recovered = CouncilStateMachine::with_store(db).unwrap();
+        assert!(recovered.recovered_bootstrap_pending().await);
+        assert!(
+            !CouncilStateMachine::new()
+                .recovered_bootstrap_pending()
+                .await
+        );
+
+        recovered
+            .apply(vec![normal_entry(1, 1, RaftRequest::Noop)])
+            .await
+            .unwrap();
+        let snapshot = recovered
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut joiner = CouncilStateMachine::new();
+        joiner
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(joiner.desired_state().await.recovery_epoch, 1);
+        assert!(!joiner.recovered_bootstrap_pending().await);
+    }
+
     #[tokio::test]
     async fn node_fault_capacity_survives_snapshot_and_leader_term_changes() {
         use crate::smoker::reservation::NodeFaultReservation;
