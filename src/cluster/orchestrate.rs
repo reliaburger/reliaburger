@@ -690,7 +690,7 @@ fn plan_pass(
         // A daemon set targets every *eligible* node, so its convergence count
         // is the eligible-node count, not every alive node (M25).
         let want = if override_replicas.is_none() && matches!(spec.replicas, Replicas::DaemonSet) {
-            daemon_eligible_count(cache, spec, dns_required)
+            daemon_eligible_count(cache, app_id, spec, dns_required)
         } else {
             effective_replicas(spec, override_replicas, alive.len())
         };
@@ -1069,7 +1069,12 @@ fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<
 /// node is ineligible (not ready, lacks a required capability, doesn't fit),
 /// `placements.len()` never equals `alive.len()` and the leader re-commits an
 /// identical `SchedulingDecision` to Raft every tick.
-fn daemon_eligible_count(cache: &ClusterStateCache, spec: &AppSpec, dns_required: bool) -> usize {
+fn daemon_eligible_count(
+    cache: &ClusterStateCache,
+    app_id: &crate::meat::AppId,
+    spec: &AppSpec,
+    dns_required: bool,
+) -> usize {
     let resources = scheduler_resources(spec);
     let required = spec
         .placement
@@ -1077,8 +1082,15 @@ fn daemon_eligible_count(cache: &ClusterStateCache, spec: &AppSpec, dns_required
         .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
         .unwrap_or_default();
     let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
-    crate::meat::filter::filter_nodes(&resources, &required, requires_egress, dns_required, cache)
-        .len()
+    crate::meat::scheduler::daemon_candidates(
+        cache,
+        app_id,
+        &resources,
+        &required,
+        requires_egress,
+        dns_required,
+    )
+    .len()
 }
 
 /// The per-replica resources an app requests, for quota accounting. Mirrors
@@ -6095,5 +6107,71 @@ mod audit_stale_endpoints {
         assert!(!has_stale_member(&members, &reports));
         reports.stale_nodes.push(NodeId::new("planned"));
         assert!(has_stale_member(&members, &reports));
+    }
+}
+
+#[cfg(test)]
+mod audit_daemon_self_reservation {
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::quota::QuotaLedger;
+    use crate::meat::{cluster_state::SchedulerNodeState, types::AppId};
+    fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels,
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+    fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(replicas);
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu_request,
+            limit: cpu_request,
+        });
+        spec
+    }
+    #[test]
+    fn daemon_placement_must_not_evict_a_running_instance_for_its_own_reservation() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("a", 1000, BTreeMap::new()));
+        cache.set_node(sched_node("b", 1000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("a"), NodeId::new("b")]);
+        let app = AppId::new("daemon", "default");
+        let mut spec = app_spec(600, 1);
+        spec.replicas = Replicas::DaemonSet;
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), spec);
+        let first = plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(first[0].placements.len(), 2);
+        desired
+            .scheduling
+            .insert(app.clone(), first[0].placements.clone());
+        // Node a has reported its started daemon; node b has not started/reported yet.
+        let mut a = sched_node("a", 1000, BTreeMap::new());
+        a.allocated = Resources::new(600, 0, 0);
+        a.app_replicas.insert(app.clone(), 1);
+        let mut fresh = ClusterStateCache::new();
+        fresh.set_node(a);
+        fresh.set_node(sched_node("b", 1000, BTreeMap::new()));
+        let second =
+            plan_scheduling_pass(&mut fresh, &desired, &alive, &mut QuotaLedger::default());
+        eprintln!("daemon second pass: {second:?}");
+        assert!(
+            second.is_empty()
+                || second[0]
+                    .placements
+                    .iter()
+                    .any(|p| p.node_id == NodeId::new("a")),
+            "running daemon was removed because it cannot fit a second copy"
+        );
     }
 }
