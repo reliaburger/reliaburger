@@ -390,6 +390,15 @@ enum Command {
         #[command(subcommand)]
         action: ImageAction,
     },
+    /// Unclaimed appliances on the LAN: list them, or claim them with seeds
+    /// over the network.
+    Machines {
+        #[command(subcommand)]
+        action: Option<MachinesAction>,
+        /// How long to listen for machines' announcements, in seconds.
+        #[arg(long, default_value_t = 3)]
+        wait: u64,
+    },
     /// Manage short-lived node-enrolment tokens.
     JoinToken {
         #[command(subcommand)]
@@ -809,6 +818,47 @@ enum ImageAction {
         /// Each machine as MAC@IP.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MachinesAction {
+    /// Claim machines: compare each one's claim key with its console, then
+    /// send it a seed, joining it to the cluster in DIRECTORY (or, with
+    /// --create, making a new cluster there from them).
+    Claim {
+        /// The cluster directory (`relish cluster create --bare-metal`'s).
+        directory: PathBuf,
+        /// Create a new cluster named --name from these machines, node 1 first.
+        #[arg(long, requires_all = ["name", "operators"])]
+        create: bool,
+        /// The new cluster's name (with --create).
+        #[arg(long)]
+        name: Option<String>,
+        /// Address or network relish runs from (with --create; repeatable).
+        #[arg(long = "operator")]
+        operators: Vec<String>,
+        /// The LAN machines added later join from (with --create).
+        #[arg(long)]
+        network: Option<String>,
+        /// Admit workload and node faults (with --create).
+        #[arg(long)]
+        faults: bool,
+        /// Operator countersignature key for cluster bun upgrades (with --create).
+        #[arg(long)]
+        external_signing_key: Option<String>,
+        /// Public key for root SSH on lab images.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// How long join tokens stay valid (s, m, h or d; at most 7d).
+        #[arg(long, default_value = "1h", value_parser = parse_seed_ttl)]
+        ttl: u64,
+        /// Don't ask to compare claim keys with the machines' consoles.
+        #[arg(long)]
+        trust_lan: bool,
+        /// Each machine by MAC (found over mDNS) or address.
+        #[arg(required = true)]
+        machines: Vec<String>,
     },
 }
 
@@ -1790,6 +1840,44 @@ async fn main() -> ExitCode {
                         &machines,
                         std::time::Duration::from_secs(ttl),
                         ssh_key,
+                    )
+                    .await
+                }
+            },
+        },
+        Command::Machines { action, wait } => match action {
+            None => reliaburger::relish::machines::browse(std::time::Duration::from_secs(wait))
+                .map(|machines| print!("{}", reliaburger::relish::machines::render(&machines))),
+            Some(MachinesAction::Claim {
+                directory,
+                create,
+                name,
+                operators,
+                network,
+                faults,
+                external_signing_key,
+                ssh_key,
+                ttl,
+                trust_lan,
+                machines,
+            }) => match ssh_key.as_deref().map(std::fs::read).transpose() {
+                Err(error) => Err(error.into()),
+                Ok(ssh_key) => {
+                    reliaburger::relish::machines::run_claim(
+                        &reliaburger::relish::machines::ClaimOptions {
+                            directory,
+                            targets: machines,
+                            create: create.then(|| reliaburger::relish::machines::NewCluster {
+                                name: name.unwrap_or_default(),
+                                operators,
+                                network,
+                                faults,
+                                external_signing_key,
+                            }),
+                            token_ttl: std::time::Duration::from_secs(ttl),
+                            ssh_key,
+                            trust_lan,
+                        },
                     )
                     .await
                 }

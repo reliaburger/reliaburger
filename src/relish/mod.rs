@@ -32,6 +32,7 @@ pub mod k8s_export;
 )]
 pub mod k8s_import;
 pub mod local_context;
+pub mod machines;
 pub mod manifest;
 pub mod manual;
 pub mod metrics_cmd;

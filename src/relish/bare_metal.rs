@@ -346,15 +346,16 @@ pub fn admitted(fleet: &Fleet, address: IpAddr) -> bool {
     }
 }
 
-/// `relish image seed <dir> MAC@IP...`: add machines to a running cluster.
-/// Their join tokens come from the cluster (relish's context must point at
-/// it), and their seeds land beside the others in `<dir>/stick/seeds`.
-pub async fn run_add(
+/// Add machines to a running cluster: a join token from the cluster for
+/// each (relish's context must point at it), a seed beside the others in
+/// `<dir>/stick/seeds`, and the fleet list updated. Returns each new node
+/// with its seed.
+pub async fn add(
     directory: &Path,
     machines: &[(String, IpAddr)],
     token_ttl: Duration,
     ssh_key: Option<Vec<u8>>,
-) -> Result<(), RelishError> {
+) -> Result<Vec<(FleetNode, PathBuf)>, RelishError> {
     let fleet_path = directory.join("fleet.json");
     let mut fleet: Fleet = serde_json::from_slice(&std::fs::read(&fleet_path)?)
         .map_err(|e| failed(&format!("{}: {e}", fleet_path.display())))?;
@@ -381,7 +382,27 @@ pub async fn run_add(
         &fleet_path,
         &serde_json::to_vec_pretty(&fleet).map_err(RelishError::SerialiseJson)?,
     )?;
-    for (node, seed) in added.iter().zip(&written) {
+    for node in &added {
+        if !admitted(&fleet, node.address) {
+            println!(
+                "{} isn't in a network the cluster admits (cluster create --network); add it to \
+                 [security] bootstrap_peers on the existing nodes, or it can't reach them to join",
+                node.address
+            );
+        }
+    }
+    Ok(added.into_iter().zip(written).collect())
+}
+
+/// `relish image seed <dir> MAC@IP...`: add machines to a running cluster,
+/// with seeds for the RBSEED stick.
+pub async fn run_add(
+    directory: &Path,
+    machines: &[(String, IpAddr)],
+    token_ttl: Duration,
+    ssh_key: Option<Vec<u8>>,
+) -> Result<(), RelishError> {
+    for (node, seed) in add(directory, machines, token_ttl, ssh_key).await? {
         println!(
             "  {} ({} at {}): {}",
             node.name,
@@ -389,13 +410,6 @@ pub async fn run_add(
             node.address,
             seed.display()
         );
-        if !admitted(&fleet, node.address) {
-            println!(
-                "    {} isn't in a network the cluster admits (cluster create --network); add it to \
-                 [security] bootstrap_peers on the existing nodes, or it can't reach them to join",
-                node.address
-            );
-        }
     }
     println!("Copy the new seeds onto the RBSEED stick (seeds/ keeps one per MAC).");
     Ok(())
@@ -434,15 +448,6 @@ pub fn context(
 /// to do next.
 pub fn run_create(options: &CreateOptions) -> Result<(), RelishError> {
     let created = create(options)?;
-    let context = context(&created.fleet, &options.directory, &created.admin_token)?;
-    let path = super::local_context::default_path()?;
-    let saved = match super::local_context::LocalContext::load(&path) {
-        Ok(None) => context.save(&path).map(|()| true)?,
-        Ok(Some(existing)) if existing.owner == context.owner => {
-            context.save(&path).map(|()| true)?
-        }
-        _ => false,
-    };
     let dir = options.directory.display();
     println!("cluster {} created in {dir}", created.fleet.cluster);
     println!("  root CA: {}", created.fleet.ca_fingerprint);
@@ -459,6 +464,22 @@ pub fn run_create(options: &CreateOptions) -> Result<(), RelishError> {
     println!(
         "Copy {dir}/stick/seeds onto a USB stick labelled RBSEED (FAT32), then boot each machine with it."
     );
+    adopt(&created, &options.directory)
+}
+
+/// Point relish at a newly created cluster, unless another cluster's
+/// context is in the way, and remind the operator to back up its secrets.
+pub fn adopt(created: &Created, directory: &Path) -> Result<(), RelishError> {
+    let context = context(&created.fleet, directory, &created.admin_token)?;
+    let path = super::local_context::default_path()?;
+    let saved = match super::local_context::LocalContext::load(&path) {
+        Ok(None) => context.save(&path).map(|()| true)?,
+        Ok(Some(existing)) if existing.owner == context.owner => {
+            context.save(&path).map(|()| true)?
+        }
+        _ => false,
+    };
+    let dir = directory.display();
     println!("Back up {dir}/secrets: it holds the master key and the sealed root CA key.");
     if saved {
         println!(
