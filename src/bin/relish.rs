@@ -585,9 +585,13 @@ enum ManualAction {
 
 #[derive(Subcommand)]
 enum CouncilCommand {
-    /// Show every node's view of the council: role, recovery epoch, term,
-    /// log position and reachability, with the epoch, leader and quorum
-    /// above. The default when no subcommand is given.
+    /// Show every node's view of the council (the default).
+    ///
+    /// One row per node: role, recovery epoch, term, log position,
+    /// membership and reachability, asked through this node's relay. Above
+    /// it: the newest epoch, the leader and quorum. Nodes that didn't answer
+    /// are listed, and fenced nodes, split epochs or a second leader are
+    /// called out.
     Status,
     /// Recover a cluster whose entire council was lost.
     ///
@@ -2560,7 +2564,7 @@ mod tests {
     fn parse_council_command() {
         let cli = parse(&["relish", "council"]).unwrap();
         assert!(matches!(cli.command, Command::Council { action: None }));
-        let cli = parse(&["relish", "council", "status", "-o", "json"]).unwrap();
+        let cli = parse(&["relish", "council", "status", "--output", "json"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Council {

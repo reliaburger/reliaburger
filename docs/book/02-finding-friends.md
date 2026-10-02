@@ -2312,6 +2312,50 @@ pub fn persist_recovered_snapshot(
 
 `saturating_add` is Rust's "add, but clamp at the maximum instead of overflowing." A plain `+` on an integer that's already at `u64::MAX` would panic in a debug build and wrap around in a release build — both wrong. Saturating arithmetic is the boring-correct choice for a counter that only ever goes up. Recover a cluster twice and the epoch reads 2; anything tagged with epoch 0 or 1 is demonstrably pre-recovery. It's cheap, it's monotonic, and it never lies.
 
+### When the epoch wasn't enough
+
+The epoch marker shipped with a fence attached. Every Raft RPC carried the sender's epoch, and the receiving side dropped anything that didn't match its own. A recovered survivor at epoch 1 would never talk to a dead-cluster peer at epoch 0. Job done, we thought.
+
+Then a tester ran three-node clusters on EC2 with real fault injection. Stop two voters, recover the third with `--force`, write something, bring the two back. Their report was one line: two councils, both accepting writes, both reporting healthy.
+
+Can you see the hole? The fence was a filter between *pairs* of nodes. It kept epoch 1 away from epoch 0. It did nothing to stop epoch 0 talking to epoch 0. The two returning voters still held the old three-voter membership in their data directories, and two out of three is a majority. They elected a leader between themselves, committed writes, and never once needed the recovered node. Worse, they didn't even know they'd been replaced: recovery runs offline on the survivor, so nothing ever told them. When they tried the recovered node, it simply closed the connection, which to Raft looks exactly like a dead peer.
+
+So the fence moved from the wire into the node. It's now a small state machine in `src/council/fence.rs`:
+
+```rust
+pub enum FenceState {
+    Unclaimed,
+    Probing,
+    Serving,
+    Fenced { newer_epoch: u64 },
+}
+```
+
+A node holding epoch 0 that hears about epoch 1 *from anywhere* fences itself, for good. It stops sending Raft RPCs, refuses every one it receives, rejects writes with a `CouncilError::Fenced`, stops naming any leader, and writes the fence to disk so a restart doesn't forget it. It hears about newer epochs in two ways. A refusal is no longer a silent hang-up: the refusing node replies `Fenced { recovery_epoch }`, naming the newest epoch it knows, so one fenced node passes the news to the next old voter that tries it. And gossip now advertises every node's epoch, so a restarted voter spends a few seconds in `Probing`, listening for its peers, before it serves Raft at all.
+
+The state lives in a `tokio::sync::watch` channel shared by the transport, the council node and the runtime. Moving between states goes through `send_if_modified`, which hands you a mutable reference to the current value inside a closure and only wakes the subscribers if the closure returns `true`:
+
+```rust
+pub fn observe_peer_epoch(&self, peer_epoch: u64) -> bool {
+    let was_fenced = self.is_fenced();
+    self.state
+        .send_if_modified(|current| fence_if_newer(current, peer_epoch));
+    !was_fenced && self.is_fenced()
+}
+```
+
+In Go you'd reach for a mutex around a struct and a separate condition variable to tell the watchers. Here the channel is both. The closure runs while the channel's internal lock is held, so two RPC handlers learning about epoch 1 at the same moment can't interleave a half-made update, and nobody gets woken for a no-op.
+
+`Unclaimed` came out of fixing a second bug the first one was hiding. A node with a fresh data directory had epoch 0, the recovered council had epoch 1, and the equality filter meant the fresh node dropped every RPC from the council that was trying to admit it. So the documented way back for a replaced voter, wiping it and letting it rejoin, had never worked over real TCP. A fresh node now claims no epoch at all and adopts the first council that contacts it. `relish council re-enrol` does the wiping: it removes a fenced node's Raft state and nothing else.
+
+There was a third. Recovery seeds the state machine straight from the backup, and no log entry carries that state. A new member that replicated the log from the start got everything written *after* recovery and none of the apps, CAs or tokens from before it. The recovered node now takes a snapshot and purges its log right after it bootstraps, so Raft has no choice but to send newcomers the snapshot.
+
+And chasing that one turned up a fourth, which had nothing to do with recovery. `get_current_snapshot` returned the stored snapshot's bytes but labelled them with the *live* state's last applied log index. Apply one entry after building a snapshot and the label lies. openraft hands that stored snapshot to any member that has fallen behind the purged log, the member records the lying index, and it never receives the entries in between. Debug builds caught it, because openraft asserts on it; release builds would have diverged silently. The fix is to keep the snapshot's own log id and membership beside its bytes. The lesson is an old one: metadata has to describe the bytes it travels with, not whatever the world looks like when someone asks.
+
+The last piece is seeing it. One node's council status is only that node's opinion, and a split brain looks perfectly healthy from either half. That was the "both report healthy" part of the report. So `relish council status`, the header `relish status` now prints, and `relish wtf` all ask *every* node, through the relay, and compare. Two serving epochs, two leaders or a fenced node is critical, and each finding names the nodes and the way back.
+
+Is the fence perfect now? No, and the manual says so. An old voter only learns of the new epoch from a node that holds it. Bring two old voters back where they can see each other but not the recovered side, and they have nothing to learn from. That's why the manual's advice after `council recover --force` is blunt: re-enrol the old voters before you start them. If you don't, `relish wtf` will tell you, loudly.
+
 ### Resigning under disk pressure
 
 There's a slower failure worth heading off before it becomes a total loss: a voter whose disk is filling up. Raft can't make progress if a voter can't persist its log, so a voter drowning in disk pressure is a liability sitting in the quorum. Better it resigns and lets a healthy spare take the seat.

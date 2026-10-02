@@ -453,7 +453,7 @@ pub fn render_council_status(
     out
 }
 
-/// The machine-readable `relish council status -o json` document.
+/// The machine-readable `relish council status --output json` document.
 #[derive(Debug, Clone, Serialize)]
 pub struct CouncilReport<'a> {
     /// What the answers add up to.
