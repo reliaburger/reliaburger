@@ -5962,3 +5962,97 @@ image = "busybox:latest"
         );
     }
 }
+
+#[cfg(test)]
+mod audit_stale_endpoints {
+    use crate::meat::quota::QuotaLedger;
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::{
+        cluster_state::SchedulerNodeState,
+        types::{AppId, Placement},
+    };
+    use crate::reporting::types::*;
+    use std::time::{Instant, SystemTime};
+    fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels,
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+    fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(replicas);
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu_request,
+            limit: cpu_request,
+        });
+        spec
+    }
+    #[test]
+    fn stale_reports_must_not_publish_healthy_endpoints() {
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        let mut spec = app_spec(100, 1);
+        spec.port = Some(8080);
+        desired.apps.insert(app, spec);
+        let id = NodeId::new("n1");
+        let members = vec![MembershipSnapshot {
+            node_id: id.clone(),
+            address: "10.1.1.1:9116".parse().unwrap(),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: Default::default(),
+            first_seen: Instant::now(),
+            resources: None,
+        }];
+        let mut reports = AggregatedState::default();
+        reports.stale_nodes.push(id.clone());
+        reports.reports.insert(
+            id.clone(),
+            StateReport {
+                has_buildah: false,
+                node_id: id,
+                timestamp: SystemTime::now(),
+                cached_specs: vec![],
+                resource_usage: ResourceUsage::default(),
+                event_log: vec![],
+                running_apps: vec![RunningApp {
+                    execution: None,
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    instance_id: 0,
+                    image: "x:1".into(),
+                    port: Some(30000),
+                    health_status: ReportHealthStatus::Healthy,
+                    uptime: Duration::ZERO,
+                    resource_usage: AppResourceUsage::default(),
+                }],
+            },
+        );
+        let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+        let unhealthy = catalog
+            .services
+            .values()
+            .flat_map(|s| &s.backends)
+            .all(|b| !b.healthy);
+        desired.endpoint_catalog = catalog;
+        let evicted =
+            build_endpoint_catalog(&members, &AggregatedState::default(), &desired).unwrap();
+        eprintln!("backends after report eviction: {:?}", evicted.services);
+        assert!(
+            unhealthy,
+            "stale report still publishes a healthy backend, then report eviction preserves it indefinitely"
+        );
+    }
+}
