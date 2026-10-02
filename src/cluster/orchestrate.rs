@@ -5962,3 +5962,99 @@ image = "busybox:latest"
         );
     }
 }
+
+#[cfg(test)]
+mod audit_placement_revalidation {
+    use crate::meat::quota::QuotaLedger;
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::{
+        cluster_state::SchedulerNodeState,
+        types::{AppId, Placement},
+    };
+    use crate::reporting::types::*;
+    use std::time::{Instant, SystemTime};
+    fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels,
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+    fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(replicas);
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu_request,
+            limit: cpu_request,
+        });
+        spec
+    }
+    #[test]
+    fn resource_increase_must_be_readmitted() {
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(2000, 1));
+        desired.scheduling.insert(
+            app.clone(),
+            vec![Placement {
+                node_id: NodeId::new("small"),
+                resources: Resources::new(600, 0, 0),
+            }],
+        );
+        let mut cache = ClusterStateCache::new();
+        let mut small = sched_node("small", 1000, BTreeMap::new());
+        small.allocated = Resources::new(600, 0, 0);
+        cache.set_node(small);
+        cache.set_node(sched_node("large", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("small"), NodeId::new("large")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        eprintln!("updated spec decisions: {decisions:?}");
+        assert!(
+            !decisions.is_empty(),
+            "2000m app remains converged on a 1000m node with old 600m placement"
+        );
+    }
+
+    #[test]
+    fn changed_required_labels_must_move_a_placement() {
+        let app = AppId::new("web", "default");
+        let spec: AppSpec =
+            toml::from_str("image='x:1'\n[placement]\nrequired=['zone=west']").unwrap();
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), spec);
+        desired.scheduling.insert(
+            app.clone(),
+            vec![Placement {
+                node_id: NodeId::new("east"),
+                resources: Resources::default(),
+            }],
+        );
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node(
+            "east",
+            1000,
+            BTreeMap::from([("zone".into(), "east".into())]),
+        ));
+        cache.set_node(sched_node(
+            "west",
+            1000,
+            BTreeMap::from([("zone".into(), "west".into())]),
+        ));
+        let alive = HashSet::from([NodeId::new("east"), NodeId::new("west")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert!(
+            !decisions.is_empty(),
+            "a new hard placement constraint is ignored"
+        );
+    }
+}
