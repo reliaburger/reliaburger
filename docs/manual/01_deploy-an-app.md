@@ -165,6 +165,12 @@ drain_timeout = "30s"     # default 30s
 auto_rollback = true      # default true
 ```
 
+A changed `cpu` or `memory` request rolls in place too, on every node that
+still has room for it once the old instance's share is counted as freed. A
+replica whose node no longer has room moves to one that does. A changed
+`placement.required` moves the replicas on nodes that no longer match and
+leaves the rest where they are.
+
 An app with a managed volume always rolls stop-first: Bun stops the old
 instance before it starts the new one, whatever `strategy` and `max_surge`
 say, because both would write the same volume directory. Expect a moment
