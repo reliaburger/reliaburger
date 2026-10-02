@@ -152,7 +152,12 @@ pub(super) fn statuses_to_dashboard_apps(
             row.state = "unhealthy".into();
         }
     }
-    for app in desired.iter().filter(|app| app.blocked.is_some()) {
+    // A quota block, or a volume app waiting for its home node (#423): either
+    // way the scheduler holds it back on purpose, so it reads as blocked.
+    for app in desired
+        .iter()
+        .filter(|app| app.blocked.is_some() || app.volume_home_away.is_some())
+    {
         if let Some(row) = rows.get_mut(&(app.namespace.clone(), app.app.clone()))
             && row.state == "pending"
         {
@@ -331,11 +336,21 @@ pub(super) async fn app_detail_handler(
     let (overall_state, desired_instances) = summary
         .map(|row| (row.state, row.instances_desired))
         .unwrap_or_else(|| ("unknown".to_string(), 0));
-    let blocked = desired
-        .iter()
-        .find(|evidence| evidence.app == app && evidence.namespace == namespace)
-        .and_then(|evidence| evidence.blocked.as_ref())
-        .map(ToString::to_string);
+    let blocked =
+        desired
+            .iter()
+            .find(|evidence| evidence.app == app && evidence.namespace == namespace)
+            .and_then(|evidence| {
+                evidence
+                    .blocked
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        evidence.volume_home_away.as_ref().map(|home| {
+                    format!("waiting for {home}, which holds its volume and is out of the cluster")
+                })
+                    })
+            });
 
     let env = if let Some(council) = &state.council {
         let desired = council.desired_state().await;

@@ -523,6 +523,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             placements: Default::default(),
                             service_port: spec.port,
                             blocked: None,
+                            volume_home_away: None,
                         },
                     )
                     .collect::<Vec<_>>();

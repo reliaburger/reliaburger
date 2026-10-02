@@ -207,6 +207,10 @@ pub struct ReplicaObservation {
     /// no room for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// The node holding the app's managed volume, when that node is out of
+    /// the cluster and the app waits for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_home_away: Option<String>,
 }
 
 /// One active Smoker fault.
