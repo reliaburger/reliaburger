@@ -106,6 +106,9 @@ enum Command {
         /// Show only this instance's lines (e.g. default__web-2).
         #[arg(long)]
         instance: Option<String>,
+        /// Show only one stream: stdout or stderr; not with --follow.
+        #[arg(long)]
+        stream: Option<String>,
         /// Filter structured JSON logs by field (key=value).
         #[arg(long)]
         json_field: Option<String>,
@@ -1276,6 +1279,7 @@ async fn main() -> ExitCode {
             ref since,
             ref until,
             ref instance,
+            ref stream,
             ref json_field,
             ref namespace,
         } => {
@@ -1289,6 +1293,7 @@ async fn main() -> ExitCode {
                     since: since.clone(),
                     until: until.clone(),
                     instance: instance.clone(),
+                    stream: stream.clone(),
                     json_field: json_field.clone(),
                 },
             )

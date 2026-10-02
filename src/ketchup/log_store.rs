@@ -570,14 +570,7 @@ impl LogStore {
         let timestamps: Vec<u64> = self.buffer.iter().map(|e| e.timestamp).collect();
         let apps: Vec<&str> = self.buffer.iter().map(|e| e.app.as_str()).collect();
         let namespaces: Vec<&str> = self.buffer.iter().map(|e| e.namespace.as_str()).collect();
-        let streams: Vec<&str> = self
-            .buffer
-            .iter()
-            .map(|e| match e.stream {
-                LogStream::Stdout => "stdout",
-                LogStream::Stderr => "stderr",
-            })
-            .collect();
+        let streams: Vec<&str> = self.buffer.iter().map(|e| e.stream.as_str()).collect();
         let lines: Vec<&str> = self.buffer.iter().map(|e| e.line.as_str()).collect();
         let sequences: Vec<u64> = self.buffer.iter().map(|e| e.sequence).collect();
         let instances: Vec<Option<&str>> =
@@ -791,6 +784,7 @@ impl LogStore {
             end,
             grep: grep.map(str::to_string),
             instance: None,
+            stream: None,
             tail,
         };
         self.query_with(app, namespace, &filter).await
@@ -831,6 +825,9 @@ impl LogStore {
             let instance = escape_sql_literal(instance);
             conditions.push(format!("instance = '{instance}'"));
         }
+        if let Some(stream) = filter.stream {
+            conditions.push(format!("stream = '{}'", stream.as_str()));
+        }
 
         let where_clause = conditions.join(" AND ");
         let select = format!(
@@ -861,6 +858,8 @@ pub struct LogFilter {
     pub grep: Option<String>,
     /// Only this instance's lines (`default__web-0`).
     pub instance: Option<String>,
+    /// Only the lines written to this stream.
+    pub stream: Option<LogStream>,
     /// Only the newest N matching lines.
     pub tail: Option<usize>,
 }
@@ -1566,6 +1565,37 @@ mod tests {
         };
         let found = store.query_with("web", "default", &filter).await.unwrap();
         assert_eq!(lines(&found), ["from zero", "zero again"]);
+    }
+
+    /// F07 part 2: `--stream stderr` keeps the lines a workload wrote to
+    /// stderr.
+    #[tokio::test]
+    async fn query_filters_by_stream() {
+        let (mut store, _dir) = test_store();
+        store.append_at(1, "web", "default", LogStream::Stdout, "all good");
+        store.append_at(2, "web", "default", LogStream::Stderr, "panic: oh no");
+        store.append_at(3, "web", "default", LogStream::Stdout, "still good");
+
+        let filter = LogFilter {
+            stream: Some(LogStream::Stderr),
+            ..LogFilter::default()
+        };
+        let found = store.query_with("web", "default", &filter).await.unwrap();
+        assert_eq!(lines(&found), ["panic: oh no"]);
+        let filter = LogFilter {
+            stream: Some(LogStream::Stdout),
+            ..LogFilter::default()
+        };
+        let found = store.query_with("web", "default", &filter).await.unwrap();
+        assert_eq!(lines(&found), ["all good", "still good"]);
+    }
+
+    #[test]
+    fn stream_names_round_trip() {
+        for stream in [LogStream::Stdout, LogStream::Stderr] {
+            assert_eq!(LogStream::parse(stream.as_str()), Some(stream));
+        }
+        assert_eq!(LogStream::parse("stdin"), None);
     }
 
     /// `--until` is the existing `end`, inclusive.

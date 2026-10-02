@@ -13,6 +13,8 @@ pub(super) struct LogsQuery {
     pub(super) grep: Option<String>,
     /// Only this instance's lines (`default__web-0`).
     pub(super) instance: Option<String>,
+    /// Only lines written to this stream: `stdout` or `stderr`.
+    pub(super) stream: Option<String>,
     /// Follow only this node's instances. Set on the internal per-node
     /// streams of a cluster-wide follow, so a peer never fans out again.
     pub(super) local: Option<bool>,
@@ -45,6 +47,13 @@ pub(super) async fn logs_handler(
         return resp;
     }
     let follow = query.follow.unwrap_or(false);
+    // A followed stream's tail comes from the raw capture, which doesn't
+    // keep each line's stream; refuse rather than half-filter.
+    if follow && query.stream.is_some() {
+        return log_query_error(crate::ketchup::types::KetchupError::QueryRejected {
+            reason: "stream can't be combined with follow".to_string(),
+        });
+    }
 
     if follow {
         // A cluster member follows every node that runs the app; the
@@ -532,24 +541,44 @@ pub(super) async fn logs_entries_handler(
     };
 
     let store = log_store.read().await;
-    match store
-        .query_with(&app, &namespace, &log_filter(&query))
-        .await
-    {
+    let filter = match log_filter(&query) {
+        Ok(filter) => filter,
+        Err(e) => return log_query_error(e),
+    };
+    match store.query_with(&app, &namespace, &filter).await {
         Ok(entries) => Json(entries).into_response(),
         Err(e) => log_query_error(e),
     }
 }
 
-/// The store filter a request's query parameters ask for.
-fn log_filter(query: &LogsQuery) -> crate::ketchup::log_store::LogFilter {
-    crate::ketchup::log_store::LogFilter {
+/// The store filter a request's query parameters ask for, or why they don't
+/// make one.
+fn log_filter(
+    query: &LogsQuery,
+) -> Result<crate::ketchup::log_store::LogFilter, crate::ketchup::types::KetchupError> {
+    Ok(crate::ketchup::log_store::LogFilter {
         start: query.start,
         end: query.end,
         grep: query.grep.clone(),
         instance: query.instance.clone(),
+        stream: parse_stream(query.stream.as_deref())?,
         tail: query.tail,
-    }
+    })
+}
+
+/// `stdout`, `stderr` or nothing; any other value is refused.
+fn parse_stream(
+    stream: Option<&str>,
+) -> Result<Option<crate::ketchup::types::LogStream>, crate::ketchup::types::KetchupError> {
+    stream
+        .map(|name| {
+            crate::ketchup::types::LogStream::parse(name).ok_or_else(|| {
+                crate::ketchup::types::KetchupError::QueryRejected {
+                    reason: format!("stream {name:?} is neither stdout nor stderr"),
+                }
+            })
+        })
+        .transpose()
 }
 
 /// A refused query (a grep pattern that won't compile) is the caller's
@@ -601,6 +630,10 @@ pub(super) async fn logs_cross_node_handler(
     {
         return log_query_error(error);
     }
+    let stream = match parse_stream(query.stream.as_deref()) {
+        Ok(stream) => stream,
+        Err(error) => return log_query_error(error),
+    };
 
     // Build a LogQuery from request params
     let log_query = LogQuery {
@@ -610,6 +643,7 @@ pub(super) async fn logs_cross_node_handler(
         end: query.end,
         grep: query.grep.clone(),
         instance: query.instance.clone(),
+        stream,
         json_field: None,
         // The newest N cluster-wide are among each node's newest N, so every
         // node sends only its own tail; the merge below trims to N again.
@@ -696,11 +730,12 @@ pub(super) async fn logs_cross_node_handler(
             .into_response();
         };
 
+        let filter = match log_filter(&query) {
+            Ok(filter) => filter,
+            Err(e) => return log_query_error(e),
+        };
         let store = log_store.read().await;
-        match store
-            .query_with(&app, &namespace, &log_filter(&query))
-            .await
-        {
+        match store.query_with(&app, &namespace, &filter).await {
             Ok(entries) => Json(LogQueryResult {
                 entries,
                 node_count: 1,
