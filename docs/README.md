@@ -696,7 +696,7 @@ a release that trusts both old and new keys, then dropping the old one.
 ```sh
 relish dev create mycluster --nodes 3
 limactl shell reliaburger-1 relish nodes     # all three nodes
-limactl shell reliaburger-1 relish council   # council members + leader
+limactl shell reliaburger-1 relish council   # every node's council view + leader
 relish dev destroy mycluster
 ```
 

@@ -1903,6 +1903,7 @@ async fn a_worker_outside_raft_forwards_upgrade_calls_to_the_leader_gossip_names
             leader: Some(crate::mustard::message::LeaderHint {
                 node_id: crate::meat::NodeId::new("node-1"),
                 term: 1,
+                recovery_epoch: 0,
                 api_address: leader_api,
                 reporting_address: leader_api,
             }),

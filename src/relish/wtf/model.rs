@@ -137,6 +137,12 @@ pub struct CouncilObservation {
     pub reachable_members: usize,
     /// Current leader node identifier, when one is elected.
     pub leader: Option<String>,
+    /// Council members whose Bun API did not answer.
+    #[serde(default)]
+    pub missing_members: Vec<String>,
+    /// Every node's own view of the council, to catch a split (#424).
+    #[serde(default)]
+    pub nodes: Vec<crate::relish::council_view::CouncilNodeObservation>,
 }
 
 /// One timestamped workload restart.

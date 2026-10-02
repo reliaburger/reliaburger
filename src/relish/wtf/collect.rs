@@ -13,6 +13,7 @@ use crate::ketchup::types::{LogQueryResult, LogStream};
 use crate::onion::types::ResolveResponse;
 use crate::relish::RelishError;
 use crate::relish::client::BunClient;
+use crate::relish::council_view::CouncilNodeObservation;
 
 use super::{
     AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
@@ -40,6 +41,8 @@ struct NodeCollection {
     faults: Result<Vec<crate::smoker::types::FaultSummary>, String>,
     instances: Result<Vec<InstanceStatus>, String>,
     version: Result<crate::relish::client::AgentVersion, String>,
+    /// The node's own view of the council (#424).
+    council: Result<CouncilStatus, String>,
 }
 
 struct LocalEvidenceSet {
@@ -253,10 +256,11 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
                 faults: Err(reason.clone()),
                 instances: Err(reason.clone()),
                 version: Err(reason.clone()),
+                council: Err(reason.clone()),
             };
         }
     };
-    let (health, diagnostics, events, deploys, alerts, faults, instances, version) = tokio::join!(
+    let (health, diagnostics, events, deploys, alerts, faults, instances, version, council) = tokio::join!(
         bounded("health", client.health()),
         bounded("diagnostics", client.diagnostics(1)),
         bounded("events", client.node_events(EVENT_LIMIT)),
@@ -265,6 +269,7 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
         bounded("faults", client.list_faults()),
         bounded("instances", client.status()),
         bounded("version", client.version()),
+        bounded("council", client.council()),
     );
     NodeCollection {
         node_id,
@@ -276,6 +281,7 @@ async fn collect_node(endpoint: &NodeEndpoint) -> NodeCollection {
         faults,
         instances,
         version,
+        council,
     }
 }
 
@@ -411,6 +417,8 @@ fn collect_council_evidence(
                 member_count: 0,
                 reachable_members: 0,
                 leader: None,
+                missing_members: Vec::new(),
+                nodes: Vec::new(),
             },
         );
     }
@@ -418,20 +426,31 @@ fn collect_council_evidence(
         .iter()
         .map(|node| (node.node_id.as_str(), node.reachable))
         .collect::<BTreeMap<_, _>>();
+    // Every node's own view: one node's answer can't show a split (#424).
+    let nodes = collected
+        .iter()
+        .map(|node| match &node.council {
+            Ok(status) => CouncilNodeObservation::answered(&node.node_id, status),
+            Err(error) => CouncilNodeObservation::unanswered(&node.node_id, error.clone()),
+        })
+        .collect::<Vec<_>>();
     match council {
         Ok(council) if !council.members.is_empty() => {
-            let reachable_members = council
+            let missing_members = council
                 .members
                 .iter()
-                .filter(|member| health.get(member.name.as_str()).copied().unwrap_or(false))
-                .count();
+                .filter(|member| !health.get(member.name.as_str()).copied().unwrap_or(false))
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>();
             Evidence::available(
                 observed_at,
                 CouncilObservation {
                     enabled: true,
                     member_count: council.members.len(),
-                    reachable_members,
+                    reachable_members: council.members.len() - missing_members.len(),
                     leader: council.leader,
+                    missing_members,
+                    nodes,
                 },
             )
         }
@@ -1130,6 +1149,7 @@ mod tests {
             faults: Err("unused".to_string()),
             instances: Err("unused".to_string()),
             version: Err("unused".into()),
+            council: Err("unused".into()),
         }];
 
         let evidence = collect_local_diagnostics(&collected, 10);
@@ -1168,6 +1188,7 @@ mod tests {
             faults: Err("unused".into()),
             instances: Err("unused".into()),
             version: Err("unused".into()),
+            council: Err("unused".into()),
         });
         let evidence = collect_alerts(&collected, None, 10);
         let observed = evidence.value().unwrap();
@@ -1188,6 +1209,7 @@ mod tests {
             faults: Err("unused".to_string()),
             instances: Err("unused".to_string()),
             version: Err("unused".into()),
+            council: Err("unused".into()),
         }];
 
         let evidence = collect_restarts(&collected, 10);
@@ -1209,6 +1231,7 @@ mod tests {
             faults: Err("unused".to_string()),
             instances: Err("unused".to_string()),
             version: Err("unused".into()),
+            council: Err("unused".into()),
         }];
 
         let evidence = collect_restarts(&collected, 10);
@@ -1369,6 +1392,7 @@ mod tests {
             faults: Err("unused".into()),
             instances: Err("unused".into()),
             version,
+            council: Err("unused".into()),
         });
 
         let evidence = collect_builds(&collected, 10);

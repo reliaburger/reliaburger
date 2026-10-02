@@ -12,6 +12,7 @@ use openraft::{ChangeMembers, Raft, RaftNetworkFactory};
 use tokio::sync::watch;
 
 use super::CouncilError;
+use super::fence::{FenceSnapshot, RecoveryFence};
 #[cfg(test)]
 use super::log_store::MemLogStore;
 use super::state_machine::CouncilStateMachine;
@@ -35,6 +36,19 @@ pub struct CsrSignResult {
     pub serial: SerialNumber,
 }
 
+/// The Raft metrics type every council consumer watches.
+pub type RaftMetrics = openraft::RaftMetrics<u64, CouncilNodeInfo>;
+
+/// How the rest of the node should see `metrics` under `fence`: a fenced
+/// node's council was replaced, so it names no leader and is no leader.
+fn fenced_view(mut metrics: RaftMetrics, fence: &FenceSnapshot) -> RaftMetrics {
+    if fence.fenced_by().is_some() {
+        metrics.current_leader = None;
+        metrics.state = openraft::ServerState::Follower;
+    }
+    metrics
+}
+
 // ---------------------------------------------------------------------------
 // CouncilNode
 // ---------------------------------------------------------------------------
@@ -54,6 +68,9 @@ pub struct CouncilNode {
     consumer_contacts: tokio::sync::Mutex<crate::onion::lease::ConsumerContacts>,
     /// Master secret for unwrapping CA private keys (in-memory only).
     wrapping_ikm: Option<[u8; 32]>,
+    /// The recovery fence (#424) and the Raft metrics as the rest of the node
+    /// should see them: a fenced node never claims a leader.
+    fence: Option<(RecoveryFence, watch::Receiver<RaftMetrics>)>,
     /// Test hook: writes and linearizable reads never return, as they don't
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
@@ -105,9 +122,53 @@ impl CouncilNode {
                 std::time::Instant::now(),
             )),
             wrapping_ikm,
+            fence: None,
             #[cfg(test)]
             writes_hang: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Put this node behind a recovery fence (#424), shared with its Raft
+    /// transport. Once the fence closes, writes and linearizable reads are
+    /// refused, and [`metrics`](Self::metrics) stops naming any leader, so
+    /// the leader hint, placement and every leader-only loop stand down.
+    ///
+    /// Spawns the task that filters the metrics, so call it on the runtime.
+    pub fn with_recovery_fence(mut self, fence: RecoveryFence) -> Self {
+        let mut raw = self.raft.metrics();
+        let mut fence_rx = fence.subscribe();
+        let (filtered_tx, filtered_rx) =
+            watch::channel(fenced_view(raw.borrow().clone(), &fence_rx.borrow()));
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = raw.changed() => if changed.is_err() { break },
+                    changed = fence_rx.changed() => if changed.is_err() { break },
+                }
+                let view = fenced_view(raw.borrow().clone(), &fence_rx.borrow());
+                if filtered_tx.send(view).is_err() {
+                    break;
+                }
+            }
+        });
+        self.fence = Some((fence, filtered_rx));
+        self
+    }
+
+    /// This node's recovery fence, when it runs behind one.
+    pub fn recovery_fence(&self) -> Option<&RecoveryFence> {
+        self.fence.as_ref().map(|(fence, _)| fence)
+    }
+
+    /// The fence error, when this node is fenced.
+    fn fenced_error(&self) -> Option<CouncilError> {
+        let snapshot = self.recovery_fence()?.snapshot();
+        snapshot
+            .fenced_by()
+            .map(|newer_epoch| CouncilError::Fenced {
+                epoch: snapshot.epoch,
+                newer_epoch,
+            })
     }
 
     /// Test hook: from now on every write and linearizable read hangs.
@@ -145,6 +206,9 @@ impl CouncilNode {
     pub async fn write(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
         #[cfg(test)]
         self.hang_if_asked().await;
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
         let _membership = if matches!(
             &request,
             RaftRequest::ReserveNodeFault { .. } | RaftRequest::DecommissionNode { .. }
@@ -169,11 +233,17 @@ impl CouncilNode {
 
     /// Return the current leader's node ID, if known.
     pub async fn current_leader(&self) -> Option<u64> {
+        if self.fenced_error().is_some() {
+            return None;
+        }
         self.raft.current_leader().await
     }
 
     /// Return `true` if this node is the current leader.
     pub async fn is_leader(&self) -> bool {
+        if self.fenced_error().is_some() {
+            return false;
+        }
         self.raft.ensure_linearizable().await.is_ok()
     }
 
@@ -190,8 +260,13 @@ impl CouncilNode {
     }
 
     /// Subscribe to Raft metrics changes.
-    pub fn metrics(&self) -> watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>> {
-        self.raft.metrics()
+    ///
+    /// Behind a recovery fence, a fenced node's metrics name no leader.
+    pub fn metrics(&self) -> watch::Receiver<RaftMetrics> {
+        match &self.fence {
+            Some((_, filtered)) => filtered.clone(),
+            None => self.raft.metrics(),
+        }
     }
 
     /// Read the current desired state from the state machine.
@@ -355,6 +430,9 @@ impl CouncilNode {
     ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
         #[cfg(test)]
         self.hang_if_asked().await;
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
         self.raft
             .ensure_linearizable()
             .await

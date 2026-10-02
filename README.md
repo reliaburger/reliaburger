@@ -80,8 +80,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
 - `relish nodes`: List cluster nodes and their gossip state
-- `relish council`: Show council (Raft) composition and status, or recover from full loss
+- `relish council`: Show the council (Raft) on every node, or recover from full loss
+  - `relish council status`: Show every node's view of the council (the default)
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
+  - `relish council re-enrol --data-dir <DATA_DIR>`: Re-enrol a voter fenced out by `council recover`
 - `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
 - `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
 
@@ -220,7 +222,9 @@ change. `relish import` writes the equivalent TOML if you'd rather keep that.
 
 **Clustering without etcd.** Nodes find each other and detect failure with SWIM
 gossip. A small Raft council, embedded in the agent, holds cluster state. Lose
-a node and the scheduler moves its workloads to the survivors.
+a node and the scheduler moves its workloads to the survivors. Lose the whole
+council and `relish council recover` rebuilds it from a backup, fencing off the
+old voters if they return; `relish council status` shows every node's view.
 
 **Service discovery in the kernel.** Every app gets a stable virtual IP and,
 with DNS enabled, a `.internal` name. An eBPF connect hook sends each

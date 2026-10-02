@@ -309,6 +309,7 @@ async fn consumer_reconciler_retries_lost_receipts_after_tls_leader_change() {
         leader: Some(reliaburger::mustard::message::LeaderHint {
             node_id: reliaburger::meat::NodeId::new("leader"),
             term: index as u64 + 1,
+            recovery_epoch: 0,
             api_address: addresses[index],
             reporting_address: addresses[index],
         }),

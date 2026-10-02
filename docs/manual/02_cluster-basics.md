@@ -73,8 +73,8 @@ it, and list your own laptop's network in `[security] operator_cidrs` so
 ## Watch it
 
 ```sh
-relish nodes      # gossip membership and node state
-relish council    # Raft voters and the current leader
+relish nodes            # gossip membership and node state
+relish council status   # every node's view of the council
 ```
 
 `relish nodes` shows every member's gossip state: `alive`, `suspect` (missed
@@ -82,6 +82,14 @@ its probes, not yet declared dead) or `dead`. A dead node stays listed for up
 to a day after it was last heard from, so you can see what went missing. It
 drops off sooner if it comes back, leaves the cluster on purpose, or you
 retire it with `relish decommission-node`.
+
+`relish council status` asks every node, through the one you're connected to,
+for its own view: its role, recovery epoch, Raft term and log position. Above
+the table it prints the epoch, the leader and quorum (`3/3 voters, quorum
+ok`), and it lists any node that didn't answer. One node's answer can't show a
+split, so it compares them all and calls out fenced nodes, two epochs or two
+leaders. `--output json` gives the same report to scripts. `relish status` opens
+with a one-line summary of it.
 
 The council heals itself: lose a voter and the reconciler promotes a caught-up
 node in its place. If every voter is lost, `relish council recover` rebuilds

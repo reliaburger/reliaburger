@@ -525,6 +525,7 @@ mod tests {
             leader: None,
             labels: std::collections::BTreeMap::new(),
             disk_pressured: false,
+            recovery_epoch: None,
             hmac: [0u8; 32],
         }
     }

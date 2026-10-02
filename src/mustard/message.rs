@@ -214,6 +214,10 @@ pub struct LeaderHint {
     pub node_id: NodeId,
     /// The Raft term this hint was observed under.
     pub term: u64,
+    /// The leader's recovery epoch (#424). A recovered council restarts its
+    /// term line, so hints order by epoch first and term second: otherwise
+    /// a stale hint from the replaced council's higher term would win.
+    pub recovery_epoch: u64,
     /// The leader's advertised HTTP API endpoint.
     pub api_address: SocketAddr,
     /// The leader's advertised reporting-tree endpoint.
@@ -254,6 +258,11 @@ pub struct DirectoryExtension {
     /// replaced. The extension HMAC covers it, so a flipped `disk_pressured`
     /// bit fails verification.
     pub disk_pressured: bool,
+    /// The stamping node's recovery epoch (#424), or `None` while it holds
+    /// none (a fresh node no council has contacted yet). A restarted voter
+    /// reads its peers' epochs here to learn, before it serves Raft, whether
+    /// a recovery replaced its council.
+    pub recovery_epoch: Option<u64>,
     /// HMAC-SHA256 over the carrying message's canonical bytes plus this
     /// extension with `hmac` zeroed. Zeroed when gossip runs unkeyed.
     pub hmac: [u8; 32],
@@ -618,11 +627,13 @@ mod tests {
             leader: Some(LeaderHint {
                 node_id: NodeId::new("leader"),
                 term: 7,
+                recovery_epoch: 0,
                 api_address: SocketAddr::from(([10, 0, 0, 1], 9117)),
                 reporting_address: SocketAddr::from(([10, 0, 0, 1], 9445)),
             }),
             labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
             disk_pressured: false,
+            recovery_epoch: None,
             hmac: [0u8; 32],
         }
     }

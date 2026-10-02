@@ -674,8 +674,9 @@ relish exec <app> --namespace <ns> <cmd...>  # Scope to a namespace
 relish init [dir] --cluster-name <name> --node-id <id> # Generate config + PKI
 relish init [dir] --development-plaintext              # Local-only plaintext transports
 relish nodes                        # Gossip membership and node state
-relish council                      # Raft voters and the current leader
+relish council [status]             # Every node's council view: role, epoch, term, log, quorum
 relish council recover --data-dir <dir> [--from <url>] [--master-key <path>] [--force]
+relish council re-enrol --data-dir <dir> [--force]  # Drop a fenced voter's Raft state to rejoin
 relish join --token <token> --node-id <id> <api-addr>  # Enrol a node identity
 relish join --token <t> --node-id <id> <addr> --ca-fingerprint sha256:... [--identity-dir <dir>]
 
