@@ -348,11 +348,14 @@ pub async fn start(
     // existing cluster from durable state instead of re-initialising into a
     // fresh single-node cluster (which would elect itself a second leader —
     // the split-brain bug this stage fixes). The one other fresh store that
-    // bootstraps is a survivor `relish council recover` just stamped with a
-    // newer recovery epoch: it must re-form its council even when its config
-    // still lists join seeds.
+    // bootstraps is a survivor `relish council recover` just stamped (#429):
+    // it must re-form its council even when its config still lists join
+    // seeds. Only an offline recovery snapshot counts (an epoch, but no log
+    // position or membership); a joiner holding an installed snapshot from
+    // the recovered council must never start a council of its own.
     let snapshot_epoch = state_machine.desired_state().await.recovery_epoch;
-    let bootstrapping = store_fresh && (params.seeds.is_empty() || snapshot_epoch > 0);
+    let recovered_bootstrap = state_machine.recovered_bootstrap_pending().await;
+    let bootstrapping = store_fresh && (params.seeds.is_empty() || recovered_bootstrap);
 
     // The recovery fence (C5, #424): this node's epoch claim, stamped on
     // every Raft RPC and enforced in both directions. A node holding Raft
@@ -471,7 +474,7 @@ pub async fn start(
             params.bootstrap_security_state.as_deref(),
         )
         .await?;
-        if snapshot_epoch > 0 {
+        if recovered_bootstrap {
             compact_recovered_log(&council).await?;
         }
     }
