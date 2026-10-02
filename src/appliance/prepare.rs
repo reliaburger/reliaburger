@@ -32,6 +32,10 @@ pub struct Paths {
     pub stick_wait: Duration,
     /// `/sys/class/net`, for this machine's MAC addresses.
     pub net_dir: PathBuf,
+    /// Where an unclaimed machine keeps its claim key and a claimed seed
+    /// (`super::claim`). `None` runs no claim server: no seed then means
+    /// bun runs standalone.
+    pub claim_dir: Option<PathBuf>,
 }
 
 impl Paths {
@@ -43,6 +47,7 @@ impl Paths {
             stick_mount: PathBuf::from("/run/reliaburger-seed-stick"),
             stick_wait: Duration::from_secs(10),
             net_dir: PathBuf::from("/sys/class/net"),
+            claim_dir: Some(PathBuf::from("/var/lib/reliaburger/claim")),
         }
     }
 
@@ -133,6 +138,8 @@ pub enum PrepareError {
 /// Where the seed came from, for the log and for wiping a create seed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
+    /// Posted by `relish machines claim`.
+    Claim,
     Credential,
     Stick {
         file: String,
@@ -144,6 +151,7 @@ pub enum Source {
 impl std::fmt::Display for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Source::Claim => write!(f, "a claim over the LAN"),
             Source::Credential => write!(f, "the reliaburger.seed credential"),
             Source::Stick { file } => write!(f, "the RBSEED stick ({file})"),
             Source::Kept => write!(f, "the seed kept from an earlier boot"),
@@ -158,7 +166,13 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
         say("node.toml is in place");
         return Ok(Step::Done);
     }
-    let found = find_seed(paths)?;
+    let mut found = find_seed(paths)?;
+    if found.is_none()
+        && let Some(claim_dir) = &paths.claim_dir
+    {
+        wait_for_claim(paths, claim_dir).await?;
+        found = find_seed(paths)?;
+    }
     let (seed, source) = match found {
         Some((seed, source)) => (Some(seed), Some(source)),
         None => (None, None),
@@ -171,6 +185,11 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
         match (step, &seed) {
             (Step::Done, _) => {
                 say("node.toml is in place");
+                if let Some(claim_dir) = &paths.claim_dir {
+                    // The claimed seed may hold the master key; its files are
+                    // installed now.
+                    let _ = std::fs::remove_file(claim_dir.join("claimed.seed"));
+                }
                 if let (Some(Source::Stick { file }), Some(Seed::V1 { config, .. })) =
                     (&source, &seed)
                     && config.role == SeedRole::Create
@@ -242,6 +261,15 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
 /// The seed, from (in order) the credential, the stick, or the copy kept
 /// from an earlier boot.
 fn find_seed(paths: &Paths) -> Result<Option<(Seed, Source)>, PrepareError> {
+    if let Some(claim_dir) = &paths.claim_dir {
+        let path = claim_dir.join("claimed.seed");
+        if path.is_file() {
+            return Ok(Some((
+                Seed::from_tar_gz(&std::fs::read(path)?)?,
+                Source::Claim,
+            )));
+        }
+    }
     if let Some(dir) = &paths.credentials_dir {
         let path = dir.join("reliaburger.seed");
         if path.is_file() {
@@ -268,6 +296,34 @@ fn find_seed(paths: &Paths) -> Result<Option<(Seed, Source)>, PrepareError> {
         )));
     }
     Ok(None)
+}
+
+/// No seed anywhere: become unclaimed until `relish machines claim` posts one.
+async fn wait_for_claim(paths: &Paths, claim_dir: &Path) -> Result<(), PrepareError> {
+    let key = super::claim::ClaimKey::load_or_create(claim_dir)?;
+    let info = super::claim::MachineInfo {
+        macs: stick_names(&paths.net_dir)
+            .into_iter()
+            .map(|name| name.replace('-', ":"))
+            .collect(),
+        arch: std::env::consts::ARCH.to_string(),
+        os_version: std::fs::read_to_string("/usr/lib/os-release")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("IMAGE_VERSION="))
+                    .map(|v| v.trim_matches('"').to_string())
+            }),
+        fingerprint: key.fingerprint(),
+    };
+    say(&format!(
+        "no seed: unclaimed, claim key {} on port {}",
+        super::claim::short_fingerprint(&info.fingerprint),
+        super::claim::CLAIM_PORT
+    ));
+    super::claim::serve_until_claimed(&key, info, claim_dir.join("claimed.seed")).await?;
+    say("claimed");
+    Ok(())
 }
 
 /// This machine's MAC addresses as the stick names them (`aa-bb-…`).
@@ -508,7 +564,7 @@ fn write_private(path: &Path, data: Option<&Vec<u8>>) -> Result<(), PrepareError
 }
 
 /// Write beside the target and rename into place, with owner-only modes.
-fn write_atomic(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::DirBuilder::new()
@@ -648,6 +704,7 @@ mod tests {
             stick_mount: dir.join("mnt"),
             stick_wait: Duration::ZERO,
             net_dir: dir.join("net"),
+            claim_dir: None,
         }
     }
 

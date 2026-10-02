@@ -18,6 +18,9 @@ pub struct Status {
     pub macs: Vec<String>,
     /// From bun's `/v1/health`: `None` when bun doesn't answer.
     pub healthy: Option<bool>,
+    /// An unclaimed machine's claim key, as a person compares it
+    /// (`super::claim::short_fingerprint`).
+    pub claim_key: Option<String>,
     /// Lines from `bun appliance prepare`, when it's still working (an
     /// unseeded node, or one enrolling).
     pub notes: Vec<String>,
@@ -75,8 +78,14 @@ pub fn render(status: &Status, width: usize) -> String {
             format!("{bun} ({})", status.bun_version.as_deref().unwrap_or("-")),
         ),
     ];
+    let claim_row = status
+        .claim_key
+        .as_ref()
+        .filter(|_| status.node.is_none())
+        .map(|key| ("Claim key", key.clone()));
+    let rows = rows.into_iter().chain(claim_row);
     for (label, value) in rows {
-        let line = format!("  {label:<9}{value}");
+        let line = format!("  {label:<11}{value}");
         let _ = writeln!(screen, "{}", truncate(&line, width));
     }
     if !status.notes.is_empty() {
@@ -86,7 +95,11 @@ pub fn render(status: &Status, width: usize) -> String {
         }
     }
     if status.node.is_none() {
-        let hint = "  Seed this machine: plug in its RBSEED stick and power-cycle it.";
+        let hint = if status.claim_key.is_some() {
+            "  Claim this machine with `relish machines claim`, comparing the claim key."
+        } else {
+            "  Seed this machine: plug in its RBSEED stick and power-cycle it."
+        };
         let _ = writeln!(screen, "\n{}", truncate(hint, width));
     }
     screen
@@ -119,6 +132,11 @@ pub async fn gather(paths: &super::Paths) -> Status {
             .map(|name| name.replace('-', ":"))
             .collect(),
         healthy: healthy().await,
+        claim_key: paths.claim_dir.as_ref().and_then(|dir| {
+            std::fs::read(dir.join("claim.crt")).ok().map(|der| {
+                super::claim::short_fingerprint(&super::claim::certificate_fingerprint(&der))
+            })
+        }),
         notes: Vec::new(),
     }
 }
@@ -179,21 +197,26 @@ mod tests {
             address: Some("192.168.1.52".into()),
             macs: vec!["d8:9e:f3:12:34:56".into()],
             healthy: Some(true),
+            claim_key: Some("ignored-once-seeded".into()),
             notes: vec![],
         };
         let screen = render(&status, 80);
         assert!(screen.starts_with("\x1b[2J\x1b[H"));
         for expected in [
             "Reliaburger OS 2026.41.0",
-            "  Node     home-2",
-            "  Cluster  home",
-            "  Address  192.168.1.52",
-            "  MAC      d8:9e:f3:12:34:56",
-            "  bun      running (0.1.3)",
+            "  Node       home-2",
+            "  Cluster    home",
+            "  Address    192.168.1.52",
+            "  MAC        d8:9e:f3:12:34:56",
+            "  bun        running (0.1.3)",
         ] {
             assert!(screen.contains(expected), "{expected:?} in\n{screen}");
         }
         assert!(!screen.contains("Seed this machine"));
+        assert!(
+            !screen.contains("Claim key"),
+            "a seeded node has no claim key"
+        );
     }
 
     #[test]
@@ -203,6 +226,22 @@ mod tests {
         assert!(screen.contains("waiting for DHCP"));
         assert!(screen.contains("not answering"));
         assert!(screen.contains("Seed this machine"));
+    }
+
+    #[test]
+    fn an_unclaimed_node_shows_its_claim_key() {
+        let screen = render(
+            &Status {
+                claim_key: Some("3f9a-12bc-77de-0a41".into()),
+                ..Status::default()
+            },
+            80,
+        );
+        assert!(
+            screen.contains("  Claim key  3f9a-12bc-77de-0a41"),
+            "{screen}"
+        );
+        assert!(screen.contains("relish machines claim"));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! on the next boot. See docs/plans/2026-10-01-plan-appliance-product.md, W2.
 
 pub mod address;
+pub mod claim;
 pub mod console;
 pub mod prepare;
 pub mod seed;
