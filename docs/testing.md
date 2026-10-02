@@ -107,8 +107,10 @@ Gates CI can't run are manual, so the evidence check skips them:
 [`select-jobs.sh`](../scripts/ci/select-jobs.sh) diffs a pull request against
 its base (with renames split into a deletion and an addition, so moving code
 into `docs/` still counts as code). Documentation-only changes skip the Rust
-jobs; pull requests stacked on another branch skip the heavy suites unless
-labelled `full-ci`. When GitHub retargets a stacked pull request to `main`,
+jobs. Pull requests into `main` or into a release's merge-train branch
+(`release-*`, one per release, e.g. `release-1-1-4`) run the heavy suites;
+pull requests stacked on any other branch skip them unless labelled
+`full-ci`. When GitHub retargets a stacked pull request to `main`,
 [`ci-retarget.yml`](../.github/workflows/ci-retarget.yml) reruns CI with the
 new base, so the heavy suites don't wait for another push. Its fixtures, in
 [`test_select_jobs.py`](../scripts/ci/test_select_jobs.py), cover each of

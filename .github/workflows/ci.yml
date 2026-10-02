@@ -5,9 +5,10 @@ on:
   push:
     branches: [main]
   pull_request:
-    # fix/** covers review PRs stacked on each other rather than on main, and
-    # feat/appliance-* the appliance workstreams stacked on #259.
-    branches: [main, "codex/**", "fix/**", "feat/appliance-*"]
+    # fix/** covers review PRs stacked on each other rather than on main,
+    # feat/appliance-* the appliance workstreams stacked on #259, and
+    # release-* each release's merge train: PRs into it get the whole of CI.
+    branches: [main, "codex/**", "fix/**", "feat/appliance-*", "release-*"]
     # labeled lets a `full-ci` label start the heavy suites on a stacked PR.
     types: [opened, synchronize, reopened, labeled]
   schedule:

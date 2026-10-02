@@ -136,6 +136,14 @@ class SelectJobsTests(unittest.TestCase):
         self.assertEqual(self.repo.select(base_ref="fix/base", base_sha=base),
                          {"code": True, "gossip": False, "heavy": False})
 
+    def test_a_pull_request_into_a_release_train_runs_the_heavy_suites(self):
+        # Each release collects its PRs on a `release-*` branch; those PRs
+        # are the release's changes, so they get the whole of CI.
+        base = self.stacked_base("src/lib.rs")
+        self.pull_request("src/lib.rs")
+        self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base),
+                         {"code": True, "gossip": False, "heavy": True})
+
     def test_the_full_ci_label_runs_the_heavy_suites_on_a_stacked_pull_request(self):
         base = self.stacked_base()
         self.pull_request("src/lib.rs")

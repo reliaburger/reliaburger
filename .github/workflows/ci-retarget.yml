@@ -8,7 +8,7 @@ name: CI after retarget
 # a run whose skipped jobs could replace the real results on the same commit.
 on:
   pull_request:
-    branches: [main, "codex/**", "fix/**", "feat/appliance-*"]
+    branches: [main, "codex/**", "fix/**", "feat/appliance-*", "release-*"]
     types: [edited]
 
 permissions:
