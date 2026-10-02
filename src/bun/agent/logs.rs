@@ -134,19 +134,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         });
     }
 
-    /// Start a `FollowLogs` stream from a task. An app with no instances
-    /// closes the stream at once, as it always has.
+    /// Start a `FollowLogs` stream from a task, of every instance of the app
+    /// or only `instance`. An app with no instances to follow closes the
+    /// stream at once, as it always has.
     pub(super) fn spawn_logs_follow(
         &self,
         app_name: &str,
         namespace: &str,
         tail: Option<usize>,
+        instance: Option<String>,
         label: Option<String>,
         lines: mpsc::Sender<String>,
     ) {
-        let Ok(instance_ids) = self.app_instance_ids(app_name, namespace) else {
+        let Ok(mut instance_ids) = self.app_instance_ids(app_name, namespace) else {
             return;
         };
+        if let Some(instance) = &instance {
+            instance_ids.retain(|id| &id.0 == instance);
+        }
         tokio::spawn(send_tail_then_follow(
             self.supervisor.grill().clone(),
             instance_ids,

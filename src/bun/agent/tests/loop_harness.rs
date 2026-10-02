@@ -992,6 +992,7 @@ async fn status_answers_while_a_follow_tail_waits_on_a_client_that_never_reads()
         app_name: "web".into(),
         namespace: "default".into(),
         tail: Some(200),
+        instance: None,
         label: None,
         lines,
     })

@@ -776,10 +776,7 @@ impl LogStore {
     }
 
     /// Query one app's logs by time range and grep pattern, oldest first.
-    ///
-    /// Rows come back in ingest order (`sequence`), which is emission order
-    /// per instance. With `tail`, only the newest `tail` matching rows come
-    /// back, still oldest first.
+    /// See [`Self::query_with`].
     pub async fn query(
         &self,
         app: &str,
@@ -789,6 +786,28 @@ impl LogStore {
         grep: Option<&str>,
         tail: Option<usize>,
     ) -> Result<Vec<LogEntry>, KetchupError> {
+        let filter = LogFilter {
+            start,
+            end,
+            grep: grep.map(str::to_string),
+            instance: None,
+            tail,
+        };
+        self.query_with(app, namespace, &filter).await
+    }
+
+    /// Query one app's logs through `filter`, oldest first.
+    ///
+    /// Rows come back in ingest order (`sequence`), which is emission order
+    /// per instance. With `tail`, only the newest `tail` matching rows come
+    /// back, still oldest first. `grep` is a regular expression; one that
+    /// doesn't compile is refused before any query runs.
+    pub async fn query_with(
+        &self,
+        app: &str,
+        namespace: &str,
+        filter: &LogFilter,
+    ) -> Result<Vec<LogEntry>, KetchupError> {
         // M1: escape single quotes so an app/namespace/grep param can't
         // break out of the SQL string literal and read other tenants' logs.
         let app = escape_sql_literal(app);
@@ -797,15 +816,20 @@ impl LogStore {
             format!("app = '{app}'"),
             format!("namespace = '{namespace}'"),
         ];
-        if let Some(s) = start {
+        if let Some(s) = filter.start {
             conditions.push(format!("timestamp >= {s}"));
         }
-        if let Some(e) = end {
+        if let Some(e) = filter.end {
             conditions.push(format!("timestamp <= {e}"));
         }
-        if let Some(g) = grep {
+        if let Some(g) = &filter.grep {
+            validate_grep(g)?;
             let g = escape_sql_literal(g);
-            conditions.push(format!("line LIKE '%{g}%'"));
+            conditions.push(format!("regexp_like(line, '{g}')"));
+        }
+        if let Some(instance) = &filter.instance {
+            let instance = escape_sql_literal(instance);
+            conditions.push(format!("instance = '{instance}'"));
         }
 
         let where_clause = conditions.join(" AND ");
@@ -814,7 +838,7 @@ impl LogStore {
              FROM logs WHERE {where_clause}"
         );
         // A tail takes the newest rows, then puts them back in order.
-        let sql = match tail {
+        let sql = match filter.tail {
             Some(tail) => format!(
                 "SELECT * FROM ({select} ORDER BY sequence DESC LIMIT {tail}) AS tailed \
                  ORDER BY sequence"
@@ -823,6 +847,32 @@ impl LogStore {
         };
         self.query_sql(&sql).await
     }
+}
+
+/// What a log query keeps. Every field narrows the result; the default keeps
+/// everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogFilter {
+    /// Seconds since the epoch, inclusive.
+    pub start: Option<u64>,
+    /// Seconds since the epoch, inclusive.
+    pub end: Option<u64>,
+    /// A regular expression a line must match somewhere.
+    pub grep: Option<String>,
+    /// Only this instance's lines (`default__web-0`).
+    pub instance: Option<String>,
+    /// Only the newest N matching lines.
+    pub tail: Option<usize>,
+}
+
+/// Refuse a `grep` pattern that won't compile, with the reason, before it
+/// reaches the query engine (whose error would read as a server fault).
+pub fn validate_grep(pattern: &str) -> Result<(), KetchupError> {
+    regex::Regex::new(pattern)
+        .map(|_| ())
+        .map_err(|error| KetchupError::QueryRejected {
+            reason: format!("grep pattern {pattern:?} isn't a valid regular expression: {error}"),
+        })
 }
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -1441,6 +1491,103 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].line.contains("ERROR"));
         assert_eq!(results[0].stream, LogStream::Stderr);
+    }
+
+    fn record(instance: &str, line: &str) -> super::super::types::LogRecord {
+        super::super::types::LogRecord {
+            app: "web".into(),
+            namespace: "default".into(),
+            instance: instance.into(),
+            stream: LogStream::Stdout,
+            line: line.into(),
+            position: None,
+        }
+    }
+
+    fn lines(entries: &[LogEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.line.as_str()).collect()
+    }
+
+    /// F07 part 2: `--grep` is a regular expression, as in grep itself.
+    #[tokio::test]
+    async fn grep_is_a_regular_expression() {
+        let (mut store, _dir) = test_store();
+        store.append_at(1, "web", "default", LogStream::Stdout, "GET /healthz 200");
+        store.append_at(2, "web", "default", LogStream::Stdout, "GET /ready 200");
+        store.append_at(3, "web", "default", LogStream::Stdout, "POST /orders 503");
+        store.append_at(4, "web", "default", LogStream::Stdout, "it's fine");
+
+        for (pattern, want) in [
+            (
+                "GET /(healthz|ready)",
+                vec!["GET /healthz 200", "GET /ready 200"],
+            ),
+            (r"5\d\d$", vec!["POST /orders 503"]),
+            ("it's", vec!["it's fine"]),
+            ("orders", vec!["POST /orders 503"]),
+        ] {
+            let filter = LogFilter {
+                grep: Some(pattern.into()),
+                ..LogFilter::default()
+            };
+            let found = store.query_with("web", "default", &filter).await.unwrap();
+            assert_eq!(lines(&found), want, "{pattern}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_grep_pattern_is_rejected() {
+        let (store, _dir) = test_store();
+        let filter = LogFilter {
+            grep: Some("(unclosed".into()),
+            ..LogFilter::default()
+        };
+        let error = store
+            .query_with("web", "default", &filter)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, KetchupError::QueryRejected { .. }),
+            "{error}"
+        );
+    }
+
+    /// F07 part 2: `--instance` keeps one replica's lines.
+    #[tokio::test]
+    async fn query_filters_by_instance() {
+        let (mut store, _dir) = test_store();
+        store.ingest_at(1, &record("default__web-0", "from zero"));
+        store.ingest_at(2, &record("default__web-1", "from one"));
+        store.ingest_at(3, &record("default__web-0", "zero again"));
+
+        let filter = LogFilter {
+            instance: Some("default__web-0".into()),
+            ..LogFilter::default()
+        };
+        let found = store.query_with("web", "default", &filter).await.unwrap();
+        assert_eq!(lines(&found), ["from zero", "zero again"]);
+    }
+
+    /// `--until` is the existing `end`, inclusive.
+    #[tokio::test]
+    async fn query_stops_at_the_end_time() {
+        let (mut store, _dir) = test_store();
+        for second in 1..=4 {
+            store.append_at(
+                second,
+                "web",
+                "default",
+                LogStream::Stdout,
+                &format!("at {second}"),
+            );
+        }
+        let filter = LogFilter {
+            start: Some(2),
+            end: Some(3),
+            ..LogFilter::default()
+        };
+        let found = store.query_with("web", "default", &filter).await.unwrap();
+        assert_eq!(lines(&found), ["at 2", "at 3"]);
     }
 
     #[tokio::test]

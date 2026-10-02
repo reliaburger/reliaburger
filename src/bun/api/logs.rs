@@ -11,6 +11,8 @@ pub(super) struct LogsQuery {
     pub(super) start: Option<u64>,
     pub(super) end: Option<u64>,
     pub(super) grep: Option<String>,
+    /// Only this instance's lines (`default__web-0`).
+    pub(super) instance: Option<String>,
     /// Follow only this node's instances. Set on the internal per-node
     /// streams of a cluster-wide follow, so a peer never fans out again.
     pub(super) local: Option<bool>,
@@ -48,7 +50,13 @@ pub(super) async fn logs_handler(
         // A cluster member follows every node that runs the app; the
         // per-node streams it opens come back here with `local=true`.
         if !query.local.unwrap_or(false)
-            && let Some(frames) = spawn_cluster_log_follow(&state, &app, &namespace, query.tail)
+            && let Some(frames) = spawn_cluster_log_follow(
+                &state,
+                &app,
+                &namespace,
+                query.tail,
+                query.instance.clone(),
+            )
         {
             let stream = ReceiverStream::new(frames)
                 .map(|frame| Ok::<_, std::convert::Infallible>(log_frame_event(frame)));
@@ -61,7 +69,16 @@ pub(super) async fn logs_handler(
             .unwrap_or(false)
             .then(|| state.node_name.clone())
             .flatten();
-        let lines_rx = match follow_local_logs(&state, app, namespace, query.tail, label).await {
+        let lines_rx = match follow_local_logs(
+            &state,
+            app,
+            namespace,
+            query.tail,
+            query.instance.clone(),
+            label,
+        )
+        .await
+        {
             Ok(lines_rx) => lines_rx,
             Err(response) => return response,
         };
@@ -97,6 +114,7 @@ pub(super) async fn follow_local_logs(
     app: String,
     namespace: String,
     tail: Option<usize>,
+    instance: Option<String>,
     label: Option<String>,
 ) -> Result<mpsc::Receiver<String>, Response> {
     let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
@@ -106,6 +124,7 @@ pub(super) async fn follow_local_logs(
             app_name: app,
             namespace,
             tail,
+            instance,
             label,
             lines: lines_tx,
         })
@@ -130,6 +149,7 @@ pub(super) fn spawn_cluster_log_follow(
     app: &str,
     namespace: &str,
     tail: Option<usize>,
+    instance: Option<String>,
 ) -> Option<mpsc::Receiver<LogFrame>> {
     let (Some(council), Some(membership), Some(self_name)) =
         (&state.council, &state.membership, &state.node_name)
@@ -145,6 +165,7 @@ pub(super) fn spawn_cluster_log_follow(
         app.to_string(),
         namespace.to_string(),
         tail,
+        instance,
         frames_tx,
     ));
     Some(frames_rx)
@@ -188,6 +209,7 @@ pub(super) async fn follow_cluster_logs(
     app: String,
     namespace: String,
     tail: Option<usize>,
+    instance: Option<String>,
     events: mpsc::Sender<LogFrame>,
 ) {
     let app_id = crate::meat::types::AppId::new(&app, &namespace);
@@ -251,6 +273,7 @@ pub(super) async fn follow_cluster_logs(
                     &app,
                     &namespace,
                     tail,
+                    instance.clone(),
                     &self_name,
                     events.clone(),
                     ended_tx.clone(),
@@ -269,6 +292,7 @@ pub(super) async fn follow_cluster_logs(
                     node.0.clone(),
                     url,
                     tail,
+                    instance.as_deref(),
                     events.clone(),
                     ended_tx.clone(),
                 ))
@@ -302,11 +326,13 @@ pub(super) async fn send_log_warning(events: &mpsc::Sender<LogFrame>, warning: S
 }
 
 /// Follow this node's own instances as one source of a cluster-wide follow.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_local_log_source(
     state: &ApiState,
     app: &str,
     namespace: &str,
     tail: Option<usize>,
+    instance: Option<String>,
     self_name: &str,
     events: mpsc::Sender<LogFrame>,
     ended: mpsc::Sender<LogSourceEnded>,
@@ -316,6 +342,7 @@ pub(super) async fn spawn_local_log_source(
         app.to_string(),
         namespace.to_string(),
         tail,
+        instance,
         Some(self_name.to_string()),
     )
     .await
@@ -341,6 +368,7 @@ pub(super) fn spawn_peer_log_source(
     node: String,
     url: String,
     tail: Option<usize>,
+    instance: Option<&str>,
     events: mpsc::Sender<LogFrame>,
     ended: mpsc::Sender<LogSourceEnded>,
 ) -> tokio::task::AbortHandle {
@@ -351,6 +379,9 @@ pub(super) fn spawn_peer_log_source(
     ]);
     if let Some(tail) = tail {
         request = request.query(&[("tail", tail)]);
+    }
+    if let Some(instance) = instance {
+        request = request.query(&[("instance", instance)]);
     }
     if let Some(token) = &state.service_token {
         request = request.bearer_auth(token);
@@ -417,9 +448,24 @@ pub(super) async fn ws_logs_handler(
     {
         return resp;
     }
-    let frames = match spawn_cluster_log_follow(&state, &app, &namespace, query.tail) {
+    let frames = match spawn_cluster_log_follow(
+        &state,
+        &app,
+        &namespace,
+        query.tail,
+        query.instance.clone(),
+    ) {
         Some(frames) => frames,
-        None => match follow_local_logs(&state, app, namespace, query.tail, None).await {
+        None => match follow_local_logs(
+            &state,
+            app,
+            namespace,
+            query.tail,
+            query.instance.clone(),
+            None,
+        )
+        .await
+        {
             Ok(lines) => frame_local_lines(lines),
             Err(response) => return response,
         },
@@ -487,23 +533,37 @@ pub(super) async fn logs_entries_handler(
 
     let store = log_store.read().await;
     match store
-        .query(
-            &app,
-            &namespace,
-            query.start,
-            query.end,
-            query.grep.as_deref(),
-            query.tail,
-        )
+        .query_with(&app, &namespace, &log_filter(&query))
         .await
     {
         Ok(entries) => Json(entries).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => log_query_error(e),
     }
+}
+
+/// The store filter a request's query parameters ask for.
+fn log_filter(query: &LogsQuery) -> crate::ketchup::log_store::LogFilter {
+    crate::ketchup::log_store::LogFilter {
+        start: query.start,
+        end: query.end,
+        grep: query.grep.clone(),
+        instance: query.instance.clone(),
+        tail: query.tail,
+    }
+}
+
+/// A refused query (a grep pattern that won't compile) is the caller's
+/// mistake, so it's a 400 with the reason; anything else is ours.
+fn log_query_error(error: crate::ketchup::types::KetchupError) -> Response {
+    let status = match error {
+        crate::ketchup::types::KetchupError::QueryRejected { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
+        .into_response()
 }
 
 /// `GET /v1/logs/query/{app}/{namespace}?start=S&end=E&grep=G&tail=N`
@@ -534,6 +594,14 @@ pub(super) async fn logs_cross_node_handler(
         return resp;
     }
 
+    // A bad pattern would fail on every node and come back as an empty
+    // result full of warnings; refuse it once, here.
+    if let Some(grep) = &query.grep
+        && let Err(error) = crate::ketchup::log_store::validate_grep(grep)
+    {
+        return log_query_error(error);
+    }
+
     // Build a LogQuery from request params
     let log_query = LogQuery {
         app: app.clone(),
@@ -541,6 +609,7 @@ pub(super) async fn logs_cross_node_handler(
         start: query.start,
         end: query.end,
         grep: query.grep.clone(),
+        instance: query.instance.clone(),
         json_field: None,
         // The newest N cluster-wide are among each node's newest N, so every
         // node sends only its own tail; the merge below trims to N again.
@@ -629,14 +698,7 @@ pub(super) async fn logs_cross_node_handler(
 
         let store = log_store.read().await;
         match store
-            .query(
-                &app,
-                &namespace,
-                query.start,
-                query.end,
-                query.grep.as_deref(),
-                query.tail,
-            )
+            .query_with(&app, &namespace, &log_filter(&query))
             .await
         {
             Ok(entries) => Json(LogQueryResult {
@@ -645,11 +707,7 @@ pub(super) async fn logs_cross_node_handler(
                 warnings: vec![],
             })
             .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response(),
+            Err(e) => log_query_error(e),
         }
     }
 }

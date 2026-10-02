@@ -101,8 +101,10 @@ pub struct LogQuery {
     pub start: Option<u64>,
     /// End time (inclusive, seconds since epoch).
     pub end: Option<u64>,
-    /// Grep pattern (substring match).
+    /// Grep pattern (a regular expression).
     pub grep: Option<String>,
+    /// Only this instance's lines.
+    pub instance: Option<String>,
     /// JSON field filter (key=value).
     pub json_field: Option<(String, String)>,
     /// Return only the last N lines.
