@@ -183,7 +183,7 @@ pxe-service=tag:!ipxe,X86-64_EFI,"Reliaburger iPXE x86_64",ipxe-x86_64.efi
 pxe-service=tag:ipxe,ARM64_EFI,"Reliaburger script",boot.ipxe
 ```
 
-`port=0` turns off dnsmasq's DNS server, and the word `proxy` in the range is what makes it a proxy. That's a stand-in: the real thing will be `relish netboot`, in Rust, later.
+`port=0` turns off dnsmasq's DNS server, and the word `proxy` in the range is what makes it a proxy. The lab still runs it, but people installing a fleet shouldn't need dnsmasq, Python and a shell script: `relish netboot` does the same job in Rust, and we'll get to it after the iPXE scripts.
 
 ### PXE, then iPXE, then HTTP
 
@@ -232,6 +232,46 @@ chain --autofree ${base}/installer.efi reliaburger.url=${base} console=tty0 cons
 ```
 
 Arguments given to a UKI replace its built-in command line (with Secure Boot off, which it is on the Wyse fleet), which is why this line repeats the console settings. `reliaburger.url=` tells the installer where the image lives.
+
+### `relish netboot`: three servers and one rule
+
+`relish netboot os` replaces dnsmasq, Python's `http.server` and the script gluing them together. It's three small servers in `src/relish/netboot/`: a ProxyDHCP on UDP 67 and 4011, a read-only TFTP server on UDP 69, and HTTP through axum on 8080. They share one rule: **nothing is served until it's checked.** At start-up, `artefacts::load` verifies each architecture's `SHA256SUMS` signature against the release keys, then hashes every file it lists, and refuses to start if anything is off. A netboot server that hands out an unverified file installs it on every machine that asks, so a refusal is the friendly outcome.
+
+Each server is a pure function wrapped in a thin loop. The ProxyDHCP's whole policy is one function:
+
+```rust
+pub fn answer(
+    request: &Message,
+    port: ListenPort,
+    context: &DhcpContext,
+) -> Result<Answer, Ignored> {
+    let mac = client_mac(request).ok_or(Ignored::NotEthernetRequest)?;
+    let http_client = match class_identifier(request) {
+        Some(class) if class.starts_with(b"PXEClient") => false,
+        Some(class) if class.starts_with(b"HTTPClient") => true,
+        _ => return Err(Ignored::NotPxe),
+    };
+    …
+}
+```
+
+`Message` is a parsed DHCP packet from the `dhcproto` crate, and `Result<Answer, Ignored>` says the function either answers or explains why not. `Ignored` is an enum, so "a laptop asking for an address" (`NotPxe`, silent) and "a BIOS machine we can't boot" (`UnsupportedArch`, logged) are different values, and the compiler makes the log code handle each. `b"PXEClient"` is a byte-string literal, a `&[u8; 9]` rather than a `&str`, because DHCP options are bytes, not text. The `?` after `ok_or` turns a missing MAC into an early `return Err(…)`, the same trick `?` plays on any `Result`.
+
+Because `answer` touches no sockets, the tests feed it hand-built packets: a UEFI DISCOVER (architecture 7) must get `ipxe-x86_64.efi`, arm64 (11) `ipxe-arm64.efi`, HTTP Boot (16, 19) an `http://` URL and `HTTPClient`, and iPXE (user class `iPXE`) `boot.ipxe`. Two property tests, with `proptest`, throw thousands of random requests at it and check what must never happen: a reply with a non-zero `yiaddr`, or any reply at all to a client that didn't say `PXEClient` or `HTTPClient`. Those two properties are why a ProxyDHCP can't hurt a LAN, so they're worth more than any number of examples.
+
+One more line deserves a look. `dhcproto` has a few `debug_assert!`s on option lengths, which a crafted packet can trip in a debug build. A panic in the DHCP task would quietly take the server down, so decoding runs inside `std::panic::catch_unwind`, which turns a panic into an `Err` we treat as "not DHCP". It's not something you reach for often in Rust: panics are for bugs, not input. Here the bug is in someone else's parser, and our input comes from anyone on the LAN.
+
+TFTP is RFC 1350 plus option negotiation: `blksize` (we cap it at 1468, so a block fits one Ethernet frame), `tsize` and `timeout`. The sender is a state machine, `Transfer`, with `on_packet` and `on_timeout` returning a `Step`: send this, wait, done, or give up. It only resends on a timeout, never on a duplicate ACK. Resending on both is the Sorcerer's Apprentice bug, where every late ACK doubles the traffic from then on. UEFI firmware also has a habit worth knowing: it asks for a file with only `tsize`, reads the size from our option acknowledgement, and sends an error to stop. That's a size probe, not a failure, so it isn't logged as one.
+
+The last piece fixes something dnsmasq couldn't. A machine whose boot order puts the network first used to install itself again on every boot. Now the TFTP `boot.ipxe` is just a hand-over:
+
+```
+chain --autofree http://192.168.1.20:8080/boot.ipxe?mac=${netX/mac}&uuid=${uuid}&arch=${buildarch} || exit 1
+```
+
+The HTTP handler reads the MAC and SMBIOS UUID from the query and answers with the install script, or with `exit 1` if that machine has fetched the installer before. It remembers machines in a small JSON file next to the artefacts, and only once the whole installer has streamed out, so a download that dies halfway doesn't count. `exit 1` rather than `exit`: UEFI firmware may stop at its boot menu when a boot option returns success, but it moves on to the next one, the disk, after a failure.
+
+The safety rails are small. `--mac` limits who gets answered, `--for` (an hour by default) stops a forgotten server, and before binding anything it broadcasts a PXE DISCOVER of its own and refuses to start if another boot server answers within two seconds, because two ProxyDHCPs race for every machine.
 
 ### The installer: curl | zstd | dd
 
