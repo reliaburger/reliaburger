@@ -690,9 +690,19 @@ impl super::Grill for ProcessGrill {
         Ok(procs.get(instance).and_then(|entry| entry.exit_code))
     }
 
+    /// Both streams, stdout then stderr, as runc answers: the two capture
+    /// files carry no times, so this can't interleave them. The log store,
+    /// which ingests each line as it arrives, keeps the order.
     async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
-        let stdout = self.stdout(instance).await?;
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
+        let mut logs = String::from_utf8_lossy(&self.stdout(instance).await?).into_owned();
+        let stderr = self.stderr(instance).await?;
+        if !stderr.is_empty() {
+            if !logs.is_empty() && !logs.ends_with('\n') {
+                logs.push('\n');
+            }
+            logs.push_str(&String::from_utf8_lossy(&stderr));
+        }
+        Ok(logs)
     }
 
     async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
@@ -749,56 +759,73 @@ impl super::Grill for ProcessGrill {
         lines_tx: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
         resume: &crate::ketchup::types::CaptureOffsets,
     ) {
-        // Snapshot how this instance's logs are captured.
-        let (stdout_buf, log_stem) = if let Some(control) = &self.control {
-            (
-                Arc::new(Mutex::new(Vec::new())),
-                control.log_stem(instance).ok(),
-            )
+        use crate::ketchup::types::LogStream;
+
+        // Snapshot how this instance's logs are captured: two files, or two
+        // in-memory buffers, one per stream.
+        let (buffers, log_stem) = if let Some(control) = &self.control {
+            let empty = || Arc::new(Mutex::new(Vec::new()));
+            ([empty(), empty()], control.log_stem(instance).ok())
         } else {
             let procs = self.processes.lock().await;
             match procs.get(instance) {
-                Some(entry) => (entry.stdout_buf.clone(), entry.log_stem.clone()),
+                Some(entry) => (
+                    [entry.stdout_buf.clone(), entry.stderr_buf.clone()],
+                    entry.log_stem.clone(),
+                ),
                 None => return,
             }
         };
 
-        let stream = crate::ketchup::types::LogStream::Stdout;
-        let mut reader = match &log_stem {
-            Some(stem) => {
-                crate::grill::capture::CaptureReader::resume(
-                    stream,
-                    log_file(stem, "stdout"),
-                    resume,
-                )
-                .await
-            }
-            None => crate::grill::capture::CaptureReader::new(stream, None),
-        };
+        // One reader per stream, each with its own offset, as runc follows
+        // its two files. Lines keep their order within a stream; across the
+        // two, the store orders them by when they were read.
+        let mut readers = Vec::with_capacity(2);
+        for ((stream, suffix), buffer) in
+            [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")]
+                .into_iter()
+                .zip(buffers)
+        {
+            let reader = match &log_stem {
+                Some(stem) => {
+                    crate::grill::capture::CaptureReader::resume(
+                        stream,
+                        log_file(stem, suffix),
+                        resume,
+                    )
+                    .await
+                }
+                None => crate::grill::capture::CaptureReader::new(stream, None),
+            };
+            readers.push((reader, buffer));
+        }
 
         loop {
-            // New bytes since the last poll, from the file or the buffer, at
-            // most one bounded chunk at a time: a capture with no checkpoint
-            // replays from byte 0, and one long synchronous step would hold a
-            // runtime worker for as long as it took.
-            let new_data = if let Some(file) = reader.file() {
-                crate::grill::capture::read_capture_chunk(file, reader.read_offset())
-                    .await
-                    .unwrap_or_default()
-            } else {
-                let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
-                let buf = stdout_buf.lock().await;
-                let end = buf
-                    .len()
-                    .min(offset.saturating_add(crate::grill::capture::CAPTURE_CHUNK_BYTES));
-                buf.get(offset..end).unwrap_or_default().to_vec()
-            };
-
-            let no_new_data = new_data.is_empty();
-            let backlog = new_data.len() == crate::grill::capture::CAPTURE_CHUNK_BYTES;
-            for line in reader.push(&new_data) {
-                if lines_tx.send(line).await.is_err() {
-                    return;
+            // New bytes since the last poll, from each file or buffer, at
+            // most one bounded chunk per stream at a time: a capture with no
+            // checkpoint replays from byte 0, and one long synchronous step
+            // would hold a runtime worker for as long as it took.
+            let mut no_new_data = true;
+            let mut backlog = false;
+            for (reader, buffer) in &mut readers {
+                let new_data = if let Some(file) = reader.file() {
+                    crate::grill::capture::read_capture_chunk(file, reader.read_offset())
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
+                    let buf = buffer.lock().await;
+                    let end = buf
+                        .len()
+                        .min(offset.saturating_add(crate::grill::capture::CAPTURE_CHUNK_BYTES));
+                    buf.get(offset..end).unwrap_or_default().to_vec()
+                };
+                no_new_data &= new_data.is_empty();
+                backlog |= new_data.len() == crate::grill::capture::CAPTURE_CHUNK_BYTES;
+                for line in reader.push(&new_data) {
+                    if lines_tx.send(line).await.is_err() {
+                        return;
+                    }
                 }
             }
             if backlog {
@@ -822,8 +849,10 @@ impl super::Grill for ProcessGrill {
                 entry.state == ContainerState::Stopped || entry.state == ContainerState::Stopping
             };
             if exited && no_new_data {
-                if let Some(line) = reader.finish() {
-                    let _ = lines_tx.send(line).await;
+                for (reader, _) in &mut readers {
+                    if let Some(line) = reader.finish() {
+                        let _ = lines_tx.send(line).await;
+                    }
                 }
                 return;
             }
@@ -1258,6 +1287,63 @@ mod tests {
             .unwrap();
         assert_eq!(stored.len(), 1);
         grill.kill(&id).await.unwrap();
+    }
+
+    /// F07 part 2: a process's stderr reaches the log store labelled as
+    /// stderr. It was written to `<instance>.stderr` all along, but only the
+    /// `.stdout` file was followed, so it never arrived.
+    #[tokio::test]
+    async fn follow_logs_carries_stderr_as_stderr() {
+        use crate::ketchup::types::LogStream;
+        let dir = tempfile::tempdir().unwrap();
+        for grill in [
+            ProcessGrill::with_log_dir(dir.path().to_path_buf()),
+            ProcessGrill::new(),
+        ] {
+            let id = InstanceId("both-0".to_string());
+            let spec = spec_with_args(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo to-out; echo to-err >&2".to_string(),
+            ]);
+            grill.create(&id, &spec).await.unwrap();
+            grill.start(&id).await.unwrap();
+
+            let mut lines: Vec<(LogStream, String)> = followed_lines(&grill, &id, 2)
+                .await
+                .into_iter()
+                .map(|captured| (captured.stream, captured.line))
+                .collect();
+            lines.sort_by(|a, b| a.1.cmp(&b.1));
+            assert_eq!(
+                lines,
+                [
+                    (LogStream::Stderr, "to-err".to_string()),
+                    (LogStream::Stdout, "to-out".to_string()),
+                ]
+            );
+            let _ = grill.kill(&id).await;
+            let _ = std::fs::remove_file(dir.path().join("both-0.stdout"));
+            let _ = std::fs::remove_file(dir.path().join("both-0.stderr"));
+        }
+    }
+
+    /// `logs()` answers with both streams, stdout first, as runc's does.
+    #[tokio::test]
+    async fn logs_include_stderr() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("both-1".to_string());
+        let spec = spec_with_args(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo to-out; echo to-err >&2".to_string(),
+        ]);
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        let logs = grill.logs(&id).await.unwrap();
+        assert!(logs.contains("to-out"), "{logs:?}");
+        assert!(logs.contains("to-err"), "{logs:?}");
     }
 
     /// Read the first `count` lines `follow_logs` produces for `id`, as a
