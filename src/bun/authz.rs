@@ -630,6 +630,21 @@ mod tests {
         );
     }
 
+    /// Audit events span every tenant and their routes name no app, so the
+    /// per-app scan above can't see them. Both the listing and its live
+    /// stream must refuse a scoped token; the stream once didn't.
+    #[test]
+    fn both_event_routes_refuse_scoped_tokens() {
+        let source = include_str!("api.rs");
+        for handler in ["events_handler", "ws_events_handler"] {
+            let body = mounted_handler_body(source, handler).expect(handler);
+            assert!(
+                body.contains("require_unscoped"),
+                "{handler} serves every tenant's events to a scoped token"
+            );
+        }
+    }
+
     /// `/v1/logs/sql` reads across every tenant and takes no app to scope
     /// against, so it must refuse a scoped token outright.
     #[test]
