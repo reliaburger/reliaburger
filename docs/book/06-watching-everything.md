@@ -709,6 +709,18 @@ let mut readers = [
 ];
 ```
 
+The process runtime had the same two files all along (its owner hands
+the workload a `.stdout` and a `.stderr` descriptor) but followed only the
+first, so a process's stderr was written to disk and never reached the store.
+Its `follow_logs` now keeps one reader per stream as well, over the files or,
+for a process started without a log directory, over its two in-memory pipe
+buffers, and `logs()` answers with stderr after stdout.
+`follow_logs_carries_stderr_as_stderr` runs `echo to-out; echo to-err >&2`
+in both modes and checks each line's stream. Across the two streams the order
+is the order the lines were read in: neither file stamps its lines, so a
+stdout line and a stderr line written within the same poll can swap places.
+Within one stream, the order is exact.
+
 That's a fixed-size array, `[CaptureReader; 2]`, built in place with no
 `Vec` and no heap allocation. Our first version built it with `.map` over
 an array of `(stream, extension)` pairs, which read nicely. Then opening a
