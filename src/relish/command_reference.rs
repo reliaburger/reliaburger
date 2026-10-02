@@ -63,6 +63,7 @@ pub const GROUPS: &[CommandGroup] = &[
             "cluster",
             "image",
             "machines",
+            "netboot",
             "join",
             "join-token",
             "nodes",

@@ -2348,6 +2348,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "dhcproto"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c278d2f17dbcb7332f3b31788be67f76017096c5eedc293e1259f2d48b0f891f"
+dependencies = [
+ "dhcproto-macros",
+ "hickory-proto",
+ "ipnet",
+ "rand 0.10.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "dhcproto-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3944d18b1889ce23702b0ea0230e87033cf5b4659e233419b5c00da3983a387b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5264,6 +5288,7 @@ dependencies = [
  "criterion",
  "crossterm 0.28.1",
  "datafusion",
+ "dhcproto",
  "dirs",
  "flate2",
  "futures-util",

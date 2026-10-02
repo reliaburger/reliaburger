@@ -1,7 +1,7 @@
 #!/bin/bash
 # A netboot server for appliance installs on a LAN (preview; `relish
-# netboot` replaces it in Phase 2b). Run it as root on any Linux machine on
-# the same network as the machines to install:
+# netboot` replaces it, and the QEMU lab moves over in W7). Run it as root
+# on any Linux machine on the same network as the machines to install:
 #
 #   netboot-server.sh <artefacts> <interface> [port]
 #

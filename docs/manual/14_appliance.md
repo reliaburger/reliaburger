@@ -10,9 +10,6 @@ on it's a node.
 It's a **preview**, and the rough edges are part of what it's for:
 - The images come from CI runs of the appliance branch, kept for a day, each
   signed with a throwaway key.
-- A shell script from the repository, `image/tools/netboot-server.sh`, does
-  the job of `relish netboot`, and seeds on a USB stick stand in for claiming
-  machines over the LAN.
 - We've run all of it in QEMU VMs, both aarch64 and x86_64. Real hardware (a
   fleet of Dell Wyse 3040s) comes next, so expect firmware surprises.
 
@@ -26,8 +23,9 @@ It's a **preview**, and the rough edges are part of what it's for:
   **The installer erases the largest built-in disk.**
 - **Your router**, with a DHCP reservation for each machine, so each keeps the
   same address. Nodes find each other by address.
-- **A Linux machine on that network** to serve the netboot: any spare box, or
-  a VM bridged onto the LAN. It needs `dnsmasq` and `python3`, and root.
+- **A machine on that network to serve the netboot**: your laptop (Linux or
+  macOS), any spare box, or a VM bridged onto the LAN. It needs `relish` and
+  root.
 - **Your laptop**, on the same network, with:
   - `relish`, from the same release as the images' bun;
   - `gh`, `openssl`, `python3`, and Rust (`rustup`), for a small helper;
@@ -55,24 +53,52 @@ You only need the architecture of your machines. Each artefact holds:
 The installer checks that signature before it writes anything. It carries the
 same run's public key.
 
+Once an OS release is published, `relish image download --dir os` fetches the
+newest one instead (add `--arch aarch64` for arm64 machines). It checks the
+release against the key relish carries and writes the same layout, `os/x86_64/`
+or `os/aarch64/`.
+
 ## Serve them
 
-On the Linux machine, with the `art/` directory and the repository copied over:
+On the machine that serves the netboot, point `relish netboot` at the
+directory. For a release from `relish image download --dir os`:
 
 ```sh
-sudo image/tools/netboot-server.sh art eth0
+sudo relish netboot os
 ```
 
-Use the interface that's on your LAN in place of `eth0`. It prints what it serves
-and then logs every boot request. Leave it running until every machine has
-installed.
+For a CI run's artefacts, name the run's throwaway key too, since they aren't
+signed with the release key:
+
+```sh
+sudo relish netboot art --key art/x86_64/spike-signing-key.pub.pem
+```
+
+Before it serves anything, it checks the signature on each architecture's
+`SHA256SUMS` and the SHA-256 of every file it lists, and refuses to start if
+any of them is wrong. Then it prints what it serves and logs every boot
+request: each machine's MAC address, its firmware, and what it was told to
+boot. It stops after an hour (`--for 3h` to change that) or at Ctrl-C.
 
 It doesn't touch your router's DHCP. When a machine asks the network where to
-boot from, your router still hands out the address, and this script answers
-only the boot part: a *ProxyDHCP*. It never assigns an address, so it can't
-break anything else on the LAN. The machine then fetches a small boot program
+boot from, your router still hands out the address, and relish answers only
+the boot part: a *ProxyDHCP*. It never assigns an address, so it can't break
+anything else on the LAN. The machine then fetches a small boot program
 (iPXE) over TFTP, and iPXE fetches the installer over HTTP on port 8080. If
-the Linux machine has a firewall, open UDP 67, 69 and 4011 and TCP 8080.
+the serving machine has a firewall, open UDP 67, 69 and 4011 and TCP 8080.
+
+A few options for real networks:
+- It answers from the interface the default route uses. Name another with
+  `--interface eth0` (or `--address 192.168.1.20`).
+- `--mac d8:9e:f3:12:34:56`, once per machine, answers only those machines.
+  Anything else on the LAN that network-boots is left alone.
+- Two netboot servers on one LAN race to boot every machine, so it refuses
+  to start when another one answers.
+
+It remembers each machine that downloaded the installer, by MAC address and
+SMBIOS UUID, in `netboot-installed.json` in the directory it serves. Next time that machine
+network-boots, it's told to boot its disk instead. Pass `--reinstall` to
+install over them again.
 
 ## Prepare the machines
 
@@ -85,9 +111,8 @@ A blank disk isn't bootable, so the first boot falls through to the network.
 After that, the disk boots.
 
 If you leave the network first, it still works, only slower. With the netboot
-server running, each boot starts the installer. The installer sees the
-installed disk and sends the machine straight back to it, which costs about
-half a minute. With the server off, the firmware tries every kind of network
+server running, an installed machine is told to boot its disk, which costs a
+few seconds. With the server off, the firmware tries every kind of network
 boot it has before it gives up and boots the disk, which can take minutes.
 
 ## Install
@@ -296,11 +321,12 @@ systemctl reboot
 
 `os-stage` checks the new version's signature and hashes, and writes it into
 the spare slot. Each CI run signs with its own key, so name the new run's key
-explicitly, as above. Serve the new run's artefacts yourself:
-`netboot-server.sh` serves only what a fresh install needs. Download them the
-same way as before, into `new/x86_64`, and run `python3 -m http.server 8080`
-in `new/`, so the URLs above find them. Stop `netboot-server.sh` first, since
-it also uses port 8080. `bootctl list` on the node shows both versions afterwards.
+explicitly, as above. Serve the new run's artefacts yourself: `relish
+netboot` serves only files its `SHA256SUMS` lists, and the key isn't one of
+them. Download them the same way as before, into `new/x86_64`, and run
+`python3 -m http.server 8080` in `new/`, so the URLs above find them. Stop
+`relish netboot` first, since it also uses port 8080. `bootctl list` on the
+node shows both versions afterwards.
 
 ### What happens to `/etc`
 
@@ -320,8 +346,6 @@ from the new image; reinstall them to start clean.
 
 ## What's missing
 
-- **No `relish netboot` yet.** Serving from your laptop (macOS included) is
-  Phase 2b.
 - **No OS updates run by bun.** Staging by hand over SSH stands in for them.
 - **Secure Boot** has to be off.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and

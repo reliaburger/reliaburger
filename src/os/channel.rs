@@ -19,6 +19,8 @@ pub enum OsError {
     NoArchitecture { version: String, arch: String },
     #[error("{name} doesn't match the digest the OS channel names")]
     SumsDigest { name: String },
+    #[error("{name}'s signature doesn't match a trusted key")]
+    SumsSignature { name: String },
     #[error("{name} isn't a valid SHA256SUMS: {reason}")]
     SumsFormat { name: String, reason: String },
     #[error("{asset} isn't listed in {sums}")]
@@ -159,6 +161,24 @@ impl OsChannel {
         }
         parse_sums(&entry.sums, sums)
     }
+}
+
+/// Parse a release's `SHA256SUMS` only if `signature` (raw, 64 bytes) is
+/// one of `keys`' signatures over exactly `bytes`. For when no channel
+/// vouches for it: a directory `relish image download` wrote, or a lab
+/// build signed with its own key.
+pub fn signed_sums(
+    name: &str,
+    bytes: &[u8],
+    signature: &[u8],
+    keys: &[PublicKey],
+) -> Result<Vec<SumsEntry>, OsError> {
+    if !verify_detached(keys, bytes, signature) {
+        return Err(OsError::SumsSignature {
+            name: name.to_string(),
+        });
+    }
+    parse_sums(name, bytes)
 }
 
 /// Check one downloaded artefact against the `SHA256SUMS` entries.
@@ -354,6 +374,20 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *reliaburger-os
             check_asset(&entries, "s", "other.raw", &good),
             Err(OsError::NotListed { .. })
         ));
+    }
+
+    #[test]
+    fn signed_sums_need_a_trusted_signature_over_the_exact_bytes() {
+        let (signature, key) = signed(SUMS);
+        assert_eq!(signed_sums("s", SUMS, &signature, &[key]).unwrap().len(), 2);
+        let (_, other) = generate_keypair().unwrap();
+        assert_eq!(
+            signed_sums("s", SUMS, &signature, &[other]),
+            Err(OsError::SumsSignature { name: "s".into() })
+        );
+        let mut edited = SUMS.to_vec();
+        edited[0] = b'c';
+        assert!(signed_sums("s", &edited, &signature, &[key]).is_err());
     }
 
     #[test]

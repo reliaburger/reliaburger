@@ -384,6 +384,17 @@ jobs:
         timeout-minutes: 20
         run: image/tests/netboot-install.sh image/mkosi.output "$IMAGE_VERSION"
 
+      - name: relish netboot install (x86-64, KVM)
+        # The same install, served by the commit's relish as a ProxyDHCP
+        # beside an ordinary DHCP server (lab builds only).
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/relish-netboot-install.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
       - name: Seeded pair (x86-64, KVM)
         # Two appliances form a cluster from their seeds alone, with the
         # bun and relish of the commit under test (lab builds only).

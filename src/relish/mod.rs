@@ -36,6 +36,7 @@ pub mod machines;
 pub mod manifest;
 pub mod manual;
 pub mod metrics_cmd;
+pub mod netboot;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;
@@ -194,6 +195,10 @@ pub enum RelishError {
     /// `relish uninstall` refused or could not remove something.
     #[error("{0}")]
     Uninstall(#[from] uninstall::UninstallError),
+
+    /// `relish netboot` refused to start or failed.
+    #[error("{0}")]
+    Netboot(#[from] netboot::NetbootError),
 
     /// `relish manual CHAPTER` named no single chapter.
     #[error("{0}")]

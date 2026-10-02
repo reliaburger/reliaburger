@@ -399,6 +399,42 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         wait: u64,
     },
+    /// Install appliances over the network: ProxyDHCP, TFTP and HTTP for
+    /// the OS that `relish image download` saved.
+    ///
+    /// Needs root (UDP 67, 69 and 4011). It never hands out addresses, so
+    /// your router keeps doing DHCP; it answers only the boot part, and only
+    /// serves files whose signature and hashes it checked.
+    Netboot {
+        /// The directory `relish image download --dir` wrote.
+        dir: PathBuf,
+        /// The interface on your LAN (default: the one with the default route).
+        #[arg(long, conflicts_with = "address")]
+        interface: Option<String>,
+        /// This machine's address on your LAN, instead of --interface.
+        #[arg(long)]
+        address: Option<std::net::Ipv4Addr>,
+        /// The port for HTTP (the installer and the disk image).
+        #[arg(long, default_value_t = reliaburger::relish::netboot::DEFAULT_HTTP_PORT)]
+        http_port: u16,
+        /// Answer only this machine (repeat for more).
+        #[arg(long = "mac", value_name = "MAC", value_parser = parse_mac)]
+        macs: Vec<reliaburger::relish::netboot::MacAddress>,
+        /// Stop after this long (s, m, h or d).
+        #[arg(long = "for", value_name = "DURATION", default_value = "1h", value_parser = parse_netboot_duration)]
+        duration: std::time::Duration,
+        /// Also trust this Ed25519 public key (PEM), such as a lab build's
+        /// spike-signing-key.pub.pem.
+        #[arg(long, value_name = "PEM")]
+        key: Option<PathBuf>,
+        /// Install again on machines that installed from here already.
+        #[arg(long)]
+        reinstall: bool,
+        /// Trust only this key (ed25519:BASE64) instead of the release keys.
+        /// Debug builds only, for tests.
+        #[arg(long, hide = true)]
+        trust_key: Option<String>,
+    },
     /// Manage short-lived node-enrolment tokens.
     JoinToken {
         #[command(subcommand)]
@@ -864,6 +900,50 @@ enum MachinesAction {
 
 fn parse_machine(value: &str) -> Result<(String, std::net::IpAddr), String> {
     reliaburger::relish::bare_metal::parse_machine(value)
+}
+
+fn parse_mac(value: &str) -> Result<reliaburger::relish::netboot::MacAddress, String> {
+    value
+        .parse()
+        .map_err(|e: reliaburger::relish::netboot::NetbootError| e.to_string())
+}
+
+fn parse_netboot_duration(value: &str) -> Result<std::time::Duration, String> {
+    reliaburger::relish::netboot::parse_duration(value).map_err(|e| e.to_string())
+}
+
+/// `relish netboot`: work out the keys and the interface, then serve.
+#[allow(clippy::too_many_arguments)]
+async fn netboot(
+    dir: PathBuf,
+    interface: Option<String>,
+    address: Option<std::net::Ipv4Addr>,
+    http_port: u16,
+    macs: Vec<reliaburger::relish::netboot::MacAddress>,
+    duration: std::time::Duration,
+    key: Option<PathBuf>,
+    reinstall: bool,
+    trust_key: Option<String>,
+) -> Result<(), reliaburger::relish::RelishError> {
+    use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
+    let pem = key.as_deref().map(std::fs::read_to_string).transpose()?;
+    let keys = netboot::trusted_keys(pem.as_deref(), trust_key.as_deref())?;
+    let interface = match (interface, address) {
+        (Some(name), _) => InterfaceChoice::Named(name),
+        (None, Some(address)) => InterfaceChoice::Address(address),
+        (None, None) => InterfaceChoice::DefaultRoute,
+    };
+    netboot::run(NetbootOptions {
+        directory: dir,
+        interface,
+        http_port,
+        allowed: macs,
+        duration,
+        keys,
+        reinstall,
+    })
+    .await?;
+    Ok(())
 }
 
 fn parse_seed_ttl(value: &str) -> Result<u64, String> {
@@ -1883,6 +1963,22 @@ async fn main() -> ExitCode {
                 }
             },
         },
+        Command::Netboot {
+            dir,
+            interface,
+            address,
+            http_port,
+            macs,
+            duration,
+            key,
+            reinstall,
+            trust_key,
+        } => {
+            netboot(
+                dir, interface, address, http_port, macs, duration, key, reinstall, trust_key,
+            )
+            .await
+        }
         Command::JoinToken { action } => match &action {
             JoinTokenAction::List => commands::join_token_list().await,
             JoinTokenAction::Revoke { node_id } => commands::join_token_revoke(node_id).await,
@@ -3098,6 +3194,92 @@ mod tests {
             } => assert_eq!(node, "reliaburger-1"),
             _ => panic!("expected Dev Shell command"),
         }
+    }
+
+    #[test]
+    fn netboot_defaults_to_an_hour_on_port_8080_for_every_machine() {
+        let cli = parse(&["relish", "netboot", "os"]).unwrap();
+        let Command::Netboot {
+            dir,
+            interface,
+            address,
+            http_port,
+            macs,
+            duration,
+            key,
+            reinstall,
+            trust_key,
+        } = cli.command
+        else {
+            panic!("expected netboot");
+        };
+        assert_eq!(dir, PathBuf::from("os"));
+        assert_eq!((interface, address), (None, None));
+        assert_eq!(http_port, 8080);
+        assert!(macs.is_empty());
+        assert_eq!(duration, std::time::Duration::from_secs(3600));
+        assert_eq!((key, reinstall, trust_key), (None, false, None));
+    }
+
+    #[test]
+    fn netboot_takes_an_interface_macs_a_time_limit_and_a_lab_key() {
+        let cli = parse(&[
+            "relish",
+            "netboot",
+            "art",
+            "--interface",
+            "eth0",
+            "--mac",
+            "52:54:00:12:34:56",
+            "--mac",
+            "52-54-00-12-34-57",
+            "--for",
+            "30m",
+            "--http-port",
+            "8081",
+            "--key",
+            "art/spike-signing-key.pub.pem",
+            "--reinstall",
+        ])
+        .unwrap();
+        let Command::Netboot {
+            interface,
+            macs,
+            duration,
+            http_port,
+            key,
+            reinstall,
+            ..
+        } = cli.command
+        else {
+            panic!("expected netboot");
+        };
+        assert_eq!(interface.as_deref(), Some("eth0"));
+        assert_eq!(macs.len(), 2);
+        assert_eq!(macs[1].to_string(), "52:54:00:12:34:57");
+        assert_eq!(duration, std::time::Duration::from_secs(1800));
+        assert_eq!(http_port, 8081);
+        assert_eq!(key, Some(PathBuf::from("art/spike-signing-key.pub.pem")));
+        assert!(reinstall);
+    }
+
+    #[test]
+    fn netboot_refuses_a_bad_mac_a_bad_duration_and_both_interface_flags() {
+        assert!(parse(&["relish", "netboot", "os", "--mac", "nope"]).is_err());
+        assert!(parse(&["relish", "netboot", "os", "--for", "1w"]).is_err());
+        assert!(
+            parse(&[
+                "relish",
+                "netboot",
+                "os",
+                "--interface",
+                "eth0",
+                "--address",
+                "192.168.1.20"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["relish", "netboot"]).is_err());
     }
 
     #[test]

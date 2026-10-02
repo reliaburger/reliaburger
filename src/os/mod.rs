@@ -11,4 +11,6 @@
 
 pub mod channel;
 
-pub use channel::{ChannelArch, OsChannel, OsError, OsVersion, SumsEntry, check_asset};
+pub use channel::{
+    ChannelArch, OsChannel, OsError, OsVersion, SumsEntry, check_asset, signed_sums,
+};
