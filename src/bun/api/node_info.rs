@@ -351,6 +351,9 @@ pub(super) async fn gather_desired_apps(
     state: &ApiState,
 ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
     let apps = if let Some(council) = &state.council {
+        if !confirmed_lease_leader(council).await {
+            return Err("desired cluster state requires a current leader; query the leader or retry after election".into());
+        }
         let desired = council.desired_state().await;
         let live_nodes = match &state.membership {
             Some(membership) => membership.read().await.len().max(1),

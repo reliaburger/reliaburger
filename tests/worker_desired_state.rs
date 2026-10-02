@@ -1,16 +1,10 @@
-use reliaburger::config::Replicas;
-use reliaburger::config::app::AppSpec;
-use reliaburger::council::types::{DesiredState, RaftRequest};
-use reliaburger::meat::cluster_state::{ClusterStateCache, SchedulerNodeState};
-use reliaburger::meat::quota::QuotaLedger;
-use reliaburger::meat::types::{AppId, NodeId, Placement, Resources};
-use reliaburger::mustard::membership::MembershipSnapshot;
-use reliaburger::mustard::state::NodeState;
-use reliaburger::reporting::aggregator::AggregatedState;
-use reliaburger::reporting::types::*;
-use reliaburger::{bun, cluster, config, council, meat, mustard};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, Instant, SystemTime};
+use reliaburger::config::{Replicas, app::AppSpec};
+use reliaburger::council::types::RaftRequest;
+use reliaburger::meat::types::{AppId, NodeId};
+use reliaburger::{bun, config, council, mustard};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
     let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
     spec.replicas = Replicas::Fixed(replicas);
@@ -140,6 +134,11 @@ async fn worker_desired_apps_must_not_report_an_empty_cluster() {
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        expected.as_array().unwrap().len(),
+        1,
+        "leader control must expose the committed app"
+    );
     let response = client
         .get(format!("{worker_url}/v1/diagnostics/apps"))
         .send()
@@ -152,5 +151,9 @@ async fn worker_desired_apps_must_not_report_an_empty_cluster() {
     leader.shutdown().await.unwrap();
     worker.shutdown().await.unwrap();
     eprintln!("leader={expected}; worker={code} {actual}");
-    assert!(code == reqwest::StatusCode::SERVICE_UNAVAILABLE || (code.is_success() && actual == expected), "worker must return authoritative state or explicit unavailability; got {code} {actual}");
+    assert!(
+        code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || (code.is_success() && actual == expected),
+        "worker must return authoritative state or explicit unavailability; got {code} {actual}"
+    );
 }
