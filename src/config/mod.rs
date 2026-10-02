@@ -53,9 +53,29 @@ pub struct Config {
     /// Build job definitions keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build: BTreeMap<String, build::BuildSpec>,
+    /// The replica ordinals the leader assigned this node, per app (#398).
+    /// Only the placement reconciler sets it, for the deploy it hands the
+    /// local agent; it's never read from TOML. See [`Self::replica_ordinals`].
+    #[serde(skip)]
+    pub ordinals: BTreeMap<String, Vec<u32>>,
 }
 
 impl Config {
+    /// The ordinals this node runs app `name` with: the ones the leader
+    /// assigned, or `0..n` for a deploy without a leader (a single node, a
+    /// rollback without a council), where `n` is the spec's replica count
+    /// and a daemon set runs one.
+    pub fn replica_ordinals(&self, name: &str, spec: &AppSpec) -> Vec<u32> {
+        if let Some(assigned) = self.ordinals.get(name) {
+            return assigned.clone();
+        }
+        let count = match spec.replicas {
+            Replicas::Fixed(n) => n,
+            Replicas::DaemonSet => 1,
+        };
+        (0..count).collect()
+    }
+
     /// Parse workload configuration from a TOML string.
     ///
     /// Parsing checks the TOML shape; call [`Self::validate`] to check workload

@@ -484,17 +484,22 @@ pub(super) async fn placements_handler(
 
     let mut apps = Vec::new();
     for (app_id, placements) in &desired.scheduling {
-        let replicas = placements.iter().filter(|p| p.node_id == node).count() as u32;
-        if replicas == 0 {
+        let mut ordinals: Vec<u32> = placements
+            .iter()
+            .filter(|p| p.node_id == node)
+            .map(|p| p.ordinal)
+            .collect();
+        if ordinals.is_empty() {
             continue;
         }
+        ordinals.sort_unstable();
         let Some(spec) = desired.apps.get(app_id) else {
             continue; // spec deleted; placements lag briefly
         };
         apps.push(crate::cluster::orchestrate::NodeAssignment {
             name: app_id.name.clone(),
             namespace: app_id.namespace.clone(),
-            replicas,
+            ordinals,
             spec: spec.clone(),
         });
     }

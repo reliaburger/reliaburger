@@ -65,12 +65,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Whether the app's live instances are exactly the adopted ones, all
-    /// running, as many as `spec` asks for, and launched from `spec`.
+    /// running, as many as `spec` asks for, launched from `spec`, and named
+    /// by exactly the assigned `ordinals` (#398).
     pub(super) fn adopted_instances_match(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        ordinals: &[u32],
     ) -> bool {
         let key = (app_name.to_string(), namespace.to_string());
         let Some(adopted) = self.adopted_apps.get(&key) else {
@@ -91,7 +93,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .into_iter()
             .filter(|instance| instance.app_name == app_name && instance.namespace == namespace)
             .collect();
+        let mut running: Vec<u32> = current
+            .iter()
+            .filter_map(|instance| crate::grill::InstanceIdentity::parse(&instance.id.0))
+            .map(|identity| identity.ordinal)
+            .collect();
+        running.sort_unstable();
+        let mut assigned = ordinals.to_vec();
+        assigned.sort_unstable();
         current.len() == replicas as usize
+            && running == assigned
             && current.len() == adopted.instances.len()
             && current.iter().all(|instance| {
                 adopted.instances.contains(&instance.id)

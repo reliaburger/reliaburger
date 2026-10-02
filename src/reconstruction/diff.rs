@@ -128,6 +128,7 @@ mod tests {
             scheduling.entry(app_id).or_default().push(Placement {
                 node_id,
                 resources: Resources::new(100, 128 * 1024 * 1024, 0),
+                ordinal: 0,
             });
         }
         DesiredState {

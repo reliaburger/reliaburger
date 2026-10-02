@@ -8869,6 +8869,62 @@ async fn raising_the_replica_count_starts_only_the_new_replicas() {
     );
 }
 
+/// The ordinals of the running `web` replicas, whatever their generation.
+fn live_web_ordinals(agent: &BunAgent<MockGrill>) -> Vec<u32> {
+    let mut ordinals: Vec<u32> = live_web_ids(agent)
+        .iter()
+        .map(|id| crate::grill::InstanceIdentity::parse(id).unwrap().ordinal)
+        .collect();
+    ordinals.sort();
+    ordinals
+}
+
+/// `web` as the placement reconciler hands it over: this node's share, with
+/// the ordinals the leader assigned it.
+fn web_with_ordinals(ordinals: &[u32]) -> Config {
+    let mut config = web_with_replicas(ordinals.len() as u32);
+    config.ordinals.insert("web".into(), ordinals.to_vec());
+    config
+}
+
+/// #398: the leader numbers replicas across the cluster, and a node names
+/// its instances by the ordinals it was assigned instead of counting from 0
+/// like every other node.
+#[tokio::test]
+async fn a_node_names_its_replicas_by_their_assigned_ordinals() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[2, 5])).await);
+    assert_eq!(live_web_ids(&agent), ["default__web-2", "default__web-5"]);
+
+    // Another node died and replica 1 moves here: only it starts.
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[1, 2, 5])).await);
+    assert_eq!(
+        live_web_ids(&agent),
+        ["default__web-1", "default__web-2", "default__web-5"]
+    );
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(call, id)| (call == "stop" || call == "kill") && id.0 == "default__web-2"),
+        "a serving replica was replaced"
+    );
+
+    // A changed spec rolls each replica onto a new generation of its ordinal.
+    let mut changed = web_with_ordinals(&[1, 2, 5]);
+    changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    expect_complete(&drain_deploy(&mut agent, changed).await);
+    assert_eq!(live_web_ordinals(&agent), [1, 2, 5]);
+    assert!(live_web_ids(&agent).iter().all(|id| id.contains("-g")));
+
+    // Scaling down keeps exactly the ordinals still assigned.
+    let mut fewer = web_with_ordinals(&[1, 2]);
+    fewer.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    expect_complete(&drain_deploy(&mut agent, fewer).await);
+    assert_eq!(live_web_ordinals(&agent), [1, 2]);
+}
+
 #[tokio::test]
 async fn redeploy_does_not_overwrite_a_stopped_or_failed_cleanup_owner() {
     for state in [ContainerState::Stopped, ContainerState::Failed] {
@@ -11639,6 +11695,7 @@ async fn unpublished_hold_fixture() -> (
             app_name: "web".into(),
             namespace: "default".into(),
             spec: Box::new(spec),
+            ordinals: vec![0],
             reply,
         })
         .await;
@@ -12168,7 +12225,7 @@ async fn adopted_instances_that_run_their_placement_are_recognised() {
         .collect();
     assert_eq!(ids.len(), 2);
     assert!(
-        !agent.adopted_instances_match("web", "default", &placed),
+        !agent.adopted_instances_match("web", "default", &placed, &[0, 1]),
         "instances this agent deployed itself are not adoption evidence"
     );
 
@@ -12180,15 +12237,18 @@ async fn adopted_instances_that_run_their_placement_are_recognised() {
         runtime.set_adopt_result(id, true);
     }
     assert_eq!(replacement.adopt_recorded_instances().await.unwrap(), 2);
-    assert!(replacement.adopted_instances_match("web", "default", &placed));
+    assert!(replacement.adopted_instances_match("web", "default", &placed, &[0, 1]));
 
     let mut newer = placed.clone();
     newer.image = Some("web:v2".into());
-    assert!(!replacement.adopted_instances_match("web", "default", &newer));
+    assert!(!replacement.adopted_instances_match("web", "default", &newer, &[0, 1]));
     let mut bigger = placed.clone();
     bigger.replicas = crate::config::Replicas::Fixed(3);
-    assert!(!replacement.adopted_instances_match("web", "default", &bigger));
-    assert!(!replacement.adopted_instances_match("api", "default", &placed));
+    assert!(!replacement.adopted_instances_match("web", "default", &bigger, &[0, 1, 2]));
+    assert!(!replacement.adopted_instances_match("api", "default", &placed, &[0, 1]));
+    // #398: adopted replicas named by other ordinals than the leader assigns
+    // need the deploy, which renames them.
+    assert!(!replacement.adopted_instances_match("web", "default", &placed, &[0, 4]));
 
     // An instance that isn't running any more needs the deploy.
     replacement
@@ -12196,18 +12256,18 @@ async fn adopted_instances_that_run_their_placement_are_recognised() {
         .get_instance_mut(&ids[0])
         .unwrap()
         .state = ContainerState::Unhealthy;
-    assert!(!replacement.adopted_instances_match("web", "default", &placed));
+    assert!(!replacement.adopted_instances_match("web", "default", &placed, &[0, 1]));
     replacement
         .supervisor
         .get_instance_mut(&ids[0])
         .unwrap()
         .state = ContainerState::Running;
-    assert!(replacement.adopted_instances_match("web", "default", &placed));
+    assert!(replacement.adopted_instances_match("web", "default", &placed, &[0, 1]));
 
     // Once this agent deploys the app itself, adoption says nothing more.
     let config = Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
     expect_complete(&drain_deploy(&mut replacement, config).await);
-    assert!(!replacement.adopted_instances_match("web", "default", &placed));
+    assert!(!replacement.adopted_instances_match("web", "default", &placed, &[0, 1]));
 }
 
 /// Adopted instances whose records disagree about their spec prove
@@ -12230,7 +12290,7 @@ async fn adopted_instances_with_disagreeing_records_are_not_converged() {
     assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 2);
     let mut placed = first.app_spec.clone().unwrap();
     placed.replicas = crate::config::Replicas::Fixed(2);
-    assert!(!agent.adopted_instances_match("web", "default", &placed));
+    assert!(!agent.adopted_instances_match("web", "default", &placed, &[0, 1]));
 }
 
 /// The reconciler asks over the command channel.
@@ -12246,6 +12306,7 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
         app_name: "web".into(),
         namespace: "default".into(),
         spec: Box::new(toml::from_str("image = 'web:v1'").unwrap()),
+        ordinals: vec![0],
         response,
     })
     .await

@@ -2511,6 +2511,7 @@ async fn cluster_lease_delete_waits_for_system_retirement_acknowledgements() {
             placements: vec![Placement {
                 node_id: NodeId::new("worker"),
                 resources: Resources::new(500, 1024, 0),
+                ordinal: 0,
             }],
         }),
     ] {

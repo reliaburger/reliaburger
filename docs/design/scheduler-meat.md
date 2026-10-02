@@ -432,8 +432,8 @@ pub enum NodeStatus {
 ### Scheduling Decisions
 
 The shipped `SchedulingDecision` (in `meat::types`) is deliberately minimal: it
-carries the app being scheduled and one `Placement` (node + reserved resources)
-per replica. The richer shape below — a per-decision `decision_id`, a
+carries the app being scheduled and one `Placement` (node, reserved resources
+and the replica's ordinal) per replica. The richer shape below — a per-decision `decision_id`, a
 `spec_version`, an allocated port, and a timestamp — is **planned — not yet
 implemented**; those fields back the replay-protection design in Section 8.4,
 which the current struct cannot enforce.
@@ -1128,8 +1128,20 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 1. Only a placement on a node gossip no longer lists as `Alive` or `Suspect` is lost, or one on a node that reported itself not ready, not capable, or went stale. A `Suspect` node missed a probe and has the suspicion timeout to refute it; in a three-node cluster that just lost a member there is no third node to relay an indirect probe, so a loaded survivor can be suspected for a late ack. Its placements hold until gossip declares it dead (#346). A live node whose readiness report hasn't reached a new leader yet keeps its placements too (§7.2).
 2. Every placement that holds stays where it is. Meat places only the missing replicas.
 3. Before placing them, the pass sets each node's replica count for the App from the kept placements (reports can lag a new leader), so spread sends each replacement to the eligible survivor running the fewest replicas. No node ends up with more than `ceil(replicas / eligible nodes)` unless the others lack room.
-4. The survivor that gains a replica receives the same spec with a higher count. Its agent starts only the added replica beside the running ones; it rolls its replicas only when the spec changed in any other way, or when not every replica is running.
-5. When the lost node returns, nothing moves back: the App is converged, and rebalancing would restart healthy replicas.
+4. Each replacement takes the ordinal of a replica that was lost, so the App's instances are still `-0` to `-(n-1)` (§7.5.1).
+5. The survivor that gains a replica receives the same spec with one more ordinal. Its agent starts only the added replica beside the running ones; it rolls its replicas only when the spec changed in any other way, when a replica it runs lost its ordinal, or when not every replica is running.
+6. When the lost node returns, nothing moves back: the App is converged, and rebalancing would restart healthy replicas.
+
+#### 7.5.1 Replica ordinals
+
+The leader numbers an App's replicas across the cluster (#398), so an instance id (`{namespace}__{app}-{ordinal}`, or `-g{generation}-{ordinal}` after a rollout) names one replica in the whole cluster rather than one per node. `assign_ordinals` in the planning pass applies these rules:
+
+- A placement that still holds keeps its ordinal. Of two holding placements with one ordinal, the first keeps it, and the pass doesn't treat an App as converged while two share one.
+- A new placement on a node that ran a replica of the App in the previous decision takes that ordinal back, so a daemon set re-planned after a node joins keeps every copy's name.
+- Any other new placement takes the lowest ordinal no placement uses: a lost replica's, or the next one up.
+- Scaling down keeps the holding placements with the lowest ordinals.
+
+`/v1/placements/{node}` hands each node its ordinals, and the node's agent names its instances by them on a fresh deploy, an in-place addition and both rollout strategies. A deploy without a leader numbers `0..n`. A stopped App returning to the nodes that hold its volumes is numbered afresh from 0, since `last_placed_nodes` records nodes only.
 
 ### 7.6 Cascading Node Failures
 

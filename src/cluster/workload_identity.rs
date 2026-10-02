@@ -212,6 +212,7 @@ mod tests {
             vec![Placement {
                 node_id: NodeId::new(node),
                 resources: Default::default(),
+                ordinal: 0,
             }],
         );
         desired

@@ -429,9 +429,23 @@ impl<G: Grill> WorkloadSupervisor<G> {
             Replicas::Fixed(n) => n,
             Replicas::DaemonSet => 1,
         };
-        let indices: Vec<u32> = (0..replica_count).collect();
+        let ordinals: Vec<u32> = (0..replica_count).collect();
+        self.deploy_app_as(app_name, namespace, spec, &ordinals, now)
+            .await
+    }
+
+    /// Deploy an app as one Pending instance per ordinal in `ordinals`: the
+    /// ones the leader assigned this node (#398), or `0..n` without one.
+    pub async fn deploy_app_as(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        ordinals: &[u32],
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
         let instance_ids = self
-            .create_app_instances(app_name, namespace, spec, &indices, now)
+            .create_app_instances(app_name, namespace, spec, ordinals, now)
             .await?;
         self.app_instances.insert(
             (app_name.to_string(), namespace.to_string()),
@@ -440,27 +454,19 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(instance_ids)
     }
 
-    /// Add `count` Pending replicas to an app that already runs, beside its
-    /// existing ones, for a deploy that only raises the replica count. They
-    /// take the lowest ordinals no owned instance uses.
+    /// Add a Pending replica per ordinal in `ordinals` to an app that already
+    /// runs, beside its existing ones, for a deploy that only adds replicas.
+    /// The caller picks ordinals no owned instance uses.
     pub async fn add_app_replicas(
         &mut self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-        count: u32,
+        ordinals: &[u32],
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
-        let indices: Vec<u32> = (0..u32::MAX)
-            .filter(|index| {
-                let id =
-                    crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
-                !self.instances.contains_key(&id)
-            })
-            .take(count as usize)
-            .collect();
         let added = self
-            .create_app_instances(app_name, namespace, spec, &indices, now)
+            .create_app_instances(app_name, namespace, spec, ordinals, now)
             .await?;
         self.app_instances
             .entry((app_name.to_string(), namespace.to_string()))

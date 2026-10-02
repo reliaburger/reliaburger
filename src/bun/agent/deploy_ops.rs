@@ -49,14 +49,15 @@ pub(super) enum DeployOp {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<Option<u32>>,
+        ordinals: Vec<u32>,
+        reply: oneshot::Sender<Option<Vec<u32>>>,
     },
     /// Create Pending instances for the replicas a scale-up adds.
     AddAppReplicas {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        count: u32,
+        ordinals: Vec<u32>,
         reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
     },
     /// Reserve and return the next rolling-redeploy generation counter.
@@ -69,6 +70,7 @@ pub(super) enum DeployOp {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
+        ordinals: Vec<u32>,
         reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
     },
     /// Create supervisor-tracked instances for a job deploy.
@@ -468,12 +470,14 @@ impl DeployOps {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-    ) -> Option<u32> {
+        ordinals: &[u32],
+    ) -> Option<Vec<u32>> {
         self.call(
             |reply| DeployOp::ReplicasToAddInPlace {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
+                ordinals: ordinals.to_vec(),
                 reply,
             },
             None,
@@ -486,14 +490,14 @@ impl DeployOps {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-        count: u32,
+        ordinals: &[u32],
     ) -> Result<Vec<InstanceId>, BunError> {
         self.call(
             |reply| DeployOp::AddAppReplicas {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
-                count,
+                ordinals: ordinals.to_vec(),
                 reply,
             },
             Err(BunError::DeployFailed {
@@ -539,12 +543,14 @@ impl DeployOps {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        ordinals: &[u32],
     ) -> Result<Vec<InstanceId>, BunError> {
         self.call(
             |reply| DeployOp::SupervisorDeployApp {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
+                ordinals: ordinals.to_vec(),
                 reply,
             },
             Ok(Vec::new()),
@@ -1140,21 +1146,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 namespace,
                 spec,
+                ordinals,
                 reply,
             } => {
-                let _ = reply.send(self.replicas_to_add_in_place(&app_name, &namespace, &spec));
+                let _ = reply
+                    .send(self.replicas_to_add_in_place(&app_name, &namespace, &spec, &ordinals));
             }
             DeployOp::AddAppReplicas {
                 app_name,
                 namespace,
                 spec,
-                count,
+                ordinals,
                 reply,
             } => {
                 // LOOP-INLINE: in-memory lock, no I/O
                 let result = self
                     .supervisor
-                    .add_app_replicas(&app_name, &namespace, &spec, count, Instant::now())
+                    .add_app_replicas(&app_name, &namespace, &spec, &ordinals, Instant::now())
                     .await;
                 let _ = reply.send(result);
             }
@@ -1193,13 +1201,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 namespace,
                 spec,
+                ordinals,
                 reply,
             } => {
                 let now = Instant::now();
                 // LOOP-INLINE: in-memory lock, no I/O
                 let result = self
                     .supervisor
-                    .deploy_app(&app_name, &namespace, &spec, now)
+                    .deploy_app_as(&app_name, &namespace, &spec, &ordinals, now)
                     .await;
                 let _ = reply.send(result);
             }

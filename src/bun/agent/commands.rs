@@ -82,6 +82,8 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
+        /// The replica ordinals the leader assigned this node (#398).
+        ordinals: Vec<u32>,
         response: oneshot::Sender<bool>,
     },
     /// Get the local desired application specs for standalone diagnostics.
@@ -494,9 +496,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 namespace,
                 spec,
+                ordinals,
                 response,
             } => {
-                let _ = response.send(self.adopted_instances_match(&app_name, &namespace, &spec));
+                let _ = response
+                    .send(self.adopted_instances_match(&app_name, &namespace, &spec, &ordinals));
             }
             AgentCommand::DesiredApps { response } => {
                 let mut apps = self

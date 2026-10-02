@@ -158,6 +158,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return;
             }
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+            let ordinals = config.replica_ordinals(app_name, spec);
 
             // run_before (E): jobs declaring `run_before = ["app.<name>"]` must
             // run to completion before this app's deploy begins — migrations are
@@ -229,7 +230,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // Asked before the new spec replaces the one the replicas run.
             let in_place = self
                 .ops
-                .replicas_to_add_in_place(app_name, namespace, spec)
+                .replicas_to_add_in_place(app_name, namespace, spec, &ordinals)
                 .await;
             if let Err(error) = self
                 .ops
@@ -246,9 +247,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let existing = self.ops.list_existing_owned(app_name, namespace).await;
 
-            if let Some(count) = in_place.filter(|_| !existing.is_empty()) {
+            if let Some(added) = in_place.filter(|_| !existing.is_empty()) {
                 if self
-                    .add_replicas_in_place(app_name, namespace, spec, count, &events)
+                    .add_replicas_in_place(app_name, namespace, spec, &added, &events)
                     .await
                     .is_break()
                 {
@@ -288,12 +289,16 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 let strategy = crate::meat::deploy_types::DeployConfig::for_app(spec).strategy;
                 let outcome = match strategy {
                     crate::meat::deploy_types::DeployStrategy::BlueGreen => {
-                        self.blue_green_redeploy(app_name, namespace, spec, existing, &events, now)
-                            .await
+                        self.blue_green_redeploy(
+                            app_name, namespace, spec, &ordinals, existing, &events, now,
+                        )
+                        .await
                     }
                     crate::meat::deploy_types::DeployStrategy::Rolling => {
-                        self.rolling_redeploy(app_name, namespace, spec, existing, &events, now)
-                            .await
+                        self.rolling_redeploy(
+                            app_name, namespace, spec, &ordinals, existing, &events, now,
+                        )
+                        .await
                     }
                 };
                 if outcome.is_break() {
@@ -318,7 +323,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let ids = match self
                 .ops
-                .supervisor_deploy_app(app_name, namespace, spec)
+                .supervisor_deploy_app(app_name, namespace, spec, &ordinals)
                 .await
             {
                 Ok(ids) => ids,
@@ -744,20 +749,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-        count: u32,
+        added: &[u32],
         events: &mpsc::Sender<ApplyEvent>,
     ) -> std::ops::ControlFlow<()> {
         let _ = events
             .send(ApplyEvent::Progress {
                 message: format!(
-                    "adding {count} replica(s) of {app_name} beside the running ones (replicas: {})",
+                    "adding {} replica(s) of {app_name} beside the running ones (replicas: {})",
+                    added.len(),
                     spec.replicas
                 ),
             })
             .await;
         let ids = match self
             .ops
-            .add_app_replicas(app_name, namespace, spec, count)
+            .add_app_replicas(app_name, namespace, spec, added)
             .await
         {
             Ok(ids) => ids,
@@ -824,11 +830,13 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     /// them off the loop, then retire the old ones. Returns `Break` when the
     /// caller must stop the whole deploy. On new-instance failure it keeps the
     /// old instances and returns `Continue`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn rolling_redeploy(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        ordinals: &[u32],
         existing: Vec<InstanceId>,
         events: &mpsc::Sender<ApplyEvent>,
         now: Instant,
@@ -855,10 +863,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return std::ops::ControlFlow::Break(());
             }
         };
-        let replica_count = match spec.replicas {
-            crate::config::types::Replicas::Fixed(n) => n,
-            crate::config::types::Replicas::DaemonSet => 1,
-        };
+        let replica_count = ordinals.len() as u32;
 
         let mut new_ids: Vec<InstanceId> = Vec::new();
         let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
@@ -882,7 +887,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // is given only what's left, and its own retire loop is an idempotent
         // catch-up for anything the planner didn't reach.
         let mut retired: usize = 0;
-        let mut next_replica_index: u32 = 0;
+        let mut next_replica_index: usize = 0;
         loop {
             if self.report_cancellation(events).await {
                 new_failed = true;
@@ -988,7 +993,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 crate::meat::deploy_types::RollingStep::StartNew => {}
             }
 
-            let i = next_replica_index;
+            let i = ordinals[next_replica_index];
             next_replica_index += 1;
             let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
                 .instance_id();
@@ -1423,11 +1428,13 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     /// entire time green is coming up, so a failure anywhere in green tears the
     /// green fleet down and leaves blue untouched. Returns `Break` when the
     /// caller must stop the whole deploy.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn blue_green_redeploy(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        ordinals: &[u32],
         existing: Vec<InstanceId>,
         events: &mpsc::Sender<ApplyEvent>,
         now: Instant,
@@ -1457,10 +1464,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return std::ops::ControlFlow::Break(());
             }
         };
-        let replica_count = match spec.replicas {
-            crate::config::types::Replicas::Fixed(n) => n,
-            crate::config::types::Replicas::DaemonSet => 1,
-        };
+        let replica_count = ordinals.len() as u32;
 
         let mut new_ids: Vec<InstanceId> = Vec::new();
         let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
@@ -1476,7 +1480,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // Start and health check the entire green fleet before touching blue.
         // Unlike the rolling planner, nothing retires here and nothing is
         // published to routing yet: green comes up dark, alongside blue.
-        for i in 0..replica_count {
+        for &i in ordinals {
             if self.report_cancellation(events).await {
                 new_failed = true;
                 break;

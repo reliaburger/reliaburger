@@ -1363,6 +1363,43 @@ async fn start_spread_web_cluster(
     [n1, n2, n3]
 }
 
+/// The ordinals of the live `web` replicas on `nodes`, sorted, whatever
+/// their deploy generation.
+async fn web_ordinals(nodes: &[&Node]) -> Vec<u32> {
+    let mut ordinals: Vec<u32> = web_instance_ids(nodes)
+        .await
+        .iter()
+        .map(|placed| {
+            let (_, id) = placed.split_once('/').unwrap();
+            reliaburger::grill::InstanceIdentity::parse(id)
+                .unwrap()
+                .ordinal
+        })
+        .collect();
+    ordinals.sort_unstable();
+    ordinals
+}
+
+/// #398: three replicas on three nodes are `web-0`, `web-1` and `web-2`,
+/// not a `web-0` on every node, so an instance id names one replica in the
+/// whole cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn replicas_are_numbered_across_the_cluster() {
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("rn", 18841, &shutdown).await;
+    let nodes: Vec<&Node> = nodes.iter().collect();
+
+    let placed = web_instance_ids(&nodes).await;
+    let ids: std::collections::BTreeSet<&str> = placed
+        .iter()
+        .map(|placed| placed.split_once('/').unwrap().1)
+        .collect();
+    assert_eq!(ids.len(), 3, "two replicas share an id: {placed:?}");
+    assert_eq!(web_ordinals(&nodes).await, [0, 1, 2], "{placed:?}");
+    shutdown.cancel();
+}
+
 /// Z6.7, #346: losing the leader node of three must bring the app back to
 /// three replicas on the survivors without touching either survivor's
 /// replica, spread so neither runs all three, and without churning
@@ -1466,6 +1503,9 @@ async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
         }
     }
     assert!(leftovers.is_empty(), "{leftovers:?}");
+    // #398: the replacement took the lost replica's ordinal, so the three
+    // are still 0, 1 and 2, one id each.
+    assert_eq!(web_ordinals(&survivors).await, [0, 1, 2]);
     let report = reliaburger::relish::wtf::diagnose(
         &reliaburger::relish::wtf::collect(&entry.client, None)
             .await

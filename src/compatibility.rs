@@ -27,11 +27,13 @@ pub struct Compatibility {
 /// (`ImageSummary::platforms`), the apps a namespace quota keeps
 /// unplaced (`RaftRequest::QuotaBlocked`, `DesiredState::quota_blocked` and
 /// `DesiredAppEvidence::blocked`), and the cluster-wide views: peers answer
-/// deploy history, events and jobs for themselves on `local=true`, and the
-/// WebSocket log stream sends `LogFrame` JSON (F07).
+/// deploy history, events and jobs for themselves on `local=true`, the
+/// WebSocket log stream sends `LogFrame` JSON (F07), and replicas numbered
+/// across the cluster: each placement's `ordinal` in Raft, and the ordinals
+/// `/v1/placements` hands each node instead of a count (#398).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 30,
-    state: 48,
+    protocol: 31,
+    state: 49,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

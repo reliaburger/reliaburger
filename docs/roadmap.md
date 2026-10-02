@@ -115,7 +115,7 @@ migration and no feature gate
   - [x] the installers showing what they're downloading instead of staying
     silent for minutes ([#395](https://github.com/reliaburger/reliaburger/issues/395), [#397](https://github.com/reliaburger/reliaburger/pull/397)).
 
-  0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 30 and 48
+  0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 31 and 49
   now), so a 0.1.2 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.2](releasing.md#upgrading-from-012)). 0.1.2's leader
   refuses the upgrade before it records a run.

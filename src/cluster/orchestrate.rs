@@ -160,9 +160,28 @@ pub(crate) fn withdrawal_backlog_warning(
 pub struct NodeAssignment {
     pub name: String,
     pub namespace: String,
-    /// Number of replicas of this app assigned to the node.
-    pub replicas: u32,
+    /// The ordinals of this app's replicas assigned to the node, ascending:
+    /// one replica each, numbered across the cluster (#398).
+    pub ordinals: Vec<u32>,
     pub spec: AppSpec,
+}
+
+/// What the reconciler last handed the local agent for one assignment: the
+/// node's share of the spec and the ordinals it runs them as. Its JSON is the
+/// `Applied` fingerprint in the checkpoint, so a changed spec, count or
+/// ordinal all deploy again.
+#[derive(Serialize, Deserialize)]
+struct AppliedShare {
+    spec: AppSpec,
+    ordinals: Vec<u32>,
+}
+
+fn share_fingerprint(spec: &AppSpec, ordinals: &[u32]) -> String {
+    serde_json::to_string(&AppliedShare {
+        spec: spec.clone(),
+        ordinals: ordinals.to_vec(),
+    })
+    .unwrap_or_default()
 }
 
 /// An ingress route distributed to every node, including nodes without replicas.
@@ -715,6 +734,7 @@ fn plan_pass(
             .get(app_id)
             .map(|placements| {
                 placements.len() == want
+                    && ordinals_are_distinct(placements)
                     && placements.iter().all(|p| {
                         placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
                     })
@@ -773,22 +793,23 @@ fn plan_pass(
         // A fixed-size app keeps the placements that still hold and only
         // places the rest. Losing one node of three must not move the
         // replicas on the other two: they're serving, and replacing them
-        // would restart them for nothing.
+        // would restart them for nothing. Scaling down keeps the lowest
+        // ordinals.
+        let previous: &[crate::meat::types::Placement] =
+            desired.scheduling.get(app_id).map_or(&[], Vec::as_slice);
         let mut kept: Vec<crate::meat::types::Placement> = match effective_spec.replicas {
-            Replicas::Fixed(_) => desired
-                .scheduling
-                .get(app_id)
-                .map(|placements| {
-                    placements
-                        .iter()
-                        .filter(|p| {
-                            placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
-                        })
-                        .take(want)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Replicas::Fixed(_) => {
+                let mut holding: Vec<_> = previous
+                    .iter()
+                    .filter(|p| {
+                        placement_holds(p, spec, cache, alive, suspect, unheard, dns_required)
+                    })
+                    .cloned()
+                    .collect();
+                holding.sort_by_key(|p| p.ordinal);
+                holding.truncate(want);
+                holding
+            }
             Replicas::DaemonSet => Vec::new(),
         };
         // An app with no placement left (it was stopped, or is starting
@@ -814,6 +835,8 @@ fn plan_pass(
         if !kept.is_empty() {
             let missing = want - kept.len();
             if missing == 0 {
+                let held = kept.len();
+                assign_ordinals(&mut kept, held, previous);
                 decisions.push(crate::meat::types::SchedulingDecision {
                     app_id: app_id.clone(),
                     placements: kept,
@@ -842,10 +865,12 @@ fn plan_pass(
         match result {
             Ok(mut decision) => {
                 *cache = scheduler.cluster;
+                let held = kept.len();
                 if !kept.is_empty() {
                     let added = std::mem::take(&mut decision.placements);
                     decision.placements = kept.into_iter().chain(added).collect();
                 }
+                assign_ordinals(&mut decision.placements, held, previous);
                 decisions.push(decision);
             }
             Err(e) => {
@@ -857,6 +882,56 @@ fn plan_pass(
     PassPlan {
         decisions,
         quota_blocked,
+    }
+}
+
+/// True when no two of an app's placements share an ordinal.
+fn ordinals_are_distinct(placements: &[crate::meat::types::Placement]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    placements.iter().all(|p| seen.insert(p.ordinal))
+}
+
+/// Give every placement of one app its own ordinal, so its instance ids are
+/// unique across the cluster (#398).
+///
+/// The first `held` placements are replicas from the last decision that still
+/// hold, and they keep their ordinals (of two sharing one, the first keeps
+/// it). The rest are new. A new placement on a node that ran a replica of
+/// this app in `previous` takes that replica's ordinal back, which is how a
+/// daemon copy re-planned onto the same node keeps its name. Anything else
+/// takes the lowest ordinal nobody uses: the ordinal of a replica just lost,
+/// or the next one up.
+fn assign_ordinals(
+    placements: &mut [crate::meat::types::Placement],
+    held: usize,
+    previous: &[crate::meat::types::Placement],
+) {
+    let mut taken = std::collections::BTreeSet::new();
+    let mut new = Vec::new();
+    for (index, placement) in placements.iter().enumerate() {
+        if index >= held || !taken.insert(placement.ordinal) {
+            new.push(index);
+        }
+    }
+    let mut unnumbered = Vec::new();
+    for index in new {
+        let node = &placements[index].node_id;
+        let returning = previous
+            .iter()
+            .filter(|p| &p.node_id == node)
+            .map(|p| p.ordinal)
+            .find(|ordinal| !taken.contains(ordinal));
+        match returning {
+            Some(ordinal) => {
+                taken.insert(ordinal);
+                placements[index].ordinal = ordinal;
+            }
+            None => unnumbered.push(index),
+        }
+    }
+    let mut free = (0..).filter(|ordinal| !taken.contains(ordinal));
+    for index in unnumbered {
+        placements[index].ordinal = free.next().expect("u32 ordinals run out");
     }
 }
 
@@ -973,6 +1048,7 @@ impl VolumeHome<'_> {
             homes.push(crate::meat::types::Placement {
                 node_id: node_id.clone(),
                 resources,
+                ordinal: homes.len() as u32,
             });
         }
         // Reserve only once every home is known to fit, so a wait leaves
@@ -1484,6 +1560,7 @@ async fn adopted_instances_match(
     cmd_tx: &mpsc::Sender<AgentCommand>,
     key: &(String, String),
     spec: &crate::config::app::AppSpec,
+    ordinals: &[u32],
     io_timeout: Duration,
 ) -> bool {
     let ask = async {
@@ -1493,6 +1570,7 @@ async fn adopted_instances_match(
                 app_name: key.0.clone(),
                 namespace: key.1.clone(),
                 spec: Box::new(spec.clone()),
+                ordinals: ordinals.to_vec(),
                 response,
             })
             .await
@@ -1512,16 +1590,14 @@ pub fn retain_live_assignments(
         let AssignmentState::Applied { fingerprint } = state else {
             continue;
         };
-        let expected = serde_json::from_str::<AppSpec>(fingerprint)
+        let expected = serde_json::from_str::<AppliedShare>(fingerprint)
             .ok()
-            .and_then(|spec| {
-                if let Replicas::Fixed(count) = spec.replicas {
-                    Some(count)
-                } else {
-                    None
-                }
+            .map(|share| {
+                let mut ordinals = share.ordinals;
+                ordinals.sort_unstable();
+                ordinals
             });
-        let active = statuses
+        let mut active: Vec<u32> = statuses
             .iter()
             .filter(|instance| {
                 &instance.app_name == name
@@ -1537,8 +1613,11 @@ pub fn retain_live_assignments(
                             | "unhealthy"
                     )
             })
-            .count();
-        if expected.is_none_or(|expected| active != expected as usize) {
+            .filter_map(|instance| crate::grill::InstanceIdentity::parse(&instance.id))
+            .map(|identity| identity.ordinal)
+            .collect();
+        active.sort_unstable();
+        if expected.is_none_or(|expected| active != expected) {
             *state = AssignmentState::Pending;
         }
     }
@@ -1866,9 +1945,10 @@ fn spawn_placement_reconciler_with_io_timeout(
                 }
 
                 let mut spec = assignment.spec.clone();
-                // The local agent runs exactly this node's share.
-                spec.replicas = Replicas::Fixed(assignment.replicas);
-                let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
+                // The local agent runs exactly this node's share, named by the
+                // ordinals the leader assigned.
+                spec.replicas = Replicas::Fixed(assignment.ordinals.len() as u32);
+                let fingerprint = share_fingerprint(&spec, &assignment.ordinals);
                 if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
                 {
                     continue; // already converged; don't redeploy
@@ -1899,7 +1979,9 @@ fn spawn_placement_reconciler_with_io_timeout(
                 // adopted instances already run it. Rolling them again would
                 // replace every replica for nothing (and surge a second writer
                 // onto a volume app's data before #267).
-                if adopted_instances_match(&cmd_tx, &key, &spec, io_timeout).await {
+                if adopted_instances_match(&cmd_tx, &key, &spec, &assignment.ordinals, io_timeout)
+                    .await
+                {
                     let mut next = applied.clone();
                     next.insert(key.clone(), AssignmentState::Applied { fingerprint });
                     match persist_placements(checkpoint_path.as_deref(), &next).await {
@@ -1918,6 +2000,9 @@ fn spawn_placement_reconciler_with_io_timeout(
 
                 let mut config = Config::default();
                 config.app.insert(assignment.name.clone(), spec);
+                config
+                    .ordinals
+                    .insert(assignment.name.clone(), assignment.ordinals.clone());
 
                 // The durable intent survives a crash after the agent accepts
                 // work but before we can observe its terminal outcome.
@@ -2566,7 +2651,7 @@ mod tests {
         NodeAssignment {
             name: name.into(),
             namespace: namespace.into(),
-            replicas: 1,
+            ordinals: vec![0],
             spec: spec_from_toml(toml),
         }
     }
@@ -3036,7 +3121,7 @@ mod tests {
         let assignment = NodeAssignment {
             name: "web".into(),
             namespace: "default".into(),
-            replicas: 1,
+            ordinals: vec![0],
             spec: spec.clone(),
         };
         let mut applied_spec = spec;
@@ -3048,7 +3133,7 @@ mod tests {
             &[(
                 ("web".to_string(), "default".to_string()),
                 AssignmentState::Applied {
-                    fingerprint: serde_json::to_string(&applied_spec).unwrap(),
+                    fingerprint: share_fingerprint(&applied_spec, &[0]),
                 },
             )]
             .into_iter()
@@ -3136,7 +3221,7 @@ mod tests {
             apps: vec![NodeAssignment {
                 name: "web".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
                 ),
@@ -3247,7 +3332,7 @@ mod tests {
             apps: vec![NodeAssignment {
                 name: "web".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
                 ),
@@ -3552,7 +3637,7 @@ mod tests {
             apps: vec![NodeAssignment {
                 name: "broken".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.broken]
 image = "proc-grill:image-ignored"
@@ -3646,7 +3731,7 @@ command = ["false"]
             apps: vec![NodeAssignment {
                 name: "writer".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.writer]
 image = "busybox:latest"
@@ -3768,7 +3853,7 @@ image = "busybox:latest"
             apps: vec![NodeAssignment {
                 name: "interrupted".into(),
                 namespace: "rbtest-interrupted".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.interrupted]
 image = "proc-grill:image-ignored"
@@ -4006,16 +4091,29 @@ image = "busybox:latest"
         );
         spec.replicas = Replicas::Fixed(1);
         let fingerprint = AssignmentState::Applied {
-            fingerprint: serde_json::to_string(&spec).unwrap(),
+            fingerprint: share_fingerprint(&spec, &[0]),
         };
         let mut applied = BTreeMap::from([
             (("live".into(), "default".into()), fingerprint.clone()),
             (("gone".into(), "default".into()), fingerprint.clone()),
-            (("stopped".into(), "default".into()), fingerprint),
+            (("stopped".into(), "default".into()), fingerprint.clone()),
+            (("renamed".into(), "default".into()), fingerprint),
         ]);
         let statuses = vec![
             crate::bun::agent::InstanceStatus {
-                id: "live-0".into(),
+                id: "default__renamed-3".into(),
+                app_name: "renamed".into(),
+                namespace: "default".into(),
+                state: "running".into(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: None,
+                pid: Some(43),
+                runtime_unknown: false,
+                status_age_ms: None,
+            },
+            crate::bun::agent::InstanceStatus {
+                id: "default__live-0".into(),
                 app_name: "live".into(),
                 namespace: "default".into(),
                 state: "running".into(),
@@ -4027,7 +4125,7 @@ image = "busybox:latest"
                 status_age_ms: None,
             },
             crate::bun::agent::InstanceStatus {
-                id: "stopped-0".into(),
+                id: "default__stopped-0".into(),
                 app_name: "stopped".into(),
                 namespace: "default".into(),
                 state: "stopped".into(),
@@ -4052,8 +4150,14 @@ image = "busybox:latest"
             applied[&("stopped".into(), "default".into())],
             AssignmentState::Pending
         );
+        // #398: a replica running under another ordinal than the one applied
+        // isn't this assignment.
+        assert_eq!(
+            applied[&("renamed".into(), "default".into())],
+            AssignmentState::Pending
+        );
         retain_live_assignments(&mut applied, &[]);
-        assert_eq!(applied.len(), 3);
+        assert_eq!(applied.len(), 4);
         assert!(
             applied
                 .values()
@@ -4781,9 +4885,11 @@ image = "busybox:latest"
     fn placed_on(names: &[&str]) -> Vec<crate::meat::types::Placement> {
         names
             .iter()
-            .map(|name| crate::meat::types::Placement {
+            .zip(0..)
+            .map(|(name, ordinal)| crate::meat::types::Placement {
                 node_id: NodeId::new(*name),
                 resources: Resources::new(100, 0, 0),
+                ordinal,
             })
             .collect()
     }
@@ -5337,6 +5443,158 @@ image = "busybox:latest"
         assert_eq!(nodes_of(&decisions[0]), ["n1", "n2"]);
     }
 
+    /// Each placement as `(node, ordinal)`, sorted by ordinal.
+    fn ordinals_of(decision: &crate::meat::types::SchedulingDecision) -> Vec<(&str, u32)> {
+        let mut placed: Vec<_> = decision
+            .placements
+            .iter()
+            .map(|p| (p.node_id.0.as_str(), p.ordinal))
+            .collect();
+        placed.sort_by_key(|(_, ordinal)| *ordinal);
+        placed
+    }
+
+    /// `placed_on`, with each placement's ordinal given.
+    fn placed_with(placed: &[(&str, u32)]) -> Vec<crate::meat::types::Placement> {
+        placed
+            .iter()
+            .map(|(name, ordinal)| crate::meat::types::Placement {
+                node_id: NodeId::new(*name),
+                resources: Resources::new(100, 0, 0),
+                ordinal: *ordinal,
+            })
+            .collect()
+    }
+
+    fn three_nodes() -> (ClusterStateCache, HashSet<NodeId>) {
+        let mut cache = ClusterStateCache::new();
+        for name in ["n1", "n2", "n3"] {
+            cache.set_node(sched_node(name, 4000, BTreeMap::new()));
+        }
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")]);
+        (cache, alive)
+    }
+
+    /// #398: ordinals are counted across the cluster, not per node, so three
+    /// nodes' first replicas aren't all `frontend-0`.
+    #[test]
+    fn new_replicas_take_distinct_ordinals_across_nodes() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 6));
+        let (mut cache, alive) = three_nodes();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        let ordinals: Vec<u32> = ordinals_of(&decisions[0]).iter().map(|(_, o)| *o).collect();
+        assert_eq!(ordinals, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(per_node(&decisions[0]).len(), 3, "spread over the nodes");
+    }
+
+    #[test]
+    fn a_replacement_takes_the_lost_replicas_ordinal() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_with(&[("n1", 0), ("n2", 1), ("n3", 2)]));
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        let placed = ordinals_of(&decisions[0]);
+        assert_eq!(placed[0], ("n1", 0), "{placed:?}");
+        assert_eq!(placed[2], ("n3", 2), "{placed:?}");
+        assert_eq!(placed[1].1, 1, "the replacement is replica 1 again");
+        assert_ne!(placed[1].0, "n2");
+    }
+
+    #[test]
+    fn scaling_up_takes_the_next_free_ordinals() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 4));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_with(&[("n1", 0), ("n2", 1)]));
+        let (mut cache, alive) = three_nodes();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        let placed = ordinals_of(&decisions[0]);
+        assert_eq!(placed[..2], [("n1", 0), ("n2", 1)], "{placed:?}");
+        assert_eq!(placed[2].1, 2);
+        assert_eq!(placed[3].1, 3);
+    }
+
+    /// Scaling down keeps the lowest ordinals, so three replicas cut to two
+    /// are `-0` and `-1`, whatever order the placements were committed in.
+    #[test]
+    fn scaling_down_keeps_the_lowest_ordinals() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 2));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_with(&[("n1", 2), ("n2", 0), ("n3", 1)]));
+        let (mut cache, alive) = three_nodes();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(ordinals_of(&decisions[0]), [("n2", 0), ("n3", 1)]);
+    }
+
+    /// Two placements sharing an ordinal would be two instances with one id.
+    /// The plan isn't converged until they're distinct, and the first keeps
+    /// its ordinal.
+    #[test]
+    fn duplicate_ordinals_are_renumbered() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 2));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_with(&[("n1", 0), ("n2", 0)]));
+        let (mut cache, alive) = three_nodes();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "not converged");
+        assert_eq!(ordinals_of(&decisions[0]), [("n1", 0), ("n2", 1)]);
+    }
+
+    /// A daemon set is re-planned from scratch when it changes, but each copy
+    /// keeps its ordinal on its node, and a new node takes the next free one.
+    #[test]
+    fn a_daemon_copy_keeps_its_ordinal_on_its_node() {
+        let app = AppId::new("mon", "system");
+        let mut desired = DesiredState::default();
+        let mut spec = app_spec(100, 1);
+        spec.replicas = Replicas::DaemonSet;
+        desired.apps.insert(app.clone(), spec);
+        desired
+            .scheduling
+            .insert(app.clone(), placed_with(&[("n1", 1), ("n2", 0)]));
+        let (mut cache, alive) = three_nodes();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(
+            ordinals_of(&decisions[0]),
+            [("n2", 0), ("n1", 1), ("n3", 2)]
+        );
+    }
+
     /// A cordoned (upgrade) node receives nothing.
     #[test]
     fn decommissioned_node_is_not_scheduled_from_stale_reports() {
@@ -5552,6 +5810,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("big"),
                 resources: Resources::new(600, 0, 0),
+                ordinal: 0,
             }],
         );
 
@@ -5588,6 +5847,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("gone"),
                 resources: Resources::new(100, 0, 0),
+                ordinal: 0,
             }],
         );
 
@@ -5615,6 +5875,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("lost-hooks"),
                 resources: Resources::new(100, 0, 0),
+                ordinal: 0,
             }],
         );
 
@@ -5648,6 +5909,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("dns-lost"),
                 resources: Resources::new(100, 0, 0),
+                ordinal: 0,
             }],
         );
 

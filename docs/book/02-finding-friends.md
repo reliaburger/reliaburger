@@ -2492,6 +2492,43 @@ Keeping placements put was half the job. The other half is where the missing rep
 
 The node agent had its own version of the problem. A node's share of an app arrives as the app's spec with `replicas` set to that share, so when node-1's share went from one to two, it saw a changed spec and rolled every replica: the healthy frontend stopped, two new ones started. While a node is down, the old replica's address can't be released (the dead node never confirms the withdrawal), so the stopped instance lingered in `relish inspect` for a minute. Now, if the new spec is the old one with a higher count and every replica is running, the agent starts only the extra replicas beside the old ones, through the same path a fresh deploy uses. Anything else, a new image, a crash-looping replica, a stopped app, still rolls.
 
+### Three replicas called frontend-0
+
+Run the tour, type `relish status`, and you'll see `default__frontend-0` three times, once per node. A user asked the obvious question: which one is replica 0? All of them. Each node was told only *how many* replicas it ran, so each counted its own from zero. The id was unique on its node and nowhere else, which made logs, `relish inspect` and the dashboard read as if one replica had been cloned, and left anything that names a replica by its id alone needing the node as well.
+
+The fix starts where the decision is made. A `Placement` in the leader's scheduling decision now carries an ordinal next to its node and resources:
+
+```rust
+pub struct Placement {
+    pub node_id: NodeId,
+    pub resources: Resources,
+    pub ordinal: u32,
+}
+```
+
+The planning pass numbers each app's placements once it knows which ones it kept, in `assign_ordinals`. The rules are short. A replica that still holds keeps its ordinal, which is the point: when node-3 dies, the replicas on node-1 and node-2 don't change name any more than they change process. A new placement takes the lowest ordinal nobody uses, so the replacement for node-3's `frontend-2` is `frontend-2` again, on a survivor, and a scale-up from three to five adds `-3` and `-4`. Scaling down sorts the placements that hold by ordinal and keeps the lowest, so five back down to three leaves `-0`, `-1` and `-2`.
+
+Daemon sets needed one more rule. The pass re-plans a daemon set from scratch whenever its set of eligible nodes changes, and the scheduler numbers what it places in node order. Left alone, a new node joining would renumber every copy. So a new placement first looks at the previous decision: if this node ran a replica of the app before, it takes that ordinal back. Only a node that's new to the app gets a fresh number.
+
+The pass also refuses to call an app converged while two of its placements share an ordinal. That can't come out of `assign_ordinals`, but the check costs one `BTreeSet` and turns "two instances with one name" from a bug that hides into a decision the next tick corrects:
+
+```rust
+fn ordinals_are_distinct(placements: &[Placement]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    placements.iter().all(|p| seen.insert(p.ordinal))
+}
+```
+
+`insert` returns `false` when the value was already there, and `all` stops at the first `false`. It's the same trick as Python's `len(set(xs)) == len(xs)`, except that it stops at the first duplicate and never builds a set it doesn't need.
+
+The node has to hear about all this, so `/v1/placements/{node}` now hands each node its ordinals rather than a count, and the reconciler passes them to the local agent in `Config::ordinals`. That field is marked `#[serde(skip)]`: the reconciler sets it in memory for the deploy it queues, and no TOML file can. We considered putting the ordinals on `AppSpec`, where the replica count lives, and backed off. Specs are compared with `==` in several places (the "only the count grew" check above, adoption after a restart), and a field that's present in one spec and absent from its stored copy would make every one of those comparisons fail. A deploy without a leader, a single node or a rollback without a council, has no ordinals to pass and still counts `0..n`.
+
+On the agent, every way of starting replicas takes the ordinals: a fresh deploy, the in-place growth above (which now adds the ordinals the node doesn't run yet, and only if every replica it runs is still assigned), and both rollout strategies, where a rolling deploy replaces `frontend-2` with `frontend-g7-2` rather than with whichever index came next. The reconciler's record of what it last applied now includes the ordinals, so a node handed `[3]` instead of `[0]` redeploys even though its count didn't change.
+
+This changes what the leader stores in Raft and what it sends on `/v1/placements`, so 0.1.3 moved to protocol 31 and state format 49, with no migration (the pre-1.0 rule). `new_replicas_take_distinct_ordinals_across_nodes`, `a_replacement_takes_the_lost_replicas_ordinal`, `scaling_up_takes_the_next_free_ordinals`, `scaling_down_keeps_the_lowest_ordinals`, `duplicate_ordinals_are_renumbered` and `a_daemon_copy_keeps_its_ordinal_on_its_node` pin the planner. `a_node_names_its_replicas_by_their_assigned_ordinals` drives one agent through a fresh deploy, a replacement arriving, a rollout and a scale-down. In `tests/placement.rs`, `replicas_are_numbered_across_the_cluster` checks three real nodes end up with `web-0`, `web-1` and `web-2`, and the leader-loss test checks the survivors still have exactly those once the replacement runs.
+
+One thing ordinals don't give you is a stable *full* id. Each node keeps its own deploy generation counter, so after a move the same replica might be `frontend-2` on one node and `frontend-g5-2` on another. The ordinal is the part that names the replica; the generation says which rollout started it.
+
 ### An instance id that forgot which namespace it lived in
 
 Here's a bug that hid in plain sight for most of the project. A workload instance had an id like `api-0`: the app name, a hyphen, the replica index. Clean, readable, and wrong.

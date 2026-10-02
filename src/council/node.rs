@@ -937,6 +937,7 @@ mod tests {
             placements: vec![Placement {
                 node_id: NodeId::new("node-1"),
                 resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                ordinal: 0,
             }],
         };
         leader

@@ -2523,6 +2523,7 @@ mod tests {
                         .map(|node| Placement {
                             node_id: NodeId::new(*node),
                             resources: Resources::new(100, 0, 0),
+                            ordinal: 0,
                         })
                         .collect(),
                 }),
@@ -3210,10 +3211,12 @@ mod tests {
                 Placement {
                     node_id: NodeId::new("node-1"),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 0,
                 },
                 Placement {
                     node_id: NodeId::new("node-2"),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 1,
                 },
             ],
         };
@@ -6455,6 +6458,7 @@ mod tests {
                 placements: vec![Placement {
                     node_id: NodeId::new(node),
                     resources: Resources::new(1, 1, 0),
+                    ordinal: 0,
                 }],
             })
         };
@@ -6675,6 +6679,7 @@ mod tests {
                         .map(|node| Placement {
                             node_id: NodeId::new(node),
                             resources: Resources::new(1, 1, 0),
+                            ordinal: 0,
                         })
                         .collect(),
                 }),
@@ -6738,6 +6743,7 @@ mod tests {
                 placements: vec![Placement {
                     node_id: NodeId::new(node),
                     resources: Resources::new(1, 1, 0),
+                    ordinal: 0,
                 }],
             })
         };
@@ -6770,6 +6776,7 @@ mod tests {
                 placements: vec![Placement {
                     node_id: NodeId::new(node),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 0,
                 }],
             })
         };

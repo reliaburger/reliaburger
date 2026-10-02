@@ -14,22 +14,25 @@ use crate::config::app::AppSpec;
 use crate::grill::state::ContainerState;
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// How many replicas deploying `spec` adds beside the ones already
-    /// running, when the deploy changes nothing but a higher replica count.
+    /// The ordinals deploying `spec` as `ordinals` adds beside the replicas
+    /// already running, when the deploy changes nothing but a higher replica
+    /// count and every running replica's ordinal is still among `ordinals`.
     ///
     /// `None` means the deploy must roll as usual: the app is new, its spec
-    /// changed, its count didn't grow, or not every replica it runs is
-    /// running (a stopped app, a crash-looping replica, a rollout that
-    /// failed halfway). Call it before the new spec is stored.
+    /// changed, its count didn't grow, a running replica's ordinal is no
+    /// longer assigned here, or not every replica it runs is running (a
+    /// stopped app, a crash-looping replica, a rollout that failed halfway).
+    /// Call it before the new spec is stored.
     pub(super) fn replicas_to_add_in_place(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-    ) -> Option<u32> {
+        ordinals: &[u32],
+    ) -> Option<Vec<u32>> {
         let key = (app_name.to_string(), namespace.to_string());
         let previous = self.deployed_specs.get(&key)?;
-        let (running, added) = replicas_added(previous, spec)?;
+        let (running, _) = replicas_added(previous, spec)?;
         let instances: Vec<_> = self
             .supervisor
             .list_instances()
@@ -44,7 +47,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let all_running = instances
             .iter()
             .all(|instance| instance.state == ContainerState::Running && !instance.retry_pending);
-        (all_running && instances.len() == running as usize).then_some(added)
+        if !all_running || instances.len() != running as usize {
+            return None;
+        }
+        let mut running_ordinals = std::collections::BTreeSet::new();
+        for instance in &instances {
+            let ordinal = crate::grill::InstanceIdentity::parse(&instance.id.0)?.ordinal;
+            if !ordinals.contains(&ordinal) || !running_ordinals.insert(ordinal) {
+                return None;
+            }
+        }
+        let added: Vec<u32> = ordinals
+            .iter()
+            .copied()
+            .filter(|ordinal| !running_ordinals.contains(ordinal))
+            .collect();
+        (!added.is_empty()).then_some(added)
     }
 }
 

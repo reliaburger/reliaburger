@@ -165,6 +165,7 @@ impl Scheduler {
             placements.push(Placement {
                 node_id: selected_node.clone(),
                 resources: *requirements.resources,
+                ordinal: placements.len() as u32,
             });
         }
 
@@ -207,6 +208,7 @@ impl Scheduler {
             placements.push(Placement {
                 node_id: node_id.clone(),
                 resources: *requirements.resources,
+                ordinal: placements.len() as u32,
             });
         }
 
