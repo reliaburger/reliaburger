@@ -690,7 +690,7 @@ fn plan_pass(
         // A daemon set targets every *eligible* node, so its convergence count
         // is the eligible-node count, not every alive node (M25).
         let want = if override_replicas.is_none() && matches!(spec.replicas, Replicas::DaemonSet) {
-            daemon_eligible_count(cache, spec, dns_required)
+            daemon_eligible_count(cache, app_id, spec, dns_required)
         } else {
             effective_replicas(spec, override_replicas, alive.len())
         };
@@ -1059,7 +1059,12 @@ fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<
 /// node is ineligible (not ready, lacks a required capability, doesn't fit),
 /// `placements.len()` never equals `alive.len()` and the leader re-commits an
 /// identical `SchedulingDecision` to Raft every tick.
-fn daemon_eligible_count(cache: &ClusterStateCache, spec: &AppSpec, dns_required: bool) -> usize {
+fn daemon_eligible_count(
+    cache: &ClusterStateCache,
+    app_id: &crate::meat::AppId,
+    spec: &AppSpec,
+    dns_required: bool,
+) -> usize {
     let resources = scheduler_resources(spec);
     let required = spec
         .placement
@@ -1067,8 +1072,15 @@ fn daemon_eligible_count(cache: &ClusterStateCache, spec: &AppSpec, dns_required
         .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
         .unwrap_or_default();
     let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
-    crate::meat::filter::filter_nodes(&resources, &required, requires_egress, dns_required, cache)
-        .len()
+    crate::meat::scheduler::daemon_candidates(
+        cache,
+        app_id,
+        &resources,
+        &required,
+        requires_egress,
+        dns_required,
+    )
+    .len()
 }
 
 /// The per-replica resources an app requests, for quota accounting. Mirrors
@@ -5965,16 +5977,11 @@ image = "busybox:latest"
 
 #[cfg(test)]
 mod audit_daemon_self_reservation {
-    use crate::meat::quota::QuotaLedger;
     use super::*;
     use crate::config::Replicas;
     use crate::council::types::DesiredState;
-    use crate::meat::{
-        cluster_state::SchedulerNodeState,
-        types::{AppId, Placement},
-    };
-    use crate::reporting::types::*;
-    use std::time::{Instant, SystemTime};
+    use crate::meat::quota::QuotaLedger;
+    use crate::meat::{cluster_state::SchedulerNodeState, types::AppId};
     fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
         SchedulerNodeState {
             node_id: NodeId::new(name),
