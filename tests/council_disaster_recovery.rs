@@ -684,6 +684,37 @@ async fn old_voters_returning_after_recovery_cannot_form_a_quorum() {
         "a fenced voter must refuse writes with the fence error, got {refused:?}"
     );
 
+    // Every node's own council status, compared the way `relish council
+    // status`, the `relish status` header and `relish wtf` compare them,
+    // shows the recovered council healthy and both old voters fenced.
+    let mut observations = Vec::new();
+    for (name, node) in [("fence0", &recovered), ("fence1", &old1), ("fence2", &old2)] {
+        let metrics = node.council.metrics().borrow().clone();
+        let status = reliaburger::bun::agent::council_status(&node.council, &metrics).await;
+        observations.push(
+            reliaburger::relish::council_view::CouncilNodeObservation::answered(name, &status),
+        );
+    }
+    let summary = reliaburger::relish::council_view::summarise(&observations);
+    assert_eq!(summary.epoch, Some(1));
+    assert_eq!(summary.leaders, vec!["fence0".to_string()]);
+    assert_eq!(summary.voters, vec!["fence0".to_string()]);
+    assert!(summary.quorum_ok());
+    let fenced: Vec<&str> = summary.fenced.iter().map(|n| n.node_id.as_str()).collect();
+    assert_eq!(fenced, vec!["fence1", "fence2"]);
+    assert_eq!(
+        summary.epochs.len(),
+        1,
+        "fenced voters must not count as a council"
+    );
+    let table = reliaburger::relish::council_view::render_council_status(&observations, &summary);
+    assert!(table.contains("fence1  fenced"), "council status:\n{table}");
+    let header = reliaburger::relish::council_view::render_status_header(&summary);
+    assert!(
+        header.contains("warning: fenced: fence1"),
+        "status header:\n{header}"
+    );
+
     // The fence survives a restart: the old voter comes back still fenced.
     old2.stop().await;
     let old2 = FenceNode::start(2, vec![fence_gossip(0)]).await;

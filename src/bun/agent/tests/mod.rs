@@ -8543,17 +8543,85 @@ fn council_status_serialisation_round_trip() {
             raft_id: 1,
             name: "node-1".to_string(),
             address: "192.168.1.1:9200".to_string(),
+            voter: true,
         }],
         leader: Some("node-1".to_string()),
         term: 5,
         last_applied_log: Some(42),
         app_count: 3,
+        ..Default::default()
     };
     let json = serde_json::to_string(&status).unwrap();
     let decoded: CouncilStatus = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded.term, 5);
     assert_eq!(decoded.leader, Some("node-1".to_string()));
     assert_eq!(decoded.members.len(), 1);
+}
+
+fn council_metrics(
+    id: u64,
+    voters: &[u64],
+    learners: &[u64],
+    state: openraft::ServerState,
+) -> openraft::RaftMetrics<u64, crate::council::types::CouncilNodeInfo> {
+    let nodes: std::collections::BTreeMap<u64, crate::council::types::CouncilNodeInfo> = voters
+        .iter()
+        .chain(learners)
+        .map(|id| {
+            (
+                *id,
+                crate::council::types::CouncilNodeInfo {
+                    addr: "127.0.0.1:9444".parse().unwrap(),
+                    name: format!("node-{id}"),
+                },
+            )
+        })
+        .collect();
+    let membership = openraft::Membership::new(vec![voters.iter().copied().collect()], nodes);
+    let mut metrics = openraft::RaftMetrics::new_initial(id);
+    metrics.membership_config =
+        std::sync::Arc::new(openraft::StoredMembership::new(None, membership));
+    metrics.state = state;
+    metrics
+}
+
+fn fence(state: crate::council::fence::FenceState) -> Option<crate::council::fence::FenceSnapshot> {
+    Some(crate::council::fence::FenceSnapshot { epoch: 0, state })
+}
+
+#[test]
+fn council_role_reads_raft_state_for_a_serving_member() {
+    use crate::bun::agent::{CouncilRole, council_role};
+    use crate::council::fence::FenceState;
+    use openraft::ServerState;
+    let serving = fence(FenceState::Serving);
+    let leader = council_metrics(1, &[1, 2, 3], &[], ServerState::Leader);
+    assert_eq!(council_role(&leader, serving), CouncilRole::Leader);
+    let follower = council_metrics(2, &[1, 2, 3], &[], ServerState::Follower);
+    assert_eq!(council_role(&follower, serving), CouncilRole::Follower);
+    let candidate = council_metrics(2, &[1, 2, 3], &[], ServerState::Candidate);
+    assert_eq!(council_role(&candidate, serving), CouncilRole::Candidate);
+    let learner = council_metrics(4, &[1, 2, 3], &[4], ServerState::Learner);
+    assert_eq!(council_role(&learner, serving), CouncilRole::Learner);
+    let worker = council_metrics(9, &[1, 2, 3], &[], ServerState::Learner);
+    assert_eq!(council_role(&worker, None), CouncilRole::Worker);
+}
+
+#[test]
+fn council_role_puts_the_fence_before_what_raft_says() {
+    use crate::bun::agent::{CouncilRole, council_role};
+    use crate::council::fence::FenceState;
+    use openraft::ServerState;
+    // A fenced old leader may still think it leads; it must say fenced.
+    let stale_leader = council_metrics(1, &[1, 2, 3], &[], ServerState::Leader);
+    assert_eq!(
+        council_role(&stale_leader, fence(FenceState::Fenced { newer_epoch: 1 })),
+        CouncilRole::Fenced
+    );
+    assert_eq!(
+        council_role(&stale_leader, fence(FenceState::Probing)),
+        CouncilRole::Starting
+    );
 }
 
 #[tokio::test]

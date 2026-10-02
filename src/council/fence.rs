@@ -187,6 +187,22 @@ impl RecoveryFence {
         Ok(Self::new(snapshot, Some(file)))
     }
 
+    /// Read the newer epoch a stopped node's persisted record says fenced
+    /// it, if any. Blocking: for offline tools such as `relish council
+    /// re-enrol`, never the runtime.
+    pub fn read_fenced_by(raft_dir: &Path) -> std::io::Result<Option<u64>> {
+        let file = raft_dir.join(FENCE_FILE);
+        match std::fs::read(&file) {
+            Ok(bytes) => serde_json::from_slice::<FenceRecord>(&bytes)
+                .map(|record| record.fenced_by)
+                .map_err(|e| {
+                    std::io::Error::other(format!("{} is unreadable: {e}", file.display()))
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The current fence.
     pub fn snapshot(&self) -> FenceSnapshot {
         *self.state.borrow()

@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use super::WTF_SCHEMA_VERSION;
 use super::model::{
-    ApplicationEvidence, BuildObservation, ClusterEvidence, CorrelatedEvent, DeployObservation,
-    Evidence, LogObservation, RestartObservation, WtfFinding, WtfInputs, WtfOk, WtfReport,
-    WtfSummary, WtfUnknown,
+    ApplicationEvidence, BuildObservation, ClusterEvidence, CorrelatedEvent, CouncilObservation,
+    DeployObservation, Evidence, LogObservation, RestartObservation, WtfFinding, WtfInputs, WtfOk,
+    WtfReport, WtfSummary, WtfUnknown,
 };
 
 const CRASHLOOP_WINDOW_SECONDS: u64 = 15 * 60;
@@ -290,7 +290,7 @@ fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
         }
         return;
     }
-    let mut healthy = true;
+    let mut healthy = check_council_split(council, report);
     if council.leader.is_none() {
         healthy = false;
         report.critical.push(WtfFinding {
@@ -332,12 +332,15 @@ fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
                 "{missing} of {} council members did not answer",
                 council.member_count
             ),
-            details: vec![format!(
-                "quorum holds with {} of {}; {} more failure(s) would lose it",
-                council.reachable_members,
-                council.member_count,
-                council.reachable_members + 1 - quorum
-            )],
+            details: vec![
+                format!(
+                    "quorum holds with {} of {}; {} more failure(s) would lose it",
+                    council.reachable_members,
+                    council.member_count,
+                    council.reachable_members + 1 - quorum
+                ),
+                format!("not answering: {}", council.missing_members.join(", ")),
+            ],
             suggestion: "bring the missing node back, or replace it: `relish nodes`, `relish local start <node>` on a laptop cluster".to_string(),
             correlated_events: Vec::new(),
             affected_resource: "council".to_string(),
@@ -352,6 +355,76 @@ fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
             ),
         });
     }
+}
+
+/// Compare every node's own view of the council (#424): a fenced node, two
+/// serving recovery epochs, or two leaders. Returns `false` if it found any.
+fn check_council_split(council: &CouncilObservation, report: &mut WtfReport) -> bool {
+    if council.nodes.is_empty() {
+        return true;
+    }
+    let summary = crate::relish::council_view::summarise(&council.nodes);
+    let mut healthy = true;
+    if !summary.fenced.is_empty() {
+        healthy = false;
+        report.critical.push(WtfFinding {
+            id: "council-fenced".to_string(),
+            title: format!(
+                "{} node(s) fenced out of a council that `relish council recover` replaced",
+                summary.fenced.len()
+            ),
+            details: summary
+                .fenced
+                .iter()
+                .map(|node| {
+                    format!(
+                        "{}: belonged to recovery epoch {}, replaced by epoch {}; it serves no \
+                         Raft and refuses writes",
+                        node.node_id, node.epoch, node.fenced_by
+                    )
+                })
+                .collect(),
+            suggestion: "re-enrol each fenced node: stop it, run `relish council re-enrol \
+                         --data-dir <its data directory>`, then start it so the current council \
+                         admits it afresh"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    if summary.epochs.len() > 1 {
+        healthy = false;
+        report.critical.push(WtfFinding {
+            id: "council-epoch-split".to_string(),
+            title: "nodes serve different recovery epochs: two councils".to_string(),
+            details: summary
+                .epochs
+                .iter()
+                .map(|(epoch, nodes)| format!("epoch {epoch}: {}", nodes.join(", ")))
+                .collect(),
+            suggestion: format!(
+                "the newest epoch ({}) is the recovered council; stop the nodes on older \
+                 epochs, then `relish council re-enrol --data-dir <data directory>` each one",
+                summary.epoch.unwrap_or_default()
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    if summary.leaders.len() > 1 {
+        healthy = false;
+        report.critical.push(WtfFinding {
+            id: "council-multiple-leaders".to_string(),
+            title: format!("{} nodes are reported as leader", summary.leaders.len()),
+            details: vec![format!("leaders: {}", summary.leaders.join(", "))],
+            suggestion: "compare every node's view with `relish council status`; a lasting \
+                         second leader is a split brain, so stop the side on the older epoch"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    healthy
 }
 
 fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
@@ -1036,6 +1109,8 @@ mod tests {
                     member_count: 1,
                     reachable_members: 1,
                     leader: Some("node-1".to_string()),
+                    missing_members: Vec::new(),
+                    nodes: Vec::new(),
                 }),
                 faults: available(Vec::new()),
                 disks: available(vec![DiskObservation {
@@ -1201,6 +1276,8 @@ mod tests {
             member_count: 3,
             reachable_members: 1,
             leader: None,
+            missing_members: vec!["node-2".to_string(), "node-3".to_string()],
+            nodes: Vec::new(),
         });
 
         let report = diagnose(&inputs);
@@ -1221,6 +1298,8 @@ mod tests {
             member_count: 3,
             reachable_members: 2,
             leader: Some("node-1".to_string()),
+            missing_members: vec!["node-3".to_string()],
+            nodes: Vec::new(),
         });
 
         let report = diagnose(&inputs);
@@ -1232,8 +1311,132 @@ mod tests {
             .unwrap();
         assert_eq!(finding.title, "1 of 3 council members did not answer");
         assert!(finding.details[0].contains("1 more failure(s)"));
+        assert_eq!(finding.details[1], "not answering: node-3");
         assert!(report.critical.is_empty());
         assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    fn council_node(
+        name: &str,
+        role: crate::bun::agent::CouncilRole,
+        epoch: u64,
+        fenced_by: Option<u64>,
+        leader: Option<&str>,
+    ) -> crate::relish::council_view::CouncilNodeObservation {
+        use crate::relish::council_view::{CouncilMemberObservation, CouncilNodeObservation};
+        CouncilNodeObservation {
+            node_id: name.to_string(),
+            error: None,
+            role,
+            recovery_epoch: Some(epoch),
+            fenced_by,
+            leader: leader.map(str::to_string),
+            term: 3,
+            last_applied: Some(10),
+            last_log_index: Some(10),
+            members: vec![CouncilMemberObservation {
+                name: "node-1".to_string(),
+                voter: true,
+            }],
+        }
+    }
+
+    fn council_with_nodes(
+        nodes: Vec<crate::relish::council_view::CouncilNodeObservation>,
+    ) -> Evidence<CouncilObservation> {
+        available(CouncilObservation {
+            enabled: true,
+            member_count: 1,
+            reachable_members: 1,
+            leader: Some("node-1".to_string()),
+            missing_members: Vec::new(),
+            nodes,
+        })
+    }
+
+    /// #424, after the fence: the recovered council is healthy, but the old
+    /// voters must not hide. Each is named, with the way back.
+    #[test]
+    fn a_fenced_node_is_critical_and_names_the_way_back() {
+        use crate::bun::agent::CouncilRole;
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = council_with_nodes(vec![
+            council_node("node-1", CouncilRole::Leader, 1, None, Some("node-1")),
+            council_node("node-2", CouncilRole::Fenced, 0, Some(1), None),
+            council_node("node-3", CouncilRole::Fenced, 0, Some(1), None),
+        ]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|item| item.id == "council-fenced")
+            .unwrap();
+        assert!(finding.title.starts_with("2 node(s) fenced"));
+        assert!(finding.details[0].starts_with("node-2: belonged to recovery epoch 0"));
+        assert!(
+            finding
+                .suggestion
+                .contains("relish council re-enrol --data-dir")
+        );
+        // The fence working is not a second council.
+        assert!(
+            !report
+                .critical
+                .iter()
+                .any(|item| item.id == "council-epoch-split")
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    /// #424, before the fence: both halves serve and both report healthy.
+    #[test]
+    fn two_serving_epochs_and_two_leaders_are_critical() {
+        use crate::bun::agent::CouncilRole;
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = council_with_nodes(vec![
+            council_node("node-1", CouncilRole::Leader, 1, None, Some("node-1")),
+            council_node("node-2", CouncilRole::Leader, 0, None, Some("node-2")),
+            council_node("node-3", CouncilRole::Follower, 0, None, Some("node-2")),
+        ]);
+
+        let report = diagnose(&inputs);
+
+        let split = report
+            .critical
+            .iter()
+            .find(|item| item.id == "council-epoch-split")
+            .unwrap();
+        assert_eq!(
+            split.details,
+            vec!["epoch 0: node-2, node-3", "epoch 1: node-1"]
+        );
+        let leaders = report
+            .critical
+            .iter()
+            .find(|item| item.id == "council-multiple-leaders")
+            .unwrap();
+        assert_eq!(leaders.details, vec!["leaders: node-1, node-2"]);
+        assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    #[test]
+    fn one_council_on_one_epoch_stays_ok() {
+        use crate::bun::agent::CouncilRole;
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = council_with_nodes(vec![council_node(
+            "node-1",
+            CouncilRole::Leader,
+            1,
+            None,
+            Some("node-1"),
+        )]);
+
+        let report = diagnose(&inputs);
+
+        assert!(report.critical.is_empty());
+        assert!(report.ok.iter().any(|ok| ok.id == "council"));
     }
 
     #[test]

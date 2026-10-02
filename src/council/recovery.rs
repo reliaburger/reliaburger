@@ -52,6 +52,35 @@ pub enum RecoveryError {
     Bootstrap(String),
     #[error("persist recovered snapshot: {0}")]
     Persist(String),
+    #[error(
+        "{path} holds a council this node still serves, not a fenced one; re-enrolling would \
+         throw away a live voter's log (pass --force only if this node is on a stale epoch that \
+         wasn't fenced)"
+    )]
+    NotFenced { path: String },
+}
+
+/// Offline re-enrolment of a voter fenced out by a recovery (#424): drop the
+/// replaced council's Raft state (log, snapshot and fence record) so the next
+/// start joins the current council as a fresh member and adopts its epoch.
+///
+/// Refuses unless the persisted fence record says the node is fenced, or
+/// `force` is set. Returns the epoch that fenced it, when one was recorded.
+/// The node must be stopped: redb holds exclusive locks on these files.
+pub fn reenrol_data_dir(data_dir: &Path, force: bool) -> Result<Option<u64>, RecoveryError> {
+    let raft_dir = data_dir.join("raft");
+    let fenced_by = crate::council::fence::RecoveryFence::read_fenced_by(&raft_dir)
+        .map_err(|e| RecoveryError::OpenSource(e.to_string()))?;
+    if fenced_by.is_none() && !force {
+        return Err(RecoveryError::NotFenced {
+            path: raft_dir.display().to_string(),
+        });
+    }
+    if raft_dir.exists() {
+        std::fs::remove_dir_all(&raft_dir)
+            .map_err(|e| RecoveryError::Persist(format!("remove {}: {e}", raft_dir.display())))?;
+    }
+    Ok(fenced_by)
 }
 
 /// Whether the gossip view shows any council voter still alive.
@@ -233,6 +262,60 @@ mod tests {
             first_seen: std::time::Instant::now(),
             resources: None,
         }
+    }
+
+    async fn write_fence(raft_dir: &Path, fenced: bool) {
+        use crate::council::fence::{FenceSnapshot, FenceState, RecoveryFence};
+        std::fs::create_dir_all(raft_dir).unwrap();
+        std::fs::write(raft_dir.join("log.redb"), b"old council").unwrap();
+        let state = if fenced {
+            FenceState::Fenced { newer_epoch: 2 }
+        } else {
+            FenceState::Serving
+        };
+        RecoveryFence::new(
+            FenceSnapshot { epoch: 1, state },
+            Some(raft_dir.join(crate::council::fence::FENCE_FILE)),
+        )
+        .persist()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reenrol_drops_a_fenced_nodes_raft_state() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fence(&dir.path().join("raft"), true).await;
+        assert_eq!(reenrol_data_dir(dir.path(), false).unwrap(), Some(2));
+        assert!(!dir.path().join("raft").exists());
+    }
+
+    #[tokio::test]
+    async fn reenrol_refuses_a_serving_voter_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fence(&dir.path().join("raft"), false).await;
+        assert!(matches!(
+            reenrol_data_dir(dir.path(), false),
+            Err(RecoveryError::NotFenced { .. })
+        ));
+        assert!(dir.path().join("raft").join("log.redb").exists());
+        assert_eq!(reenrol_data_dir(dir.path(), true).unwrap(), None);
+        assert!(!dir.path().join("raft").exists());
+    }
+
+    #[test]
+    fn recover_data_dir_drops_the_old_fence_record() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
+        let raft = dir.path().join("raft");
+        std::fs::create_dir_all(&raft).unwrap();
+        std::fs::write(
+            raft.join(crate::council::fence::FENCE_FILE),
+            br#"{"epoch":0,"fenced_by":null}"#,
+        )
+        .unwrap();
+        recover_data_dir(dir.path(), DesiredState::default()).unwrap();
+        assert!(!raft.join(crate::council::fence::FENCE_FILE).exists());
     }
 
     #[test]

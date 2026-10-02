@@ -1,0 +1,12 @@
+---
+source: src/relish/council_view.rs
+expression: "render_council_status(&nodes, &summarise(&nodes))"
+---
+Epoch:   0
+Leader:  node-2
+Quorum:  3/3 voters, quorum ok
+
+NODE    ROLE       EPOCH        TERM   APPLIED       LOG  MEMBER   REACHABLE
+node-1  follower   0               4       120       120  voter    yes
+node-2  leader     0               4       120       120  voter    yes
+node-3  follower   0               4       120       120  voter    yes
