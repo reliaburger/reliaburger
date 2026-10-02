@@ -2298,6 +2298,8 @@ Every step before the intent file touches only the staging directory, so a failu
 
 Why retire the log at all? A Raft node's log carries its term and its idea of who the voters are. If we kept it, the restored node would try to resume the dead cluster's history — voting for peers that no longer exist, at a term line nobody else shares. Instead the restored node starts from an empty log, re-bootstraps a fresh single-voter council (quorum of one: itself), and the self-healing reconciler grows it back from the surviving workers exactly as if it were a brand-new cluster. The restored desired state comes along for the ride, so the apps are all still there.
 
+There's a catch in "when the node starts". A node bootstraps a council only when its store is fresh *and* it has no join seeds; a node with seeds waits to be invited. Most survivors' configs still list `cluster.join` seeds, so the first version of recovery produced a node that sat waiting for an invitation from a council that no longer existed. The runtime now also bootstraps when the state machine holds an offline recovery snapshot: one with a recovery epoch, no log position and no membership (`recovered_bootstrap_pending`). That last part matters. A node that joined the recovered council later holds the same epoch, but its snapshot came from Raft and carries a log position, so it can never mistake itself for a survivor and start a council of its own.
+
 ### The epoch marker
 
 One subtlety. After recovery, the cluster looks brand new to Raft, but the world outside it doesn't know that. A worker might still hold a token issued by the dead cluster; a stale report might be in flight. How do we tell "before the loss" from "after"?

@@ -4,12 +4,13 @@
  * Serves https://reliaburger.com/feedback/ (docs/website/feedback/index.html). Workshop attendees answer Miko's
  * three questions (biggest Kubernetes problem, what Reliaburger needs for work use, the ONE missing feature) and
  * leave their name, email and LinkedIn, with an explicit "happy to share my information with the Reliaburger
- * team" consent. The script:
+ * team" consent. Four required 1-3 ratings (overall, easy to digest, fits my stack, would recommend) and up to
+ * 10 screenshots, attached raw to the email as "<Name> - screenshot N.<ext>" (the page scales big ones down). The script:
  *   1. emails ONE message From mark@sreday.com, To the same address, Cc FEEDBACK_CC (Script Property, comma-separated,
  *      e.g. Miko), Reply-To the attendee. Subject "<Name> - Reliaburger feedback - <event>". Filed in the Inbox,
  *      unread + important, under the Gmail label "Reliaburger feedback".
  *   2. appends a row to a Google Sheet ("Reliaburger feedback", created on first use, id in FEEDBACK_SHEET_ID).
- *      That sheet is the raffle list (filter by event) and the place to read all answers side by side.
+ *      Filter it by event to read all answers side by side.
  *      Rows are never deleted by code.
  *
  * Same conventions as the conference forms in llmday/_build/*.gs (waitlist-form.gs, communityhero-form.gs):
@@ -29,7 +30,16 @@
 var SENDER = 'mark@sreday.com';
 var SENDER_NAME = 'Reliaburger feedback';
 var LABEL = 'Reliaburger feedback';
-var DAILY_MAX = 300;                      // submissions per day (a full room is ~100)
+var DAILY_MAX = 300;
+var MAX_IMAGE_BYTES = 10 * 1024 * 1024;   // per screenshot, same cap as the page
+var MAX_SHOTS = 10;
+var MAX_TOTAL_BYTES = 20 * 1024 * 1024;   // all screenshots together; Gmail refuses messages over 25 MB
+var RATINGS = [
+  ['overall', 'Overall, I enjoyed the experience'],
+  ['digest', 'It was easy to digest'],
+  ['stack', 'It would fit in my stack once it\'s properly cooked'],
+  ['recommend', 'I\'d recommend it to a teammate']
+];                      // submissions per day (a full room is ~100)
 var LIMITS = { platform_other: 80, name: 80, email: 254, linkedin: 300, company: 120, role: 120, event: 60, answer: 2000, broke: 2000 };
 var PLATFORMS = ['macOS', 'Linux', 'Other'];
 var STEPS = ['Install', 'Deploy an app', 'Sick version + rollback', 'Break it on purpose', 'Manual and source', 'Submitted a PR'];
@@ -56,11 +66,24 @@ function doPost(e) {
   var s = normalize(data);
   if (s.errors.length) return respond({ ok: false, error: 'invalid', fields: s.errors });
 
+  var attachments = [], shots = Array.isArray(data.shots) ? data.shots.slice(0, MAX_SHOTS) : [];
+  for (var i = 0; i < shots.length; i++) {
+    var sh = shots[i] || {};
+    var blob = decodeImage(sh.b64, photoMime(sh.type, sh.name), s.name + ' - screenshot ' + (attachments.length + 1) + photoExt(sh.type, sh.name));
+    if (blob === 'too large') return respond({ ok: false, error: 'image too large' });
+    if (blob) attachments.push(blob);
+  }
+  var totalBytes = attachments.reduce(function (n, b) { return n + b.getBytes().length; }, 0);
+  if (totalBytes > MAX_TOTAL_BYTES) return respond({ ok: false, error: 'images too large' });
+  s.shots = attachments.length;
+
   var mail = compose(s);
-  if (data.dry_run) return respond({ ok: true, dry_run: true, subject: mail.subject, text: mail.text, html: mail.html });
+  if (data.dry_run) return respond({ ok: true, dry_run: true, subject: mail.subject, text: mail.text, html: mail.html,
+                                     attachments: attachments.map(function (b) { return b.getName(); }) });
   if (!dailyBudget()) return respond({ ok: false, error: 'too many today' });
 
   var options = { name: SENDER_NAME, replyTo: s.email, htmlBody: mail.html };
+  if (attachments.length) options.attachments = attachments;
   var cc = clean(props().getProperty('FEEDBACK_CC'), 500);
   if (cc) options.cc = cc;
   // Send from the alias when this account has it as "Send mail as"; otherwise the primary address is used.
@@ -71,7 +94,7 @@ function doPost(e) {
   var message = GmailApp.createDraft(to, mail.subject, mail.text, options).send();
   fileThread(message);
   record(s);
-  Logger.log('Feedback: %s <%s> at %s', s.name, s.email, s.event);
+  Logger.log('Feedback: %s <%s> at %s, %s screenshots', s.name, s.email, s.event, s.shots);
   return respond({ ok: true });
 }
 
@@ -95,13 +118,21 @@ function normalize(d) {
     contributor: d.contributor === true,
     event:       clean(d.event, LIMITS.event).toLowerCase().replace(/[^a-z0-9-]/g, '') || 'general',
     page:        clean(d.page, 300),
+    ratings:     {},
     errors:      []
   };
   if (!s.name) s.errors.push('name');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s.email)) s.errors.push('email');
   if (!/^https?:\/\/([a-z]{2,3}\.)?(www\.)?linkedin\.com\/.+/i.test(s.linkedin)) s.errors.push('linkedin');
   if (!s.consent) s.errors.push('consent');
-  ['broke', 'company', 'role'].forEach(function (k) { if (!s[k]) s.errors.push(k); });
+  ['broke', 'company', 'role', 'platform'].forEach(function (k) { if (!s[k]) s.errors.push(k); });
+  if (s.platform === 'Other' && !s.platform_other) s.errors.push('platform_other');
+  if (!s.steps.length) s.errors.push('steps');
+  var r = d.ratings || {};
+  RATINGS.forEach(function (q) {
+    var v = parseInt(r[q[0]], 10);
+    if (v >= 1 && v <= 3) s.ratings[q[0]] = v; else s.errors.push('rating_' + q[0]);
+  });
   QUESTIONS.forEach(function (q) { if (!s[q[0]]) s.errors.push(q[0]); });
   return s;
 }
@@ -116,14 +147,16 @@ function compose(s) {
   ];
   var answers = QUESTIONS.map(function (q) { return [q[1], s[q[0]]]; });
   answers.push(['What broke? (if anything)', s.broke]);
+  var rates = RATINGS.map(function (q) { return [q[1], s.ratings[q[0]] + ' / 3']; });
   var more = [
     ['Company', s.company], ['Role', s.role], ['Platform', platformText(s)],
     ['Steps completed', s.steps.length ? s.steps.join(', ') : ''],
+    ['Screenshots attached', s.shots ? String(s.shots) : ''],
     ['Wants to contribute / be a burger ambassador', s.contributor ? 'yes' : 'no'],
     ['Event', s.event]
   ].filter(function (r) { return r[1]; });
 
-  var text = [who, answers, more].map(function (rows) {
+  var text = [who, answers, rates, more].map(function (rows) {
     return rows.map(function (r) { return r[0] + (/\?$/.test(r[0]) ? '' : ':') + '\n' + r[1]; }).join('\n\n');
   }).join('\n\n----------\n\n') + '\n';
 
@@ -138,7 +171,7 @@ function compose(s) {
   }
   var html = '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#111">' +
     '<h3 style="color:#a83b15;margin:0 0 12px">Reliaburger feedback - ' + esc(s.event) + '</h3>' +
-    table(who) + table(answers) + (more.length ? table(more) : '') + '</div>';
+    table(who) + table(answers) + table(rates) + (more.length ? table(more) : '') + '</div>';
   return { subject: subject, text: text, html: html };
 }
 
@@ -150,7 +183,9 @@ function platformText(s) {
 // One spreadsheet, created on first use and remembered in FEEDBACK_SHEET_ID. Never cleared by code.
 
 var COLUMNS = ['timestamp', 'event', 'name', 'email', 'linkedin', 'consent', 'company', 'role', 'platform', 'steps',
-               'q1_biggest_k8s_problem', 'q2_needed_for_work', 'q3_one_missing_feature', 'what_broke', 'contributor', 'page'];
+               'q1_biggest_k8s_problem', 'q2_needed_for_work', 'q3_one_missing_feature', 'what_broke', 'contributor', 'page',
+               // added later: kept at the end so rows written before them stay aligned
+               'rating_overall', 'rating_easy_to_digest', 'rating_fits_my_stack', 'rating_would_recommend', 'screenshots'];
 
 function feedbackSheet() {
   var id = props().getProperty('FEEDBACK_SHEET_ID'), ss = null;
@@ -162,14 +197,18 @@ function feedbackSheet() {
     props().setProperty('FEEDBACK_SHEET_ID', ss.getId());
     Logger.log('Created the feedback sheet: ' + ss.getUrl());
   }
-  return ss.getSheets()[0];
+  var sheet = ss.getSheets()[0];
+  // A sheet created by an older version has a shorter header: extend it in place.
+  if (sheet.getLastColumn() < COLUMNS.length) sheet.getRange(1, 1, 1, COLUMNS.length).setValues([COLUMNS]);
+  return sheet;
 }
 
 function record(s) {
   try {
     feedbackSheet().appendRow([new Date().toISOString(), s.event, s.name, s.email, s.linkedin, s.consent ? 'yes' : 'no',
                                s.company, s.role, platformText(s), s.steps.join(', '), s.q1, s.q2, s.q3, s.broke,
-                               s.contributor ? 'yes' : 'no', s.page].map(sheetSafe));
+                               s.contributor ? 'yes' : 'no', s.page,
+                               s.ratings.overall, s.ratings.digest, s.ratings.stack, s.ratings.recommend, s.shots || 0].map(sheetSafe));
   } catch (err) {
     Logger.log('Emailed, but could not add the sheet row: ' + err);    // the email is the backup
   }
@@ -224,6 +263,33 @@ function cleanMultiline(v, max) {
 function esc(v) {
   return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
+var IMAGE_TYPES = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/heic': '.heic', 'image/heif': '.heif', 'image/gif': '.gif' };
+
+function photoExt(type, name) {
+  type = String(type || '').toLowerCase();
+  if (IMAGE_TYPES[type]) return IMAGE_TYPES[type];
+  var m = /\.([a-z0-9]{2,5})$/i.exec(String(name || ''));
+  return m ? '.' + m[1].toLowerCase().replace(/^jpeg$/, 'jpg') : '.png';
+}
+function photoMime(type, name) {
+  type = String(type || '').toLowerCase();
+  if (IMAGE_TYPES[type]) return type;
+  var ext = photoExt(type, name);
+  for (var k in IMAGE_TYPES) if (IMAGE_TYPES[k] === ext) return k;
+  return 'application/octet-stream';
+}
+// base64 -> Blob; returns null when empty or undecodable, 'too large' when over the cap
+function decodeImage(b64, mime, filename) {
+  b64 = String(b64 || '').replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
+  if (!b64) return null;
+  if (b64.length * 3 / 4 > MAX_IMAGE_BYTES) return 'too large';
+  try {
+    return Utilities.newBlob(Utilities.base64Decode(b64), mime, filename);
+  } catch (err) {
+    return null;
+  }
+}
+
 // Keep only allowed values, in the allowed list's order, without duplicates.
 function pick(values, allowed) {
   if (!Array.isArray(values)) return [];
@@ -238,6 +304,8 @@ function sample(dryRun) {
     consent: true, company: 'SREday', role: 'Organizer', platform: 'Other', platform_other: 'Fedora on a ThinkPad', steps: ['Install', 'Deploy an app', 'Break it on purpose', 'Submitted a PR'],
     q1: 'Too many moving parts.\nUpgrades eat a week every quarter.', q2: 'A stable 1.0 and a migration path from Helm.',
     q3: 'Windows support', broke: 'relish wtf printed nothing the first time.', contributor: true,
+    ratings: { overall: 3, digest: 2, stack: 3, recommend: 3 },
+    shots: [{ b64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', type: 'image/png', name: 'wtf.png' }],
     event: 'sreday-sf-2026-q4', page: 'https://reliaburger.com/feedback/?event=sreday-sf-2026-q4'
   }) } };
 }
