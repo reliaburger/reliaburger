@@ -867,6 +867,14 @@ impl StateMachineInner {
                 {
                     return None;
                 }
+                // A bun upgrade and an OS rollout both restart nodes; never
+                // start one while the other holds the fleet.
+                if self.state.os_rollout.is_some()
+                    && self.state.active_upgrade.as_ref().map(|a| &a.upgrade_id)
+                        != Some(&state.upgrade_id)
+                {
+                    return None;
+                }
                 self.state.active_upgrade = Some(*state.clone());
             }
             RaftRequest::UpgradeClear { upgrade_id } => {
@@ -879,6 +887,36 @@ impl StateMachineInner {
                     } else {
                         // Clear for a different id: put it back untouched.
                         self.state.active_upgrade = Some(active);
+                    }
+                }
+            }
+            RaftRequest::OsRolloutUpdate { rollout } => {
+                // The same guards as a bun upgrade's (M13): no different
+                // rollout over a running one (a resume replaces a paused
+                // one), and none while a bun upgrade holds the fleet.
+                if self.state.active_upgrade.is_some() {
+                    return None;
+                }
+                if let Some(active) = &self.state.os_rollout
+                    && active.rollout_id != rollout.rollout_id
+                    && !matches!(
+                        active.phase,
+                        crate::os::rollout::OsRolloutPhase::Paused { .. }
+                    )
+                {
+                    return None;
+                }
+                self.state.os_rollout = Some(*rollout.clone());
+            }
+            RaftRequest::OsRolloutClear { rollout_id } => {
+                if let Some(active) = self.state.os_rollout.take() {
+                    if active.rollout_id == *rollout_id {
+                        self.state.os_rollout_history.push(active);
+                        if self.state.os_rollout_history.len() > 20 {
+                            self.state.os_rollout_history.remove(0);
+                        }
+                    } else {
+                        self.state.os_rollout = Some(active);
                     }
                 }
             }
@@ -5423,6 +5461,77 @@ mod tests {
 
         assert_eq!(inner.state.active_upgrade, Some(advanced));
         assert!(inner.state.upgrade_history.is_empty());
+    }
+
+    fn os_rollout(id: &str) -> crate::os::rollout::OsRollout {
+        crate::os::rollout::plan(
+            id,
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "n1",
+            vec![(
+                "n1".into(),
+                "10.0.0.1:9117".into(),
+                true,
+                "2026.41.0".into(),
+            )],
+            0,
+        )
+    }
+
+    #[test]
+    fn an_os_rollout_and_a_bun_upgrade_never_overlap() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(os_rollout("os-1")),
+        });
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        assert!(
+            inner.state.active_upgrade.is_none(),
+            "no bun upgrade during an OS rollout"
+        );
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(os_rollout("os-2")),
+        });
+        assert_eq!(inner.state.os_rollout.as_ref().unwrap().rollout_id, "os-1");
+
+        inner.apply_request(&RaftRequest::OsRolloutClear {
+            rollout_id: "os-1".into(),
+        });
+        assert!(inner.state.os_rollout.is_none());
+        assert_eq!(inner.state.os_rollout_history.len(), 1);
+
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(os_rollout("os-3")),
+        });
+        assert!(
+            inner.state.os_rollout.is_none(),
+            "no OS rollout during a bun upgrade"
+        );
+    }
+
+    #[test]
+    fn a_paused_os_rollout_can_be_resumed_under_a_new_id() {
+        let mut inner = StateMachineInner::default();
+        let mut paused = os_rollout("os-1");
+        paused.phase = crate::os::rollout::OsRolloutPhase::Paused {
+            reason: "n1 fell back".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(paused.clone()),
+        });
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(crate::os::rollout::resume(paused, 10)),
+        });
+        assert_eq!(
+            inner.state.os_rollout.as_ref().unwrap().rollout_id,
+            "os-1-retry"
+        );
     }
 
     #[test]

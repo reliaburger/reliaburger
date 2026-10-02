@@ -244,6 +244,12 @@ pub enum AgentCommand {
         generation: u64,
         response: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Let `address` through the perimeter for `duration` (G2).
+    OpenJoinWindow {
+        address: std::net::IpAddr,
+        duration: std::time::Duration,
+        response: oneshot::Sender<()>,
+    },
     /// List all ingress routes.
     Routes {
         response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
@@ -367,6 +373,7 @@ impl AgentCommand {
             AgentCommand::SyncClusterCatalog { .. } => "sync_cluster_catalog",
             AgentCommand::SyncClusterConsumer { .. } => "sync_cluster_consumer",
             AgentCommand::ConfirmConsumerReceipt { .. } => "confirm_consumer_receipt",
+            AgentCommand::OpenJoinWindow { .. } => "open_join_window",
             AgentCommand::Routes { .. } => "routes",
             AgentCommand::PrepareNodeFault { .. } => "prepare_node_fault",
             AgentCommand::FenceNodeFault { .. } => "fence_node_fault",
@@ -1116,6 +1123,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 let result = self.confirm_consumer_receipt(generation).await;
                 let _ = response.send(result);
+            }
+            AgentCommand::OpenJoinWindow {
+                address,
+                duration,
+                response,
+            } => {
+                self.join_windows
+                    .open(address, std::time::Instant::now() + duration);
+                let _ = response.send(());
             }
             AgentCommand::Routes { response } => {
                 let table = self.routing_table.read().await;

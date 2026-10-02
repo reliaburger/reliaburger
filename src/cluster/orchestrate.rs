@@ -422,6 +422,7 @@ pub fn spawn_leader_scheduler(
                 continue;
             }
             crate::meat::filter::apply_upgrade_cordon(&mut cache, desired.active_upgrade.as_ref());
+            crate::meat::filter::apply_os_rollout_cordon(&mut cache, desired.os_rollout.as_ref());
 
             // Quotas come from desired-state namespaces (12b.2 T6). A
             // cluster with no declared namespace budgets gets an empty
@@ -1246,7 +1247,7 @@ pub(crate) fn volume_home_away(
 /// Whether a fixed-size app keeps state in a managed volume, which lives on
 /// the node it runs on. A daemon set runs on every eligible node anyway, so
 /// there is nowhere else for its volume to be.
-fn has_managed_volume(spec: &AppSpec) -> bool {
+pub(crate) fn has_managed_volume(spec: &AppSpec) -> bool {
     matches!(spec.replicas, Replicas::Fixed(_))
         && spec.volumes.iter().any(|volume| volume.source.is_none())
 }

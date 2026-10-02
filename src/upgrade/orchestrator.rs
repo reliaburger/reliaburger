@@ -871,7 +871,7 @@ pub fn live_quorum_headroom_ok(configured_voters: usize, live_voters: usize) -> 
 /// not appear in its own gossip snapshot to be alive.
 ///
 /// Returns `(configured_voters, live_voters)`.
-fn count_live_voters(
+pub(crate) fn count_live_voters(
     council: &crate::council::CouncilNode,
     membership: &[crate::mustard::membership::MembershipSnapshot],
     self_id: u64,

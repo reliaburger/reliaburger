@@ -1,0 +1,20 @@
+# /usr goes into the inactive slot (the other reliaburger_<version>, or the
+# _empty one first boot added). @u carries the partition UUID over from the
+# build, since the verity generator finds /usr by the UUID usrhash= implies.
+[Transfer]
+ProtectVersion=%A
+Verify=no
+
+[Source]
+Type=regular-file
+Path=/var/lib/reliaburger/os-staging
+MatchPattern=reliaburger-os_@v.usr.@u.raw.zst
+
+[Target]
+Type=partition
+Path=auto
+MatchPattern=reliaburger_@v
+MatchPartitionType=usr
+PartitionFlags=0
+ReadOnly=1
+InstancesMax=2

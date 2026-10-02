@@ -1,3 +1,4 @@
+pub mod bare_metal;
 pub mod bench_cmd;
 /// Relish CLI library.
 ///
@@ -14,6 +15,7 @@ pub mod dev;
 pub mod diff;
 pub mod fault;
 pub mod fmt;
+pub mod image;
 pub mod inspect;
 pub mod install;
 #[cfg(feature = "kubernetes")]
@@ -31,9 +33,12 @@ pub mod k8s_export;
 )]
 pub mod k8s_import;
 pub mod local_context;
+pub mod machines;
 pub mod manifest;
 pub mod manual;
 pub mod metrics_cmd;
+pub mod netboot;
+pub mod os;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;
@@ -192,6 +197,10 @@ pub enum RelishError {
     /// `relish uninstall` refused or could not remove something.
     #[error("{0}")]
     Uninstall(#[from] uninstall::UninstallError),
+
+    /// `relish netboot` refused to start or failed.
+    #[error("{0}")]
+    Netboot(#[from] netboot::NetbootError),
 
     /// `relish manual CHAPTER` named no single chapter.
     #[error("{0}")]

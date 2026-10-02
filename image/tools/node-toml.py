@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""node.toml for one appliance node of a fleet seeded by hand (preview).
+
+    node-toml.py --cluster NAME --addresses IP1,IP2,... --index N
+                 --operator IP [--network CIDR] [--operator-key ed25519:...]
+
+Node N (1-based) gets the N-th address. Node 1 bootstraps the cluster;
+the others join it. --network lets any machine on that network through the
+firewall to the cluster ports before it has joined, so nodes can be added
+later; without it only the listed addresses get through. Mirrors src/relish/quickstart/provision.rs::node_config
+(mTLS, eBPF, DNS, ingress, the laptop fault policy), plus operator_cidrs so
+relish on the operator's machine can reach the API, optionally the operator
+key cluster bun upgrades need (docs/manual/12_operations.md), and retention
+sized for an 8 GB disk: one old bun (about 100 MB each) and two days of
+unreferenced images.
+"""
+import argparse
+import ipaddress
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--cluster", required=True)
+parser.add_argument("--addresses", required=True, help="comma-separated, node 1 first")
+parser.add_argument("--index", type=int, required=True)
+parser.add_argument("--operator", required=True, help="address relish connects from")
+parser.add_argument("--network", default="", help="CIDR later nodes may join from")
+parser.add_argument("--operator-key", default="")
+args = parser.parse_args()
+
+addresses = [a.strip() for a in args.addresses.split(",") if a.strip()]
+if not 1 <= args.index <= len(addresses):
+    parser.error(f"--index must be between 1 and {len(addresses)}")
+me = addresses[args.index - 1]
+if args.network:
+    network = ipaddress.ip_network(args.network)  # refuses host bits set
+    if network.prefixlen == 0:
+        parser.error("--network must not be /0")
+    # The network, plus any listed address outside it.
+    outside = [a for a in addresses if ipaddress.ip_address(a) not in network]
+    peers = ", ".join(f'"{p}"' for p in [str(network)] + outside)
+else:
+    peers = ", ".join(f'"{a}"' for a in addresses)
+join = "[]" if args.index == 1 else f'["{addresses[0]}:9443"]'
+bootstrap = 'bootstrap_path = "/etc/reliaburger/security-bootstrap.json"\n' if args.index == 1 else ""
+
+print(f'''[node]
+name = "node-{args.index:02d}"
+
+[cluster]
+name = "{args.cluster}"
+join = {join}
+
+[network]
+advertise_address = "{me}"
+
+[security]
+require_mtls = true
+allow_insecure_cluster = false
+identity_dir = "/etc/reliaburger/identity"
+master_key_path = "/etc/reliaburger/master.key"
+{bootstrap}bootstrap_peers = [{peers}]
+operator_cidrs = ["{args.operator}"]
+
+[ebpf]
+enabled = true
+
+[dns]
+enabled = true
+listen = "{me}:53"
+
+[ingress]
+enabled = true
+
+[images]
+gc_retain_days = 2
+
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults", "alter_node_state"]
+
+[upgrades]
+retain_versions = 1
+''', end="")
+if args.operator_key:
+    print(f'external_signing_key = "{args.operator_key}"\n', end="")

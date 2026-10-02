@@ -56,6 +56,7 @@ mod logs;
 mod metrics;
 mod node_info;
 mod nodes;
+mod os;
 mod registry;
 mod secrets;
 mod snapshots;
@@ -80,14 +81,15 @@ use faults::{
 };
 use gitops::gitops_webhook_handler;
 use identity::{
-    identity_jwks_handler, identity_sign_handler, join_token_create_handler, token_create_handler,
-    token_list_handler, token_revoke_handler,
+    identity_jwks_handler, identity_sign_handler, join_token_create_handler,
+    join_token_list_handler, join_token_revoke_handler, perimeter_admit_handler,
+    token_create_handler, token_list_handler, token_revoke_handler,
 };
 use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
     producer_retirement_handler, refuse_retired_tls_peer, workload_csr_handler,
 };
-use join::{cluster_ca_handler, join_handler, node_renewal_handler};
+use join::{cluster_ca_handler, join_handler, master_key_handler, node_renewal_handler};
 use logs::{
     logs_cross_node_handler, logs_entries_handler, logs_export_handler, logs_handler,
     logs_sql_handler, ws_logs_handler,
@@ -105,6 +107,10 @@ use node_info::{
 use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
     nodes_handler,
+};
+use os::{
+    os_rollout_abort_handler, os_rollout_handler, os_rollout_resume_handler,
+    os_rollout_start_handler, os_stage_handler,
 };
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
@@ -569,6 +575,9 @@ pub fn router_with_upgrade(
         .route("/ui/static/{*path}", get(static_asset_handler))
         .route("/v1/cluster/join", post(join_handler))
         .route("/v1/cluster/ca", get(cluster_ca_handler))
+        // Authenticated by the node's TLS client certificate inside the
+        // handler: a joiner has no bearer token until it has the master key.
+        .route("/v1/cluster/master-key", get(master_key_handler))
         // The GitOps webhook is public: real providers (GitHub, GitLab)
         // send `X-Hub-Signature-256`/`X-Gitlab-Token`, never a Reliaburger
         // bearer token, so it can't sit behind the bearer-auth middleware.
@@ -677,6 +686,11 @@ pub fn router_with_upgrade(
             "/v1/upgrade/cluster-rollback",
             post(upgrade_cluster_rollback_handler),
         )
+        .route("/v1/os/stage", post(os_stage_handler))
+        .route("/v1/os/rollout", get(os_rollout_handler))
+        .route("/v1/os/rollout/start", post(os_rollout_start_handler))
+        .route("/v1/os/rollout/resume", post(os_rollout_resume_handler))
+        .route("/v1/os/rollout/abort", post(os_rollout_abort_handler))
         .route("/v1/cluster/elect", post(cluster_elect_handler))
         .route("/v1/chaos/reserve", post(node_fault_reserve_handler))
         .route("/v1/chaos/fence", post(node_fault_fence_handler))
@@ -770,6 +784,9 @@ pub fn router_with_upgrade(
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/join-token/create", post(join_token_create_handler))
+        .route("/v1/join-token/list", get(join_token_list_handler))
+        .route("/v1/join-token/revoke", post(join_token_revoke_handler))
+        .route("/v1/perimeter/admit", post(perimeter_admit_handler))
         .route("/v1/secret/public-key", get(secret_public_key_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
         .route_layer(axum::middleware::from_fn_with_state(

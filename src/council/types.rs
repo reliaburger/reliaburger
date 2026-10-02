@@ -330,6 +330,12 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
+    /// Start or advance an appliance OS rollout (W6).
+    OsRolloutUpdate {
+        rollout: Box<crate::os::rollout::OsRollout>,
+    },
+    /// Finish an OS rollout: archive it to history and clear the slot.
+    OsRolloutClear { rollout_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +449,13 @@ pub struct DesiredState {
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
     pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
+    /// The appliance OS rollout in progress, if any. At most one, and never
+    /// at the same time as a bun upgrade.
+    #[serde(default)]
+    pub os_rollout: Option<crate::os::rollout::OsRollout>,
+    /// Finished OS rollouts, newest last (bounded to 20).
+    #[serde(default)]
+    pub os_rollout_history: Vec<crate::os::rollout::OsRollout>,
     /// Durable batch tracker: monotonic id counter plus in-flight and
     /// recently terminal batches (12b.2 JOB4).
     pub batch_state: crate::meat::batch_tracker::BatchDurableState,
