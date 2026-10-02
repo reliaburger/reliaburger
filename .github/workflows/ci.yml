@@ -53,14 +53,17 @@ jobs:
       - name: Build the rootless test once
         run: cargo nextest run --profile ci --features ebpf --no-run
       - name: Loop the rootless adoption test (#456)
+        env:
+          FILTER: test(rootless_pid_answers_while_state_reads_hold_the_instance)
+          LOOPS: 3
         run: |
           pass=0; fail=0
-          for i in $(seq 1 ${LOOPS:-30}); do
+          for i in $(seq 1 ${LOOPS}); do
             echo "=== iteration $i" | tee -a /tmp/reliaburger-456.log
-            if RELIABURGER_ROOTLESS_RUNC_TESTS=1 cargo nextest run --profile ci --no-tests=fail --features ebpf --run-ignored=only -E 'test(normal_rootless_bun)' > /tmp/iter.log 2>&1; then
+            if RELIABURGER_ROOTLESS_RUNC_TESTS=1 cargo nextest run --profile ci --no-tests=fail --features ebpf --run-ignored=only -E "$FILTER" > /tmp/iter.log 2>&1; then
               pass=$((pass+1))
             else
-              fail=$((fail+1)); echo "--- iteration $i failed"; grep -E "panicked|never answered|FAIL" /tmp/iter.log | head -5
+              fail=$((fail+1)); echo "--- iteration $i failed"; grep -A2 -E "panicked" /tmp/iter.log | head -12
             fi
           done
           echo "passed=$pass failed=$fail"
