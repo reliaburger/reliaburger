@@ -5962,3 +5962,69 @@ image = "busybox:latest"
         );
     }
 }
+
+#[cfg(test)]
+mod audit_pending_reservations {
+    use crate::meat::quota::QuotaLedger;
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::{
+        cluster_state::SchedulerNodeState,
+        types::{AppId, Placement},
+    };
+    use crate::reporting::types::*;
+    use std::time::{Instant, SystemTime};
+    fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels,
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+    fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(replicas);
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu_request,
+            limit: cpu_request,
+        });
+        spec
+    }
+    #[test]
+    fn pending_placements_must_reserve_capacity_across_ticks() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("solo", 1000, BTreeMap::new()));
+        let old_report = cache.clone();
+        let alive = HashSet::from([NodeId::new("solo")]);
+        let a = AppId::new("a", "default");
+        let b = AppId::new("b", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(a.clone(), app_spec(600, 1));
+        desired.apps.insert(b.clone(), app_spec(600, 1));
+        let first = plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(first.len(), 1);
+        for decision in first {
+            desired
+                .scheduling
+                .insert(decision.app_id, decision.placements);
+        }
+        let second = plan_scheduling_pass(
+            &mut old_report.clone(),
+            &desired,
+            &alive,
+            &mut QuotaLedger::default(),
+        );
+        eprintln!("second pass with same report: {second:?}");
+        assert!(
+            second.iter().all(|d| d.app_id != b),
+            "second tick overbooks the same 1000m node with two 600m apps"
+        );
+    }
+}
