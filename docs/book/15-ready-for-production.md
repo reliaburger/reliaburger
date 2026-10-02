@@ -4272,6 +4272,32 @@ deadline would change what a miss *does*: a failed publication costs a
 restart attempt, and a DNS timeout starts the instance deny-all. So they
 carry tags naming #419, which moves them off the loop properly.
 
+A day later the new slow-inventory scenario failed once, in the release
+candidate's coverage build: `the worst loop turn took 1.031124606s in
+health_tick`. The fix looked suspect at first. Was something in the tick
+still waiting past the deadline? The log answered that. Two turns had taken
+500 ms each, which is the deadline doing its job while the inventory was
+slow. The 1031 ms turn came after the test made the inventory fast again: it
+was the turn that *completed* the retirement. Counting showed why it was
+slow. Completing a startup retirement journals it with four fsync'd persists
+(two to release the network reference, two to retire the discovery service).
+On a macOS laptop each takes about 10 ms. On a CI runner busy with a
+coverage build of the whole suite they took around 250 ms each.
+
+That's within the rules: persists may stay inline as long as a disk taking
+150 ms a write keeps every turn under budget, and four of those are 600 ms.
+But nothing had checked it. The harness's slow disk stalled the job ledger
+and instance records, not the discovery journal. So the stall now covers the
+journal and the egress owners too, and a new scenario completes a startup
+retirement on that slow disk. Its completion turn takes 663 ms: four
+150 ms persists and the work around them. The two slow-work scenarios now
+judge only the turns that meet the slow work, and they judge them harder.
+The inventory stays slow for 30 s rather than 2.5, and every turn has to end
+within 250 ms of the turn's deadline, not merely under a second. A turn that
+waited out the slow work, or sat out a fixed one-second timeout, fails by a
+wide margin. A slow disk under the completion turn no longer has a
+31 ms gap to fall into.
+
 ### Two commands, two answers
 
 Issue #241 had one more complaint in it. With three replicas of `hello`

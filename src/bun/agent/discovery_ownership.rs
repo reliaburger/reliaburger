@@ -470,6 +470,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         else {
             return Err(failure("discovery ownership changed during update".into()));
         };
+        #[cfg(test)]
+        self.loop_stalls.hold(super::LoopStall::Persist).await;
         // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
         match journal.persist(next).await {
             Ok(journal) => {
