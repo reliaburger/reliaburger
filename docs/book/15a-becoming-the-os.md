@@ -337,7 +337,7 @@ An appliance you can't update is a time bomb, and the whole point of the A/B lay
 
 ### Staging: bun checks, sysupdate copies
 
-systemd-sysupdate writes new versions into A/B slots, driven by `.transfer` files. It can download by itself, but it only verifies downloads with GPG, and we already have an Ed25519 trust chain. So the transfers read from a local directory, and something we trust fills that directory first. Eventually that's bun. During the spike it's a shell script, `os-stage`, which fetches the signed `SHA256SUMS`, checks the signature, downloads the UKI and both `/usr` images, checks their hashes, moves them into root-only `/var/lib/reliaburger/os-staging`, and runs sysupdate. The `/usr` transfer:
+systemd-sysupdate writes new versions into A/B slots, driven by `.transfer` files. It can download by itself, but it only verifies downloads with GPG, and we already have an Ed25519 trust chain. So the transfers read from a local directory, and something we trust fills that directory first. Now that's bun ([Rolling it across the fleet](#rolling-it-across-the-fleet) below). During the spike it was a shell script, `os-stage`, which fetched the signed `SHA256SUMS`, checked the signature, downloaded the UKI and both `/usr` images, checked their hashes, moved them into root-only `/var/lib/reliaburger/os-staging`, and ran sysupdate. The `/usr` transfer:
 
 ```ini
 [Transfer]
@@ -359,7 +359,7 @@ ReadOnly=1
 InstancesMax=2
 ```
 
-The `@` patterns are sysupdate's capture groups: `@v` is a version, `@u` a partition UUID. So `reliaburger-os_2026.40.23.usr.<uuid>.raw.zst` in the staging directory becomes a partition labelled `reliaburger_2026.40.23` with that UUID. `Verify=no` is honest here, because `os-stage` already verified everything, and `ProtectVersion=%A` stops sysupdate from overwriting the version we're running. `InstancesMax=2` means two slots, so the next version goes into `_empty` the first time and into the older slot after that.
+The `@` patterns are sysupdate's capture groups: `@v` is a version, `@u` a partition UUID. So `reliaburger-os_2026.40.23.usr.<uuid>.raw.zst` in the staging directory becomes a partition labelled `reliaburger_2026.40.23` with that UUID. `Verify=no` is honest here, because whatever staged the files (bun now, `os-stage` then) already verified everything, and `ProtectVersion=%A` stops sysupdate from overwriting the version we're running. `InstancesMax=2` means two slots, so the next version goes into `_empty` the first time and into the older slot after that.
 
 The UUID matters more than it looks. mkosi names each split `/usr` image after its partition UUID (`SplitName=usr.%U`, in the repart file earlier), and `@u` carries it into slot B. The new UKI's `usrhash=` implies that UUID, and that's how the verity generator finds the right slot at boot. Without it, the new kernel would boot and find no `/usr`.
 
@@ -427,7 +427,7 @@ Only a counted boot reboots itself. A node running a blessed version whose bun i
 
 The good update rolled across all five lab nodes, followers first and the leader last. Each came back blessed about 20 s after its reboot, the cluster never dropped below five nodes alive, and Raft carried on (term 12, log index 964 to 1008).
 
-Then the bad one. CI can build an image whose bun never starts (a `workflow_dispatch` input drops in a unit override with `ExecStart=/bin/false`), and we staged it on node-05. Three counted boots each ended with `bun not healthy after 300 s` and a reboot. The UKI ran out of tries at `+0-3`, systemd-boot picked the previous version by itself, and node-05 was healthy 7.6 s into that boot and back in the cluster. From the first try to the fallback took about 15 min 40 s, with no hands. Nearly all of that is the 300 s timeout, three times over, which tells us where to tune.
+Then the bad one. CI can build an image whose bun never starts (a `workflow_dispatch` input drops in a unit override with `ExecStart=/bin/false`), and we staged it on node-05. Three counted boots each ended with `bun not healthy after 300 s` and a reboot. The UKI ran out of tries at `+0-3`, systemd-boot picked the previous version by itself, and node-05 was healthy 7.6 s into that boot and back in the cluster. From the first try to the fallback took about 15 min 40 s, with no hands. Nearly all of that is the 300 s timeout, three times over, which told us where to tune: a counted boot now gets 120 s, since a healthy lab node answers in 8 to 23 s, and an ordinary boot keeps 300 s because nothing falls back from it. The Wyse will tell us whether 120 s is right for slow hardware.
 
 ### bun's own upgrades
 
@@ -459,6 +459,55 @@ fi
 `sort -V` sorts version numbers numerically, so the condition reads "the image's bun is strictly newer than the active one". The copy uses the same two-step as Chapter 14's `BinaryStore`: write a hidden temporary file, rename it into place, then build a new symlink and rename that over the old one. `mv -T` makes `mv` replace `bun` itself rather than treat it as a directory to move into, so the swap is a single atomic rename. The upshot: an OS update can't downgrade a bun that upgraded itself, and a bun upgrade can't be undone by the next OS image. We tested five cases on Linux with stand-in binaries (first boot, same version, newer image, older image, and a bun that upgraded itself past the image), and the second rolling update, to 2026.40.30, moved bun onto `/var` on every node.
 
 We later ran both directions with real releases. An image carrying bun 0.1.1, updated to a newer image carrying 0.1.0, kept running 0.1.1, exactly as the launcher promises. And `relish upgrade` from 0.1.0 to 0.1.1 was refused, as Chapter 14's compatibility rules say it must be: the state format moved from 44 to 46 between them, so the run paused on the first node and no node moved. A rolling bun upgrade that actually swaps a binary on the appliance waits for two releases that share their formats, and so far every release has changed them.
+
+### Rolling it across the fleet
+
+Updating one node is a script. Updating a cluster is a little distributed system of its own, and Chapter 14 already built one: the rolling bun upgrade, where the leader walks the nodes and keeps the walk in Raft so a leader change is a resume, not a restart. The OS rollout copies its shape but not its code, because the two differ in what matters. A bun swap takes a second and keeps the containers running; an OS update reboots the machine, so the node's workloads have to go somewhere first. And a bun upgrade's progress is a version number, while an OS update can come back on the *old* version, on purpose, because systemd-boot fell back.
+
+The rollout is one record in Raft, `DesiredState::os_rollout`, holding the target, each node's phase and when it entered it:
+
+```rust
+pub enum OsNodePhase {
+    Pending,
+    Draining,
+    Updating,
+    Done,
+    Skipped,
+    Failed { reason: String },
+}
+```
+
+The leader runs a loop every five seconds, and the loop calls one pure function, `step`, which looks at the record, asks the nodes what they're doing through a trait, and returns the next record. Pure apart from the trait, it's tested like `next_step` earlier in this chapter: a table of situations and what should come out. One node at a time, workers first, council members only while the council can lose a voter and keep its majority, and the leader last.
+
+`Draining` is the new part. While a node is draining or updating, the scheduler's cache marks it not ready, exactly as Chapter 14's upgrade cordon does, so on its next pass the scheduler moves that node's replicas elsewhere. The leader waits until no movable replica is placed there, or five minutes, whichever comes first. Replicas of apps with a managed volume don't move: their data is on that disk, so they wait for the node, as they would through any reboot.
+
+Then the leader posts the directive, and the node takes over. It fetches the release's `SHA256SUMS` and signature from the GitHub release named after the version, checks the signature, streams each file to disk while hashing it, and hands the directory to sysupdate, exactly as `os-stage` did. Which key does it check against? The release keys compiled into bun, *and* the key in `/usr/lib/reliaburger/os-signing-key.pub.pem` in its own image. dm-verity guards that file like every other byte of `/usr`, so an image vouches for its successors. A published image carries the release key; a CI lab build carries its own throwaway key, which is what lets CI test a real update between two lab builds.
+
+Before it reboots, the node writes what it's doing to `/var/lib/reliaburger/os-update.json`: `{"state": "rebooting", "target": "2026.42.0"}`. That one file answers the hard question after the reboot. If the node comes up on 2026.42.0, the update worked. If it comes up on anything else, it was a fallback, and bun says so in `/v1/version`:
+
+```rust
+pub fn after_boot(saved: OsUpdateState, running: Option<&str>) -> OsUpdateState {
+    match saved {
+        OsUpdateState::Rebooting { target } if running == Some(target.as_str()) => {
+            OsUpdateState::Idle
+        }
+        OsUpdateState::Rebooting { target } => OsUpdateState::Failed {
+            reason: format!(
+                "booted {} instead: {target} failed its boot checks, so systemd-boot fell back",
+                running.unwrap_or("an unknown version")
+            ),
+            target,
+        },
+        // ...
+    }
+}
+```
+
+The match guard (`if running == Some(target.as_str())`) is a condition on an arm: the first arm matches a `Rebooting` state only when the running version is its target, and every other `Rebooting` falls through to the second arm. `Option<&str>` compares with `Some(...)` directly, so there's no unwrapping to get wrong. The leader reads that failure, marks the node failed and pauses the rollout, rather than waiting for a timeout to guess. A paused rollout keeps its record, and `relish os resume` starts the failed node again under a new run id. That's the same trick Chapter 14's resume uses so the state machine can tell a resume from a second, concurrent start.
+
+Two rollouts that restart nodes must never overlap, and neither must a rollout and a bun upgrade. Checking in the handler and then writing is a race, which Chapter 14 learned the hard way (M13), so the rule lives where writes are serialised, in the Raft state machine: an OS rollout write is ignored while a bun upgrade is active, and the other way round. Raft can't return an error from `apply`, so the start handler reads the record back after writing it, and if it isn't there, something else won.
+
+CI runs the whole thing. A lab build makes the image twice, one version apart, and signs both with its throwaway key. One node boots the first version and forms a cluster from its seed, the runner serves the second laid out like a GitHub release, and `relish os upgrade` has to end with the node healthy on the new version.
 
 ### Keeping /etc in step
 
@@ -681,6 +730,6 @@ The spike's interim record is a pass for everything that can be proven without h
 
 - **S5, ten Dell Wyse 3040s.** BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds.
 - **`relish netboot` in Rust.** A ProxyDHCP on UDP 67 and 4011 that reads the client's architecture from option 93, TFTP for iPXE, and HTTP for the rest. It should remember installed machines by MAC and SMBIOS UUID, and serve them a `boot.ipxe` that just says `exit`.
-- **Smaller things with known answers:** a shorter health timeout on counted boots, to bring the fallback well under 16 minutes; dropping the lab's credential-gated SSH once bun stages OS updates itself; signing OS images with the release key; and a way for the installer to find its server under Secure Boot, which drops the command line iPXE passes.
+- **Smaller things with known answers:** dropping the lab's credential-gated SSH, now that bun stages OS updates itself; and a way for the installer to find its server under Secure Boot, which drops the command line iPXE passes.
 
 The shape is clear, though. The operating system is now one more artefact that Reliaburger builds, signs, rolls out and rolls back, like bun. It just happens to be the one bun stands on.

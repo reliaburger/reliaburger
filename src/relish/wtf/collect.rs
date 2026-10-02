@@ -390,6 +390,8 @@ fn collect_builds(
                 version: version.version.clone(),
                 commit: version.commit.clone(),
                 binary_sha256: version.binary_sha256.clone(),
+                os_version: version.os_version.clone(),
+                os_update: version.os_update.clone(),
             }),
             Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
         }
@@ -1352,6 +1354,8 @@ mod tests {
             version: "v0.1.1".into(),
             commit: Some("3fcb1fd".into()),
             binary_sha256: Some("aaaa".into()),
+            os_version: None,
+            os_update: Default::default(),
         };
         let collected = [
             ("node-1", Ok(answered)),

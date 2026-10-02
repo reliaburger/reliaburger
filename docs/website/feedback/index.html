@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Tell the Reliaburger team what broke, what you liked and what would get it into your team's hands.">
+  <meta name="theme-color" content="#181b19">
+  <meta name="robots" content="noindex">
+  <title>Reliaburger feedback</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23181b19'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='23' fill='%23f49463'%3Er%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../style.css">
+  <style>
+    .fb { max-width: 720px; padding: 48px 0 24px; }
+    .fb h1 { font-size: clamp(2rem, 4.4vw, 2.9rem); margin-bottom: 18px; }
+    .fb fieldset { border: 0; border-top: 1px solid var(--line); margin: 34px 0 0; padding: 22px 0 0; }
+    .fb legend { font: 500 .75rem var(--mono); letter-spacing: .07em; color: var(--accent); padding: 0; margin-bottom: 4px; }
+    .field { margin: 0 0 22px; }
+    .field > label, .field > .label { display: block; font-weight: 600; margin-bottom: 8px; line-height: 1.4; }
+    .q-num { font: 500 .75rem var(--mono); color: var(--accent); margin-right: .5em; }
+    .hint { display: block; font-weight: 400; font-size: .875rem; color: var(--muted); margin-top: 2px; }
+    .req { color: var(--accent); }
+    .fb input[type=text], .fb input[type=email], .fb input[type=url], .fb textarea {
+      width: 100%; font: inherit; font-size: 1rem; color: var(--ink); background: #fff;
+      border: 1px solid #b9c2ba; border-radius: 3px; padding: 11px 12px;
+    }
+    .fb textarea { min-height: 7.5rem; resize: vertical; line-height: 1.5; }
+    .fb input:focus-visible, .fb textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; border-color: var(--ink); }
+    .fb [aria-invalid=true] { border-color: var(--accent); }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+    .choices { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+    .choice, .field > label.choice { display: inline-flex; align-items: center; gap: 8px; font-weight: 400; margin: 0; }
+    .choice input { width: 18px; height: 18px; accent-color: var(--accent); margin: 0; flex-shrink: 0; }
+    .steps { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; }
+    .consent { display: flex; gap: 10px; align-items: flex-start; font-weight: 600; border-left: 3px solid var(--accent); padding: 12px 14px; background: #fff; }
+    .consent input { width: 20px; height: 20px; margin-top: 2px; accent-color: var(--accent); flex-shrink: 0; }
+    .hp { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+    .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 16px 24px; margin-top: 30px; }
+    .fb button { font: inherit; font-weight: 600; cursor: pointer; background: var(--ink); color: #fff; border: 1px solid var(--ink); padding: 13px 24px; border-radius: 0; }
+    .fb button:hover { background: #303c32; }
+    .fb button:disabled { opacity: .6; cursor: progress; }
+    .fb button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    .raffle { color: var(--muted); font-size: .9375rem; margin: 0; }
+    .error { color: var(--accent); font-weight: 600; margin: 16px 0 0; }
+    .count { display: block; text-align: right; font: .75rem var(--mono); color: var(--muted); margin-top: 4px; }
+    .done { padding: 56px 0 40px; max-width: 720px; }
+    .done-card { border: 2px solid var(--ink); border-left: 6px solid var(--accent); padding: 28px 26px; background: #fff; }
+    .done-card h1 { margin-bottom: 12px; }
+    .done-name { font: 700 1.5rem var(--mono); letter-spacing: -.03em; margin: 0 0 6px; }
+    .done-meta { font: .875rem var(--mono); color: var(--muted); margin: 0; }
+    @media (max-width: 600px) {
+      .page { padding: 0 16px; }
+      .fb { padding-top: 32px; }
+      .two, .steps { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="masthead">
+      <a class="wordmark" href="../" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
+      <nav aria-label="Main navigation">
+        <a href="../#install">Install</a>
+        <a href="../#tour">Try it</a>
+        <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <form class="fb" id="fb" novalidate>
+        <div class="eyebrow">STEP 06 · TELL US WHAT BROKE</div>
+        <h1>How was your burger?</h1>
+        <p class="lede">Three questions. Short answers are fine, honest ones are better.
+          Reliaburger is 0.1, so what you write here decides what we build next.</p>
+
+        <fieldset>
+          <legend>THE THREE QUESTIONS</legend>
+          <div class="field">
+            <label for="q1"><span class="q-num">01</span>What is your BIGGEST problem with the Kubernetes stack? <span class="req" aria-hidden="true">*</span></label>
+            <textarea id="q1" name="q1" maxlength="2000" required></textarea>
+          </div>
+          <div class="field">
+            <label for="q2"><span class="q-num">02</span>What would Reliaburger need to do so that your team can use it at work? <span class="req" aria-hidden="true">*</span></label>
+            <textarea id="q2" name="q2" maxlength="2000" required></textarea>
+          </div>
+          <div class="field">
+            <label for="q3"><span class="q-num">03</span>What's the ONE missing feature? <span class="req" aria-hidden="true">*</span></label>
+            <textarea id="q3" name="q3" maxlength="2000" required></textarea>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>ABOUT YOU</legend>
+          <div class="field">
+            <label for="name">Name <span class="req" aria-hidden="true">*</span></label>
+            <input type="text" id="name" name="name" maxlength="80" autocomplete="name" required>
+          </div>
+          <div class="two">
+            <div class="field">
+              <label for="email">Email <span class="req" aria-hidden="true">*</span></label>
+              <input type="email" id="email" name="email" maxlength="254" autocomplete="email" inputmode="email" required>
+            </div>
+            <div class="field">
+              <label for="linkedin">LinkedIn <span class="req" aria-hidden="true">*</span>
+                <span class="hint">Your profile URL, e.g. linkedin.com/in/you</span></label>
+              <input type="url" id="linkedin" name="linkedin" maxlength="300" inputmode="url" autocapitalize="off" spellcheck="false" required>
+            </div>
+          </div>
+          <div class="two">
+            <div class="field">
+              <label for="company">Company</label>
+              <input type="text" id="company" name="company" maxlength="120" autocomplete="organization">
+            </div>
+            <div class="field">
+              <label for="role">Role</label>
+              <input type="text" id="role" name="role" maxlength="120" autocomplete="organization-title">
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>THE WORKSHOP (OPTIONAL)</legend>
+          <div class="field">
+            <span class="label" id="platform-label">What did you run it on?</span>
+            <div class="choices" role="radiogroup" aria-labelledby="platform-label">
+              <label class="choice"><input type="radio" name="platform" value="macOS"> macOS</label>
+              <label class="choice"><input type="radio" name="platform" value="Linux"> Linux</label>
+              <label class="choice"><input type="radio" name="platform" value="Other"> Something else</label>
+            </div>
+          </div>
+          <div class="field">
+            <span class="label" id="steps-label">Which steps did you get through?</span>
+            <div class="steps" role="group" aria-labelledby="steps-label">
+              <label class="choice"><input type="checkbox" name="steps" value="1 Install"> 1. Install</label>
+              <label class="choice"><input type="checkbox" name="steps" value="2 Deploy"> 2. Deploy an app</label>
+              <label class="choice"><input type="checkbox" name="steps" value="3 Sick version + rollback"> 3. Sick version + rollback</label>
+              <label class="choice"><input type="checkbox" name="steps" value="4 Break it"> 4. Break it on purpose</label>
+              <label class="choice"><input type="checkbox" name="steps" value="5 Manual + source"> 5. Manual and source</label>
+              <label class="choice"><input type="checkbox" name="steps" value="6 Feedback" checked> 6. This form</label>
+            </div>
+          </div>
+          <div class="field">
+            <label for="broke">What broke? <span class="hint">Error messages, the command you ran, where you got stuck.</span></label>
+            <textarea id="broke" name="broke" maxlength="2000"></textarea>
+          </div>
+          <div class="field">
+            <label class="choice"><input type="checkbox" id="contributor" name="contributor">
+              I'd like to hear about contributing or becoming a burger ambassador</label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>CONSENT</legend>
+          <label class="consent"><input type="checkbox" id="consent" name="consent" required>
+            <span>I'm happy to share my information with the Reliaburger team <span class="req" aria-hidden="true">*</span></span></label>
+        </fieldset>
+
+        <div class="hp" aria-hidden="true"><label>Website<input type="text" name="website" tabindex="-1" autocomplete="off"></label></div>
+
+        <div class="actions">
+          <button type="submit" id="submit">Send feedback</button>
+          <p class="raffle">Send it to enter today's raffle.</p>
+        </div>
+        <p class="error" id="error" role="alert" hidden></p>
+      </form>
+
+      <section class="done" id="done" hidden tabindex="-1" aria-labelledby="done-title">
+        <div class="done-card">
+          <div class="eyebrow">FEEDBACK RECEIVED</div>
+          <h1 id="done-title">Thank you! 🍔</h1>
+          <p class="done-name" id="done-name"></p>
+          <p class="done-meta" id="done-meta"></p>
+        </div>
+        <p style="margin-top:22px">You're in the raffle. Show this screen at the table if we ask.
+          Found a bug? <a href="https://github.com/reliaburger/reliaburger/issues">Open an issue on GitHub</a>.</p>
+      </section>
+    </main>
+    <footer>
+      <span>Reliaburger · by Miko Pawlikowski</span>
+      <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
+      <span class="footer-note">This form sends your answers to a Google Apps Script run by the
+        Reliaburger team, which emails them to us and keeps them in a spreadsheet. Nothing else.</span>
+    </footer>
+  </div>
+  <script>
+  (function () {
+    "use strict";
+    // The Apps Script web app (scripts/feedback-form.gs). Set after deploying it.
+    var FEEDBACK_URL = "";
+
+    var form = document.getElementById("fb");
+    var errorBox = document.getElementById("error");
+    var submit = document.getElementById("submit");
+    var params = new URLSearchParams(location.search);
+    var event = (params.get("event") || "general").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 60) || "general";
+    var DRAFT_KEY = "rb-feedback-draft";
+    var TEXT_FIELDS = ["q1", "q2", "q3", "name", "email", "linkedin", "company", "role", "broke"];
+
+    // Keep a draft on this device, so a dropped connection or a closed tab doesn't lose the answers.
+    function saveDraft() {
+      var d = {};
+      TEXT_FIELDS.forEach(function (k) { d[k] = form.elements[k].value; });
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify(d)); } catch (e) {}
+    }
+    try {
+      var saved = JSON.parse(localStorage.getItem(DRAFT_KEY) || "{}");
+      TEXT_FIELDS.forEach(function (k) { if (saved[k]) form.elements[k].value = saved[k]; });
+    } catch (e) {}
+    form.addEventListener("input", saveDraft);
+
+    function normalizeLinkedin(v) {
+      v = v.trim();
+      if (v && !/^https?:\/\//i.test(v)) v = "https://" + v.replace(/^\/+/, "");
+      return v;
+    }
+
+    function showError(msg, field) {
+      errorBox.textContent = msg;
+      errorBox.hidden = false;
+      if (field) { field.setAttribute("aria-invalid", "true"); field.focus(); }
+    }
+
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      errorBox.hidden = true;
+      Array.prototype.forEach.call(form.querySelectorAll("[aria-invalid]"), function (el) { el.removeAttribute("aria-invalid"); });
+
+      var el = form.elements;
+      el.linkedin.value = normalizeLinkedin(el.linkedin.value);
+      var checks = [
+        [el.q1, el.q1.value.trim(), "Please answer question 1."],
+        [el.q2, el.q2.value.trim(), "Please answer question 2."],
+        [el.q3, el.q3.value.trim(), "Please answer question 3."],
+        [el.name, el.name.value.trim(), "Please add your name."],
+        [el.email, /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(el.email.value.trim()), "Please add a valid email."],
+        [el.linkedin, /^https?:\/\/([a-z]{2,3}\.)?(www\.)?linkedin\.com\/.+/i.test(el.linkedin.value), "Please add your LinkedIn profile URL (linkedin.com/in/...)."],
+        [el.consent, el.consent.checked, "Please tick the box to share your information with the Reliaburger team."]
+      ];
+      for (var i = 0; i < checks.length; i++) {
+        if (!checks[i][1]) { showError(checks[i][2], checks[i][0]); return; }
+      }
+      if (!FEEDBACK_URL) { showError("The form isn't connected yet. Please tell Mark or Miko."); return; }
+
+      var steps = Array.prototype.map.call(form.querySelectorAll("input[name=steps]:checked"), function (c) { return c.value; });
+      var platform = form.querySelector("input[name=platform]:checked");
+      var body = {
+        q1: el.q1.value, q2: el.q2.value, q3: el.q3.value,
+        name: el.name.value.trim(), email: el.email.value.trim(), linkedin: el.linkedin.value,
+        consent: el.consent.checked, company: el.company.value.trim(), role: el.role.value.trim(),
+        platform: platform ? platform.value : "", steps: steps, broke: el.broke.value,
+        contributor: el.contributor.checked, event: event, website: el.website.value, page: location.href
+      };
+
+      submit.disabled = true;
+      submit.textContent = "Sending…";
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 30000);
+      // A plain text body keeps this a "simple" request, so the browser skips the CORS preflight Apps Script can't answer.
+      fetch(FEEDBACK_URL, { method: "POST", body: JSON.stringify(body), signal: ctrl ? ctrl.signal : undefined })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          clearTimeout(timer);
+          if (!res.ok) throw new Error(res.error === "invalid" ? "Some fields need another look: " + (res.fields || []).join(", ") + "." : (res.error || "unknown error"));
+          try { localStorage.removeItem(DRAFT_KEY); } catch (e) {}
+          document.getElementById("done-name").textContent = body.name;
+          document.getElementById("done-meta").textContent = event + " · " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          form.hidden = true;
+          var done = document.getElementById("done");
+          done.hidden = false;
+          done.focus();
+          window.scrollTo(0, 0);
+        })
+        .catch(function (err) {
+          clearTimeout(timer);
+          submit.disabled = false;
+          submit.textContent = "Send feedback";
+          var msg = err && err.name === "AbortError" ? "The WiFi seems slow. Your answers are saved on this device, please try again." : String(err && err.message || err);
+          showError("That didn't go through. " + msg);
+        });
+    });
+  })();
+  </script>
+</body>
+</html>

@@ -40,6 +40,12 @@ pub struct AgentVersion {
     /// its self-upgrade manager, which is what hashes it.
     #[serde(default)]
     pub binary_sha256: Option<String>,
+    /// The appliance OS version; absent off an appliance.
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// The node's OS update in progress, or how the last one ended.
+    #[serde(default)]
+    pub os_update: crate::os::rollout::OsUpdateState,
 }
 
 /// Client for the Bun agent HTTP API.

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Wait up to five minutes for bun's liveness endpoint, then say so on the
-# console. Exits non-zero (and says why) if bun never answers.
+# Wait for bun's liveness endpoint, then say so on the console. Exits
+# non-zero (and says why) if bun never answers.
 #
 # This is also the A/B health gate (research §7.6): the unit runs before
 # boot-complete.target, so systemd-bless-boot only marks a freshly updated
@@ -12,7 +12,12 @@ counted() {
     # systemd-boot sets this only when the entry has tries left (+N).
     [ -e /sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f ]
 }
-deadline=$(( $(date +%s) + 300 ))
+# A counted boot is a new version on trial: two minutes, so a bad update
+# falls back in minutes, not a quarter of an hour (three tries). The lab's
+# nodes answer in 8 to 23 s; S5 measures the Wyse. Other boots get five,
+# since nothing falls back from them.
+if counted; then limit=120; else limit=300; fi
+deadline=$(( $(date +%s) + limit ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
     if curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \
         || curl -fsSk --max-time 2 https://127.0.0.1:9117/v1/health >/dev/null 2>&1; then
@@ -31,7 +36,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     fi
     sleep 2
 done
-echo "reliaburger: bun not healthy after 300 s on OS ${IMAGE_VERSION:-unknown}"
+echo "reliaburger: bun not healthy after $limit s on OS ${IMAGE_VERSION:-unknown}"
 if counted; then
     echo "reliaburger: counted boot failed, rebooting (systemd-boot falls back after the last try)"
     systemctl reboot

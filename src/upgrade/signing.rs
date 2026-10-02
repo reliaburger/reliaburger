@@ -127,6 +127,26 @@ pub fn public_key_from_pkcs8(pkcs8: &[u8]) -> Result<PublicKey, UpgradeError> {
         })
 }
 
+/// The DER prefix of an Ed25519 `SubjectPublicKeyInfo` (RFC 8410): the
+/// 32-byte key follows it.
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+/// Parse an Ed25519 public key in PEM, as `openssl pkey -pubout` writes it:
+/// the OS signing key an appliance image carries, or a lab build's key.
+pub fn parse_pem_public_key(text: &str) -> Result<PublicKey, String> {
+    let block = pem::parse(text).map_err(|e| e.to_string())?;
+    if block.tag() != "PUBLIC KEY" {
+        return Err(format!("a {} block", block.tag()));
+    }
+    block
+        .contents()
+        .strip_prefix(&ED25519_SPKI_PREFIX[..])
+        .and_then(|key| PublicKey::try_from(key).ok())
+        .ok_or_else(|| "the key".to_string())
+}
+
 /// Sign bytes with a PKCS#8 Ed25519 private key. Returns the base64 signature.
 pub fn sign(pkcs8: &[u8], bytes: &[u8]) -> Result<String, UpgradeError> {
     Ok(BASE64.encode(key_pair(pkcs8)?.sign(bytes)))

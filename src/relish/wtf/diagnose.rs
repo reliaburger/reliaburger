@@ -34,6 +34,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         record_cluster_unknowns(&inputs.cluster, &mut report);
         check_nodes(inputs, &mut report);
         check_builds(inputs, &mut report);
+        check_os(inputs, &mut report);
         check_council(inputs, &mut report);
         check_faults(inputs, &mut report);
         check_disks(inputs, &mut report);
@@ -267,6 +268,60 @@ fn check_builds(inputs: &WtfInputs, report: &mut WtfReport) {
         correlated_events: Vec::new(),
         affected_resource: "cluster".to_string(),
     });
+}
+
+/// Appliance OS findings (W6): a node whose OS update failed, and nodes on
+/// different OS versions. Whether a newer release exists is `relish os
+/// list`'s business: it needs the internet, and `wtf --watch` polls.
+fn check_os(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(builds) = inputs.cluster.builds.value() else {
+        return;
+    };
+    for build in builds {
+        if let crate::os::rollout::OsUpdateState::Failed { target, reason } = &build.os_update {
+            report.warnings.push(WtfFinding {
+                id: "os-update-failed".to_string(),
+                title: format!("{} couldn't update its OS to {target}", build.node_id),
+                details: vec![reason.clone()],
+                suggestion: "see the rollout with `relish os status`; `relish os resume` \
+                             retries the node once the cause is fixed"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: format!("node/{}", build.node_id),
+            });
+        }
+    }
+    let appliances: Vec<(&str, &str)> = builds
+        .iter()
+        .filter_map(|b| Some((b.node_id.as_str(), b.os_version.as_deref()?)))
+        .collect();
+    let versions: std::collections::BTreeSet<&str> = appliances.iter().map(|(_, v)| *v).collect();
+    match versions.len() {
+        0 => {}
+        1 => report.ok.push(WtfOk {
+            id: "os".to_string(),
+            description: match appliances.as_slice() {
+                [(node, version)] => format!("{node} runs OS {version}"),
+                [(_, version), ..] => {
+                    format!("all {} appliances run OS {version}", appliances.len())
+                }
+                [] => return,
+            },
+        }),
+        _ => report.warnings.push(WtfFinding {
+            id: "os-skew".to_string(),
+            title: "appliances run different OS versions".to_string(),
+            details: appliances
+                .iter()
+                .map(|(node, version)| format!("{node}: {version}"))
+                .collect(),
+            suggestion:
+                "`relish os upgrade <version>` brings them in line; nodes already on it are skipped"
+                    .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "cluster".to_string(),
+        }),
+    }
 }
 
 fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
@@ -1706,7 +1761,68 @@ mod tests {
             version: version.to_string(),
             commit: commit.map(str::to_string),
             binary_sha256: binary_sha256.map(str::to_string),
+            os_version: None,
+            os_update: Default::default(),
         }
+    }
+
+    fn on_os(
+        node_id: &str,
+        os: &str,
+        update: crate::os::rollout::OsUpdateState,
+    ) -> BuildObservation {
+        BuildObservation {
+            os_version: Some(os.to_string()),
+            os_update: update,
+            ..build(node_id, "v0.1.1", Some(COMMIT_A), Some("aaaa"))
+        }
+    }
+
+    #[test]
+    fn appliances_on_one_os_version_are_ok() {
+        use crate::os::rollout::OsUpdateState::Idle;
+        let report = with_builds(vec![
+            on_os("home-1", "2026.42.0", Idle),
+            on_os("home-2", "2026.42.0", Idle),
+        ]);
+        assert!(
+            report
+                .ok
+                .iter()
+                .any(|ok| ok.id == "os" && ok.description == "all 2 appliances run OS 2026.42.0")
+        );
+        assert!(!report.warnings.iter().any(|w| w.id.starts_with("os")));
+    }
+
+    #[test]
+    fn a_failed_os_update_and_mixed_versions_are_warnings() {
+        use crate::os::rollout::OsUpdateState::{Failed, Idle};
+        let report = with_builds(vec![
+            on_os("home-1", "2026.42.0", Idle),
+            on_os(
+                "home-2",
+                "2026.41.0",
+                Failed {
+                    target: "2026.42.0".into(),
+                    reason: "booted 2026.41.0 instead".into(),
+                },
+            ),
+        ]);
+        let ids: Vec<&str> = report.warnings.iter().map(|w| w.id.as_str()).collect();
+        assert!(ids.contains(&"os-update-failed"), "{ids:?}");
+        assert!(ids.contains(&"os-skew"), "{ids:?}");
+        let failed = report
+            .warnings
+            .iter()
+            .find(|w| w.id == "os-update-failed")
+            .unwrap();
+        assert_eq!(failed.title, "home-2 couldn't update its OS to 2026.42.0");
+    }
+
+    #[test]
+    fn nodes_without_an_appliance_os_say_nothing_about_it() {
+        let report = with_builds(vec![build("n1", "v0.1.1", Some(COMMIT_A), Some("aaaa"))]);
+        assert!(!report.ok.iter().any(|ok| ok.id == "os"));
     }
 
     fn with_builds(builds: Vec<BuildObservation>) -> WtfReport {

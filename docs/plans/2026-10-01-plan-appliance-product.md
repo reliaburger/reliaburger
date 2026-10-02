@@ -108,19 +108,20 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 
 ### W6. OS updates run by bun (~2.5 weeks), [#406](https://github.com/reliaburger/reliaburger/issues/406)
 
-- **Discovery and pinning:**
-  - the leader reads `os-channel.json` daily and on `relish os list`, verifying it;
-  - `os-update-available` shows in `relish wtf` and Brioche;
-  - the pin is `os.target_version` in Raft, set by `relish os upgrade <version>`;
-  - nodes report their OS version, and `relish nodes` shows it;
-  - nodes installed from an older image move to the pin before taking workloads.
-- **Rolling it out:**
-  - an `OsSlot` backend for `UpgradeManager`, beside `Symlink`. It downloads, verifies, stages into `/var/lib/reliaburger/os-staging` and runs `systemd-sysupdate`, replacing `os-stage`.
-  - The orchestrator's order and quorum rules apply: workers first, council one at a time, leader last.
-  - Each node is drained before its reboot. A fallback pauses the run.
-- **The boot check:** a shorter timeout on counted boots, sized from the Wyse's measured bun start-up (today three tries of 300 s take about 16 minutes).
-- `relish os list | upgrade | status`.
-- **Tests:** unit tests for version, channel and pin logic; a CI test in QEMU that updates one version to the next; a broken image that must fall back without hands.
+What was built, and (in italics) what the original plan had that wasn't:
+
+- **Discovery:** `relish os list` reads and verifies `os-channel.json` and shows each node's OS version beside the newest release. `relish wtf` warns about a node whose OS update failed and about nodes on different versions. It doesn't fetch the channel, since `wtf --watch` polls and clusters may be offline, so "update available" is `relish os list`'s. *Not built:* a daily leader-side check and a Brioche notice; `relish nodes` has no OS column (`relish os list` is the per-node view).
+- **The rollout, not a pin:** `relish os upgrade [version]` writes an `OsRollout` to Raft (`DesiredState::os_rollout`, with history). Raft's apply refuses one while a bun upgrade is active, and the other way round. A later `relish os upgrade` of the same version brings new machines from older images in line, skipping nodes already there. *Not built:* a standing `os.target_version` pin that nodes move to before taking workloads; the rollout covers it without a second mechanism.
+- **Rolling it out:** `os::rollout::step` is pure apart from an `OsControl` trait, and the leader runs it every 5 s, one node at a time: workers, council members while quorum can spare one, the leader last.
+  - Each node is cordoned through the scheduler cache, as bun upgrades are, and drained until no movable replica is placed on it, or 5 minutes.
+  - Then `POST /v1/os/stage`. The node's `os::slot::OsSlot` (not an `UpgradeManager` backend: the two share nothing but the word "upgrade") fetches the release's signed `SHA256SUMS` from `os-<version>-<arch>`, checks it against the release keys and its own image's `os-signing-key.pub.pem`, streams and hashes the three files, runs systemd-sysupdate and reboots.
+  - `os-update.json` tells bun after the reboot whether it landed on the target or fell back, and `/v1/version` reports `os_version` and `os_update`.
+  - A reported fallback, a refusal or 45 minutes without the target pauses the run. `relish os status | resume | abort`.
+- **The boot check:** 120 s on counted boots (lab nodes answer in 8 to 23 s), 300 s otherwise. S5 checks it against the Wyse.
+- **Tests:**
+  - unit tests for every rollout transition, the slot (a signed release staged end to end from a local server, a wrongly signed one refused, fallback detection), the Raft guards, the scheduler cordon, the routes' authz and the renderers;
+  - `image/tests/os-update.sh` in the appliance workflow: lab builds build a second image one version on, and a seeded node updates to it through `relish os upgrade`.
+  - *Not built:* a CI fallback test with a broken image. The lab did it by hand (book, "Three tries, then fall back"), and `after_boot` is unit-tested.
 
 ### W7. Docs, lab and the exit test (~1.5 weeks, then the hardware), [#407](https://github.com/reliaburger/reliaburger/issues/407)
 

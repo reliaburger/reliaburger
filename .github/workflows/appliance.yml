@@ -248,6 +248,19 @@ jobs:
           printf 'bun %s\nimage %s\n' "$BUN_RELEASE" "$(git rev-parse HEAD:image)" \
             > "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.build"
 
+      - name: Build the next version (x86-64 lab builds)
+        # A second build, one version on, for the OS update test: same
+        # sources, but a different version makes it a different /usr.
+        if: matrix.arch == 'x86_64' && env.PUBLISH != 'true' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        run: |
+          set -euo pipefail
+          next="${IMAGE_VERSION%.*}.$(( ${IMAGE_VERSION##*.} + 1 ))"
+          echo "NEXT_VERSION=$next" >> "$GITHUB_ENV"
+          mkosi -C image --image-version "$next" --profile lab \
+            --extra-tree "$GITHUB_WORKSPACE/image/bin-tree" \
+            --output-dir "$RUNNER_TEMP/next" build
+          ls -l "$RUNNER_TEMP/next"
+
       - name: Record sizes
         run: |
           set -euo pipefail
@@ -310,7 +323,8 @@ jobs:
           set -euo pipefail
           cd image/mkosi.output
           cp "$RUNNER_TEMP/spike.pub.pem" spike-signing-key.pub.pem
-          for sums in *.SHA256SUMS; do
+          for sums in *.SHA256SUMS "$RUNNER_TEMP"/next/*.SHA256SUMS; do
+            [ -f "$sums" ] || continue
             openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
             openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
           done
@@ -412,6 +426,18 @@ jobs:
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 25
         run: image/tests/claimed-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
+      - name: OS update (x86-64, KVM)
+        # bun rolls the next version onto a one-node cluster: staging,
+        # sysupdate, the reboot and the boot checks, end to end.
+        if: env.NEXT_VERSION != ''
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
+            "$RUNNER_TEMP/next" "$NEXT_VERSION" source-bin/relish-linux-x86_64
 
       - name: Upload the image
         uses: actions/upload-artifact@v4

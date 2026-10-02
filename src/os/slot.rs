@@ -43,6 +43,9 @@ pub fn installed() -> Option<Arc<OsSlot>> {
     INSTALLED.get().cloned()
 }
 
+/// The OS signing key baked into the image.
+pub const IMAGE_KEY: &str = "/usr/lib/reliaburger/os-signing-key.pub.pem";
+
 /// The version of the running image, from `os-release`'s `IMAGE_VERSION`.
 pub fn image_version(os_release: &str) -> Option<String> {
     os_release
@@ -168,9 +171,22 @@ pub struct OsSlot {
 
 impl OsSlot {
     /// The slot on this machine, or `None` if it isn't an appliance.
-    pub fn detect(keys: Vec<PublicKey>) -> Option<Arc<Self>> {
+    ///
+    /// It trusts `keys` (the release keys) and the OS signing key the
+    /// running image carries. dm-verity guards that key as it guards the
+    /// rest of `/usr`, so an image vouches for its successors: a published
+    /// image names the release key, a lab build its own throwaway key.
+    pub fn detect(mut keys: Vec<PublicKey>) -> Option<Arc<Self>> {
         if !Path::new(DEFINITIONS).is_dir() {
             return None;
+        }
+        match std::fs::read_to_string(IMAGE_KEY)
+            .map_err(|e| e.to_string())
+            .and_then(|pem| crate::upgrade::signing::parse_pem_public_key(&pem))
+        {
+            Ok(key) if !keys.contains(&key) => keys.push(key),
+            Ok(_) => {}
+            Err(error) => eprintln!("bun: OS updates: {IMAGE_KEY}: {error}"),
         }
         let running = image_version(&std::fs::read_to_string("/usr/lib/os-release").ok()?);
         Some(Self::new(

@@ -193,25 +193,10 @@ fn read(path: &Path) -> Result<Vec<u8>, NetbootError> {
     std::fs::read(path).map_err(|e| NetbootError::io(path.display().to_string(), e))
 }
 
-/// The DER prefix of an Ed25519 `SubjectPublicKeyInfo` (RFC 8410): the
-/// 32-byte key follows it.
-const ED25519_SPKI_PREFIX: [u8; 12] = [
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
-
 /// Parse an Ed25519 public key in PEM, as `openssl pkey -pubout` writes
 /// it (a lab build's `spike-signing-key.pub.pem`).
 pub fn parse_pem_public_key(text: &str) -> Result<PublicKey, NetbootError> {
-    let invalid = |why: &str| NetbootError::InvalidKey(why.to_string());
-    let block = pem::parse(text).map_err(|e| invalid(&e.to_string()))?;
-    if block.tag() != "PUBLIC KEY" {
-        return Err(invalid(&format!("a {} block", block.tag())));
-    }
-    block
-        .contents()
-        .strip_prefix(&ED25519_SPKI_PREFIX[..])
-        .and_then(|key| PublicKey::try_from(key).ok())
-        .ok_or_else(|| invalid("the key"))
+    crate::upgrade::signing::parse_pem_public_key(text).map_err(NetbootError::InvalidKey)
 }
 
 /// A served directory, signed with a throwaway key, for tests here and in

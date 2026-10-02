@@ -305,28 +305,53 @@ into it with three tries, and it's only marked good once bun is healthy
 again. If bun doesn't come up, the node goes back to the previous version by
 itself after the third try.
 
-Eventually bun will do all of this across the cluster, one node at a time. In
-the preview you stage each node by hand, which needs root SSH. Pass
-`--ssh-key ~/.ssh/id_ed25519.pub` to `relish cluster create` when you create
-the cluster, and every seed carries your key (only the lab images, from pull
-requests, have sshd). Then serve a newer run's artefacts
-over HTTP, and on each node in turn (node 1 last):
+bun does this across the cluster, one node at a time. See what each node runs
+and what the newest release is:
 
 ```sh
-ssh root@192.168.1.52
-curl -fsSO http://192.168.1.20:8080/x86_64/spike-signing-key.pub.pem
-/usr/lib/reliaburger/os-stage http://192.168.1.20:8080/x86_64 2026.40.40 spike-signing-key.pub.pem
-systemctl reboot
+relish os list
 ```
 
-`os-stage` checks the new version's signature and hashes, and writes it into
-the spare slot. Each CI run signs with its own key, so name the new run's key
-explicitly, as above. Serve the new run's artefacts yourself: `relish
-netboot` serves only files its `SHA256SUMS` lists, and the key isn't one of
-them. Download them the same way as before, into `new/x86_64`, and run
-`python3 -m http.server 8080` in `new/`, so the URLs above find them. Stop
-`relish netboot` first, since it also uses port 8080. `bootctl list` on the
-node shows both versions afterwards.
+```
+Newest OS release: 2026.42.0
+
+NODE                 OS           NOTE
+home-1               2026.41.0    update available
+home-2               2026.41.0    update available
+home-3               2026.41.0    update available
+```
+
+Then roll it out:
+
+```sh
+relish os upgrade
+relish os status
+```
+
+`relish os upgrade` takes the newest release, or a version you name. The
+leader takes the nodes in turn: workers first, then the council (only while
+the others can keep a majority), and itself last. For each node it first
+moves the workloads it can elsewhere, then tells the node to update. The node
+downloads the release from GitHub, checks its signature against the key its
+own image carries and every file against the release's `SHA256SUMS`, writes
+it into the spare slot and reboots. Once it's healthy on the new version, the
+leader moves on. Apps with a managed volume stay with their data and are back
+when the node is, a minute or two later.
+
+If a node comes back on its old version, because the new one failed its boot
+checks three times, or doesn't come back within 45 minutes, the rollout
+pauses and `relish os status` says which node and why. `relish os resume`
+tries that node again; `relish os abort` stops, leaving each node on the
+version it has. A node that's already on the target is skipped, so after
+adding machines from an older image, run `relish os upgrade` again to bring
+them in line. To go back to an older version, name it and add
+`--allow-downgrade`.
+
+`relish wtf` warns about a node whose update failed, and about nodes left
+on different versions.
+
+A bun upgrade and an OS rollout never run at once: both restart nodes, so
+each refuses to start while the other is under way.
 
 ### What happens to `/etc`
 
@@ -346,7 +371,8 @@ from the new image; reinstall them to start clean.
 
 ## What's missing
 
-- **No OS updates run by bun.** Staging by hand over SSH stands in for them.
+- **OS updates need published releases.** Each CI run's images trust only
+  that run's throwaway key, so they can't update to another run's.
 - **Secure Boot** has to be off.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and
   upgrading one would leave the other without a majority, so

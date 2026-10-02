@@ -8,8 +8,8 @@ ProtectVersion=%A
 Verify=no
 
 [Source]
-# Staged and checked first (Ed25519, SHA-256) by os-stage, standing in for
-# bun (research §7.6), so sysupdate only copies.
+# Staged and checked first (Ed25519, SHA-256) by bun (src/os/slot.rs), or
+# by os-stage in the lab, so sysupdate only copies.
 Type=regular-file
 Path=/var/lib/reliaburger/os-staging
 MatchPattern=reliaburger-os_@v.efi
