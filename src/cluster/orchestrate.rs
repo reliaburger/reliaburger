@@ -656,6 +656,22 @@ fn plan_pass(
             cache.set_node(node);
         }
     }
+    // Reports can lag committed assignments by several ticks. Reconstruct
+    // missing reservations before admitting any app, including when all of
+    // an earlier app's placements are already converged.
+    for (app_id, placements) in &desired.scheduling {
+        let mut counts = HashMap::<NodeId, u32>::new();
+        for placement in placements {
+            let committed = counts.entry(placement.node_id.clone()).or_default();
+            *committed += 1;
+            let reported = cache
+                .get_node(&placement.node_id)
+                .map_or(0, |node| node.replicas_of(app_id));
+            if *committed > reported {
+                cache.reserve(&placement.node_id, app_id, &placement.resources);
+            }
+        }
+    }
     let mut decisions = Vec::new();
     let mut quota_blocked = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
@@ -6111,6 +6127,67 @@ mod audit_stale_endpoints {
 }
 
 #[cfg(test)]
+mod audit_pending_reservations {
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::quota::QuotaLedger;
+    use crate::meat::{cluster_state::SchedulerNodeState, types::AppId};
+    fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels,
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+    fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(replicas);
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu_request,
+            limit: cpu_request,
+        });
+        spec
+    }
+    #[test]
+    fn pending_placements_must_reserve_capacity_across_ticks() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("solo", 1000, BTreeMap::new()));
+        let old_report = cache.clone();
+        let alive = HashSet::from([NodeId::new("solo")]);
+        let a = AppId::new("a", "default");
+        let b = AppId::new("b", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(a.clone(), app_spec(600, 1));
+        desired.apps.insert(b.clone(), app_spec(600, 1));
+        let first = plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(first.len(), 1);
+        for decision in first {
+            desired
+                .scheduling
+                .insert(decision.app_id, decision.placements);
+        }
+        let second = plan_scheduling_pass(
+            &mut old_report.clone(),
+            &desired,
+            &alive,
+            &mut QuotaLedger::default(),
+        );
+        eprintln!("second pass with same report: {second:?}");
+        assert!(
+            second.iter().all(|d| d.app_id != b),
+            "second tick overbooks the same 1000m node with two 600m apps"
+        );
+    }
+}
+
+#[cfg(test)]
 mod audit_daemon_self_reservation {
     use super::*;
     use crate::config::Replicas;
@@ -6173,5 +6250,91 @@ mod audit_daemon_self_reservation {
                     .any(|p| p.node_id == NodeId::new("a")),
             "running daemon was removed because it cannot fit a second copy"
         );
+    }
+}
+
+/// Where #432's reconstructed reservations meet #433's daemon credit: a
+/// daemon whose committed copies haven't been reported yet keeps every
+/// placement, and its reconstructed footprint still blocks other apps.
+#[cfg(test)]
+mod reconstructed_daemon_reservations {
+    use super::*;
+    use crate::config::Replicas;
+    use crate::council::types::DesiredState;
+    use crate::meat::quota::QuotaLedger;
+    use crate::meat::{cluster_state::SchedulerNodeState, types::AppId};
+
+    fn empty_node(name: &str) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(1000, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels: BTreeMap::new(),
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+
+    fn requesting(cpu: u64, replicas: Replicas) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = replicas;
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu,
+            limit: cpu,
+        });
+        spec
+    }
+
+    fn lagging_cache() -> ClusterStateCache {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(empty_node("a"));
+        cache.set_node(empty_node("b"));
+        cache
+    }
+
+    #[test]
+    fn an_unreported_daemon_keeps_its_placements_and_its_room() {
+        let alive = HashSet::from([NodeId::new("a"), NodeId::new("b")]);
+        let daemon = AppId::new("agent", "default");
+        let web = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(daemon.clone(), requesting(600, Replicas::DaemonSet));
+        let first = plan_scheduling_pass(
+            &mut lagging_cache(),
+            &desired,
+            &alive,
+            &mut QuotaLedger::default(),
+        );
+        assert_eq!(first[0].placements.len(), 2);
+        desired
+            .scheduling
+            .insert(daemon.clone(), first[0].placements.clone());
+        desired
+            .apps
+            .insert(web.clone(), requesting(600, Replicas::Fixed(1)));
+
+        // Neither node has reported the daemon yet.
+        let mut cache = lagging_cache();
+        let second =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(
+            second.iter().all(|d| d.app_id != daemon),
+            "the daemon was re-planned: {second:?}"
+        );
+        assert!(
+            second.iter().all(|d| d.app_id != web),
+            "web was placed into room the daemon holds: {second:?}"
+        );
+        for node in ["a", "b"] {
+            let node = cache.get_node(&NodeId::new(node)).unwrap();
+            assert_eq!(node.allocated.cpu_millicores, 600);
+            assert_eq!(node.replicas_of(&daemon), 1);
+        }
     }
 }
