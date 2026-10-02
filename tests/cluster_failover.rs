@@ -151,6 +151,7 @@ async fn start_node_for_test(
         operator_token: operator,
         fault_injection: false,
         labels: Default::default(),
+        keep_data_dir: false,
     })
     .await
 }

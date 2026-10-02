@@ -102,7 +102,16 @@ async fn start_node_with_auth(
     shutdown: &CancellationToken,
     auth: Option<NodeFaultAuth>,
 ) -> Node {
-    start_node_with(name, gossip_port, seeds, shutdown, auth, Default::default()).await
+    start_node_with(
+        name,
+        gossip_port,
+        seeds,
+        shutdown,
+        auth,
+        Default::default(),
+        false,
+    )
+    .await
 }
 
 async fn start_labelled_node(
@@ -112,11 +121,43 @@ async fn start_labelled_node(
     shutdown: &CancellationToken,
     labels: &[(&str, &str)],
 ) -> Node {
+    labelled_node(name, gossip_port, seeds, shutdown, labels, false).await
+}
+
+/// Bring a stopped labelled node back on its old data directory, the way
+/// `systemctl restart bun` does.
+async fn restart_labelled_node(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    shutdown: &CancellationToken,
+    labels: &[(&str, &str)],
+) -> Node {
+    labelled_node(name, gossip_port, seeds, shutdown, labels, true).await
+}
+
+async fn labelled_node(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    shutdown: &CancellationToken,
+    labels: &[(&str, &str)],
+    keep_data_dir: bool,
+) -> Node {
     let labels = labels
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-    start_node_with(name, gossip_port, seeds, shutdown, None, labels).await
+    start_node_with(
+        name,
+        gossip_port,
+        seeds,
+        shutdown,
+        None,
+        labels,
+        keep_data_dir,
+    )
+    .await
 }
 
 async fn start_node_with(
@@ -126,6 +167,7 @@ async fn start_node_with(
     shutdown: &CancellationToken,
     auth: Option<NodeFaultAuth>,
     labels: std::collections::BTreeMap<String, String>,
+    keep_data_dir: bool,
 ) -> Node {
     let wired = start_wired_node(WiredNodeOptions {
         name: name.to_string(),
@@ -150,6 +192,7 @@ async fn start_node_with(
         operator_token: auth.as_ref().map(|auth| auth.token.clone()),
         fault_injection: auth.is_some(),
         labels,
+        keep_data_dir,
     })
     .await;
 
@@ -576,6 +619,151 @@ async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
     for n in nodes {
         if let Some(c) = &n.handle.council {
             c.shutdown().await.ok();
+        }
+    }
+}
+
+/// The managed-volume directory of `app` on the wired node `name`.
+fn volume_root(name: &str, gossip_port: u16, app: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("rb-placement-{name}-{gossip_port}"))
+        .join("volumes")
+        .join("default")
+        .join(app)
+}
+
+/// #423: an external tester restarted bun on the node holding a volume
+/// app's data, and within ten seconds the app was running on another node
+/// on an empty volume. A graceful stop announces Left over gossip, and the
+/// leader treated Left like a lost node: it dropped the placement and let
+/// the scheduler pick a new home. A restart must never move a volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
+    let root = CancellationToken::new();
+    let ports = [("h1", 21141_u16), ("h2", 21145), ("h3", 21149)];
+    let zones = [[("zone", "a")], [("zone", "b")], [("zone", "b")]];
+    let tokens: Vec<CancellationToken> = (0..3).map(|_| root.child_token()).collect();
+    let mut nodes: Vec<Option<Node>> = Vec::new();
+    for (index, (name, port)) in ports.iter().enumerate() {
+        let seeds = if index == 0 {
+            vec![]
+        } else {
+            vec![local(ports[0].1)]
+        };
+        nodes.push(Some(
+            start_labelled_node(name, *port, seeds, &tokens[index], &zones[index]).await,
+        ));
+    }
+    {
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        let ready = wait_until(Duration::from_secs(30), || {
+            live.iter().any(|n| *n.thinks_leader.borrow())
+        })
+        .await;
+        assert!(ready, "no leader elected");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Pinned to zone b, db lands on h2 or h3; the other zone-b node is where
+    // a wrong move would take it.
+    let manifest = r#"
+        [app.db]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+
+        [app.db.placement]
+        required = ["zone=b"]
+
+        [[app.db.volumes]]
+        path = "/data"
+    "#;
+    let home = {
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        apply_until_live(live[0], &live, manifest, "db").await
+    };
+    assert_eq!(home.len(), 1, "db runs once: {home:?}");
+    let home_index = ports.iter().position(|(n, _)| *n == home[0]).unwrap();
+    let (home_name, home_port) = ports[home_index];
+    let marker = volume_root(home_name, home_port, "db")
+        .join("data")
+        .join("marker");
+    std::fs::write(&marker, b"written before the restart").unwrap();
+    let observer_index = if home_index == 0 { 1 } else { 0 };
+
+    // `systemctl restart bun`: SIGTERM cancels the node's shutdown token.
+    let stopped = nodes[home_index].take().unwrap();
+    tokens[home_index].cancel();
+    if let Some(council) = &stopped.handle.council {
+        council.shutdown().await.ok();
+    }
+    drop(stopped);
+    let observer = nodes[observer_index].as_ref().unwrap();
+    let left = wait_until(Duration::from_secs(15), || {
+        peer_state(observer, home_name) != Some(reliaburger::mustard::state::NodeState::Alive)
+    })
+    .await;
+    assert!(left, "{home_name} never left gossip");
+
+    // A slow restart: give the leader well past gossip's suspicion and
+    // dead timeouts to make the wrong call.
+    let window = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < window {
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        let elsewhere = nodes_with_live(&live, "db").await;
+        assert!(
+            elsewhere.is_empty(),
+            "db started on {elsewhere:?} while {home_name}, which holds its volume, restarted"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let restart_token = root.child_token();
+    nodes[home_index] = Some(
+        restart_labelled_node(
+            home_name,
+            home_port,
+            vec![local(ports[observer_index].1)],
+            &restart_token,
+            &zones[home_index],
+        )
+        .await,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        let running = nodes_with_live(&live, "db").await;
+        if running == [home_name.to_string()] {
+            break;
+        }
+        assert!(
+            running.iter().all(|n| n == home_name),
+            "db started on {running:?} instead of its home {home_name}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "db never came back on {home_name}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"written before the restart",
+        "db's data is still in its volume"
+    );
+    for (index, (name, port)) in ports.iter().enumerate() {
+        if index != home_index {
+            assert!(
+                !volume_root(name, *port, "db").exists(),
+                "{name} provisioned a second, empty volume for db"
+            );
+        }
+    }
+
+    root.cancel();
+    for node in nodes.iter().flatten() {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
         }
     }
 }
