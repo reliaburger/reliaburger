@@ -1292,6 +1292,9 @@ fn build_endpoint_catalog(
         })
         .collect();
     for (node_id, report) in &reports.reports {
+        if reports.stale_nodes.contains(node_id) {
+            continue;
+        }
         let Some(&node_ip) = node_ips.get(node_id) else {
             continue; // no known IP (departed, or IPv6-only) — can't route to it
         };
@@ -1346,6 +1349,7 @@ fn build_endpoint_catalog(
                     && member.address.ip() == std::net::IpAddr::V4(backend.node_ip)
             });
             if still_there
+                && !reports.stale_nodes.contains(&node_id)
                 && !reports.reports.contains_key(&node_id)
                 && !desired
                     .producer_retirements
@@ -5965,29 +5969,12 @@ image = "busybox:latest"
 
 #[cfg(test)]
 mod audit_stale_endpoints {
-    use crate::meat::quota::QuotaLedger;
     use super::*;
     use crate::config::Replicas;
     use crate::council::types::DesiredState;
-    use crate::meat::{
-        cluster_state::SchedulerNodeState,
-        types::{AppId, Placement},
-    };
+    use crate::meat::AppId;
     use crate::reporting::types::*;
     use std::time::{Instant, SystemTime};
-    fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
-        SchedulerNodeState {
-            node_id: NodeId::new(name),
-            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
-            allocated: Resources::default(),
-            labels,
-            ready: true,
-            capabilities: Default::default(),
-            app_replicas: Default::default(),
-            uptime_secs: 86400,
-            cached_images: Default::default(),
-        }
-    }
     fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
         let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
         spec.replicas = Replicas::Fixed(replicas);
