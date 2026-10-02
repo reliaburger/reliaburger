@@ -198,10 +198,25 @@ impl RuncGrill {
         }
         let runtime = self.clone();
         let id = instance.clone();
+        let caller = std::any::type_name::<F>();
         tokio::spawn(async move {
+            let queued = std::time::Instant::now();
             let _lifecycle = runtime.lock_lifecycle(&id).await;
+            let waited = queued.elapsed();
             let context = runtime.owned_context(&id, expected).await?;
-            operation(runtime, id, context).await
+            let result = operation(runtime, id.clone(), context).await;
+            let total = queued.elapsed();
+            if total > Duration::from_millis(150) {
+                crate::grill::diag456_status(&format!(
+                    "op {} {} waited={}ms total={}ms ok={}",
+                    id.0,
+                    caller,
+                    waited.as_millis(),
+                    total.as_millis(),
+                    result.is_ok()
+                ));
+            }
+            result
         })
         .await
         .map_err(|error| failure(instance, error))?
@@ -1049,3 +1064,4 @@ impl RuncGrill {
         }
     }
 }
+

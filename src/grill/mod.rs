@@ -935,3 +935,18 @@ mod tests {
         assert!(InstanceIdentity::parse("api-0").is_none());
     }
 }
+
+/// Throwaway #456 diagnostics.
+pub(crate) fn diag456_status(line: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/reliaburger-456.log")
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let _ = writeln!(file, "{}.{:03} {line}", now.as_secs(), now.subsec_millis());
+    }
+}

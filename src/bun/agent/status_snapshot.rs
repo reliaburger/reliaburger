@@ -259,7 +259,30 @@ async fn complete_entry<G: Grill>(
                 .and_then(Result::ok),
         }
     };
-    let (exited, pid, exit_code) = tokio::join!(exited, pid, exit_code);
+    let started = std::time::Instant::now();
+    let exited = async {
+        let value = exited.await;
+        (value, started.elapsed())
+    };
+    let pid = async {
+        let value = pid.await;
+        (value, started.elapsed())
+    };
+    let exit_code = async {
+        let value = exit_code.await;
+        (value, started.elapsed())
+    };
+    let ((exited, exited_ms), (pid, pid_ms), (exit_code, exit_ms)) =
+        tokio::join!(exited, pid, exit_code);
+    if exited.is_err() || pid.is_none() || exit_code.is_none() {
+        crate::grill::diag456_status(&format!(
+            "status {} alive={alive} exited={exited:?}@{}ms pid={pid:?}@{}ms exit={exit_code:?}@{}ms",
+            status.id,
+            exited_ms.as_millis(),
+            pid_ms.as_millis(),
+            exit_ms.as_millis()
+        ));
+    }
     // A missing liveness verdict leaves the loop's view of the state.
     let liveness_unknown = exited.is_err();
     let exited = exited.unwrap_or(false);
