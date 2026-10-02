@@ -345,6 +345,9 @@ pub struct ApiState {
     /// live. Read by the auth middleware. Production Bun always supplies one;
     /// `None` remains available to small embedded/test routers.
     pub token_store: Option<crate::sesame::auth::TokenStore>,
+    /// When each API token last authenticated a request on this node, shared
+    /// with the auth middleware that records it.
+    pub token_last_used: crate::sesame::auth::TokenLastUsed,
     /// The cluster's internal service token, presented on cross-node fan-out
     /// calls so peers accept them as the system principal. `None` single-node.
     pub service_token: Option<String>,
@@ -506,6 +509,7 @@ pub fn router_with_upgrade(
     jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
     status: Option<super::agent::StatusReader>,
 ) -> Router {
+    let token_last_used = crate::sesame::auth::new_token_last_used();
     let state = ApiState {
         cmd_tx,
         status,
@@ -523,6 +527,7 @@ pub fn router_with_upgrade(
         rollup_store,
         membership,
         token_store: token_store.clone(),
+        token_last_used: token_last_used.clone(),
         service_token: service_token.clone(),
         cluster_http,
         api_port,
@@ -553,7 +558,8 @@ pub fn router_with_upgrade(
     let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
         service_token,
-    );
+    )
+    .with_last_used(token_last_used);
     if let Some(verifier) = jwt_verifier {
         auth_state = auth_state.with_jwt_verifier(verifier);
     }
@@ -978,6 +984,48 @@ async fn fetch_from_peer<T: serde::de::DeserializeOwned>(
         Ok(Err(error)) => Err(format!("node {name}: {error}")),
         Err(_) => Err(format!("node {name} timed out")),
     }
+}
+
+/// Record an audited action, attributed to the credential that asked for it
+/// (F05 I1). The principal is the caller's stable `principal_id`, and the
+/// token's name goes in the details for people; a node with no token store
+/// yet (the bootstrap window) records `local-bootstrap`. Never pass a secret
+/// in `details` or `message`.
+pub(super) async fn record_caller_audit(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    kind: crate::bun::events::EventKind,
+    action: &str,
+    mut details: std::collections::BTreeMap<String, String>,
+    message: String,
+) {
+    let Some(events) = &state.events else {
+        return;
+    };
+    let (principal, token_name) = match auth {
+        Some(auth) => (auth.principal_id.clone(), auth.token_name.clone()),
+        None => ("local-bootstrap".to_string(), "local-bootstrap".to_string()),
+    };
+    details.insert("token_name".to_string(), token_name);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    events
+        .write()
+        .await
+        .record_audit(crate::bun::events::AuditEvent {
+            timestamp,
+            kind,
+            severity: crate::bun::events::EventSeverity::Info,
+            action: action.to_string(),
+            principal,
+            app: None,
+            namespace: None,
+            node: Some(local_node_name(state)),
+            details,
+            message,
+        });
 }
 
 /// Ask every live member except this node for `path`.

@@ -130,6 +130,8 @@ struct Setup {
     events: Option<Arc<RwLock<EventStore>>>,
     members: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
     tokens: Vec<crate::sesame::types::ApiToken>,
+    council: Option<Arc<crate::council::CouncilNode>>,
+    service_token: Option<String>,
 }
 
 impl Setup {
@@ -140,6 +142,8 @@ impl Setup {
             events: None,
             members: None,
             tokens: Vec::new(),
+            council: None,
+            service_token: None,
         }
     }
 
@@ -158,9 +162,9 @@ impl Setup {
             Some(Arc::new(RwLock::new(self.history))),
             None,
             None,
-            None,
+            self.council,
             token_store,
-            None,
+            self.service_token,
             None,
             self.members,
             None,
@@ -694,4 +698,192 @@ async fn a_node_streams_its_own_new_events_on_request() {
     let event: crate::bun::events::ClusterEvent = serde_json::from_str(&event.data).unwrap();
     assert_eq!(event.message, "fresh");
     assert_eq!(event.node.as_deref(), Some("local"));
+}
+
+// ---------------------------------------------------------------------------
+// API tokens (F05 I2)
+// ---------------------------------------------------------------------------
+
+/// A council whose token store holds `tokens`, and the same tokens for the
+/// router's auth layer.
+async fn council_with_tokens(
+    tag: &str,
+    tokens: &[crate::sesame::types::ApiToken],
+) -> Arc<crate::council::CouncilNode> {
+    let council = super::tests::seeded_council(tag).await;
+    for token in tokens {
+        council
+            .write(crate::council::RaftRequest::CreateApiToken(token.clone()))
+            .await
+            .unwrap();
+    }
+    council
+}
+
+fn token_named<'a>(
+    view: &'a crate::bun::cluster_view::ClusterTokens,
+    name: &str,
+) -> &'a crate::bun::cluster_view::TokenSummary {
+    view.tokens
+        .iter()
+        .find(|token| token.name == name)
+        .unwrap_or_else(|| panic!("{name} missing from {:?}", view.tokens))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[tokio::test]
+async fn token_list_shows_scope_expiry_and_last_use_after_a_request() {
+    use crate::sesame::types::{ApiRole, TokenScope};
+    let admin =
+        crate::sesame::token::create_token("admin", ApiRole::Admin, TokenScope::default(), None)
+            .unwrap();
+    let expiry = SystemTime::now() + Duration::from_secs(10 * 86_400);
+    let reader = crate::sesame::token::create_token(
+        "reader",
+        ApiRole::ReadOnly,
+        TokenScope {
+            apps: Some(vec!["web".into()]),
+            namespaces: Some(vec!["team".into()]),
+        },
+        Some(expiry),
+    )
+    .unwrap();
+    let tokens = vec![admin.token.clone(), reader.token.clone()];
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    setup.council = Some(council_with_tokens("token-last-used", &tokens).await);
+    setup.tokens = tokens;
+    let app = setup.router().await;
+
+    let before = unix_now();
+    let (status, body) = get(app.clone(), "/v1/token/list", Some(&admin.plaintext)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let view: crate::bun::cluster_view::ClusterTokens = serde_json::from_slice(&body).unwrap();
+    let listed = token_named(&view, "reader");
+    assert_eq!(listed.role, "read-only");
+    assert_eq!(listed.scope.apps, Some(vec!["web".to_string()]));
+    assert_eq!(listed.scope.namespaces, Some(vec!["team".to_string()]));
+    assert_eq!(
+        listed.expires_at,
+        Some(
+            expiry
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        )
+    );
+    assert_eq!(listed.last_used, None, "the reader hasn't been used yet");
+    assert!(
+        token_named(&view, "admin").last_used >= Some(before),
+        "the listing request itself is a use of the admin token"
+    );
+
+    // The reader authenticates once; the next listing shows when.
+    let (status, _) = get(app.clone(), "/v1/status", Some(&reader.plaintext)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(app, "/v1/token/list", Some(&admin.plaintext)).await;
+    let view: crate::bun::cluster_view::ClusterTokens = serde_json::from_slice(&body).unwrap();
+    let last_used = token_named(&view, "reader").last_used;
+    assert!(
+        last_used >= Some(before) && last_used <= Some(unix_now()),
+        "{last_used:?}"
+    );
+}
+
+#[tokio::test]
+async fn token_list_merges_every_members_last_use_and_names_a_silent_one() {
+    use crate::bun::cluster_view::{ClusterTokens, TokenSummary};
+    use crate::sesame::types::{ApiRole, TokenScope};
+    let admin =
+        crate::sesame::token::create_token("admin", ApiRole::Admin, TokenScope::default(), None)
+            .unwrap();
+    let ci =
+        crate::sesame::token::create_token("ci", ApiRole::Deployer, TokenScope::default(), None)
+            .unwrap();
+    let ci_principal = crate::sesame::auth::token_principal_id(&ci.token);
+    // The peer saw `ci` in the future (as far as this node knows), and a
+    // token this node has never heard of, which the merge must ignore.
+    let peer_view = ClusterTokens {
+        tokens: vec![
+            TokenSummary {
+                name: "ci".into(),
+                principal: ci_principal,
+                role: "deployer".into(),
+                scope: TokenScope::default(),
+                created_at: 0,
+                expires_at: None,
+                last_used: Some(4_000_000_000),
+            },
+            TokenSummary {
+                name: "stranger".into(),
+                principal: "token:stranger".into(),
+                role: "admin".into(),
+                scope: TokenScope::default(),
+                created_at: 0,
+                expires_at: None,
+                last_used: Some(4_000_000_001),
+            },
+        ],
+        warnings: Vec::new(),
+    };
+    let peer = serve_peer(Router::new().route(
+        "/v1/token/list",
+        axum::routing::get(move |Query(params): Params| {
+            let view = peer_view.clone();
+            async move {
+                require_local(&params)?;
+                Ok::<_, StatusCode>(Json(view))
+            }
+        }),
+    ))
+    .await;
+    let dead = dead_address().await;
+
+    let tokens = vec![admin.token.clone(), ci.token.clone()];
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    setup.council = Some(council_with_tokens("token-merge", &tokens).await);
+    setup.tokens = tokens;
+    setup.members = Some(members(&[("peer", peer), ("gone", dead)]));
+    let app = setup.router().await;
+
+    let (status, body) = get(app, "/v1/token/list", Some(&admin.plaintext)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let view: ClusterTokens = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = view.tokens.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["admin", "ci"],
+        "only the tokens in this node's store"
+    );
+    assert_eq!(token_named(&view, "ci").last_used, Some(4_000_000_000));
+    assert_eq!(view.warnings.len(), 1, "{:?}", view.warnings);
+    assert!(view.warnings[0].contains("gone"), "{:?}", view.warnings);
+}
+
+/// A peer answers its share for the node fan-out, which presents the
+/// service token. That principal may read the local answer, but it still
+/// can't ask for the cluster-wide list: it stays off user management.
+#[tokio::test]
+async fn the_service_principal_reads_only_a_nodes_own_token_list() {
+    use crate::sesame::types::{ApiRole, TokenScope};
+    let admin =
+        crate::sesame::token::create_token("admin", ApiRole::Admin, TokenScope::default(), None)
+            .unwrap();
+    let service = crate::sesame::token::derive_service_token(&[3u8; 32]).unwrap();
+    let tokens = vec![admin.token.clone()];
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    setup.council = Some(council_with_tokens("token-service", &tokens).await);
+    setup.tokens = tokens;
+    setup.service_token = Some(service.clone());
+    let app = setup.router().await;
+
+    let (status, body) = get(app.clone(), "/v1/token/list?local=true", Some(&service)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, _) = get(app, "/v1/token/list", Some(&service)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

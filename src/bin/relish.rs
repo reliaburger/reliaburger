@@ -724,7 +724,7 @@ enum TokenAction {
         #[arg(long)]
         ttl_days: Option<u64>,
     },
-    /// List all API tokens.
+    /// List all API tokens with their scope, expiry and last use.
     List,
     /// Revoke an API token by name.
     Revoke {
@@ -1637,7 +1637,7 @@ async fn main() -> ExitCode {
                 )
                 .await
             }
-            TokenAction::List => commands::token_list().await,
+            TokenAction::List => commands::token_list(cli.output).await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
         },
         Command::JoinToken { action } => match &action {

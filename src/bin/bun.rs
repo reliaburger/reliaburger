@@ -1543,6 +1543,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
         }
+
+        // Leader-only: drop tokens a day past their expiry, never the last
+        // Admin (F05 I2). Followers tick too, and do nothing.
+        tokio::spawn(reliaburger::bun::token_sweep::run_token_sweep_loop(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        ));
     }
     // Create the log store before the agent adopts anything: its checkpoint
     // tells each adopted instance's forwarder where to resume (#308). (The

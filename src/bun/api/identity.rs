@@ -88,27 +88,53 @@ pub(super) async fn identity_sign_handler(
 // Token management endpoints
 // ---------------------------------------------------------------------------
 
-/// List API tokens from SecurityState in Raft.
+#[derive(serde::Deserialize)]
+pub(super) struct TokenListQuery {
+    /// Answer from this node only, with this node's last-use times. Set on
+    /// the fan-out's own requests so a peer never fans out again.
+    #[serde(default)]
+    local: bool,
+}
+
+/// List the cluster's API tokens: name, role, scope, times and when each was
+/// last used. Never a secret or a hash.
+///
+/// The tokens come from Raft, the same on every node. Last use doesn't: each
+/// node only knows the requests it authenticated, so the node asked merges
+/// its own times with every live member's (the latest wins) and names any
+/// member that didn't answer.
 pub(super) async fn token_list_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    Query(query): Query<TokenListQuery>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
-    {
-        return resp;
-    }
-    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
-        return response;
-    }
-    if let Err(response) = enforce_cluster_permission(
-        &state,
-        auth.as_deref(),
-        crate::config::PermissionAction::Admin,
-    )
-    .await
-    {
-        return response;
+    // A peer's share is asked for by the node fan-out, which presents the
+    // service token. That principal stays off user management (AUTH4), so
+    // it may read only this node's answer, never start a cluster-wide one.
+    let system_reads_local = query.local
+        && auth.as_deref().is_some_and(|ctx| {
+            ctx.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL
+                && ctx.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL
+        });
+    if !system_reads_local {
+        if let Err(resp) = crate::sesame::auth::authorize_user(
+            auth.as_deref(),
+            crate::sesame::types::ApiRole::Admin,
+        ) {
+            return resp;
+        }
+        if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+            return response;
+        }
+        if let Err(response) = enforce_cluster_permission(
+            &state,
+            auth.as_deref(),
+            crate::config::PermissionAction::Admin,
+        )
+        .await
+        {
+            return response;
+        }
     }
     let Some(ref council) = state.council else {
         return (
@@ -119,20 +145,47 @@ pub(super) async fn token_list_handler(
     };
 
     let security_state = council.security_state().await;
-    let tokens: Vec<serde_json::Value> = security_state
+    let last_used = state.token_last_used.read().await.clone();
+    let unix_seconds = |at: std::time::SystemTime| {
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+    let tokens: Vec<crate::bun::cluster_view::TokenSummary> = security_state
         .api_tokens
         .iter()
-        .map(|t| {
-            serde_json::json!({
-                "name": t.name,
-                "role": t.role.to_string(),
-                "expires_at": t.expires_at.map(|e| e.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
-                "created_at": t.created_at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-            })
+        .map(|token| {
+            let principal = crate::sesame::auth::token_principal_id(token);
+            crate::bun::cluster_view::TokenSummary {
+                name: token.name.clone(),
+                role: token.role.to_string(),
+                scope: token.scope.clone(),
+                created_at: unix_seconds(token.created_at),
+                expires_at: token.expires_at.map(unix_seconds),
+                last_used: last_used.get(&principal).copied(),
+                principal,
+            }
         })
         .collect();
 
-    Json(serde_json::json!({ "tokens": tokens })).into_response()
+    let mut warnings = Vec::new();
+    let tokens = if query.local {
+        tokens
+    } else {
+        let (peers, failures) = fan_out_to_peers::<crate::bun::cluster_view::ClusterTokens>(
+            &state,
+            "/v1/token/list?local=true",
+            CLUSTER_STATUS_TIMEOUT,
+        )
+        .await;
+        warnings = failures;
+        crate::bun::cluster_view::merge_token_last_used(
+            tokens,
+            peers.into_iter().map(|(_, view)| view.tokens).collect(),
+        )
+    };
+
+    Json(crate::bun::cluster_view::ClusterTokens { tokens, warnings }).into_response()
 }
 
 /// Revoke an API token by name via Raft.
@@ -193,8 +246,19 @@ pub(super) async fn token_revoke_handler(
             Json(serde_json::json!({ "error": reason })),
         )
             .into_response(),
-        Ok(_) => Json(serde_json::json!({ "message": format!("token {} revoked", req.name) }))
-            .into_response(),
+        Ok(_) => {
+            record_caller_audit(
+                &state,
+                auth.as_deref(),
+                crate::bun::events::EventKind::Token,
+                "token.revoked",
+                std::collections::BTreeMap::from([("token".to_string(), req.name.clone())]),
+                format!("API token {} revoked", req.name),
+            )
+            .await;
+            Json(serde_json::json!({ "message": format!("token {} revoked", req.name) }))
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -408,6 +472,25 @@ pub(super) async fn token_create_handler(
     if let Err(response) = write_lease_request(council, request).await {
         return response;
     }
+    let mut details = std::collections::BTreeMap::from([
+        ("token".to_string(), req.name.clone()),
+        ("role".to_string(), req.role.clone()),
+    ]);
+    if let Some(apps) = &req.apps {
+        details.insert("apps".to_string(), apps.join(","));
+    }
+    if let Some(namespaces) = &req.namespaces {
+        details.insert("namespaces".to_string(), namespaces.join(","));
+    }
+    record_caller_audit(
+        &state,
+        auth.as_deref(),
+        crate::bun::events::EventKind::Token,
+        "token.created",
+        details,
+        format!("API token {} created with role {}", req.name, req.role),
+    )
+    .await;
     Json(serde_json::json!({
         "name": req.name,
         "role": req.role,
@@ -518,12 +601,26 @@ pub(super) async fn join_token_create_handler(
         .write(crate::council::RaftRequest::CreateJoinToken(join_token))
         .await
     {
-        Ok(_) => Json(serde_json::json!({
-            "token": plaintext,
-            "ttl_seconds": req.ttl_seconds,
-            "expires_at": expires_at,
-        }))
-        .into_response(),
+        Ok(_) => {
+            record_caller_audit(
+                &state,
+                auth.as_deref(),
+                crate::bun::events::EventKind::Token,
+                "join_token.created",
+                std::collections::BTreeMap::from([
+                    ("node_id".to_string(), req.node_id.clone()),
+                    ("ttl_seconds".to_string(), req.ttl_seconds.to_string()),
+                ]),
+                format!("join token created for node {}", req.node_id),
+            )
+            .await;
+            Json(serde_json::json!({
+                "token": plaintext,
+                "ttl_seconds": req.ttl_seconds,
+                "expires_at": expires_at,
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({

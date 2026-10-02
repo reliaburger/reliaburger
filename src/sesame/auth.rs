@@ -43,6 +43,37 @@ pub fn new_token_store() -> TokenStore {
     Arc::new(RwLock::new(Vec::new()))
 }
 
+/// When each API token last authenticated a request on this node, as Unix
+/// seconds keyed by the token's principal id (`token:<digest>`).
+///
+/// Node-local and in memory on purpose (F05 I2): writing "last used" through
+/// Raft would turn every authenticated request into a cluster-wide log entry.
+/// `GET /v1/token/list` asks every node for its map and keeps the latest per
+/// token. A restarted node forgets its share, which only ever makes a token
+/// look *less* recently used than it was.
+pub type TokenLastUsed = Arc<RwLock<std::collections::HashMap<String, u64>>>;
+
+/// Create an empty last-used map.
+pub fn new_token_last_used() -> TokenLastUsed {
+    Arc::new(RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Record that `principal_id` authenticated a request just now.
+async fn record_token_use(last_used: &TokenLastUsed, principal_id: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // The write lock covers one map insert; it's never held across I/O.
+    let mut map = last_used.write().await;
+    match map.get_mut(principal_id) {
+        Some(seen) => *seen = (*seen).max(now),
+        None => {
+            map.insert(principal_id.to_string(), now);
+        }
+    }
+}
+
 /// Reserved name for the internal service principal (the derived service
 /// token). Not a real user token; never stored in `SecurityState`.
 pub const SYSTEM_PRINCIPAL: &str = "__system";
@@ -92,6 +123,8 @@ pub struct AuthState {
     /// Verifier for workload-identity JWT bearers. `None` disables JWT auth
     /// (single-node / pre-OIDC), leaving the token and session paths unchanged.
     pub jwt_verifier: Option<Arc<WorkloadJwtVerifier>>,
+    /// When each user token last authenticated a request here.
+    pub last_used: TokenLastUsed,
 }
 
 impl AuthState {
@@ -102,7 +135,14 @@ impl AuthState {
             service_token,
             sessions: super::session::SessionStore::new(),
             jwt_verifier: None,
+            last_used: new_token_last_used(),
         }
+    }
+
+    /// Share `last_used` with the API, so the token listing can read it.
+    pub fn with_last_used(mut self, last_used: TokenLastUsed) -> Self {
+        self.last_used = last_used;
+        self
     }
 
     /// Attach a workload-JWT verifier, enabling JWT bearer authentication.
@@ -184,7 +224,7 @@ pub fn authenticate(
 
 /// The stable principal id for a stored token: a digest of its hash, so it
 /// names this exact credential rather than its (reusable) name.
-fn token_principal_id(token: &ApiToken) -> String {
+pub(crate) fn token_principal_id(token: &ApiToken) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, &token.token_hash);
     format!("token:{}", hex::encode(digest.as_ref()))
 }
@@ -382,6 +422,7 @@ pub async fn auth_middleware(
         }
         return match authenticate_off_lock(bearer_token, tokens).await {
             Ok(ctx) => {
+                record_token_use(&state.last_used, &ctx.principal_id).await;
                 request.extensions_mut().insert(ctx);
                 next.run(request).await
             }
@@ -404,6 +445,8 @@ pub async fn auth_middleware(
         && let Some(identity) = state.sessions.validate(&id).await
     {
         if session_credential_is_live(&identity, &tokens, state.service_token.is_some()) {
+            // A dashboard session is its token at work, too.
+            record_token_use(&state.last_used, &identity.principal_id).await;
             request
                 .extensions_mut()
                 .insert(readonly_session_context(&identity));

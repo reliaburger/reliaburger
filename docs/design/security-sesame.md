@@ -404,7 +404,10 @@ pub struct ApiToken {
     /// When the token was created.
     pub created_at: SystemTime,
 
-    /// Last time the token was used (updated on each API request).
+    /// Last time the token was used. Shipped, but *not* stored here: each
+    /// node keeps it in memory (`sesame::auth::TokenLastUsed`, keyed by the
+    /// token's principal id) and `GET /v1/token/list` merges every node's
+    /// answer, the latest per token (§5.4).
     pub last_used: Option<SystemTime>,
 
     /// Per-token rate limit (requests per second). Default: 100.
@@ -938,7 +941,11 @@ $ relish token rotate ci-deploy    # planned
 3. During the grace period, both old and new tokens are accepted.
 4. After the grace period, the old hash is deleted.
 
-**Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`. A background sweep that proactively deletes expired tokens from Raft state is planned; today expiry is enforced at check time, not by a sweep.
+**Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
+
+**Expiry sweep (shipped, F05 I2):** every hour (`bun::token_sweep::TOKEN_SWEEP_INTERVAL`) the leader proposes `RaftRequest::SweepExpiredApiTokens { now_unix_ms }`, but only when its own copy of the store has something due, so a quiet cluster writes nothing. The state machine decides what to remove from the entry's `now_unix_ms` alone (`sesame::token::tokens_to_sweep`), so every replica removes the same tokens: those whose `expires_at` plus a 24-hour grace (`EXPIRED_TOKEN_GRACE`) is past. Two rules override that, because an empty store is the bootstrap window in `auth_middleware`: the last Admin is never removed (if every Admin is due, the one that expired most recently stays, ties to the greater name), and the store is never emptied (with no Admin, the most recently expired token stays). The reply, `CouncilResponse::ApiTokensSwept { removed }`, lets the leader record one `token.expired_swept` audit event per token with principal `system`. A store whose every token has expired is not empty, so it still refuses anonymous requests (tested).
+
+**Last use and the listing (shipped, F05 I2):** when `auth_middleware` authenticates a bearer token or a session cookie, it records "now" against the token's principal id in a node-local map. Nothing goes through Raft: a write per request would turn reads into log entries. `GET /v1/token/list` returns each token's name, principal id, role, scope, `created_at`, `expires_at` and `last_used`; the node asked fans out to every live member with `local=true` (allowed to the system principal only in that form; every other caller still needs an unscoped Admin), keeps the latest `last_used` per principal and names silent members in `warnings`. A restarted node forgets its share, so `last_used` can only under-report.
 
 **Rate limiting:** Each API request checks the token's `rate_limit_rps`. A token-keyed sliding window counter (in-memory on the API-serving node) tracks request counts. Exceeding the limit returns HTTP 429 with a `Retry-After` header.
 

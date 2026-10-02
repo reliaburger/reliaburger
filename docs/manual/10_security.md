@@ -53,7 +53,7 @@ through a port forward that arrives on the node's loopback.
 
 ```sh
 relish token create --name ci-deploy --role deployer --namespaces shop --ttl-days 90
-relish token list      # name, role, created and expiry times (UTC)
+relish token list      # name, role, times (UTC), last use and scope
 relish token revoke ci-deploy
 ```
 
@@ -76,6 +76,42 @@ only a hash, so `TOKEN="$(relish token create ...)"` captures it. Tokens don't
 expire unless you give `--ttl-days`. `revoke` refuses to remove the last admin
 token; create its replacement first. Revoking a token, or letting it expire,
 also ends every dashboard session that was logged in with it.
+
+`relish token list` shows, for each token, its role, when it was created, when
+it expires (`never`, `(in 30d)` or `(expired)`), when it was **last used** and
+its **scope** (`all`, or `apps=… namespaces=…`). New columns are added on the
+right, so a script that cuts the older ones out keeps working; `-o json` gives
+the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
+never) plus a `principal` id that matches the `principal` of that token's audit
+events.
+
+Last use is kept in memory on each node, not in the cluster's replicated state,
+so it's cheap. The node you ask collects every node's answer and shows the
+latest. Two things follow:
+
+- a node that doesn't answer leaves a gap, and `token list` names it on stderr
+  (`warning: last use incomplete: node-3 timed out`);
+- a node forgets what it saw when it restarts, so a token can look *less*
+  recently used than it was, never more. `never` means no node that's up has
+  seen it since starting.
+
+### Expired tokens
+
+An expired token is refused at once (`401 token expired`). A day later (the
+24-hour grace, so `token list` still shows why a client started failing) the
+council leader removes it from the store. The sweep runs hourly and records a
+`token.expired_swept` event per token, with principal `system`, in
+`relish events`.
+
+The sweep never removes the last admin token, and never empties the store. An
+empty store is the bootstrap window: the API lets everyone in so the first
+token can be created. If every admin token has expired, the one that expired
+most recently stays: still refused, but present, so the API stays closed.
+Expiry alone can lock you out of token management, sweep or no sweep, so keep
+one admin token without `--ttl-days`, or mint the next admin token before the
+current one lapses. With no admin token at all, the most recently expired
+token stays. A store whose every token has expired is
+not empty, so it keeps refusing anonymous requests.
 
 ### Permissions
 

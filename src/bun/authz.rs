@@ -294,6 +294,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/identity/sign", Admin, Cluster(ADMIN)),
     // Credential and trust management additionally requires an unscoped user.
     gated(Post, "/v1/token/create", Admin, Cluster(ADMIN)),
+    // With `local=true` the system principal may also read it: that's the
+    // node fan-out asking a peer for its last-use times (F05 I2).
     gated(Get, "/v1/token/list", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
@@ -641,6 +643,29 @@ mod tests {
             assert!(
                 body.contains("require_unscoped"),
                 "{handler} serves every tenant's events to a scoped token"
+            );
+        }
+    }
+
+    /// F05 I1: the routes that change who can do what record who called
+    /// them. A new handler for minting or revoking credentials, or for
+    /// rotating keys, belongs in this list.
+    #[test]
+    fn trust_changing_routes_record_an_audit_event() {
+        let sources = [include_str!("api.rs")];
+        for handler in [
+            "token_create_handler",
+            "token_revoke_handler",
+            "join_token_create_handler",
+            "secret_rotate_handler",
+        ] {
+            let body = sources
+                .iter()
+                .find_map(|source| mounted_handler_body(source, handler))
+                .unwrap_or_else(|| panic!("{handler} not found"));
+            assert!(
+                body.contains("record_caller_audit"),
+                "{handler} changes trust without an audit event"
             );
         }
     }
