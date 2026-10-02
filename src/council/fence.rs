@@ -32,7 +32,8 @@ pub const FENCE_FILE: &str = "recovery-fence.json";
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum FenceState {
     /// A fresh data directory: no council yet, so no epoch to defend. The
-    /// node adopts the epoch of the first council that contacts it.
+    /// node adopts the epoch of the first council that contacts it, unless
+    /// gossip has already shown it a newer one.
     Unclaimed,
     /// A restarted member, holding its epoch but not serving Raft yet while
     /// gossip shows whether any peer has moved to a newer epoch.
@@ -50,7 +51,8 @@ pub enum FenceState {
 /// A point-in-time view of the fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FenceSnapshot {
-    /// The epoch this node holds (meaningless while `Unclaimed`).
+    /// The epoch this node holds. While `Unclaimed` it holds none, and this
+    /// is the newest epoch gossip has shown it: the floor for adoption.
     pub epoch: u64,
     /// What the node may do with it.
     pub state: FenceState,
@@ -232,6 +234,11 @@ impl RecoveryFence {
         self.state.send_if_modified(|current| {
             let before = *current;
             admission = match current.state {
+                // A council older than one gossip has already shown us is a
+                // replaced one: joining it would hand it a vote (#428).
+                FenceState::Unclaimed if sender_epoch < current.epoch => Admission::Refuse {
+                    newest_epoch: current.epoch,
+                },
                 FenceState::Unclaimed => {
                     *current = FenceSnapshot {
                         epoch: sender_epoch,
@@ -294,15 +301,26 @@ impl RecoveryFence {
         tokio::fs::write(&staging, bytes).await?;
         let staged = tokio::fs::File::open(&staging).await?;
         staged.sync_all().await?;
-        tokio::fs::rename(&staging, file).await
+        tokio::fs::rename(&staging, file).await?;
+        // The rename is only durable once the directory entry is: without
+        // this a power cut can bring back a node that forgot its fence.
+        if let Some(directory) = file.parent() {
+            tokio::fs::File::open(directory).await?.sync_all().await?;
+        }
+        Ok(())
     }
 }
 
 /// Fence `current` if `peer_epoch` is newer than anything it knows. Returns
 /// `true` if the fence moved.
 fn fence_if_newer(current: &mut FenceSnapshot, peer_epoch: u64) -> bool {
-    if current.state == FenceState::Unclaimed || peer_epoch <= current.newest_known_epoch() {
+    if peer_epoch <= current.newest_known_epoch() {
         return false;
+    }
+    if current.state == FenceState::Unclaimed {
+        // Nothing to fence: remember it as the floor for adoption.
+        current.epoch = peer_epoch;
+        return true;
     }
     current.state = FenceState::Fenced {
         newer_epoch: peer_epoch,
@@ -380,8 +398,9 @@ mod tests {
     fn unclaimed_node_adopts_the_first_council_that_contacts_it() {
         let fence = fence(0, FenceState::Unclaimed);
         assert_eq!(fence.outbound_epoch(), None);
-        // Gossip about epochs means nothing to a node with no council.
-        assert!(!fence.observe_peer_epoch(5));
+        // Gossip can't fence a node with no council.
+        assert!(!fence.observe_peer_epoch(1));
+        assert!(!fence.is_fenced());
         assert_eq!(fence.admit(2), Admission::Adopted);
         assert_eq!(
             fence.snapshot(),
@@ -391,6 +410,18 @@ mod tests {
             }
         );
         assert_eq!(fence.admit(2), Admission::Serve);
+    }
+
+    /// #428: a re-enrolled old voter must not hand a vote to an unfenced
+    /// old voter once gossip has shown it the recovered council's epoch.
+    #[test]
+    fn unclaimed_node_refuses_a_council_older_than_one_gossip_showed_it() {
+        let fence = fence(0, FenceState::Unclaimed);
+        fence.observe_peer_epoch(1);
+        assert_eq!(fence.admit(0), Admission::Refuse { newest_epoch: 1 });
+        assert_eq!(fence.snapshot().claimed_epoch(), None);
+        assert_eq!(fence.admit(1), Admission::Adopted);
+        assert_eq!(fence.snapshot().claimed_epoch(), Some(1));
     }
 
     #[test]

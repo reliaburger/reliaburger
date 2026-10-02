@@ -131,3 +131,68 @@ async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
     let _ = learner.shutdown().await;
     let _ = leader.shutdown().await;
 }
+
+/// From #437 (#427): the stored snapshot keeps the membership as well as the
+/// log position it captured, and a follower installing it can still replay
+/// every entry after it.
+#[tokio::test]
+async fn a_current_snapshot_keeps_its_captured_log_position_and_membership() {
+    use openraft::storage::RaftStateMachine;
+    use openraft::{
+        CommittedLeaderId, Entry, EntryPayload, LogId, Membership, RaftSnapshotBuilder,
+    };
+    use reliaburger::council::types::{DesiredState, TypeConfig};
+    use std::collections::BTreeSet;
+
+    let log = |index| LogId::new(CommittedLeaderId::new(1, 1), index);
+    let mut leader = CouncilStateMachine::new();
+    leader
+        .apply([Entry::<TypeConfig> {
+            log_id: log(1),
+            payload: EntryPayload::Normal(RaftRequest::ConfigSet {
+                key: "before".into(),
+                value: "snapshot".into(),
+            }),
+        }])
+        .await
+        .unwrap();
+    let captured = leader
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .unwrap();
+    let members = BTreeMap::from([(1, info(1))]);
+    leader
+        .apply([
+            Entry {
+                log_id: log(2),
+                payload: EntryPayload::Normal(RaftRequest::ConfigSet {
+                    key: "after".into(),
+                    value: "snapshot".into(),
+                }),
+            },
+            Entry {
+                log_id: log(3),
+                payload: EntryPayload::Membership(Membership::new(
+                    vec![BTreeSet::from([1])],
+                    members,
+                )),
+            },
+        ])
+        .await
+        .unwrap();
+    let snapshot = leader.get_current_snapshot().await.unwrap().unwrap();
+    let payload: DesiredState = serde_json::from_slice(snapshot.snapshot.get_ref()).unwrap();
+    assert_eq!(snapshot.meta, captured.meta);
+    assert_eq!(snapshot.meta.last_log_id, payload.last_applied_log);
+    assert_eq!(snapshot.meta.last_membership, payload.last_membership);
+    let mut follower = CouncilStateMachine::new();
+    follower
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+    // Entries after the snapshot must still be eligible for replay.
+    assert_eq!(follower.applied_state().await.unwrap().0, Some(log(1)));
+    assert!(!follower.desired_state().await.config.contains_key("after"));
+}
