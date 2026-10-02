@@ -2392,8 +2392,9 @@ async fn ingress_reaches_nodes_without_local_replicas() {
                     .send()
                     .await
                     .unwrap();
-                assert!(response.status().is_success());
+                let status = response.status();
                 let html = response.text().await.unwrap();
+                assert!(status.is_success(), "{path} answered {status}: {html}");
                 assert!(
                     html.contains(&instances[0].instance.id),
                     "{path} must show the remote instance on every node: {html}"

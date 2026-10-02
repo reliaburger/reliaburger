@@ -1076,7 +1076,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/capabilities` | Authenticated live DNS, egress and node-readiness evidence |
 | `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
 | `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
-| `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics |
+| `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics. A node that isn't the leader forwards the read to the leader, and answers `503` when no leader answers |
 | `POST` | `/v1/path` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as unscoped Admin) |

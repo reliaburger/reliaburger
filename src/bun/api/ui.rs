@@ -177,16 +177,24 @@ pub(super) fn statuses_to_dashboard_apps(
     rows.into_values().collect()
 }
 
-pub(super) async fn gather_dashboard_apps(state: &ApiState) -> Result<Vec<DashboardApp>, String> {
-    let (statuses, desired) =
-        tokio::try_join!(cluster_statuses(state), gather_desired_apps(state))?;
+pub(super) async fn gather_dashboard_apps(
+    state: &ApiState,
+    directory: Option<&LeaderDirectory>,
+) -> Result<Vec<DashboardApp>, String> {
+    let (statuses, desired) = tokio::try_join!(
+        cluster_statuses(state),
+        gather_desired_apps(state, DesiredAppsSource::Caller(directory))
+    )?;
     let statuses: Vec<_> = statuses.into_iter().map(|row| row.instance).collect();
     Ok(statuses_to_dashboard_apps(&statuses, &desired))
 }
 
 /// Build the dashboard data from current agent state.
-pub(super) async fn gather_dashboard_data(state: &ApiState) -> Result<DashboardData, String> {
-    let apps = gather_dashboard_apps(state).await?;
+pub(super) async fn gather_dashboard_data(
+    state: &ApiState,
+    directory: Option<&LeaderDirectory>,
+) -> Result<DashboardData, String> {
+    let apps = gather_dashboard_apps(state, directory).await?;
 
     let alerts = firing_dashboard_alerts(state).await;
     let alert_count = alerts.len();
@@ -257,9 +265,10 @@ pub(super) fn html_response(html: String) -> Response {
 /// spec doesn't grant `metrics` across the cluster sees the page without it.
 pub(super) async fn dashboard_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
     State(state): State<ApiState>,
 ) -> Response {
-    let mut data = match gather_dashboard_data(&state).await {
+    let mut data = match gather_dashboard_data(&state, directory.as_deref()).await {
         Ok(data) => data,
         Err(error) => return unavailable_response(error),
     };
@@ -303,16 +312,19 @@ pub(super) async fn scraped_metric_names(
 pub(super) async fn app_detail_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let (rows, desired) =
-        match tokio::try_join!(cluster_statuses(&state), gather_desired_apps(&state)) {
-            Ok(result) => result,
-            Err(error) => return unavailable_response(error),
-        };
+    let (rows, desired) = match tokio::try_join!(
+        cluster_statuses(&state),
+        gather_desired_apps(&state, DesiredAppsSource::Caller(directory.as_deref()))
+    ) {
+        Ok(result) => result,
+        Err(error) => return unavailable_response(error),
+    };
     let instances: Vec<InstanceStatus> = rows
         .into_iter()
         .map(|row| row.instance)
@@ -503,8 +515,11 @@ pub(super) async fn gitops_handler(State(state): State<ApiState>) -> Response {
 }
 
 /// `GET /ui/fragment/apps` — apps table HTML fragment for HTMX swap.
-pub(super) async fn fragment_apps_handler(State(state): State<ApiState>) -> Response {
-    match gather_dashboard_apps(&state).await {
+pub(super) async fn fragment_apps_handler(
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    State(state): State<ApiState>,
+) -> Response {
+    match gather_dashboard_apps(&state, directory.as_deref()).await {
         Ok(apps) => html_response(fragments::render_apps_table_fragment(&apps)),
         Err(error) => unavailable_response(error),
     }

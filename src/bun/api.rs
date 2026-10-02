@@ -98,8 +98,9 @@ use metrics::{
     metrics_query_handler, metrics_rollup_handler, metrics_summary_handler,
 };
 use node_info::{
-    capabilities_handler, cluster_capabilities_handler, desired_apps_handler, diagnostics_handler,
-    gather_desired_apps, health_handler, path_handler, readiness_handler, version_handler,
+    DesiredAppsSource, capabilities_handler, cluster_capabilities_handler, desired_apps_handler,
+    diagnostics_handler, gather_desired_apps, health_handler, path_handler, readiness_handler,
+    version_handler,
 };
 use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
