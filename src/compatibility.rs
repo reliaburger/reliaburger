@@ -26,13 +26,15 @@ pub struct Compatibility {
 /// Pickle's catalogue (`LayerDescriptor::platform`) and image listings
 /// (`ImageSummary::platforms`), the apps a namespace quota keeps
 /// unplaced (`RaftRequest::QuotaBlocked`, `DesiredState::quota_blocked` and
-/// `DesiredAppEvidence::blocked`), and the cluster-wide views: peers answer
-/// deploy history, events and jobs for themselves on `local=true`, the
-/// WebSocket log stream sends `LogFrame` JSON (F07), and replicas numbered
-/// across the cluster: each placement's `ordinal` in Raft, and the ordinals
-/// `/v1/placements` hands each node instead of a count (#398).
+/// `DesiredAppEvidence::blocked`), the cluster-wide views: peers answer
+/// deploy history, events and jobs for themselves on `local=true` and the
+/// WebSocket log stream sends `LogFrame` JSON (F07); the volume home a
+/// managed-volume app waits for (`DesiredAppEvidence::volume_home_away`, #423);
+/// and replicas numbered across the cluster: each placement's `ordinal` in
+/// Raft, and the ordinals `/v1/placements` hands each node instead of a count
+/// (#398).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 31,
+    protocol: 32,
     state: 49,
 };
 

@@ -661,6 +661,8 @@ The app is *desired state* in Raft. The scheduler places it because the council 
 
 Both symptoms have one cause: stop wasn't going through Raft. Now it does. In cluster mode, `stop` proposes an `AppDelete` request to the council, exactly the way `apply` proposes an `AppSpec`. The desired state clears, the scheduler stops placing the app, and no reconciler resurrects it. The local container stop becomes best-effort cleanup that runs *after* the delete commits — and because a missing local replica is expected on a leader that holds none, it's no longer an error. Followers can't write to Raft (openraft doesn't forward client writes), so a stop received on a follower forwards to the leader's API, the same leader-forwarding dance `apply` already does. A gated three-node test proves the whole loop: deploy an app, stop it through any node, and watch the desired state clear and *stay* clear across several reconcile ticks.
 
+One thing the handler still got wrong was its answer. Once the Raft write committed it replied `200 OK` with `{"status": "stopped"}`, and `relish` printed `stopped web`. But a commit only records a decision. The workers haven't heard about it yet, and one of them might be unreachable for the next hour (an audit reproduced exactly that, #435). Claiming the app had stopped was a guess. HTTP has a status code for this situation: `202 Accepted` means "I've taken your request, and the work happens later". So a clustered stop now answers `202` with `stopping`, a delete answers `202` with `deleting`, and `relish` says `stop requested for web` and points at `relish status`. Every caller that only checks for success (the CLI, the test runner, the soak harness) carries on unchanged, because `202` is a success. The callers that need the instances gone already poll for that. A standalone node keeps `200` with `stopped`, since there the handler waits for the local stop to finish before it answers.
+
 ## A slow deploy shouldn't freeze the node
 
 Here's a bug you only notice under load. The Bun agent runs one central task, its command loop. A `select!` block waits on several things at once: incoming commands, a health-check timer that fires every second, snapshot requests from the cluster, and a shutdown signal. Whichever fires first wins; the loop handles it, then goes back to waiting. Simple, and for most commands it's fine, because most commands are fast.
@@ -1281,6 +1283,32 @@ We did think about keeping the old behaviour for "reported, fresh and not ready"
 The first test builds the scheduler's view the way the leader does, from an `AggregatedState` with node `home` listed stale, through `build_cluster_cache` and `unheard_nodes`. Before the fix, it placed the app on `busy`. A second test does the same for a running app, and checks that a node gossip has declared dead still releases it.
 
 The report worker's stalls are their own problem, and they're still open. Even with this fix, they make the leader move apps *without* volumes off a node that is running them fine.
+
+## A restart is not a loss
+
+"Gossip no longer has it alive" turned out to be the wrong line too. An outside tester ran three-node clusters on EC2, ran `systemctl restart bun` on the node holding a volume app, and watched the app turn up on another node within ten seconds, on an empty volume. The data was still on the first node, and `relish wtf` said everything was fine. They got the same result six times out of six.
+
+The reason is a courtesy. On SIGTERM, Bun cancels its shutdown token, and the gossip loop's last act is `leave()`: it tells its peers it's leaving, so they don't spend five seconds suspecting it first. Peers mark it Left at once. The leader's next pass saw a node that was neither Alive nor Suspect, so `placement_holds` dropped the placement, `VolumeHome::reserve` skipped the home with `continue`, and the scheduler put the app wherever scored best. A reboot or a SIGKILL takes the slow route to the same place: Suspect for five seconds, then Dead.
+
+Gossip can't tell "restarting" from "gone for good", and it shouldn't have to. A local volume is lost only when someone decides the node isn't coming back. So that decision now belongs to the operator. A managed-volume placement holds whatever gossip says, until the node is decommissioned:
+
+```rust
+fn keeps_volume_home(
+    placement: &crate::meat::types::Placement,
+    spec: &AppSpec,
+    retired: &HashSet<NodeId>,
+) -> bool {
+    has_managed_volume(spec) && !retired.contains(&placement.node_id)
+}
+```
+
+`retired` is built once per pass from the council's decommission records, with `.keys().map(NodeId::new).collect()`. `collect` builds whatever collection the left-hand side asks for, here a `HashSet<NodeId>`, so the same iterator chain could fill a `Vec` or a `BTreeSet` instead. A stopped app coming back gets the same treatment: `reserve` now answers `Wait { reason: HomeWait::Away }` for a home that is out of the cluster, and lets go only of one that was decommissioned.
+
+Keeping the app back is only half of it. An app that silently doesn't run is barely better than one that silently runs empty, which is why the tester's `wtf` saying "all OK" mattered as much as the move. The council's per-app evidence (`/v1/diagnostics/apps`) now carries `volume_home_away`: the home node, when that node isn't a live member. `relish status` and `relish inspect` print "waits for node-2, which holds its volume and is out of the cluster", the dashboard shows the app as blocked, and `wtf` raises a critical finding that names both ways out: bring the node back, or run `relish decommission-node` and accept an empty volume.
+
+The cost is availability. A three-replica volume app that loses a node runs two replicas until the node returns or is decommissioned, where it used to get a fresh, empty third straight away. We think that's the right trade for local storage, and it's the one Kubernetes makes for local persistent volumes. If you want the app to survive losing a node without anyone stepping in, its data has to live somewhere other than that node.
+
+The gated test `restarting_bun_on_a_volume_apps_node_never_moves_the_app` restarts the home node's agent the way systemd does: it cancels that node's shutdown token, keeps it down for fifteen seconds (well past the suspicion timeout), and checks that no other node runs the app or provisions a volume for it in that time. Then it starts the node again on the same data directory and checks the app comes back there, with the marker it wrote before the restart. Before the fix it failed about two seconds after the stop, with the app running on the other zone-`b` node.
 
 ## Two seconds is too eager
 

@@ -249,6 +249,12 @@ pub fn render(inspection: &Inspection) -> String {
                 if let Some(reason) = &app.blocked {
                     let _ = writeln!(out, "  Blocked:   {reason}");
                 }
+                if let Some(home) = &app.volume_home_away {
+                    let _ = writeln!(
+                        out,
+                        "  Waiting:   for {home}, which holds its volume and is out of the cluster"
+                    );
+                }
             }
             (None, Err(reason)) => {
                 let _ = writeln!(
@@ -343,6 +349,7 @@ mod tests {
                 .collect(),
             service_port: None,
             blocked: None,
+            volume_home_away: None,
         }
     }
 
@@ -509,6 +516,30 @@ mod tests {
         assert!(
             output.contains(
                 "  Blocked:   namespace \"default\" would exceed CPU quota: 0+1600 > 1000m\n"
+            ),
+            "{output}"
+        );
+    }
+
+    /// #423: a volume app waiting for its home node says which node.
+    #[test]
+    fn a_volume_app_waiting_for_its_home_node_says_so() {
+        let inspection = Inspection {
+            name: "hello".to_string(),
+            desired: Ok(vec![DesiredAppEvidence {
+                volume_home_away: Some("node-2".to_string()),
+                ..desired(1, &[("node-2", 1)])
+            }]),
+            nodes: vec![NodeReport {
+                node: "node-1".to_string(),
+                answer: NodeAnswer::Answered(Vec::new()),
+            }],
+        };
+
+        let output = render(&inspection);
+        assert!(
+            output.contains(
+                "  Waiting:   for node-2, which holds its volume and is out of the cluster\n"
             ),
             "{output}"
         );

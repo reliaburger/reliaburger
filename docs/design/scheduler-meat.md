@@ -667,9 +667,12 @@ A managed volume lives on one node, so placement follows the data. Desired state
 
 - A home node that is alive, ready and still matches the app's required labels gets the replica, reserved in the pass's cache.
 - A home node that is alive but can't take it right now makes the app wait: placing it elsewhere would start it on an empty volume. That covers no room, no fresh report (a new leader, or a report worker that stalled for longer than `stale_report_timeout_secs`), not ready, cordoned for an upgrade, and missing a capability the app needs.
-- A home node that gossip no longer has alive (or that was retired), or that no longer matches the labels, is dropped, and that replica goes through the normal pipeline. That's the documented loss of a local volume with its node, or the operator moving the app on purpose.
+- A home node that is out of the cluster (Suspect, Left, Dead, or reaped from gossip) also makes the app wait. A `systemctl restart bun` announces Left, and a reboot goes Suspect then Dead, with the data still on disk (#423).
+- A home node that was decommissioned (`relish decommission-node`), or that no longer matches the labels, is dropped, and that replica goes through the normal pipeline. Both are the operator moving the app on purpose, and the app starts on a new, empty volume.
 
-The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that went stale, reported not ready or was cordoned is replaced elsewhere; for a fixed-replica app with a managed volume, the placement holds for as long as the node is alive. Moving it would restart it on an empty volume while its data sits on the node it left.
+The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that went stale, reported not ready, was cordoned or left the cluster is replaced elsewhere. For a fixed-replica app with a managed volume (`keeps_volume_home`), the placement holds whatever the node is doing until the node is decommissioned, including for each replica of a multi-replica app. Moving it would restart it on an empty volume while its data sits on the node it left.
+
+While an app waits for a home that is out of the cluster, the council's per-app evidence (`GET /v1/diagnostics/apps`) carries `volume_home_away`, the node it waits for. `relish status`, `relish inspect` and the dashboard show it, and `relish wtf` reports a critical `volume-home-away` finding naming the node and the decommission command.
 
 `relish delete` forgets the record. Apps without a managed volume are placed by score as usual.
 

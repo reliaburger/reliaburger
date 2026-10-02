@@ -94,7 +94,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.3: incompatible binary: found protocol 31, state 49; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47. …
+refusing to upgrade to v0.1.3: incompatible binary: found protocol 32, state 49; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47. …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -125,7 +125,7 @@ state format from 44 to 46, so a 0.1.0 cluster refuses it and stays on 0.1.0
 0.1.2 is another: it moved the protocol to 28 and the state format to 47, so a
 0.1.1 cluster refuses it too
 ([upgrading from 0.1.1](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-011)).
-So is 0.1.3: protocol 31 and state format 49. A 0.1.2 cluster's leader refuses
+So is 0.1.3: protocol 32 and state format 49. A 0.1.2 cluster's leader refuses
 it before recording a run, with the message above
 ([upgrading from 0.1.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-012)).
 
