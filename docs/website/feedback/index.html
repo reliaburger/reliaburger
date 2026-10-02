@@ -40,7 +40,29 @@
     .fb button:hover { background: #303c32; }
     .fb button:disabled { opacity: .6; cursor: progress; }
     .fb button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
-    .raffle { color: var(--muted); font-size: .9375rem; margin: 0; }
+    .drop { display: block; border: 1px dashed #9aa59c; border-radius: 3px; background: #fff; padding: 18px 16px; text-align: center; cursor: pointer; color: var(--muted); }
+    .drop b { color: var(--ink); }
+    .drop:hover, .drop.over { border-color: var(--accent); }
+    .drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+    .drop:focus-within { outline: 3px solid var(--accent); outline-offset: 1px; }
+    .shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 10px; margin: 12px 0 0; padding: 0; list-style: none; }
+    .shots li { position: relative; aspect-ratio: 1; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; background: #fff; }
+    .shots img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .shots button { position: absolute; top: 4px; right: 4px; width: 26px; height: 26px; padding: 0; border-radius: 50%; font-size: 1rem; line-height: 1; background: var(--ink); color: #fff; }
+    .shots-status { font-size: .875rem; color: var(--muted); margin: 8px 0 0; }
+    .rating { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px 20px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .rating:first-of-type { border-top: 1px solid var(--line); }
+    .rating-q { font-weight: 600; line-height: 1.4; }
+    .rate { display: inline-flex; border: 0; margin: 0; padding: 0; }
+    .rate label { position: relative; }
+    .rate input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .rate span { display: grid; place-items: center; width: 48px; height: 44px; font: 600 1rem var(--mono); border: 1px solid #b9c2ba; margin-left: -1px; background: #fff; cursor: pointer; }
+    .rate label:first-child span { border-radius: 3px 0 0 3px; margin-left: 0; }
+    .rate label:last-child span { border-radius: 0 3px 3px 0; }
+    .rate input:checked + span { background: var(--ink); color: #fff; border-color: var(--ink); }
+    .rate input:focus-visible + span { outline: 3px solid var(--accent); outline-offset: 1px; position: relative; z-index: 1; }
+    .rate.invalid span { border-color: var(--accent); }
+    .scale { font: .75rem var(--mono); color: var(--muted); margin: 0 0 4px; letter-spacing: .03em; }
     .error { color: var(--accent); font-weight: 600; margin: 16px 0 0; }
     .count { display: block; text-align: right; font: .75rem var(--mono); color: var(--muted); margin-top: 4px; }
     .done { padding: 56px 0 40px; max-width: 720px; }
@@ -52,6 +74,7 @@
       .page { padding: 0 16px; }
       .fb { padding-top: 32px; }
       .two, .steps { grid-template-columns: 1fr; }
+      .rating { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -122,9 +145,9 @@
         </fieldset>
 
         <fieldset>
-          <legend>THE WORKSHOP (OPTIONAL)</legend>
+          <legend>THE WORKSHOP</legend>
           <div class="field">
-            <span class="label" id="platform-label">What did you run it on?</span>
+            <span class="label" id="platform-label">What did you run it on? <span class="req" aria-hidden="true">*</span></span>
             <div class="choices" role="radiogroup" aria-labelledby="platform-label">
               <label class="choice"><input type="radio" name="platform" value="macOS"> macOS</label>
               <label class="choice"><input type="radio" name="platform" value="Linux"> Linux</label>
@@ -133,7 +156,7 @@
             <input type="text" id="platform_other" name="platform_other" maxlength="80" aria-label="What else did you run it on?" placeholder="What did you run it on?" hidden>
           </div>
           <div class="field">
-            <span class="label" id="steps-label">Which steps did you go through?</span>
+            <span class="label" id="steps-label">Which steps did you go through? <span class="req" aria-hidden="true">*</span> <span class="hint">Tick all that apply.</span></span>
             <div class="steps" role="group" aria-labelledby="steps-label">
               <label class="choice"><input type="checkbox" name="steps" value="Install"> Install</label>
               <label class="choice"><input type="checkbox" name="steps" value="Deploy an app"> Deploy an app</label>
@@ -144,9 +167,29 @@
             </div>
           </div>
           <div class="field">
+            <span class="label" id="shots-label">Screenshots <span class="hint">Errors, the dashboard, anything worth showing. Up to 10, please hide anything sensitive.</span></span>
+            <label class="drop" id="drop"><input type="file" id="shots-input" accept="image/*" multiple aria-labelledby="shots-label">
+              <b>Choose screenshots</b> or drop them here</label>
+            <ul class="shots" id="shots" aria-label="Attached screenshots"></ul>
+            <p class="shots-status" id="shots-status" aria-live="polite"></p>
+          </div>
+          <div class="field">
             <label class="choice"><input type="checkbox" id="contributor" name="contributor">
               I'd like to hear about contributing or becoming a burger ambassador</label>
           </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>RATE IT</legend>
+          <p class="scale">1 = NOT REALLY · 2 = SOMEWHAT · 3 = ABSOLUTELY</p>
+          <div class="rating"><span class="rating-q" id="r-overall">Overall, I enjoyed the experience <span class="req" aria-hidden="true">*</span></span>
+            <div class="rate" role="radiogroup" aria-labelledby="r-overall" data-name="overall"></div></div>
+          <div class="rating"><span class="rating-q" id="r-digest">It was easy to digest <span class="req" aria-hidden="true">*</span></span>
+            <div class="rate" role="radiogroup" aria-labelledby="r-digest" data-name="digest"></div></div>
+          <div class="rating"><span class="rating-q" id="r-stack">It would fit in my stack once it's properly cooked <span class="req" aria-hidden="true">*</span></span>
+            <div class="rate" role="radiogroup" aria-labelledby="r-stack" data-name="stack"></div></div>
+          <div class="rating"><span class="rating-q" id="r-recommend">I'd recommend it to a teammate <span class="req" aria-hidden="true">*</span></span>
+            <div class="rate" role="radiogroup" aria-labelledby="r-recommend" data-name="recommend"></div></div>
         </fieldset>
 
         <fieldset>
@@ -170,8 +213,7 @@
           <p class="done-name" id="done-name"></p>
           <p class="done-meta" id="done-meta"></p>
         </div>
-        <p style="margin-top:22px">You're in the raffle. Show this screen at the table if we ask.
-          Found a bug? <a href="https://github.com/reliaburger/reliaburger/issues">Open an issue on GitHub</a>.</p>
+        <p style="margin-top:22px">Found a bug? <a href="https://github.com/reliaburger/reliaburger/issues">Open an issue on GitHub</a>.</p>
       </section>
     </main>
     <footer>
@@ -217,6 +259,82 @@
     });
     syncPlatform();
 
+    // 1-2-3 rating buttons, built from the data-name on each group.
+    var RATINGS = ["overall", "digest", "stack", "recommend"];
+    Array.prototype.forEach.call(form.querySelectorAll(".rate"), function (g) {
+      for (var n = 1; n <= 3; n++) {
+        var l = document.createElement("label");
+        l.innerHTML = '<input type="radio" name="' + g.getAttribute("data-name") + '" value="' + n + '" aria-label="' + n + '"><span aria-hidden="true">' + n + "</span>";
+        g.appendChild(l);
+      }
+      g.addEventListener("change", function () { g.classList.remove("invalid"); });
+    });
+    function rating(name) {
+      var r = form.querySelector("input[name=" + name + "]:checked");
+      return r ? Number(r.value) : 0;
+    }
+
+    // Screenshots: big ones are scaled down on the phone before upload, so conference WiFi copes.
+    var MAX_SHOTS = 10, MAX_FILE = 10 * 1024 * 1024, MAX_TOTAL = 20 * 1024 * 1024, MAX_SIDE = 2000;
+    var shots = [], pending = 0;
+    var shotsList = document.getElementById("shots"), shotsStatus = document.getElementById("shots-status");
+    var shotsInput = document.getElementById("shots-input"), drop = document.getElementById("drop");
+    function totalBytes() { return shots.reduce(function (n, s) { return n + s.bytes; }, 0); }
+    function mb(n) { return (n / 1048576).toFixed(1) + " MB"; }
+    function renderShots(note) {
+      shotsList.innerHTML = "";
+      shots.forEach(function (s, i) {
+        var li = document.createElement("li");
+        var img = document.createElement("img"); img.src = s.url; img.alt = s.name;
+        var x = document.createElement("button"); x.type = "button"; x.textContent = "×"; x.setAttribute("aria-label", "Remove " + s.name);
+        x.addEventListener("click", function () { shots.splice(i, 1); renderShots(); });
+        li.appendChild(img); li.appendChild(x); shotsList.appendChild(li);
+      });
+      var msg = shots.length ? shots.length + " of " + MAX_SHOTS + " screenshots, " + mb(totalBytes()) + "." : "";
+      if (pending) msg = (msg ? msg + " " : "") + "Preparing " + pending + "…";
+      shotsStatus.textContent = msg + (note ? " " + note : "");
+    }
+    function readAsDataURL(blob) {
+      return new Promise(function (ok, fail) { var r = new FileReader(); r.onload = function () { ok(String(r.result)); }; r.onerror = fail; r.readAsDataURL(blob); });
+    }
+    function shrink(file) {
+      return new Promise(function (ok) {
+        var url = URL.createObjectURL(file), img = new Image();
+        img.onload = function () {
+          var scale = Math.min(1, MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+          if (scale === 1 && file.size <= 1.5 * 1024 * 1024) { URL.revokeObjectURL(url); ok(file); return; }
+          var c = document.createElement("canvas");
+          c.width = Math.round(img.naturalWidth * scale); c.height = Math.round(img.naturalHeight * scale);
+          var ctx = c.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height); ctx.drawImage(img, 0, 0, c.width, c.height);
+          URL.revokeObjectURL(url);
+          c.toBlob(function (b) { ok(b && b.size < file.size ? b : file); }, "image/jpeg", 0.85);
+        };
+        img.onerror = function () { URL.revokeObjectURL(url); ok(file); };   // e.g. HEIC in Chrome: send as is
+        img.src = url;
+      });
+    }
+    function addShots(files) {
+      var note = "";
+      Array.prototype.slice.call(files).forEach(function (file) {
+        if (!/^image\//.test(file.type) && !/\.(heic|heif|png|jpe?g|webp|gif)$/i.test(file.name)) { note = file.name + " isn't an image."; return; }
+        if (shots.length + pending >= MAX_SHOTS) { note = "Ten screenshots is the limit."; return; }
+        pending++;
+        shrink(file).then(function (blob) {
+          if (blob.size > MAX_FILE) throw new Error(file.name + " is over 10 MB.");
+          if (totalBytes() + blob.size > MAX_TOTAL) throw new Error(file.name + " would take the total over 20 MB.");
+          return readAsDataURL(blob).then(function (dataUrl) {
+            shots.push({ name: file.name, type: blob.type || file.type, bytes: blob.size, url: dataUrl, b64: dataUrl.split(",")[1] || "" });
+          });
+        }).catch(function (err) { note = err.message; })
+          .then(function () { pending--; renderShots(note); });
+      });
+      renderShots(note);
+    }
+    shotsInput.addEventListener("change", function () { if (this.files) addShots(this.files); this.value = ""; });
+    ["dragenter", "dragover"].forEach(function (t) { drop.addEventListener(t, function (e) { e.preventDefault(); drop.classList.add("over"); }); });
+    ["dragleave", "drop"].forEach(function (t) { drop.addEventListener(t, function () { drop.classList.remove("over"); }); });
+    drop.addEventListener("drop", function (e) { e.preventDefault(); if (e.dataTransfer && e.dataTransfer.files) addShots(e.dataTransfer.files); });
+
     function normalizeLinkedin(v) {
       v = v.trim();
       if (v && !/^https?:\/\//i.test(v)) v = "https://" + v.replace(/^\/+/, "");
@@ -248,9 +366,23 @@
         [el.linkedin, /^https?:\/\/([a-z]{2,3}\.)?(www\.)?linkedin\.com\/.+/i.test(el.linkedin.value), "Please add your LinkedIn profile URL (linkedin.com/in/...)."],
         [el.consent, el.consent.checked, "Please tick the box to share your information with the Reliaburger team."]
       ];
+      var platformPick = form.querySelector("input[name=platform]:checked");
+      checks.splice(checks.length - 1, 0,
+        [form.querySelector("input[name=platform]"), !!platformPick, "Please tell us what you ran it on."],
+        [el.platform_other, !(platformPick && platformPick.value === "Other") || el.platform_other.value.trim(), "Please tell us what else you ran it on."],
+        [form.querySelector("input[name=steps]"), !!form.querySelector("input[name=steps]:checked"), "Please tick the steps you went through."]);
       for (var i = 0; i < checks.length; i++) {
         if (!checks[i][1]) { showError(checks[i][2], checks[i][0]); return; }
       }
+      for (var j = 0; j < RATINGS.length; j++) {
+        if (!rating(RATINGS[j])) {
+          var g = form.querySelector('.rate[data-name="' + RATINGS[j] + '"]');
+          g.classList.add("invalid");
+          showError("Please pick 1, 2 or 3 for every rating.", g.querySelector("input"));
+          return;
+        }
+      }
+      if (pending) { showError("Screenshots are still being prepared, give it a second."); return; }
       if (!FEEDBACK_URL) { showError("The form isn't connected yet. Please tell Mark or Miko."); return; }
 
       var steps = Array.prototype.map.call(form.querySelectorAll("input[name=steps]:checked"), function (c) { return c.value; });
@@ -260,19 +392,24 @@
         name: el.name.value.trim(), email: el.email.value.trim(), linkedin: el.linkedin.value,
         consent: el.consent.checked, company: el.company.value.trim(), role: el.role.value.trim(),
         platform: platform ? platform.value : "", platform_other: platform && platform.value === "Other" ? el.platform_other.value.trim() : "", steps: steps, broke: el.broke.value,
-        contributor: el.contributor.checked, event: event, website: el.website.value, page: location.href
+        contributor: el.contributor.checked, event: event, website: el.website.value, page: location.href,
+        ratings: { overall: rating("overall"), digest: rating("digest"), stack: rating("stack"), recommend: rating("recommend") },
+        shots: shots.map(function (s) { return { b64: s.b64, type: s.type, name: s.name }; })
       };
 
       submit.disabled = true;
       submit.textContent = "Sending…";
       var ctrl = window.AbortController ? new AbortController() : null;
-      var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 30000);
+      var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, shots.length ? 120000 : 30000);
       // A plain text body keeps this a "simple" request, so the browser skips the CORS preflight Apps Script can't answer.
       fetch(FEEDBACK_URL, { method: "POST", body: JSON.stringify(body), signal: ctrl ? ctrl.signal : undefined })
         .then(function (r) { return r.json(); })
         .then(function (res) {
           clearTimeout(timer);
-          if (!res.ok) throw new Error(res.error === "invalid" ? "Some fields need another look: " + (res.fields || []).join(", ") + "." : (res.error || "unknown error"));
+          if (!res.ok) throw new Error(res.error === "invalid" ? "Some fields need another look: " + (res.fields || []).join(", ") + "."
+            : res.error === "image too large" ? "A screenshot is too large, please remove it."
+            : res.error === "images too large" ? "The screenshots add up to more than 20 MB, please remove some."
+            : (res.error || "unknown error"));
           try { localStorage.removeItem(DRAFT_KEY); } catch (e) {}
           document.getElementById("done-name").textContent = body.name;
           document.getElementById("done-meta").textContent = event + " · " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -286,7 +423,7 @@
           clearTimeout(timer);
           submit.disabled = false;
           submit.textContent = "Send feedback";
-          var msg = err && err.name === "AbortError" ? "The WiFi seems slow. Your answers are saved on this device, please try again." : String(err && err.message || err);
+          var msg = err && err.name === "AbortError" ? "The WiFi seems slow. Your answers are saved on this device, please try again" + (shots.length ? ", maybe with fewer screenshots." : ".") : String(err && err.message || err);
           showError("That didn't go through. " + msg);
         });
     });
