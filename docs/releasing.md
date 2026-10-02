@@ -101,8 +101,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 47; this binary (reliaburger v0.1.3 (465fdeb)) needs 48. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 28, state 47; this binary (reliaburger v0.1.3 (465fdeb)) needs protocol 30, state 48. …
+incompatible state format: found 47; this binary (reliaburger v0.1.3 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 28, state 47; this binary (reliaburger v0.1.3 (465fdeb)) needs protocol 33, state 49. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -146,7 +146,7 @@ paused run, because no node moved.
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
 `start` fails with both format pairs. A 0.1.2 cluster refuses 0.1.3 like this:
-`refusing to upgrade to v0.1.3: incompatible binary: found protocol 30, state 48; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`.
+`refusing to upgrade to v0.1.3: incompatible binary: found protocol 33, state 49; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -171,9 +171,12 @@ the run pauses until `relish upgrade abort`.
 ### Upgrading from 0.1.2
 
 0.1.3 can't roll onto a 0.1.2 cluster. The scheduler now records the apps a
-namespace quota keeps unplaced, and the cluster-wide views ask each peer for
-its own deploy history, events and jobs and stream logs as `LogFrame` JSON
-(F07), so the protocol moved from 28 to 30 and the state format from 47 to 48.
+namespace quota keeps unplaced, the volume home a managed-volume app waits
+for, and a cluster-wide ordinal for every placement; the cluster-wide views
+ask each peer for its own deploy history, events and jobs and stream logs as
+`LogFrame` JSON (F07); and gossip, leader hints and Raft carry the recovery
+fence's epoch. So the protocol moved from 28 to 33 and the state format from
+47 to 49.
 Recreate the cluster the same way as [from 0.1.0](#upgrading-from-010): move
 the data directories aside (or `relish local destroy --yes` a laptop
 cluster), install 0.1.3 and re-apply your apps.
@@ -181,7 +184,7 @@ cluster), install 0.1.3 and re-apply your apps.
 This is the first release where trying anyway is refused up front. 0.1.2's
 leader checks the candidate before it records a run (#350), so
 `relish upgrade start v0.1.3` on a 0.1.2 cluster fails straight away with
-`found protocol 30, state 48; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`,
+`found protocol 33, state 49; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`,
 and no node moves. There's no paused run to abort.
 
 A council of exactly two voters (a two-node cluster, or a bigger one whose
