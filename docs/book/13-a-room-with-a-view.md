@@ -346,3 +346,19 @@ memory charts on a node's own page. The tests live in
 ephemeral port, and the tests check the merge, the warning for a member that
 doesn't answer, that a `local=true` request never fans out, and that a scoped
 token's rows stay inside its namespace.
+
+The live event stream was the last view to stay local. `/v1/ws/events` sent the
+connected node's events, so the TUI's events view caught other nodes' only on
+its two-second refresh of the merged list. Now the stream opens with the
+cluster's recent events, merged as `/v1/events` merges them, and then relays
+every member's new ones. Each node offers its own new events as SSE on
+`/v1/events?follow=true&local=true`, and the node you're connected to follows
+each member's feed the way a cluster-wide `relish logs -f` follows each node's
+log stream: it re-reads the membership every two seconds, opens feeds to new
+members, drops those of members that left, and reopens one that ended. Its own
+feed subscribes before it reads the backlog, so an event recorded in between
+arrives twice; the live half drops it by node, sequence and timestamp. The
+timestamp is there because sequences are per process: a member that restarts
+counts from one again, and without it its first new events would look like
+ones the backlog already sent. `the_live_event_stream_merges_every_members_events`
+checks both halves against a fake peer.
