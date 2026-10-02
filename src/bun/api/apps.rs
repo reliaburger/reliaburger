@@ -156,10 +156,14 @@ pub(super) async fn cluster_app_change(
             .into_response(),
         Ok(_) => {
             let status = match change {
-                AppChange::Stop => "stopped",
-                AppChange::Delete => "deleted",
+                AppChange::Stop => "stopping",
+                AppChange::Delete => "deleting",
             };
-            Json(serde_json::json!({ "status": status })).into_response()
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "status": status })),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
