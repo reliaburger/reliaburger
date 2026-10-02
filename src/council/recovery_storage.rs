@@ -34,17 +34,32 @@ pub(crate) fn lock(raft: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Hold every existing store's redb lock, refusing a store a live node has
+/// open. A store redb can't open for any other reason (a damaged file is
+/// exactly what recovery exists for) doesn't block recovery: the whole
+/// directory is moved aside and retained, never deleted.
 fn lock_existing(raft: &Path) -> io::Result<Vec<redb::Database>> {
-    ["log.redb", "snapshot.redb"]
-        .into_iter()
-        .filter_map(|name| {
-            let path = raft.join(name);
-            path.exists().then(|| {
-                redb::Database::open(&path)
-                    .map_err(|e| io_error(format!("refusing to replace {}: {e}", path.display())))
-            })
-        })
-        .collect()
+    let mut held = Vec::new();
+    for name in ["log.redb", "snapshot.redb"] {
+        let path = raft.join(name);
+        if !path.exists() {
+            continue;
+        }
+        match redb::Database::open(&path) {
+            Ok(db) => held.push(db),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                return Err(io_error(format!(
+                    "refusing to replace {}: a running node holds it open",
+                    path.display()
+                )));
+            }
+            Err(error) => eprintln!(
+                "recovery: {} is unreadable ({error}); it is retained beside the replacement",
+                path.display()
+            ),
+        }
+    }
+    Ok(held)
 }
 
 fn validate_replacement(path: &Path) -> io::Result<()> {
