@@ -53,6 +53,26 @@ struct WorkloadRequirements<'a> {
     requires_dns: bool,
 }
 
+/// Check a daemon's replacement capacity while crediting its existing copy.
+/// The real cache retains all running allocations; only this eligibility view
+/// subtracts one copy, so other applications cannot spend that capacity.
+pub(crate) fn daemon_candidates(
+    cluster: &ClusterStateCache,
+    app_id: &AppId,
+    resources: &Resources,
+    labels: &BTreeMap<String, String>,
+    requires_egress: bool,
+    requires_dns: bool,
+) -> Vec<super::types::NodeId> {
+    let mut available = cluster.clone();
+    for node in cluster.nodes() {
+        if node.replicas_of(app_id) > 0 {
+            available.release(&node.node_id, app_id, resources);
+        }
+    }
+    filter_nodes(resources, labels, requires_egress, requires_dns, &available)
+}
+
 impl Scheduler {
     /// Create a new scheduler with the given cluster state.
     pub fn new(cluster: ClusterStateCache) -> Self {
@@ -160,12 +180,13 @@ impl Scheduler {
         app_id: &AppId,
         requirements: &WorkloadRequirements<'_>,
     ) -> Result<SchedulingDecision, ScheduleError> {
-        let candidates = filter_nodes(
+        let candidates = daemon_candidates(
+            &self.cluster,
+            app_id,
             requirements.resources,
             requirements.labels,
             requirements.requires_egress,
             requirements.requires_dns,
-            &self.cluster,
         );
         if candidates.is_empty() {
             return Err(ScheduleError::NoEligibleNodes {
@@ -175,8 +196,14 @@ impl Scheduler {
 
         let mut placements = Vec::with_capacity(candidates.len());
         for node_id in &candidates {
-            self.cluster
-                .reserve(node_id, app_id, requirements.resources);
+            if self
+                .cluster
+                .get_node(node_id)
+                .is_some_and(|node| node.replicas_of(app_id) == 0)
+            {
+                self.cluster
+                    .reserve(node_id, app_id, requirements.resources);
+            }
             placements.push(Placement {
                 node_id: node_id.clone(),
                 resources: *requirements.resources,
