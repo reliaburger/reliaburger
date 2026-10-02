@@ -301,8 +301,15 @@ pub(super) async fn diagnostics_handler(
 pub(super) async fn desired_apps_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
 ) -> Response {
-    match gather_desired_apps(&state).await {
+    let source = if headers.contains_key(DESIRED_APPS_FORWARDED_HEADER) {
+        DesiredAppsSource::ForwardedRequest
+    } else {
+        DesiredAppsSource::Caller(directory.as_deref())
+    };
+    match gather_desired_apps(&state, source).await {
         Ok(apps) => Json(filter_desired_apps_for_scope(apps, auth.as_deref())).into_response(),
         Err(error) => unavailable_response(error),
     }
@@ -347,10 +354,46 @@ pub(super) fn council_app_evidence(
     apps
 }
 
+/// Marks a desired-apps read a non-leader has already forwarded, so two nodes
+/// that disagree about the leader can't pass it back and forth.
+pub(super) const DESIRED_APPS_FORWARDED_HEADER: &str = "x-reliaburger-desired-apps-forwarded";
+
+/// How long a non-leader waits for the leader's desired-apps answer.
+const DESIRED_APPS_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Who is asking for desired apps, which decides what a non-leader may do.
+#[derive(Clone, Copy)]
+pub(super) enum DesiredAppsSource<'a> {
+    /// A caller on this node (CLI, dashboard). A non-leader forwards to the
+    /// leader, found through the gossip directory when there is one.
+    Caller(Option<&'a LeaderDirectory>),
+    /// Another node already forwarded this read; never forward it again.
+    ForwardedRequest,
+}
+
+/// Desired replicas and scheduler coverage, from the current leader.
+///
+/// Only a leader that still holds a quorum answers from its own state. A
+/// worker outside Raft has an empty, unreplicated state machine, so its own
+/// view would claim the cluster runs nothing (#436). Any other node forwards
+/// the read to the leader, so `relish status` and the dashboard work from
+/// every node, and reports an error when no leader answers.
 pub(super) async fn gather_desired_apps(
     state: &ApiState,
+    source: DesiredAppsSource<'_>,
 ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
     let apps = if let Some(council) = &state.council {
+        if !confirmed_lease_leader(council).await {
+            return match source {
+                DesiredAppsSource::Caller(directory) => {
+                    desired_apps_from_leader(state, council, directory).await
+                }
+                DesiredAppsSource::ForwardedRequest => Err(
+                    "this node was named the leader but isn't; retry once the election settles"
+                        .into(),
+                ),
+            };
+        }
         let desired = council.desired_state().await;
         let live_nodes = match &state.membership {
             Some(membership) => membership.read().await.len().max(1),
@@ -373,6 +416,50 @@ pub(super) async fn gather_desired_apps(
         .map_err(|_| "desired-app query timed out".to_string())??
     };
     Ok(apps)
+}
+
+/// Ask the leader's API for its desired apps.
+async fn desired_apps_from_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
+    let advertised = directory.and_then(|LeaderDirectory(directory)| {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
+    });
+    let leader_url = match advertised {
+        Some(address) => state.cluster_http.url(&address.to_string(), ""),
+        None => leader_api_url(state, council).await.ok_or_else(|| {
+            "desired cluster state requires a current leader, and none is known yet; retry shortly"
+                .to_string()
+        })?,
+    };
+    let mut request = state
+        .cluster_http
+        .client()
+        .get(format!("{leader_url}/v1/diagnostics/apps"))
+        .header(DESIRED_APPS_FORWARDED_HEADER, "1");
+    if let Some(token) = &state.service_token {
+        request = request.bearer_auth(token);
+    }
+    let exchange = async {
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("the leader answered {status}: {body}"));
+        }
+        response
+            .json::<Vec<crate::bun::diagnostics::DesiredAppEvidence>>()
+            .await
+            .map_err(|error| format!("the leader's answer was unreadable: {error}"))
+    };
+    tokio::time::timeout(DESIRED_APPS_FORWARD_TIMEOUT, exchange)
+        .await
+        .map_err(|_| "the leader did not answer the desired-apps read in time".to_string())?
+        .map_err(|error| format!("could not read desired apps from the leader: {error}"))
 }
 
 /// `POST /v1/path` — fixed DNS and TCP probes from a local source workload.
