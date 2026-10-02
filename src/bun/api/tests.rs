@@ -6767,3 +6767,25 @@ async fn per_app_process_metric_is_queryable() {
 
     shutdown.cancel();
 }
+
+#[tokio::test]
+async fn an_admin_opens_a_join_window_of_up_to_an_hour() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let admit = |minutes: u64| format!(r#"{{"address": "192.168.1.60", "minutes": {minutes}}}"#);
+    for (minutes, expected) in [
+        (0, StatusCode::BAD_REQUEST),
+        (61, StatusCode::BAD_REQUEST),
+        (15, StatusCode::OK),
+    ] {
+        let status = post_status(
+            app.clone(),
+            "/v1/perimeter/admit",
+            &plaintext,
+            &admit(minutes),
+        )
+        .await;
+        assert_eq!(status, expected, "{minutes} minutes");
+    }
+    shutdown.cancel();
+}

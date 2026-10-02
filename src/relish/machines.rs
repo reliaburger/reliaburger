@@ -385,16 +385,16 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
                 .collect::<Vec<_>>();
             (Some(created), seeds)
         }
-        None => (
-            None,
+        None => (None, {
+            open_join_windows(&pairs).await?;
             bare_metal::add(
                 &options.directory,
                 &pairs,
                 options.token_ttl,
                 options.ssh_key.clone(),
             )
-            .await?,
-        ),
+            .await?
+        }),
     };
     for ((node, seed), (_, address, fingerprint)) in seeds.iter().zip(&machines) {
         post_seed(*address, fingerprint, std::fs::read(seed)?)
@@ -418,6 +418,41 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         );
         bare_metal::adopt(created, &options.directory)?;
     }
+    Ok(())
+}
+
+/// How long a claimed machine has to enrol through the cluster's
+/// firewalls before they shut it out again.
+const JOIN_WINDOW_MINUTES: u64 = 15;
+
+/// Let the machines through every node's perimeter while they enrol (G2),
+/// so joining doesn't depend on the cluster having been created with
+/// `--network` covering them. A node that can't be reached is reported and
+/// skipped: if it's down, its firewall doesn't matter.
+async fn open_join_windows(machines: &[(String, IpAddr)]) -> Result<(), RelishError> {
+    let client = super::client::BunClient::default_local();
+    let nodes = client.nodes().await?;
+    for node in nodes.iter().filter(|n| n.state == "alive") {
+        let node_client = match client.for_node(node) {
+            Ok(node_client) => node_client,
+            Err(error) => {
+                eprintln!("warning: {error}");
+                continue;
+            }
+        };
+        for (_, address) in machines {
+            if let Err(error) = node_client
+                .perimeter_admit(*address, JOIN_WINDOW_MINUTES)
+                .await
+            {
+                eprintln!(
+                    "warning: {} didn't open a join window for {address}: {error}",
+                    node.node_id
+                );
+            }
+        }
+    }
+    println!("opened a {JOIN_WINDOW_MINUTES}-minute join window on the cluster's nodes");
     Ok(())
 }
 

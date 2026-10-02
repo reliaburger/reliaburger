@@ -142,6 +142,7 @@ mod tests {
         let markdown = &chapters[index].markdown;
         assert!(markdown.contains("relish cluster create --bare-metal"));
         assert!(markdown.contains("relish image seed"));
+        assert!(markdown.contains("relish machines claim"));
     }
 
     #[test]

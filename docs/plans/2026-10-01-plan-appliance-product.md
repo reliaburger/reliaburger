@@ -53,7 +53,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
   - zero the create-seed after first boot.
 - **Security gaps** (research §4.3):
   - G1: the master key is fetched after join, over the node-certificate mTLS connection, never carried on the seed;
-  - G2: a time-boxed join window on the API port;
+  - G2: a time-boxed join window on the API port (moved to W5, where claims need it);
   - G3: advertise-address detection from the default route;
   - G4: appliance names from the cluster plus an ordinal;
   - G6: pre-seeded, node-bound, single-use join tokens in the initial security state.
@@ -92,16 +92,19 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 
 ### W5. Claiming machines over the LAN (~3 weeks), [#405](https://github.com/reliaburger/reliaburger/issues/405)
 
-- **Unclaimed nodes:** a claim server (self-signed key; fingerprint and QR on tty1) and an mDNS announcement `_reliaburger-unclaimed._tcp` (`mdns-sd`), with no secrets in TXT records.
+- **Unclaimed nodes:** a claim server (self-signed key, kept until claimed; its fingerprint on tty1) on port 9119 and an mDNS announcement `_reliaburger-unclaimed._tcp` (`mdns-sd`), with no secrets in TXT records. The first valid seed posted wins.
 - **On the laptop:**
   - `relish machines` lists unclaimed machines with their fingerprints;
-  - `relish machines claim <mac|ip> --create` claims the first machine;
-  - `relish machines claim --all --cluster <name>` claims the rest, interactive by default, or `--trust-lan`;
-  - `relish join-token list | revoke`.
-- **Claiming updates every node's `bootstrap_peers`**, so a fleet grows without `--network` or editing `node.toml`.
+  - `relish machines claim <dir> --create --name <cluster> ... <mac|ip>...` creates a cluster from the machines it claims, node 1 first;
+  - `relish machines claim <dir> <mac|ip>...` joins more;
+  - both compare each claim key with the console interactively, or skip that with `--trust-lan`, and post the seed over TLS pinned to the key's full SHA-256;
+  - `relish join-token list | revoke` (done in W2).
+- **G2, the join window (moved here from W2):** instead of rewriting every node's `bootstrap_peers`, a joining claim asks every node to admit the new address for 15 minutes (`POST /v1/perimeter/admit`, admin, at most 60). The agent's firewall loop re-applies the ruleset when the open windows change. Once the machine has joined, gossip membership keeps it in.
 - **Tests:**
-  - claim protocol unit tests: a wrong fingerprint, replay, a consumed token;
+  - the claim API (one valid seed, then 409), the pinned verifier over real TLS on loopback (a wrong pin never delivers the seed), target resolution, join windows and the admit handler's bounds;
+  - `image/tests/claimed-pair.sh` in the appliance workflow: two unseeded VMs found over mDNS, node 1 claimed with `--create` and no `--network`, node 2 claimed afterwards through the join window;
   - a scripted Mac-lab qualification: netboot five VMs, claim them, run the tour, kill one, and write a record in `docs/qualification/`.
+- **Deferred:** a QR code on tty1 (the short fingerprint is what people compare); claiming with `--all`, which would trust whatever answers mDNS.
 
 ### W6. OS updates run by bun (~2.5 weeks), [#406](https://github.com/reliaburger/reliaburger/issues/406)
 

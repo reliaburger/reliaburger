@@ -23,9 +23,9 @@ use super::{BunAgent, BunError, ContainerState, Grill, InstanceId};
 pub(super) enum FollowUp {
     /// An upgrade or rollback fetched, verified and staged its binary.
     UpgradePrepared(UpgradePreparation),
-    /// `nft` applied, or refused, the ruleset for these cluster nodes.
+    /// `nft` applied, or refused, the ruleset for these inputs.
     FirewallApplied {
-        cluster_nodes: crate::firewall::rules::ClusterNodes,
+        inputs: crate::firewall::rules::PerimeterInputs,
         result: Result<(), crate::firewall::rules::FirewallError>,
     },
     /// A kill, pause or resume fault's signals were sent, or weren't.
@@ -98,16 +98,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok((_, FollowUp::UpgradePrepared(preparation))) => {
                 self.finish_upgrade_preparation(preparation).await;
             }
-            Ok((
-                _,
-                FollowUp::FirewallApplied {
-                    cluster_nodes,
-                    result,
-                },
-            )) => {
+            Ok((_, FollowUp::FirewallApplied { inputs, result })) => {
                 self.firewall_applying = None;
                 match result {
-                    Ok(()) => self.last_firewall_nodes = Some(cluster_nodes),
+                    Ok(()) => self.last_firewall_inputs = Some(inputs),
                     Err(error) => eprintln!("warning: firewall reconciliation failed: {error}"),
                 }
             }
@@ -317,13 +311,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         );
     }
 
-    /// Apply `ruleset` for `cluster_nodes` with `nft`, off the loop. A test
+    /// Apply `ruleset` for `inputs` with `nft`, off the loop. A test
     /// that stalls the firewall stands in for `nft` entirely, so the harness
     /// never rewrites the host's firewall.
     pub(super) fn spawn_perimeter_apply(
         &mut self,
         ruleset: String,
-        cluster_nodes: crate::firewall::rules::ClusterNodes,
+        inputs: crate::firewall::rules::PerimeterInputs,
     ) {
         #[cfg(test)]
         let stalls = std::sync::Arc::clone(&self.loop_stalls);
@@ -331,15 +325,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(test)]
             if stalls.hold(super::LoopStall::Firewall).await {
                 return FollowUp::FirewallApplied {
-                    cluster_nodes,
+                    inputs,
                     result: Ok(()),
                 };
             }
             let result = crate::firewall::rules::apply_ruleset(&ruleset).await;
-            FollowUp::FirewallApplied {
-                cluster_nodes,
-                result,
-            }
+            FollowUp::FirewallApplied { inputs, result }
         });
         self.firewall_applying = Some(task.id());
     }

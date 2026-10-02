@@ -81,8 +81,8 @@ use faults::{
 use gitops::gitops_webhook_handler;
 use identity::{
     identity_jwks_handler, identity_sign_handler, join_token_create_handler,
-    join_token_list_handler, join_token_revoke_handler, token_create_handler, token_list_handler,
-    token_revoke_handler,
+    join_token_list_handler, join_token_revoke_handler, perimeter_admit_handler,
+    token_create_handler, token_list_handler, token_revoke_handler,
 };
 use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
@@ -775,6 +775,7 @@ pub fn router_with_upgrade(
         .route("/v1/join-token/create", post(join_token_create_handler))
         .route("/v1/join-token/list", get(join_token_list_handler))
         .route("/v1/join-token/revoke", post(join_token_revoke_handler))
+        .route("/v1/perimeter/admit", post(perimeter_admit_handler))
         .route("/v1/secret/public-key", get(secret_public_key_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
         .route_layer(axum::middleware::from_fn_with_state(

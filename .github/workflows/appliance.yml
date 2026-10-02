@@ -395,6 +395,13 @@ jobs:
           chmod +x source-bin/relish-linux-x86_64
           image/tests/seeded-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
 
+      - name: Claimed pair (x86-64, KVM)
+        # Two unseeded appliances claimed over the LAN: mDNS discovery, the
+        # pinned claim, and a join through the firewall's join window.
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 25
+        run: image/tests/claimed-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
       - name: Upload the image
         uses: actions/upload-artifact@v4
         with:

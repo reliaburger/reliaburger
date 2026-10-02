@@ -650,3 +650,68 @@ pub(super) async fn join_token_create_handler(
             .into_response(),
     }
 }
+
+/// `POST /v1/perimeter/admit {"address", "minutes"}`: open a join window
+/// (G2), letting one address through this node's perimeter firewall for up
+/// to an hour so a machine being claimed can enrol. Enrolment still needs
+/// its join token; this only lets the packets in.
+pub(super) async fn perimeter_admit_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    #[derive(serde::Deserialize)]
+    struct AdmitRequest {
+        address: std::net::IpAddr,
+        minutes: u64,
+    }
+    let request: AdmitRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let duration = std::time::Duration::from_secs(request.minutes.saturating_mul(60));
+    if duration.is_zero() || duration > crate::firewall::rules::JoinWindows::MAX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "minutes must be between 1 and 60" })),
+        )
+            .into_response();
+    }
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::OpenJoinWindow {
+        address: request.address,
+        duration,
+        response,
+    })
+    .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "address": request.address,
+            "minutes": request.minutes,
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
+}

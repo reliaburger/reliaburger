@@ -305,6 +305,7 @@ fn refuses_system_principal(path: &str) -> bool {
             | "/v1/join-token/create"
             | "/v1/join-token/list"
             | "/v1/join-token/revoke"
+            | "/v1/perimeter/admit"
             | "/v1/identity/sign"
             | "/v1/secret/rotate"
             | "/v1/nodes/decommission"

@@ -451,6 +451,79 @@ scan() {
 
 If you mostly write Python, read `local -A hash` as `hash = {}` (a bash associative array), and `local -n into=$2` as "`into` is another name for the caller's variable whose name is in `$2`", which is how bash passes a dictionary by reference. `< <(...)` feeds the loop from a command, and every name travels between NUL bytes (`-print0`, `-z`, `read -d ''`), the only byte a path can't contain. That's the same reason Rust's `std::ffi::OsStr` exists: a file name isn't text until you check. The `\037` is the old ASCII unit separator, and it isn't decoration. Our first try split fields on tabs, and `read` treats a tab as whitespace, collapsing the empty link target of every regular file and shifting the name into the wrong field. Nine tests in `image/tests/test_etc_sync.py` run the real script against temporary directories, and they caught it before any machine did. A full `/etc` of 1,439 files now syncs in 0.2 s, and the emulated boot reaches it at 10 s.
 
+## Becoming a node
+
+A freshly installed appliance knows nothing. It has bun, an empty data partition and a network card. Before bun can start, the machine needs a `node.toml`, a certificate signed by the cluster's CA and the cluster's master key. Where do they come from on a box with no login?
+
+From a *seed*: a small tarball with a `seed.toml` in it. Node 1's seed is a *create* seed, and carries the cluster's freshly made keys. Every other machine's is a *join* seed, and carries only a join token: single-use, bound to that machine's node name, and good for a week at most. `relish cluster create --bare-metal` makes all of them on the operator's laptop, so the cluster's keys are born there and nowhere else.
+
+### A state machine that can lose power
+
+`bun appliance prepare` turns a seed into a node. It runs at every boot until there's a `node.toml`, and a machine can lose power at any point along the way. So rather than a script that does five things in order, it's a function that looks at what's on disk and says what to do next:
+
+```rust
+pub fn next_step(seed: Option<&Seed>, disk: Disk) -> Step {
+    if disk.node_toml {
+        return Step::Done;
+    }
+    match seed {
+        None => Step::NoSeed,
+        Some(Seed::Legacy { .. }) => Step::InstallLegacy,
+        Some(Seed::V1 { config, .. }) => match (config.role, disk.identity, disk.master_key) {
+            (SeedRole::Create, true, true) => Step::WriteConfig,
+            (SeedRole::Create, _, _) => Step::InstallBootstrap,
+            (SeedRole::Join, false, _) => Step::Enrol,
+            (SeedRole::Join, true, false) => Step::FetchMasterKey,
+            (SeedRole::Join, true, true) => Step::WriteConfig,
+        },
+    }
+}
+```
+
+Matching on a tuple is one of Rust's quiet pleasures. The compiler checks that the arms cover every combination of role and two booleans, so a case nobody thought of is a compile error rather than a machine stuck at boot. `_` matches anything, and `Seed::Legacy { .. }` matches that variant whatever its fields hold. The loop around it does the step, then asks again, until the answer is `Done`. Pull the plug half-way through enrolling and the next boot simply picks up where the disk says it was. And because `next_step` touches nothing, the tests are a table of inputs and the step each should give.
+
+A join seed's token buys a certificate, and the certificate buys the master key: `GET /v1/cluster/master-key` answers only a caller presenting a node certificate the cluster signed and hasn't retired. The token never sees the key.
+
+### Claiming over the network
+
+Seeds on a USB stick work, but you have to walk the stick round. So a machine that boots with no seed becomes *unclaimed* instead. It makes a self-signed key, shows a short fingerprint of it on its monitor, announces itself over mDNS as `_reliaburger-unclaimed._tcp`, and serves a tiny API on port 9119: `GET /v1/claim` says what it is, and `POST /v1/claim` with a seed claims it, once. From there it carries on exactly as if the seed had come on a stick.
+
+The interesting part is trust. Anyone on the LAN can answer mDNS, and node 1's seed carries the cluster's keys. A certificate authority can't help, because the machine made its key thirty seconds ago and nobody has signed it. What we can do is what SSH does the first time you connect: show the key's fingerprint and ask a human to compare it with the machine's console. relish fetches the machine's details, prints `claim key 3f9a-12bc-77de-0a41`, and asks whether the monitor shows the same. If it does, relish posts the seed over a connection that accepts that one certificate and nothing else.
+
+Doing that in Rust means writing our own rustls certificate verifier. rustls describes one as a trait, `ServerCertVerifier`, and calls its methods during the handshake:
+
+```rust
+impl ServerCertVerifier for ClaimKeyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        /* ... */
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fingerprint = certificate_fingerprint(end_entity);
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = Some(fingerprint.clone());
+        }
+        match &self.expected {
+            Some(expected) if *expected != fingerprint => Err(rustls::Error::General(format!(
+                "the machine's claim key is {fingerprint}, not {expected}"
+            ))),
+            _ => Ok(ServerCertVerified::assertion()),
+        }
+    }
+    // ...the signature checks delegate to rustls's own.
+}
+```
+
+The `'_` in `CertificateDer<'_>` is an elided lifetime: the certificate borrows bytes from the handshake, and `'_` says "some lifetime the compiler can work out", without our naming it. The verifier ignores the server name and the CA chain completely. The SHA-256 of the certificate is the whole identity. With `expected` unset, on the first look, it accepts anything but records what it saw in `seen`, an `Arc<Mutex<Option<String>>>` that relish reads once the request is done. That's a `std::sync::Mutex`, not tokio's, which [CLAUDE.md](https://github.com/reliaburger/reliaburger/blob/main/CLAUDE.md) normally frowns on. Here it's right: rustls calls the verifier synchronously, and the lock is held only long enough to store one string. Nothing awaits while holding it.
+
+Notice what the verifier doesn't skip. The certificate must still match the key that signed the handshake, so a machine that merely *copies* another's certificate can't finish connecting. The test for all this runs the real claim server on loopback: a post pinned to the wrong fingerprint never connects and the seed never lands, then the right one claims the machine.
+
+### A window in the firewall
+
+One more problem. Each node's perimeter firewall lets cluster ports through only from known nodes, the operator, and the bootstrap peers in `node.toml`. A machine claimed into a running cluster is none of those yet, so its enrolment request is dropped before it can show its token. Editing every node's `node.toml` for each new machine defeats the point of claiming.
+
+So `relish machines claim` first asks each node to open a *join window*: `POST /v1/perimeter/admit` with an address and up to 60 minutes. The agent keeps the windows in a map from address to closing time, and the firewall loop, which already rebuilt the ruleset whenever gossip membership changed, now also rebuilds it when the set of open windows changes, adding them to the bootstrap peers. When the window closes, the next tick drops it again. By then the machine has joined, and gossip lets it in for good. The window only lets packets in: enrolment still needs the token, and the cluster ports still need certificates. A stick seed gets no window, because it can sit in a drawer for a week.
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
@@ -496,7 +569,7 @@ for n in 1 2 3 4 5; do ./rbnode.sh $n install fresh & done; wait
 
 Five aarch64 nodes, blank 10 GB disks, 2 GiB each. Each took its address from the router and its boot script from the proxy, and all five were installed in 42 s. No installer used more than 32 MiB of anonymous memory, and `MemAvailable` stayed above 1359 MiB.
 
-Forming the cluster needed configuration, and the appliance has no login. The spike passes it as a systemd credential: a small blob that the firmware hands to PID 1, here through QEMU's `-smbios type=11`. `reliaburger-seed.service` picks it up with `ImportCredential=reliaburger.seed` and unpacks a tarball of `node.toml`, the master key and the node's identity into `/etc/reliaburger`, once. On real machines, `apply-seed` looks for a USB stick labelled `RBSEED` instead. Node 1 was healthy 7.7 s into its seeded boot, the four joiners (enrolled with `relish join` from the server VM) at 17 to 23 s, and all five became council voters.
+Forming the cluster needed configuration, and the appliance has no login. The spike passes it as a systemd credential: a small blob that the firmware hands to PID 1, here through QEMU's `-smbios type=11`. `reliaburger-seed.service` picks it up with `ImportCredential=reliaburger.seed` and unpacks a tarball of `node.toml`, the master key and the node's identity into `/etc/reliaburger`, once. On real machines, a script called `apply-seed` looked for a USB stick labelled `RBSEED` instead (bun does this now, as [Becoming a node](#becoming-a-node) describes). Node 1 was healthy 7.7 s into its seeded boot, the four joiners (enrolled with `relish join` from the server VM) at 17 to 23 s, and all five became council voters.
 
 Then the tour, the manual's five-minute walk through Reliaburger (`relish manual tour`): apply podinfo, ingress on two nodes, `relish path` through the eBPF service map, a 300 ms netem delay that `path` duly measured at 300 ms, `fault kill` and the restart, and a node "powered off" by killing its QEMU (four of four left alive, council healthy, replicas rescheduled). Power it back on and it rejoined: five of five, and `relish wtf` showed 12 OK and no warnings. Only `relish dashboard` was skipped, because it opens a browser and `relish` was running headless on the server VM.
 
@@ -568,7 +641,6 @@ The spike's interim record is a pass for everything that can be proven without h
 
 - **S5, ten Dell Wyse 3040s.** BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds.
 - **`relish netboot` in Rust.** A ProxyDHCP on UDP 67 and 4011 that reads the client's architecture from option 93, TFTP for iPXE, and HTTP for the rest. It should remember installed machines by MAC and SMBIOS UUID, and serve them a `boot.ipxe` that just says `exit`.
-- **Claims.** Seeds over SMBIOS and USB sticks were a spike shortcut. The product plan is a claim over the LAN: the machine boots `unclaimed`, and an operator with the admin token adopts it. Netboot never serves secrets.
 - **Smaller things with known answers:** a shorter health timeout on counted boots, to bring the fallback well under 16 minutes; dropping the lab's credential-gated SSH once bun stages OS updates itself; signing OS images with the release key; and a way for the installer to find its server under Secure Boot, which drops the command line iPXE passes.
 
 The shape is clear, though. The operating system is now one more artefact that Reliaburger builds, signs, rolls out and rolls back, like bun. It just happens to be the one bun stands on.

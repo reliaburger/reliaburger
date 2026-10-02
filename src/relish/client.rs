@@ -2244,6 +2244,29 @@ impl BunClient {
         Ok(json["revoked"].as_u64().unwrap_or(0))
     }
 
+    /// Open a join window (G2) on this node: let `address` through its
+    /// perimeter firewall for `minutes` (at most 60).
+    pub async fn perimeter_admit(
+        &self,
+        address: std::net::IpAddr,
+        minutes: u64,
+    ) -> Result<(), RelishError> {
+        let url = format!("{}/v1/perimeter/admit", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .json(&serde_json::json!({ "address": address, "minutes": minutes }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// Create a single-use node join token. The server commits only its hash
     /// to Raft and returns the plaintext once.
     pub async fn join_token_create(

@@ -192,17 +192,75 @@ monitor shows its name, address and whether bun is running.
 A machine only looks for a seed until it has one, and waits up to ten
 seconds for the stick. So a stick left in later changes nothing.
 
+## Or claim them over the network
+
+You don't need the stick. A machine that boots with no seed becomes
+*unclaimed*: it makes a key, shows a short fingerprint of it on its monitor,
+and announces itself on the LAN until someone sends it a seed:
+
+```
+  Address    192.168.1.51
+  MAC        d8:9e:f3:12:34:56
+  Claim key  3f9a-12bc-77de-0a41
+```
+
+From your laptop, on the same LAN:
+
+```sh
+relish machines
+```
+
+```
+ADDRESS           MAC               ARCH     CLAIM KEY
+192.168.1.51      d8:9e:f3:12:34:56 x86_64   3f9a-12bc-77de-0a41
+192.168.1.52      d8:9e:f3:12:34:57 x86_64   77c0-9e1d-4b2a-e816
+```
+
+Create the cluster from them, node 1 first. relish takes the same options as
+`relish cluster create`, and the machines by MAC or by address:
+
+```sh
+relish machines claim ~/home-cluster --create --name home \
+  --operator 192.168.1.10 --network 192.168.1.0/24 \
+  d8:9e:f3:12:34:56 d8:9e:f3:12:34:57
+```
+
+For each machine, relish shows the claim key it got and asks whether the
+machine's monitor shows the same. Check: anything on your LAN can announce
+itself, and this is what stops node 1's seed, which carries the cluster's
+keys, going to the wrong machine. relish then sends each seed over a
+connection pinned to that key, and the machines carry on as if the seeds had
+come on a stick. If you trust everything on the network, `--trust-lan` skips
+the questions.
+
+The claim uses each machine's current address as its node address, so
+reserve those addresses for their MACs in your router first. mDNS doesn't
+cross routers; if relish can't see a machine, give its address instead of
+its MAC.
+
 ## Add machines later
+
+Claim them, without `--create`:
+
+```sh
+relish machines claim ~/home-cluster d8:9e:f3:12:34:59
+```
+
+The new machine becomes `home-4`, with a join token the cluster mints for
+it. relish also asks every node to let the new machine's address through its
+firewall for 15 minutes, so it can enrol even outside the `--network` you
+created the cluster with. Once it has joined, the cluster knows it.
+
+Or, with the stick:
 
 ```sh
 relish image seed ~/home-cluster d8:9e:f3:12:34:59@192.168.1.54
 cp -R ~/home-cluster/stick/seeds /Volumes/RBSEED/
 ```
 
-The new machine becomes `home-4`, with a join token the cluster mints for
-it. If its address is outside the `--network` you created the cluster with,
-the existing nodes' firewalls drop it until you add it to their `[security]
-bootstrap_peers`.
+A stick seed can sit in a drawer for up to a week, so nothing opens a
+firewall for it: if its address is outside `--network`, the existing nodes
+drop it until you add it to their `[security] bootstrap_peers`.
 
 ## Take the tour
 
@@ -264,9 +322,6 @@ from the new image; reinstall them to start clean.
 
 - **No `relish netboot` yet.** Serving from your laptop (macOS included) is
   Phase 2b.
-- **No claiming machines over the LAN.** Seeds on a stick stand in for it.
-  With claims, a new machine announces itself and `relish machines claim`
-  enrols it.
 - **No OS updates run by bun.** Staging by hand over SSH stands in for them.
 - **Secure Boot** has to be off.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and

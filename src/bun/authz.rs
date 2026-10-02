@@ -301,6 +301,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
     gated(Get, "/v1/join-token/list", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/revoke", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/perimeter/admit", Admin, Cluster(ADMIN)),
     route(Get, "/v1/secret/public-key", AnyToken),
     gated(Post, "/v1/secret/rotate", Admin, Cluster(SECRET_WRITE)),
 ];

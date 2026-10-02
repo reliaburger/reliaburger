@@ -84,6 +84,51 @@ pub enum FirewallError {
 /// The set of cluster node IPs (maintained from gossip membership).
 pub type ClusterNodes = BTreeSet<IpAddr>;
 
+/// What a ruleset is generated from besides the static config. The agent
+/// re-applies the firewall whenever these change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerimeterInputs {
+    pub nodes: ClusterNodes,
+    /// Addresses in an open join window, let in as bootstrap peers are.
+    pub admitted: BTreeSet<IpAddr>,
+}
+
+impl PerimeterInputs {
+    /// The config with the admitted addresses added to its bootstrap peers.
+    pub fn config(&self, config: &PerimeterConfig) -> PerimeterConfig {
+        let mut config = config.clone();
+        config
+            .bootstrap_peers
+            .extend(self.admitted.iter().map(IpAddr::to_string));
+        config
+    }
+}
+
+/// Join windows (G2): addresses let through the perimeter for a few
+/// minutes, so a machine being claimed can enrol before the cluster knows
+/// it. The operator opens one with `POST /v1/perimeter/admit`; it closes by
+/// itself, and once the machine has joined, gossip lets it in for good.
+#[derive(Debug, Clone, Default)]
+pub struct JoinWindows(std::collections::BTreeMap<IpAddr, std::time::Instant>);
+
+impl JoinWindows {
+    /// The longest a window stays open.
+    pub const MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+    /// Admit `address` until `until`, or longer if it's already admitted
+    /// for longer.
+    pub fn open(&mut self, address: IpAddr, until: std::time::Instant) {
+        let entry = self.0.entry(address).or_insert(until);
+        *entry = (*entry).max(until);
+    }
+
+    /// The addresses still admitted at `now`, forgetting the rest.
+    pub fn active(&mut self, now: std::time::Instant) -> BTreeSet<IpAddr> {
+        self.0.retain(|_, until| *until > now);
+        self.0.keys().copied().collect()
+    }
+}
+
 /// How long a single `nft` invocation may take before we give up.
 #[cfg(target_os = "linux")]
 const NFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -432,6 +477,34 @@ mod tests {
                 "an established inbound connection must still obey current peer policy"
             );
         }
+    }
+
+    #[test]
+    fn a_join_window_admits_its_address_until_it_closes() {
+        let now = std::time::Instant::now();
+        let minute = std::time::Duration::from_secs(60);
+        let address: IpAddr = "192.168.1.60".parse().unwrap();
+        let mut windows = JoinWindows::default();
+        windows.open(address, now + 10 * minute);
+        windows.open(address, now + minute);
+        assert_eq!(
+            windows.active(now + 5 * minute),
+            BTreeSet::from([address]),
+            "the longer window wins"
+        );
+        assert!(windows.active(now + 10 * minute).is_empty());
+
+        let inputs = PerimeterInputs {
+            nodes: ClusterNodes::new(),
+            admitted: BTreeSet::from([address]),
+        };
+        let config = inputs.config(&PerimeterConfig::default());
+        assert_eq!(config.bootstrap_peers, ["192.168.1.60"]);
+        assert!(
+            generate_ruleset(&config, &inputs.nodes)
+                .unwrap()
+                .contains("192.168.1.60")
+        );
     }
 
     #[test]
