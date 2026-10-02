@@ -66,6 +66,14 @@ async fn wait_file(path: &Path) {
 
 fn assert_absent(root: &Path, id: &InstanceId) {
     assert!(!root.join("state").join(&id.0).exists());
+    // The spec carries decrypted env; it must not outlive the instance.
+    assert!(
+        !root
+            .join("bundles")
+            .join(&id.0)
+            .join("config.json")
+            .exists()
+    );
     assert!(!reliaburger::grill::netns::namespace_path(id).exists());
     assert!(
         !Path::new("/sys/class/net")
