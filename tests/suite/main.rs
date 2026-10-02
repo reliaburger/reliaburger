@@ -68,5 +68,6 @@ mod stop_confirmation;
 mod tls_connection_lifetime;
 mod uninstall;
 mod website;
+mod worker_desired_state;
 mod workload_trust_domain;
 mod wtf_watch;
