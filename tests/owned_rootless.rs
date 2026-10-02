@@ -318,7 +318,9 @@ async fn rootless_helper_that_keeps_dying_is_reported_then_recovers() {
 /// instance: here, each one retrying a network helper that keeps dying,
 /// with backoff (#358). Nothing they do changes the launcher, so its pid
 /// answers at once instead of queueing behind them past the status
-/// deadline. A fresh runtime stands in for the Bun that just exec'd.
+/// deadline, and so do the exit code and the liveness check status reads
+/// beside it (#456). A fresh runtime stands in for the Bun that just
+/// exec'd.
 #[tokio::test]
 #[ignore = "requires unprivileged Linux user, rootless runc, slirp4netns and static busybox; run with make test-rootless-runc"]
 async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
@@ -349,6 +351,22 @@ async fn rootless_pid_answers_while_state_reads_hold_the_instance() {
     assert!(
         asked.elapsed() < Duration::from_millis(250),
         "the pid waited {:?} behind state reads",
+        asked.elapsed()
+    );
+    // Status asks for the exit code and whether the instance has exited
+    // beside the pid, and a live launcher answers both too (#456).
+    let asked = std::time::Instant::now();
+    assert_eq!(runtime.exit_code(&id).await.unwrap(), None);
+    assert!(
+        asked.elapsed() < Duration::from_millis(250),
+        "the exit code waited {:?} behind state reads",
+        asked.elapsed()
+    );
+    let asked = std::time::Instant::now();
+    assert!(!runtime.has_exited(&id).await.unwrap());
+    assert!(
+        asked.elapsed() < Duration::from_millis(250),
+        "the liveness check waited {:?} behind state reads",
         asked.elapsed()
     );
     for read in busy {
