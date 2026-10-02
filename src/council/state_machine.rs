@@ -340,6 +340,18 @@ impl StateMachineInner {
                         reason: "placement targets a retired node identity".into(),
                     });
                 }
+                // An instance is named after its ordinal, so two placements
+                // sharing one would give two replicas the same id (#398).
+                let mut ordinals = std::collections::HashSet::new();
+                if !decision
+                    .placements
+                    .iter()
+                    .all(|placement| ordinals.insert(placement.ordinal))
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("two placements of {} share an ordinal", decision.app_id),
+                    });
+                }
 
                 if decision.app_id.namespace.starts_with("rbtest-") {
                     let resource = crate::testkit::lease::LeasedResource::App {
@@ -383,12 +395,15 @@ impl StateMachineInner {
                 }
                 // A stop commits an empty decision; where the app ran must
                 // outlive it, because that's where its managed volumes are.
+                // Recorded in ordinal order, so a returning app gets each
+                // home's ordinal back.
                 if !decision.placements.is_empty() {
+                    let mut placed: Vec<_> = decision.placements.iter().collect();
+                    placed.sort_by_key(|placement| placement.ordinal);
                     self.state.last_placed_nodes.insert(
                         decision.app_id.clone(),
-                        decision
-                            .placements
-                            .iter()
+                        placed
+                            .into_iter()
                             .map(|placement| placement.node_id.clone())
                             .collect(),
                     );
@@ -2520,9 +2535,11 @@ mod tests {
                     app_id: app_id.clone(),
                     placements: nodes
                         .iter()
-                        .map(|node| Placement {
+                        .zip(0..)
+                        .map(|(node, ordinal)| Placement {
                             node_id: NodeId::new(*node),
                             resources: Resources::new(100, 0, 0),
+                            ordinal,
                         })
                         .collect(),
                 }),
@@ -2573,6 +2590,50 @@ mod tests {
                 .await
                 .last_placed_nodes
                 .contains_key(&app_id)
+        );
+    }
+
+    /// Two replicas named `web-1` on different nodes is the bug #398 fixed;
+    /// the log refuses a decision that would bring it back.
+    #[tokio::test]
+    async fn a_decision_with_a_shared_ordinal_is_refused() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let placement = |node: &str, ordinal| Placement {
+            node_id: NodeId::new(node),
+            resources: Resources::new(100, 0, 0),
+            ordinal,
+        };
+        let decision = |index, placements| {
+            normal_entry(
+                1,
+                index,
+                RaftRequest::SchedulingDecision(SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements,
+                }),
+            )
+        };
+        let refused = sm
+            .apply(vec![decision(
+                1,
+                vec![placement("node-1", 1), placement("node-2", 1)],
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+        assert!(!sm.desired_state().await.scheduling.contains_key(&app_id));
+
+        // Listed out of ordinal order, the nodes are still remembered in it.
+        sm.apply(vec![decision(
+            2,
+            vec![placement("node-2", 1), placement("node-1", 0)],
+        )])
+        .await
+        .unwrap();
+        assert_eq!(
+            sm.desired_state().await.last_placed_nodes[&app_id],
+            [NodeId::new("node-1"), NodeId::new("node-2")]
         );
     }
 
@@ -3210,10 +3271,12 @@ mod tests {
                 Placement {
                     node_id: NodeId::new("node-1"),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 0,
                 },
                 Placement {
                     node_id: NodeId::new("node-2"),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 1,
                 },
             ],
         };
@@ -6455,6 +6518,7 @@ mod tests {
                 placements: vec![Placement {
                     node_id: NodeId::new(node),
                     resources: Resources::new(1, 1, 0),
+                    ordinal: 0,
                 }],
             })
         };
@@ -6672,9 +6736,11 @@ mod tests {
                     app_id: app_id.clone(),
                     placements: ["retired-worker", "surviving-worker"]
                         .into_iter()
-                        .map(|node| Placement {
+                        .zip(0..)
+                        .map(|(node, ordinal)| Placement {
                             node_id: NodeId::new(node),
                             resources: Resources::new(1, 1, 0),
+                            ordinal,
                         })
                         .collect(),
                 }),
@@ -6738,6 +6804,7 @@ mod tests {
                 placements: vec![Placement {
                     node_id: NodeId::new(node),
                     resources: Resources::new(1, 1, 0),
+                    ordinal: 0,
                 }],
             })
         };
@@ -6770,6 +6837,7 @@ mod tests {
                 placements: vec![Placement {
                     node_id: NodeId::new(node),
                     resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 0,
                 }],
             })
         };
@@ -7151,6 +7219,7 @@ mod tests {
                     placements: vec![crate::meat::types::Placement {
                         node_id: crate::meat::NodeId::new("east"),
                         resources: crate::meat::types::Resources::new(600, 0, 0),
+                        ordinal: 0,
                     }],
                 }),
             )])

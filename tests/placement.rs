@@ -1556,16 +1556,40 @@ async fn start_spread_web_cluster(
     [n1, n2, n3]
 }
 
+/// The ordinal of every live `web` instance on `nodes`, by node, read from
+/// its id, lowest first.
+async fn web_ordinals(nodes: &[&Node]) -> Vec<(u32, String)> {
+    let mut ordinals: Vec<(u32, String)> = web_instance_ids(nodes)
+        .await
+        .into_iter()
+        .map(|placed| {
+            let (node, id) = placed.split_once('/').unwrap();
+            let identity = reliaburger::grill::InstanceIdentity::parse(id)
+                .unwrap_or_else(|| panic!("{id} is not a canonical instance id"));
+            (identity.ordinal, node.to_string())
+        })
+        .collect();
+    ordinals.sort();
+    ordinals
+}
+
 /// Z6.7, #346: losing the leader node of three must bring the app back to
 /// three replicas on the survivors without touching either survivor's
 /// replica, spread so neither runs all three, and without churning
 /// generations of replacements or leaving stopped instances behind.
 /// `relish wtf` flags the gap while it lasts.
+///
+/// #398: the three replicas are `web-0`, `web-1` and `web-2`, one per node,
+/// not `web-0` three times; the replacement takes the ordinal the lost node's
+/// replica had, and the survivors keep theirs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
     let shutdown = CancellationToken::new();
     let nodes = start_spread_web_cluster("nl", 19941, &shutdown).await;
+    let spread = web_ordinals(&nodes.iter().collect::<Vec<_>>()).await;
+    let numbers: Vec<u32> = spread.iter().map(|(ordinal, _)| *ordinal).collect();
+    assert_eq!(numbers, [0, 1, 2], "replicas share an id: {spread:?}");
     let entry = &nodes[0];
     // Lose the leader when it isn't the entry node, as the tour's node-3 was;
     // otherwise any other node, so the test never loses its own client.
@@ -1581,6 +1605,11 @@ async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
     for node in &survivors {
         before.insert(node.name.clone(), web_process(node).await.unwrap().0);
     }
+    let lost_ordinal = spread
+        .iter()
+        .find(|(_, node)| *node == doomed.name)
+        .map(|(ordinal, _)| *ordinal)
+        .expect("the doomed node ran a replica");
 
     doomed._wired.shutdown.cancel();
 
@@ -1624,6 +1653,25 @@ async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
         "new replicas kept starting after three ran: {settled:?} then {later:?}"
     );
     assert_eq!(live_web_instances(&survivors).await, 3);
+    // The survivors kept their ordinals and the replacement took the lost one.
+    let healed = web_ordinals(&survivors).await;
+    let kept: Vec<_> = spread
+        .iter()
+        .filter(|(_, node)| *node != doomed.name)
+        .collect();
+    for survivor in &kept {
+        assert!(healed.contains(survivor), "{survivor:?} moved: {healed:?}");
+    }
+    let replacement: Vec<_> = healed.iter().filter(|o| !kept.contains(o)).collect();
+    assert_eq!(
+        replacement.len(),
+        1,
+        "expected one replacement: {spread:?} then {healed:?}"
+    );
+    assert_eq!(
+        replacement[0].0, lost_ordinal,
+        "the replacement didn't take the lost ordinal: {spread:?} then {healed:?}"
+    );
     // Every survivor still runs its own replica, untouched: only the
     // missing replica was placed, beside them (#346).
     for node in &survivors {

@@ -29,10 +29,13 @@ pub struct Compatibility {
 /// `DesiredAppEvidence::blocked`), the cluster-wide views: peers answer
 /// deploy history, events and jobs for themselves on `local=true` and the
 /// WebSocket log stream sends `LogFrame` JSON (F07); and the volume home a
-/// managed-volume app waits for (`DesiredAppEvidence::volume_home_away`, #423).
+/// managed-volume app waits for (`DesiredAppEvidence::volume_home_away`, #423);
+/// and cluster-wide instance ordinals: each placement's `Placement::ordinal`
+/// in council state, the ordinals a placement poll hands a node
+/// (`NodeAssignment::ordinals`) and the instance ids named after them (#398).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 31,
-    state: 48,
+    protocol: 32,
+    state: 49,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

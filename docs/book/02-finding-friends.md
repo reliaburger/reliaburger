@@ -2524,6 +2524,39 @@ match self.generation {
 
 What about records written with the old, namespace-less ids? A restarted bun re-adopts still-live processes from their adoption records (Chapter 14 covers adoption in full), so this could have been a migration problem. It isn't, because nothing has shipped: no node in the wild carries an `api-0` record. `parse` reads only the canonical form, and adoption refuses any record whose id doesn't match the one rebuilt from its own `namespace`, `app_name` and `replica_index` fields. A round-trip test pins the canonical form so a careless edit can't quietly break it.
 
+### Three replicas, all called frontend-0
+
+The namespace fix made ids unique on a node. It didn't make them unique in the cluster. A user running the tour sent us their `relish status`: three frontend replicas, one per node, and every one of them `default__frontend-0`. Each node agent got its share of the app as "run one replica" and numbered its replicas from 0, the way a single node always had. The names only meant something next to a node name, which is a poor property for a name you grep logs for.
+
+The fix moves the numbering to the one place that sees every replica: the leader. A `Placement` in council state now carries the replica's ordinal next to its node and resources, and the leader hands each node the ordinals it should run instead of a count. The interesting part is keeping those numbers stable, because a name that changes every time the scheduler thinks is worse than a name that repeats. So every scheduling pass ends with one small function, `number_placements`, and three rules: a placement the pass kept keeps its ordinal; a new placement on a node that held one before takes that one back (that's for daemon sets, which are re-placed whole when a node joins); anything else takes the lowest free ordinal. After a node loss, "lowest free" is exactly the ordinal the lost replica had, so the replacement inherits its name. On a scale-up it's the next ones up. A scale-down sorts the surviving placements by ordinal before truncating, so it retires the highest.
+
+The free-ordinal search uses a Rust idiom worth a look:
+
+```rust
+let mut free = (0u32..).filter(|ordinal| !taken.contains(ordinal));
+for mut placement in unnumbered {
+    placement.ordinal = free.next().unwrap_or(u32::MAX);
+    placements.push(placement);
+}
+```
+
+`0u32..` is a range with no end: every `u32` from 0 upwards. In Python that would be `itertools.count()`, and in Go you'd write a `for i := 0; ; i++` loop. It doesn't allocate anything, because Rust iterators are lazy: `filter` wraps the range in another iterator, and nothing runs until `next()` asks for a value. Each call walks forward just far enough to find the next ordinal not in `taken`, and the iterator remembers where it stopped, so handing out three ordinals scans the range once, not three times. The `u32` suffix on `0u32` tells the compiler the range's type; without it, the integer would default to `i32` and wouldn't compare with the `u32` ordinals in `taken`. `next()` returns an `Option`, which is `None` only when an iterator runs dry, and this one can't (there are far fewer placements than `u32` values). We still don't `unwrap()` in library code, so `unwrap_or` names a fallback rather than a panic.
+
+The council guards the result. A `SchedulingDecision` whose placements share an ordinal is refused before it reaches the log:
+
+```rust
+let mut ordinals = std::collections::HashSet::new();
+if !decision.placements.iter().all(|placement| ordinals.insert(placement.ordinal)) {
+    // refuse
+}
+```
+
+`HashSet::insert` returns `true` if the value was new and `false` if it was already there, so `all` doubles as a duplicate check, and stops at the first repeat. It's the same trick as Go's `if _, seen := m[k]; seen`, folded into one expression.
+
+The node side needed the ordinals to arrive with the spec the agent deploys, and to survive a restart, because adoption compares the spec each instance was launched from against what the leader asks for now. The cheapest carrier was the spec itself: `AppSpec` grew an `ordinals: Option<Vec<u32>>` field that only the placement reconciler fills in. `None` means a standalone node, which numbers from 0 as before. Config validation refuses the field, so nobody can pick their own ordinals in a TOML file. We considered a separate field on the agent's deploy command, which keeps the user-facing type clean, but every place that persists or compares a deployed spec (adoption records, the in-place scale-up check, the reconciler's fingerprint) would then have needed to learn about it separately. The agent creates exactly the assigned ordinals, starts only the new ones when its share grows, and a rolling deploy starts `frontend-g1-2` to replace `frontend-2`, so the ordinal survives every generation.
+
+This changed what's in the Raft log and what a placement poll returns, so it bumped both compatibility versions. Before 1.0 that's the whole migration story: an old cluster and a new binary refuse each other, and you start the cluster fresh.
+
 ## What we built
 
 Take a step back and look at what happened in this chapter. We started with a single-node container agent and turned it into a distributed system.

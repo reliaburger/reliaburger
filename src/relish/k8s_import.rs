@@ -1082,6 +1082,7 @@ fn empty_app_spec() -> AppSpec {
         exec: None,
         script: None,
         replicas: Replicas::default(),
+        ordinals: None,
         port: None,
         health: None,
         memory: None,

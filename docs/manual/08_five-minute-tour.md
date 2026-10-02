@@ -37,7 +37,8 @@ relish status
 ```
 
 Give it half a minute for the images to arrive. Three frontend replicas, one on
-each node. The scheduler spread them, not you.
+each node, named `default__frontend-0`, `-1` and `-2`. The scheduler spread
+them and numbered them, not you.
 
 Now open <http://podinfo.localhost:18080> in a browser. The request comes in
 through the built-in ingress; reload and the hostname changes as each replica
@@ -155,8 +156,8 @@ relish inspect frontend
 
 Now lose a whole machine. About a minute later there are three running
 frontends again, spread over the two nodes that are left: each keeps the one it
-had, and one of them starts a replacement for node-3's. Nobody had to notice
-first.
+had, and one of them starts a replacement for node-3's, under the name node-3's
+had. Nobody had to notice first.
 `relish inspect` asks every node for its instances, lists each one, running or
 stopped, with the node it's on, and names the node that didn't answer.
 

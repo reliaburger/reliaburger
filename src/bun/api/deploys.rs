@@ -270,7 +270,7 @@ pub(super) async fn rollback_handler(
         successful.get(1).and_then(|e| e.spec.clone()).map(|s| *s)
     };
 
-    let Some(spec) = target_spec else {
+    let Some(mut spec) = target_spec else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -280,6 +280,10 @@ pub(super) async fn rollback_handler(
             .into_response();
     };
 
+    // This node recorded its own share, under the ordinals the leader gave
+    // it. Those belong to the placement, not the spec, and an apply refuses
+    // them; the leader numbers the replicas again (#398).
+    spec.ordinals = None;
     // Re-apply the previous spec through the standard deploy path.
     let mut config = Config::default();
     config.app.insert(app.clone(), spec);

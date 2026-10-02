@@ -160,8 +160,9 @@ pub(crate) fn withdrawal_backlog_warning(
 pub struct NodeAssignment {
     pub name: String,
     pub namespace: String,
-    /// Number of replicas of this app assigned to the node.
-    pub replicas: u32,
+    /// The cluster-wide ordinals of the replicas assigned to the node,
+    /// lowest first. Their count is the node's share of the app.
+    pub ordinals: Vec<u32>,
     pub spec: AppSpec,
 }
 
@@ -794,20 +795,24 @@ fn plan_pass(
         // A fixed-size app keeps the placements that still hold and only
         // places the rest. Losing one node of three must not move the
         // replicas on the other two: they're serving, and replacing them
-        // would restart them for nothing.
+        // would restart them for nothing. A scale-down keeps the lowest
+        // ordinals, so it retires the highest.
+        let previous = desired
+            .scheduling
+            .get(app_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let mut kept: Vec<crate::meat::types::Placement> = match effective_spec.replicas {
-            Replicas::Fixed(_) => desired
-                .scheduling
-                .get(app_id)
-                .map(|placements| {
-                    placements
-                        .iter()
-                        .filter(|p| liveness.keeps(p, spec, cache))
-                        .take(want)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Replicas::Fixed(_) => {
+                let mut holding: Vec<_> = previous
+                    .iter()
+                    .filter(|p| liveness.keeps(p, spec, cache))
+                    .cloned()
+                    .collect();
+                holding.sort_by_key(|p| p.ordinal);
+                holding.truncate(want);
+                holding
+            }
             Replicas::DaemonSet => Vec::new(),
         };
         // A kept replica whose request changed is resized where it runs:
@@ -846,7 +851,7 @@ fn plan_pass(
             if missing == 0 {
                 decisions.push(crate::meat::types::SchedulingDecision {
                     app_id: app_id.clone(),
-                    placements: kept,
+                    placements: number_placements(previous, kept, Vec::new()),
                 });
                 continue;
             }
@@ -874,10 +879,8 @@ fn plan_pass(
         match result {
             Ok(mut decision) => {
                 *cache = scheduler.cluster;
-                if !kept.is_empty() {
-                    let added = std::mem::take(&mut decision.placements);
-                    decision.placements = kept.into_iter().chain(added).collect();
-                }
+                let added = std::mem::take(&mut decision.placements);
+                decision.placements = number_placements(previous, kept, added);
                 decisions.push(decision);
             }
             Err(e) => {
@@ -890,6 +893,45 @@ fn plan_pass(
         decisions,
         quota_blocked,
     }
+}
+
+/// Give an app's placements their cluster-wide ordinals, distinct within the
+/// app (#398), lowest first.
+///
+/// `kept` placements already hold theirs. Each `added` one takes the ordinal
+/// its node held in `previous` while that's still free, which keeps a daemon
+/// set's replica on a node numbered as it was when the set is re-placed
+/// whole. Any other takes the lowest free ordinal: the one a lost replica
+/// gave up, or the next one up on a scale-up.
+fn number_placements(
+    previous: &[crate::meat::types::Placement],
+    kept: Vec<crate::meat::types::Placement>,
+    added: Vec<crate::meat::types::Placement>,
+) -> Vec<crate::meat::types::Placement> {
+    let mut taken: HashSet<u32> = kept.iter().map(|p| p.ordinal).collect();
+    let mut placements = kept;
+    let mut unnumbered = Vec::new();
+    for mut placement in added {
+        let held = previous
+            .iter()
+            .find(|p| p.node_id == placement.node_id && !taken.contains(&p.ordinal));
+        match held {
+            Some(held) => {
+                placement.ordinal = held.ordinal;
+                taken.insert(held.ordinal);
+                placements.push(placement);
+            }
+            None => unnumbered.push(placement),
+        }
+    }
+    let mut free = (0u32..).filter(|ordinal| !taken.contains(ordinal));
+    for mut placement in unnumbered {
+        // `free` is endless: there are fewer placements than u32 ordinals.
+        placement.ordinal = free.next().unwrap_or(u32::MAX);
+        placements.push(placement);
+    }
+    placements.sort_by_key(|p| p.ordinal);
+    placements
 }
 
 /// Record in `cache` exactly the replicas of `app_id` that `kept` places on
@@ -983,7 +1025,9 @@ impl VolumeHome<'_> {
             .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
             .unwrap_or_default();
         let mut homes = Vec::new();
-        for node_id in last_nodes.iter().take(want) {
+        // The leader records an app's nodes in ordinal order, so each home
+        // gets back the ordinal its replica had (#398).
+        for (ordinal, node_id) in (0u32..).zip(last_nodes.iter().take(want)) {
             let wait = |reason| HomeOutcome::Wait {
                 node: node_id.clone(),
                 reason,
@@ -1012,6 +1056,7 @@ impl VolumeHome<'_> {
             homes.push(crate::meat::types::Placement {
                 node_id: node_id.clone(),
                 resources,
+                ordinal,
             });
         }
         // Reserve only once every home is known to fit, so a wait leaves
@@ -2043,8 +2088,10 @@ fn spawn_placement_reconciler_with_io_timeout(
                 }
 
                 let mut spec = assignment.spec.clone();
-                // The local agent runs exactly this node's share.
-                spec.replicas = Replicas::Fixed(assignment.replicas);
+                // The local agent runs exactly this node's share, under the
+                // ordinals the leader gave it.
+                spec.replicas = Replicas::Fixed(assignment.ordinals.len() as u32);
+                spec.ordinals = Some(assignment.ordinals.clone());
                 let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
                 if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
                 {
@@ -2743,7 +2790,7 @@ mod tests {
         NodeAssignment {
             name: name.into(),
             namespace: namespace.into(),
-            replicas: 1,
+            ordinals: vec![0],
             spec: spec_from_toml(toml),
         }
     }
@@ -3213,7 +3260,7 @@ mod tests {
         let assignment = NodeAssignment {
             name: "web".into(),
             namespace: "default".into(),
-            replicas: 1,
+            ordinals: vec![0],
             spec: spec.clone(),
         };
         let mut applied_spec = spec;
@@ -3313,7 +3360,7 @@ mod tests {
             apps: vec![NodeAssignment {
                 name: "web".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
                 ),
@@ -3424,7 +3471,7 @@ mod tests {
             apps: vec![NodeAssignment {
                 name: "web".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
                 ),
@@ -3729,7 +3776,7 @@ mod tests {
             apps: vec![NodeAssignment {
                 name: "broken".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.broken]
 image = "proc-grill:image-ignored"
@@ -3823,7 +3870,7 @@ command = ["false"]
             apps: vec![NodeAssignment {
                 name: "writer".into(),
                 namespace: "default".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.writer]
 image = "busybox:latest"
@@ -3945,7 +3992,7 @@ image = "busybox:latest"
             apps: vec![NodeAssignment {
                 name: "interrupted".into(),
                 namespace: "rbtest-interrupted".into(),
-                replicas: 1,
+                ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.interrupted]
 image = "proc-grill:image-ignored"
@@ -4958,11 +5005,205 @@ image = "busybox:latest"
     fn placed_on(names: &[&str]) -> Vec<crate::meat::types::Placement> {
         names
             .iter()
-            .map(|name| crate::meat::types::Placement {
+            .zip(0..)
+            .map(|(name, ordinal)| crate::meat::types::Placement {
                 node_id: NodeId::new(*name),
                 resources: Resources::new(100, 0, 0),
+                ordinal,
             })
             .collect()
+    }
+
+    // -- cluster-wide ordinals (#398) ----------------------------------------
+
+    /// Placements of `spec`'s size, as `(node, ordinal)` pairs.
+    fn placed_as(spec: &AppSpec, placed: &[(&str, u32)]) -> Vec<crate::meat::types::Placement> {
+        placed
+            .iter()
+            .map(|(name, ordinal)| crate::meat::types::Placement {
+                node_id: NodeId::new(*name),
+                resources: scheduler_resources(spec),
+                ordinal: *ordinal,
+            })
+            .collect()
+    }
+
+    /// Each placement's ordinal, lowest first, with its node.
+    fn ordinals_of(decision: &crate::meat::types::SchedulingDecision) -> Vec<(u32, &str)> {
+        let mut ordinals: Vec<(u32, &str)> = decision
+            .placements
+            .iter()
+            .map(|p| (p.ordinal, p.node_id.0.as_str()))
+            .collect();
+        ordinals.sort_unstable();
+        ordinals
+    }
+
+    fn three_node_cache() -> (ClusterStateCache, HashSet<NodeId>) {
+        let mut cache = ClusterStateCache::new();
+        for name in ["n1", "n2", "n3"] {
+            cache.set_node(sched_node(name, 4000, BTreeMap::new()));
+        }
+        let alive = ["n1", "n2", "n3"].into_iter().map(NodeId::new).collect();
+        (cache, alive)
+    }
+
+    /// The tour showed `frontend-0` on all three nodes: each node counted its
+    /// own replicas from 0. The leader numbers them across the cluster.
+    #[test]
+    fn three_replicas_on_three_nodes_take_distinct_ordinals() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        let (mut cache, alive) = three_node_cache();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        let ordinals: Vec<u32> = ordinals_of(&decisions[0]).iter().map(|o| o.0).collect();
+        assert_eq!(ordinals, [0, 1, 2]);
+        let nodes: HashSet<&str> = nodes_of(&decisions[0]).into_iter().collect();
+        assert_eq!(nodes.len(), 3, "{decisions:?}");
+    }
+
+    #[test]
+    fn a_replacement_takes_the_ordinal_its_lost_replica_held() {
+        let app = AppId::new("frontend", "default");
+        let spec = app_spec(100, 3);
+        let mut desired = DesiredState::default();
+        desired.scheduling.insert(
+            app.clone(),
+            placed_as(&spec, &[("n1", 0), ("n2", 1), ("n3", 2)]),
+        );
+        desired.apps.insert(app.clone(), spec);
+        // n2 is gone: gossip dropped it and the cache has no report of it.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n3")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        let ordinals = ordinals_of(&decisions[0]);
+        assert_eq!(ordinals[0], (0, "n1"), "{ordinals:?}");
+        assert_eq!(ordinals[2], (2, "n3"), "{ordinals:?}");
+        assert_eq!(ordinals[1].0, 1, "{ordinals:?}");
+        assert_ne!(ordinals[1].1, "n2", "{ordinals:?}");
+    }
+
+    #[test]
+    fn a_scale_up_takes_the_lowest_free_ordinals() {
+        let app = AppId::new("frontend", "default");
+        let spec = app_spec(100, 4);
+        let mut desired = DesiredState::default();
+        // Ordinal 1's node was lost and decommissioned earlier.
+        desired
+            .scheduling
+            .insert(app.clone(), placed_as(&spec, &[("n1", 0), ("n3", 2)]));
+        desired.apps.insert(app.clone(), spec);
+        let (mut cache, alive) = three_node_cache();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        let ordinals = ordinals_of(&decisions[0]);
+        let numbers: Vec<u32> = ordinals.iter().map(|o| o.0).collect();
+        assert_eq!(numbers, [0, 1, 2, 3], "{ordinals:?}");
+        assert_eq!(ordinals[0], (0, "n1"));
+        assert_eq!(ordinals[2], (2, "n3"));
+    }
+
+    #[test]
+    fn a_scale_down_retires_the_highest_ordinals() {
+        let app = AppId::new("frontend", "default");
+        let spec = app_spec(100, 2);
+        let mut desired = DesiredState::default();
+        // Listed out of order: the planner goes by ordinal, not by position.
+        desired.scheduling.insert(
+            app.clone(),
+            placed_as(&spec, &[("n3", 2), ("n1", 0), ("n2", 1)]),
+        );
+        desired.apps.insert(app.clone(), spec);
+        let (mut cache, alive) = three_node_cache();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(ordinals_of(&decisions[0]), [(0, "n1"), (1, "n2")]);
+    }
+
+    /// A rolling deploy changes the spec, not the placements; a resize is the
+    /// one spec change the leader re-plans, and it keeps every ordinal where
+    /// it was.
+    #[test]
+    fn a_resized_app_keeps_every_ordinal_on_its_node() {
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.scheduling.insert(
+            app.clone(),
+            placed_as(&app_spec(100, 3), &[("n1", 0), ("n2", 1), ("n3", 2)]),
+        );
+        desired.apps.insert(app.clone(), app_spec(200, 3));
+        let (mut cache, alive) = three_node_cache();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(
+            ordinals_of(&decisions[0]),
+            [(0, "n1"), (1, "n2"), (2, "n3")]
+        );
+        assert!(
+            decisions[0]
+                .placements
+                .iter()
+                .all(|p| p.resources == scheduler_resources(&app_spec(200, 3)))
+        );
+    }
+
+    /// A daemon set is re-planned whole when its eligible nodes change. The
+    /// nodes it already runs on keep their ordinals; a joining node takes the
+    /// lowest free one.
+    #[test]
+    fn a_daemon_set_keeps_each_nodes_ordinal_when_a_node_joins() {
+        let app = AppId::new("agent", "default");
+        let mut spec = app_spec(100, 1);
+        spec.replicas = Replicas::DaemonSet;
+        let mut desired = DesiredState::default();
+        desired
+            .scheduling
+            .insert(app.clone(), placed_as(&spec, &[("n3", 0), ("n1", 1)]));
+        desired.apps.insert(app.clone(), spec);
+        let (mut cache, alive) = three_node_cache();
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(
+            ordinals_of(&decisions[0]),
+            [(0, "n3"), (1, "n1"), (2, "n2")]
+        );
+    }
+
+    /// A volume app returning from a stop gets its old ordinals back on its
+    /// home nodes: the leader records the nodes in ordinal order.
+    #[test]
+    fn a_returning_volume_app_takes_its_ordinals_in_home_order() {
+        let (desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(ordinals_of(&decisions[0]), [(0, "home")]);
     }
 
     fn nodes_of(decision: &crate::meat::types::SchedulingDecision) -> Vec<&str> {
@@ -5149,6 +5390,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("home"),
                 resources: Resources::new(600, 0, 0),
+                ordinal: 0,
             }],
         );
         desired
@@ -5443,7 +5685,12 @@ image = "busybox:latest"
         let decisions =
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
 
-        assert_eq!(nodes_of(&decisions[0]), ["n2", "n3", "n2", "n2"]);
+        // n2 and n3 keep ordinals 2 and 3; both replacements land on n2,
+        // under the ordinals n1's replicas had.
+        assert_eq!(
+            ordinals_of(&decisions[0]),
+            [(0, "n2"), (1, "n2"), (2, "n2"), (3, "n3")]
+        );
     }
 
     /// #346: one of three nodes dies while gossip only suspects another
@@ -5848,6 +6095,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("big"),
                 resources: Resources::new(600, 0, 0),
+                ordinal: 0,
             }],
         );
 
@@ -5884,6 +6132,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("gone"),
                 resources: Resources::new(100, 0, 0),
+                ordinal: 0,
             }],
         );
 
@@ -5911,6 +6160,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("lost-hooks"),
                 resources: Resources::new(100, 0, 0),
+                ordinal: 0,
             }],
         );
 
@@ -5944,6 +6194,7 @@ image = "busybox:latest"
             vec![crate::meat::types::Placement {
                 node_id: NodeId::new("dns-lost"),
                 resources: Resources::new(100, 0, 0),
+                ordinal: 0,
             }],
         );
 
@@ -6677,6 +6928,7 @@ mod audit_placement_revalidation {
             vec![Placement {
                 node_id: NodeId::new("small"),
                 resources: Resources::new(600, 0, 0),
+                ordinal: 0,
             }],
         );
         let mut cache = ClusterStateCache::new();
@@ -6706,6 +6958,7 @@ mod audit_placement_revalidation {
             vec![Placement {
                 node_id: NodeId::new("east"),
                 resources: Resources::default(),
+                ordinal: 0,
             }],
         );
         let mut cache = ClusterStateCache::new();
@@ -6840,6 +7093,7 @@ mod revalidation_in_place {
             vec![Placement {
                 node_id: NodeId::new("home"),
                 resources: Resources::new(600, 0, 0),
+                ordinal: 0,
             }],
         );
         desired

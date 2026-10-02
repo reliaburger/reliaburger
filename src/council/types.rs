@@ -586,6 +586,7 @@ mod tests {
                 placements: vec![Placement {
                     node_id: crate::meat::types::NodeId::new("node-1"),
                     resources: crate::meat::types::Resources::new(500, 256 * 1024 * 1024, 0),
+                    ordinal: 0,
                 }],
             }),
             RaftRequest::ConfigSet {
