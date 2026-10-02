@@ -54,6 +54,7 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         placements: Default::default(),
         service_port: Some(8080),
         blocked: None,
+        volume_home_away: None,
     };
 
     let visible = filter_desired_apps_for_scope(
@@ -5409,11 +5410,69 @@ fn council_app_evidence_carries_the_quota_block() {
     };
     desired.quota_blocked.insert(greedy, reason.clone());
 
-    let evidence = council_app_evidence(&desired, 1);
+    let evidence = council_app_evidence(&desired, None);
     assert_eq!(evidence[0].app, "fine");
     assert_eq!(evidence[0].blocked, None);
     assert_eq!(evidence[1].app, "greedy");
     assert_eq!(evidence[1].blocked, Some(reason));
+}
+
+/// #423: a volume app whose home node is out of the cluster carries that
+/// node, so status, inspect, the dashboard and wtf can say what it waits
+/// for. A decommissioned home, a live one, or a stopped app carries none.
+#[test]
+fn council_app_evidence_names_the_volume_home_an_app_waits_for() {
+    let mut desired = crate::council::types::DesiredState::default();
+    let db = crate::meat::types::AppId::new("db", "prod");
+    let spec: crate::config::app::AppSpec =
+        toml::from_str("image = \"x:1\"\n[[volumes]]\npath = \"/data\"\n").unwrap();
+    desired.apps.insert(db.clone(), spec);
+    desired.scheduling.insert(
+        db.clone(),
+        vec![crate::meat::types::Placement {
+            node_id: crate::meat::NodeId::new("node-2"),
+            resources: crate::meat::Resources::new(100, 0, 0),
+        }],
+    );
+    let live: std::collections::HashSet<String> = ["node-1".to_string()].into();
+
+    let away = |desired: &crate::council::types::DesiredState| {
+        council_app_evidence(desired, Some(&live))[0]
+            .volume_home_away
+            .clone()
+    };
+    assert_eq!(away(&desired), Some("node-2".to_string()));
+    assert_eq!(
+        council_app_evidence(&desired, None)[0].volume_home_away,
+        None
+    );
+
+    let mut back = live.clone();
+    back.insert("node-2".to_string());
+    assert_eq!(
+        council_app_evidence(&desired, Some(&back))[0].volume_home_away,
+        None
+    );
+
+    let mut stopped = desired.clone();
+    stopped.stopped_apps.insert(db.clone());
+    assert_eq!(away(&stopped), None);
+
+    let mut retired = desired.clone();
+    retired.security_state.crl.retired_nodes.insert(
+        "node-2".into(),
+        crate::cluster::retirement::NodeRetirement {
+            node_id: "node-2".into(),
+            retired_by: "operator".into(),
+            reason: "disk died".into(),
+            retired_at_unix_ms: 30,
+            released_placements: Default::default(),
+            released_registry_writers: Default::default(),
+            released_node_fault: None,
+            released_endpoint_consumer: false,
+        },
+    );
+    assert_eq!(away(&retired), None);
 }
 
 #[test]
@@ -5435,6 +5494,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             placements: Default::default(),
             service_port: None,
             blocked: None,
+            volume_home_away: None,
         },
         crate::bun::diagnostics::DesiredAppEvidence {
             app: "pending".into(),
@@ -5444,6 +5504,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             placements: Default::default(),
             service_port: None,
             blocked: None,
+            volume_home_away: None,
         },
     ];
     let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
@@ -5466,6 +5527,13 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
         limit: 1,
     });
     let rows = statuses_to_dashboard_apps(&[running.clone()], &quota_blocked);
+    let pending = rows.iter().find(|row| row.name == "pending").unwrap();
+    assert_eq!(pending.state, "blocked");
+
+    // #423: so does a volume app waiting for the node that holds its data.
+    let mut waiting = desired.clone();
+    waiting[1].volume_home_away = Some("node-2".into());
+    let rows = statuses_to_dashboard_apps(&[running.clone()], &waiting);
     let pending = rows.iter().find(|row| row.name == "pending").unwrap();
     assert_eq!(pending.state, "blocked");
 

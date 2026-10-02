@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use super::WTF_SCHEMA_VERSION;
 use super::model::{
     ApplicationEvidence, BuildObservation, ClusterEvidence, CorrelatedEvent, CouncilObservation,
-    DeployObservation, Evidence, LogObservation, RestartObservation, WtfFinding, WtfInputs, WtfOk,
+    DeployObservation, Evidence, LogObservation, ReplicaObservation, RestartObservation, WtfFinding,
+    WtfInputs, WtfOk,
     WtfReport, WtfSummary, WtfUnknown,
 };
 
@@ -637,6 +638,14 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             });
             continue;
         }
+        // Not a lost replica the scheduler will replace: it holds the app
+        // back on purpose, because anywhere else the volume would be empty.
+        if let Some(home) = &app.volume_home_away {
+            report
+                .critical
+                .push(volume_home_away_finding(app, home, running));
+            continue;
+        }
         let replicas = |count: u32| {
             if count == 1 {
                 "1 replica".to_string()
@@ -693,6 +702,31 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             id: "replicas".to_string(),
             description: "every app runs its desired replicas".to_string(),
         });
+    }
+}
+
+/// #423: a managed-volume app whose home node is out of the cluster waits
+/// for it. That's an outage until someone brings the node back or writes
+/// its data off, so it's critical, and it says which of the two to do.
+fn volume_home_away_finding(app: &ReplicaObservation, home: &str, running: u32) -> WtfFinding {
+    WtfFinding {
+        id: "volume-home-away".to_string(),
+        title: format!(
+            "app {}/{} waits for {home}, which holds its volume ({running} of {} replicas running)",
+            app.app, app.namespace, app.desired_replicas
+        ),
+        details: vec![format!(
+            "{home} is out of the cluster; the scheduler won't start the app on another \
+             node, where its volume would be empty"
+        )],
+        suggestion: format!(
+            "bring {home} back (start bun, or the machine) and the app starts there with its \
+             data; if {home} is gone for good, `relish decommission-node {home} \
+             --workloads-stopped --reason <why>` writes its volume off and lets the app start \
+             on another node with an empty volume"
+        ),
+        correlated_events: Vec::new(),
+        affected_resource: app_resource(&app.app, &app.namespace),
     }
 }
 
@@ -1157,6 +1191,7 @@ mod tests {
                     running: BTreeMap::from([("node-1".to_string(), 1)]),
                     unanswered: Vec::new(),
                     blocked: None,
+                    volume_home_away: None,
                 }]),
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
@@ -1762,6 +1797,7 @@ mod tests {
             running: BTreeMap::from([("node-1".to_string(), 1), ("node-2".to_string(), 1)]),
             unanswered: vec!["node-3".to_string()],
             blocked: None,
+            volume_home_away: None,
         }]);
 
         let report = diagnose(&inputs);
@@ -1789,6 +1825,7 @@ mod tests {
             running: BTreeMap::from([("node-1".to_string(), 1)]),
             unanswered: Vec::new(),
             blocked: None,
+            volume_home_away: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -1814,6 +1851,7 @@ mod tests {
             running: BTreeMap::from([("node-1".to_string(), 1)]),
             unanswered: Vec::new(),
             blocked: None,
+            volume_home_away: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -1841,6 +1879,7 @@ mod tests {
             running: BTreeMap::new(),
             unanswered: Vec::new(),
             blocked: Some(reason.to_string()),
+            volume_home_away: None,
         }]);
 
         let report = diagnose(&inputs);
@@ -1867,6 +1906,66 @@ mod tests {
         assert!(!report.ok.iter().any(|ok| ok.id == "replicas"));
     }
 
+    /// #423: a volume app waiting for its home node is an outage, so it is
+    /// critical, and it names the node and both ways out.
+    #[test]
+    fn a_volume_app_waiting_for_its_home_node_is_critical() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "db".to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-2".to_string(), 1)]),
+            running: BTreeMap::new(),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: Some("node-2".to_string()),
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|finding| finding.id == "volume-home-away")
+            .expect("a volume app waiting for its home is critical");
+        assert_eq!(
+            finding.title,
+            "app db/prod waits for node-2, which holds its volume (0 of 1 replicas running)"
+        );
+        assert_eq!(finding.affected_resource, "app.db/prod");
+        assert!(
+            finding
+                .suggestion
+                .contains("relish decommission-node node-2"),
+            "{}",
+            finding.suggestion
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "under-replicated"),
+            "the volume finding replaces the generic one"
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "replicas"));
+
+        // Once it runs again, there's nothing to report.
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "db".to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-2".to_string(), 1)]),
+            running: BTreeMap::from([("node-2".to_string(), 1)]),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+        }]);
+        let report = diagnose(&inputs);
+        assert!(report.critical.is_empty(), "{:?}", report.critical);
+    }
+
     #[test]
     fn apps_at_or_above_their_desired_replicas_are_ok() {
         let mut inputs = healthy_inputs();
@@ -1879,6 +1978,7 @@ mod tests {
             running: BTreeMap::from([("node-1".to_string(), 2)]),
             unanswered: Vec::new(),
             blocked: None,
+            volume_home_away: None,
         }]);
         let report = diagnose(&inputs);
         assert!(report.warnings.is_empty());

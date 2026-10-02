@@ -129,7 +129,10 @@ migration and no feature gate
   of F07: separate stderr capture, richer log filters, a merged live event
   stream and rollback over merged history
   ([#392](https://github.com/reliaburger/reliaburger/issues/392)). The
-  security work comes before real fleets in 0.3.0.
+  security work comes before real fleets in 0.3.0. Also a data-loss fix:
+  restarting Bun no longer moves a managed-volume app onto an empty volume,
+  and `relish wtf` reports an app waiting for its volume's node
+  ([#423](https://github.com/reliaburger/reliaburger/issues/423)).
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays

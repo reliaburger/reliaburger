@@ -663,6 +663,7 @@ fn collect_replicas(
                 running,
                 unanswered: unanswered.clone(),
                 blocked: desired.blocked.as_ref().map(ToString::to_string),
+                volume_home_away: desired.volume_home_away.clone(),
             }
         })
         .collect();
@@ -1075,6 +1076,7 @@ mod tests {
                 placements: Default::default(),
                 service_port: Some(8080),
                 blocked: None,
+                volume_home_away: None,
             }]),
             Ok(Vec::new()),
             None,

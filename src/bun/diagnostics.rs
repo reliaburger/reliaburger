@@ -191,6 +191,11 @@ pub struct DesiredAppEvidence {
     /// room. `None` when nothing blocks it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<crate::meat::quota::QuotaError>,
+    /// The node holding this app's managed volume when that node is out of
+    /// the cluster. The scheduler keeps the app there and waits rather than
+    /// start it elsewhere on an empty volume (#423). `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_home_away: Option<String>,
 }
 
 /// Current diagnostics wire schema.

@@ -1,6 +1,8 @@
 //! Node information routes: health, readiness, version, capabilities,
 //! diagnostics, desired apps and the path probe.
 
+use std::collections::HashSet;
+
 use super::*;
 
 /// Liveness check.
@@ -315,12 +317,16 @@ pub(super) async fn desired_apps_handler(
     }
 }
 
-/// Desired replicas, placements and any quota block for every app the
-/// council knows, sorted by namespace and name.
+/// Desired replicas, placements, any quota block and any volume home it
+/// waits for, for every app the council knows, sorted by namespace and name.
+///
+/// `live` names the cluster's live members; `None` when this node can't
+/// tell, and then no app is reported as waiting for its volume home.
 pub(super) fn council_app_evidence(
     desired: &crate::council::types::DesiredState,
-    live_nodes: usize,
+    live: Option<&HashSet<String>>,
 ) -> Vec<crate::bun::diagnostics::DesiredAppEvidence> {
+    let live_nodes = live.map_or(1, |live| live.len().max(1));
     let mut apps = desired
         .apps
         .iter()
@@ -347,6 +353,10 @@ pub(super) fn council_app_evidence(
                 ),
                 service_port: spec.port,
                 blocked: desired.quota_blocked.get(app_id).cloned(),
+                volume_home_away: live.and_then(|live| {
+                    crate::cluster::orchestrate::volume_home_away(desired, app_id, spec, live)
+                        .map(|node| node.0)
+                }),
             },
         )
         .collect::<Vec<_>>();
@@ -395,11 +405,24 @@ pub(super) async fn gather_desired_apps(
             };
         }
         let desired = council.desired_state().await;
-        let live_nodes = match &state.membership {
-            Some(membership) => membership.read().await.len().max(1),
-            None => 1,
+        let live = match &state.membership {
+            Some(membership) => {
+                let mut live: HashSet<String> = membership
+                    .read()
+                    .await
+                    .iter()
+                    .map(|member| member.node_id.0.clone())
+                    .collect();
+                // The node answering is live, whether or not its own table
+                // lists it.
+                if !state.static_capabilities.node_id.is_empty() {
+                    live.insert(state.static_capabilities.node_id.clone());
+                }
+                Some(live)
+            }
+            None => None,
         };
-        council_app_evidence(&desired, live_nodes)
+        council_app_evidence(&desired, live.as_ref())
     } else {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (response, receiver) = oneshot::channel();

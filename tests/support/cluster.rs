@@ -269,6 +269,10 @@ pub struct WiredNodeOptions {
     pub fault_injection: bool,
     /// Node labels, for placement constraints.
     pub labels: BTreeMap<String, String>,
+    /// Keep the node's data directory from an earlier run, so the node comes
+    /// back the way `systemctl restart bun` brings it back: same Raft log,
+    /// same volumes. `false` starts from an empty directory.
+    pub keep_data_dir: bool,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -316,13 +320,16 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         operator_token,
         fault_injection,
         labels,
+        keep_data_dir,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
     let api_port = gossip_port + 3;
 
     let data_dir = std::env::temp_dir().join(format!("{data_dir_prefix}-{name}-{gossip_port}"));
-    let _ = std::fs::remove_dir_all(&data_dir);
+    if !keep_data_dir {
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
     let reconciler_state_dir = data_dir.clone();
 
     let mayo = metrics_rollup.map(|_| {
