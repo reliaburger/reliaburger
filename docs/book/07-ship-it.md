@@ -1282,6 +1282,32 @@ The first test builds the scheduler's view the way the leader does, from an `Agg
 
 The report worker's stalls are their own problem, and they're still open. Even with this fix, they make the leader move apps *without* volumes off a node that is running them fine.
 
+## A restart is not a loss
+
+"Gossip no longer has it alive" turned out to be the wrong line too. An outside tester ran three-node clusters on EC2, ran `systemctl restart bun` on the node holding a volume app, and watched the app turn up on another node within ten seconds, on an empty volume. The data was still on the first node, and `relish wtf` said everything was fine. They got the same result six times out of six.
+
+The reason is a courtesy. On SIGTERM, Bun cancels its shutdown token, and the gossip loop's last act is `leave()`: it tells its peers it's leaving, so they don't spend five seconds suspecting it first. Peers mark it Left at once. The leader's next pass saw a node that was neither Alive nor Suspect, so `placement_holds` dropped the placement, `VolumeHome::reserve` skipped the home with `continue`, and the scheduler put the app wherever scored best. A reboot or a SIGKILL takes the slow route to the same place: Suspect for five seconds, then Dead.
+
+Gossip can't tell "restarting" from "gone for good", and it shouldn't have to. A local volume is lost only when someone decides the node isn't coming back. So that decision now belongs to the operator. A managed-volume placement holds whatever gossip says, until the node is decommissioned:
+
+```rust
+fn keeps_volume_home(
+    placement: &crate::meat::types::Placement,
+    spec: &AppSpec,
+    retired: &HashSet<NodeId>,
+) -> bool {
+    has_managed_volume(spec) && !retired.contains(&placement.node_id)
+}
+```
+
+`retired` is built once per pass from the council's decommission records, with `.keys().map(NodeId::new).collect()`. `collect` builds whatever collection the left-hand side asks for, here a `HashSet<NodeId>`, so the same iterator chain could fill a `Vec` or a `BTreeSet` instead. A stopped app coming back gets the same treatment: `reserve` now answers `Wait { reason: HomeWait::Away }` for a home that is out of the cluster, and lets go only of one that was decommissioned.
+
+Keeping the app back is only half of it. An app that silently doesn't run is barely better than one that silently runs empty, which is why the tester's `wtf` saying "all OK" mattered as much as the move. The council's per-app evidence (`/v1/diagnostics/apps`) now carries `volume_home_away`: the home node, when that node isn't a live member. `relish status` and `relish inspect` print "waits for node-2, which holds its volume and is out of the cluster", the dashboard shows the app as blocked, and `wtf` raises a critical finding that names both ways out: bring the node back, or run `relish decommission-node` and accept an empty volume.
+
+The cost is availability. A three-replica volume app that loses a node runs two replicas until the node returns or is decommissioned, where it used to get a fresh, empty third straight away. We think that's the right trade for local storage, and it's the one Kubernetes makes for local persistent volumes. If you want the app to survive losing a node without anyone stepping in, its data has to live somewhere other than that node.
+
+The gated test `restarting_bun_on_a_volume_apps_node_never_moves_the_app` restarts the home node's agent the way systemd does: it cancels that node's shutdown token, keeps it down for fifteen seconds (well past the suspicion timeout), and checks that no other node runs the app or provisions a volume for it in that time. Then it starts the node again on the same data directory and checks the app comes back there, with the marker it wrote before the restart. Before the fix it failed about two seconds after the stop, with the app running on the other zone-`b` node.
+
 ## Two seconds is too eager
 
 Each node's placement reconciler polls the leader every couple of seconds and deploys whatever its share of the placements says. If a deploy failed, the next poll simply tried again. Kubernetes has `CrashLoopBackOff` for exactly this; we had a supervisor back-off for instances that crash after starting, but a deploy that never produces a running instance never reaches the supervisor. The V02 soak found the result: an app whose binary had been truncated by a power cut reached generation `g170` in eight minutes, every attempt a fresh container, a fresh journal entry and a fresh log line.

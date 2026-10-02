@@ -1451,13 +1451,25 @@ fn render_status(
         .iter()
         .filter_map(|app| app.blocked.as_ref().map(|reason| (app, reason)))
         .collect();
-    if !blocked.is_empty() {
+    let waiting: Vec<_> = desired
+        .iter()
+        .filter_map(|app| app.volume_home_away.as_ref().map(|home| (app, home)))
+        .collect();
+    if !blocked.is_empty() || !waiting.is_empty() {
         output.push('\n');
     }
     for (app, reason) in blocked {
         let _ = writeln!(
             output,
             "{} (namespace {}) is not placed, blocked: {reason}",
+            app.app, app.namespace
+        );
+    }
+    // #423: the app isn't lost, it waits for the node holding its data.
+    for (app, home) in waiting {
+        let _ = writeln!(
+            output,
+            "{} (namespace {}) waits for {home}, which holds its volume and is out of the cluster",
             app.app, app.namespace
         );
     }
@@ -2821,6 +2833,7 @@ spec:
             placements: Default::default(),
             service_port: None,
             blocked: None,
+            volume_home_away: None,
         }
     }
 
@@ -2843,6 +2856,23 @@ spec:
             "no workloads running\n\n\
              greedy (namespace prod) is not placed, blocked: \
              namespace \"prod\" would exceed CPU quota: 0+1600 > 1000m\n"
+        );
+    }
+
+    /// #423: an app waiting for the node that holds its volume isn't just
+    /// missing from the table; status says which node it waits for.
+    #[test]
+    fn status_names_a_volume_app_waiting_for_its_home_node() {
+        let waiting = crate::bun::diagnostics::DesiredAppEvidence {
+            volume_home_away: Some("node-2".to_string()),
+            ..evidence("db", 1)
+        };
+        let output = render_status(&[], &[evidence("fine", 1), waiting]);
+        assert_eq!(
+            output,
+            "no workloads running\n\n\
+             db (namespace prod) waits for node-2, which holds its volume and is out of the \
+             cluster\n"
         );
     }
 
