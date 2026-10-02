@@ -1008,6 +1008,59 @@ async fn wait_for_release(allocator: &PortAllocator, host_port: u16, within: std
     .expect("the startup retirement never released its port");
 }
 
+/// How far past the turn's runtime budget a turn that gave up at that
+/// deadline may end: the bookkeeping after the wait, with room for a loaded
+/// coverage runner. Well inside the 1 s [`TURN_BUDGET`], so a turn that
+/// waited out the slow work, or a fixed one-second timeout, still fails.
+const DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Long enough for two health ticks to meet the slow work.
+const TWO_TICKS: std::time::Duration = std::time::Duration::from_millis(1600);
+
+/// While a startup retirement waits on something slow, every turn ends at
+/// the turn's deadline (within [`DEADLINE_MARGIN`]), a queued status is
+/// answered within the budget, and the retirement still holds its port.
+///
+/// The turn that later completes the retirement isn't judged here. It
+/// journals the release with four fsync'd persists, which on a real disk
+/// under a loaded coverage build took a second between them (0.1.3 release
+/// candidate 2). The slow-disk scenario below bounds that turn instead.
+async fn assert_turns_end_at_the_deadline(
+    running: &RunningAgent,
+    allocator: &PortAllocator,
+    host_port: u16,
+    slow_work: &str,
+) {
+    let worst = running.meter.worst_turn().expect("no turn ran");
+    let bound = TURN_RUNTIME_BUDGET + DEADLINE_MARGIN;
+    assert!(
+        worst.took < bound,
+        "the worst loop turn took {worst} while {slow_work}; a turn that gives up at \
+         the turn's deadline ends within {bound:?}"
+    );
+    let latency = running.status_latency().await;
+    assert!(
+        latency.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {latency:?} while {slow_work}"
+    );
+    assert!(
+        allocator.is_allocated(host_port).await,
+        "the port was released before the slow work finished"
+    );
+}
+
+/// Stop a running agent without judging its turns.
+async fn stop(running: RunningAgent) {
+    running.shutdown.cancel();
+    let mut task = running.task;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+    }
+}
+
 /// The 0.1.3 final tier (#418): after a graceful whole-cluster stop, the
 /// first node back ran its first health tick for 1008 ms. Its startup
 /// retirement asked the remembered leader, still booting, to release an
@@ -1028,16 +1081,17 @@ async fn the_tick_waits_out_a_startup_retirement_whose_leader_answers_late() {
     agent.set_producer_release_client(client);
     let running = run_restarted(agent);
     running.measure_from_here();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(
-        allocator.is_allocated(host_port).await,
-        "the port was released before the leader confirmed"
-    );
+    tokio::time::sleep(TWO_TICKS).await;
+    assert_turns_end_at_the_deadline(
+        &running,
+        &allocator,
+        host_port,
+        "a startup retirement waited for a leader that answers late",
+    )
+    .await;
     // Retirement isn't abandoned: once the leader answers, a tick finishes it.
     wait_for_release(&allocator, host_port, STALL * 3).await;
-    running
-        .assert_responsive("a startup retirement waited for a leader that answered late")
-        .await;
+    stop(running).await;
     server.abort();
 }
 
@@ -1052,20 +1106,45 @@ async fn the_tick_waits_out_a_startup_retirement_whose_inventory_is_slow() {
     let (client, server) =
         crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
     agent.set_producer_release_client(client);
-    grill.set_inventory_delay(Some(STALL));
+    // Far past any budget: only a turn that gives up at its deadline passes.
+    grill.set_inventory_delay(Some(std::time::Duration::from_secs(30)));
     let running = run_restarted(agent);
     running.measure_from_here();
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    assert!(allocator.is_allocated(host_port).await);
-    let latency = running.status_latency().await;
-    assert!(
-        latency.is_some_and(|latency| latency < TURN_BUDGET),
-        "status took {latency:?} while the startup retirement read a slow inventory"
-    );
+    tokio::time::sleep(TWO_TICKS).await;
+    assert_turns_end_at_the_deadline(
+        &running,
+        &allocator,
+        host_port,
+        "a startup retirement read a slow runtime inventory",
+    )
+    .await;
     grill.set_inventory_delay(None);
     wait_for_release(&allocator, host_port, STALL * 2).await;
+    stop(running).await;
+    server.abort();
+}
+
+/// Completing a startup retirement journals it: the network reference's
+/// release, then the discovery service's retirement, four fsync'd persists
+/// in one turn. Persists may stay inline (#351, decision 2) only while a
+/// disk taking 150 ms a write keeps every turn in budget, and the
+/// harness's slow disk didn't reach the discovery journal until now.
+#[tokio::test]
+async fn a_startup_retirement_completes_within_the_budget_on_a_slow_disk() {
+    let (mut agent, _grill, _root, host_port, confirmation) =
+        restarted_with_a_startup_retirement().await;
+    let allocator = agent.supervisor.port_allocator.clone();
+    let (client, server) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
+    agent.set_producer_release_client(client);
+    let running = run_restarted(agent);
     running
-        .assert_responsive("a startup retirement read a slow runtime inventory")
+        .stalls
+        .set(LoopStall::Persist, std::time::Duration::from_millis(150));
+    running.measure_from_here();
+    wait_for_release(&allocator, host_port, std::time::Duration::from_secs(10)).await;
+    running
+        .assert_responsive("a startup retirement journalled its release to a slow disk")
         .await;
     server.abort();
 }

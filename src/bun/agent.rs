@@ -363,7 +363,8 @@ use super::egress_owners::{EgressBinding, PolicyPhase};
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LoopStall {
-    /// Every fsync'd state persist: job ledger, instance record, schedules.
+    /// Every fsync'd state persist: job ledger, instance record, schedules,
+    /// the discovery journal and the egress owners.
     Persist,
     /// Removing a retired instance's identity directory and record.
     ArtifactCleanup,
