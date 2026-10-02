@@ -71,7 +71,7 @@
       <form class="fb" id="fb" novalidate>
         <div class="eyebrow">STEP 06 · TELL US WHAT BROKE</div>
         <h1>How was your burger?</h1>
-        <p class="lede">Three questions. Reliaburger is 0.1, so what you write here decides what we build next.</p>
+        <p class="lede">Reliaburger is early in development at 0.1, your feedback helps us refine the recipe.</p>
 
         <fieldset>
           <legend>THE THREE QUESTIONS</legend>
@@ -88,8 +88,8 @@
             <textarea id="q3" name="q3" maxlength="2000" required></textarea>
           </div>
           <div class="field">
-            <label for="broke"><span class="q-num">04</span>What broke? <span class="hint">Error messages, the command you ran, where you got stuck.</span></label>
-            <textarea id="broke" name="broke" maxlength="2000"></textarea>
+            <label for="broke"><span class="q-num">04</span>What broke? (if anything) <span class="req" aria-hidden="true">*</span> <span class="hint">Error messages, the command you ran, where you got stuck.</span></label>
+            <textarea id="broke" name="broke" maxlength="2000" required></textarea>
           </div>
         </fieldset>
 
@@ -111,12 +111,12 @@
           </div>
           <div class="two">
             <div class="field">
-              <label for="company">Company</label>
-              <input type="text" id="company" name="company" maxlength="120" autocomplete="organization">
+              <label for="company">Company <span class="req" aria-hidden="true">*</span></label>
+              <input type="text" id="company" name="company" maxlength="120" autocomplete="organization" required>
             </div>
             <div class="field">
-              <label for="role">Role</label>
-              <input type="text" id="role" name="role" maxlength="120" autocomplete="organization-title">
+              <label for="role">Role <span class="req" aria-hidden="true">*</span></label>
+              <input type="text" id="role" name="role" maxlength="120" autocomplete="organization-title" required>
             </div>
           </div>
         </fieldset>
@@ -177,8 +177,7 @@
     <footer>
       <span>Reliaburger · by Miko Pawlikowski</span>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
-      <span class="footer-note">This form sends your answers to a Google Apps Script run by the
-        Reliaburger team, which emails them to us and keeps them in a spreadsheet. Nothing else.</span>
+      <span class="footer-note">This form sends your answers to our team, and keeps them in a spreadsheet. Nothing else.</span>
     </footer>
   </div>
   <script>
@@ -241,8 +240,11 @@
         [el.q1, el.q1.value.trim(), "Please answer question 1."],
         [el.q2, el.q2.value.trim(), "Please answer question 2."],
         [el.q3, el.q3.value.trim(), "Please answer question 3."],
+        [el.broke, el.broke.value.trim(), "Please tell us what broke (or write \"nothing\")."],
         [el.name, el.name.value.trim(), "Please add your name."],
         [el.email, /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(el.email.value.trim()), "Please add a valid email."],
+        [el.company, el.company.value.trim(), "Please add your company."],
+        [el.role, el.role.value.trim(), "Please add your role."],
         [el.linkedin, /^https?:\/\/([a-z]{2,3}\.)?(www\.)?linkedin\.com\/.+/i.test(el.linkedin.value), "Please add your LinkedIn profile URL (linkedin.com/in/...)."],
         [el.consent, el.consent.checked, "Please tick the box to share your information with the Reliaburger team."]
       ];
