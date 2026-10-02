@@ -23,8 +23,10 @@
 //!      steps, state sweeps, and the [`follow_ups`] enum (upgrades, `nft`,
 //!      egress DNS, node pressure).
 //!    - **Have whoever drove the runtime read it**: a deploy worker or a
-//!      restart step hands over the network reference it retained and the
-//!      [`launch_evidence`] of what it started, with the step that records it.
+//!      restart step hands over the network reference it retained, the
+//!      egress allowlist it resolved, and the [`launch_evidence`] of what it
+//!      started (its execution included, for the discovery journal), with
+//!      the step that records it.
 //!    - **Start it, and collect it on a later turn** ([`off_loop_work`]):
 //!      a step whose disk or runtime work isn't done within the turn fails
 //!      with [`BunError::StillRunning`], and its caller asks again.
@@ -370,26 +372,45 @@ enum LoopStall {
     ArtifactCleanup,
     /// The `nft -f -` subprocess that applies the perimeter ruleset.
     Firewall,
+    /// A pre-start's DNS lookups for an egress allowlist. Whoever prepares
+    /// the start does them now, off the loop (#419).
+    EgressDns,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
 /// because the agent moves into its task.
 #[cfg(test)]
 #[derive(Debug, Default)]
-struct LoopStalls(std::sync::Mutex<std::collections::HashMap<LoopStall, std::time::Duration>>);
+struct LoopStalls {
+    delays: std::sync::Mutex<std::collections::HashMap<LoopStall, std::time::Duration>>,
+    /// How many times each stall's await has been reached, slow or not.
+    reached: std::sync::Mutex<std::collections::HashMap<LoopStall, usize>>,
+}
 
 #[cfg(test)]
 impl LoopStalls {
     fn set(&self, stall: LoopStall, delay: std::time::Duration) {
-        if let Ok(mut stalls) = self.0.lock() {
+        if let Ok(mut stalls) = self.delays.lock() {
             stalls.insert(stall, delay);
         }
     }
 
+    /// How many times `stall`'s await has been reached so far.
+    fn reached(&self, stall: LoopStall) -> usize {
+        self.reached
+            .lock()
+            .ok()
+            .and_then(|reached| reached.get(&stall).copied())
+            .unwrap_or(0)
+    }
+
     /// Wait out `stall`'s delay, if the test set one; `true` when it did.
     async fn hold(&self, stall: LoopStall) -> bool {
+        if let Ok(mut reached) = self.reached.lock() {
+            *reached.entry(stall).or_default() += 1;
+        }
         let delay = self
-            .0
+            .delays
             .lock()
             .ok()
             .and_then(|stalls| stalls.get(&stall).copied());
@@ -558,6 +579,10 @@ pub struct BunAgent<G: Grill> {
     startup_cleanup_pending: bool,
     network_references:
         std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
+    /// The generation each local instance's launch ran, for the discovery
+    /// journal, as whoever started it read it from the runtime (#419).
+    /// Launches that hold their address have none.
+    launch_executions: std::collections::HashMap<InstanceId, crate::grill::RuntimeGeneration>,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -787,6 +812,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
+            launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -937,6 +963,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
+            launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -1417,6 +1444,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     fn turn_deadline(&self) -> tokio::time::Instant {
         self.turn_deadline
             .unwrap_or_else(|| tokio::time::Instant::now() + OUTSIDE_TURN_RUNTIME_PATIENCE)
+    }
+
+    /// What a deploy worker or a restart step resolves egress allowlists
+    /// with, off the loop.
+    fn egress_resolver(&self) -> launch_evidence::EgressResolver {
+        launch_evidence::EgressResolver {
+            #[cfg(test)]
+            stalls: Arc::clone(&self.loop_stalls),
+        }
     }
 
     /// The loop's periodic work: health probes, restarts, retirements, jobs,
