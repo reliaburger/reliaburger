@@ -8,7 +8,7 @@
 //! whose certificate hashes to the fingerprint the operator compared with
 //! the machine's console (or chose to trust with `--trust-lan`).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -205,17 +205,14 @@ fn claim_client(
     Ok((client, seen))
 }
 
-fn claim_url(address: IpAddr) -> String {
-    format!(
-        "https://{}/v1/claim",
-        std::net::SocketAddr::new(address, CLAIM_PORT)
-    )
+fn claim_url(address: SocketAddr) -> String {
+    format!("https://{address}/v1/claim")
 }
 
 /// Ask a machine what it is, learning its claim key's full fingerprint. If
 /// the announcement gave a short fingerprint, the key must match it.
 pub async fn inspect(
-    address: IpAddr,
+    address: SocketAddr,
     announced: Option<&str>,
 ) -> Result<(MachineInfo, String), RelishError> {
     let (client, seen) = claim_client(None)?;
@@ -252,7 +249,7 @@ pub async fn inspect(
 
 /// Post `seed` to the machine at `address`, over TLS pinned to `fingerprint`.
 pub async fn post_seed(
-    address: IpAddr,
+    address: SocketAddr,
     fingerprint: &str,
     seed: Vec<u8>,
 ) -> Result<(), RelishError> {
@@ -342,7 +339,8 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
     };
     let mut machines = Vec::new();
     for (address, announced) in resolve(&options.targets, &discovered)? {
-        let (info, fingerprint) = inspect(address, announced.as_deref()).await?;
+        let (info, fingerprint) =
+            inspect(SocketAddr::new(address, CLAIM_PORT), announced.as_deref()).await?;
         let mac = info
             .macs
             .first()
@@ -397,14 +395,18 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         }),
     };
     for ((node, seed), (_, address, fingerprint)) in seeds.iter().zip(&machines) {
-        post_seed(*address, fingerprint, std::fs::read(seed)?)
-            .await
-            .map_err(|e| {
-                failed(&format!(
-                    "{e}; its seed is still in {}, for a stick",
-                    seed.display()
-                ))
-            })?;
+        post_seed(
+            SocketAddr::new(*address, CLAIM_PORT),
+            fingerprint,
+            std::fs::read(seed)?,
+        )
+        .await
+        .map_err(|e| {
+            failed(&format!(
+                "{e}; its seed is still in {}, for a stick",
+                seed.display()
+            ))
+        })?;
         println!(
             "  {} ({} at {}): claimed",
             node.name, node.mac, node.address
@@ -566,21 +568,19 @@ mod tests {
             fingerprint: key.fingerprint(),
         };
         let seed_path = dir.path().join("claimed.seed");
+        // An ephemeral port and no mDNS: the production port may be taken
+        // by another test, and announcing isn't what this test is about.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
         let server = tokio::spawn({
             let info = info.clone();
             let seed_path = seed_path.clone();
-            async move { crate::appliance::claim::serve_until_claimed(&key, info, seed_path).await }
+            async move { crate::appliance::claim::serve(listener, &key, info, seed_path).await }
         });
-        let local: IpAddr = "127.0.0.1".parse().unwrap();
-        let mut learned = None;
-        for _ in 0..50 {
-            if let Ok(found) = inspect(local, Some(&short_fingerprint(&info.fingerprint))).await {
-                learned = Some(found);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let (seen_info, fingerprint) = learned.expect("the claim server answered");
+        let learned = inspect(local, Some(&short_fingerprint(&info.fingerprint)))
+            .await
+            .unwrap();
+        let (seen_info, fingerprint) = learned;
         assert_eq!(seen_info, info);
         assert_eq!(fingerprint, info.fingerprint);
 

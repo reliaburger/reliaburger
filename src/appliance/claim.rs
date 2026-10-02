@@ -156,9 +156,27 @@ async fn claim_handler(State(state): State<ClaimState>, body: Bytes) -> impl Int
     (StatusCode::OK, "claimed".to_string())
 }
 
-/// Serve the claim API over TLS with `key` and announce the machine over
-/// mDNS, until a seed has been posted.
+/// Serve the claim API over TLS with `key` on [`CLAIM_PORT`] and announce
+/// the machine over mDNS, until a seed has been posted.
 pub async fn serve_until_claimed(
+    key: &ClaimKey,
+    info: MachineInfo,
+    seed_path: PathBuf,
+) -> std::io::Result<()> {
+    let listener =
+        tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], CLAIM_PORT))).await?;
+    let announcement = announce(&info);
+    let served = serve(listener, key, info, seed_path).await;
+    if let Some(daemon) = announcement {
+        let _ = daemon.shutdown();
+    }
+    served
+}
+
+/// Serve the claim API over TLS with `key` on `listener` until a seed has
+/// been posted.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
     key: &ClaimKey,
     info: MachineInfo,
     seed_path: PathBuf,
@@ -175,11 +193,8 @@ pub async fn serve_until_claimed(
         )
         .map_err(std::io::Error::other)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(certified));
-    let listener =
-        tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], CLAIM_PORT))).await?;
     let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let announcement = announce(&info);
     let server = tokio::spawn(crate::sesame::connection::serve_router_over_tls(
         listener,
         acceptor,
@@ -192,9 +207,6 @@ pub async fn serve_until_claimed(
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     shutdown.cancel();
     let _ = server.await;
-    if let Some(daemon) = announcement {
-        let _ = daemon.shutdown();
-    }
     Ok(())
 }
 
