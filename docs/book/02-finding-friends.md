@@ -2273,24 +2273,30 @@ relish council recover --data-dir /var/lib/reliaburger/data \
 
 It refuses if a council voter still answers, unless you pass `--force` with a loud warning — recovering a cluster that still has a quorum would give you two clusters that both think they're in charge, which is the split-brain we spend the whole chapter avoiding. In a genuine total loss the check simply passes, because there's nothing left to answer.
 
-Then it restores the desired state and, crucially, *throws away the dead cluster's Raft log*:
+Then it restores the desired state and, crucially, *retires the dead cluster's Raft log*. Retiring isn't deleting. The first version did delete: it removed `log.redb` and `snapshot.redb` and then wrote the new snapshot. A crash between those steps, or a write that failed, left the node with neither the old state nor the new one. Worse, `remove_file` on Unix happily unlinks a file another process has open, so recovering a node that was still running quietly swapped the state out from under it.
+
+So `recover_data_dir` now runs a small transaction (`src/council/recovery_storage.rs`):
 
 ```rust
-pub fn recover_data_dir(data_dir: &Path, state: DesiredState) -> Result<(), RecoveryError> {
-    let raft_dir = data_dir.join("raft");
-    // Wipe the dead cluster's log: its term line belongs to the council that died.
-    let log_path = raft_dir.join("log.redb");
-    if log_path.exists() {
-        std::fs::remove_file(&log_path)?;
-    }
-    // Write the restored state as the only snapshot the next start will load.
-    let db = redb::Database::create(raft_dir.join("snapshot.redb"))?;
-    CouncilStateMachine::persist_recovered_snapshot(&db, state)?;
-    Ok(())
+pub(crate) fn replace(raft: &Path, state: DesiredState) -> io::Result<()> {
+    let _guard = lock(raft)?;            // one recovery or startup at a time
+    finish_pending(raft)?;               // complete any interrupted earlier run
+    let stores = lock_existing(raft)?;   // refuse a store a live node holds
+    // Build and validate the replacement in a staging directory...
+    let transaction = stage.keep();
+    // ...write a durable intent naming it, then rename raft/ aside and the
+    // replacement into place.
+    atomic_write(&raft.with_extension("recovery"), name.as_bytes())?;
+    drop(stores);
+    finish_pending(raft)
 }
 ```
 
-Why wipe the log? A Raft node's log carries its term and its idea of who the voters are. If we kept it, the restored node would try to resume the dead cluster's history — voting for peers that no longer exist, at a term line nobody else shares. Instead we clear it, so when the node starts it re-bootstraps a fresh single-voter council (quorum of one: itself), and the self-healing reconciler grows it back from the surviving workers exactly as if it were a brand-new cluster. The restored desired state comes along for the ride, so the apps are all still there.
+Every step before the intent file touches only the staging directory, so a failure there changes nothing. After it, the two renames are idempotent, and node startup calls `finish_pending` before it opens a store, so a crash between them is finished the next time anything looks at the directory. The old `raft/` directory ends up at `.raft-recovery-*/previous`, kept for inspection rather than deleted. `lock_existing` opens each old store with redb, which takes an exclusive file lock: a running node already holds it, so recovery refuses. A store redb can't open for any other reason doesn't block anything. A damaged store is exactly what recovery is for, and it's retained either way.
+
+`File::try_lock` is the standard library's advisory file lock (stable since Rust 1.89). The `File` it returns is the lock: when `_guard` goes out of scope at the end of the function, Rust drops it, the file closes and the lock is released. There's no `unlock` to forget, which is the same ownership trick you'll see throughout the book.
+
+Why retire the log at all? A Raft node's log carries its term and its idea of who the voters are. If we kept it, the restored node would try to resume the dead cluster's history — voting for peers that no longer exist, at a term line nobody else shares. Instead the restored node starts from an empty log, re-bootstraps a fresh single-voter council (quorum of one: itself), and the self-healing reconciler grows it back from the surviving workers exactly as if it were a brand-new cluster. The restored desired state comes along for the ride, so the apps are all still there.
 
 ### The epoch marker
 

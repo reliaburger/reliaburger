@@ -228,8 +228,11 @@ relish council recover --data-dir /var/lib/reliaburger/data \
   --from s3://backups/prod-council --master-key /etc/reliaburger/master.key
 ```
 
-Without `--from`, it uses the node's own latest snapshot. It wipes the dead
-council's log and stamps a new recovery epoch; starting the node brings up a
+Without `--from`, it uses the node's own latest snapshot. It moves the dead
+council's Raft directory aside (to `.raft-recovery-*/previous` in the data
+directory, where you can delete it once the cluster is healthy) and stamps a
+new recovery epoch. It refuses while the node is still running, and the next
+start finishes a recovery that crashed part-way. Starting the node brings up a
 one-voter council that grows again as nodes rejoin. Anything written after the
 backup is lost. It refuses while it can still see a live council; `--force`
 skips that check, and using it against a cluster that's still alive splits
