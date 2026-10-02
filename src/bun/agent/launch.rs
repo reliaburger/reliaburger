@@ -170,6 +170,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             drains: self.drains.clone(),
             operation: Some(operation),
             stop_confirmation_timeout: self.stop_confirmation_timeout,
+            egress: self.egress_resolver(),
         };
         let worker_task = tokio::spawn(async move {
             worker.run_deploy(config, forward_tx).await;
@@ -474,6 +475,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
         evidence: &launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
+        self.record_launch_execution(instance_id, &evidence.execution)?;
         self.spawn_log_forwarder(instance_id, app_name, namespace);
         self.persist_instance_record(instance_id, evidence).await?;
         let container_ip = evidence.container_ip;
