@@ -623,14 +623,32 @@ impl RuncGrill {
         .await
     }
 
+    /// Whether the workload has exited, for status.
+    ///
+    /// `runc run` lives exactly as long as the container, so a remembered
+    /// launcher that is still running answers without the lifecycle lock.
+    /// Status asks this beside the pid and exit code, and behind a state
+    /// read that probes the rootless network helper it used to miss its
+    /// deadline on every poll (#456). Anything else asks `state`.
+    pub(super) async fn owned_has_exited(&self, instance: &InstanceId) -> Result<bool, GrillError> {
+        if self.remembered_launcher(instance).await.is_some() {
+            return Ok(false);
+        }
+        Ok(self.owned_state(instance).await? == ContainerState::Stopped)
+    }
+
     /// Read the actual workload outcome without inventing a cleanup result.
     ///
     /// An instance with no generation has no exit code; any other failure
-    /// is an error, never "no exit code" (#389).
+    /// is an error, never "no exit code" (#389). A launcher still running
+    /// has no outcome yet, which needs no lifecycle lock (#456).
     pub(super) async fn owned_exit_code(
         &self,
         instance: &InstanceId,
     ) -> Result<Option<i32>, GrillError> {
+        if self.remembered_launcher(instance).await.is_some() {
+            return Ok(None);
+        }
         let read = self.owned_operation(instance, |_runtime, _id, context| async move {
             if let IntentPhase::Retired { exit_code } = context.intent().await?.phase {
                 return Ok(exit_code);

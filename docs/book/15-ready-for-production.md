@@ -3555,6 +3555,33 @@ exit code. Changing the trait's return type was the whole fix in a sense: the
 compiler then listed every call site that had been quietly treating an error
 as an answer.
 
+Making the exit code honest brought the rootless test back once more (#456),
+this time with a pid but `runtime_unknown: true` for fifteen seconds
+straight. The pid had escaped the lifecycle lock, but the exit code and the
+liveness check hadn't, and they now counted. A throwaway CI loop that logged
+every slow runtime call showed why both missed together: a single rootless
+`state()` read sometimes held the lock for 1.3 to 2.8 seconds while it waited
+for the network helper, and every poll's two reads queued behind it. The fix
+is the pid's trick again. `runc run` lives exactly as long as its container,
+so a remembered launcher that's still running answers both questions: no exit
+code yet, and not exited. Only liveness needed a new trait method, because
+`state()` does more than look. For runc it also supervises the network helper,
+and that work must keep its lock:
+
+```rust
+fn has_exited(
+    &self,
+    instance: &InstanceId,
+) -> impl std::future::Future<Output = Result<bool, GrillError>> + Send {
+    async move { Ok(self.state(instance).await? == ContainerState::Stopped) }
+}
+```
+
+A trait method with a body is a *default*. Every runtime gets it for free and
+may override it, which a Go interface can't express. The process and Apple
+runtimes keep the default; runc overrides it with the lock-free answer and
+falls back to `state()` once its launcher is gone.
+
 There was a type problem in the middle of this. The reads need the container
 runtime, and `BunAgent<G: Grill>` is generic over it, but the API state isn't
 generic and we didn't want it to become so. The reader stores the one
