@@ -6,9 +6,10 @@
 #   heavy   - run the acceptance suites (cluster, upgrade, privileged Linux)
 #
 # Pushes, schedules and manual runs get everything. Pull requests are judged
-# by the files they change against their base. Stacked PRs (base other than
-# main) skip the heavy suites unless labelled full-ci; they run in full once
-# the PR targets main. Retargeting a PR (GitHub does it when the branch under
+# by the files they change against their base. A PR into main or into a
+# release's merge-train branch (`release-*`) gets the heavy suites; other
+# stacked PRs skip them unless labelled full-ci, and run in full once the PR
+# targets main. Retargeting a PR (GitHub does it when the branch under
 # it merges) reruns this through ci-retarget.yml, so the heavy suites don't
 # wait for the next push.
 #
@@ -62,7 +63,11 @@ while IFS= read -r file; do
 done <<<"$changed"
 
 heavy=false
-if [ "$code" = true ] && { [ "${BASE_REF}" = main ] || [ "${FULL_CI}" = true ]; }; then
+case "${BASE_REF}" in
+    main | release-*) targets_a_release=true ;;
+    *) targets_a_release=false ;;
+esac
+if [ "$code" = true ] && { [ "$targets_a_release" = true ] || [ "${FULL_CI}" = true ]; }; then
     heavy=true
 fi
 

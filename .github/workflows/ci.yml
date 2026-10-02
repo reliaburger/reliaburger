@@ -6,7 +6,8 @@ on:
     branches: [main]
   pull_request:
     # fix/** covers review PRs stacked on each other rather than on main.
-    branches: [main, "codex/**", "fix/**"]
+    # release-* is each release's merge train: PRs into it get the whole of CI.
+    branches: [main, "codex/**", "fix/**", "release-*"]
     # labeled lets a `full-ci` label start the heavy suites on a stacked PR.
     types: [opened, synchronize, reopened, labeled]
   schedule:
