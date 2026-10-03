@@ -545,6 +545,9 @@ pub struct BunAgent<G: Grill> {
         std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// A local change awaits in-place republication of the consumer view.
     consumer_view_stale: bool,
+    /// The consumer synchronisation part of the way through its steps, and
+    /// the leader answer waiting behind it (#505).
+    consumer_syncs: consumer::ConsumerSyncs,
     /// While the view lease has lapsed, the local-only view installed in
     /// place of the last publication: this node's own backends and nothing
     /// else. `None` while the published view is the whole cluster's.
@@ -796,6 +799,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            consumer_syncs: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
@@ -936,6 +940,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            consumer_syncs: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
@@ -1395,6 +1400,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.apply_follow_up(done).await;
                         turn
                     }
+                    // A consumer synchronisation journals one write a turn
+                    // (#505). Its steps take turns with everything below:
+                    // this branch yields once after each step, and the one
+                    // under commands takes the step when nothing else waits.
+                    _ = std::future::ready(()), if self.consumer_syncs.step_first() => {
+                        let turn = self.begin_turn(LoopBranch::FollowUp, Some("consumer_sync"));
+                        self.continue_consumer_sync().await;
+                        turn
+                    }
                     Some(op) = self.deploy_ops_rx.recv() => {
                         let turn = self.begin_turn(LoopBranch::DeployOp, Some(op.name()));
                         self.handle_deploy_op(op).await;
@@ -1403,6 +1417,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(cmd) = self.command_rx.recv() => {
                         let turn = self.begin_turn(LoopBranch::Command, Some(cmd.name()));
                         self.handle_command(cmd).await;
+                        turn
+                    }
+                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle() => {
+                        let turn = self.begin_turn(LoopBranch::FollowUp, Some("consumer_sync"));
+                        self.continue_consumer_sync().await;
                         turn
                     }
                     _ = health_interval.tick() => {
@@ -1415,9 +1434,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             };
             // Local changes only mark the consumer view stale, so a burst of
             // them costs one republication, and the old view serves meanwhile.
-            // The republication is part of the turn: a caller waits for it too.
-            if let Err(error) = self.refresh_consumer_view().await {
-                eprintln!("bun: consumer view refresh awaits retry: {error}");
+            // The republication starts in the turn and its writes go on in
+            // turns of their own; a turn that took a step leaves it for the
+            // next, so no turn journals two of them.
+            if !self.consumer_syncs.end_turn() {
+                self.start_consumer_refresh().await;
             }
             // Status readers answer from this, not by queueing for a turn.
             self.publish_status();
