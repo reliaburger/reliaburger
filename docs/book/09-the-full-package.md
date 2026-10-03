@@ -1258,6 +1258,16 @@ daemon it came up with has gone. The stops take 0, 0.3 and 0.6 seconds, so
 without the gate VM 1's start fails every time with the error from the Mac.
 With the gate, all three end up `Running`.
 
+These watchdog tests then turned flaky on their own (#517). Alone they
+passed; two in one test process failed nine runs in ten. The culprit was
+macOS, not our code: it checks a new executable file the first time anything
+runs it, the check costs over 100 ms, and two first runs of different new
+files wait for each other. Each test wrote a fresh fake `limactl` and started
+it under a 200 ms watchdog, so the second one routinely missed its deadline
+before its script printed a byte. The fix runs each fake once, right after
+writing it and before the clock starts. A file that has been checked starts
+in a few milliseconds from then on.
+
 ### Bake the image, don't install at boot
 
 The measurements had one more thing to say. The kernel reached a login prompt

@@ -630,6 +630,7 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
     tx.send(AgentCommand::UpgradeApply {
         directive,
         response,
+        answer_delivered: None,
     })
     .await
     .unwrap();

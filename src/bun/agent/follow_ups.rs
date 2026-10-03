@@ -56,7 +56,16 @@ pub(super) struct UpgradePreparation {
     prepared:
         Result<Option<crate::upgrade::manager::PreparedUpgrade>, crate::upgrade::UpgradeError>,
     response: oneshot::Sender<Result<(), BunError>>,
+    /// Resolves once the answer has reached the caller.
+    answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
 }
+
+/// How long the exec waits for the "upgrading" answer to reach the caller.
+///
+/// Writing a short answer to a local socket takes milliseconds; the bound
+/// only matters when the caller stops reading, and then the node upgrades
+/// anyway rather than stay on the old version.
+const ANSWER_DELIVERY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A running workload the upgrade marker must find alive after the swap,
 /// before its pid is known.
@@ -197,6 +206,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         directive: crate::upgrade::types::UpgradeDirective,
         response: oneshot::Sender<Result<(), BunError>>,
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     ) {
         let Some(manager) = self.upgrade.clone() else {
             let _ = response.send(Err(BunError::UpgradesUnavailable));
@@ -222,6 +232,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 kind,
                 prepared,
                 response,
+                answer_delivered,
             })
         });
         self.upgrade_preparing = Some((preparing, task.id()));
@@ -234,6 +245,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         version: Option<crate::upgrade::BinaryVersion>,
         response: oneshot::Sender<Result<(), BunError>>,
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     ) {
         let Some(manager) = self.upgrade.clone() else {
             let _ = response.send(Err(BunError::UpgradesUnavailable));
@@ -255,19 +267,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 kind,
                 prepared,
                 response,
+                answer_delivered,
             })
         });
         self.upgrade_preparing = Some((preparing, task.id()));
     }
 
     /// Answer the caller, then exec the staged binary. Only the exec, and
-    /// the moment before it that lets the answer flush, stay on the loop.
+    /// the wait before it for the answer to reach the caller, stay on the
+    /// loop.
     async fn finish_upgrade_preparation(&mut self, preparation: UpgradePreparation) {
         self.upgrade_preparing = None;
         let UpgradePreparation {
             kind,
             prepared,
             response,
+            answer_delivered,
         } = preparation;
         let Some(manager) = self.upgrade.clone() else {
             let _ = response.send(Err(BunError::UpgradesUnavailable));
@@ -297,11 +312,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 println!("bun: rolling back to {}", prepared.target_version())
             }
         }
-        // Respond before the point of no return, and give the HTTP layer a
-        // moment to flush the response: exec closes every socket.
+        // Respond before the point of no return, and wait until the answer
+        // has reached the caller: exec closes every socket. A fixed 200 ms
+        // pause used to stand in for that wait, and on a loaded host the
+        // exec sometimes won, so the caller saw a dropped connection for an
+        // upgrade that went ahead (#526).
         let _ = response.send(Ok(()));
-        // LOOP-INLINE: 200 ms on purpose, so the answer flushes before exec replaces the process
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(delivered) = answer_delivered {
+            // LOOP-INLINE: the exec must follow the delivered answer, and ANSWER_DELIVERY_BOUND caps the wait
+            let _ = tokio::time::timeout(ANSWER_DELIVERY_BOUND, delivered.wait()).await;
+        }
 
         // Only returns on failure (the symlink is already reverted then).
         let error = manager.execute(prepared);

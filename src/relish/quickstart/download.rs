@@ -864,6 +864,12 @@ mod tests {
     /// request number, path and `Range` start, so tests can drop a
     /// connection mid-body the way a flaky link does: a `Content-Length`
     /// that the body never reaches.
+    ///
+    /// Each connection carries exactly one request, and every reply says
+    /// `connection: close`. Without it the client pooled the connection and
+    /// could send its next request (a redirect's target) down a socket this
+    /// server was about to close; that request was lost, the retry shifted
+    /// the request numbers, and a script keyed on them answered 403 (#520).
     async fn scripted_server(
         body: &'static [u8],
         script: impl Fn(usize, &str, Option<u64>) -> Reply + Send + Sync + 'static,
@@ -907,24 +913,30 @@ mod tests {
                     let reply = script(number, &path, start);
                     let head = match reply {
                         Reply::Status(code) => {
-                            format!("HTTP/1.1 {code} Scripted\r\ncontent-length: 0\r\n\r\n")
+                            format!(
+                                "HTTP/1.1 {code} Scripted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                            )
                         }
                         Reply::Redirect(to) => format!(
-                            "HTTP/1.1 302 Found\r\nlocation: {to}\r\ncontent-length: 0\r\n\r\n"
+                            "HTTP/1.1 302 Found\r\nconnection: close\r\nlocation: {to}\r\ncontent-length: 0\r\n\r\n"
                         ),
                         Reply::Body { honour_range, .. } => match start {
                             Some(start) if honour_range => format!(
-                                "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {start}-{}/{}\r\ncontent-length: {}\r\n\r\n",
+                                "HTTP/1.1 206 Partial Content\r\nconnection: close\r\ncontent-range: bytes {start}-{}/{}\r\ncontent-length: {}\r\n\r\n",
                                 body.len() - 1,
                                 body.len(),
                                 body.len() - start as usize
                             ),
                             _ => {
-                                format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len())
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                                    body.len()
+                                )
                             }
                         },
                     };
                     socket.write_all(head.as_bytes()).await.unwrap();
+                    let mut complete = true;
                     if let Reply::Body {
                         honour_range,
                         send,
@@ -938,11 +950,19 @@ mod tests {
                         };
                         let rest = &body[from..];
                         let count = send.unwrap_or(rest.len()).min(rest.len());
+                        complete = count == rest.len();
                         let _ = socket.write_all(&rest[..count]).await;
                         let _ = socket.flush().await;
                         if stall {
                             tokio::time::sleep(Duration::from_secs(60)).await;
                         }
+                    }
+                    // This server reads one request per connection. Holding a
+                    // finished connection open for a moment before hanging up
+                    // makes a client that reuses it fail every time, rather
+                    // than only when its next request beats the close (#520).
+                    if complete {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 });
             }
@@ -1106,7 +1126,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!("{error:#}; the server saw {:?}", requests.lock().unwrap())
+            });
         server.abort();
         assert_eq!(std::fs::read(&path).unwrap(), BODY);
         assert_eq!(
