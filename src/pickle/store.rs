@@ -87,10 +87,25 @@ pub struct BlobStore {
 
 /// Exclusive process ownership of a registry's temporary upload directory.
 /// Keep this guard alive until every registry writer has stopped.
+///
+/// The ownership is a `flock`, which belongs to the open file description,
+/// not to the descriptor. A child process that another thread is spawning
+/// holds a copy of every descriptor until its `exec` closes it, so closing
+/// ours alone could leave the directory owned for a moment, and a
+/// replacement claimed straight after a drop was refused (#497). Dropping
+/// the owner unlocks first, which releases the lock for every copy at once.
 #[derive(Debug)]
 #[must_use = "keep the upload owner alive while registry writers can run"]
 pub struct UploadDirectoryOwner {
-    _lock: std::fs::File,
+    lock: std::fs::File,
+}
+
+impl Drop for UploadDirectoryOwner {
+    fn drop(&mut self) {
+        // Nothing useful can be done with a failed unlock: closing the
+        // descriptor straight after still releases the lock eventually.
+        let _ = self.lock.unlock();
+    }
 }
 
 impl BlobStore {
@@ -145,7 +160,7 @@ impl BlobStore {
                 std::fs::remove_file(entry.path())?;
             }
             std::fs::File::open(uploads)?.sync_all()?;
-            Ok(UploadDirectoryOwner { _lock: lock })
+            Ok(UploadDirectoryOwner { lock })
         })
         .await
         .map_err(|error| std::io::Error::other(format!("upload recovery task failed: {error}")))?
@@ -661,6 +676,45 @@ mod tests {
         drop(owner);
         let _replacement = store.claim_upload_directory().await.unwrap();
         assert!(!store.upload_path(&id).exists());
+    }
+
+    /// A child that another thread is forking holds a copy of every open
+    /// descriptor until its `exec`, the lock file's included. Dropping the
+    /// owner must still release the lock at once, or the replacement claim
+    /// straight after is refused as busy (#497).
+    #[tokio::test]
+    async fn a_dropped_owner_is_replaced_while_other_threads_spawn_processes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (store, _dir) = test_store();
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let spawning = Arc::clone(&spawning);
+                std::thread::spawn(move || {
+                    while spawning.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let mut refused = 0;
+        for _ in 0..100 {
+            match store.claim_upload_directory().await {
+                Ok(owner) => drop(owner),
+                Err(_) => refused += 1,
+            }
+        }
+        spawning.store(false, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(refused, 0, "claims refused by a lock nobody holds");
     }
 
     #[cfg(unix)]

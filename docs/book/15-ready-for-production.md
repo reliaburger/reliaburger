@@ -4601,6 +4601,28 @@ long) and `[1, 1, 1]` for a changed view, in the same order as before. The local
 health change takes the same steps, and a turn that took a step leaves it
 for the next one.
 
+#### Counting instead of timing
+
+The same day, the oldest slow-disk scenario,
+`status_answers_while_every_persist_waits_on_a_slow_disk`, failed once on a
+hosted macOS runner (#508): `agent loop turn took
+1109 ms in restart_step`. At 150 ms a persist, that sounds like seven writes
+in one turn. So we counted them. `LoopStalls` now keeps a count per turn as
+well as a total (`begin_turn` clears it, and `hold` remembers the most any
+turn reached), and the restart's turn makes exactly one persist. Seven
+writes would have been a bug to split. One write and a second of something
+else is the runner: the turn also pays for the record's real fsyncs, and on
+macOS `sync_all` is `F_FULLFSYNC`, which flushes the drive's cache and queues
+behind every other test process doing the same.
+
+The scenario was timing a disk it doesn't control. The slowed persist exists
+to stand in for that disk, so the verdict now counts persists instead: no turn
+may make more than two (`MOST_PERSISTS_IN_A_TURN`, the rule #422 settled on),
+and status must still answer. That's stricter than the stopwatch, not
+looser. Put three persists into the record write and the new verdict fails
+straight away, while the old one would have passed: every turn came in under
+500 ms.
+
 #### A test that raced the clock
 
 One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`

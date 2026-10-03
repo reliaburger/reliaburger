@@ -163,7 +163,25 @@ pub fn default_path() -> Result<PathBuf, RelishError> {
     Ok(root_directory()?.join("context.json"))
 }
 
-fn lock_context(path: &Path) -> Result<std::fs::File, RelishError> {
+/// The `flock` on the context's lock file, released when dropped.
+///
+/// A `flock` belongs to the open file description, not to the descriptor,
+/// and a child process that another thread is spawning holds a copy of every
+/// descriptor until its `exec` closes it. Closing ours alone could leave the
+/// lock held by that copy for a moment, so the next writer straight after
+/// was refused as busy (#500). Unlocking explicitly releases it for every
+/// copy at once.
+struct ContextLock(std::fs::File);
+
+impl Drop for ContextLock {
+    fn drop(&mut self) {
+        // Nothing useful can be done with a failed unlock: closing the
+        // descriptor straight after still releases the lock eventually.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_context(path: &Path) -> Result<ContextLock, RelishError> {
     let lock_path = path.with_extension("lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -172,15 +190,16 @@ fn lock_context(path: &Path) -> Result<std::fs::File, RelishError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let lock = options.open(&lock_path)?;
-    lock.try_lock()
+    let file = options.open(&lock_path)?;
+    file.try_lock()
         .map_err(|error| RelishError::InitFailed(format!("local context is busy: {error}")))?;
+    let lock = ContextLock(file);
     // `relish uninstall` deletes the lock file (under the lock) once no
     // context is left. A writer that opened the file just before that
     // unlink now holds a lock nobody else can see, while a newer writer
     // could lock a fresh file at the same path. Refuse unless the file we
     // locked is still the one the path names.
-    if !still_linked(&lock, &lock_path)? {
+    if !still_linked(&lock.0, &lock_path)? {
         return Err(RelishError::InitFailed(
             "local context is busy: its lock file was removed; retry".to_string(),
         ));
@@ -272,6 +291,46 @@ mod tests {
         assert!(remove_unused_lock(&path).unwrap());
         assert!(!lock.exists());
         assert!(!remove_unused_lock(&path).unwrap(), "already gone");
+    }
+
+    /// A child that another thread is forking holds a copy of every open
+    /// descriptor until its `exec`, the lock file's included. Each writer
+    /// must still release the lock when it returns, or the next one is
+    /// refused as busy (#500).
+    #[test]
+    fn writers_take_turns_while_other_threads_spawn_processes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let spawning = Arc::clone(&spawning);
+                std::thread::spawn(move || {
+                    while spawning.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let refused = (0..100)
+            .filter(|_| {
+                context(root.path(), "one").save(&path).is_err()
+                    || LocalContext::remove_owned(&path, "one").is_err()
+                    || remove_unused_lock(&path).is_err()
+            })
+            .count();
+        spawning.store(false, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(refused, 0, "writers refused by a lock nobody holds");
     }
 
     #[test]

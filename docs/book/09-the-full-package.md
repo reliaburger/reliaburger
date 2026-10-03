@@ -946,6 +946,16 @@ for every copy at once, including the one in a half-spawned child. The
 relish CLI never reopens an operation in the same process, so users never saw
 this, but the fix makes "dropping releases the lock" true without a caveat.
 
+We fixed that lock and missed its neighbours. Five days later the same
+refusal turned up in two more places that take an `flock` and let a plain
+`File` close it: the local context's `context.lock` (#500) and Pickle's upload
+directory owner (#497, in Chapter 5). Both now hold the file in a small type
+whose `Drop` unlocks first, `ContextLock` and `UploadDirectoryOwner`. Each got
+the same test as the operation lock: a hundred lock-and-drop rounds beside two
+threads spawning `true`. Before the fix the upload owner's version was refused
+75 times out of 100. The lesson is a boring one. When you fix a class of bug,
+grep for the class, not just the line in the stack trace.
+
 ### Download before you trust, verify before you replace
 
 The installer needs a guest image and prebuilt binaries. A partial download
