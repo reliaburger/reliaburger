@@ -82,6 +82,7 @@ known_command() {
         "curl -fsSL https://reliaburger.com/install.sh | sh" \
         | "relish apply -f ${DEMO_URL}" \
         | "relish status" \
+        | "relish council status" \
         | "${BURGER_FETCH}" \
         | "relish build burger/burger.toml" \
         | "relish images" \

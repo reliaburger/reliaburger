@@ -81,11 +81,9 @@ migration and no feature gate
   0.1.2 changes the protocol and state formats (27 and 46 in 0.1.1; 28 and 47
   now), so a 0.1.1 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
-- [ ] **0.1.3: ready for release, qualification in progress**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)). Every
-  item has landed and the crate says 0.1.3; what's left is building, staging,
-  soaking and promoting the candidate ([runbook](releasing.md)). 0.1.3 is about
-  the agent loop, observability and test quality:
+- [x] **0.1.3: agent loop, observability and test quality.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.3)
+  on 3 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)):
   - [x] an agent loop that's metered and never waits inline on slow work: a
     turn meter, a starvation harness and the inline-await rule, the status
     snapshot, parallel state reads and restarts off the loop, and the last
@@ -133,11 +131,14 @@ migration and no feature gate
     ([#419](https://github.com/reliaburger/reliaburger/issues/419), [#422](https://github.com/reliaburger/reliaburger/issues/422), [#448](https://github.com/reliaburger/reliaburger/issues/448), [#450](https://github.com/reliaburger/reliaburger/issues/450), [#456](https://github.com/reliaburger/reliaburger/issues/456), [#461](https://github.com/reliaburger/reliaburger/issues/461), [#420](https://github.com/reliaburger/reliaburger/pull/420), [#421](https://github.com/reliaburger/reliaburger/pull/421),
     [#449](https://github.com/reliaburger/reliaburger/pull/449), [#453](https://github.com/reliaburger/reliaburger/pull/453), [#464](https://github.com/reliaburger/reliaburger/pull/464), [#465](https://github.com/reliaburger/reliaburger/pull/465)).
 
+  The homepage tour was re-recorded against the published install, with
+  `relish council status`, the council line in `relish status` and replicas
+  numbered across the cluster.
   0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 33 and 49
   now), so a 0.1.2 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.2](releasing.md#upgrading-from-012)). 0.1.2's leader
   refuses the upgrade before it records a run.
-- [ ] **0.1.4: ready for release, qualification to follow 0.1.3**
+- [ ] **0.1.4: the next release, ready for qualification**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/8), merge
   train [#474](https://github.com/reliaburger/reliaburger/pull/474)). Every
   item has landed on `release-1-1-4` and the crate says 0.1.4. 0.1.4 is part 2

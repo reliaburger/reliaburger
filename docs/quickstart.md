@@ -1,6 +1,6 @@
 # A laptop cluster
 
-The command below installs the published, signed 0.1.2 release (1 October
+The command below installs the published, signed 0.1.3 release (3 October
 2026) and builds a laptop cluster from it. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
 to a ready three-node cluster ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
@@ -18,7 +18,7 @@ relish dashboard             # Ctrl-C stops the browser connection
 ```
 
 The installer says what it's fetching before each download (for example
-`Downloading relish v0.1.2 for macos-aarch64 (37.2 MiB)...`), draws curl's
+`Downloading relish v0.1.3 for macos-aarch64 (87.8 MiB)...`), draws curl's
 progress bar when you run it in a terminal, and finishes each download with
 the bytes and seconds it took. In a log or a pipe it prints only those lines.
 
