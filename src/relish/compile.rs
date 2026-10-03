@@ -17,7 +17,7 @@ pub struct CompileResult {
     pub config: Config,
     /// Files that were successfully merged.
     pub merged_from: Vec<PathBuf>,
-    /// Warnings (e.g. parse errors in individual files).
+    /// Non-fatal duplicate-definition warnings; incomplete trees are errors.
     pub warnings: Vec<String>,
 }
 
@@ -67,10 +67,7 @@ fn compile_directory_with_defaults(
     let mut warnings = Vec::new();
 
     // Load defaults: own file takes priority, fall back to parent's
-    let (own_defaults, defaults_warning) = load_defaults(dir);
-    if let Some(warning) = defaults_warning {
-        warnings.push(warning);
-    }
+    let own_defaults = load_defaults(dir)?;
     let defaults = own_defaults.as_ref().or(parent_defaults);
 
     // Process all .toml files in this directory (except _defaults.toml)
@@ -99,44 +96,46 @@ fn compile_directory_with_defaults(
                     apply_namespace(&mut file_config, ns);
                 }
 
-                for collision in merge_into(&mut merged, file_config) {
+                for collision in merge_into(&mut merged, file_config)? {
                     warnings.push(format!("{}: {collision}", entry_path.display()));
                 }
                 merged_from.push(entry_path.clone());
             }
             Err(e) => {
-                warnings.push(format!("{}: {e}", entry_path.display()));
+                return Err(RelishError::FormatFailed(format!(
+                    "{}: {e}",
+                    entry_path.display()
+                )));
             }
         }
     }
 
     // Recurse into subdirectories — directory name becomes the namespace
-    if let Ok(read_dir) = std::fs::read_dir(dir) {
-        let mut subdirs: Vec<PathBuf> = read_dir
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
+    {
+        let read_dir = std::fs::read_dir(dir)?;
+        let mut subdirs = Vec::new();
+        for entry in read_dir {
+            let path = entry?.path();
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            if metadata.is_dir() {
+                subdirs.push(path);
+            }
+        }
         subdirs.sort();
 
         for subdir in subdirs {
-            match compile_directory_with_defaults(&subdir, defaults) {
-                Ok(mut sub_result) => {
-                    // Apply the subdirectory name as namespace
-                    if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
-                        apply_namespace(&mut sub_result.config, ns);
-                    }
-                    for collision in merge_into(&mut merged, sub_result.config) {
-                        warnings.push(format!("{}: {collision}", subdir.display()));
-                    }
-                    merged_from.extend(sub_result.merged_from);
-                    warnings.extend(sub_result.warnings);
-                }
-                Err(RelishError::Io(_)) => {
-                    // Skip unreadable directories
-                }
-                Err(e) => return Err(e),
+            let mut sub_result = compile_directory_with_defaults(&subdir, defaults)?;
+            // Apply the subdirectory name as namespace.
+            if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
+                apply_namespace(&mut sub_result.config, ns);
             }
+            for collision in merge_into(&mut merged, sub_result.config)? {
+                warnings.push(format!("{}: {collision}", subdir.display()));
+            }
+            merged_from.extend(sub_result.merged_from);
+            warnings.extend(sub_result.warnings);
         }
     }
 
@@ -149,46 +148,43 @@ fn compile_directory_with_defaults(
 
 /// Collect all .toml files in a directory (non-recursive, sorted).
 fn collect_toml_files(dir: &Path) -> Result<Vec<PathBuf>, RelishError> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "toml"))
-        .collect();
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            if metadata.is_file() {
+                files.push(path);
+            }
+        }
+    }
     files.sort();
     Ok(files)
 }
 
-/// Load `_defaults.toml` from a directory, if present.
-///
-/// Returns the defaults and any reason they could not be loaded (O10). The
-/// `.ok()?` this replaced turned an unreadable or malformed defaults file
-/// into "there are no defaults" — so a typo in `_defaults.toml` didn't fail
-/// the compile, it silently dropped the default image from every app in the
-/// directory and let the error surface much later as a missing field.
-fn load_defaults(dir: &Path) -> (Option<BTreeMap<String, toml::Value>>, Option<String>) {
-    let defaults_path = dir.join("_defaults.toml");
-    if !defaults_path.is_file() {
-        return (None, None);
-    }
-    let content = match std::fs::read_to_string(&defaults_path) {
-        Ok(content) => content,
-        Err(e) => {
-            return (
-                None,
-                Some(format!("{}: unreadable: {e}", defaults_path.display())),
-            );
+/// Read defaults strictly: errors must not turn a tree into a partial manifest.
+fn load_defaults(dir: &Path) -> Result<Option<BTreeMap<String, toml::Value>>, RelishError> {
+    let path = dir.join("_defaults.toml");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RelishError::FormatFailed(format!(
+                "{}: {error}",
+                path.display()
+            )));
         }
-    };
-    match toml::from_str(&content) {
-        Ok(parsed) => (Some(parsed), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "{}: invalid TOML, defaults not applied: {e}",
-                defaults_path.display()
-            )),
-        ),
+        Ok(_) => {}
     }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))?;
+    toml::from_str(&content)
+        .map(Some)
+        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))
 }
 
 /// Apply defaults to a config. For each app, if a field from defaults
@@ -218,7 +214,7 @@ fn derive_namespace(root: &Path, file: &Path) -> Option<String> {
     parent.file_name()?.to_str().map(String::from)
 }
 
-/// Apply a namespace to all apps and jobs in a config that don't
+/// Apply a namespace to all apps, jobs and builds in a config that don't
 /// already have one set.
 fn apply_namespace(config: &mut Config, namespace: &str) {
     for app in config.app.values_mut() {
@@ -231,52 +227,82 @@ fn apply_namespace(config: &mut Config, namespace: &str) {
             job.namespace = Some(namespace.to_string());
         }
     }
+    for build in config.build.values_mut() {
+        if build.namespace.is_none() {
+            build.namespace = Some(namespace.to_string());
+        }
+    }
 }
 
-/// Merge `source` into `target`, appending all resources.
-///
-/// Returns a warning for every resource the merge *overwrote* (O10). The
-/// maps are keyed by name, so `extend` silently replaced a same-named app
-/// from an earlier file — split your apps across two files, name one twice
-/// by accident, and `compile` would emit one of them with no hint that the
-/// other ever existed. Two apps of the same name in *different* namespaces
-/// are legitimate (DEP1) and are not reported.
-#[must_use]
-fn merge_into(target: &mut Config, source: Config) -> Vec<String> {
+/// Merge resources, refusing identities that the bare-name maps cannot express.
+/// Same-namespace duplicates retain the existing last-file-wins warning policy.
+fn merge_into(target: &mut Config, source: Config) -> Result<Vec<String>, RelishError> {
     let mut collisions = Vec::new();
 
     for (name, spec) in source.app {
-        let namespace = spec.namespace.clone();
-        if let Some(existing) = target.app.get(&name)
-            && existing.namespace == namespace
-        {
+        if let Some(existing) = target.app.get(&name) {
+            check_namespace_collision(
+                "app",
+                &name,
+                existing.namespace.as_deref(),
+                spec.namespace.as_deref(),
+            )?;
             collisions.push(format!(
-                "duplicate app {:?} in namespace {:?}: the later definition wins",
-                name,
-                namespace.as_deref().unwrap_or("default")
+                "duplicate app {name:?} in namespace {:?}: the later definition wins",
+                spec.namespace.as_deref().unwrap_or("default")
             ));
         }
         target.app.insert(name, spec);
     }
-
     for (name, spec) in source.job {
-        let namespace = spec.namespace.clone();
-        if let Some(existing) = target.job.get(&name)
-            && existing.namespace == namespace
-        {
+        if let Some(existing) = target.job.get(&name) {
+            check_namespace_collision(
+                "job",
+                &name,
+                existing.namespace.as_deref(),
+                spec.namespace.as_deref(),
+            )?;
             collisions.push(format!(
-                "duplicate job {:?} in namespace {:?}: the later definition wins",
-                name,
-                namespace.as_deref().unwrap_or("default")
+                "duplicate job {name:?} in namespace {:?}: the later definition wins",
+                spec.namespace.as_deref().unwrap_or("default")
             ));
         }
         target.job.insert(name, spec);
     }
-
+    for (name, spec) in source.build {
+        if let Some(existing) = target.build.get(&name) {
+            check_namespace_collision(
+                "build",
+                &name,
+                existing.namespace.as_deref(),
+                spec.namespace.as_deref(),
+            )?;
+            collisions.push(format!(
+                "duplicate build {name:?} in namespace {:?}: the later definition wins",
+                spec.namespace.as_deref().unwrap_or("default")
+            ));
+        }
+        target.build.insert(name, spec);
+    }
     target.namespace.extend(source.namespace);
     target.permission.extend(source.permission);
-    target.build.extend(source.build);
-    collisions
+    Ok(collisions)
+}
+
+fn check_namespace_collision(
+    kind: &str,
+    name: &str,
+    existing: Option<&str>,
+    incoming: Option<&str>,
+) -> Result<(), RelishError> {
+    let existing = existing.unwrap_or("default");
+    let incoming = incoming.unwrap_or("default");
+    if existing != incoming {
+        return Err(RelishError::FormatFailed(format!(
+            "cannot compile {kind}.{name} from namespaces {existing:?} and {incoming:?} into one manifest: use distinct resource names or apply separate manifests"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -355,49 +381,61 @@ mod tests {
         assert_eq!(result.config.app["web"].image.as_deref(), Some("second:1"));
     }
 
-    /// Two apps of the same name in different namespaces have been
-    /// legitimate since DEP1, and must not be reported as a collision.
     #[test]
-    fn same_app_name_in_two_namespaces_is_not_a_duplicate() {
-        let dir = TempDir::new().unwrap();
-        fs::create_dir(dir.path().join("team-a")).unwrap();
-        fs::create_dir(dir.path().join("team-b")).unwrap();
-        write_file(
-            &dir.path().join("team-a"),
-            "web.toml",
-            "[app.web]\nimage = \"a:1\"\n",
-        );
-        write_file(
-            &dir.path().join("team-b"),
-            "web.toml",
-            "[app.web]\nimage = \"b:1\"\n",
-        );
-
-        let result = compile(dir.path()).unwrap();
-        assert!(
-            !result.warnings.iter().any(|w| w.contains("duplicate app")),
-            "namespaced apps were reported as duplicates: {:?}",
-            result.warnings
-        );
+    fn cross_namespace_workloads_cannot_be_silently_overwritten() {
+        for kind in ["app", "job", "build"] {
+            let dir = TempDir::new().unwrap();
+            for (file, namespace) in [("a.toml", "prod"), ("b.toml", "staging")] {
+                let fields = if kind == "build" {
+                    "context = \".\"\ndestination = \"pickle://web:1\"\n"
+                } else {
+                    "image = \"image:1\"\n"
+                };
+                write_file(
+                    dir.path(),
+                    file,
+                    &format!("[{kind}.web]\nnamespace = \"{namespace}\"\n{fields}"),
+                );
+            }
+            let error = compile(dir.path())
+                .expect_err("both namespaces cannot fit a bare-name map")
+                .to_string();
+            assert!(
+                error.contains("web") && error.contains("prod") && error.contains("staging"),
+                "{error}"
+            );
+        }
     }
 
-    /// O10: a malformed `_defaults.toml` used to be indistinguishable from
-    /// no defaults at all, so the error surfaced later as a missing field.
     #[test]
-    fn a_malformed_defaults_file_is_reported() {
+    fn directory_namespaces_cannot_lose_same_named_workloads() {
+        for kind in ["app", "job", "build"] {
+            let dir = TempDir::new().unwrap();
+            for namespace in ["prod", "staging"] {
+                let subdir = dir.path().join(namespace);
+                fs::create_dir(&subdir).unwrap();
+                let fields = if kind == "build" {
+                    "context = \".\"\ndestination = \"pickle://web:1\"\n"
+                } else {
+                    "image = \"image:1\"\n"
+                };
+                write_file(&subdir, "web.toml", &format!("[{kind}.web]\n{fields}"));
+            }
+            let error = compile(dir.path()).unwrap_err().to_string();
+            assert!(
+                error.contains("prod") && error.contains("staging"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_defaults_refuse_the_entire_compile() {
         let dir = TempDir::new().unwrap();
         write_file(dir.path(), "_defaults.toml", "image = \"not closed\n");
         write_file(dir.path(), "a.toml", "[app.web]\nimage = \"x:1\"\n");
-
-        let result = compile(dir.path()).unwrap();
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("_defaults.toml") && w.contains("invalid TOML")),
-            "a malformed defaults file was swallowed: {:?}",
-            result.warnings
-        );
+        let error = compile(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("_defaults.toml"), "{error}");
     }
 
     #[test]
@@ -453,22 +491,38 @@ mod tests {
     }
 
     #[test]
-    fn compile_invalid_file_skipped_with_warning() {
+    fn malformed_workload_files_refuse_the_entire_compile() {
         let dir = TempDir::new().unwrap();
         write_file(dir.path(), "bad.toml", "this is not valid toml [[[");
-        write_file(
-            dir.path(),
-            "good.toml",
-            r#"
-            [app.web]
-            image = "myapp:v1"
-            "#,
-        );
+        write_file(dir.path(), "good.toml", "[app.web]\nimage = \"web:1\"\n");
+        let error = compile(dir.path())
+            .expect_err("partial manifests must not be emitted")
+            .to_string();
+        assert!(error.contains("bad.toml"), "{error}");
+    }
 
-        let result = compile(dir.path()).unwrap();
-        assert_eq!(result.config.app.len(), 1, "valid file should be parsed");
-        assert_eq!(result.warnings.len(), 1, "bad file should produce warning");
-        assert!(result.warnings[0].contains("bad.toml"));
+    #[test]
+    fn invalid_files_in_nested_directories_refuse_the_entire_compile() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("prod")).unwrap();
+        write_file(&dir.path().join("prod"), "bad.toml", "[app.web\n");
+        write_file(dir.path(), "good.toml", "[app.api]\nimage = \"api:1\"\n");
+        assert!(
+            compile(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("bad.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_symlink_input_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("bad.toml"))
+            .unwrap();
+        let error = compile(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("bad.toml"), "{error}");
     }
 
     #[test]
