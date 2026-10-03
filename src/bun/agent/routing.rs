@@ -3,6 +3,22 @@
 
 use super::*;
 
+#[cfg(all(test, not(all(feature = "ebpf", target_os = "linux"))))]
+thread_local! {
+    /// The VIPs whose whole kernel entry an agent on this thread withdrew,
+    /// so tests without the eBPF data path can still see a withdrawal.
+    /// Tests run on a current-thread runtime, and a thread runs one test at
+    /// a time; read it with [`take_whole_entry_withdrawals`].
+    static WHOLE_ENTRY_WITHDRAWALS: std::cell::RefCell<Vec<crate::onion::vip::VirtualIP>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the whole-entry withdrawals recorded on this thread.
+#[cfg(all(test, not(all(feature = "ebpf", target_os = "linux"))))]
+pub(super) fn take_whole_entry_withdrawals() -> Vec<crate::onion::vip::VirtualIP> {
+    WHOLE_ENTRY_WITHDRAWALS.with_borrow_mut(std::mem::take)
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Republish the current `DnsNxdomain` fault set to the DNS responder.
     ///
@@ -130,9 +146,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn withdraw_service_ebpf(
         &self,
-        _id: &crate::onion::service_id::ServiceId,
+        id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
-        Ok(())
+        let Some(entry) = self.service_map.resolve(id) else {
+            return Ok(());
+        };
+        self.withdraw_discovery_entry(entry).await
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
@@ -140,6 +159,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         _entry: &crate::onion::types::ServiceEntry,
     ) -> Result<(), BunError> {
+        #[cfg(test)]
+        WHOLE_ENTRY_WITHDRAWALS.with_borrow_mut(|withdrawn| withdrawn.push(_entry.vip));
         Ok(())
     }
 

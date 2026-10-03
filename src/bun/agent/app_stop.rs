@@ -403,7 +403,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// In a cluster the kernel entry for a VIP is the whole view, other
     /// nodes' backends included. Deleting it on a local stop refused every
     /// local client with `EPERM` until the next catalogue arrived (#481).
-    async fn withdraw_backends_from_view(
+    /// A local rollout retires its old instances the same way.
+    pub(super) async fn withdraw_backends_from_view(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
         instances: &[InstanceId],

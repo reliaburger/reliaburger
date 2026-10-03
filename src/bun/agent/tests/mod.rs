@@ -11766,16 +11766,17 @@ async fn deploy_before_its_committed_allocation_leaves_nothing_for_the_retry() {
     assert_eq!(instances, ["default__web-0".to_string()]);
 }
 
-/// #481: stopping this node's last replica of a service that still runs
-/// on other nodes withdrew the whole VIP from the kernel, so local clients
-/// got `EPERM` until the next catalogue arrived. The stop must take only
-/// this node's backends out of the installed view; the kernel entry is
-/// written from that same view, so it keeps the remote backends too.
-#[tokio::test]
-async fn stopping_the_last_local_replica_keeps_routing_to_other_nodes() {
+/// A consumer node running `web-0`, whose published view of `web` also
+/// names a replica on another node. Returns the agent, its records and
+/// `web`'s VIP.
+async fn consumer_web_fixture() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::vip::VirtualIP,
+) {
     use crate::onion::catalog::CatalogBackend;
     use crate::onion::service_id::ServiceId;
-    let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+    let (mut agent, root, catalog) = clustered_allocation_fixture().await;
     agent.supervisor.grill().set_pid(std::process::id());
     let (_, ingress) = cluster_publication_fixture();
     let web = ServiceId::new("default", "web");
@@ -11842,26 +11843,62 @@ async fn stopping_the_last_local_replica_keeps_routing_to_other_nodes() {
         host_port: 30002,
         healthy: true,
     };
+    let committed = with_web(vec![here, elsewhere]);
+    let vip = committed.resolve(&web).unwrap().vip;
     agent
-        .synchronise_consumer(3, with_web(vec![here, elsewhere]), ingress, vec![])
+        .synchronise_consumer(3, committed, ingress, vec![])
         .await
         .unwrap();
-    let backends = |agent: &BunAgent<MockGrill>| {
-        agent
-            .service_map_tx
-            .borrow()
-            .resolve(&web)
-            .map(|entry| entry.backends.clone())
-            .unwrap_or_default()
+    let view = consumer_web_view(&agent);
+    assert_eq!(view.len(), 2, "the view should name both replicas");
+    assert!(view.iter().any(|backend| backend.local));
+    (agent, root, vip)
+}
+
+/// The backends the installed consumer view names for `web`.
+fn consumer_web_view(agent: &BunAgent<MockGrill>) -> Vec<crate::onion::types::BackendInstance> {
+    agent
+        .service_map_tx
+        .borrow()
+        .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
+        .map(|entry| entry.backends.clone())
+        .unwrap_or_default()
+}
+
+/// Whether an agent on this thread withdrew `vip`'s whole kernel entry
+/// since the last call. Unit tests have no eBPF data path, so the agent
+/// records the withdrawal instead.
+fn withdrew_whole_entry(vip: crate::onion::vip::VirtualIP) -> bool {
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    let withdrew = super::routing::take_whole_entry_withdrawals().contains(&vip);
+    // With the data path compiled in, an agent without a loaded handle
+    // withdraws nothing, whole or not.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    let withdrew = {
+        let _ = vip;
+        false
     };
-    let before = backends(&agent);
-    assert_eq!(before.len(), 2, "the view should name both replicas");
-    assert!(before.iter().any(|backend| backend.local));
+    withdrew
+}
+
+/// #481: stopping this node's last replica of a service that still runs
+/// on other nodes withdrew the whole VIP from the kernel, so local clients
+/// got `EPERM` until the next catalogue arrived. The stop must take only
+/// this node's backends out of the installed view; the kernel entry is
+/// written from that same view, so it keeps the remote backends too.
+#[tokio::test]
+async fn stopping_the_last_local_replica_keeps_routing_to_other_nodes() {
+    let (mut agent, _root, vip) = consumer_web_fixture().await;
+    let before = consumer_web_view(&agent);
+    let _ = withdrew_whole_entry(vip);
 
     agent.begin_app_stop("web", "default").await.unwrap();
-    let after = backends(&agent);
+    assert!(
+        !withdrew_whole_entry(vip),
+        "the stop deleted the kernel entry, other nodes' backends included"
+    );
     assert_eq!(
-        after,
+        consumer_web_view(&agent),
         before
             .into_iter()
             .filter(|backend| !backend.local)
@@ -11869,6 +11906,34 @@ async fn stopping_the_last_local_replica_keeps_routing_to_other_nodes() {
         "the stop must withdraw only this node's backend, not the whole VIP"
     );
     assert!(agent.consumer_view_stale, "the next tick rebuilds the view");
+}
+
+/// #481, the rollout half: finishing a local rolling deploy withdrew the
+/// whole kernel entry the same way, the other node's backend and the new
+/// local replica included, until the next view refresh put it back.
+#[tokio::test]
+async fn a_local_rollout_keeps_routing_to_other_nodes() {
+    let (mut agent, _root, vip) = consumer_web_fixture().await;
+    let _ = withdrew_whole_entry(vip);
+
+    let mut changed = basic_config();
+    changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    expect_complete(&drain_deploy(&mut agent, changed).await);
+    assert!(
+        !withdrew_whole_entry(vip),
+        "the rollout deleted the kernel entry, other nodes' backends included"
+    );
+    let view = consumer_web_view(&agent);
+    assert!(
+        view.iter().any(|backend| !backend.local),
+        "the other node's backend left the view: {view:?}"
+    );
+    assert!(
+        !view
+            .iter()
+            .any(|backend| backend.local && backend.instance_id == "default__web-0"),
+        "the replaced replica is still routed: {view:?}"
+    );
 }
 
 /// A discovery-owning agent with a Pending `web` instance whose runtime
