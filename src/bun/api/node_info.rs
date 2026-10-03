@@ -357,6 +357,10 @@ pub(super) fn council_app_evidence(
                     crate::cluster::orchestrate::volume_home_away(desired, app_id, spec, live)
                         .map(|node| node.0)
                 }),
+                volume_homes: crate::cluster::orchestrate::volume_homes(desired, app_id, spec)
+                    .into_iter()
+                    .map(|node| node.0)
+                    .collect(),
             },
         )
         .collect::<Vec<_>>();
