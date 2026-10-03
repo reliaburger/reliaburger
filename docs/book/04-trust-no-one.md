@@ -1051,3 +1051,13 @@ after startup begins and separately check the empty-store deadline. A shutdown
 guard cancels already spawned tasks when startup exits with an error; Rust drops
 the guard on both the success and error return paths.
 
+
+
+A renewal test needs two clocks. The real certificate must remain valid long
+enough for TLS to complete, while the connection lifetime calculation can use
+an injected time close to expiry. We use the ordinary TLS listener and pooled
+client, allow a request to lose its connection during retirement, and require
+the next successful connection to present the renewed certificate. A handler
+records old-identity requests after the test deadline even if no response reaches
+the client. Keeping retirement disabled in a negative control proves the test
+would catch the original bug. Production still uses the current system time.
