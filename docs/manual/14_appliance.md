@@ -54,9 +54,24 @@ The installer checks that signature before it writes anything. It carries the
 same run's public key.
 
 Once an OS release is published, `relish image download --dir os` fetches the
-newest one instead (add `--arch aarch64` for arm64 machines). It checks the
-release against the key relish carries and writes the same layout, `os/x86_64/`
-or `os/aarch64/`.
+newest one instead. It fetches every architecture the release has, whatever
+the machine you run it on, so an arm64 Mac serving x86_64 machines gets the
+right image. It checks each one against the key relish carries, writes the same
+layout, `os/x86_64/` and `os/aarch64/`, and ends by naming what it saved:
+
+```
+Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)
+```
+
+To fetch only the architecture of your machines and save a few hundred
+megabytes, name it with `--arch`; repeat the flag for more than one:
+
+```sh
+relish image download --dir os --arch x86_64
+```
+
+An architecture the release doesn't have is refused, and so is a name relish
+doesn't know (`x86_64` and `aarch64` are the two it builds).
 
 ## Serve them
 
