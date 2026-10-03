@@ -135,7 +135,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         for record in records {
             if !launches.iter().any(|launch| {
-                launch.instance_id.0 == record.instance_id && launch.spec == record.oci_spec
+                launch.instance_id.0 == record.instance_id && launch.launched(&record.oci_spec)
             }) {
                 return Err(BunError::AdoptionState(
                     "adoption record conflicts with original runtime inventory".into(),

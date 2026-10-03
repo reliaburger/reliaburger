@@ -65,7 +65,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if !launches.iter().any(|current| {
                 current.instance_id == original.instance_id
                     && current.generation == original.generation
-                    && current.spec == original.spec
+                    && current.launched(&original.spec)
             }) {
                 return Err(BunError::AdoptionState(
                     "startup cleanup execution changed".into(),

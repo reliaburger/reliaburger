@@ -32,7 +32,7 @@ fn instance(root: &Path) -> InstanceId {
 fn spec(root: &Path, script: &str) -> OciSpec {
     let mut spec: OciSpec = serde_json::from_value(serde_json::json!({
         "root": {"path": "/empty-fixture", "readonly": true},
-        "process": {"args": ["/bin/busybox", "sh", "-c", script], "env": ["PATH=/bin"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+        "process": {"args": ["/bin/busybox", "sh", "-c", script], "env": ["PATH=/bin", format!("API_TOKEN={SECRET}")], "cwd": "/", "user": {"uid": 0, "gid": 0}},
         "mounts": [], "linux": {"namespaces": []}
     })).unwrap();
     spec.mounts = reliaburger::grill::oci::standard_mounts();
@@ -64,6 +64,28 @@ async fn wait_file(path: &Path) {
     .unwrap();
 }
 
+/// Stands in for a value decrypted from `ENC[...]`.
+const SECRET: &str = "owned-runc-decrypted-secret";
+
+/// Whether any regular file below `path` contains `needle`.
+fn contains_text(path: &Path, needle: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("{}: {error}", path.display()),
+        // A root filesystem holds only fixture binaries, and could still hold
+        // a kernel mount if cleanup regressed; never read through one.
+        Ok(metadata) if metadata.is_dir() => std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name() != "rootfs")
+            .any(|entry| contains_text(&entry.path(), needle)),
+        Ok(metadata) if metadata.is_file() => {
+            String::from_utf8_lossy(&std::fs::read(path).unwrap()).contains(needle)
+        }
+        Ok(_) => false,
+    }
+}
+
 fn assert_absent(root: &Path, id: &InstanceId) {
     assert!(!root.join("state").join(&id.0).exists());
     // The spec carries decrypted env; it must not outlive the instance.
@@ -74,6 +96,17 @@ fn assert_absent(root: &Path, id: &InstanceId) {
             .join("config.json")
             .exists()
     );
+    // Nor may the retired intent keep it (#476).
+    for path in [
+        root.join("bundles").join(&id.0),
+        root.join("bundles/.intents/records").join(&id.0),
+    ] {
+        assert!(
+            !contains_text(&path, SECRET),
+            "{} kept a decrypted secret",
+            path.display()
+        );
+    }
     assert!(!reliaburger::grill::netns::namespace_path(id).exists());
     assert!(
         !Path::new("/sys/class/net")

@@ -825,7 +825,35 @@ Why delete only the spec and not the whole bundle directory? Because the bundle 
 
 The tests come in two layers. The `grill::bundle` unit tests run on every development machine, including macOS where runc doesn't exist. They check the modes with `std::os::unix::fs::PermissionsExt` (an extension trait: importing it adds a `mode()` method to the standard `Permissions` type, which is how Rust exposes Unix-only details without putting them on every platform), and check that removal leaves the upper alone. The Linux runc tests then assert the same modes on a real bundle and that `config.json` is gone after `kill` and after a natural exit.
 
-We haven't closed every copy yet. The agent's adoption record and the runtime's own launch intent also hold the full spec, because a restarted agent must compare it with the running workload before adopting it. Both are 0600 inside owner-only directories, and the adoption record goes away with the instance. A retired intent, though, keeps its copy until the same instance id starts again. Scrubbing it means teaching every recovery comparison to ignore the environment, which is a bigger change than this fix.
+That wasn't every copy. The agent's adoption record and the runtime's own launch intent (`bundles/.intents/records/<instance>/intent.json`) also hold the full spec, because a restarted agent must compare it with the running workload before adopting it. Both are 0600 inside owner-only directories, and the adoption record goes away with the instance. The intent doesn't. Once its generation retires it stays on disk as the record that nothing owns any more, and until the same instance id started again (which may be never) it kept the decrypted `DB_PASSWORD` too.
+
+Could we stop writing the plaintext into the intent at all? Not while the instance runs: recovery after a crash compares the spec the agent asked for with the one the runtime recorded, field by field, and a secret that changed is a different request. Once the generation retires, though, nothing can adopt or relaunch it. So retirement now cuts every environment entry down to its name before it writes the record:
+
+```rust
+pub fn without_environment_values(&self) -> OciSpec {
+    let mut scrubbed = self.clone();
+    for entry in &mut scrubbed.process.env {
+        if let Some((name, _value)) = entry.split_once('=') {
+            *entry = name.to_string();
+        }
+    }
+    scrubbed
+}
+```
+
+`split_once` returns an `Option<(&str, &str)>`: `Some` with the parts either side of the first `=`, or `None` when there isn't one. The `if let` pattern destructures the tuple in one go, and the leading underscore in `_value` tells the compiler (and the reader) we're ignoring it on purpose. `&mut scrubbed.process.env` borrows the vector mutably, so `entry` is a `&mut String` we can overwrite through `*entry`. We work on a clone because the caller's spec is borrowed with `&self`, read-only.
+
+Why keep the names rather than empty the list? Because recovery still compares retired intents. Half a dozen places (adoption records, discovery, egress, startup cleanup, the status report) ask "was this generation launched from that spec?", and an empty environment would make an instance that set three variables indistinguishable from one that set none. Every one of those places now calls `OciSpec::matches_journal` instead of `==`:
+
+```rust
+pub fn matches_journal(&self, journal: &OciSpec) -> bool {
+    self == journal || self.without_environment_values() == *journal
+}
+```
+
+A live intent must be equal, as before. A retired one must be equal once the values are gone. The trick that keeps this honest is that a launched entry is always `NAME=value`. A scrubbed entry has no `=`, so a live intent can never pass for a scrubbed one, and scrubbing twice changes nothing (retiring an already retired intent is idempotent, so that matters).
+
+The test that pins it lives in `tests/runc_intent.rs`. It builds a spec from an app whose `API_TOKEN` is `ENC[AGE:...]`, decrypts it with a stand-in decryptor, publishes and retires the intent, then walks every file under the bundle base looking for the plaintext. Before the fix it found `intent.json`. The Linux runc tests now carry a fake decrypted secret in every workload and make the same check on each instance's bundle and intent once it has stopped.
 
 ## Certificate revocation
 
