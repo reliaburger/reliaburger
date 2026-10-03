@@ -339,7 +339,76 @@ order=$(efibootmgr | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -vx "$new" 
 efibootmgr -q -o "$new${order:+,$order}"
 ```
 
-Why bother, when the operator can set the boot order in the BIOS? Because you put network boot first to install, and then you forget. A machine that network-boots every time would reinstall itself every time, or stall waiting for a server that's gone home. So the installer makes the disk come first. And if a machine does network-boot onto a disk that already carries a `reliaburger-data` partition, the installer leaves the disk alone: it puts the disk's boot entry first again, also names it as the next boot with `efibootmgr -n`, and reboots into the existing install. Wiping a non-empty disk needs `reliaburger.wipe=1` on the command line. The removable-media path, `\EFI\BOOT\BOOT*.EFI`, stays as a fallback for firmware that forgets entries the OS created.
+Why bother, when the operator can set the boot order in the BIOS? Because you put network boot first to install, and then you forget. A machine that network-boots every time would reinstall itself every time, or stall waiting for a server that's gone home. So the installer makes the disk come first. And if a machine does network-boot onto a disk that already carries a `reliaburger-data` partition, the installer leaves the disk alone: it puts the disk's boot entry first again, also names it as the next boot with `efibootmgr -n`, and reboots into the existing install. Wiping any other non-empty disk needs `reliaburger.wipe=1` on the command line, or a yes from the operator, which is the next section. The removable-media path, `\EFI\BOOT\BOOT*.EFI`, stays as a fallback for firmware that forgets entries the OS created.
+
+### Asking before wiping
+
+Ten second-hand Dell Wyse 3040s arrived for the lab. Some had blank eMMCs. Some still had ThinOS on them. The installer above refuses a disk that isn't empty unless the kernel command line says `reliaburger.wipe=1`, and `relish netboot` writes that command line, so the obvious fix is a `--wipe` flag that adds it. It's also the wrong fix. A flag that wipes every machine that network-boots will one day meet a laptop on the same switch whose owner pressed F12 at the wrong moment.
+
+So the decision moved to the person at the `relish netboot` terminal. Before it writes anything, the installer runs `ask-to-wipe`, which posts what `lsblk -P` sees on the disk to the URL `relish netboot` gave it on the command line (`reliaburger.ask=http://…/disk?mac=…&uuid=…`). It gets back a ticket, and polls `GET /disk/<ticket>` every two seconds. Meanwhile the operator sees:
+
+```
+relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+```
+
+The whole policy is one pure function in `src/relish/netboot/wipe.rs`:
+
+```rust
+pub fn decide(
+    report: &DiskReport,
+    mac: Option<MacAddress>,
+    pre_approved: &[MacAddress],
+    answer: Answer,
+) -> WipeDecision {
+    without_asking(report, mac, pre_approved).unwrap_or(match answer {
+        Answer::Yes => WipeDecision::WipeAndInstall,
+        Answer::No | Answer::NoAnswer | Answer::NoTerminal => WipeDecision::Decline,
+    })
+}
+```
+
+`without_asking` returns `Some(Install)` for a blank disk, `Some(WipeAndInstall)` for a MAC that `--wipe` lists, and `None` for everything else, which is when the operator's answer counts. `unwrap_or` takes the `Option`'s value if there is one, or the fallback. The `match` lists every `Answer` variant, so adding a fifth one later (say, "wipe all remaining") won't compile until someone decides what it means here. That's the decision table, and the unit test walks it row by row:
+
+| Disk | `--wipe` lists it | Operator | Result |
+|------|-------------------|----------|--------|
+| blank | either | not asked | install |
+| used | yes | not asked | wipe, install |
+| used | no | `y` | wipe, install |
+| used | no | anything else | leave it alone |
+| used | no | no answer in 10 minutes | leave it alone |
+| used | no | no terminal (stdin isn't a TTY) | leave it alone |
+
+A disk that already holds Reliaburger OS never reaches the table: as before, the installer boots it.
+
+#### Why a machine can't approve its own wipe
+
+Look at what each endpoint accepts. `POST /disk` takes lsblk output and returns a random ticket. It never returns a decision, and nothing in the body is a decision: the only thing a report can influence is whether the disk looks blank. `GET /disk/<ticket>` reads. There's no `PUT`, no `POST` to a ticket, no `?answer=yes`, and a test sends all four write methods to a ticket and expects `405 Method Not Allowed`. The decision comes from exactly two places: a line typed on the terminal's stdin, or the `--wipe` list on the command line. Neither is reachable over the network.
+
+Why tickets rather than polling by MAC? Because MACs are easy to fake. If the installer polled `GET /disk?mac=…`, any machine on the LAN could post a blank-looking report under a Wyse's MAC, collect an `install`, and the real Wyse would read that answer as its own. With tickets, each report gets its own question and its own answer, and the installer only ever reads the answer to *its* report. It also refuses `install` for a disk it saw was used ("that answer wasn't for this disk"), so only the word `wipe` lets it write over anything.
+
+That doesn't make the network trusted. A machine can still lie about its own disk, but all it achieves is wiping itself, which it could do anyway. And a forged report under someone else's MAC shows up as a second question about the same machine, which an operator who's paying attention will notice. The `--mac` allow-list has the same limit: it trusts what the switch tells it.
+
+A "no" means no for the rest of the session. `DiskSession` remembers the machine, its next `boot.ipxe` is an `exit 1` that sends it to its own disk, and its entry in `netboot-installed.json` (written when it downloaded the installer) is removed again, so the next `relish netboot` run asks afresh instead of treating it as installed. The installer prints why on the console and powers off.
+
+#### Asking from async code
+
+The HTTP handler can't block waiting for a human, and several machines may report at once. So each report spawns a task that sends a `Question` down a channel and awaits its answer:
+
+```rust
+let (reply, answer) = oneshot::channel();
+let question = Question { machine, summary, deadline: Instant::now() + state.question_timeout, reply };
+let answer = if operator.send(question).is_ok() {
+    answer.await.unwrap_or(Answer::NoAnswer)
+} else {
+    Answer::NoAnswer
+};
+```
+
+A `oneshot` channel carries exactly one value, from one sender to one receiver: here, the answer back to the task that asked. Moving `reply` into the `Question` moves the right to answer along with it, so whoever ends up holding the question is the only one who can answer it. If that side drops it without answering, `answer.await` returns an error and `unwrap_or` turns it into `NoAnswer`, which declines. A bug that loses a question can't wipe a disk.
+
+One task, `ask_operator`, reads questions off that channel and asks them one at a time, so ten Wyses booting together become ten prompts in a row, not ten prompts fighting over one line of input. It waits with `tokio::time::timeout_at(question.deadline, lines.recv())`. The deadline is counted from the report, not from when the question appears, so a question stuck in the queue behind a slow operator still runs out on time. Before each question it throws away any lines typed since the last one: an Enter pressed twice shouldn't answer a question nobody has read yet.
+
+stdin is the awkward part. Reading a terminal is a blocking call, and tokio can't cancel a blocking read once it starts, so tokio's own documentation suggests a dedicated thread for interactive input. `relish netboot` starts one `std::thread` that reads lines and sends them into an unbounded `mpsc` channel, and only when `std::io::stdin().is_terminal()` says there's a person there. Run it from a script, or in CI with `< /dev/null`, and there's no operator at all: every used disk that `--wipe` doesn't list is left alone. CI's `relish-netboot-install.sh` now writes a GPT and an ext4 filesystem labelled `ThinOS` onto the VM's disk first and passes `--wipe <the VM's MAC>`, so every lab build installs over a used disk.
 
 ## Updating a read-only system
 

@@ -150,6 +150,44 @@ way, so a 2 GiB machine installs a 1.7 GB image without holding any of it in
 memory. It puts the disk first in the boot order and reboots. After a
 reboot the node runs bun on its own, not yet in a cluster.
 
+### A disk that isn't blank
+
+A second-hand machine usually still has its old system on the disk. A Dell
+Wyse 3040, for instance, may come with ThinOS. The installer never wipes a
+disk on its own. Before it writes anything, it reports what's on the disk to
+`relish netboot` and waits. The netboot terminal asks you:
+
+```
+relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+```
+
+Type `y` and Enter to wipe it and install. Anything else, or no answer within
+10 minutes, leaves the disk as it was. The installer says so on the machine's
+console and powers it off. For the rest of that `relish netboot` run, the
+machine is told to boot its own disk and isn't asked again. Start `relish
+netboot` again to be asked again.
+
+A blank disk installs without a question. So does a disk that already holds
+Reliaburger OS: the installer boots it instead of reinstalling.
+
+For an unattended run, list the machines whose disks may be wiped up front:
+
+```sh
+sudo relish netboot os --mac 6c:4b:90:12:34:56 --wipe 6c:4b:90:12:34:56
+```
+
+`--wipe` takes one MAC address and can be repeated. There's no way to say
+"wipe everything": each machine is named. When `relish netboot` runs without
+a terminal (from a script, or with its input redirected), there's nobody to
+ask, so it wipes only the disks of `--wipe` machines and leaves every other
+used disk alone. Every decision goes into its log:
+
+```
+http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wiping it and installing (--wipe lists it)
+```
+
+If several machines report at once, the questions come one at a time.
+
 Write down each machine's MAC address and address from the `this machine`
 line. You'll need them next. (Your router's list of reservations has them
 too.)
