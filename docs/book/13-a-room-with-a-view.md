@@ -362,3 +362,12 @@ timestamp is there because sequences are per process: a member that restarts
 counts from one again, and without it its first new events would look like
 ones the backlog already sent. `the_live_event_stream_merges_every_members_events`
 checks both halves against a fake peer.
+
+The NODE column exposed one thing the views hadn't been ready for. Pressing
+Enter on a job opened `View::JobDetail { name, namespace }`, and the page
+showed the first job with that name. Before the merge there was only ever one;
+now node 2's failed run and node 1's finished one share a name, and choosing
+node 2's row showed node 1's. The view now carries the node and instance too,
+the same identity the row has, and the page looks up exactly that. When a view
+is keyed by less than the row it was opened from, it will eventually show the
+wrong row. `job_detail_shows_the_selected_nodes_instance` pins it.

@@ -6,14 +6,19 @@ use super::widgets;
 
 pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
     match app.view() {
-        View::JobDetail { name, namespace } => {
-            let Some(tagged) = app
-                .data
-                .jobs
-                .iter()
-                .find(|job| &job.row.name == name && &job.row.namespace == namespace)
-            else {
-                return vec![Line::raw("job not found")];
+        View::JobDetail {
+            name,
+            namespace,
+            node,
+            instance,
+        } => {
+            let Some(tagged) = app.data.jobs.iter().find(|job| {
+                &job.row.name == name
+                    && &job.row.namespace == namespace
+                    && &job.node == node
+                    && &job.row.instance_id == instance
+            }) else {
+                return vec![Line::raw(format!("job {name} on {node} not found"))];
             };
             let job = &tagged.row;
             vec![

@@ -179,6 +179,8 @@ mod tests {
         app.view_stack.push(View::JobDetail {
             name: "migrate".into(),
             namespace: "default".into(),
+            node: "node-1".into(),
+            instance: "migrate-0".into(),
         });
         insta::assert_snapshot!("job_detail", render_to_string(&app, 120, 40));
 
