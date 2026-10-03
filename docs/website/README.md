@@ -57,7 +57,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.1.2
+  --record docs/website/assets/tour.cast --install v0.1.3
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -79,7 +79,7 @@ the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` when the
 tarball isn't published yet. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.1.2`.
+`--install v0.1.3`.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 The "Try it in five minutes" section keeps its heading and the recording in
@@ -128,7 +128,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.1.2` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.1.3` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
