@@ -30,7 +30,9 @@ on:
     # Monday 04:00 UTC: Ubuntu's kernels and USNs of the previous week.
     - cron: "0 4 * * 1"
   pull_request:
-    branches: [main, "feat/appliance-*"]
+    # release-* is each release's merge train (the appliance's is
+    # release-1-3-0): PRs into it build and test the image too.
+    branches: [main, "feat/appliance-*", "release-*"]
     paths:
       - "image/**"
       - ".github/workflows/appliance.yml"
