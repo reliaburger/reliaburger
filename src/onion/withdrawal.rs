@@ -12,6 +12,10 @@ pub const MAX_WITHDRAWAL_GENERATIONS: usize = 1_024;
 pub const MAX_WITHDRAWAL_EXPOSURES: usize = 65_536;
 /// Maximum outstanding consumer confirmations across all generations.
 pub const MAX_WITHDRAWAL_CONFIRMATIONS: usize = 262_144;
+/// Catalogue generations a recovery epoch owns: epoch `e` publishes from
+/// `e << 40`, so a council would need 2^40 publications (a million a second
+/// for twelve days) to reach the next epoch's range.
+pub const RECOVERY_EPOCH_SHIFT: u32 = 40;
 
 /// Removed destinations and ownership of their original virtual address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +85,25 @@ pub enum WithdrawalError {
 }
 
 impl EndpointWithdrawals {
+    /// The first catalogue generation of recovery epoch `epoch`.
+    pub fn epoch_floor(epoch: u64) -> u64 {
+        epoch.saturating_mul(1 << RECOVERY_EPOCH_SHIFT)
+    }
+
+    /// Start recovery epoch `epoch`'s generations (#478).
+    ///
+    /// Nodes refuse a catalogue generation below the newest one they have
+    /// confirmed, which is what keeps a stale leader from rolling their
+    /// views back. A council restored from a backup restores the backup's
+    /// generation, and the dead council may have published past it. Lifting
+    /// the generation to the epoch's floor puts every publication of the new
+    /// epoch above every one of the old, so nodes follow the recovered
+    /// council and keep refusing the one it replaced. Retained withdrawals
+    /// keep their original generations, all below the new one.
+    pub fn enter_recovery_epoch(&mut self, epoch: u64) {
+        self.generation = self.generation.max(Self::epoch_floor(epoch));
+    }
+
     /// Virtual addresses retained until all original consumers confirm withdrawal.
     pub fn reserved_vips(&self) -> impl Iterator<Item = super::vip::VirtualIP> + '_ {
         self.pending

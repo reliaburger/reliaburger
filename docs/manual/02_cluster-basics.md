@@ -93,8 +93,9 @@ with a one-line summary of it.
 
 The council heals itself: lose a voter and the reconciler promotes a caught-up
 node in its place. If every voter is lost, `relish council recover` rebuilds
-the council from a stopped survivor's snapshot or a sealed backup (see
-`operations`). Read its `--help` first: writes after the last backup are lost.
+the council from a stopped voter's own snapshot and committed log, or from a
+sealed backup (see `operations`). Read its `--help` first: writes after the
+last backup are lost.
 
 ## When a node is gone for good
 

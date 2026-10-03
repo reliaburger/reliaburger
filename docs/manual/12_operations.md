@@ -231,16 +231,30 @@ relish council recover --data-dir /var/lib/reliaburger/data \
   --from s3://backups/prod-council --master-key /etc/reliaburger/master.key
 ```
 
-Without `--from`, it uses the node's own latest snapshot. It moves the dead
+Without `--from`, it rebuilds the state from the node's own Raft directory:
+its snapshot, if it has taken one, plus every committed log entry after it.
+That only works on a node that was a voter, and the log is encrypted, so pass
+`--master-key` (it defaults to `/etc/reliaburger/master.key` when that file
+exists). Entries the node hadn't seen committed are left out. It moves the dead
 council's Raft directory aside (to `.raft-recovery-*/previous` in the data
 directory, where you can delete it once the cluster is healthy) and stamps a
 new recovery epoch. It refuses while the node is still running, and the next
 start finishes a recovery that crashed part-way. Starting the node brings up a
 one-voter council that grows again as nodes rejoin, even if its config still
 lists `cluster.join` seeds. New members receive the whole restored state.
-Anything written after the backup is lost. It refuses while it can still see a
-live council; `--force` skips that check, and using it against a cluster
-that's still alive splits the brain.
+Anything written after the backup is lost. The restored state keeps its API
+tokens, join tokens and certificate revocations: the node's
+`security.bootstrap_path` file seeds only a brand-new cluster, never a
+recovered one. Nodes that saw the old council publish a newer service
+catalogue than the backup holds still follow the recovered one, because each
+recovery starts a new range of catalogue generations; a leader of the replaced
+council stays refused.
+
+Before it starts, it asks the local agent whether any voter is still alive
+and refuses if one is; `--force` skips that check. The node is stopped by
+then, though, so in practice nothing answers and the check passes. Make sure
+yourself that the other voters are really gone: recovering a cluster that's
+still alive splits the brain.
 
 You need `--force` when a majority is gone but not every voter, say two of
 three. The survivor can't regrow the council alone (changing membership needs

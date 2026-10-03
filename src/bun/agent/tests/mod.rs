@@ -11379,6 +11379,42 @@ async fn durable_consumer_catalogue_change_keeps_captured_requests_and_view() {
     agent.drains.decrement_connections(&backend).await;
 }
 
+/// #478: a council recovered from a backup restores the catalogue
+/// generation the backup holds, older than what the dead council went on to
+/// publish. The node must follow the recovered council's new epoch, and
+/// still refuse a leader of the council it replaced.
+#[tokio::test]
+async fn durable_consumer_follows_a_recovered_council_and_still_refuses_the_replaced_one() {
+    let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+    let (_, ingress) = cluster_publication_fixture();
+    // The last backup was taken at generation 2; the old council published
+    // generation 3 before every voter died.
+    agent
+        .synchronise_consumer(3, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    let mut backup = crate::council::types::DesiredState::default();
+    backup.endpoint_withdrawals.generation = 2;
+    let recovered =
+        crate::council::state_machine::CouncilStateMachine::from_recovered_state(backup)
+            .desired_state()
+            .await
+            .endpoint_withdrawals
+            .generation;
+    let result = agent
+        .synchronise_consumer(recovered, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .expect("the recovered council's publication was refused");
+    assert!(result.published);
+    assert!(
+        agent
+            .synchronise_consumer(4, catalog, ingress, vec![])
+            .await
+            .is_err(),
+        "a leader of the replaced council was accepted after recovery"
+    );
+}
+
 #[tokio::test]
 async fn durable_consumer_history_compacts_once_a_long_capture_releases() {
     let (mut agent, _root, catalog) = clustered_allocation_fixture().await;

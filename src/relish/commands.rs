@@ -969,8 +969,9 @@ fn print_standalone_council(
 /// Recover a cluster whose entire council was lost (12b.2 D21/CP12).
 ///
 /// Offline by design: run it against a STOPPED node. It restores the desired
-/// state (from a sealed backup or the node's own durable snapshot), wipes the
-/// dead cluster's Raft log, and stamps a fresh recovery epoch. The next start
+/// state (from a sealed backup or the node's own snapshot and committed
+/// log), retires the dead cluster's Raft log, and stamps a fresh recovery
+/// epoch. The next start
 /// re-bootstraps a single-voter council the reconciler regrows.
 pub async fn council_recover(
     data_dir: &std::path::Path,
@@ -1001,18 +1002,21 @@ pub async fn council_recover(
         );
     }
 
-    // Load the master key when a sealed backup is the source.
-    let master_key = if from.is_some() {
-        let path = master_key_path
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("/etc/reliaburger/master.key"));
-        Some(
-            crate::sesame::bootstrap::load_master_key(&path)
-                .map_err(|e| RelishError::Recovery(format!("load master key: {e}")))?,
-        )
-    } else {
-        None
+    // A sealed backup always needs the master key. The node's own Raft log
+    // needs it when the cluster encrypts the log, so use one given, or the
+    // default one if it exists; a keyless cluster has none.
+    let default_key = std::path::Path::new("/etc/reliaburger/master.key");
+    let key_path = match master_key_path {
+        Some(path) => Some(path),
+        None if from.is_some() || default_key.exists() => Some(default_key),
+        None => None,
     };
+    let master_key = key_path
+        .map(|path| {
+            crate::sesame::bootstrap::load_master_key(path)
+                .map_err(|e| RelishError::Recovery(format!("load master key: {e}")))
+        })
+        .transpose()?;
 
     let source = match from {
         Some(url) => RecoverySource::BackupUrl(url.to_string()),
@@ -1023,12 +1027,14 @@ pub async fn council_recover(
         .await
         .map_err(|e| RelishError::Recovery(e.to_string()))?;
     let app_count = state.apps.len();
+    let token_count = state.security_state.api_tokens.len();
     let prior_epoch = state.recovery_epoch;
 
     recover_data_dir(data_dir, state).map_err(|e| RelishError::Recovery(e.to_string()))?;
 
     println!("Council recovery complete.");
     println!("  Restored apps:   {app_count}");
+    println!("  API tokens:      {token_count}");
     println!("  Recovery epoch:  {} -> {}", prior_epoch, prior_epoch + 1);
     println!("  Data directory:  {}", data_dir.display());
     println!();
