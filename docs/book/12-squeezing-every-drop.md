@@ -450,6 +450,31 @@ The same review caught an identity bug. A multi-volume snapshot deliberately giv
 
 And one line of config validation: `retain = 0` with a schedule set is now refused at startup. At the time each sweep pruned before it uploaded, so retaining nothing deleted every snapshot the moment it was taken.
 
+### Which node's copy?
+
+An external test of 0.1.2 on three EC2 nodes found the next hole, and it had nothing to do with paths. `volapp` ran on node-03. The tester sent `relish snapshot create volapp` to each node's API in turn, and all three said yes. Only node-03's snapshot held the live data. Node-01 and node-02 had snapshotted stale copies of the volume, left behind when the app had moved earlier (#423), and each node's `list` showed only its own. A node with no copy at all answered "not a managed volume". So a "before-upgrade" snapshot could quietly miss the data it was meant to protect.
+
+The cause was one line in each of the four handlers: `ask_agent(...)`, straight to the local agent. The agent resolves the volume from its own disk inventory, and any node with a leftover directory passes that check. The disk can't tell a live volume from an orphan. The council can, because since #423 it records where every managed-volume app lives: its placements, or for a stopped app, the nodes it last ran on (`last_placed_nodes`), so it can go back to its data.
+
+So the handlers now ask the council first. `volume_homes` in `cluster/orchestrate.rs` turns that record into a list of nodes, less any decommissioned one, and it rides along in the desired-app evidence every node can already read (a non-leader forwards that read to the leader). Then a small pure function picks the route:
+
+```rust
+pub(super) fn snapshot_route(self_name: &str, homes: &[String]) -> SnapshotRoute {
+    match homes {
+        [] => SnapshotRoute::Here,
+        _ if homes.iter().any(|home| home == self_name) => SnapshotRoute::Here,
+        [home] => SnapshotRoute::Forward(home.clone()),
+        _ => SnapshotRoute::Ambiguous(homes.to_vec()),
+    }
+}
+```
+
+That `match` uses *slice patterns*, which C and Go don't have. `[]` matches an empty slice, `[home]` matches a slice of exactly one element and binds it, and `_ if ...` is a pattern with a guard: it matches anything, but only when the condition holds. Arms are tried in order, so the guard sees every non-empty list before `[home]` does. No volume home on record (a standalone node, an app the council doesn't know) means answer here, as before. A node that holds one of the copies answers for its own replica. One other home means forward. Several other homes means there's no single right copy, so the request is refused with a 409 that names them.
+
+Forwarding works like the fault routes from Chapter 8. The request goes on with the caller's own `Authorization` header, so the volume's node repeats every role and scope check, plus an `x-reliaburger-snapshot-forwarded` header. A request carrying that header is always answered where it lands, which means two nodes that briefly disagree about where a volume lives can't bounce it between them forever.
+
+The test is the issue's reproduction on a fake three-node cluster in `cluster_routing_tests.rs`: real routers on loopback, a scripted agent per node, `db`'s volume on node-2. It runs create, list, restore and delete through node-1 and node-3 and checks that only node-2's agent saw them, and that the listing came back with node-2's snapshots. Before the fix, node-1 listed its own.
+
 ### Owning the volume, surviving the crash
 
 The same review had four more findings about snapshots, and they share a theme: each check was right at the moment it ran and wrong a moment later.

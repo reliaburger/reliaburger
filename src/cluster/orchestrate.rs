@@ -1219,8 +1219,25 @@ pub(crate) fn volume_home_away(
     spec: &AppSpec,
     live: &HashSet<String>,
 ) -> Option<NodeId> {
-    if !has_managed_volume(spec) || desired.stopped_apps.contains(app_id) {
+    if desired.stopped_apps.contains(app_id) {
         return None;
+    }
+    volume_homes(desired, app_id, spec)
+        .into_iter()
+        .find(|node| !live.contains(&node.0))
+}
+
+/// Every node that holds `app_id`'s managed volumes, live or not: its
+/// placements, or with none (a stopped app), the nodes it last ran on, less
+/// any decommissioned node, in placement order without repeats. Empty for an
+/// app without a managed volume.
+pub(crate) fn volume_homes(
+    desired: &crate::council::types::DesiredState,
+    app_id: &crate::meat::types::AppId,
+    spec: &AppSpec,
+) -> Vec<NodeId> {
+    if !has_managed_volume(spec) {
+        return Vec::new();
     }
     let placed: Vec<&NodeId> = desired
         .scheduling
@@ -1237,10 +1254,13 @@ pub(crate) fn volume_home_away(
         placed
     };
     let retired = &desired.security_state.crl.retired_nodes;
-    homes
-        .into_iter()
-        .find(|node| !live.contains(&node.0) && !retired.contains_key(&node.0))
-        .cloned()
+    let mut unique: Vec<NodeId> = Vec::new();
+    for node in homes {
+        if !retired.contains_key(&node.0) && !unique.contains(node) {
+            unique.push(node.clone());
+        }
+    }
+    unique
 }
 
 /// Whether a fixed-size app keeps state in a managed volume, which lives on

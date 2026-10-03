@@ -526,6 +526,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             service_port: spec.port,
                             blocked: None,
                             volume_home_away: None,
+                            volume_homes: Vec::new(),
                         },
                     )
                     .collect::<Vec<_>>();

@@ -55,6 +55,7 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         service_port: Some(8080),
         blocked: None,
         volume_home_away: None,
+        volume_homes: Vec::new(),
     };
 
     let visible = filter_desired_apps_for_scope(
@@ -5756,6 +5757,73 @@ fn council_app_evidence_names_the_volume_home_an_app_waits_for() {
     assert_eq!(away(&retired), None);
 }
 
+/// #482: desired-app evidence names every node holding an app's managed
+/// volume, so a snapshot request can reach it from any node: the placements,
+/// a stopped app's last homes, never a decommissioned node, and nothing for
+/// an app without a managed volume.
+#[test]
+fn council_app_evidence_names_the_nodes_holding_an_apps_volume() {
+    let mut desired = crate::council::types::DesiredState::default();
+    let db = crate::meat::types::AppId::new("db", "prod");
+    let web = crate::meat::types::AppId::new("web", "prod");
+    let volume_spec: crate::config::app::AppSpec =
+        toml::from_str("image = \"x:1\"\nreplicas = 2\n[[volumes]]\npath = \"/data\"\n").unwrap();
+    let plain_spec: crate::config::app::AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+    desired.apps.insert(db.clone(), volume_spec);
+    desired.apps.insert(web.clone(), plain_spec);
+    let placement = |node: &str, ordinal| crate::meat::types::Placement {
+        node_id: crate::meat::NodeId::new(node),
+        resources: crate::meat::Resources::new(100, 0, 0),
+        ordinal,
+    };
+    desired.scheduling.insert(
+        db.clone(),
+        vec![placement("node-3", 0), placement("node-1", 1)],
+    );
+    desired.scheduling.insert(web, vec![placement("node-2", 0)]);
+
+    let homes = |desired: &crate::council::types::DesiredState| {
+        council_app_evidence(desired, None)
+            .into_iter()
+            .map(|app| (app.app, app.volume_homes))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        homes(&desired),
+        [
+            (
+                "db".to_string(),
+                vec!["node-3".to_string(), "node-1".to_string()]
+            ),
+            ("web".to_string(), Vec::new()),
+        ]
+    );
+
+    let mut stopped = desired.clone();
+    stopped.stopped_apps.insert(db.clone());
+    stopped.scheduling.insert(db.clone(), Vec::new());
+    stopped
+        .last_placed_nodes
+        .insert(db.clone(), vec![crate::meat::NodeId::new("node-3")]);
+    assert_eq!(homes(&stopped)[0].1, ["node-3".to_string()]);
+
+    let mut retired = desired.clone();
+    retired.security_state.crl.retired_nodes.insert(
+        "node-3".into(),
+        crate::cluster::retirement::NodeRetirement {
+            node_id: "node-3".into(),
+            retired_by: "operator".into(),
+            reason: "disk died".into(),
+            retired_at_unix_ms: 30,
+            released_placements: Default::default(),
+            released_registry_writers: Default::default(),
+            released_node_fault: None,
+            released_endpoint_consumer: false,
+        },
+    );
+    assert_eq!(homes(&retired)[0].1, ["node-1".to_string()]);
+}
+
 #[test]
 fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
     let mut running: InstanceStatus = serde_json::from_value(serde_json::json!({
@@ -5776,6 +5844,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            volume_homes: Vec::new(),
         },
         crate::bun::diagnostics::DesiredAppEvidence {
             app: "pending".into(),
@@ -5786,6 +5855,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            volume_homes: Vec::new(),
         },
     ];
     let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
