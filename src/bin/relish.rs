@@ -93,12 +93,22 @@ enum Command {
         /// Follow log output (stream new lines as they appear).
         #[arg(long, short = 'f')]
         follow: bool,
-        /// Filter lines matching this substring.
+        /// Keep lines matching this regular expression (`error|warn`).
         #[arg(long)]
         grep: Option<String>,
         /// Show logs since this time (e.g. "1h", "30m", epoch seconds).
         #[arg(long)]
         since: Option<String>,
+        /// Show logs up to this time (e.g. "10m", epoch seconds); not with
+        /// --follow.
+        #[arg(long)]
+        until: Option<String>,
+        /// Show only this instance's lines (e.g. default__web-2).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Show only one stream: stdout or stderr; not with --follow.
+        #[arg(long)]
+        stream: Option<String>,
         /// Filter structured JSON logs by field (key=value).
         #[arg(long)]
         json_field: Option<String>,
@@ -1267,17 +1277,25 @@ async fn main() -> ExitCode {
             follow,
             ref grep,
             ref since,
+            ref until,
+            ref instance,
+            ref stream,
             ref json_field,
             ref namespace,
         } => {
             commands::logs(
                 name,
-                tail,
-                follow,
-                grep.clone(),
-                since.clone(),
-                json_field.clone(),
                 namespace,
+                commands::LogFlags {
+                    tail,
+                    follow,
+                    grep: grep.clone(),
+                    since: since.clone(),
+                    until: until.clone(),
+                    instance: instance.clone(),
+                    stream: stream.clone(),
+                    json_field: json_field.clone(),
+                },
             )
             .await
         }

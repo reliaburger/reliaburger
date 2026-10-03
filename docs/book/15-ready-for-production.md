@@ -604,7 +604,9 @@ book chapters sets `code` to false and runs no Rust at all, unless it touches ch
 the READMEs or the manual. Those count as code, because `documentation_first_run` checks
 their snippets and the manual is compiled into `relish`. A pull request stacked on another
 branch skips the acceptance suites unless someone labels it `full-ci`; it gets them when it
-targets `main`. Benchmarks run on `main`, nightly, and on changes to the gossip protocol,
+targets `main`, or a release's merge-train branch: from 0.1.4 on, each release collects its
+pull requests on one `release-*` branch, and those are the release's changes, so they get the
+whole of CI. Benchmarks run on `main`, nightly, and on changes to the gossip protocol,
 since nothing gates on their numbers yet.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
@@ -1870,6 +1872,24 @@ records `fault.injected` with fault id, type, duration and target. Every
 specific, service-wide, all-workload and council clear path records its own
 stable action. The human message remains for people; automation reads the
 fields.
+
+For a while faults were the only thing audited, which is backwards: the
+actions that most need a name on them are the ones that change who can do
+anything at all. Minting or revoking an API token, creating a join token, and
+rotating or finalising the secret key now record `token.created`,
+`token.revoked`, `join_token.created`, `secret.rotated` and
+`secret.rotation_finalised` through one helper, `record_caller_audit`, which
+takes the principal from the request's `AuthContext` so a handler can't
+attribute an action to anyone but its caller. The token's name goes in the
+details for people. The secret a route hands back never does:
+`trust_changing_routes_record_who_called_them` serialises every event it
+recorded and checks that none of the returned tokens appears in it. A source
+check, `trust_changing_routes_record_an_audit_event`, keeps those four
+handlers honest. The new event kinds change what a peer's `/v1/events` answer
+can carry, so the protocol moved to 34. These events still live in each node's
+bounded memory, which makes them a recent record, not an audit log you'd
+take to a regulator. Where a durable one should live is an open question in
+the F05 plan.
 
 ## Make a node disappear without killing Bun
 

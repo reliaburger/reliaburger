@@ -81,7 +81,7 @@ acceptance uses Linux VMs (V04 in the roadmap's [known gaps](../roadmap.md#known
 
 Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
-PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+PR targets `main` or a release's merge-train branch (`release-*`), and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
 holds a fixture for each of these rules.

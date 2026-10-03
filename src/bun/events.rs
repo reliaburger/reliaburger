@@ -82,6 +82,12 @@ pub enum EventKind {
     Alert,
     /// A fault was injected or cleared.
     Fault,
+    /// An API or join token was created or revoked.
+    Token,
+    /// A secret-encryption key was rotated or a rotation finalised.
+    Secret,
+    /// A workload identity or image signature was issued.
+    Identity,
 }
 
 /// Importance of an event.

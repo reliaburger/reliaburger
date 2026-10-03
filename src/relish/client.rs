@@ -74,10 +74,10 @@ pub struct LogsExportOutcome {
 
 /// Print one event of a followed log stream: lines to stdout (after the
 /// client-side filters), warnings to stderr.
-fn print_followed_event(event: &crate::ketchup::sse::SseEvent, options: &LogOptions) {
+fn print_followed_event(event: &crate::ketchup::sse::SseEvent, filter: &LineFilter) {
     if event.event.as_deref() == Some(crate::ketchup::sse::WARNING_EVENT) {
         eprintln!("warning: {}", event.data);
-    } else if options.matches(&event.data) {
+    } else if filter.matches(&event.data) {
         println!("{}", event.data);
     }
 }
@@ -86,34 +86,33 @@ fn print_followed_event(event: &crate::ketchup::sse::SseEvent, options: &LogOpti
 pub struct LogOptions {
     pub tail: Option<usize>,
     pub follow: bool,
-    /// Keep only lines containing this substring.
+    /// Keep only lines matching this regular expression.
     pub grep: Option<String>,
     /// Keep only entries at or after this unix timestamp (seconds).
     pub start: Option<u64>,
+    /// Keep only entries at or before this unix timestamp (seconds).
+    pub end: Option<u64>,
+    /// Keep only this instance's lines (`default__web-0`).
+    pub instance: Option<String>,
+    /// Keep only lines written to this stream.
+    pub stream: Option<crate::ketchup::types::LogStream>,
     /// Keep only lines that parse as JSON where `field == value`.
     pub json_field: Option<(String, String)>,
 }
 
-impl LogOptions {
-    /// Query parameters understood by the server-side log endpoints.
-    fn query_params(&self) -> Vec<(String, String)> {
-        let mut params = Vec::new();
-        if let Some(n) = self.tail {
-            params.push(("tail".to_string(), n.to_string()));
-        }
-        if let Some(ref g) = self.grep {
-            params.push(("grep".to_string(), g.clone()));
-        }
-        if let Some(s) = self.start {
-            params.push(("start".to_string(), s.to_string()));
-        }
-        params
-    }
+/// The filters a client applies to each line itself, compiled once per
+/// command: a followed stream can carry thousands of lines.
+#[derive(Debug, Clone)]
+pub(crate) struct LineFilter {
+    grep: Option<regex::Regex>,
+    json_field: Option<(String, String)>,
+}
 
-    /// Client-side line filter: substring grep plus JSON field match.
+impl LineFilter {
+    /// Regular-expression grep plus the JSON field match.
     fn matches(&self, line: &str) -> bool {
-        if let Some(ref g) = self.grep
-            && !line.contains(g.as_str())
+        if let Some(grep) = &self.grep
+            && !grep.is_match(line)
         {
             return false;
         }
@@ -138,6 +137,47 @@ impl LogOptions {
     }
 }
 
+impl LogOptions {
+    /// Query parameters understood by the server-side log endpoints.
+    fn query_params(&self) -> Vec<(String, String)> {
+        let mut params = Vec::new();
+        if let Some(n) = self.tail {
+            params.push(("tail".to_string(), n.to_string()));
+        }
+        if let Some(ref g) = self.grep {
+            params.push(("grep".to_string(), g.clone()));
+        }
+        if let Some(s) = self.start {
+            params.push(("start".to_string(), s.to_string()));
+        }
+        if let Some(e) = self.end {
+            params.push(("end".to_string(), e.to_string()));
+        }
+        if let Some(ref i) = self.instance {
+            params.push(("instance".to_string(), i.clone()));
+        }
+        if let Some(s) = self.stream {
+            params.push(("stream".to_string(), s.as_str().to_string()));
+        }
+        params
+    }
+
+    /// The per-line filter. `relish logs` has already refused a pattern that
+    /// doesn't compile; a caller that hands one in directly gets it matched
+    /// literally rather than an error.
+    pub(crate) fn line_filter(&self) -> LineFilter {
+        let grep = self.grep.as_deref().map(|pattern| {
+            regex::Regex::new(pattern).unwrap_or_else(|_| {
+                regex::Regex::new(&regex::escape(pattern)).expect("an escaped pattern compiles")
+            })
+        });
+        LineFilter {
+            grep,
+            json_field: self.json_field.clone(),
+        }
+    }
+}
+
 /// Render queried log entries as lines, oldest first.
 ///
 /// When the lines come from more than one instance, each line starts with
@@ -145,9 +185,10 @@ impl LogOptions {
 /// instance both appear in a tail, and unlabelled their output reads as one
 /// app skipping values.
 fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &LogOptions) -> String {
+    let filter = options.line_filter();
     let shown: Vec<&crate::ketchup::types::LogEntry> = entries
         .iter()
-        .filter(|entry| options.matches(&entry.line))
+        .filter(|entry| filter.matches(&entry.line))
         .collect();
     // A run is one instance on one node. An instance that moves keeps its
     // name, and the view interleaves its two runs by two nodes' clocks, so
@@ -1570,6 +1611,12 @@ impl BunClient {
             }
         }
 
+        // The agent's own endpoint answers plain text with no instance or
+        // time on each line, so it can't honour these filters: an empty
+        // answer is the answer.
+        if options.instance.is_some() || options.end.is_some() || options.stream.is_some() {
+            return Ok(String::new());
+        }
         // Fall back to the local agent endpoint (process logs that
         // haven't been ingested into the LogStore yet)
         self.logs_local(app, namespace, options).await
@@ -1604,7 +1651,8 @@ impl BunClient {
         })?;
 
         let logs = json["logs"].as_str().unwrap_or("");
-        let filtered: Vec<&str> = logs.lines().filter(|l| options.matches(l)).collect();
+        let filter = options.line_filter();
+        let filtered: Vec<&str> = logs.lines().filter(|l| filter.matches(l)).collect();
         Ok(filtered.join("\n"))
     }
 
@@ -1636,16 +1684,17 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
+        let filter = options.line_filter();
         let mut stream = response.bytes_stream();
         let mut decoder = crate::ketchup::sse::SseDecoder::default();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(classify_error)?;
             for event in decoder.push(&bytes) {
-                print_followed_event(&event, options);
+                print_followed_event(&event, &filter);
             }
         }
         if let Some(event) = decoder.finish() {
-            print_followed_event(&event, options);
+            print_followed_event(&event, &filter);
         }
 
         Ok(String::new())

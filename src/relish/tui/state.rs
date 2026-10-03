@@ -52,9 +52,13 @@ pub enum View {
         node: String,
     },
     Jobs,
+    /// One node's run of a job: several nodes can each run a job of the
+    /// same name, so the node and instance pick the row.
     JobDetail {
         name: String,
         namespace: String,
+        node: String,
+        instance: String,
     },
     Events,
     Logs {
