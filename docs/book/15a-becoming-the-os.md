@@ -656,7 +656,7 @@ A join seed's token buys a certificate, and the certificate buys the master key:
 
 ### Claiming over the network
 
-Seeds on a USB stick work, but you have to walk the stick round. So a machine that boots with no seed becomes *unclaimed* instead. It makes a self-signed key, shows a short fingerprint of it on its monitor, announces itself over mDNS as `_reliaburger-unclaimed._tcp`, and serves a tiny API on port 9119: `GET /v1/claim` says what it is, and `POST /v1/claim` with a seed claims it, once. From there it carries on exactly as if the seed had come on a stick.
+Seeds on a USB stick work, but you have to walk the stick round. So a machine that boots with no seed becomes *unclaimed* instead. It makes a self-signed key, shows a short fingerprint of it on its monitor, announces itself over mDNS as `_rb-unclaimed._tcp`, and serves a tiny API on port 9119: `GET /v1/claim` says what it is, and `POST /v1/claim` with a seed claims it, once. From there it carries on exactly as if the seed had come on a stick.
 
 The interesting part is trust. Anyone on the LAN can answer mDNS, and node 1's seed carries the cluster's keys. A certificate authority can't help, because the machine made its key thirty seconds ago and nobody has signed it. What we can do is what SSH does the first time you connect: show the key's fingerprint and ask a human to compare it with the machine's console. relish fetches the machine's details, prints `claim key 3f9a-12bc-77de-0a41`, and asks whether the monitor shows the same. If it does, relish posts the seed over a connection that accepts that one certificate and nothing else.
 
@@ -796,6 +796,10 @@ iPXE's `dhcp` command waits for proxy offers only when the router's offer says `
 ### macOS, multicast, and a hub that forgets
 
 The research plan's no-root fallback was QEMU's `-netdev dgram`, joining VMs over UDP multicast. On macOS every send failed with `EADDRNOTAVAIL`. Hence the hub inside the server VM. Then the hub had its own quirk: its stream server doesn't deliver frames to a second client on a reused socket. The symptom was a node whose `DHCPDISCOVER` got an offer that never arrived, and ARP that failed. So every QEMU start takes a fresh slot from a counter, 40 per server start, and when they run out you restart the server. Not elegant, but reliable.
+
+### Fifteen bytes of service name
+
+The claimed-pair test in CI failed every run it reached. Both VMs booted, both printed their claim keys, and `relish machines` never listed either. We first suspected the usual multicast suspects: the runner's route for 224.0.0.251, bridge snooping, a firewall. The cause was in our own constant. RFC 6763 caps a DNS-SD service name at 15 bytes, and we'd called ours `_reliaburger-unclaimed`, which is 21. mdns-sd checks that limit inside its daemon thread, after `register` has already returned `Ok`, so the machine announced nothing and said nothing about it. It's now `_rb-unclaimed._tcp`. Two tests guard it: one checks the length against mdns-sd's own limit, and one announces a machine and finds it with `relish machines`' browse, over this host's real interfaces. The second would have caught it on day one. A unit test of the parts proves little when the bug lives in the handshake between them.
 
 ### A binary that can't write next to itself
 
