@@ -17,7 +17,7 @@ pub struct CompileResult {
     pub config: Config,
     /// Files that were successfully merged.
     pub merged_from: Vec<PathBuf>,
-    /// Warnings (e.g. parse errors in individual files).
+    /// Non-fatal duplicate-definition warnings; incomplete trees are errors.
     pub warnings: Vec<String>,
 }
 
@@ -67,10 +67,7 @@ fn compile_directory_with_defaults(
     let mut warnings = Vec::new();
 
     // Load defaults: own file takes priority, fall back to parent's
-    let (own_defaults, defaults_warning) = load_defaults(dir);
-    if let Some(warning) = defaults_warning {
-        warnings.push(warning);
-    }
+    let own_defaults = load_defaults(dir)?;
     let defaults = own_defaults.as_ref().or(parent_defaults);
 
     // Process all .toml files in this directory (except _defaults.toml)
@@ -105,38 +102,40 @@ fn compile_directory_with_defaults(
                 merged_from.push(entry_path.clone());
             }
             Err(e) => {
-                warnings.push(format!("{}: {e}", entry_path.display()));
+                return Err(RelishError::FormatFailed(format!(
+                    "{}: {e}",
+                    entry_path.display()
+                )));
             }
         }
     }
 
     // Recurse into subdirectories — directory name becomes the namespace
-    if let Ok(read_dir) = std::fs::read_dir(dir) {
-        let mut subdirs: Vec<PathBuf> = read_dir
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
+    {
+        let read_dir = std::fs::read_dir(dir)?;
+        let mut subdirs = Vec::new();
+        for entry in read_dir {
+            let path = entry?.path();
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            if metadata.is_dir() {
+                subdirs.push(path);
+            }
+        }
         subdirs.sort();
 
         for subdir in subdirs {
-            match compile_directory_with_defaults(&subdir, defaults) {
-                Ok(mut sub_result) => {
-                    // Apply the subdirectory name as namespace
-                    if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
-                        apply_namespace(&mut sub_result.config, ns);
-                    }
-                    for collision in merge_into(&mut merged, sub_result.config)? {
-                        warnings.push(format!("{}: {collision}", subdir.display()));
-                    }
-                    merged_from.extend(sub_result.merged_from);
-                    warnings.extend(sub_result.warnings);
-                }
-                Err(RelishError::Io(_)) => {
-                    // Skip unreadable directories
-                }
-                Err(e) => return Err(e),
+            let mut sub_result = compile_directory_with_defaults(&subdir, defaults)?;
+            // Apply the subdirectory name as namespace.
+            if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
+                apply_namespace(&mut sub_result.config, ns);
             }
+            for collision in merge_into(&mut merged, sub_result.config)? {
+                warnings.push(format!("{}: {collision}", subdir.display()));
+            }
+            merged_from.extend(sub_result.merged_from);
+            warnings.extend(sub_result.warnings);
         }
     }
 
@@ -149,46 +148,43 @@ fn compile_directory_with_defaults(
 
 /// Collect all .toml files in a directory (non-recursive, sorted).
 fn collect_toml_files(dir: &Path) -> Result<Vec<PathBuf>, RelishError> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "toml"))
-        .collect();
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            if metadata.is_file() {
+                files.push(path);
+            }
+        }
+    }
     files.sort();
     Ok(files)
 }
 
-/// Load `_defaults.toml` from a directory, if present.
-///
-/// Returns the defaults and any reason they could not be loaded (O10). The
-/// `.ok()?` this replaced turned an unreadable or malformed defaults file
-/// into "there are no defaults" — so a typo in `_defaults.toml` didn't fail
-/// the compile, it silently dropped the default image from every app in the
-/// directory and let the error surface much later as a missing field.
-fn load_defaults(dir: &Path) -> (Option<BTreeMap<String, toml::Value>>, Option<String>) {
-    let defaults_path = dir.join("_defaults.toml");
-    if !defaults_path.is_file() {
-        return (None, None);
-    }
-    let content = match std::fs::read_to_string(&defaults_path) {
-        Ok(content) => content,
-        Err(e) => {
-            return (
-                None,
-                Some(format!("{}: unreadable: {e}", defaults_path.display())),
-            );
+/// Read defaults strictly: errors must not turn a tree into a partial manifest.
+fn load_defaults(dir: &Path) -> Result<Option<BTreeMap<String, toml::Value>>, RelishError> {
+    let path = dir.join("_defaults.toml");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RelishError::FormatFailed(format!(
+                "{}: {error}",
+                path.display()
+            )));
         }
-    };
-    match toml::from_str(&content) {
-        Ok(parsed) => (Some(parsed), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "{}: invalid TOML, defaults not applied: {e}",
-                defaults_path.display()
-            )),
-        ),
+        Ok(_) => {}
     }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))?;
+    toml::from_str(&content)
+        .map(Some)
+        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))
 }
 
 /// Apply defaults to a config. For each app, if a field from defaults
@@ -433,23 +429,13 @@ mod tests {
         }
     }
 
-    /// O10: a malformed `_defaults.toml` used to be indistinguishable from
-    /// no defaults at all, so the error surfaced later as a missing field.
     #[test]
-    fn a_malformed_defaults_file_is_reported() {
+    fn malformed_defaults_refuse_the_entire_compile() {
         let dir = TempDir::new().unwrap();
         write_file(dir.path(), "_defaults.toml", "image = \"not closed\n");
         write_file(dir.path(), "a.toml", "[app.web]\nimage = \"x:1\"\n");
-
-        let result = compile(dir.path()).unwrap();
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("_defaults.toml") && w.contains("invalid TOML")),
-            "a malformed defaults file was swallowed: {:?}",
-            result.warnings
-        );
+        let error = compile(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("_defaults.toml"), "{error}");
     }
 
     #[test]
@@ -505,22 +491,38 @@ mod tests {
     }
 
     #[test]
-    fn compile_invalid_file_skipped_with_warning() {
+    fn malformed_workload_files_refuse_the_entire_compile() {
         let dir = TempDir::new().unwrap();
         write_file(dir.path(), "bad.toml", "this is not valid toml [[[");
-        write_file(
-            dir.path(),
-            "good.toml",
-            r#"
-            [app.web]
-            image = "myapp:v1"
-            "#,
-        );
+        write_file(dir.path(), "good.toml", "[app.web]\nimage = \"web:1\"\n");
+        let error = compile(dir.path())
+            .expect_err("partial manifests must not be emitted")
+            .to_string();
+        assert!(error.contains("bad.toml"), "{error}");
+    }
 
-        let result = compile(dir.path()).unwrap();
-        assert_eq!(result.config.app.len(), 1, "valid file should be parsed");
-        assert_eq!(result.warnings.len(), 1, "bad file should produce warning");
-        assert!(result.warnings[0].contains("bad.toml"));
+    #[test]
+    fn invalid_files_in_nested_directories_refuse_the_entire_compile() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("prod")).unwrap();
+        write_file(&dir.path().join("prod"), "bad.toml", "[app.web\n");
+        write_file(dir.path(), "good.toml", "[app.api]\nimage = \"api:1\"\n");
+        assert!(
+            compile(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("bad.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_symlink_input_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("bad.toml"))
+            .unwrap();
+        let error = compile(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("bad.toml"), "{error}");
     }
 
     #[test]
