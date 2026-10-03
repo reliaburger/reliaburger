@@ -5788,6 +5788,40 @@ async fn scrape_targets_name_each_running_instance_of_apps_with_metrics() {
     );
 }
 
+/// F07 part 2: `relish logs -f --instance` follows one replica, not the app.
+#[tokio::test]
+async fn follow_logs_keeps_only_the_asked_instance() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_replicas(2)).await);
+    grill.set_logs(&InstanceId("default__web-0".into()), "from zero\n");
+    grill.set_logs(&InstanceId("default__web-1".into()), "from one\n");
+
+    let (lines_tx, mut lines_rx) = mpsc::channel(16);
+    agent.spawn_logs_follow(
+        "web",
+        "default",
+        Some(10),
+        Some("default__web-1".into()),
+        None,
+        lines_tx,
+    );
+    let mut seen = Vec::new();
+    while let Ok(Some(line)) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), lines_rx.recv()).await
+    {
+        seen.push(line);
+    }
+    assert!(
+        seen.iter().any(|line| line.contains("from one")),
+        "{seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|line| line.contains("from zero")),
+        "{seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn follow_logs_does_not_block_the_event_loop() {
     let (tx, rx) = mpsc::channel(32);
@@ -5811,6 +5845,7 @@ async fn follow_logs_does_not_block_the_event_loop() {
         app_name: "sleeper".into(),
         namespace: "default".into(),
         tail: None,
+        instance: None,
         label: None,
         lines: line_tx,
     })

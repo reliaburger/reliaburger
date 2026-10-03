@@ -344,7 +344,7 @@ This is simpler than the metrics case because there's no aggregation involved --
 
 We add two endpoints that work together:
 
-`GET /v1/logs/entries/{app}/{namespace}` is the **internal** endpoint. It queries the local LogStore via DataFusion SQL and returns a JSON array of `LogEntry` objects. This is what `fan_out_query` calls on each node. It supports `start`, `end`, `grep`, and `tail` query parameters.
+`GET /v1/logs/entries/{app}/{namespace}` is the **internal** endpoint. It queries the local LogStore via DataFusion SQL and returns a JSON array of `LogEntry` objects. This is what `fan_out_query` calls on each node. It supports `start`, `end`, `grep` (a regular expression), `instance` and `tail` query parameters.
 
 `GET /v1/logs/query/{app}/{namespace}` is the **cross-node** endpoint. It performs the full fan-out:
 

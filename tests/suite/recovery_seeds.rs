@@ -4,28 +4,26 @@ use reliaburger::council::types::DesiredState;
 use std::path::Path;
 use std::time::Duration;
 
-fn free() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
 /// Start a node on `data_dir` whose config lists an unreachable join seed,
 /// and report (voters, leader) after `settle`.
 async fn start_with_a_seed(data_dir: &Path, settle: Duration) -> (usize, Option<u64>) {
     let cancel = tokio_util::sync::CancellationToken::new();
+    // Ports from the suite's reserved range, each free for TCP and UDP. A
+    // `bind(0)` port checked only over TCP was taken for the gossip UDP
+    // socket before the node bound it ("Address already in use").
+    let base = crate::bun_process::reserve_port_block(4);
     let (handle, _runtime) = start(
         ClusterParams {
             node_name: "survivor".into(),
-            gossip_addr: free(),
-            raft_port: free().port(),
-            reporting_port: free().port(),
-            api_port: free().port(),
+            gossip_addr: std::net::SocketAddr::from(([127, 0, 0, 1], base)),
+            raft_port: base + 1,
+            reporting_port: base + 2,
+            api_port: base + 3,
             reporting_config: Default::default(),
             seeds: vec!["127.0.0.1:9".parse().unwrap()],
             wrapping_ikm: None,
             bootstrap_security_state: None,
+            bootstrap_council_size: None,
             data_dir: data_dir.into(),
             mayo: None,
             rollup_interval: Duration::from_secs(60),

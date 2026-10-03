@@ -554,3 +554,144 @@ async fn websocket_log_frames_are_tagged_lines() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Live event stream
+// ---------------------------------------------------------------------------
+
+/// A peer that answers `/v1/events` the way another node does: its backlog
+/// as JSON, or, asked to follow with `local=true`, `live` over SSE and then
+/// nothing more.
+async fn events_peer(
+    backlog: Vec<crate::bun::events::ClusterEvent>,
+    live: crate::bun::events::ClusterEvent,
+) -> SocketAddr {
+    use futures_util::StreamExt as _;
+    serve_peer(Router::new().route(
+        "/v1/events",
+        axum::routing::get(move |Query(params): Params| {
+            let backlog = backlog.clone();
+            let live = live.clone();
+            async move {
+                require_local(&params)?;
+                if params.get("follow").map(String::as_str) != Some("true") {
+                    return Ok::<_, StatusCode>(
+                        Json(ClusterEvents {
+                            events: backlog,
+                            warnings: Vec::new(),
+                        })
+                        .into_response(),
+                    );
+                }
+                let json = serde_json::to_string(&live).unwrap();
+                let stream = futures_util::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(Event::default().data(json))
+                })
+                .chain(futures_util::stream::pending());
+                Ok(Sse::new(stream).into_response())
+            }
+        }),
+    ))
+    .await
+}
+
+/// F07 part 2: the live event stream covers the cluster. It used to send
+/// only the connected node's events, so the TUI refreshed the merged
+/// history every 2 s instead. Now it opens with every member's recent
+/// events, then relays each member's new ones as they happen, each tagged
+/// with its node.
+#[tokio::test]
+async fn the_live_event_stream_merges_every_members_events() {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let mut peer_store = EventStore::new();
+    record(&mut peer_store, 20, "peer earlier");
+    let mut peer_live = EventStore::new();
+    record(&mut peer_live, 50, "peer live");
+    let peer = events_peer(
+        peer_store.recent(100, None, None),
+        peer_live.recent(1, None, None).remove(0),
+    )
+    .await;
+
+    let mut local_store = EventStore::new();
+    record(&mut local_store, 10, "local earlier");
+    let local_store = Arc::new(RwLock::new(local_store));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    setup.events = Some(Arc::clone(&local_store));
+    setup.members = Some(members(&[("peer", peer)]));
+    let address = serve_peer(setup.router().await).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/v1/ws/events"))
+        .await
+        .unwrap();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut recorded_live = false;
+    while seen.len() < 4 {
+        let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("stalled after {seen:?}"))
+            .unwrap()
+            .unwrap();
+        if let WsMessage::Text(text) = frame {
+            let event: crate::bun::events::ClusterEvent = serde_json::from_str(&text).unwrap();
+            seen.push((event.node.unwrap_or_default(), event.message));
+        }
+        // Once the backlog is in, something new happens on this node.
+        if seen.len() == 2 && !recorded_live {
+            recorded_live = true;
+            record(&mut *local_store.write().await, 60, "local live");
+        }
+    }
+    assert_eq!(
+        seen[..2],
+        [
+            ("local".to_string(), "local earlier".to_string()),
+            ("peer".to_string(), "peer earlier".to_string()),
+        ],
+        "the backlog is every member's, oldest first"
+    );
+    let mut live = seen[2..].to_vec();
+    live.sort();
+    assert_eq!(
+        live,
+        [
+            ("local".to_string(), "local live".to_string()),
+            ("peer".to_string(), "peer live".to_string()),
+        ]
+    );
+}
+
+/// The per-node live feed a merged stream reads: `follow=true&local=true`
+/// streams this node's new events over SSE, tagged with its name.
+#[tokio::test]
+async fn a_node_streams_its_own_new_events_on_request() {
+    use futures_util::StreamExt as _;
+
+    let local_store = Arc::new(RwLock::new(EventStore::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    setup.events = Some(Arc::clone(&local_store));
+    let address = serve_peer(setup.router().await).await;
+
+    let response = reqwest::get(format!("http://{address}/v1/events?follow=true&local=true"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    record(&mut *local_store.write().await, 70, "fresh");
+    let mut body = response.bytes_stream();
+    let mut decoder = crate::ketchup::sse::SseDecoder::default();
+    let event = loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("no event within 5s")
+            .unwrap()
+            .unwrap();
+        if let Some(event) = decoder.push(&chunk).into_iter().next() {
+            break event;
+        }
+    };
+    let event: crate::bun::events::ClusterEvent = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(event.message, "fresh");
+    assert_eq!(event.node.as_deref(), Some("local"));
+}

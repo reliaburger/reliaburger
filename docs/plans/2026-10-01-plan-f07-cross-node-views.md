@@ -63,9 +63,13 @@ events through one node of three and watches a member leave.
 - Separate stderr capture end to end (process and runc runtimes; Apple
   Container nulls stderr today), a `stream` column that is honest, and a
   `--stream` filter.
-- Query filters: `--until`, `--instance`, regex `--grep`.
+- Query filters: `--until`, `--instance`, regex `--grep`. *(Done on
+  `f07-log-filters`: `--instance` also works with `-f`; a pattern that won't
+  compile is a 400, or a flag error in `relish`.)*
 - A cluster-wide live event stream (`/v1/ws/events` merging peers) instead of
-  Part 1's 2 s refresh of the merged history.
+  Part 1's 2 s refresh of the merged history. *(Done on `f07-live-events`: each node
+  offers `/v1/events?follow=true&local=true` over SSE, and the WebSocket
+  merges every member's feed after a merged backlog.)*
 - A stated live-metrics contract for the dashboard and TUI (refresh cadence,
   remote node charts through the metrics fan-out).
 

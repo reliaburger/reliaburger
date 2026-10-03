@@ -59,7 +59,7 @@ Container/Process workload
 
 Bun's agent (`src/bun/agent.rs`) spawns a forwarder task per instance that receives complete lines from the runtime, wraps each in a `LogRecord { app, namespace, stream, line }`, and sends it over an `mpsc` channel to the shared `LogStore`. `LogStore::append` stamps the wall-clock second and pushes the line into an in-memory buffer; a periodic flush turns the buffer into a Parquet file (§3.2).
 
-**stderr is never distinguished from stdout.** The forwarder always sets `stream: LogStream::Stdout` -- there is no separate stderr capture path, and the Apple Container runtime nulls stderr entirely. Every stored line therefore carries `stream = "stdout"`. The `LogStream::Stderr` variant exists in the type and round-trips through the schema, but nothing writes it. **A true separate-stderr capture story is planned -- not yet implemented.**
+**stdout and stderr are captured separately.** The process and runc runtimes write each workload's streams to two files, `<stem>.stdout` and `<stem>.stderr`, and `follow_logs` reads them with one `CaptureReader` each, so every `CapturedLine` (and every stored row) carries the stream it came from. The forwarder copies `stream` through unchanged. Lines keep their order within a stream; across the two, the store orders them by when they were read, since the files carry no per-line times. The Apple Container runtime still nulls stderr and labels everything stdout (planned).
 
 The capture task is spawned when Bun starts a workload and cancelled when it stops. Backpressure flows through the bounded channel and the runtime's own pipe buffering.
 
@@ -134,8 +134,8 @@ The task emits `ketchup::follow::LogFrame` values, `Line(String)` or `Warning(St
 These are the shipped types (`src/ketchup/types.rs`). Note what is **absent** versus earlier drafts: a `LogEntry` has no `node`, `instance`, or `is_json` field, and `LogStream` is a plain enum, not a `#[repr(u8)]` value used in a binary record.
 
 ```rust
-/// Which output stream a line came from. In practice only Stdout is ever
-/// written (see §3.1); Stderr exists but is never produced.
+/// Which output stream a line came from (see §3.1). Apple Container
+/// workloads only ever produce Stdout.
 pub enum LogStream { Stdout, Stderr }
 
 /// A captured line, tagged with its source, before it enters the store.
@@ -194,9 +194,9 @@ The shipped log config is small (`LogsSection` in `src/config/node.rs`): `retent
 
 ### 5.1 Log Capture
 
-Bun's agent (`src/bun/agent.rs`) receives complete lines from the runtime's stdout stream, builds a `LogRecord { app, namespace, stream: Stdout, line }`, and forwards it over an `mpsc` channel to the shared `LogStore`. Container and process workloads use the same path.
+Bun's agent (`src/bun/agent.rs`) receives complete lines from the runtime, each with its stream and capture position, builds a `LogRecord { app, namespace, instance, stream, line, position }`, and forwards it over an `mpsc` channel to the shared `LogStore`. Container and process workloads use the same path.
 
-As noted in §3.1, only stdout is captured: the forwarder always tags `LogStream::Stdout`, and the Apple Container runtime nulls stderr. **Separate stderr capture is planned -- not yet implemented.**
+As noted in §3.1, both streams are captured, in two files per instance with an ingest offset each, for the process and runc runtimes. The Apple Container runtime nulls stderr; capturing it there is planned.
 
 The `AsyncFd`/two-tasks-per-stream/`DayLogWriter` mechanics from earlier drafts, and the pipe-buffer reconnection guarantees around a Bun restart, describe the planned design, not the shipped forwarder.
 

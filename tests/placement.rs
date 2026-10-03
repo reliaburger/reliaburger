@@ -3200,3 +3200,130 @@ async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion(
     }
     shutdown.cancel();
 }
+
+/// The app spec the council holds for `web`.
+async fn desired_web(node: &Node) -> Option<reliaburger::config::app::AppSpec> {
+    node.handle
+        .council
+        .as_ref()?
+        .desired_state()
+        .await
+        .apps
+        .get(&reliaburger::meat::AppId::new("web", "default"))
+        .cloned()
+}
+
+/// Apply `web` at `tag` with two replicas until the council holds it and two
+/// replicas run.
+async fn roll_web_out(nodes: &[&Node], tag: &str) {
+    let config = reliaburger::config::Config::parse(&format!(
+        r#"
+        [app.web]
+        image = "proc-grill:{tag}"
+        command = ["sleep", "600"]
+        replicas = 2
+    "#
+    ))
+    .unwrap();
+    let image = format!("proc-grill:{tag}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut last_apply: Option<tokio::time::Instant> = None;
+    loop {
+        let spec = desired_web(nodes[0]).await;
+        if spec.as_ref().and_then(|s| s.image.as_deref()) == Some(image.as_str())
+            && live_web_instances(nodes).await == 2
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "web {tag} never ran two replicas"
+        );
+        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+            let _ =
+                tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// #459: `relish rollback` through a node that never ran the app. It used
+/// to read only that node's own deploy history, find nothing and answer
+/// 404; and a node that had run it recorded its *share* of the replicas,
+/// which a rollback re-applied as the whole app's count. Now the previous
+/// version comes from every node's history, at the app's current scale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
+    let shutdown = CancellationToken::new();
+    let n1 = start_node("rb1", 18961, vec![], &shutdown).await;
+    let n2 = start_node("rb2", 18965, vec![local(18961)], &shutdown).await;
+    let n3 = start_node("rb3", 18969, vec![local(18961)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    roll_web_out(&nodes, "v1").await;
+    roll_web_out(&nodes, "v2").await;
+    // Let every node finish recording its rollout of v2.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Two replicas on three nodes: one node never ran web.
+    let running: Vec<String> = web_instance_ids(&nodes)
+        .await
+        .iter()
+        .map(|placed| placed.split_once('/').unwrap().0.to_string())
+        .collect();
+    let bystander = nodes
+        .iter()
+        .find(|node| !running.contains(&node.name))
+        .expect("a node without a web replica");
+
+    // A follower that can't name the leader yet answers 503 and asks to be
+    // retried; that's the forwarding settling, not this test's subject. Any
+    // other refusal, a 404 above all (the old "no previous deploy here"),
+    // fails at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            bystander.client.rollback("web", "default"),
+        )
+        .await
+        .expect("rollback did not hang")
+        {
+            Ok(()) => break,
+            Err(reliaburger::relish::RelishError::ApiError { status: 503, .. })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => panic!("rollback through a node that never ran the app: {error}"),
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let spec = desired_web(&n1).await.expect("web is still desired");
+        if spec.image.as_deref() == Some("proc-grill:v1") {
+            assert_eq!(
+                spec.replicas,
+                reliaburger::config::Replicas::Fixed(2),
+                "a rollback must keep the app's scale, not one node's share"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rollback never restored v1: {:?}",
+            spec.image
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    shutdown.cancel();
+}

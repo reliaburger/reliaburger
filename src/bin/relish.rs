@@ -93,12 +93,22 @@ enum Command {
         /// Follow log output (stream new lines as they appear).
         #[arg(long, short = 'f')]
         follow: bool,
-        /// Filter lines matching this substring.
+        /// Keep lines matching this regular expression (`error|warn`).
         #[arg(long)]
         grep: Option<String>,
         /// Show logs since this time (e.g. "1h", "30m", epoch seconds).
         #[arg(long)]
         since: Option<String>,
+        /// Show logs up to this time (e.g. "10m", epoch seconds); not with
+        /// --follow.
+        #[arg(long)]
+        until: Option<String>,
+        /// Show only this instance's lines (e.g. default__web-2).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Show only one stream: stdout or stderr; not with --follow.
+        #[arg(long)]
+        stream: Option<String>,
         /// Filter structured JSON logs by field (key=value).
         #[arg(long)]
         json_field: Option<String>,
@@ -430,6 +440,11 @@ enum Command {
         /// Install again on machines that installed from here already.
         #[arg(long)]
         reinstall: bool,
+        /// Wipe this machine's disk without asking if it isn't blank
+        /// (repeat for more). Other used disks are wiped only after a yes
+        /// at this terminal; with no terminal, they're left alone.
+        #[arg(long = "wipe", value_name = "MAC", value_parser = parse_mac)]
+        wipe: Vec<reliaburger::relish::netboot::MacAddress>,
         /// Trust only this key (ed25519:BASE64) instead of the release keys.
         /// Debug builds only, for tests.
         #[arg(long, hide = true)]
@@ -838,6 +853,9 @@ enum ClusterAction {
         /// Operator countersignature key for cluster bun upgrades.
         #[arg(long)]
         external_signing_key: Option<String>,
+        /// How many voters the council grows to: an odd number from 1 to 7.
+        #[arg(long, value_name = "N", default_value = "5")]
+        council_size: reliaburger::council::CouncilSize,
         /// Each machine as MAC@IP, node 1 first.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
@@ -846,11 +864,11 @@ enum ClusterAction {
 
 #[derive(Subcommand)]
 enum ImageAction {
-    /// Download the newest OS build and check it against the release key.
+    /// Download the newest OS build for every architecture and check it against the release key.
     Download {
-        /// x86_64 or aarch64.
-        #[arg(long, default_value = std::env::consts::ARCH)]
-        arch: String,
+        /// Only this architecture, x86_64 or aarch64 (repeat for more; default: every one the release has).
+        #[arg(long = "arch", value_name = "ARCH", value_parser = reliaburger::relish::image::parse_arch)]
+        arches: Vec<reliaburger::relish::netboot::Arch>,
         /// Where to save it (as <dir>/<arch>/, the layout a netboot server serves).
         #[arg(long, default_value = "os")]
         dir: PathBuf,
@@ -940,6 +958,9 @@ enum MachinesAction {
         /// Operator countersignature key for cluster bun upgrades (with --create).
         #[arg(long)]
         external_signing_key: Option<String>,
+        /// How many voters the new council grows to: an odd number from 1 to 7 (with --create; default 5).
+        #[arg(long, value_name = "N", requires = "create")]
+        council_size: Option<reliaburger::council::CouncilSize>,
         /// Public key for root SSH on lab images.
         #[arg(long)]
         ssh_key: Option<PathBuf>,
@@ -980,6 +1001,7 @@ async fn netboot(
     duration: std::time::Duration,
     key: Option<PathBuf>,
     reinstall: bool,
+    wipe: Vec<reliaburger::relish::netboot::MacAddress>,
     trust_key: Option<String>,
 ) -> Result<(), reliaburger::relish::RelishError> {
     use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
@@ -998,6 +1020,7 @@ async fn netboot(
         duration,
         keys,
         reinstall,
+        wipe,
     })
     .await?;
     Ok(())
@@ -1552,17 +1575,25 @@ async fn main() -> ExitCode {
             follow,
             ref grep,
             ref since,
+            ref until,
+            ref instance,
+            ref stream,
             ref json_field,
             ref namespace,
         } => {
             commands::logs(
                 name,
-                tail,
-                follow,
-                grep.clone(),
-                since.clone(),
-                json_field.clone(),
                 namespace,
+                commands::LogFlags {
+                    tail,
+                    follow,
+                    grep: grep.clone(),
+                    since: since.clone(),
+                    until: until.clone(),
+                    instance: instance.clone(),
+                    stream: stream.clone(),
+                    json_field: json_field.clone(),
+                },
             )
             .await
         }
@@ -1937,6 +1968,7 @@ async fn main() -> ExitCode {
                     ssh_key,
                     ttl,
                     external_signing_key,
+                    council_size,
                     machines,
                 },
         } => match ssh_key.as_deref().map(std::fs::read).transpose() {
@@ -1952,16 +1984,17 @@ async fn main() -> ExitCode {
                     ssh_key,
                     token_ttl: std::time::Duration::from_secs(ttl),
                     external_signing_key,
+                    council_size,
                 },
             ),
         },
         Command::Image { action } => match action {
             ImageAction::Download {
-                arch,
+                arches,
                 dir,
                 all,
                 channel,
-            } => reliaburger::relish::image::download(&channel, &arch, &dir, all).await,
+            } => reliaburger::relish::image::download(&channel, &arches, &dir, all).await,
             ImageAction::Write { image, device, yes } => {
                 reliaburger::relish::image::write(&image, &device, yes).map(|bytes| {
                     println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
@@ -1996,6 +2029,7 @@ async fn main() -> ExitCode {
                 network,
                 faults,
                 external_signing_key,
+                council_size,
                 ssh_key,
                 ttl,
                 trust_lan,
@@ -2013,6 +2047,8 @@ async fn main() -> ExitCode {
                                 network,
                                 faults,
                                 external_signing_key,
+                                council_size: council_size
+                                    .unwrap_or(reliaburger::council::CouncilSize::APPLIANCE),
                             }),
                             token_ttl: std::time::Duration::from_secs(ttl),
                             ssh_key,
@@ -2032,10 +2068,11 @@ async fn main() -> ExitCode {
             duration,
             key,
             reinstall,
+            wipe,
             trust_key,
         } => {
             netboot(
-                dir, interface, address, http_port, macs, duration, key, reinstall, trust_key,
+                dir, interface, address, http_port, macs, duration, key, reinstall, wipe, trust_key,
             )
             .await
         }
@@ -2417,6 +2454,87 @@ mod tests {
                 action: SecretAction::Pubkey { dir: Some(ref dir) }
             }) if dir == std::path::Path::new("cluster")
         ));
+    }
+
+    #[test]
+    fn appliance_clusters_default_to_five_council_voters() {
+        use reliaburger::council::CouncilSize;
+        let create = |extra: &[&str]| {
+            let mut args = vec![
+                "relish",
+                "cluster",
+                "create",
+                "--bare-metal",
+                "lab",
+                "--name",
+                "lab",
+                "--operator",
+                "10.42.0.1",
+            ];
+            args.extend_from_slice(extra);
+            args.push("d8:9e:f3:00:00:01@10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Cluster {
+                    action: ClusterAction::Create { council_size, .. },
+                }) => council_size,
+                _ => panic!("not cluster create"),
+            })
+        };
+        assert_eq!(create(&[]).unwrap(), CouncilSize::APPLIANCE);
+        assert_eq!(create(&["--council-size", "3"]).unwrap().get(), 3);
+        for bad in ["4", "0", "9", "five"] {
+            let error = create(&["--council-size", bad]).err().unwrap().to_string();
+            assert!(error.contains("--council-size"), "{bad}: {error}");
+        }
+        let even = create(&["--council-size", "4"]).err().unwrap().to_string();
+        assert!(even.contains("pick an odd size from 1 to 7"), "{even}");
+
+        let claim = |extra: &[&str]| {
+            let mut args = vec!["relish", "machines", "claim", "lab"];
+            args.extend_from_slice(extra);
+            args.push("10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Machines {
+                    action: Some(MachinesAction::Claim { council_size, .. }),
+                    ..
+                }) => council_size,
+                _ => panic!("not machines claim"),
+            })
+        };
+        let new = ["--create", "--name", "lab", "--operator", "10.42.0.1"];
+        assert_eq!(claim(&new).unwrap(), None, "the default is applied later");
+        let mut sized = new.to_vec();
+        sized.extend(["--council-size", "7"]);
+        assert_eq!(claim(&sized).unwrap().map(CouncilSize::get), Some(7));
+        let mut even = new.to_vec();
+        even.extend(["--council-size", "6"]);
+        assert!(claim(&even).is_err());
+        assert!(
+            claim(&["--council-size", "5"]).is_err(),
+            "a council size only means something with --create"
+        );
+    }
+
+    #[test]
+    fn image_download_takes_every_architecture_unless_arch_is_repeated() {
+        use reliaburger::relish::netboot::Arch;
+        let arches = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Image {
+                action: ImageAction::Download { arches, .. },
+            }) => arches,
+            _ => panic!("not image download"),
+        };
+        assert!(arches(&["relish", "image", "download"]).is_empty());
+        assert_eq!(
+            arches(&[
+                "relish", "image", "download", "--arch", "x86_64", "--arch", "aarch64"
+            ]),
+            [Arch::X86_64, Arch::Arm64]
+        );
+        assert!(
+            Cli::try_parse_from(["relish", "image", "download", "--arch", "x86_64,aarch64"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -3304,6 +3422,7 @@ mod tests {
             duration,
             key,
             reinstall,
+            wipe,
             trust_key,
         } = cli.command
         else {
@@ -3315,6 +3434,7 @@ mod tests {
         assert!(macs.is_empty());
         assert_eq!(duration, std::time::Duration::from_secs(3600));
         assert_eq!((key, reinstall, trust_key), (None, false, None));
+        assert!(wipe.is_empty());
     }
 
     #[test]
@@ -3336,6 +3456,10 @@ mod tests {
             "--key",
             "art/spike-signing-key.pub.pem",
             "--reinstall",
+            "--wipe",
+            "52:54:00:12:34:56",
+            "--wipe",
+            "6C-4B-90-00-00-01",
         ])
         .unwrap();
         let Command::Netboot {
@@ -3345,6 +3469,7 @@ mod tests {
             http_port,
             key,
             reinstall,
+            wipe,
             ..
         } = cli.command
         else {
@@ -3357,11 +3482,16 @@ mod tests {
         assert_eq!(http_port, 8081);
         assert_eq!(key, Some(PathBuf::from("art/spike-signing-key.pub.pem")));
         assert!(reinstall);
+        let wipe: Vec<String> = wipe.iter().map(|m| m.to_string()).collect();
+        assert_eq!(wipe, ["52:54:00:12:34:56", "6c:4b:90:00:00:01"]);
     }
 
     #[test]
     fn netboot_refuses_a_bad_mac_a_bad_duration_and_both_interface_flags() {
         assert!(parse(&["relish", "netboot", "os", "--mac", "nope"]).is_err());
+        assert!(parse(&["relish", "netboot", "os", "--wipe", "nope"]).is_err());
+        // --wipe always names a machine: there's no wipe-everything switch.
+        assert!(parse(&["relish", "netboot", "os", "--wipe"]).is_err());
         assert!(parse(&["relish", "netboot", "os", "--for", "1w"]).is_err());
         assert!(
             parse(&[

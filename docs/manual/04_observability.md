@@ -12,8 +12,21 @@ it gathers from every node that runs the app:
 relish logs web                  # everything captured
 relish logs web --tail 20 -f     # last 20 per replica, then follow
 relish logs web --grep error --since 1h
+relish logs web --grep 'GET /(healthz|ready)' --since 2h --until 1h
+relish logs web --instance default__web-2      # one replica
+relish logs web --stream stderr                # only what it wrote to stderr
 relish logs web --json-field level=warn
 ```
+
+`--grep` is a regular expression, matched anywhere in the line, so quote it
+for your shell. A pattern that won't compile is refused before anything is
+asked. `--since` and `--until` take epoch seconds or a duration before now
+(`30s`, `5m`, `2h`, `1d`); `--until` can't be combined with `-f`, since a
+followed stream has no end. `--stream` takes `stdout` or `stderr` and,
+for now, isn't offered with `-f` either. `--instance` takes an id as `relish status`
+shows it, and works with `-f` too. With `-f` on a cluster, each line arrives
+as `[node instance] line`, and `--grep` sees that prefix, so anchor a
+pattern with `$` rather than `^`.
 
 `-f` follows every replica on every node and prefixes each line with its node
 and instance, like `[rb-4f2a9c1e07b3-2 default__web-0] GET /healthz 200`. It
@@ -158,6 +171,15 @@ the others sent and adds a yellow `incomplete: node … timed out` line, so a
 short list never passes for a complete one. On the web dashboard, a node's
 page lists that node's apps (or says it didn't answer) and charts CPU and
 memory only on the node's own dashboard.
+
+Besides deploys, restarts, health, jobs, alerts and faults, the events record
+who changed trust: creating or revoking an API token (`token.created`,
+`token.revoked`), creating a join token (`join_token.created`), and rotating
+or finalising the secret key (`secret.rotated`, `secret.rotation_finalised`).
+Each names the credential that did it, as the token's name in its details and
+a stable `principal`, and never carries a secret. Events are kept per node, in
+memory (the newest 1024), so they're a recent record rather than a durable
+audit log.
 
 `relish dashboard` serves the web dashboard (Brioche) on a loopback port and
 opens a one-time link to it. It forwards read-only requests using the CLI's own
