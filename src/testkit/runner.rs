@@ -43,6 +43,47 @@ fn teardown_timeout() -> Duration {
     crate::relish::client::lease_release_budget() + TEARDOWN_MARGIN
 }
 
+/// How long lease creation keeps retrying a 503 "retry shortly": long enough
+/// to ride out a council leader change, which answers with exactly that while
+/// no leader is known (#510). The case deadline still bounds the whole wait.
+const LEASE_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
+/// Pause between lease creation attempts while the cluster has no leader.
+const LEASE_RETRY_PAUSE: Duration = Duration::from_millis(250);
+
+/// Whether a lease refusal is the server's "no leader yet, retry shortly"
+/// answer. Nothing was created, so asking again is safe.
+fn lease_refusal_is_transient(error: &crate::relish::RelishError) -> bool {
+    matches!(
+        error,
+        crate::relish::RelishError::ApiError { status: 503, body } if body.contains("retry shortly")
+    )
+}
+
+/// Create the case's lease, retrying a transient refusal for up to
+/// [`LEASE_RETRY_WINDOW`].
+async fn create_lease(
+    client: &BunClient,
+    group: TestGroup,
+    ttl_seconds: u64,
+    namespace: &str,
+) -> Result<crate::testkit::lease::TestLease, crate::relish::RelishError> {
+    let give_up = Instant::now() + LEASE_RETRY_WINDOW;
+    loop {
+        let attempt = if group == TestGroup::Jobs {
+            client.create_node_job_lease(ttl_seconds).await
+        } else {
+            client.create_test_lease(ttl_seconds, Some(namespace)).await
+        };
+        match attempt {
+            Err(error) if lease_refusal_is_transient(&error) && Instant::now() < give_up => {
+                tokio::time::sleep(LEASE_RETRY_PAUSE).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Resource ownership mode. Production command wiring always requires server
 /// leases; the unleased variant exists only for runner unit tests whose tiny
 /// mock servers don't implement the lease API.
@@ -402,15 +443,10 @@ async fn run_one(
                 };
             }
             match deadline
-                .run("lease creation", async {
-                    if case.group == TestGroup::Jobs {
-                        client.create_node_job_lease(ttl_seconds).await
-                    } else {
-                        client
-                            .create_test_lease(ttl_seconds, Some(&namespace))
-                            .await
-                    }
-                })
+                .run(
+                    "lease creation",
+                    create_lease(&client, case.group, ttl_seconds, &namespace),
+                )
                 .await
             {
                 Ok(Ok(lease)) => (lease.namespace, Some(lease.lease_id)),
@@ -1146,6 +1182,98 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (address, records)
+    }
+
+    /// A lease server that answers the first `refusals` creations with
+    /// `status` and `body`, then grants leases as [`create_mock_lease`] does.
+    async fn spawn_refusing_lease_server(
+        refusals: usize,
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let state = LeaseMockState {
+            records: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            next_id: Arc::new(AtomicUsize::new(1)),
+        };
+        let counter = Arc::clone(&attempts);
+        let create = move |State(state): State<LeaseMockState>,
+                           Json(request): Json<serde_json::Value>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                use axum::response::IntoResponse;
+                if counter.fetch_add(1, Ordering::SeqCst) < refusals {
+                    return (status, body).into_response();
+                }
+                create_mock_lease(State(state), Json(request))
+                    .await
+                    .into_response()
+            }
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v1/test/leases", post(create))
+            .route("/v1/test/leases/{id}", delete(release_mock_lease))
+            .route("/v1/cluster/nodes", get(empty_mock_list))
+            .route("/v1/status", get(empty_mock_list))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, attempts)
+    }
+
+    #[tokio::test]
+    async fn lease_creation_retries_while_the_cluster_has_no_leader() {
+        // #510: a short leader change answers lease creation with a 503
+        // "retry shortly". The runner waits it out instead of failing the case.
+        async fn passes(_ctx: TestContext) -> Result<(), String> {
+            Ok(())
+        }
+        let (address, attempts) = spawn_refusing_lease_server(
+            2,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no cluster leader known yet; retry shortly",
+        )
+        .await;
+        let mut cfg = config(
+            BunClient::new_with_token(&address, None),
+            full_capabilities(),
+            1,
+        );
+        cfg.fixed_namespace = Some("rbtest-leaderless".to_string());
+        cfg.lease_ownership = LeaseOwnership::Required;
+
+        let report = run(vec![case("passes", &[], testkit_case!(passes))], cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(report.passed, 1, "{:?}", report.results[0].outcome);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn lease_creation_does_not_retry_other_refusals() {
+        async fn passes(_ctx: TestContext) -> Result<(), String> {
+            Ok(())
+        }
+        let (address, attempts) =
+            spawn_refusing_lease_server(1, StatusCode::FORBIDDEN, "test leases are disabled").await;
+        let mut cfg = config(
+            BunClient::new_with_token(&address, None),
+            full_capabilities(),
+            1,
+        );
+        cfg.fixed_namespace = Some("rbtest-refused".to_string());
+        cfg.lease_ownership = LeaseOwnership::Required;
+
+        let report = run(vec![case("passes", &[], testkit_case!(passes))], cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(report.unknown, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

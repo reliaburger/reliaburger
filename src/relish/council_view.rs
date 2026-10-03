@@ -17,6 +17,11 @@ use crate::relish::client::BunClient;
 /// How long one node gets to answer before it counts as unreachable.
 const NODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many log entries a voter may trail the furthest-applied voter before
+/// it's reported as not applying (#480). Replication keeps a healthy voter a
+/// few entries behind at most, even under steady writes.
+pub const VOTER_LAG_WARNING: u64 = 100;
+
 /// One council member as an answering node lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CouncilMemberObservation {
@@ -147,6 +152,17 @@ pub struct FencedNode {
     pub fenced_by: u64,
 }
 
+/// A voter that answers but trails the council's applied log (#480).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaggingVoter {
+    /// The trailing voter.
+    pub node_id: String,
+    /// The last log index it applied.
+    pub applied: u64,
+    /// How many entries it trails the furthest-applied voter by.
+    pub behind: u64,
+}
+
 /// What the answers add up to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CouncilSummary {
@@ -164,6 +180,10 @@ pub struct CouncilSummary {
     pub voters: Vec<String>,
     /// Those voters that answered and serve.
     pub voters_answering: Vec<String>,
+    /// Answering voters more than [`VOTER_LAG_WARNING`] entries behind the
+    /// furthest-applied voter: up, but not applying the log.
+    #[serde(default)]
+    pub lagging: Vec<LaggingVoter>,
     /// Nodes that did not answer, with the reason.
     pub unanswered: Vec<(String, String)>,
 }
@@ -234,8 +254,50 @@ impl CouncilSummary {
                 missing.join(", ")
             ));
         }
+        if !self.lagging.is_empty() {
+            warnings.push(format!(
+                "voter(s) not applying the log: {}",
+                describe_lagging(&self.lagging)
+            ));
+        }
         warnings
     }
+}
+
+/// "node-3 (applied 2827, 1149 behind)", comma-separated.
+pub fn describe_lagging(lagging: &[LaggingVoter]) -> String {
+    lagging
+        .iter()
+        .map(|voter| {
+            format!(
+                "{} (applied {}, {} behind)",
+                voter.node_id, voter.applied, voter.behind
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Answering voters that trail the furthest-applied one by more than
+/// [`VOTER_LAG_WARNING`] entries.
+fn lagging_voters(serving: &[&CouncilNodeObservation], voters: &[String]) -> Vec<LaggingVoter> {
+    let applied: Vec<(&str, u64)> = serving
+        .iter()
+        .filter(|node| voters.contains(&node.node_id))
+        .filter_map(|node| Some((node.node_id.as_str(), node.last_applied?)))
+        .collect();
+    let Some(furthest) = applied.iter().map(|(_, index)| *index).max() else {
+        return Vec::new();
+    };
+    applied
+        .into_iter()
+        .filter(|(_, index)| furthest - index > VOTER_LAG_WARNING)
+        .map(|(node_id, index)| LaggingVoter {
+            node_id: node_id.to_string(),
+            applied: index,
+            behind: furthest - index,
+        })
+        .collect()
 }
 
 /// Add up every node's answer.
@@ -300,6 +362,7 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
         .filter(|voter| serving.iter().any(|o| &o.node_id == *voter))
         .cloned()
         .collect();
+    let lagging = lagging_voters(&serving, &voters);
 
     let unanswered = observations
         .iter()
@@ -317,6 +380,7 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
         fenced,
         voters,
         voters_answering,
+        lagging,
         unanswered,
     }
 }
@@ -576,6 +640,40 @@ mod tests {
         let summary = summarise(&nodes);
         assert!(!summary.quorum_ok());
         assert!(summary.warnings()[0].starts_with("quorum lost"));
+    }
+
+    #[test]
+    fn a_voter_that_stopped_applying_is_reported_as_lagging() {
+        // #480: node-3 answers its API, but its Raft core stopped at 2827
+        // while the others went on to 3976.
+        let mut nodes = healthy();
+        for node in &mut nodes {
+            node.last_applied = Some(3976);
+        }
+        nodes[2].last_applied = Some(2827);
+        let summary = summarise(&nodes);
+        assert!(summary.quorum_ok());
+        assert_eq!(
+            summary.lagging,
+            vec![LaggingVoter {
+                node_id: "node-3".to_string(),
+                applied: 2827,
+                behind: 1149,
+            }]
+        );
+        assert_eq!(
+            summary.warnings(),
+            vec!["voter(s) not applying the log: node-3 (applied 2827, 1149 behind)".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_voter_a_few_entries_behind_is_not_lagging() {
+        let mut nodes = healthy();
+        nodes[2].last_applied = Some(120 - VOTER_LAG_WARNING);
+        let summary = summarise(&nodes);
+        assert!(summary.lagging.is_empty());
+        assert!(summary.warnings().is_empty());
     }
 
     #[test]

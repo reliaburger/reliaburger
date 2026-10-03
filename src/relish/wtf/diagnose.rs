@@ -411,6 +411,25 @@ fn check_council_split(council: &CouncilObservation, report: &mut WtfReport) -> 
             affected_resource: "council".to_string(),
         });
     }
+    if !summary.lagging.is_empty() {
+        healthy = false;
+        report.warnings.push(WtfFinding {
+            id: "council-voter-lagging".to_string(),
+            title: format!(
+                "{} council voter(s) answer but are not applying the log",
+                summary.lagging.len()
+            ),
+            details: vec![crate::relish::council_view::describe_lagging(
+                &summary.lagging,
+            )],
+            suggestion: "the voter counts towards quorum but can't commit writes; read its \
+                         journal for a storage error (a full disk stops Raft), free space, \
+                         then restart bun on it"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
     if summary.leaders.len() > 1 {
         healthy = false;
         report.critical.push(WtfFinding {
@@ -1421,6 +1440,35 @@ mod tests {
                 .iter()
                 .any(|item| item.id == "council-epoch-split")
         );
+        assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    /// #480: a voter whose Raft core stopped still answers its API, so the
+    /// member count alone called the council healthy.
+    #[test]
+    fn a_voter_that_stopped_applying_is_a_warning() {
+        use crate::bun::agent::CouncilRole;
+        let mut inputs = healthy_inputs();
+        let mut stuck = council_node("node-3", CouncilRole::Follower, 0, None, Some("node-1"));
+        stuck.last_applied = Some(2827);
+        let mut leader = council_node("node-1", CouncilRole::Leader, 0, None, Some("node-1"));
+        leader.last_applied = Some(3976);
+        leader
+            .members
+            .push(crate::relish::council_view::CouncilMemberObservation {
+                name: "node-3".to_string(),
+                voter: true,
+            });
+        inputs.cluster.council = council_with_nodes(vec![leader, stuck]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|item| item.id == "council-voter-lagging")
+            .unwrap();
+        assert_eq!(finding.details, vec!["node-3 (applied 2827, 1149 behind)"]);
         assert!(!report.ok.iter().any(|ok| ok.id == "council"));
     }
 

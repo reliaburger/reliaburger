@@ -736,6 +736,38 @@ fn spawn_supervised(
     }
 }
 
+/// Wait for this node's Raft core to stop before shutdown, and say why.
+///
+/// openraft stops its core for good on a fatal error. A log append that fails
+/// because the disk is full is one (#480), and nothing restarts the core in
+/// process: the node keeps answering its API but never applies another entry,
+/// so the council looks healthy while it's a voter short. Bun watches this and
+/// exits non-zero, so the service manager restarts it and the restarted core
+/// catches up once space is free.
+///
+/// Returns `None` once `shutdown` is cancelled: an orderly stop also stops the
+/// core, and that isn't a failure.
+pub async fn raft_core_stopped(
+    mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    shutdown: CancellationToken,
+) -> Option<String> {
+    loop {
+        let running = metrics_rx.borrow_and_update().running_state.clone();
+        if let Err(fatal) = running {
+            return (!shutdown.is_cancelled()).then(|| fatal.to_string());
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            changed = metrics_rx.changed() => {
+                if changed.is_err() {
+                    // The core's task ended without publishing why (a panic).
+                    return (!shutdown.is_cancelled()).then(|| "Raft core task ended".to_string());
+                }
+            }
+        }
+    }
+}
+
 /// Publish a [`LeaderHint`] naming THIS node while it is the Raft leader,
 /// and `None` otherwise. The gossip node stamps the hint (or the best
 /// relayed one) onto every outgoing datagram; ordering by recovery epoch,
@@ -1524,6 +1556,72 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("initialise"));
         council.shutdown().await.unwrap();
+    }
+
+    async fn bootstrapped_council(
+        log_store: crate::council::log_store::MemLogStore,
+    ) -> CouncilNode {
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        let router = InMemoryRaftRouter::new();
+        let council = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            log_store,
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, council.raft().clone()).await;
+        let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
+        initialise_bootstrap(&council, members, None).await.unwrap();
+        council
+    }
+
+    #[tokio::test]
+    async fn raft_core_stopped_reports_a_failed_log_append() {
+        // #480: a full disk fails the append, openraft stops its core, and
+        // the node must find out rather than carry on not applying anything.
+        let log_store = crate::council::log_store::MemLogStore::new();
+        let council = bootstrapped_council(log_store.clone()).await;
+        let shutdown = CancellationToken::new();
+        let watcher = tokio::spawn(raft_core_stopped(
+            council.raft().metrics(),
+            shutdown.clone(),
+        ));
+
+        log_store.fail_appends();
+        let security = crate::sesame::types::SecurityState::default();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            seed_bootstrap_state(&council, &security),
+        )
+        .await;
+
+        let reason = tokio::time::timeout(Duration::from_secs(10), watcher)
+            .await
+            .expect("the watcher noticed the stopped core")
+            .unwrap()
+            .expect("a stop before shutdown is a failure");
+        assert!(reason.to_lowercase().contains("space"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn raft_core_stopped_is_quiet_on_an_orderly_shutdown() {
+        let council = bootstrapped_council(crate::council::log_store::MemLogStore::new()).await;
+        let shutdown = CancellationToken::new();
+        let watcher = tokio::spawn(raft_core_stopped(
+            council.raft().metrics(),
+            shutdown.clone(),
+        ));
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reason, None);
     }
 
     fn snap(name: &str, port: u16, now: Instant) -> MembershipSnapshot {
