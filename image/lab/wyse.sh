@@ -2,7 +2,8 @@
 # wyse.sh <n> [fresh]: a "virtual Wyse 3040" on the lab network, standing in
 # for the hardware until the last stage (and S3's x86-64 smoke run): x86-64
 # q35 under TCG with -cpu Westmere (SSE4.2 and AES-NI but no AVX, like the
-# Wyse's Atom x5-Z8350), 2 GiB, an 8 GB disk and Ubuntu's OVMF
+# Wyse's Atom x5-Z8350), 2 GiB, a 7.25 GiB disk (the eMMC's ~7.3 GiB, as
+# image/tests/disk.sh has it) and Ubuntu's OVMF
 # (fetch-ovmf.sh). Real firmware PXE, ProxyDHCP, our iPXE, the installer,
 # then a reboot; the disk comes first in the boot order, so the same QEMU
 # process then boots the installed system. MAC 52:54:00:00:02:0<n>, from the
@@ -11,7 +12,7 @@ set -euo pipefail; . "$(dirname "$0")/lab.env"; cd "$WORK"
 n=${1:?usage: wyse.sh <n> [fresh]}; hex=$(printf %02x "$n")
 [ -f OVMF_CODE_4M.fd ] || { echo "no OVMF yet; run fetch-ovmf.sh first" >&2; exit 2; }
 if [ "${2:-}" = fresh ]; then rm -f "wyse$n.qcow2" "wyse$n-vars.fd"; fi
-[ -f "wyse$n.qcow2" ] || qemu-img create -q -f qcow2 "wyse$n.qcow2" 8G
+[ -f "wyse$n.qcow2" ] || qemu-img create -q -f qcow2 "wyse$n.qcow2" 7424M
 [ -f "wyse$n-vars.fd" ] || { cp OVMF_VARS_4M.fd "wyse$n-vars.fd"; chmod u+w "wyse$n-vars.fd"; }
 # A fresh hub slot per QEMU start (see rbnode.sh).
 slot=$(cat slot.next 2>/dev/null || echo 1); echo $((slot + 1)) > slot.next

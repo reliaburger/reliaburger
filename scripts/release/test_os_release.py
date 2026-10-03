@@ -1,6 +1,9 @@
-"""Tests for os_release.py: signing, the channel document, versions, the
-quiet-week check and pruning."""
+"""Tests for os_release.py: signing, the channel document and a CI lab
+build's channel, versions, the quiet-week check and pruning."""
+import contextlib
+import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -75,6 +78,61 @@ class Signing(unittest.TestCase):
             os_release.channel_document("2026.40.3", {"riscv64": good})
         with self.assertRaises(ValueError):
             os_release.channel_document("v0.1.0", {"aarch64": good})
+
+
+class LabChannel(unittest.TestCase):
+    """A CI lab build's channel: the next version, signed with the run's
+    throwaway key instead of the release key."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.key, self.pub = make_key(self.dir)
+        self.installed = self.dir / "reliaburger-os_2026.41.7.SHA256SUMS"
+        self.installed.write_text("ab  reliaburger-os_2026.41.7.efi\n")
+        self.next = self.dir / "reliaburger-os_2026.41.8.SHA256SUMS"
+        self.next.write_text("cd  reliaburger-os_2026.41.8.efi\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def lab_channel(self, version, sums):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return os_release.main(["lab-channel", "--key", str(self.key), "--version", version,
+                                    "--out", str(self.dir / "out"), f"x86_64={sums}"])
+
+    def test_a_lab_channel_names_the_next_version_signed_with_the_given_key(self):
+        self.assertEqual(self.lab_channel("2026.41.8", self.next), 0)
+        path = self.dir / "out" / "os-channel.json"
+        document = json.loads(path.read_bytes())
+        self.assertEqual(document["version"], "2026.41.8")
+        self.assertEqual(document["architectures"], {"x86_64": {
+            "tag": "os-2026.41.8-x86_64", "sums": self.next.name,
+            "sums_sha256": os_release.sha256_file(self.next)}})
+        self.assertEqual(len((self.dir / "out" / "os-channel.json.sig").read_bytes()), 64)
+        self.assertTrue(verifies(self.pub, path))
+        # The same canonical bytes the release channel has, so bun and relish
+        # parse a lab channel exactly as they parse a published one.
+        self.assertEqual(path.read_bytes(), os_release.channel_document("2026.41.8", {"x86_64": self.next}))
+
+    def test_a_lab_channel_refuses_the_installed_versions_sums(self):
+        # The nodes run the first build; the channel names the one they update to.
+        with self.assertRaises(ValueError):
+            self.lab_channel("2026.41.8", self.installed)
+
+    def test_a_lab_channel_never_reads_the_release_key(self):
+        os.environ["RELIABURGER_RELEASE_KEY"] = "not a key"
+        try:
+            self.assertEqual(self.lab_channel("2026.41.8", self.next), 0)
+            self.assertEqual(os.environ["RELIABURGER_RELEASE_KEY"], "not a key")
+        finally:
+            del os.environ["RELIABURGER_RELEASE_KEY"]
+        self.assertTrue(verifies(self.pub, self.dir / "out" / "os-channel.json"))
+
+    def test_a_lab_channel_needs_a_key_file(self):
+        with self.assertRaises(FileNotFoundError):
+            os_release.main(["lab-channel", "--key", str(self.dir / "missing.der"), "--version", "2026.41.8",
+                             "--out", str(self.dir / "out"), f"x86_64={self.next}"])
 
 
 class ShippedKey(unittest.TestCase):

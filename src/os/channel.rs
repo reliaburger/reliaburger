@@ -299,6 +299,43 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *reliaburger-os
         assert_eq!(entries[0].name, "reliaburger-os_2026.41.0.raw.zst");
     }
 
+    /// A CI lab build's channel (`os_release.py lab-channel`, in
+    /// `testdata/lab/`): the run's next version, signed with the run's
+    /// throwaway key. It passes every rule a published channel does, so the
+    /// lab exercises the same checks, but only that run's key vouches for it.
+    #[test]
+    fn a_lab_channel_verifies_against_its_runs_key_and_no_release_key() {
+        let bytes = include_bytes!("testdata/lab/os-channel.json");
+        let signature = include_bytes!("testdata/lab/os-channel.json.sig");
+        let lab_key: PublicKey = BASE64
+            .decode(include_str!("testdata/lab/lab-key.b64").trim())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let channel = OsChannel::verified(bytes, signature, &[lab_key]).unwrap();
+        assert_eq!(channel.os_version().unwrap(), "2026.41.8".parse().unwrap());
+        assert_eq!(channel.architectures["x86_64"].tag, "os-2026.41.8-x86_64");
+        let entries = channel
+            .verified_sums(
+                "x86_64",
+                include_bytes!("testdata/lab/reliaburger-os_2026.41.8.SHA256SUMS"),
+            )
+            .unwrap();
+        // What bun stages for an update: the UKI and both /usr images.
+        assert_eq!(
+            crate::os::slot::wanted(&entries, &channel.version)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let release_keys = crate::upgrade::keys::release_keys(&Default::default()).unwrap();
+        assert_eq!(
+            OsChannel::verified(bytes, signature, &release_keys),
+            Err(OsError::ChannelSignature)
+        );
+    }
+
     #[test]
     fn a_channel_signed_by_another_key_is_refused() {
         let bytes = channel_bytes("2026.41.0", SUMS);

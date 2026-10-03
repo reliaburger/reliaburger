@@ -17,6 +17,8 @@
 # Needs root (the bridge, port 67, a loop device), qemu-system-x86, ovmf,
 # dnsmasq, sfdisk, e2fsprogs and /dev/kvm.
 set -euo pipefail
+# shellcheck source=image/tests/disk.sh
+. "$(dirname "$0")/disk.sh"
 out=$(cd "${1:?usage: relish-netboot-install.sh <artefact dir> <version> <relish>}" && pwd)
 version=${2:?usage}
 relish=$(readlink -f "${3:?usage}")
@@ -58,8 +60,9 @@ server=$!
 
 sudo ip tuntap add rbtap0 mode tap user "$(id -un)"
 sudo ip link set rbtap0 master rbbr0 up
-# A used disk: a GPT with one partition holding an ext4 filesystem.
-truncate -s 8G "$work/used.raw"
+# A used disk: the Wyse-sized test disk (disk.sh), then a GPT with one
+# partition holding an ext4 filesystem.
+blank_disk "$work/used.raw" "$out/reliaburger-os_$version.raw.zst"
 printf 'label: gpt\nsize=1G, type=L, name=ThinOS\n' | sfdisk -q "$work/used.raw"
 loop=$(sudo losetup -fP --show "$work/used.raw")
 sudo mkfs.ext4 -q -L ThinOS "${loop}p1"

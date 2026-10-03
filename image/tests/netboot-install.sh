@@ -1,6 +1,6 @@
 #!/bin/bash
 # The netboot install test (x86-64, KVM), run by .github/workflows/appliance.yml:
-# a blank 8 GB disk and 2 GiB, QEMU's user network playing DHCP and TFTP (iPXE
+# a blank 7.25 GiB disk (disk.sh) and 2 GiB, QEMU's user network playing DHCP and TFTP (iPXE
 # and boot.ipxe), a web server on the runner serving the installer and the
 # signed image. The installer checks the signature, streams the image to disk
 # and reboots; the disk comes first in the boot order, so the second boot
@@ -15,6 +15,8 @@
 set -euo pipefail
 out=$(cd "${1:?usage: netboot-install.sh <artefact dir> <version>}" && pwd)
 version=${2:?usage: netboot-install.sh <artefact dir> <version>}
+# shellcheck source=image/tests/disk.sh
+. "$(dirname "$0")/disk.sh"
 work=$(mktemp -d)
 web="$work/web" tftp="$work/tftp"
 mkdir -p "$web/x86_64" "$tftp"
@@ -25,7 +27,7 @@ done
 ln -s "$out/reliaburger-os-installer_$version.efi" "$web/x86_64/installer.efi"
 (cd "$web" && exec python3 -m http.server 8080 >"$work/http.log" 2>&1) &
 http=$!
-truncate -s 8G "$work/blank.raw"
+blank_disk "$work/blank.raw" "$out/reliaburger-os_$version.raw.zst"
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
 log="$work/netboot.log"
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \

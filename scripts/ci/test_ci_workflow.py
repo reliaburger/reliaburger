@@ -144,5 +144,76 @@ class RetargetTests(unittest.TestCase):
         self.assertIn("github.workflow", group)
 
 
+class ApplianceTests(unittest.TestCase):
+    """appliance.yml: lab builds carry a next version and a lab channel for
+    the Wyse lab, without loosening how a published build is signed."""
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "appliance.yml").read_text()
+        self.jobs = jobs(self.text)
+        self.image = steps(self.jobs["image"])
+
+    def step(self, name):
+        found = [s for s in self.image if f"- name: {name}" in s]
+        self.assertEqual(len(found), 1, name)
+        return found[0]
+
+    def test_only_main_publishes(self):
+        plan = self.jobs["plan"]
+        self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]', plan)
+        self.assertIn("needs.plan.outputs.publish == 'true'", self.jobs["sign"])
+
+    def test_the_release_key_stays_in_the_sign_job_which_runs_only_first_party_actions(self):
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                if name == "sign":
+                    self.assertEqual(job.count("secrets.RELIABURGER_RELEASE_KEY"), 1)
+                else:
+                    self.assertNotIn("RELIABURGER_RELEASE_KEY", job)
+        actions = re.findall(r"uses: ([^@\s]+)@", self.jobs["sign"])
+        self.assertTrue(actions)
+        for action in actions:
+            self.assertTrue(action.startswith("actions/"), action)
+
+    def test_lab_builds_sign_a_lab_channel_for_the_next_version_with_the_runs_key(self):
+        sign = self.step("Sign (throwaway key)")
+        self.assertIn("if: env.PUBLISH != 'true'", sign)
+        self.assertRegex(sign, r"scripts/release/os_release\.py\"? lab-channel")
+        self.assertIn('--version "$NEXT_VERSION"', sign)
+        # The channel is checked with the run's public key, and the private
+        # key is gone before any test runs.
+        self.assertIn("os-channel.json.sig", sign)
+        self.assertLess(sign.index("lab-channel"), sign.index('rm -f "$RUNNER_TEMP/spike.key"'))
+        self.assertIn('"$RUNNER_TEMP/spike.der"', sign.split("rm -f", 1)[1])
+
+    def test_the_next_version_is_built_for_every_x86_64_lab_build(self):
+        build = self.step("Build the next version (x86-64 lab builds)")
+        self.assertIn("env.PUBLISH != 'true'", build)
+        # Not only when relish was built from source: a dispatch naming a
+        # bun release gets a next version too.
+        self.assertNotIn("source-bin", build.split("run:")[0])
+
+    def test_the_next_version_is_uploaded_as_a_release_tree(self):
+        upload = self.step("Upload the next version")
+        self.assertIn("name: appliance-x86_64-next", upload)
+        self.assertIn("lab-release", upload)
+        self.assertIn("if: env.NEXT_VERSION != ''", upload)
+        self.assertIn("lab-release.sh", self.step("Lay out the next version as a release"))
+
+    def test_dispatched_lab_builds_keep_their_artefacts_a_week(self):
+        for name in ["Upload the image", "Upload the next version"]:
+            with self.subTest(step=name):
+                self.assertIn("github.event_name == 'workflow_dispatch' && 7",
+                              self.step(name))
+        # A published build's artefacts still last three days: they go into
+        # its releases within the run.
+        self.assertIn("env.PUBLISH == 'true' && 3", self.step("Upload the image"))
+
+    def test_the_boot_test_uses_the_wyse_sized_disk(self):
+        boot = self.step("Boot test")
+        self.assertIn(". image/tests/disk.sh", boot)
+        self.assertIn("disk_from_image", boot)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,8 +4,10 @@
 
 ## Before the day
 
-- **An image with the appliance profile:** 2026.40.46 or later (zram, `noatime,compress=zstd:1`, journald at 32 MB, one old bun kept). Start a fresh build so the artefacts haven't expired: Actions → Appliance image → Run workflow, on `feat/appliance-image` (or `main` once merged). Note the run ID.
-- **A second build to update to**, started after the first: the OS update in step 7 needs a newer version. Run it once more with `broken_bun` ticked for the fallback test.
+- **Which images (maintainer, 3 October 2026):** the first lab runs use CI lab builds; the formal S5 run uses the signed channel once 0.3.0 publishes one (`relish image download`, and `relish os upgrade` with no version).
+- **A lab build:** 2026.40.46 or later (zram, `noatime,compress=zstd:1`, journald at 32 MB, one old bun kept). Start a fresh build: Actions → Appliance image → Run workflow, with `publish` off. A run started by hand keeps its artefacts for 7 days; a pull request's run, for one. Dispatch needs the workflow on `main`, so until 0.3.0 merges, take the newest green pull request run of the train and download it that day. Note the run ID.
+- **The version to update to comes with it.** Every x86_64 lab build also builds the next version (one build number on) and uploads it as `appliance-x86_64-next`: the release laid out as on GitHub beside a lab `os-channel.json`, all signed with the run's key. Step 7 serves it. For the fallback test, run the workflow once more with `broken_bun` ticked; that run makes no next version.
+- **Disk size:** CI tests on a 7.25 GiB disk (`image/tests/disk.sh`), a little under the 3040's ~7.3 GiB eMMC, so the data partition the tests see is the one the Wyses get.
 - **A Linux machine on the Wyse network** for `netboot-server.sh` (`apt install dnsmasq-base python3`), on wired Ethernet. The lab Mac can't bridge a VM onto a physical LAN without root.
 - **The laptop** with `relish` 0.1.1, `gh`, `rustup`, `mtools` and a USB stick for the seeds.
 - **A router** with a DHCP reservation per Wyse. The MAC is on the label under each unit, or in the BIOS.
@@ -26,8 +28,9 @@ F2 at power-on (default password `Fireport`):
 ## 2. Serve and seed
 
 ```sh
-# Linux box: the first build's x86_64 artefact, unpacked
+# Linux box: the build's x86_64 artefact and its next version, unpacked
 gh run download <run> -R reliaburger/reliaburger -n appliance-x86_64 -D art/x86_64
+gh run download <run> -R reliaburger/reliaburger -n appliance-x86_64-next -D next
 sudo image/tools/netboot-server.sh "$PWD/art" eth0
 
 # Laptop: all ten nodes now (released buns can't take --network yet)
@@ -75,7 +78,7 @@ Leave the tour's apps running for the first 12 hours, then remove them. One CSV 
 
 ## 7. OS update and fallback
 
-Stage the second build across the fleet as the manual's "Updating the OS" says, one node at a time, node 1 last. Then stage the `broken_bun` build on one worker and leave it.
+Roll the next version across the fleet as the manual's "Updating a CI build" says: serve `next/` (`cd next && python3 -m http.server 8000`), then `relish os upgrade <next version> --channel http://<laptop IP>:8000/releases/download/os-channel/os-channel.json`. The leader takes one node at a time, itself last. Name the version: relish checks a channel against the release keys only, so it can't read the lab channel (`relish os list` shows the newest release as unknown). Then stage the `broken_bun` build on one worker and leave it.
 
 **Record:** the time per node from `systemctl reboot` to blessed; that the cluster stayed quorate; for the broken one, the time to fall back on its own (about 16 minutes in VMs: three 300 s health checks) and whether the Wyse firmware kept counting tries.
 

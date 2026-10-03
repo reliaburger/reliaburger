@@ -93,7 +93,7 @@ CI builds both architectures natively, x86_64 on `ubuntu-24.04` and aarch64 on `
 
 ### The disk, partition by partition
 
-Here's where the appliance stops looking like a normal Linux install. This is the layout of a freshly booted node on an 8 GB disk, the Wyse's eMMC size:
+Here's where the appliance stops looking like a normal Linux install. This is the layout of a freshly booted node on the 8 GiB disk CI used at the time:
 
 ```
 vda1  512M vfat            esp                             /boot
@@ -104,7 +104,7 @@ vda5  1.1G                 _empty                          (slot B)
 vda6   64M                 _empty                          (slot B verity)
 ```
 
-Four of those partitions come from the build, one `mkosi.repart/*.conf` file each. Two appear on first boot. Let's read the most interesting build-time one, slot A of `/usr`:
+A Wyse's "8 GB" eMMC is 8 × 10⁹ bytes, about 7.3 GiB, so on the real machine the data partition is about 1 GiB smaller. Four of those partitions come from the build, one `mkosi.repart/*.conf` file each. Two appear on first boot. Let's read the most interesting build-time one, slot A of `/usr`:
 
 ```ini
 # Slot A of /usr: read-only EROFS checked by dm-verity. mkosi puts the verity
@@ -586,7 +586,9 @@ The match guard (`if running == Some(target.as_str())`) is a condition on an arm
 
 Two rollouts that restart nodes must never overlap, and neither must a rollout and a bun upgrade. Checking in the handler and then writing is a race, which Chapter 14 learned the hard way (M13), so the rule lives where writes are serialised, in the Raft state machine: an OS rollout write is ignored while a bun upgrade is active, and the other way round. Raft can't return an error from `apply`, so the start handler reads the record back after writing it, and if it isn't there, something else won.
 
-CI runs the whole thing. A lab build makes the image twice, one version apart, and signs both with its throwaway key. One node boots the first version and forms a cluster from its seed, the runner serves the second laid out like a GitHub release, and `relish os upgrade` has to end with the node healthy on the new version.
+CI runs the whole thing. A lab build makes the image twice, one version apart, and signs both with its throwaway key. It also writes a lab `os-channel.json` naming the second version, with the same `os_release.py` code and the same canonical bytes as the published channel, signed with that throwaway key instead of the release key. One node boots the first version and forms a cluster from its seed, the runner serves the second laid out like a GitHub release beside that channel, and `relish os upgrade` has to end with the node healthy on the new version. The run uploads exactly that tree as `appliance-x86_64-next`, so the Wyse lab updates from what CI tested.
+
+The lab channel is a stand-in, not a back door. relish checks a channel against the release keys compiled into it and nothing else, so it refuses a lab channel: `relish os list` says the newest release is unknown, and in the lab you name the version, `relish os upgrade <version>`, which never reads the channel. The node still checks the release's `SHA256SUMS` against the key its own image carries. A test in `src/os/channel.rs` pins both halves down with a lab channel from `os_release.py`: it passes every rule a published channel does with its run's key, and fails the signature check against the release keys.
 
 ### Keeping /etc in step
 
@@ -700,7 +702,7 @@ We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac withou
 
 ### CI boots every image
 
-Each CI run boots what it built, with 2 GiB and an 8 GB disk, like the Wyse. The pass condition is a line on the serial console, not a process exit code:
+Each CI run boots what it built, with 2 GiB and a 7.25 GiB disk, like the Wyse. For a long time the disk was `truncate -s 8G`, and 8G means 8 GiB, about 1.3 GiB more than a Wyse's 8 GB eMMC really holds. Every test passed on space the hardware doesn't have. Now every QEMU test sources `image/tests/disk.sh`, which sets the size in one place and refuses an image that leaves no room for slot B, saying so. It never lets `truncate` shrink the disk image, which would silently cut it short and make the failure a confusing boot error instead. The pass condition is a line on the serial console, not a process exit code:
 
 ```bash
 while [ $(( $(date +%s) - start )) -lt "$deadline" ]; do
