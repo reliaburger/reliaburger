@@ -168,6 +168,23 @@ impl InstalledRecord {
         Ok(true)
     }
 
+    /// Forget every machine with `client`'s MAC or UUID and save the file:
+    /// a machine whose disk wasn't wiped didn't install. Returns false (and
+    /// writes nothing) when there was nothing to forget.
+    pub fn forget(&mut self, client: &BootClient) -> Result<bool, NetbootError> {
+        let mac = client.mac.map(|m| m.to_string());
+        let before = self.machines.len();
+        self.machines.retain(|machine| {
+            !((mac.is_some() && machine.mac == mac)
+                || (client.uuid.is_some() && machine.uuid == client.uuid))
+        });
+        if self.machines.len() == before {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
     fn save(&self) -> Result<(), NetbootError> {
         let file = RecordFile {
             machines: self.machines.clone(),
@@ -194,18 +211,25 @@ pub enum BootDecision {
     AlreadyInstalled,
     /// `--mac` doesn't list it: boot whatever comes next.
     NotAllowed,
+    /// The operator kept its disk this session: boot whatever comes next.
+    Declined,
 }
 
 /// Decide what `client` gets, given the record, the `--mac` allow-list
-/// (empty allows everyone) and `--reinstall`.
+/// (empty allows everyone), `--reinstall`, and whether the operator
+/// declined to wipe its disk this session.
 pub fn decide(
     client: &BootClient,
     record: &InstalledRecord,
     allowed: &[MacAddress],
     reinstall: bool,
+    declined: bool,
 ) -> BootDecision {
     if !allowed.is_empty() && !client.mac.is_some_and(|mac| allowed.contains(&mac)) {
         return BootDecision::NotAllowed;
+    }
+    if declined {
+        return BootDecision::Declined;
     }
     if !reinstall && record.contains(client) {
         return BootDecision::AlreadyInstalled;
@@ -229,16 +253,25 @@ pub fn chain_script(server: Ipv4Addr, http_port: u16) -> String {
 /// server's address and port written in, and the installer URL carrying
 /// `client` so the server can remember the machine.
 ///
+/// `reliaburger.ask` is where the installer reports a disk that isn't
+/// blank and waits for the operator's answer ([`super::wipe`]); it's left
+/// out when the machine sent nothing to key the question on, and then the
+/// installer refuses a used disk as it always did. The script never passes
+/// `reliaburger.wipe=1`: only the operator's yes or `--wipe` wipes a disk.
+///
 /// Arguments to a UKI replace its built-in command line (Secure Boot
 /// off), so this passes the console too. `--autofree`: a failed attempt
 /// mustn't leave the installer registered, or iPXE hands it to the next
 /// try as an initrd.
 pub fn install_script(server: Ipv4Addr, http_port: u16, client: &BootClient) -> String {
     let query = client.query();
-    let query = if query.is_empty() {
-        String::new()
+    let (query, ask) = if query.is_empty() {
+        (String::new(), String::new())
     } else {
-        format!("?{query}")
+        (
+            format!("?{query}"),
+            format!(" reliaburger.ask=http://{server}:{http_port}/disk?{query}"),
+        )
     };
     format!(
         "#!ipxe\n\
@@ -246,7 +279,7 @@ pub fn install_script(server: Ipv4Addr, http_port: u16, client: &BootClient) -> 
          iseq ${{buildarch}} arm64 && set console ttyAMA0 || set console ttyS0\n\
          set base http://{server}:{http_port}/${{buildarch}}\n\
          echo reliaburger: chaining ${{base}}/installer.efi\n\
-         chain --autofree ${{base}}/installer.efi{query} reliaburger.url=${{base}} console=tty0 console=${{console}},115200\n"
+         chain --autofree ${{base}}/installer.efi{query} reliaburger.url=${{base}}{ask} console=tty0 console=${{console}},115200\n"
     )
 }
 
@@ -262,6 +295,12 @@ exit 1\n";
 pub const NOT_ALLOWED_SCRIPT: &str = "#!ipxe\n\
 # relish netboot: this machine is not on the --mac list.\n\
 echo reliaburger: not on the netboot server --mac list, booting the next option\n\
+exit 1\n";
+
+/// The script for a machine whose disk the operator kept this session.
+pub const DECLINED_SCRIPT: &str = "#!ipxe\n\
+# relish netboot: the operator kept this machine's disk.\n\
+echo reliaburger: the operator declined to wipe this disk, booting the next option\n\
 exit 1\n";
 
 #[cfg(test)]
@@ -313,7 +352,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut record = empty_record(dir.path());
         let machine = client(Some(MAC), Some(UUID));
-        assert_eq!(decide(&machine, &record, &[], false), BootDecision::Install);
+        assert_eq!(
+            decide(&machine, &record, &[], false, false),
+            BootDecision::Install
+        );
         assert!(record.remember(&machine, 1_790_000_000).unwrap());
         assert!(!record.remember(&machine, 1_790_000_001).unwrap());
 
@@ -324,13 +366,13 @@ mod tests {
         let same_uuid = client(Some("52:54:00:00:00:01"), Some(UUID));
         for known in [&machine, &same_mac, &same_uuid] {
             assert_eq!(
-                decide(known, &reread, &[], false),
+                decide(known, &reread, &[], false, false),
                 BootDecision::AlreadyInstalled
             );
         }
         let stranger = client(Some("52:54:00:00:00:02"), None);
         assert_eq!(
-            decide(&stranger, &reread, &[], false),
+            decide(&stranger, &reread, &[], false, false),
             BootDecision::Install
         );
     }
@@ -341,7 +383,10 @@ mod tests {
         let mut record = empty_record(dir.path());
         let machine = client(Some(MAC), None);
         record.remember(&machine, 1).unwrap();
-        assert_eq!(decide(&machine, &record, &[], true), BootDecision::Install);
+        assert_eq!(
+            decide(&machine, &record, &[], true, false),
+            BootDecision::Install
+        );
     }
 
     #[test]
@@ -350,7 +395,7 @@ mod tests {
         let record = empty_record(dir.path());
         let allowed = [MAC.parse().unwrap()];
         assert_eq!(
-            decide(&client(Some(MAC), None), &record, &allowed, false),
+            decide(&client(Some(MAC), None), &record, &allowed, false, false),
             BootDecision::Install
         );
         assert_eq!(
@@ -358,12 +403,13 @@ mod tests {
                 &client(Some("52:54:00:00:00:01"), None),
                 &record,
                 &allowed,
+                false,
                 false
             ),
             BootDecision::NotAllowed
         );
         assert_eq!(
-            decide(&client(None, Some(UUID)), &record, &allowed, false),
+            decide(&client(None, Some(UUID)), &record, &allowed, false, false),
             BootDecision::NotAllowed
         );
     }
@@ -402,16 +448,69 @@ mod tests {
         assert!(script.starts_with("#!ipxe\n"));
         assert!(script.contains("set base http://192.168.1.20:8081/${buildarch}\n"));
         assert!(script.contains(
-            "chain --autofree ${base}/installer.efi?mac=52:54:00:12:34:56 reliaburger.url=${base} console=tty0 console=${console},115200\n"
+            "chain --autofree ${base}/installer.efi?mac=52:54:00:12:34:56 reliaburger.url=${base} reliaburger.ask=http://192.168.1.20:8081/disk?mac=52:54:00:12:34:56 console=tty0 console=${console},115200\n"
         ));
         assert!(script.contains("set console ttyAMA0 || set console ttyS0"));
         let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default());
         assert!(anonymous.contains("${base}/installer.efi reliaburger.url="));
     }
 
+    /// The installer asks relish about a used disk at the URL this passes,
+    /// keyed by the MAC and UUID the chain script sent.
+    #[test]
+    fn the_install_script_tells_the_installer_where_to_ask_about_a_used_disk() {
+        let script = install_script(
+            Ipv4Addr::new(192, 168, 1, 20),
+            8081,
+            &client(Some(MAC), Some(UUID)),
+        );
+        assert!(
+            script.contains(
+                " reliaburger.ask=http://192.168.1.20:8081/disk?mac=52:54:00:12:34:56&uuid=4c4c4544-0042-3510-8051-b4c04f4b4e32 "
+            ),
+            "{script}"
+        );
+        assert!(!script.contains("reliaburger.wipe"), "{script}");
+        // With nothing to key the question on, there's no question: the
+        // installer refuses a used disk, as it always did.
+        let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default());
+        assert!(!anonymous.contains("reliaburger.ask"), "{anonymous}");
+    }
+
+    #[test]
+    fn a_machine_declined_this_session_gets_exit_even_with_reinstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = empty_record(dir.path());
+        let machine = client(Some(MAC), None);
+        assert_eq!(
+            decide(&machine, &record, &[], true, true),
+            BootDecision::Declined
+        );
+        let allowed = [MAC.parse().unwrap()];
+        assert_eq!(
+            decide(&machine, &record, &allowed, false, true),
+            BootDecision::Declined
+        );
+    }
+
+    #[test]
+    fn a_declined_machine_is_forgotten_so_it_is_asked_again_next_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = empty_record(dir.path());
+        let machine = client(Some(MAC), Some(UUID));
+        let other = client(Some("52:54:00:00:00:01"), None);
+        record.remember(&machine, 1).unwrap();
+        record.remember(&other, 2).unwrap();
+        assert!(record.forget(&client(Some(MAC), None)).unwrap());
+        assert!(!record.forget(&client(Some(MAC), None)).unwrap());
+        let reread = empty_record(dir.path());
+        assert!(!reread.contains(&machine));
+        assert!(reread.contains(&other));
+    }
+
     #[test]
     fn machines_that_should_not_install_exit_with_a_failure() {
-        for script in [EXIT_SCRIPT, NOT_ALLOWED_SCRIPT] {
+        for script in [EXIT_SCRIPT, NOT_ALLOWED_SCRIPT, DECLINED_SCRIPT] {
             assert!(script.starts_with("#!ipxe\n"));
             assert!(script.ends_with("exit 1\n"));
         }

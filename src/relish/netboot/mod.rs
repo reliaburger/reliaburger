@@ -23,6 +23,7 @@ pub mod installed;
 pub mod interface;
 mod server;
 pub mod tftp;
+pub mod wipe;
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -155,6 +156,8 @@ pub struct NetbootOptions {
     pub keys: Vec<PublicKey>,
     /// Install again on machines that installed already.
     pub reinstall: bool,
+    /// Machines whose used disk is wiped without asking (`--wipe`).
+    pub wipe: Vec<MacAddress>,
 }
 
 /// Why `relish netboot` refused to start or stopped.
