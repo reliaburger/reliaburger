@@ -11764,6 +11764,111 @@ async fn deploy_before_its_committed_allocation_leaves_nothing_for_the_retry() {
     assert_eq!(instances, ["default__web-0".to_string()]);
 }
 
+/// #481: stopping this node's last replica of a service that still runs
+/// on other nodes withdrew the whole VIP from the kernel, so local clients
+/// got `EPERM` until the next catalogue arrived. The stop must take only
+/// this node's backends out of the installed view; the kernel entry is
+/// written from that same view, so it keeps the remote backends too.
+#[tokio::test]
+async fn stopping_the_last_local_replica_keeps_routing_to_other_nodes() {
+    use crate::onion::catalog::CatalogBackend;
+    use crate::onion::service_id::ServiceId;
+    let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+    agent.supervisor.grill().set_pid(std::process::id());
+    let (_, ingress) = cluster_publication_fixture();
+    let web = ServiceId::new("default", "web");
+    let remote = catalog.services["default__remote"].clone();
+    let elsewhere = CatalogBackend {
+        execution: None,
+        node_id: "other-node".into(),
+        node_ip: "192.168.1.2".parse().unwrap(),
+        host_port: 30003,
+        healthy: true,
+    };
+    let with_web = |backends: Vec<CatalogBackend>| {
+        catalog
+            .reconcile([
+                (
+                    ServiceId::new("default", "remote"),
+                    remote.port,
+                    remote.backends.clone(),
+                ),
+                (web.clone(), 8080, backends),
+            ])
+            .unwrap()
+    };
+    agent
+        .synchronise_consumer(
+            2,
+            with_web(vec![elsewhere.clone()]),
+            ingress.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+
+    // The leader learns of the local replica and publishes both.
+    let local = InstanceId("default__web-0".into());
+    let execution = crate::grill::RuntimeExecution {
+        instance_id: local.clone(),
+        generation: crate::grill::RuntimeGeneration::process("original"),
+    };
+    let spec: crate::grill::OciSpec = serde_json::from_value(serde_json::json!({
+        "root": {"path": "/fixture", "readonly": true},
+        "process": {"args": ["/app"], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+        "mounts": [], "linux": {"namespaces": []},
+    }))
+    .unwrap();
+    agent
+        .supervisor
+        .grill()
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: local.clone(),
+            generation: execution.generation.clone(),
+            spec,
+            network_reference: None,
+        }])
+        .await;
+    let here = CatalogBackend {
+        execution: Some(execution),
+        node_id: "test".into(),
+        node_ip: "192.168.1.1".parse().unwrap(),
+        host_port: 30002,
+        healthy: true,
+    };
+    agent
+        .synchronise_consumer(3, with_web(vec![here, elsewhere]), ingress, vec![])
+        .await
+        .unwrap();
+    let backends = |agent: &BunAgent<MockGrill>| {
+        agent
+            .service_map_tx
+            .borrow()
+            .resolve(&web)
+            .map(|entry| entry.backends.clone())
+            .unwrap_or_default()
+    };
+    let before = backends(&agent);
+    assert_eq!(before.len(), 2, "the view should name both replicas");
+    assert!(before.iter().any(|backend| backend.local));
+
+    agent.begin_app_stop("web", "default").await.unwrap();
+    let after = backends(&agent);
+    assert_eq!(
+        after,
+        before
+            .into_iter()
+            .filter(|backend| !backend.local)
+            .collect::<Vec<_>>(),
+        "the stop must withdraw only this node's backend, not the whole VIP"
+    );
+    assert!(agent.consumer_view_stale, "the next tick rebuilds the view");
+}
+
 /// A discovery-owning agent with a Pending `web` instance whose runtime
 /// holds an address, for a service this node never published.
 async fn unpublished_hold_fixture() -> (
