@@ -1127,3 +1127,12 @@ cargo test --lib pickle       # the whole registry, in-process
 Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
 
 Phase 5 adds 72 tests, bringing the total to 867.
+
+
+### Sharing the authentication budget
+
+A registry request used to call the synchronous Argon2 verifier directly. The token decisions were correct, but the hash ran on a Tokio worker. Enough concurrent requests could occupy the workers that also run Bun's health checks and scheduling.
+
+Pickle now uses the same asynchronous verifier as the API and browser login. It rejects malformed tokens before hashing, waits for one of four process-wide permits, and runs the expensive verification with `spawn_blocking`. A permit is a borrowed place in that shared budget; holding it inside the blocking closure keeps the place occupied until the hash really finishes, even if the HTTP caller disconnects.
+
+The regression holds every verification permit and sends real registry reads and uploads, with both Bearer and TLS Basic credentials. Each request waits until admission opens, while malformed credentials return 401 immediately. Role and repository scope checks still happen after authentication. A different HTTP port doesn't buy a second CPU budget.
