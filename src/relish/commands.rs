@@ -1759,6 +1759,7 @@ pub fn resolve_image_digest(
             .find(|summary| holds(summary, image))
             .map(|_| image)
     } else if let Some((name, digest)) = image.split_once('@') {
+        let (name, _tag) = split_repo_tag(name);
         let repository = canonical_repository(name);
         images
             .iter()
