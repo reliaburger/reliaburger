@@ -137,6 +137,9 @@ impl BlobStore {
             lock.try_lock().map_err(|error| {
                 std::io::Error::other(format!("registry upload directory is busy: {error}"))
             })?;
+            // Own the lock before anything below can refuse the claim, so a
+            // refusal unlocks it too.
+            let owner = UploadDirectoryOwner { lock };
             let uploads = directory.join("uploads");
             std::fs::create_dir_all(&uploads)?;
             if !std::fs::symlink_metadata(&uploads)?.file_type().is_dir() {
@@ -160,7 +163,7 @@ impl BlobStore {
                 std::fs::remove_file(entry.path())?;
             }
             std::fs::File::open(uploads)?.sync_all()?;
-            Ok(UploadDirectoryOwner { lock })
+            Ok(owner)
         })
         .await
         .map_err(|error| std::io::Error::other(format!("upload recovery task failed: {error}")))?
@@ -680,8 +683,8 @@ mod tests {
 
     /// A child that another thread is forking holds a copy of every open
     /// descriptor until its `exec`, the lock file's included. Dropping the
-    /// owner must still release the lock at once, or the replacement claim
-    /// straight after is refused as busy (#497).
+    /// owner, or refusing a claim after taking the lock, must still release
+    /// the lock at once, or the claim straight after is refused as busy (#497).
     #[tokio::test]
     async fn a_dropped_owner_is_replaced_while_other_threads_spawn_processes() {
         use std::sync::Arc;
@@ -703,12 +706,17 @@ mod tests {
                 })
             })
             .collect();
+        let unexpected = store.base_dir.join("uploads").join("operator-file");
         let mut refused = 0;
-        for _ in 0..100 {
+        for _ in 0..300 {
             match store.claim_upload_directory().await {
                 Ok(owner) => drop(owner),
                 Err(_) => refused += 1,
             }
+            // A claim refused for an unrecognised entry has taken the lock.
+            std::fs::write(&unexpected, b"keep").unwrap();
+            assert!(store.claim_upload_directory().await.is_err());
+            std::fs::remove_file(&unexpected).unwrap();
         }
         spawning.store(false, Ordering::Relaxed);
         for spawner in spawners {

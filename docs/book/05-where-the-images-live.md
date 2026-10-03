@@ -879,6 +879,11 @@ our descriptor didn't release the lock, so a replacement owner claimed
 straight after the old one dropped was refused as busy (#497). Nothing in
 production claims twice in one process. A full parallel `cargo test` does,
 though, so the owner's `Drop` now calls `unlock()` before the file closes.
+A refused claim had the same problem one step earlier: it locked the file,
+found an unrecognised entry and returned an error, closing the file without
+unlocking it. So the claim now wraps the locked file in an
+`UploadDirectoryOwner` straight after `try_lock`, and every refusal after that
+point unlocks through the same `Drop`.
 
 The test that ties this together launches the real binary, pushes the same
 content into an ordinary and a leased repository, leaves another upload half

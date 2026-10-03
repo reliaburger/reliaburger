@@ -354,6 +354,9 @@ async fn active_export_lock_refuses_another_writer_without_uploading() {
     assert!(result.is_err());
     assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
     assert!(checkpoint.exported_files.is_empty());
+    // Unlock rather than only close: a child another test is spawning holds a
+    // copy of the descriptor until its exec, and with it the lock (#519).
+    lock.unlock().unwrap();
     drop(lock);
     export_logs(
         source.path(),
