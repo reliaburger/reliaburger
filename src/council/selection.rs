@@ -62,6 +62,103 @@ impl Default for CouncilSelectionConfig {
     }
 }
 
+impl CouncilSelectionConfig {
+    /// This config with the council capped at `size`, the cluster-wide size
+    /// an operator chose (`DesiredState::council_size`). The floor drops
+    /// with it, so a one-voter council isn't held to a minimum of three.
+    /// `None` leaves the defaults.
+    pub fn sized(&self, size: Option<CouncilSize>) -> CouncilSelectionConfig {
+        let mut config = self.clone();
+        if let Some(size) = size {
+            config.max_council_size = config.max_council_size.min(size.get());
+            config.min_council_size = config.min_council_size.min(config.max_council_size);
+        }
+        config
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CouncilSize
+// ---------------------------------------------------------------------------
+
+/// How many voters a cluster's council grows to: an odd number from 1 to
+/// 7. Odd, because a council of 2n voters survives the same n - 1 failures
+/// as one of 2n - 1 while needing one more vote for every commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct CouncilSize(u8);
+
+/// Why a council size was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CouncilSizeError {
+    #[error("a council needs at least one voter; pick an odd size from 1 to 7")]
+    Zero,
+    #[error(
+        "a council of {0} voters survives no more failures than one of {smaller}; pick an odd size from 1 to 7",
+        smaller = .0 - 1
+    )]
+    Even(u8),
+    #[error(
+        "a council of {0} voters is more than the 7 the reconciler grows to; pick an odd size from 1 to 7"
+    )]
+    TooLarge(u8),
+}
+
+impl CouncilSize {
+    /// The largest council the reconciler grows: the default cap.
+    pub const MAX: u8 = 7;
+
+    /// What appliance clusters start with: five voters ride out two
+    /// failures without seven nodes' worth of Raft work on 2 GB machines.
+    pub const APPLIANCE: CouncilSize = CouncilSize(5);
+
+    /// A council of `voters`, if that's an odd number from 1 to 7.
+    pub fn new(voters: u8) -> Result<Self, CouncilSizeError> {
+        match voters {
+            0 => Err(CouncilSizeError::Zero),
+            v if v > Self::MAX => Err(CouncilSizeError::TooLarge(v)),
+            v if v % 2 == 0 => Err(CouncilSizeError::Even(v)),
+            v => Ok(Self(v)),
+        }
+    }
+
+    /// The number of voters.
+    pub fn get(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
+impl TryFrom<u8> for CouncilSize {
+    type Error = CouncilSizeError;
+
+    fn try_from(voters: u8) -> Result<Self, Self::Error> {
+        Self::new(voters)
+    }
+}
+
+impl From<CouncilSize> for u8 {
+    fn from(size: CouncilSize) -> u8 {
+        size.0
+    }
+}
+
+impl std::str::FromStr for CouncilSize {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let voters: u8 = text
+            .parse()
+            .map_err(|_| format!("{text:?} isn't a number of voters"))?;
+        Self::new(voters).map_err(|e| e.to_string())
+    }
+}
+
+impl std::fmt::Display for CouncilSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Selection algorithm
 // ---------------------------------------------------------------------------
@@ -1091,6 +1188,97 @@ mod tests {
             change_in_flight: false,
             disk_pressured: BTreeSet::new(),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Configured council size
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn a_council_size_is_odd_and_from_one_to_seven() {
+        for voters in [1, 3, 5, 7] {
+            assert_eq!(CouncilSize::new(voters).unwrap().get(), usize::from(voters));
+        }
+        assert_eq!(CouncilSize::new(0), Err(CouncilSizeError::Zero));
+        for voters in [2, 4, 6] {
+            assert_eq!(
+                CouncilSize::new(voters),
+                Err(CouncilSizeError::Even(voters))
+            );
+        }
+        for voters in [8, 9, 255] {
+            assert_eq!(
+                CouncilSize::new(voters),
+                Err(CouncilSizeError::TooLarge(voters))
+            );
+        }
+        assert_eq!(CouncilSize::APPLIANCE.get(), 5);
+    }
+
+    #[test]
+    fn a_bad_council_size_is_refused_with_the_reason() {
+        assert_eq!(
+            CouncilSizeError::Even(4).to_string(),
+            "a council of 4 voters survives no more failures than one of 3; pick an odd size from 1 to 7"
+        );
+        assert_eq!(
+            CouncilSizeError::Zero.to_string(),
+            "a council needs at least one voter; pick an odd size from 1 to 7"
+        );
+        assert_eq!(
+            CouncilSizeError::TooLarge(9).to_string(),
+            "a council of 9 voters is more than the 7 the reconciler grows to; pick an odd size from 1 to 7"
+        );
+        assert!("4".parse::<CouncilSize>().is_err());
+        assert!("five".parse::<CouncilSize>().is_err());
+        assert_eq!("5".parse::<CouncilSize>().unwrap(), CouncilSize::APPLIANCE);
+    }
+
+    #[test]
+    fn a_council_size_never_decodes_from_a_bad_value() {
+        assert_eq!(serde_json::to_string(&CouncilSize::APPLIANCE).unwrap(), "5");
+        assert!(serde_json::from_str::<CouncilSize>("4").is_err());
+        assert!(serde_json::from_str::<CouncilSize>("0").is_err());
+        assert_eq!(serde_json::from_str::<CouncilSize>("3").unwrap().get(), 3);
+    }
+
+    #[test]
+    fn a_configured_size_caps_the_council_below_the_default() {
+        let config = CouncilSelectionConfig::default();
+        let five = config.sized(Some(CouncilSize::APPLIANCE));
+        assert_eq!(five.max_council_size, 5);
+        assert_eq!(five.min_council_size, 3);
+        // A one-voter council can't keep a floor of three.
+        let one = config.sized(Some(CouncilSize::new(1).unwrap()));
+        assert_eq!((one.min_council_size, one.max_council_size), (1, 1));
+        // No configured size keeps the defaults.
+        let unset = config.sized(None);
+        assert_eq!((unset.min_council_size, unset.max_council_size), (3, 7));
+    }
+
+    #[test]
+    fn planner_stops_growing_at_the_configured_size() {
+        let now = Instant::now();
+        let config = CouncilSelectionConfig {
+            candidate_alive_window: Duration::from_secs(5),
+            ..CouncilSelectionConfig::default()
+        }
+        .sized(Some(CouncilSize::APPLIANCE));
+        // Five voters on a ten-node cluster, five healthy spares waiting.
+        let mut fixture = healthy_three(now);
+        fixture.voters = BTreeSet::from([1, 2, 3, 4, 5]);
+        fixture.candidates = vec![6, 7, 8, 9, 10];
+        for id in 2..=10 {
+            fixture.health.insert(id, alive_for(now, 600));
+        }
+        for id in 2..=5 {
+            fixture.replication.insert(id, Some(100));
+        }
+        assert_eq!(fixture.plan(&config, now), CouncilAction::Nothing);
+        // With four voters it still grows to the fifth.
+        fixture.voters.remove(&5);
+        fixture.candidates = vec![5, 6, 7, 8, 9, 10];
+        assert_eq!(fixture.plan(&config, now), CouncilAction::AddLearner(5));
     }
 
     #[test]

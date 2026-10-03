@@ -15,7 +15,9 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including the per-node `directive_retry` record in a
+/// Supported formats, including the appliance OS rollout
+/// (`DesiredState::os_rollout` and its history, `RaftRequest::OsRolloutUpdate`
+/// and `OsRolloutClear`), the per-node `directive_retry` record in a
 /// cluster upgrade, the 503 a node answers a directive with when the
 /// binary's registry is unavailable (the orchestrator retries it), and the
 /// nodes each app last ran on (`DesiredState::last_placed_nodes`), the
@@ -37,9 +39,12 @@ pub struct Compatibility {
 /// placement poll hands a node (`NodeAssignment::ordinals`) and the
 /// instance ids named after them (#398), and the `token`, `secret` and
 /// `identity` event kinds a peer's `/v1/events` answer can carry (F05 I1).
+/// The appliance OS rollout bumps both again: a new Raft request and a new
+/// field in council state. So does the cluster-wide council size
+/// (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 34,
-    state: 49,
+    protocol: 36,
+    state: 51,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

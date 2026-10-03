@@ -1,0 +1,16 @@
+# The node's status on tty1: its name, cluster, address, MAC and whether bun
+# is up (`bun appliance console`). The appliance has no login, so this
+# replaces the getty there.
+[Unit]
+Description=Reliaburger console status
+After=reliaburger-seed.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+ExecStart=/usr/lib/reliaburger/start console
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

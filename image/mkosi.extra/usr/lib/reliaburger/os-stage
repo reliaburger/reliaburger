@@ -1,0 +1,56 @@
+#!/bin/bash
+# Stage an OS update by hand, the way bun will (research §7.6, spike S4):
+# fetch the new version's signed SHA256SUMS, check the Ed25519 signature,
+# download and hash the UKI and the /usr images into a root-only staging
+# directory, then let systemd-sysupdate copy them into the inactive slot and
+# onto the ESP. Reboot afterwards to try the new version.
+#
+#   os-stage <base URL> <version> [<public key PEM>]
+#
+# The key defaults to the one baked into this image. Spike builds each sign
+# with their own throwaway key, so staging a later build needs that build's
+# spike-signing-key.pub.pem passed explicitly.
+set -euo pipefail
+
+say() { echo "os-stage: $*"; }
+fail() {
+    say "FAILED: $*"
+    exit 1
+}
+
+[ $# -ge 2 ] || fail "usage: os-stage <base URL> <version> [<public key PEM>]"
+url=${1%/}
+version=$2
+key=${3:-/usr/lib/reliaburger/os-signing-key.pub.pem}
+staging=/var/lib/reliaburger/os-staging
+sums="reliaburger-os_${version}.SHA256SUMS"
+
+install -d -m 0700 "$staging"
+work=$(mktemp -d "$staging/.incoming.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+curl -fsS --retry 5 -o "$work/$sums" "$url/$sums" || fail "can't fetch $url/$sums"
+curl -fsS --retry 5 -o "$work/$sums.sig" "$url/$sums.sig" || fail "can't fetch $url/$sums.sig"
+openssl pkeyutl -verify -pubin -inkey "$key" -rawin -in "$work/$sums" -sigfile "$work/$sums.sig" >/dev/null \
+    || fail "bad signature on $sums"
+say "signature on $sums good"
+
+# What sysupdate.d/ needs: the UKI and the two /usr partition images, whose
+# names carry the partition UUIDs.
+wanted=$(awk '{ n = $2; sub(/^\*/, "", n); print n }' "$work/$sums" \
+    | grep -E "^reliaburger-os_${version//./\\.}\.(efi|usr\.[0-9a-f-]+\.raw\.zst|usr-verity\.[0-9a-f-]+\.raw\.zst)$" || true)
+[ "$(echo "$wanted" | grep -c .)" = 3 ] || fail "$sums doesn't list a UKI and both /usr images for $version"
+for file in $wanted; do
+    say "fetching $file"
+    curl -fsS --retry 5 -o "$work/$file" "$url/$file" || fail "can't fetch $url/$file"
+done
+(cd "$work" && sha256sum --quiet --check --ignore-missing "$sums") || fail "a download doesn't match $sums"
+
+# Only verified files reach the staging directory, and only this version's.
+find "$staging" -maxdepth 1 -type f -delete
+for file in $wanted; do
+    mv "$work/$file" "$staging/"
+done
+say "staged $version; running systemd-sysupdate"
+/usr/lib/systemd/systemd-sysupdate --definitions=/usr/lib/reliaburger/sysupdate.d update "$version"
+say "done; reboot to try $version (three tries, then systemd-boot falls back)"

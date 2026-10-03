@@ -1,0 +1,68 @@
+#!/bin/sh
+# Wait for bun's liveness endpoint, then say so on the console. Exits
+# non-zero (and says why) if bun never answers.
+#
+# This is also the A/B health gate (research §7.6): the unit runs before
+# boot-complete.target, so systemd-bless-boot only marks a freshly updated
+# UKI good once bun is healthy. On a counted boot a failure reboots, and
+# after three tries systemd-boot falls back to the previous UKI and slot.
+#
+# A machine with no seed doesn't start bun: `bun appliance prepare` waits
+# for a claim (W5) and serves the claim API meanwhile. That counts as
+# healthy too, since it's bun answering.
+set -u
+. /usr/lib/os-release
+counted() {
+    # systemd-boot sets this only when the entry has tries left (+N).
+    [ -e /sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f ]
+}
+report() {
+    echo "reliaburger: $1 on OS ${IMAGE_VERSION:-unknown}"
+    # The layout, so a boot test log shows the slots and the data partition.
+    lsblk -o NAME,SIZE,FSTYPE,PARTLABEL,MOUNTPOINTS 2>/dev/null | sed 's/^/reliaburger: disk: /'
+    ip -4 -br addr show scope global 2>/dev/null | sed 's/^/reliaburger: address: /'
+    findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS / /usr 2>/dev/null | sed 's/^/reliaburger: mount: /'
+    journalctl -b -o cat --no-pager -u systemd-repart.service -u systemd-growfs-root.service 2>/dev/null \
+        | tail -n 40 | sed 's/^/reliaburger: journal: /'
+    # systemd breaks an ordering cycle by dropping jobs (a mount, say),
+    # and says so only in the journal; the CI boot test fails on this line.
+    journalctl -b -o cat --no-pager 2>/dev/null | grep "Found ordering cycle" \
+        | sed 's/^/reliaburger: ordering cycle: /'
+    exit 0
+}
+# Whether prepare still has to finish: not yet started or running
+# (enrolling, which can wait for the cluster's first node, or waiting for a
+# claim). Until it finishes bun hasn't started, so the clock below doesn't
+# either. A node with its config skips prepare altogether.
+preparing() {
+    [ -f /etc/reliaburger/node.toml ] && return 1
+    systemctl is-active -q reliaburger.service && return 1
+    case "$(systemctl show -P ActiveState reliaburger-seed.service 2>/dev/null)" in
+        active | failed) return 1 ;;
+    esac
+}
+while preparing; do
+    if curl -fsSk --max-time 2 https://127.0.0.1:9119/v1/claim >/dev/null 2>&1; then
+        report "unclaimed, answering claims on port 9119"
+    fi
+    sleep 2
+done
+# A counted boot is a new version on trial: two minutes, so a bad update
+# falls back in minutes, not a quarter of an hour (three tries). The lab's
+# nodes answer in 8 to 23 s; S5 measures the Wyse. Other boots get five,
+# since nothing falls back from them.
+if counted; then limit=120; else limit=300; fi
+deadline=$(( $(date +%s) + limit ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \
+        || curl -fsSk --max-time 2 https://127.0.0.1:9117/v1/health >/dev/null 2>&1; then
+        report "bun healthy ($(/var/lib/reliaburger/bin/bun --version 2>/dev/null))"
+    fi
+    sleep 2
+done
+echo "reliaburger: bun not healthy after $limit s on OS ${IMAGE_VERSION:-unknown}"
+if counted; then
+    echo "reliaburger: counted boot failed, rebooting (systemd-boot falls back after the last try)"
+    systemctl reboot
+fi
+exit 1

@@ -56,6 +56,25 @@ pub fn apply_upgrade_cordon(
     }
 }
 
+/// Cordon the node an OS rollout is draining or updating (W6), the same
+/// way: not ready, so the scheduler moves what it can elsewhere before the
+/// node reboots.
+pub fn apply_os_rollout_cordon(
+    cluster: &mut ClusterStateCache,
+    rollout: Option<&crate::os::rollout::OsRollout>,
+) {
+    let Some(rollout) = rollout else { return };
+    let cordoned: Vec<_> = cluster
+        .nodes()
+        .filter(|node| rollout.is_node_cordoned(&node.node_id.0))
+        .cloned()
+        .collect();
+    for mut node in cordoned {
+        node.ready = false;
+        cluster.set_node(node);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -265,6 +284,38 @@ mod tests {
         );
         // n1 is mid-upgrade (Directed) and cordoned; n2 is merely Pending
         // and keeps taking work until its turn actually comes.
+        assert_eq!(result, vec![NodeId::new("n2")]);
+    }
+
+    #[test]
+    fn scheduler_skips_the_node_an_os_rollout_is_draining() {
+        use crate::os::rollout::{OsNodePhase, plan};
+
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(node_state("n1", 2000, 4096, BTreeMap::new(), true));
+        cluster.set_node(node_state("n2", 2000, 4096, BTreeMap::new(), true));
+        let mut rollout = plan(
+            "os-1",
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "n2",
+            vec![
+                ("n1".into(), "a".into(), false, "2026.41.0".into()),
+                ("n2".into(), "b".into(), true, "2026.41.0".into()),
+            ],
+            0,
+        );
+        rollout.nodes[0].phase = OsNodePhase::Draining;
+
+        apply_os_rollout_cordon(&mut cluster, Some(&rollout));
+
+        let result = filter_nodes(
+            &Resources::new(100, 100, 0),
+            &BTreeMap::new(),
+            false,
+            false,
+            &cluster,
+        );
         assert_eq!(result, vec![NodeId::new("n2")]);
     }
 }

@@ -1,0 +1,72 @@
+#!/bin/bash
+# Ask relish netboot whether to wipe a disk that isn't blank.
+#
+#   ask-to-wipe <ask URL> <disk>
+#
+# <ask URL> is the installer's reliaburger.ask= argument, such as
+# http://192.168.1.20:8080/disk?mac=6c:4b:90:12:34:56&uuid=…. This posts
+# what lsblk sees on <disk> there, gets a ticket back, and polls
+# <ask URL without the query>/<ticket> until relish answers. Only the
+# operator answers (a yes at the relish terminal, or --wipe <mac>); the
+# machine can only report.
+#
+# Exit 0: wipe it. Exit 1: leave it alone (a no, no answer in time, relish
+# unreachable, or any answer but "wipe").
+#
+# RELIABURGER_ASK_POLL and RELIABURGER_ASK_TIMEOUT (seconds) are for the
+# tests. relish stops waiting for the operator after 10 minutes; the
+# installer waits 15, so it hears relish's "decline" rather than giving up.
+set -euo pipefail
+
+ask=${1:?usage: ask-to-wipe <ask URL> <disk>}
+disk=${2:?usage: ask-to-wipe <ask URL> <disk>}
+poll=${RELIABURGER_ASK_POLL:-2}
+timeout=${RELIABURGER_ASK_TIMEOUT:-900}
+base=${ask%%\?*}
+
+say() { echo "reliaburger-install: $*"; }
+
+report=$(lsblk -nbpPo NAME,TYPE,SIZE,PTTYPE,FSTYPE,LABEL,PARTLABEL "$disk") || {
+    say "can't read what's on $disk"
+    exit 1
+}
+ticket=$(curl -fsS --retry 5 --retry-delay 2 --retry-connrefused \
+    -H 'Content-Type: text/plain' --data-binary "$report" "$ask") || {
+    say "can't report $disk to relish netboot at $base"
+    exit 1
+}
+# A ticket is hex; anything else isn't one, and mustn't reach the URL.
+ticket=$(printf %s "$ticket" | tr -d '[:space:]')
+case $ticket in
+    '' | *[!0-9a-f]*)
+        say "relish netboot sent no ticket for $disk"
+        exit 1
+        ;;
+esac
+
+say "$disk isn't empty:"
+printf '%s\n' "$report" | sed 's/^/reliaburger-install:   /'
+say "asked relish netboot whether to wipe it; answer wipe? [y/N] there"
+started=$(date +%s)
+while [ $(($(date +%s) - started)) -lt "$timeout" ]; do
+    answer=$(curl -fsS "$base/$ticket" 2>/dev/null) || answer=
+    case $answer in
+        wipe)
+            say "relish netboot says wipe $disk"
+            exit 0
+            ;;
+        decline)
+            say "relish netboot says leave $disk alone"
+            exit 1
+            ;;
+        install)
+            # relish saw a blank disk in a report, but this one isn't blank:
+            # that answer wasn't for this disk.
+            say "relish netboot thinks $disk is blank, but it isn't; leaving it alone"
+            exit 1
+            ;;
+    esac
+    sleep "$poll"
+done
+say "no answer from relish netboot in $timeout s; leaving $disk alone"
+exit 1

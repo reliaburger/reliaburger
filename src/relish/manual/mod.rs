@@ -133,6 +133,21 @@ mod tests {
     }
 
     #[test]
+    fn appliance_and_netboot_find_the_bare_metal_chapter() {
+        let chapters = assets::chapters();
+        let index = find_chapter(&chapters, "appliance").unwrap();
+        assert_eq!(chapters[index].file, "14_appliance.md");
+        assert_eq!(find_chapter(&chapters, "netboot").unwrap(), index);
+        // relish serves the images, creates the cluster and seeds the fleet.
+        let markdown = &chapters[index].markdown;
+        assert!(markdown.contains("sudo relish netboot os"));
+        assert!(!markdown.contains("image/tools/netboot-server.sh"));
+        assert!(markdown.contains("relish cluster create --bare-metal"));
+        assert!(markdown.contains("relish image seed"));
+        assert!(markdown.contains("relish machines claim"));
+    }
+
+    #[test]
     fn chapters_resolve_by_short_name_part_or_title() {
         let chapters = assets::chapters();
         let file = |query: &str| {

@@ -40,6 +40,12 @@ pub struct AgentVersion {
     /// its self-upgrade manager, which is what hashes it.
     #[serde(default)]
     pub binary_sha256: Option<String>,
+    /// The appliance OS version; absent off an appliance.
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// The node's OS update in progress, or how the last one ended.
+    #[serde(default)]
+    pub os_update: crate::os::rollout::OsUpdateState,
 }
 
 /// Client for the Bun agent HTTP API.
@@ -2246,6 +2252,78 @@ impl BunClient {
             .to_string())
     }
 
+    /// The join tokens the council holds, without the tokens themselves.
+    pub async fn join_token_list(
+        &self,
+    ) -> Result<Vec<crate::sesame::join::JoinTokenSummary>, RelishError> {
+        let url = format!("{}/v1/join-token/list", self.base_url);
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            join_tokens: Vec<crate::sesame::join::JoinTokenSummary>,
+        }
+        let listing: Listing = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse join-token list: {e}"),
+        })?;
+        Ok(listing.join_tokens)
+    }
+
+    /// Revoke a node id's unused join tokens; returns how many.
+    pub async fn join_token_revoke(&self, node_id: &str) -> Result<u64, RelishError> {
+        let url = format!("{}/v1/join-token/revoke", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .json(&serde_json::json!({ "node_id": node_id }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse join-token revoke response: {e}"),
+        })?;
+        Ok(json["revoked"].as_u64().unwrap_or(0))
+    }
+
+    /// Open a join window (G2) on this node: let `address` through its
+    /// perimeter firewall for `minutes` (at most 60).
+    pub async fn perimeter_admit(
+        &self,
+        address: std::net::IpAddr,
+        minutes: u64,
+    ) -> Result<(), RelishError> {
+        let url = format!("{}/v1/perimeter/admit", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .json(&serde_json::json!({ "address": address, "minutes": minutes }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// Create a single-use node join token. The server commits only its hash
     /// to Raft and returns the plaintext once.
     pub async fn join_token_create(
@@ -2253,11 +2331,32 @@ impl BunClient {
         node_id: &str,
         ttl_seconds: u64,
     ) -> Result<String, RelishError> {
+        self.join_token_create_with(node_id, ttl_seconds, false)
+            .await
+    }
+
+    /// A join token for a seed: like [`Self::join_token_create`], but it
+    /// may last up to a week.
+    pub async fn join_token_create_for_seed(
+        &self,
+        node_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<String, RelishError> {
+        self.join_token_create_with(node_id, ttl_seconds, true)
+            .await
+    }
+
+    async fn join_token_create_with(
+        &self,
+        node_id: &str,
+        ttl_seconds: u64,
+        seed: bool,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/join-token/create", self.base_url);
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id }))
+            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id, "seed": seed }))
             .send()
             .await
             .map_err(classify_error)?;
@@ -2470,6 +2569,48 @@ impl BunClient {
     pub async fn upgrade_abort(&self) -> Result<String, RelishError> {
         let response = self.post_json("/v1/upgrade/abort", String::new()).await?;
         Ok(response["upgrade_id"].as_str().unwrap_or("?").to_string())
+    }
+
+    /// This node's `/v1/version`, as JSON (it carries the appliance OS
+    /// fields `os_version` and `os_update`).
+    pub async fn version_json(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/version").await
+    }
+
+    /// The OS rollout in progress and the finished ones.
+    pub async fn os_rollout(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/os/rollout").await
+    }
+
+    /// Start rolling `version` across the cluster.
+    pub async fn os_rollout_start(
+        &self,
+        version: &str,
+        channel_url: &str,
+        allow_downgrade: bool,
+    ) -> Result<serde_json::Value, RelishError> {
+        self.post_json(
+            "/v1/os/rollout/start",
+            serde_json::json!({
+                "version": version,
+                "channel_url": channel_url,
+                "allow_downgrade": allow_downgrade,
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    /// Resume a paused OS rollout.
+    pub async fn os_rollout_resume(&self) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/os/rollout/resume", "{}".to_string())
+            .await
+    }
+
+    /// Abort the OS rollout.
+    pub async fn os_rollout_abort(&self) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/os/rollout/abort", "{}".to_string())
+            .await
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {

@@ -1,0 +1,80 @@
+#cloud-config
+# The lab server's cloud-init, filled in by mkseed.sh: @SSH_KEY@ is the lab's
+# public key (work/l2lab_key.pub) and each @FILE:<path>@ line is replaced by
+# that file from image/lab, indented to fit.
+hostname: l2lab-server
+users:
+  - name: lab
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys: ["@SSH_KEY@"]
+ssh_pwauth: false
+package_update: true
+packages: [dnsmasq-base, nftables, tcpdump, ovmf]
+write_files:
+  - path: /etc/l2lab/router.conf
+    content: |
+@FILE:conf/router.conf@
+  - path: /etc/l2lab/proxy.conf
+    content: |
+@FILE:conf/proxy.conf@
+  - path: /usr/local/sbin/l2lab-net
+    permissions: '0755'
+    content: |
+@FILE:conf/l2lab-net.sh@
+  - path: /etc/systemd/system/l2lab-net.service
+    content: |
+      [Unit]
+      Description=L2 lab: netns nb, veth into br0, NAT
+      After=systemd-networkd-wait-online.service network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/l2lab-net
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/l2lab-router.service
+    content: |
+      [Unit]
+      Description=L2 lab home-router DHCP (addresses only)
+      After=l2lab-net.service
+      Requires=l2lab-net.service
+      [Service]
+      ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/l2lab/router.conf --pid-file=/run/l2lab-router.pid
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/l2lab-proxy.service
+    content: |
+      [Unit]
+      Description=L2 lab netboot ProxyDHCP + TFTP (netns nb, 192.168.105.2)
+      After=l2lab-net.service
+      Requires=l2lab-net.service
+      [Service]
+      ExecStart=/usr/sbin/ip netns exec nb /usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/l2lab/proxy.conf --pid-file=/run/l2lab-proxy.pid
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/l2lab-http.service
+    content: |
+      [Unit]
+      Description=L2 lab netboot HTTP (netns nb, 192.168.105.2:8080, /srv/http)
+      After=l2lab-net.service
+      Requires=l2lab-net.service
+      [Service]
+      ExecStart=/usr/sbin/ip netns exec nb /usr/bin/python3 -u -m http.server 8080 --bind 192.168.105.2 --directory /srv/http
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - mkdir -p /srv/tftp /srv/http
+  - systemctl daemon-reload
+  - systemctl enable --now l2lab-net l2lab-router l2lab-proxy l2lab-http
+  - touch /run/l2lab-ready
+# First boot can't rename enp0s1 to wan (the interface is busy); the reboot
+# applies the netplan names.
+power_state:
+  mode: reboot
+  condition: true

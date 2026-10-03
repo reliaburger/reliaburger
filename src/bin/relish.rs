@@ -390,6 +390,77 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Create a cluster of bare-metal appliances (docs/manual/14_appliance.md).
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+    /// Appliance OS images: download, write to a disk, and seed machines.
+    Image {
+        #[command(subcommand)]
+        action: ImageAction,
+    },
+    /// Unclaimed appliances on the LAN: list them, or claim them with seeds
+    /// over the network.
+    Machines {
+        #[command(subcommand)]
+        action: Option<MachinesAction>,
+        /// How long to listen for machines' announcements, in seconds.
+        #[arg(long, default_value_t = 3)]
+        wait: u64,
+    },
+    /// Install appliances over the network: ProxyDHCP, TFTP and HTTP for
+    /// the OS that `relish image download` saved.
+    ///
+    /// Needs root (UDP 67, 69 and 4011). It never hands out addresses, so
+    /// your router keeps doing DHCP; it answers only the boot part, and only
+    /// serves files whose signature and hashes it checked.
+    Netboot {
+        /// The directory `relish image download --dir` wrote.
+        dir: PathBuf,
+        /// The interface on your LAN (default: the one with the default route).
+        #[arg(long, conflicts_with = "address")]
+        interface: Option<String>,
+        /// This machine's address on your LAN, instead of --interface.
+        #[arg(long)]
+        address: Option<std::net::Ipv4Addr>,
+        /// The port for HTTP (the installer and the disk image).
+        #[arg(long, default_value_t = reliaburger::relish::netboot::DEFAULT_HTTP_PORT)]
+        http_port: u16,
+        /// Answer only this machine (repeat for more).
+        #[arg(long = "mac", value_name = "MAC", value_parser = parse_mac)]
+        macs: Vec<reliaburger::relish::netboot::MacAddress>,
+        /// Stop after this long (s, m, h or d).
+        #[arg(long = "for", value_name = "DURATION", default_value = "1h", value_parser = parse_netboot_duration)]
+        duration: std::time::Duration,
+        /// Also trust this Ed25519 public key (PEM), such as a lab build's
+        /// spike-signing-key.pub.pem.
+        #[arg(long, value_name = "PEM")]
+        key: Option<PathBuf>,
+        /// Install again on machines that installed from here already.
+        #[arg(long)]
+        reinstall: bool,
+        /// Wipe this machine's disk without asking if it isn't blank
+        /// (repeat for more). Other used disks are wiped only after a yes
+        /// at this terminal; with no terminal, they're left alone.
+        #[arg(long = "wipe", value_name = "MAC", value_parser = parse_mac)]
+        wipe: Vec<reliaburger::relish::netboot::MacAddress>,
+        /// Which iPXE build PXE firmware gets: snp drives the network card
+        /// through the firmware's own driver; full brings iPXE's drivers,
+        /// for firmware whose network stack misbehaves.
+        #[arg(long, value_name = "BUILD", default_value = "snp", value_parser = parse_ipxe)]
+        ipxe: reliaburger::relish::netboot::IpxeBuild,
+        /// Trust only this key (ed25519:BASE64) instead of the release keys.
+        /// Debug builds only, for tests.
+        #[arg(long, hide = true)]
+        trust_key: Option<String>,
+    },
+    /// The appliance OS across the cluster: what each node runs, and
+    /// rolling a new version out node by node.
+    Os {
+        #[command(subcommand)]
+        action: OsAction,
+    },
     /// Manage short-lived node-enrolment tokens.
     JoinToken {
         #[command(subcommand)]
@@ -756,6 +827,239 @@ enum SignAction {
 }
 
 #[derive(Subcommand)]
+enum ClusterAction {
+    /// Create a cluster for appliance machines: its PKI and admin token on
+    /// this machine, and a seed per machine for an RBSEED stick.
+    Create {
+        /// The only kind of cluster this creates (laptop clusters are
+        /// `relish local`).
+        #[arg(long, required = true)]
+        bare_metal: bool,
+        /// Directory for the cluster's secrets, seeds and fleet list.
+        directory: PathBuf,
+        /// The cluster's name; machines become <name>-1, <name>-2, ...
+        #[arg(long)]
+        name: String,
+        /// Address or network relish runs from (repeatable).
+        #[arg(long = "operator", required = true)]
+        operators: Vec<String>,
+        /// The LAN machines added later join from (for example 192.168.1.0/24).
+        #[arg(long)]
+        network: Option<String>,
+        /// Admit workload and node faults, as the laptop quickstart does.
+        #[arg(long)]
+        faults: bool,
+        /// Public key for root SSH on lab images (which have sshd).
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// How long the seeds' join tokens stay valid (s, m, h or d; at most 7d).
+        #[arg(long, default_value = "7d", value_parser = parse_seed_ttl)]
+        ttl: u64,
+        /// Operator countersignature key for cluster bun upgrades.
+        #[arg(long)]
+        external_signing_key: Option<String>,
+        /// How many voters the council grows to: an odd number from 1 to 7.
+        #[arg(long, value_name = "N", default_value = "5")]
+        council_size: reliaburger::council::CouncilSize,
+        /// Each machine as MAC@IP, node 1 first.
+        #[arg(required = true, value_parser = parse_machine)]
+        machines: Vec<(String, std::net::IpAddr)>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageAction {
+    /// Download the newest OS build for every architecture and check it against the release key.
+    Download {
+        /// Only this architecture, x86_64 or aarch64 (repeat for more; default: every one the release has).
+        #[arg(long = "arch", value_name = "ARCH", value_parser = reliaburger::relish::image::parse_arch)]
+        arches: Vec<reliaburger::relish::netboot::Arch>,
+        /// Where to save it (as <dir>/<arch>/, the layout a netboot server serves).
+        #[arg(long, default_value = "os")]
+        dir: PathBuf,
+        /// Also fetch the pieces only OS updates use (the UKI and /usr images).
+        #[arg(long)]
+        all: bool,
+        /// Channel to read instead of the published one.
+        #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
+        channel: String,
+    },
+    /// Write a disk image (.raw or .raw.zst) onto a device, erasing it.
+    Write {
+        image: PathBuf,
+        device: PathBuf,
+        /// Confirm that everything on the device may be erased.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Write seeds for machines joining a running bare-metal cluster.
+    Seed {
+        /// The directory `relish cluster create --bare-metal` made.
+        directory: PathBuf,
+        /// How long the join tokens stay valid (s, m, h or d; at most 7d).
+        #[arg(long, default_value = "7d", value_parser = parse_seed_ttl)]
+        ttl: u64,
+        /// Public key for root SSH on lab images.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// Each machine as MAC@IP.
+        #[arg(required = true, value_parser = parse_machine)]
+        machines: Vec<(String, std::net::IpAddr)>,
+    },
+}
+
+#[derive(Subcommand)]
+enum OsAction {
+    /// Each node's OS version, and the newest release.
+    List {
+        /// Channel to read instead of the published one.
+        #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
+        channel: String,
+    },
+    /// Roll an OS version across the cluster, one node at a time: workers,
+    /// then the council, the leader last. Each node's workloads move off
+    /// before it reboots.
+    Upgrade {
+        /// The version (default: the newest release).
+        version: Option<String>,
+        /// Channel the nodes read the release from.
+        #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
+        channel: String,
+        /// Allow a version older than what nodes run.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
+    /// The rollout in progress, or the last one.
+    Status,
+    /// Carry on with a paused rollout, retrying the node that stopped it.
+    Resume,
+    /// Stop the rollout; nodes keep the version they're on.
+    Abort,
+}
+
+#[derive(Subcommand)]
+enum MachinesAction {
+    /// Claim machines: compare each one's claim key with its console, then
+    /// send it a seed, joining it to the cluster in DIRECTORY (or, with
+    /// --create, making a new cluster there from them).
+    Claim {
+        /// The cluster directory (`relish cluster create --bare-metal`'s).
+        directory: PathBuf,
+        /// Create a new cluster named --name from these machines, node 1 first.
+        #[arg(long, requires_all = ["name", "operators"])]
+        create: bool,
+        /// The new cluster's name (with --create).
+        #[arg(long)]
+        name: Option<String>,
+        /// Address or network relish runs from (with --create; repeatable).
+        #[arg(long = "operator")]
+        operators: Vec<String>,
+        /// The LAN machines added later join from (with --create).
+        #[arg(long)]
+        network: Option<String>,
+        /// Admit workload and node faults (with --create).
+        #[arg(long)]
+        faults: bool,
+        /// Operator countersignature key for cluster bun upgrades (with --create).
+        #[arg(long)]
+        external_signing_key: Option<String>,
+        /// How many voters the new council grows to: an odd number from 1 to 7 (with --create; default 5).
+        #[arg(long, value_name = "N", requires = "create")]
+        council_size: Option<reliaburger::council::CouncilSize>,
+        /// Public key for root SSH on lab images.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+        /// How long join tokens stay valid (s, m, h or d; at most 7d).
+        #[arg(long, default_value = "1h", value_parser = parse_seed_ttl)]
+        ttl: u64,
+        /// Don't ask to compare claim keys with the machines' consoles.
+        #[arg(long)]
+        trust_lan: bool,
+        /// Each machine by MAC (found over mDNS) or address.
+        #[arg(required = true)]
+        machines: Vec<String>,
+    },
+}
+
+fn parse_machine(value: &str) -> Result<(String, std::net::IpAddr), String> {
+    reliaburger::relish::bare_metal::parse_machine(value)
+}
+
+fn parse_mac(value: &str) -> Result<reliaburger::relish::netboot::MacAddress, String> {
+    value
+        .parse()
+        .map_err(|e: reliaburger::relish::netboot::NetbootError| e.to_string())
+}
+
+fn parse_ipxe(value: &str) -> Result<reliaburger::relish::netboot::IpxeBuild, String> {
+    value
+        .parse()
+        .map_err(|e: reliaburger::relish::netboot::NetbootError| e.to_string())
+}
+
+fn parse_netboot_duration(value: &str) -> Result<std::time::Duration, String> {
+    reliaburger::relish::netboot::parse_duration(value).map_err(|e| e.to_string())
+}
+
+/// `relish netboot`: work out the keys and the interface, then serve.
+#[allow(clippy::too_many_arguments)]
+async fn netboot(
+    dir: PathBuf,
+    interface: Option<String>,
+    address: Option<std::net::Ipv4Addr>,
+    http_port: u16,
+    macs: Vec<reliaburger::relish::netboot::MacAddress>,
+    duration: std::time::Duration,
+    key: Option<PathBuf>,
+    reinstall: bool,
+    wipe: Vec<reliaburger::relish::netboot::MacAddress>,
+    ipxe: reliaburger::relish::netboot::IpxeBuild,
+    trust_key: Option<String>,
+) -> Result<(), reliaburger::relish::RelishError> {
+    use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
+    let pem = key.as_deref().map(std::fs::read_to_string).transpose()?;
+    let keys = netboot::trusted_keys(pem.as_deref(), trust_key.as_deref())?;
+    let interface = match (interface, address) {
+        (Some(name), _) => InterfaceChoice::Named(name),
+        (None, Some(address)) => InterfaceChoice::Address(address),
+        (None, None) => InterfaceChoice::DefaultRoute,
+    };
+    netboot::run(NetbootOptions {
+        directory: dir,
+        interface,
+        http_port,
+        allowed: macs,
+        duration,
+        keys,
+        reinstall,
+        wipe,
+        ipxe,
+    })
+    .await?;
+    Ok(())
+}
+
+fn parse_seed_ttl(value: &str) -> Result<u64, String> {
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1_u64),
+        Some(b'm') => (&value[..value.len() - 1], 60_u64),
+        Some(b'h') => (&value[..value.len() - 1], 3_600_u64),
+        Some(b'd') => (&value[..value.len() - 1], 86_400_u64),
+        _ => return Err("TTL must end in s, m, h or d (for example 7d)".to_string()),
+    };
+    let seconds = digits
+        .parse::<u64>()
+        .map_err(|_| "TTL must start with a whole number".to_string())?
+        .checked_mul(multiplier)
+        .ok_or_else(|| "TTL is too large".to_string())?;
+    let max = reliaburger::sesame::join::MAX_SEED_JOIN_TOKEN_TTL.as_secs();
+    if !(1..=max).contains(&seconds) {
+        return Err("TTL must be between 1s and 7d".to_string());
+    }
+    Ok(seconds)
+}
+
+#[derive(Subcommand)]
 enum JoinTokenAction {
     /// Create a single-use token for enrolling one node.
     Create {
@@ -767,6 +1071,13 @@ enum JoinTokenAction {
         /// Lifetime: an integer followed by s, m or h (1s to 1h).
         #[arg(long, default_value = "15m", value_parser = parse_join_token_ttl)]
         ttl: u64,
+    },
+    /// List join tokens: node id, expiry and whether each has been used.
+    List,
+    /// Revoke every unused join token for a node id.
+    Revoke {
+        /// The node id whose unused tokens to revoke.
+        node_id: String,
     },
 }
 
@@ -1658,7 +1969,142 @@ async fn main() -> ExitCode {
             TokenAction::List => commands::token_list().await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
         },
+        Command::Cluster {
+            action:
+                ClusterAction::Create {
+                    bare_metal: _,
+                    directory,
+                    name,
+                    operators,
+                    network,
+                    faults,
+                    ssh_key,
+                    ttl,
+                    external_signing_key,
+                    council_size,
+                    machines,
+                },
+        } => match ssh_key.as_deref().map(std::fs::read).transpose() {
+            Err(error) => Err(error.into()),
+            Ok(ssh_key) => reliaburger::relish::bare_metal::run_create(
+                &reliaburger::relish::bare_metal::CreateOptions {
+                    directory,
+                    cluster: name,
+                    machines,
+                    operators,
+                    network,
+                    faults,
+                    ssh_key,
+                    token_ttl: std::time::Duration::from_secs(ttl),
+                    external_signing_key,
+                    council_size,
+                },
+            ),
+        },
+        Command::Image { action } => match action {
+            ImageAction::Download {
+                arches,
+                dir,
+                all,
+                channel,
+            } => reliaburger::relish::image::download(&channel, &arches, &dir, all).await,
+            ImageAction::Write { image, device, yes } => {
+                reliaburger::relish::image::write(&image, &device, yes).map(|bytes| {
+                    println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
+                })
+            }
+            ImageAction::Seed {
+                directory,
+                ttl,
+                ssh_key,
+                machines,
+            } => match ssh_key.as_deref().map(std::fs::read).transpose() {
+                Err(error) => Err(error.into()),
+                Ok(ssh_key) => {
+                    reliaburger::relish::bare_metal::run_add(
+                        &directory,
+                        &machines,
+                        std::time::Duration::from_secs(ttl),
+                        ssh_key,
+                    )
+                    .await
+                }
+            },
+        },
+        Command::Machines { action, wait } => match action {
+            None => reliaburger::relish::machines::browse(std::time::Duration::from_secs(wait))
+                .map(|machines| print!("{}", reliaburger::relish::machines::render(&machines))),
+            Some(MachinesAction::Claim {
+                directory,
+                create,
+                name,
+                operators,
+                network,
+                faults,
+                external_signing_key,
+                council_size,
+                ssh_key,
+                ttl,
+                trust_lan,
+                machines,
+            }) => match ssh_key.as_deref().map(std::fs::read).transpose() {
+                Err(error) => Err(error.into()),
+                Ok(ssh_key) => {
+                    reliaburger::relish::machines::run_claim(
+                        &reliaburger::relish::machines::ClaimOptions {
+                            directory,
+                            targets: machines,
+                            create: create.then(|| reliaburger::relish::machines::NewCluster {
+                                name: name.unwrap_or_default(),
+                                operators,
+                                network,
+                                faults,
+                                external_signing_key,
+                                council_size: council_size
+                                    .unwrap_or(reliaburger::council::CouncilSize::APPLIANCE),
+                            }),
+                            token_ttl: std::time::Duration::from_secs(ttl),
+                            ssh_key,
+                            trust_lan,
+                        },
+                    )
+                    .await
+                }
+            },
+        },
+        Command::Netboot {
+            dir,
+            interface,
+            address,
+            http_port,
+            macs,
+            duration,
+            key,
+            reinstall,
+            wipe,
+            ipxe,
+            trust_key,
+        } => {
+            netboot(
+                dir, interface, address, http_port, macs, duration, key, reinstall, wipe, ipxe,
+                trust_key,
+            )
+            .await
+        }
+        Command::Os { action } => match action {
+            OsAction::List { channel } => reliaburger::relish::os::list(&channel).await,
+            OsAction::Upgrade {
+                version,
+                channel,
+                allow_downgrade,
+            } => reliaburger::relish::os::upgrade(version, &channel, allow_downgrade).await,
+            OsAction::Status => reliaburger::relish::os::status().await,
+            OsAction::Resume => reliaburger::relish::os::resume().await,
+            OsAction::Abort => reliaburger::relish::os::abort().await,
+        },
         Command::JoinToken { action } => match &action {
+            JoinTokenAction::List => commands::join_token_list().await,
+            JoinTokenAction::Revoke { node_id } => commands::join_token_revoke(node_id).await,
             JoinTokenAction::Create { node_id, ttl } => {
                 commands::join_token_create(node_id, *ttl).await
             }
@@ -2023,6 +2469,87 @@ mod tests {
                 action: SecretAction::Pubkey { dir: Some(ref dir) }
             }) if dir == std::path::Path::new("cluster")
         ));
+    }
+
+    #[test]
+    fn appliance_clusters_default_to_five_council_voters() {
+        use reliaburger::council::CouncilSize;
+        let create = |extra: &[&str]| {
+            let mut args = vec![
+                "relish",
+                "cluster",
+                "create",
+                "--bare-metal",
+                "lab",
+                "--name",
+                "lab",
+                "--operator",
+                "10.42.0.1",
+            ];
+            args.extend_from_slice(extra);
+            args.push("d8:9e:f3:00:00:01@10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Cluster {
+                    action: ClusterAction::Create { council_size, .. },
+                }) => council_size,
+                _ => panic!("not cluster create"),
+            })
+        };
+        assert_eq!(create(&[]).unwrap(), CouncilSize::APPLIANCE);
+        assert_eq!(create(&["--council-size", "3"]).unwrap().get(), 3);
+        for bad in ["4", "0", "9", "five"] {
+            let error = create(&["--council-size", bad]).err().unwrap().to_string();
+            assert!(error.contains("--council-size"), "{bad}: {error}");
+        }
+        let even = create(&["--council-size", "4"]).err().unwrap().to_string();
+        assert!(even.contains("pick an odd size from 1 to 7"), "{even}");
+
+        let claim = |extra: &[&str]| {
+            let mut args = vec!["relish", "machines", "claim", "lab"];
+            args.extend_from_slice(extra);
+            args.push("10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Machines {
+                    action: Some(MachinesAction::Claim { council_size, .. }),
+                    ..
+                }) => council_size,
+                _ => panic!("not machines claim"),
+            })
+        };
+        let new = ["--create", "--name", "lab", "--operator", "10.42.0.1"];
+        assert_eq!(claim(&new).unwrap(), None, "the default is applied later");
+        let mut sized = new.to_vec();
+        sized.extend(["--council-size", "7"]);
+        assert_eq!(claim(&sized).unwrap().map(CouncilSize::get), Some(7));
+        let mut even = new.to_vec();
+        even.extend(["--council-size", "6"]);
+        assert!(claim(&even).is_err());
+        assert!(
+            claim(&["--council-size", "5"]).is_err(),
+            "a council size only means something with --create"
+        );
+    }
+
+    #[test]
+    fn image_download_takes_every_architecture_unless_arch_is_repeated() {
+        use reliaburger::relish::netboot::Arch;
+        let arches = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Image {
+                action: ImageAction::Download { arches, .. },
+            }) => arches,
+            _ => panic!("not image download"),
+        };
+        assert!(arches(&["relish", "image", "download"]).is_empty());
+        assert_eq!(
+            arches(&[
+                "relish", "image", "download", "--arch", "x86_64", "--arch", "aarch64"
+            ]),
+            [Arch::X86_64, Arch::Arm64]
+        );
+        assert!(
+            Cli::try_parse_from(["relish", "image", "download", "--arch", "x86_64,aarch64"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -2896,6 +3423,116 @@ mod tests {
             } => assert_eq!(node, "reliaburger-1"),
             _ => panic!("expected Dev Shell command"),
         }
+    }
+
+    #[test]
+    fn netboot_defaults_to_an_hour_on_port_8080_for_every_machine() {
+        let cli = parse(&["relish", "netboot", "os"]).unwrap();
+        let Command::Netboot {
+            dir,
+            interface,
+            address,
+            http_port,
+            macs,
+            duration,
+            key,
+            reinstall,
+            wipe,
+            ipxe,
+            trust_key,
+        } = cli.command
+        else {
+            panic!("expected netboot");
+        };
+        assert_eq!(dir, PathBuf::from("os"));
+        assert_eq!((interface, address), (None, None));
+        assert_eq!(http_port, 8080);
+        assert!(macs.is_empty());
+        assert_eq!(duration, std::time::Duration::from_secs(3600));
+        assert_eq!((key, reinstall, trust_key), (None, false, None));
+        assert!(wipe.is_empty());
+        assert_eq!(ipxe, reliaburger::relish::netboot::IpxeBuild::Snp);
+    }
+
+    #[test]
+    fn netboot_serves_the_full_ipxe_build_when_asked_and_refuses_others() {
+        let cli = parse(&["relish", "netboot", "os", "--ipxe", "full"]).unwrap();
+        let Command::Netboot { ipxe, .. } = cli.command else {
+            panic!("expected netboot");
+        };
+        assert_eq!(ipxe, reliaburger::relish::netboot::IpxeBuild::Full);
+        assert!(parse(&["relish", "netboot", "os", "--ipxe", "undi"]).is_err());
+    }
+
+    #[test]
+    fn netboot_takes_an_interface_macs_a_time_limit_and_a_lab_key() {
+        let cli = parse(&[
+            "relish",
+            "netboot",
+            "art",
+            "--interface",
+            "eth0",
+            "--mac",
+            "52:54:00:12:34:56",
+            "--mac",
+            "52-54-00-12-34-57",
+            "--for",
+            "30m",
+            "--http-port",
+            "8081",
+            "--key",
+            "art/spike-signing-key.pub.pem",
+            "--reinstall",
+            "--wipe",
+            "52:54:00:12:34:56",
+            "--wipe",
+            "6C-4B-90-00-00-01",
+        ])
+        .unwrap();
+        let Command::Netboot {
+            interface,
+            macs,
+            duration,
+            http_port,
+            key,
+            reinstall,
+            wipe,
+            ..
+        } = cli.command
+        else {
+            panic!("expected netboot");
+        };
+        assert_eq!(interface.as_deref(), Some("eth0"));
+        assert_eq!(macs.len(), 2);
+        assert_eq!(macs[1].to_string(), "52:54:00:12:34:57");
+        assert_eq!(duration, std::time::Duration::from_secs(1800));
+        assert_eq!(http_port, 8081);
+        assert_eq!(key, Some(PathBuf::from("art/spike-signing-key.pub.pem")));
+        assert!(reinstall);
+        let wipe: Vec<String> = wipe.iter().map(|m| m.to_string()).collect();
+        assert_eq!(wipe, ["52:54:00:12:34:56", "6c:4b:90:00:00:01"]);
+    }
+
+    #[test]
+    fn netboot_refuses_a_bad_mac_a_bad_duration_and_both_interface_flags() {
+        assert!(parse(&["relish", "netboot", "os", "--mac", "nope"]).is_err());
+        assert!(parse(&["relish", "netboot", "os", "--wipe", "nope"]).is_err());
+        // --wipe always names a machine: there's no wipe-everything switch.
+        assert!(parse(&["relish", "netboot", "os", "--wipe"]).is_err());
+        assert!(parse(&["relish", "netboot", "os", "--for", "1w"]).is_err());
+        assert!(
+            parse(&[
+                "relish",
+                "netboot",
+                "os",
+                "--interface",
+                "eth0",
+                "--address",
+                "192.168.1.20"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["relish", "netboot"]).is_err());
     }
 
     #[test]

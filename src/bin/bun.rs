@@ -101,6 +101,9 @@ enum Command {
         #[arg(long)]
         instance: String,
     },
+    /// Appliance OS steps (docs/manual/14_appliance.md).
+    #[command(subcommand)]
+    Appliance(ApplianceCommand),
     /// Run the built-in test workload.
     ///
     /// The same server the library exposes, shipped inside `bun` so every
@@ -142,6 +145,21 @@ enum Command {
         /// Number of CPU-burning worker threads.
         #[arg(long)]
         cpu_workers: usize,
+    },
+}
+
+/// `bun appliance ...`: what an appliance runs before and beside the agent.
+#[derive(clap::Subcommand)]
+enum ApplianceCommand {
+    /// Prepare this node from its seed: install the bootstrap material, or
+    /// enrol and fetch the master key, then write node.toml. Run by
+    /// reliaburger-seed.service before the agent.
+    Prepare,
+    /// Show this node's status on a console, refreshed every five seconds.
+    Console {
+        /// The terminal to draw on.
+        #[arg(long, default_value = "/dev/tty1")]
+        tty: PathBuf,
     },
 }
 
@@ -234,6 +252,7 @@ fn cluster_params_from_config(
         seeds,
         wrapping_ikm,
         bootstrap_security_state,
+        bootstrap_council_size: config.cluster.council_size,
         data_dir: config.storage.data.clone(),
         // The MayoStore doesn't exist yet when params are built; the
         // caller sets it before starting the runtime.
@@ -706,6 +725,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }) = &cli.command
     {
         return run_testapp(mode, *port, *count, *delay, *alloc_mib).await;
+    }
+    // The appliance's own steps, before (prepare) or beside (console) an agent.
+    if let Some(Command::Appliance(command)) = &cli.command {
+        let paths = reliaburger::appliance::Paths::system();
+        return match command {
+            ApplianceCommand::Prepare => reliaburger::appliance::prepare::run(&paths)
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("reliaburger: {e}")),
+            ApplianceCommand::Console { tty } => reliaburger::appliance::console::run(&paths, tty)
+                .await
+                .map_err(|e| anyhow::anyhow!("console {}: {e}", tty.display())),
+        };
     }
 
     // Resolve the running version from the real executable path (not argv[0]):
@@ -1452,6 +1484,32 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 config.runtime.stop_confirmation_timeout(),
             );
         }
+    }
+
+    // Appliance OS updates (W6): on an appliance, the slot this node stages
+    // updates into, and the leader's rollout loop beside the orchestrator.
+    match reliaburger::upgrade::keys::release_keys(&config.upgrades) {
+        Ok(keys) => {
+            if let Some(slot) = reliaburger::os::slot::OsSlot::detect(keys) {
+                reliaburger::os::slot::install(slot);
+            }
+        }
+        Err(error) => eprintln!("bun: OS updates disabled: {error}"),
+    }
+    if let (Some(council), Some(membership_rx)) =
+        (api_council.clone(), upgrade_membership_rx.clone())
+    {
+        let control = reliaburger::os::rollout::HttpOsControl::new(
+            cluster_http.clone(),
+            service_token.clone(),
+        );
+        tokio::spawn(reliaburger::os::rollout::run_rollout(
+            council,
+            control,
+            node_name.clone(),
+            membership_rx,
+            shutdown.clone(),
+        ));
     }
 
     // Rolling-upgrade orchestrator: dormant unless this node is the Raft

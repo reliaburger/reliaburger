@@ -1,0 +1,55 @@
+#!/bin/sh
+# Starts bun (research §7.6, item 7). /usr is read-only, but bun upgrades
+# itself by writing bun-vX.Y.Z beside its own binary and moving a bun
+# symlink. So bun runs from /var/lib/reliaburger/bin, and this launcher
+# installs the image's own bun there only when it's newer than the active
+# one: neither an OS update nor a bun upgrade can move bun backwards.
+#
+# With /etc/reliaburger/node.toml (written by `bun appliance prepare` from
+# the node's seed) bun runs as a cluster node. A machine with no seed waits
+# in `start prepare` until it's claimed, so bun only gets here without one if
+# prepare failed; it then runs standalone on loopback. `start prepare` and
+# `start console` run bun's appliance steps (reliaburger-seed and
+# reliaburger-console).
+set -eu
+bin=/var/lib/reliaburger/bin
+image=/usr/lib/reliaburger/bin/bun
+
+version() { "$1" --version 2>/dev/null | awk '{ print $2 }'; }
+
+install -d -m 0755 "$bin"
+image_version=$(version "$image")
+active_version=
+[ -x "$bin/bun" ] && active_version=$(version "$bin/bun")
+if [ -z "$active_version" ] \
+    || [ "$(printf '%s\n%s\n' "$active_version" "$image_version" | sort -V | tail -n 1)" != "$active_version" ]; then
+    # First boot, or the image brought a newer bun than the active one.
+    install -m 0755 "$image" "$bin/.bun-v$image_version.tmp"
+    mv -f "$bin/.bun-v$image_version.tmp" "$bin/bun-v$image_version"
+    ln -sfn "bun-v$image_version" "$bin/.bun.tmp"
+    mv -Tf "$bin/.bun.tmp" "$bin/bun"
+    echo "reliaburger: bun $image_version from the image is now active (was ${active_version:-none})"
+    # Keep the bun just replaced, for a rollback, and drop older ones: each
+    # is about 100 MB, and an 8 GB eMMC can't hold one per OS update. bun's
+    # own upgrades prune the same way ([upgrades] retain_versions).
+    for old in "$bin"/bun-v*; do
+        case ${old##*/} in
+            "bun-v$image_version" | "bun-v$active_version" | *.sig) continue ;;
+        esac
+        [ -f "$old" ] || continue
+        rm -f "$old" "$old.sig"
+        echo "reliaburger: removed ${old##*/}"
+    done
+fi
+
+# The appliance's own steps run the same bun the agent would.
+case ${1:-} in
+    prepare) exec "$bin/bun" appliance prepare ;;
+    console) exec "$bin/bun" appliance console ;;
+esac
+
+if [ -f /etc/reliaburger/node.toml ]; then
+    exec "$bin/bun" --cluster --runtime runc \
+        --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
+fi
+exec "$bin/bun" --runtime runc --listen 127.0.0.1:9117
