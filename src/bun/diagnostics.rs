@@ -196,6 +196,12 @@ pub struct DesiredAppEvidence {
     /// start it elsewhere on an empty volume (#423). `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_home_away: Option<String>,
+    /// The nodes that hold this app's managed volumes, live or not: where
+    /// its replicas are placed, or with none (a stopped app), where they
+    /// last ran. Snapshot requests go there, whichever node receives them
+    /// (#482). Empty for an app without a managed volume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_homes: Vec<String>,
 }
 
 /// Current diagnostics wire schema.

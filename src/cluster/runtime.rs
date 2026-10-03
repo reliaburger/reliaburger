@@ -355,6 +355,9 @@ pub async fn start(
     // the recovered council must never start a council of its own.
     let snapshot_epoch = state_machine.desired_state().await.recovery_epoch;
     let recovered_bootstrap = state_machine.recovered_bootstrap_pending().await;
+    let restored_security = state_machine
+        .read_desired(|state| state.security_state.is_initialised())
+        .await;
     let bootstrapping = store_fresh && (params.seeds.is_empty() || recovered_bootstrap);
 
     // The recovery fence (C5, #424): this node's epoch claim, stamped on
@@ -468,12 +471,16 @@ pub async fn start(
     if bootstrapping {
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
-        initialise_bootstrap(
-            &council,
-            members,
-            params.bootstrap_security_state.as_deref(),
-        )
-        .await?;
+        // A recovered snapshot already holds the cluster's security state,
+        // tokens included; the bootstrap file is only the init-time copy, so
+        // seeding it would roll the restored state back (#477). The state
+        // machine refuses that too; this just doesn't ask.
+        let bootstrap_security = if restored_security {
+            None
+        } else {
+            params.bootstrap_security_state.as_deref()
+        };
+        initialise_bootstrap(&council, members, bootstrap_security).await?;
         if recovered_bootstrap {
             compact_recovered_log(&council).await?;
         }
@@ -1870,7 +1877,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let init = crate::sesame::init::initialize_cluster("seedidem", "node-1", &dir).unwrap();
 
-        // The apply arm overwrites, so re-seeding leaves one coherent state.
+        // The apply arm refuses a second seed, so re-seeding leaves the
+        // first state in place.
         seed_bootstrap_state(&council, &init.security_state)
             .await
             .unwrap();

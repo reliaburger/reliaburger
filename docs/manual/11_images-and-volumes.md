@@ -219,6 +219,15 @@ relish apply db.toml     # start it again
 Restore overwrites the live volume, so stop the app first. On other
 filesystems, snapshot commands fail with an error saying so.
 
+A managed volume lives on the node that runs its app, and snapshot commands
+act there whichever node you send them to: the node that receives one asks the
+council where the app's volume lives and forwards the request, with your own
+credential, to that node. A stopped app's volume is wherever it last ran. A
+copy of the volume that an app left behind on another node is never
+snapshotted or restored by mistake. When an app with several replicas keeps a
+volume on each of several nodes, send the command to one of those nodes; any
+other node refuses it with a 409 that names them.
+
 While a restore runs it owns the app's volumes: `relish apply` for that app,
 automatic restarts, and any other snapshot command for it get a "retry
 shortly" refusal (a 409) until the restore finishes. The restored volume keeps

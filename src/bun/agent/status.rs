@@ -343,7 +343,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         execution: launches
                             .as_ref()
                             .and_then(|known| known.get(&inst.id))
-                            .filter(|launch| inst.oci_spec.as_ref() == Some(&launch.spec))
+                            .filter(|launch| {
+                                inst.oci_spec
+                                    .as_ref()
+                                    .is_some_and(|spec| launch.launched(spec))
+                            })
                             .map(|launch| crate::grill::RuntimeExecution {
                                 instance_id: launch.instance_id.clone(),
                                 generation: launch.generation.clone(),

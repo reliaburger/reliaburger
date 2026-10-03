@@ -26,14 +26,14 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.1.3 PROTOTYPE</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.1.4 PROTOTYPE</div>
           <h1 id="title">One binary.<br>A complete container platform. Zero assembly required.</h1>
           <p class="lede">Kubernetes gave us container orchestration, but gave every team an accidental 
             platform engineering department. Reliaburger gives you the full production platform — scheduling, 
             mTLS, ingress, registry, metrics, logs, GitOps, and chaos testing — compiled into a single, 
             lightning-fast Rust binary that runs anywhere in under five minutes.</p>
           <div class="intro-links">
-            <a class="primary-link" href="#install">Install 0.1.3 <span aria-hidden="true">↓</span></a>
+            <a class="primary-link" href="#install">Install 0.1.4 <span aria-hidden="true">↓</span></a>
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
             <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
               <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf" aria-label="The whitepaper as a PDF">PDF</a></span>
@@ -71,18 +71,18 @@
               and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
-              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.3">Release notes <span aria-hidden="true">↗</span></a></p>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.4">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
         </div>
       </section>
 
       <aside class="status" aria-label="Release status">
-        <strong>0.1.3 (Prototype)</strong>
-        <p>Released on 3 October 2026: an agent loop that never waits on slow work, the
-          council’s view from every node, replicas numbered across the cluster, and
-          data-safety fixes. Signed binaries for Linux and macOS, and a
-          one-line installer that builds a laptop cluster from them. Five minutes is the target; the documentation lists what 0.1.3 doesn’t do yet.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.3">Release notes <span aria-hidden="true">↗</span></a>
+        <strong>0.1.4 (Prototype)</strong>
+        <p>Released on 3 October 2026: logs and events that answer for the whole cluster,
+          rollback over the merged history, audit events for tokens and secret keys, and
+          security fixes. Signed binaries for Linux and macOS, and a
+          one-line installer that builds a laptop cluster from them. Five minutes is the target; the documentation lists what 0.1.4 doesn’t do yet.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.4">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status">
@@ -119,7 +119,7 @@
             <figcaption>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                against the published 0.1.3 install.
+                against the published 0.1.4 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
                 says how long it really took.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -254,7 +254,7 @@
               <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
               an isolated container or a multi-node cluster.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.1.3.</p>
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.1.4.</p>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
           </div>
           <div class="terminal">
@@ -313,7 +313,7 @@ target/debug/relish</code></pre>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.1.3 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <p>What’s implemented, what 0.1.4 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:

@@ -598,6 +598,14 @@ impl StateMachineInner {
                 }
             }
             RaftRequest::SecurityStateInit(ss) => {
+                // Init seeds a new cluster once. Replacing a live security
+                // state wholesale would drop every token minted since, as a
+                // recovered council re-seeding its bootstrap file did (#477).
+                if self.state.security_state.is_initialised() {
+                    return Some(CouncilResponse::Refused {
+                        reason: "the cluster's security state is already initialised".to_string(),
+                    });
+                }
                 self.state.security_state = *ss.clone();
             }
             RaftRequest::CreateJoinToken(jt) => {
@@ -2018,12 +2026,10 @@ impl CouncilStateMachine {
     /// The recovery epoch is bumped so post-recovery state is distinguishable
     /// from anything issued before the loss.
     pub fn from_recovered_state(mut state: DesiredState) -> Self {
-        state.recovery_epoch = state.recovery_epoch.saturating_add(1);
         // A recovered node re-bootstraps its own Raft: the old log id and
         // membership belong to the cluster that died, so we drop them and let
         // `initialize` establish a fresh term line and voter set.
-        state.last_applied_log = None;
-        state.last_membership = Default::default();
+        state.enter_recovery_epoch();
 
         let inner = StateMachineInner {
             state,
@@ -2049,9 +2055,7 @@ impl CouncilStateMachine {
         snapshot_db: &Database,
         mut state: DesiredState,
     ) -> Result<(), redb::Error> {
-        state.recovery_epoch = state.recovery_epoch.saturating_add(1);
-        state.last_applied_log = None;
-        state.last_membership = StoredMembership::default();
+        state.enter_recovery_epoch();
         // Serialisation of a plain struct with only owned data is infallible in
         // practice; map any error into a redb error rather than panicking.
         let data = serde_json::to_vec(&state)
@@ -2073,6 +2077,12 @@ impl CouncilStateMachine {
                 .nodes()
                 .next()
                 .is_none()
+    }
+
+    /// Whether a snapshot was loaded or taken, as opposed to the empty state
+    /// of a store that never snapshotted.
+    pub async fn holds_snapshot(&self) -> bool {
+        self.inner.read().await.snapshot_data.is_some()
     }
 
     /// Read the current desired state.
@@ -4824,6 +4834,41 @@ mod tests {
         inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(ss)));
 
         assert_eq!(inner.state.security_state.next_serial, 42);
+    }
+
+    /// #477: a recovered council already holds the restored security state
+    /// (CAs, API and join tokens, the CRL). The node's init-time bootstrap
+    /// file has CAs but no tokens; committing it on top wiped every token.
+    #[test]
+    fn security_state_init_never_replaces_an_initialised_security_state() {
+        let mut inner = StateMachineInner::default();
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("restored", &[3; 32]).unwrap();
+        inner.state.security_state = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![hierarchy.root.ca.clone()],
+            api_tokens: vec![crate::sesame::types::ApiToken {
+                name: "admin".to_string(),
+                token_hash: vec![1],
+                token_salt: vec![2],
+                role: crate::sesame::types::ApiRole::Admin,
+                scope: crate::sesame::types::TokenScope::default(),
+                expires_at: None,
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+            }],
+            next_serial: 900,
+            ..Default::default()
+        };
+        let bootstrap = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![hierarchy.root.ca],
+            next_serial: 2,
+            ..Default::default()
+        };
+        let response = inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(bootstrap)));
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "a second security bootstrap must be refused, got {response:?}"
+        );
+        assert_eq!(inner.state.security_state.api_tokens.len(), 1);
+        assert_eq!(inner.state.security_state.next_serial, 900);
     }
 
     fn test_age_keypair(

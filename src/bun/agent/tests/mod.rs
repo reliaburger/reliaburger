@@ -563,6 +563,53 @@ async fn reporting_binds_execution_to_the_original_runtime_specification() {
     }
 }
 
+/// #476: a retired Runc intent keeps environment names, not values. Its
+/// launch must still bind to the instance that started it.
+#[tokio::test]
+async fn reporting_binds_a_retired_launch_whose_environment_values_were_scrubbed() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let config = Config::parse(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\n[app.web.env]\nAPI_TOKEN = 'decrypted'\n",
+    )
+    .unwrap();
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    let id = InstanceId("default__web-0".into());
+    let spec = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    assert!(spec.process.env.contains(&"API_TOKEN=decrypted".into()));
+    let launch = crate::grill::RuntimeLaunch {
+        instance_id: id.clone(),
+        spec: spec.without_environment_values(),
+        generation: crate::grill::RuntimeGeneration::process("retired"),
+        network_reference: None,
+    };
+    let expected = crate::grill::RuntimeExecution {
+        instance_id: id.clone(),
+        generation: launch.generation.clone(),
+    };
+    grill.set_launch_inventory(vec![launch.clone()]).await;
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    assert_eq!(rx.await.unwrap().instances[0].execution, Some(expected));
+
+    // Dropping a variable is still a different request.
+    let mut other = launch;
+    other.spec.process.env.clear();
+    grill.set_launch_inventory(vec![other]).await;
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    assert!(rx.await.unwrap().instances[0].execution.is_none());
+}
+
 #[tokio::test]
 async fn late_discovery_subscribers_receive_the_latest_service_snapshot() {
     let (mut agent, _commands, _shutdown) = test_agent();
@@ -11091,6 +11138,7 @@ async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
     };
     let (response, reply) = oneshot::channel();
     agent.handle_command(answer(1, response)).await;
+    agent.finish_consumer_syncs().await;
     assert!(reply.await.unwrap().unwrap().published);
     assert!(lease.is_valid(), "publishing the leader's answer renews it");
     assert_eq!(backends(&agent, "web"), Some(vec![own.clone()]));
@@ -11130,6 +11178,7 @@ async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
     // The next answer, even for the same catalogue, restores the rest.
     let (response, reply) = oneshot::channel();
     agent.handle_command(answer(1, response)).await;
+    agent.finish_consumer_syncs().await;
     assert!(reply.await.unwrap().unwrap().published);
     assert!(lease.is_valid());
     assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
@@ -11377,6 +11426,42 @@ async fn durable_consumer_catalogue_change_keeps_captured_requests_and_view() {
         backend
     );
     agent.drains.decrement_connections(&backend).await;
+}
+
+/// #478: a council recovered from a backup restores the catalogue
+/// generation the backup holds, older than what the dead council went on to
+/// publish. The node must follow the recovered council's new epoch, and
+/// still refuse a leader of the council it replaced.
+#[tokio::test]
+async fn durable_consumer_follows_a_recovered_council_and_still_refuses_the_replaced_one() {
+    let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+    let (_, ingress) = cluster_publication_fixture();
+    // The last backup was taken at generation 2; the old council published
+    // generation 3 before every voter died.
+    agent
+        .synchronise_consumer(3, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    let mut backup = crate::council::types::DesiredState::default();
+    backup.endpoint_withdrawals.generation = 2;
+    let recovered =
+        crate::council::state_machine::CouncilStateMachine::from_recovered_state(backup)
+            .desired_state()
+            .await
+            .endpoint_withdrawals
+            .generation;
+    let result = agent
+        .synchronise_consumer(recovered, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .expect("the recovered council's publication was refused");
+    assert!(result.published);
+    assert!(
+        agent
+            .synchronise_consumer(4, catalog, ingress, vec![])
+            .await
+            .is_err(),
+        "a leader of the replaced council was accepted after recovery"
+    );
 }
 
 #[tokio::test]

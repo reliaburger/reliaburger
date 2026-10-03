@@ -1077,6 +1077,7 @@ mod tests {
                 service_port: Some(8080),
                 blocked: None,
                 volume_home_away: None,
+                volume_homes: Vec::new(),
             }]),
             Ok(Vec::new()),
             None,

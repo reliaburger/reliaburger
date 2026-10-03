@@ -864,7 +864,7 @@ impl RuncGrill {
         let adoption = adoption.clone();
         self.owned_operation(instance, move |runtime, id, context| async move {
             let intent = context.intent().await?;
-            if intent.spec != adoption.oci_spec
+            if !adoption.oci_spec.matches_journal(&intent.spec)
                 || adoption.instance_id != id.0
                 || adoption.runtime != crate::grill::records::RuntimeKind::Runc
                 || adoption.runc_container_id.as_deref() != Some(&id.0)

@@ -469,6 +469,14 @@ pub struct SecurityState {
 }
 
 impl SecurityState {
+    /// Whether this state was seeded: it holds a CA, a secret key or a token.
+    /// The council refuses to seed an initialised state again.
+    pub fn is_initialised(&self) -> bool {
+        !self.certificate_authorities.is_empty()
+            || !self.age_keypairs.is_empty()
+            || !self.api_tokens.is_empty()
+    }
+
     /// Get the CA for a given role.
     pub fn get_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
         self.certificate_authorities

@@ -57,7 +57,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.1.3
+  --record docs/website/assets/tour.cast --install v0.1.4
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -71,6 +71,12 @@ instead, with `bun` and `relish` for Linux in `target/tour-bins` (built
 the recording then shows `relish setup --quickstart --development-binaries`
 where the tour says `curl … | sh`, and says so on screen.
 
+If another laptop cluster already holds the default ports, give the tour's
+cluster its own with `--api-port`, `--ingress-port` and `--registry-port` (for
+example 29117, 28080 and 25050). `--install` and `--setup` pass them to
+`relish setup --quickstart`, and the tour sends its requests to that ingress
+port. The recording says which ports it used and shows the commands with them.
+
 `--record` runs the tour inside `asciinema rec` (110x32, idle time cut to two
 seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
@@ -79,7 +85,8 @@ the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` when the
 tarball isn't published yet. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.1.3`.
+`--install v0.1.4 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
+beside a laptop cluster on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 The "Try it in five minutes" section keeps its heading and the recording in
@@ -128,7 +135,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.1.3` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.1.4` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release

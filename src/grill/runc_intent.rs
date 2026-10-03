@@ -114,6 +114,9 @@ pub struct RuntimeIntent {
     /// Generation required by any subsequent mutation.
     pub generation: IntentGeneration,
     /// Original specification, before image, rootfs or network preparation.
+    /// Once retired, only environment variable names remain (see
+    /// [`OciSpec::without_environment_values`]); compare it with
+    /// [`OciSpec::matches_journal`], never `==`.
     pub spec: OciSpec,
     /// Runtime configuration that gave this request its meaning.
     pub configuration: IntentConfiguration,
@@ -533,6 +536,10 @@ impl IntentClaim {
                 return Ok(self);
             }
             record.phase = IntentPhase::Retired { exit_code };
+            // Nothing can adopt or relaunch a retired generation, so its
+            // environment values, decrypted secrets included, have no reader.
+            // Keep the names: recovery still matches the rest of the spec.
+            record.spec = record.spec.without_environment_values();
             persist(
                 &self
                     .journal

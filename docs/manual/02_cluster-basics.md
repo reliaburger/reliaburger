@@ -98,8 +98,9 @@ way, and a leader hands over first. The `max_storage_mb` caps on logs and
 metrics only decide what gets pruned; they never move a council seat. If a
 voter's disk fills before it's replaced, its Raft log stops accepting writes:
 bun logs `council Raft core stopped`, exits non-zero, and the service manager
-restarts it. Once there's space again, it catches up from the leader. If every voter is lost, `relish council recover` rebuilds
-the council from a stopped survivor's snapshot or a sealed backup (see
+restarts it. Once there's space again, it catches up from the leader. If every
+voter is lost, `relish council recover` rebuilds the council from a stopped
+voter's own snapshot and committed log, or from a sealed backup (see
 `operations`). Read its `--help` first: writes after the last backup are lost.
 
 ## When a node is gone for good
