@@ -399,8 +399,9 @@ the real `curl … | sh` install against it on every host we advertise.
    cluster, uninstalls, and writes a Markdown record with the timings. It never
    uses `~/.reliaburger` and fails if that directory's top level or
    `~/.local/bin/relish` changed. Pass `setup --quickstart` options after
-   `--`, for example `-- --api-port 29117 --ingress-port 28080` when another
-   cluster holds the default ports, and `--keep` to leave a failed run for
+   `--`, for example `-- --api-port 29117 --ingress-port 28080 --registry-port 25050`
+   when another cluster holds the default ports (the registry forward, 15050,
+   clashes too), and `--keep` to leave a failed run for
    debugging (then `relish local destroy --yes` and `relish uninstall --yes`
    with the same `RELIABURGER_HOME`).
 
