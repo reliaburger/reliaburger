@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::os::{OsChannel, SumsEntry};
 use crate::relish::RelishError;
+use crate::relish::netboot::Arch;
 
 /// Where the newest OS release is named.
 pub const CHANNEL_URL: &str =
@@ -57,10 +58,71 @@ pub fn asset_url(channel_url: &str, tag: &str, file: &str) -> Result<String, Rel
     Ok(format!("{base}/{tag}/{file}"))
 }
 
-/// `relish image download`: fetch and verify the newest build for `arch`.
+/// An architecture `--arch` names, by its directory name (`x86_64` or
+/// `aarch64`).
+pub fn parse_arch(name: &str) -> Result<Arch, String> {
+    Arch::ALL
+        .into_iter()
+        .find(|arch| arch.directory() == name)
+        .ok_or_else(|| format!("unknown architecture {name} ({})", known_names()))
+}
+
+/// Which architectures to fetch from a release that offers `offered`:
+/// every one relish knows unless `requested` narrows it. The operator's
+/// machine is rarely the architecture of the machines it serves (an arm64
+/// laptop netbooting x86_64 boxes), so the default doesn't guess.
+pub fn select_architectures(
+    offered: &[String],
+    requested: &[Arch],
+    version: &str,
+) -> Result<Vec<Arch>, RelishError> {
+    let is_offered = |arch: Arch| offered.iter().any(|name| name == arch.directory());
+    if let Some(missing) = requested.iter().find(|arch| !is_offered(**arch)) {
+        return Err(failed(&format!(
+            "OS {version} has no {} build",
+            missing.directory()
+        )));
+    }
+    let chosen: Vec<Arch> = Arch::ALL
+        .into_iter()
+        .filter(|arch| is_offered(*arch) && (requested.is_empty() || requested.contains(arch)))
+        .collect();
+    if chosen.is_empty() {
+        return Err(failed(&format!(
+            "OS {version} has no {} build",
+            known_names()
+        )));
+    }
+    Ok(chosen)
+}
+
+/// The last line `download` prints: which architectures it saved, and where.
+pub fn saved_summary(directory: &Path, saved: &[Arch]) -> String {
+    let names: Vec<&str> = saved.iter().map(|arch| arch.directory()).collect();
+    let paths: Vec<String> = saved
+        .iter()
+        .map(|arch| format!("{}/", directory.join(arch.directory()).display()))
+        .collect();
+    format!(
+        "Saved {} under {} ({})",
+        names.join(" and "),
+        directory.display(),
+        paths.join(", ")
+    )
+}
+
+/// "x86_64 or aarch64".
+fn known_names() -> String {
+    let names: Vec<&str> = Arch::ALL.iter().map(|arch| arch.directory()).collect();
+    names.join(" or ")
+}
+
+/// `relish image download`: fetch and verify the newest build for each
+/// architecture in `requested`, or for every one the release offers when
+/// `requested` is empty.
 pub async fn download(
     channel_url: &str,
-    arch: &str,
+    requested: &[Arch],
     directory: &Path,
     everything: bool,
 ) -> Result<(), RelishError> {
@@ -74,13 +136,32 @@ pub async fn download(
     let signature = fetch(&client, &format!("{channel_url}.sig")).await?;
     let channel = OsChannel::verified(&channel_bytes, &signature, &keys)
         .map_err(|e| failed(&e.to_string()))?;
+    let offered: Vec<String> = channel.architectures.keys().cloned().collect();
+    let chosen = select_architectures(&offered, requested, &channel.version)?;
+    for arch in &chosen {
+        download_arch(&client, channel_url, &channel, *arch, directory, everything).await?;
+    }
+    println!("{}", saved_summary(directory, &chosen));
+    Ok(())
+}
+
+/// Fetch and verify one architecture's build into `<directory>/<arch>/`.
+async fn download_arch(
+    client: &reqwest::Client,
+    channel_url: &str,
+    channel: &OsChannel,
+    arch: Arch,
+    directory: &Path,
+    everything: bool,
+) -> Result<(), RelishError> {
+    let arch = arch.directory();
     let entry = channel
         .architectures
         .get(arch)
         .ok_or_else(|| failed(&format!("OS {} has no {arch} build", channel.version)))?;
-    let sums = fetch(&client, &asset_url(channel_url, &entry.tag, &entry.sums)?).await?;
+    let sums = fetch(client, &asset_url(channel_url, &entry.tag, &entry.sums)?).await?;
     let sums_signature = fetch(
-        &client,
+        client,
         &asset_url(channel_url, &entry.tag, &format!("{}.sig", entry.sums))?,
     )
     .await?;
@@ -111,7 +192,7 @@ pub async fn download(
             continue;
         }
         let url = asset_url(channel_url, &entry.tag, &name)?;
-        let bytes = stream_to(&client, &url, &path).await?;
+        let bytes = stream_to(client, &url, &path).await?;
         let actual = sha256_file(&path)?;
         crate::os::check_asset(&entries, &entry.sums, &name, &actual).map_err(|e| {
             let _ = std::fs::remove_file(&path);
@@ -119,7 +200,6 @@ pub async fn download(
         })?;
         println!("  {name}: {} MB, checked", bytes / 1_000_000);
     }
-    println!("Saved under {}", arch_dir.display());
     Ok(())
 }
 
@@ -277,6 +357,82 @@ mod tests {
             "https://github.com/reliaburger/reliaburger/releases/download/os-2026.41.0-x86_64/boot.ipxe"
         );
         assert!(asset_url("https://example.com/channel.json", "t", "f").is_err());
+    }
+
+    fn offered(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn by_default_every_architecture_the_release_offers_is_fetched() {
+        // An arm64 Mac serving x86_64 machines must not get only its own.
+        assert_eq!(
+            select_architectures(&offered(&["aarch64", "x86_64"]), &[], "2026.41.0").unwrap(),
+            [Arch::X86_64, Arch::Arm64]
+        );
+        assert_eq!(
+            select_architectures(&offered(&["x86_64"]), &[], "2026.41.0").unwrap(),
+            [Arch::X86_64]
+        );
+    }
+
+    #[test]
+    fn arch_narrows_the_download_to_the_named_architectures() {
+        let both = offered(&["aarch64", "x86_64"]);
+        assert_eq!(
+            select_architectures(&both, &[Arch::Arm64], "2026.41.0").unwrap(),
+            [Arch::Arm64]
+        );
+        assert_eq!(
+            select_architectures(
+                &both,
+                &[Arch::Arm64, Arch::X86_64, Arch::Arm64],
+                "2026.41.0"
+            )
+            .unwrap(),
+            [Arch::X86_64, Arch::Arm64]
+        );
+    }
+
+    #[test]
+    fn an_architecture_the_release_lacks_is_refused() {
+        let error = select_architectures(&offered(&["x86_64"]), &[Arch::Arm64], "2026.41.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("OS 2026.41.0 has no aarch64 build"),
+            "{error}"
+        );
+        let error = select_architectures(&offered(&["riscv64"]), &[], "2026.41.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("OS 2026.41.0 has no x86_64 or aarch64 build"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_architecture_is_refused_by_name() {
+        assert_eq!(parse_arch("x86_64").unwrap(), Arch::X86_64);
+        assert_eq!(parse_arch("aarch64").unwrap(), Arch::Arm64);
+        assert_eq!(
+            parse_arch("riscv64").unwrap_err(),
+            "unknown architecture riscv64 (x86_64 or aarch64)"
+        );
+        assert!(parse_arch("arm64").is_err());
+    }
+
+    #[test]
+    fn the_summary_names_each_architecture_saved() {
+        assert_eq!(
+            saved_summary(Path::new("os"), &[Arch::X86_64, Arch::Arm64]),
+            "Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)"
+        );
+        assert_eq!(
+            saved_summary(Path::new("os"), &[Arch::X86_64]),
+            "Saved x86_64 under os (os/x86_64/)"
+        );
     }
 
     #[test]

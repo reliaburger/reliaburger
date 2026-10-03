@@ -430,6 +430,11 @@ enum Command {
         /// Install again on machines that installed from here already.
         #[arg(long)]
         reinstall: bool,
+        /// Wipe this machine's disk without asking if it isn't blank
+        /// (repeat for more). Other used disks are wiped only after a yes
+        /// at this terminal; with no terminal, they're left alone.
+        #[arg(long = "wipe", value_name = "MAC", value_parser = parse_mac)]
+        wipe: Vec<reliaburger::relish::netboot::MacAddress>,
         /// Which iPXE build PXE firmware gets: snp drives the network card
         /// through the firmware's own driver; full brings iPXE's drivers,
         /// for firmware whose network stack misbehaves.
@@ -851,11 +856,11 @@ enum ClusterAction {
 
 #[derive(Subcommand)]
 enum ImageAction {
-    /// Download the newest OS build and check it against the release key.
+    /// Download the newest OS build for every architecture and check it against the release key.
     Download {
-        /// x86_64 or aarch64.
-        #[arg(long, default_value = std::env::consts::ARCH)]
-        arch: String,
+        /// Only this architecture, x86_64 or aarch64 (repeat for more; default: every one the release has).
+        #[arg(long = "arch", value_name = "ARCH", value_parser = reliaburger::relish::image::parse_arch)]
+        arches: Vec<reliaburger::relish::netboot::Arch>,
         /// Where to save it (as <dir>/<arch>/, the layout a netboot server serves).
         #[arg(long, default_value = "os")]
         dir: PathBuf,
@@ -991,6 +996,7 @@ async fn netboot(
     duration: std::time::Duration,
     key: Option<PathBuf>,
     reinstall: bool,
+    wipe: Vec<reliaburger::relish::netboot::MacAddress>,
     ipxe: reliaburger::relish::netboot::IpxeBuild,
     trust_key: Option<String>,
 ) -> Result<(), reliaburger::relish::RelishError> {
@@ -1010,6 +1016,7 @@ async fn netboot(
         duration,
         keys,
         reinstall,
+        wipe,
         ipxe,
     })
     .await?;
@@ -1970,11 +1977,11 @@ async fn main() -> ExitCode {
         },
         Command::Image { action } => match action {
             ImageAction::Download {
-                arch,
+                arches,
                 dir,
                 all,
                 channel,
-            } => reliaburger::relish::image::download(&channel, &arch, &dir, all).await,
+            } => reliaburger::relish::image::download(&channel, &arches, &dir, all).await,
             ImageAction::Write { image, device, yes } => {
                 reliaburger::relish::image::write(&image, &device, yes).map(|bytes| {
                     println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
@@ -2045,11 +2052,13 @@ async fn main() -> ExitCode {
             duration,
             key,
             reinstall,
+            wipe,
             ipxe,
             trust_key,
         } => {
             netboot(
-                dir, interface, address, http_port, macs, duration, key, reinstall, ipxe, trust_key,
+                dir, interface, address, http_port, macs, duration, key, reinstall, wipe, ipxe,
+                trust_key,
             )
             .await
         }
@@ -2431,6 +2440,28 @@ mod tests {
                 action: SecretAction::Pubkey { dir: Some(ref dir) }
             }) if dir == std::path::Path::new("cluster")
         ));
+    }
+
+    #[test]
+    fn image_download_takes_every_architecture_unless_arch_is_repeated() {
+        use reliaburger::relish::netboot::Arch;
+        let arches = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Image {
+                action: ImageAction::Download { arches, .. },
+            }) => arches,
+            _ => panic!("not image download"),
+        };
+        assert!(arches(&["relish", "image", "download"]).is_empty());
+        assert_eq!(
+            arches(&[
+                "relish", "image", "download", "--arch", "x86_64", "--arch", "aarch64"
+            ]),
+            [Arch::X86_64, Arch::Arm64]
+        );
+        assert!(
+            Cli::try_parse_from(["relish", "image", "download", "--arch", "x86_64,aarch64"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -3318,6 +3349,7 @@ mod tests {
             duration,
             key,
             reinstall,
+            wipe,
             ipxe,
             trust_key,
         } = cli.command
@@ -3330,6 +3362,7 @@ mod tests {
         assert!(macs.is_empty());
         assert_eq!(duration, std::time::Duration::from_secs(3600));
         assert_eq!((key, reinstall, trust_key), (None, false, None));
+        assert!(wipe.is_empty());
         assert_eq!(ipxe, reliaburger::relish::netboot::IpxeBuild::Snp);
     }
 
@@ -3362,6 +3395,10 @@ mod tests {
             "--key",
             "art/spike-signing-key.pub.pem",
             "--reinstall",
+            "--wipe",
+            "52:54:00:12:34:56",
+            "--wipe",
+            "6C-4B-90-00-00-01",
         ])
         .unwrap();
         let Command::Netboot {
@@ -3371,6 +3408,7 @@ mod tests {
             http_port,
             key,
             reinstall,
+            wipe,
             ..
         } = cli.command
         else {
@@ -3383,11 +3421,16 @@ mod tests {
         assert_eq!(http_port, 8081);
         assert_eq!(key, Some(PathBuf::from("art/spike-signing-key.pub.pem")));
         assert!(reinstall);
+        let wipe: Vec<String> = wipe.iter().map(|m| m.to_string()).collect();
+        assert_eq!(wipe, ["52:54:00:12:34:56", "6c:4b:90:00:00:01"]);
     }
 
     #[test]
     fn netboot_refuses_a_bad_mac_a_bad_duration_and_both_interface_flags() {
         assert!(parse(&["relish", "netboot", "os", "--mac", "nope"]).is_err());
+        assert!(parse(&["relish", "netboot", "os", "--wipe", "nope"]).is_err());
+        // --wipe always names a machine: there's no wipe-everything switch.
+        assert!(parse(&["relish", "netboot", "os", "--wipe"]).is_err());
         assert!(parse(&["relish", "netboot", "os", "--for", "1w"]).is_err());
         assert!(
             parse(&[

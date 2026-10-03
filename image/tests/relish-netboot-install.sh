@@ -7,11 +7,16 @@
 # The LAN is a bridge. A network namespace on it plays the home router: its
 # dnsmasq hands out addresses and knows nothing about booting. The runner
 # runs `relish netboot` on the bridge as a ProxyDHCP, TFTP and HTTP server,
-# exactly as an operator's laptop would. A VM with a blank disk boots from
-# the network (disk first, so the second boot starts the installed system),
-# and the test passes once bun is healthy on it, relish has remembered the
-# machine as installed, and relish's start-up probe saw the router's DHCP.
-# Needs root (the bridge, port 67), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
+# exactly as an operator's laptop would. A VM whose disk already holds a GPT
+# and an ext4 filesystem, like a used Wyse with ThinOS on it, boots from the
+# network (disk first, so the second boot starts the installed system). The
+# installer reports the used disk, and relish wipes it because --wipe lists
+# the VM's MAC: there's no terminal here to answer the question. The test
+# passes once bun is healthy on it, relish has remembered the machine as
+# installed, relish's log shows it decided to wipe, and relish's start-up
+# probe saw the router's DHCP.
+# Needs root (the bridge, port 67, a loop device), qemu-system-x86, ovmf,
+# dnsmasq, sfdisk, e2fsprogs and /dev/kvm.
 set -euo pipefail
 out=$(cd "${1:?usage: relish-netboot-install.sh <artefact dir> <version> <relish>}" && pwd)
 version=${2:?usage}
@@ -49,18 +54,23 @@ ln -s "$out" "$work/serve/x86_64"
 # The log is ours to read, so the redirect stays outside sudo.
 # shellcheck disable=SC2024
 sudo "$relish" netboot "$work/serve" --key "$out/spike-signing-key.pub.pem" \
-    --interface rbbr0 --mac "$mac" --for 30m > "$work/netboot.log" 2>&1 &
+    --interface rbbr0 --mac "$mac" --wipe "$mac" --for 30m < /dev/null > "$work/netboot.log" 2>&1 &
 server=$!
 
 sudo ip tuntap add rbtap0 mode tap user "$(id -un)"
 sudo ip link set rbtap0 master rbbr0 up
-truncate -s 8G "$work/blank.raw"
+# A used disk: a GPT with one partition holding an ext4 filesystem.
+truncate -s 8G "$work/used.raw"
+printf 'label: gpt\nsize=1G, type=L, name=ThinOS\n' | sfdisk -q "$work/used.raw"
+loop=$(sudo losetup -fP --show "$work/used.raw")
+sudo mkfs.ext4 -q -L ThinOS "${loop}p1"
+sudo losetup -d "$loop"
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
 log="$work/serial.log"
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file="$work/vars.fd" \
-    -drive if=none,id=d0,format=raw,file="$work/blank.raw" \
+    -drive if=none,id=d0,format=raw,file="$work/used.raw" \
     -device virtio-blk-pci,drive=d0,bootindex=1 \
     -netdev tap,id=n0,ifname=rbtap0,script=no,downscript=no \
     -device "virtio-net-pci,netdev=n0,mac=$mac,bootindex=2" \
@@ -78,6 +88,9 @@ done
 elapsed=$(( $(date +%s) - start ))
 if [ "$result" = pass ] && ! sudo grep -qi "$mac" "$work/serve/netboot-installed.json" 2>/dev/null; then
     result="installed, but relish netboot didn't remember the machine"
+fi
+if [ "$result" = pass ] && ! grep -q "$mac.*: disk .*: wiping it and installing (--wipe lists it)" "$work/netboot.log"; then
+    result="installed, but relish netboot's log doesn't show the used disk being wiped"
 fi
 # Its start-up probe should have seen the router's dnsmasq hand out addresses.
 if [ "$result" = pass ] && ! grep -q "hands out addresses on rbbr0" "$work/netboot.log"; then
