@@ -12,6 +12,9 @@
 #                                systemd-stub records)
 #   reliaburger.disk=/dev/<name> install here instead of the largest fixed disk
 #   reliaburger.wipe=1           overwrite a disk that already has partitions
+#   reliaburger.ask=<URL>        relish netboot passes this: report a disk
+#                                that isn't empty there and wipe it only if
+#                                the operator says so (ask-to-wipe)
 #
 # After writing, it puts a boot entry for the disk first in the firmware's
 # boot order, so the machine boots its disk from now on even where network
@@ -102,7 +105,20 @@ if [ -n "$(lsblk -nlo NAME "$disk" | tail -n +2)" ] || blkid -p "$disk" >/dev/nu
         systemctl reboot
         exit 0
     fi
-    [ "$(arg reliaburger.wipe)" = 1 ] || fail "$disk isn't empty; boot with reliaburger.wipe=1 to overwrite it"
+    ask=$(arg reliaburger.ask)
+    if [ "$(arg reliaburger.wipe)" = 1 ]; then
+        say "reliaburger.wipe=1 is set"
+    elif [ -n "$ask" ]; then
+        # relish netboot: the operator decides, never this machine.
+        if ! /usr/lib/reliaburger/ask-to-wipe "$ask" "$disk"; then
+            say "$disk is untouched; powering off in 60 s"
+            sleep 60
+            systemctl poweroff
+            exit 0
+        fi
+    else
+        fail "$disk isn't empty; boot with reliaburger.wipe=1 to overwrite it"
+    fi
     say "wiping $disk"
     wipefs -a -q "$disk"
 fi

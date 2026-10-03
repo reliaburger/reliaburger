@@ -21,8 +21,13 @@ It's a **preview**, and the rough edges are part of what it's for:
   - wired to the same network.
 
   **The installer erases the largest built-in disk.**
-- **Your router**, with a DHCP reservation for each machine, so each keeps the
-  same address. Nodes find each other by address.
+- **A router you control**, with a DHCP reservation for each machine, so each
+  keeps the same address. Nodes find each other by address, and they need the
+  router's default route to work out their own. Your home router will do. On
+  an isolated switch, a Raspberry Pi can be the router:
+  [`image/lab/pi/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/pi/README.md)
+  sets one up with DHCP, DNS, NTP and NAT. Leave booting to `relish netboot`:
+  the router must not answer PXE.
 - **A machine on that network to serve the netboot**: your laptop (Linux or
   macOS), any spare box, or a VM bridged onto the LAN. It needs `relish` and
   root.
@@ -150,6 +155,44 @@ way, so a 2 GiB machine installs a 1.7 GB image without holding any of it in
 memory. It puts the disk first in the boot order and reboots. After a
 reboot the node runs bun on its own, not yet in a cluster.
 
+### A disk that isn't blank
+
+A second-hand machine usually still has its old system on the disk. A Dell
+Wyse 3040, for instance, may come with ThinOS. The installer never wipes a
+disk on its own. Before it writes anything, it reports what's on the disk to
+`relish netboot` and waits. The netboot terminal asks you:
+
+```
+relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+```
+
+Type `y` and Enter to wipe it and install. Anything else, or no answer within
+10 minutes, leaves the disk as it was. The installer says so on the machine's
+console and powers it off. For the rest of that `relish netboot` run, the
+machine is told to boot its own disk and isn't asked again. Start `relish
+netboot` again to be asked again.
+
+A blank disk installs without a question. So does a disk that already holds
+Reliaburger OS: the installer boots it instead of reinstalling.
+
+For an unattended run, list the machines whose disks may be wiped up front:
+
+```sh
+sudo relish netboot os --mac 6c:4b:90:12:34:56 --wipe 6c:4b:90:12:34:56
+```
+
+`--wipe` takes one MAC address and can be repeated. There's no way to say
+"wipe everything": each machine is named. When `relish netboot` runs without
+a terminal (from a script, or with its input redirected), there's nobody to
+ask, so it wipes only the disks of `--wipe` machines and leaves every other
+used disk alone. Every decision goes into its log:
+
+```
+http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wiping it and installing (--wipe lists it)
+```
+
+If several machines report at once, the questions come one at a time.
+
 Write down each machine's MAC address and address from the `this machine`
 line. You'll need them next. (Your router's list of reservations has them
 too.)
@@ -174,6 +217,14 @@ relish cluster create --bare-metal ~/home-cluster --name home \
   cluster ports before they've joined (those ports all need the cluster's
   certificates). Without it, only the machines listed here get through.
 - The machines become `home-1`, `home-2` and `home-3`.
+- The council, the machines that hold the cluster's state and vote on every
+  change, grows to five voters. Five ride out two failures at once. Seven
+  would ride out three, but every voter keeps the council's log and votes on
+  every write, which 2 GB machines feel.
+  `--council-size` takes another odd number from 1 to 7. An even size is
+  refused: four voters survive no more failures than three. A cluster with
+  fewer machines than its size makes every machine a voter. `relish council`
+  shows the size as `Size: up to 5 voters`.
 
 The cluster's keys are made here, on your laptop, and never anywhere else
 until node 1's seed carries them. `~/home-cluster/secrets` holds the master
@@ -257,7 +308,8 @@ ADDRESS           MAC               ARCH     CLAIM KEY
 ```
 
 Create the cluster from them, node 1 first. relish takes the same options as
-`relish cluster create`, and the machines by MAC or by address:
+`relish cluster create`, `--council-size` included, and the machines by MAC
+or by address:
 
 ```sh
 relish machines claim ~/home-cluster --create --name home \

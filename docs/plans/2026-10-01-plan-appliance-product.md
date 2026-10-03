@@ -82,7 +82,8 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
   - refuse to start when another ProxyDHCP or `bootpd` already answers;
   - an optional `--mac` allow-list;
   - a time limit;
-  - a clear error without root.
+  - a clear error without root;
+  - (added 3 October 2026, Wyse lab plan PR 1) a used disk is wiped only after the operator's yes at the `relish netboot` terminal, or when `--wipe <mac>` lists the machine. The installer reports the disk with `POST /disk` and polls a read-only `GET /disk/<ticket>`, so no machine can answer its own question (`src/relish/netboot/wipe.rs`).
 - **Installed machines get `exit`:** remember them by MAC and SMBIOS UUID, and serve `boot.ipxe` with those as query parameters.
 - `relish netboot --node <name>`: the same server run by a bun node.
 - **Tests:**

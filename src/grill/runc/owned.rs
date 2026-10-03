@@ -463,14 +463,21 @@ impl RuncGrill {
                 return Err(io::Error::other("runc deletion left OCI state"));
             }
         }
+        let bundle = self.bundle_base.join(&id.0);
         if !self.rootless {
-            super::super::rootfs::unmount_bundle(self.bundle_base.join(&id.0))
+            super::super::rootfs::unmount_bundle(bundle.clone())
                 .await
                 .map_err(io::Error::other)?;
         }
         if self.rootless {
             self.owned_remove_rootless(&record).await?;
         }
+        // Runc has deleted the container, so nothing reads the spec again and
+        // its decrypted env must not outlive the instance. The rest of the
+        // bundle stays: a restart of this instance remounts its private upper.
+        tokio::task::spawn_blocking(move || super::super::bundle::remove_spec(&bundle))
+            .await
+            .map_err(io::Error::other)??;
         let index = if self.rootless {
             None
         } else {

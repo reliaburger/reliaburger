@@ -1427,6 +1427,7 @@ mod tests {
                 name: "node-1".to_string(),
                 voter: true,
             }],
+            council_size: None,
         }
     }
 

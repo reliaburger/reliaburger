@@ -189,6 +189,8 @@ pub async fn fan_out_query(
         let app = query.app.clone();
         let namespace = query.namespace.clone();
         let grep = query.grep.clone();
+        let instance = query.instance.clone();
+        let stream = query.stream;
         let token = service_token.map(str::to_string);
         let tail = query.tail;
         let start = query.start;
@@ -215,6 +217,12 @@ pub async fn fan_out_query(
                 }
                 if let Some(ref g) = grep {
                     params.push(("grep", g.clone()));
+                }
+                if let Some(ref i) = instance {
+                    params.push(("instance", i.clone()));
+                }
+                if let Some(s) = stream {
+                    params.push(("stream", s.as_str().to_string()));
                 }
                 if let Some(s) = start {
                     params.push(("start", s.to_string()));
@@ -662,6 +670,57 @@ mod tests {
             tokio::task::yield_now().await;
         };
         assert_eq!(got, tricky, "grep value mangled in transit");
+    }
+
+    /// F07 part 2: every node applies the instance and end-time filters too,
+    /// so they travel with the fan-out.
+    #[tokio::test]
+    async fn instance_and_end_reach_every_node() {
+        use axum::Router;
+        use axum::extract::{Path, Query};
+        use axum::routing::get;
+        use std::collections::HashMap;
+
+        let received: Arc<Mutex<Option<HashMap<String, String>>>> = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&received);
+        let app = Router::new().route(
+            "/v1/logs/entries/{app}/{namespace}",
+            get(
+                move |Path((_a, _n)): Path<(String, String)>,
+                      Query(params): Query<HashMap<String, String>>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        *captured.lock().await = Some(params);
+                        axum::Json(Vec::<LogEntry>::new())
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let client = reqwest::Client::new();
+        let nodes = vec![("n1".to_string(), format!("http://{addr}"))];
+        let query = LogQuery {
+            instance: Some("default__web-2".into()),
+            end: Some(1_700_000_000),
+            stream: Some(crate::ketchup::types::LogStream::Stderr),
+            ..log_query(None)
+        };
+
+        fan_out_query(&query, &nodes, &client, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+
+        let params = received.lock().await.clone().expect("node never asked");
+        assert_eq!(
+            params.get("instance").map(String::as_str),
+            Some("default__web-2")
+        );
+        assert_eq!(params.get("end").map(String::as_str), Some("1700000000"));
+        assert_eq!(params.get("stream").map(String::as_str), Some("stderr"));
     }
 
     /// An unreachable node is reported as a partial failure, not folded into

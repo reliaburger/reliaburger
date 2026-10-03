@@ -110,10 +110,24 @@ pub(super) async fn secret_rotate_handler(
                 Json(serde_json::json!({ "error": reason })),
             )
                 .into_response(),
-            Ok(_) => Json(
-                serde_json::json!({ "message": "secret rotation finalised, old keys removed" }),
-            )
-            .into_response(),
+            Ok(_) => {
+                record_caller_audit(
+                    &state,
+                    auth.as_deref(),
+                    crate::bun::events::EventKind::Secret,
+                    "secret.rotation_finalised",
+                    std::collections::BTreeMap::from([(
+                        "scope".to_string(),
+                        "cluster".to_string(),
+                    )]),
+                    "secret rotation finalised; old keys retired".to_string(),
+                )
+                .await;
+                Json(
+                    serde_json::json!({ "message": "secret rotation finalised, old keys removed" }),
+                )
+                .into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -168,11 +182,25 @@ pub(super) async fn secret_rotate_handler(
                 Json(serde_json::json!({ "error": reason })),
             )
                 .into_response(),
-            Ok(_) => Json(serde_json::json!({
-                "message": format!("secret key rotated to generation {new_gen}"),
-                "new_public_key": new_pubkey,
-            }))
-            .into_response(),
+            Ok(_) => {
+                record_caller_audit(
+                    &state,
+                    auth.as_deref(),
+                    crate::bun::events::EventKind::Secret,
+                    "secret.rotated",
+                    std::collections::BTreeMap::from([
+                        ("scope".to_string(), "cluster".to_string()),
+                        ("generation".to_string(), new_gen.to_string()),
+                    ]),
+                    format!("secret key rotated to generation {new_gen}"),
+                )
+                .await;
+                Json(serde_json::json!({
+                    "message": format!("secret key rotated to generation {new_gen}"),
+                    "new_public_key": new_pubkey,
+                }))
+                .into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
