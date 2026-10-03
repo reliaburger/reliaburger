@@ -20,6 +20,9 @@ use super::types::{SerialNumber, SpiffeUri, WorkloadIdentity};
 /// Workload certificate lifetime: 1 hour.
 pub const WORKLOAD_CERT_LIFETIME: Duration = Duration::from_secs(3600);
 
+/// Artifact signing authority lasts at most five years and never outlives its CA.
+pub const CODE_SIGNING_CERT_LIFETIME: Duration = Duration::from_secs(5 * 365 * 24 * 3600);
+
 /// Rotation interval: 30 minutes (half of certificate lifetime).
 pub const ROTATION_INTERVAL: Duration = Duration::from_secs(1800);
 
@@ -179,10 +182,21 @@ pub fn validate_and_sign_csr(
         )?)];
     params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
 
-    // Exact validity window: a one-hour certificate is valid for one hour
-    // (plus the skew backdate), not until midnight.
     params.not_before = time::OffsetDateTime::from(now - CLOCK_SKEW_BACKDATE);
-    params.not_after = time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME);
+    params.not_after = match usage {
+        CertUsage::Mtls => time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME),
+        CertUsage::CodeSigning => {
+            let at = time::OffsetDateTime::from(now);
+            if at < workload_ca_params.not_before || at >= workload_ca_params.not_after {
+                return Err(IdentityError::SignFailed(
+                    "code-signing CA is not currently valid".into(),
+                ));
+            }
+            params.not_before = params.not_before.max(workload_ca_params.not_before);
+            time::OffsetDateTime::from(now + CODE_SIGNING_CERT_LIFETIME)
+                .min(workload_ca_params.not_after)
+        }
+    };
 
     // Reconstruct the CA certificate object for signing
     let ca_cert = workload_ca_params
@@ -825,6 +839,30 @@ mod tests {
             not_after,
             now_secs + WORKLOAD_CERT_LIFETIME.as_secs() as i64,
             "not_after is now plus the configured lifetime"
+        );
+    }
+
+    #[test]
+    fn code_signing_certificate_never_outlives_its_issuing_ca() {
+        let uri = test_spiffe_uri();
+        let (csr, _) = create_workload_csr(&uri).unwrap();
+        let (key, mut issuer, _, _) = test_workload_ca();
+        let now = SystemTime::now();
+        issuer.not_after = time::OffsetDateTime::from(now + Duration::from_secs(120));
+        let leaf = validate_and_sign_csr(
+            &csr,
+            &uri,
+            SerialNumber(9),
+            CertUsage::CodeSigning,
+            &key,
+            &issuer,
+            now,
+        )
+        .unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+        assert_eq!(
+            parsed.validity().not_after.timestamp(),
+            issuer.not_after.unix_timestamp()
         );
     }
 
