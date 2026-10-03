@@ -360,7 +360,11 @@ fn lookup_pickle_manifest<'a>(
     catalog: &'a crate::pickle::types::ManifestCatalog,
 ) -> Option<&'a crate::pickle::types::ImageManifest> {
     let manifest = match image_ref.split_once('@') {
-        Some((repository, digest)) => {
+        Some((name, digest)) => {
+            // `app:v1@sha256:…` names repository `app`: the digest wins and
+            // the tag is only for people, but left on it would miss the
+            // catalogue and pass as an external image.
+            let (repository, _tag) = split_repo_tag(name);
             catalog.get_repository_manifest(canonical_repository(repository), digest)
         }
         None => {
@@ -1194,6 +1198,32 @@ mod tests {
             None,
         );
         assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
+    }
+
+    /// F03: a reference carrying a tag *and* a digest (`app:v1@sha256:…`,
+    /// what binding at apply writes) is still the local repository. Looked up
+    /// as repository `app:v1`, it missed, counted as external and skipped
+    /// the policy.
+    #[test]
+    fn tag_and_digest_reference_hits_its_own_policy() {
+        let catalog = catalog_with_repo("app");
+        let digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        for image in [
+            format!("app:v1@{digest}"),
+            format!("localhost:5050/app:v1@{digest}"),
+        ] {
+            let result = super::verify_image_signature(
+                Some(&image),
+                &catalog,
+                &require_signatures(),
+                None,
+                None,
+            );
+            assert!(
+                matches!(result, Err(ScheduleError::UnsignedImage { .. })),
+                "{image}: an unsigned local image must be refused: {result:?}"
+            );
+        }
     }
 
     /// An explicit `cache/...` reference is exempt like the shorthand:

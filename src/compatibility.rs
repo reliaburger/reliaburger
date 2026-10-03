@@ -37,10 +37,12 @@ pub struct Compatibility {
 /// fenced RPC with a `Fenced` reply; and cluster-wide instance ordinals:
 /// each placement's `Placement::ordinal` in council state, the ordinals a
 /// placement poll hands a node (`NodeAssignment::ordinals`) and the
-/// instance ids named after them (#398). The appliance OS rollout bumps
-/// both: a new Raft request and a new field in council state.
+/// instance ids named after them (#398), and the `token`, `secret` and
+/// `identity` event kinds a peer's `/v1/events` answer can carry (F05 I1).
+/// The appliance OS rollout bumps both again: a new Raft request and a new
+/// field in council state.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 34,
+    protocol: 35,
     state: 50,
 };
 

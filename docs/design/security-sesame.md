@@ -961,7 +961,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 2. For each env var value matching `ENC[AGE:...]`, Bun requests decryption from the council.
 3. The council decrypts using the age private key (cluster-wide or namespace-scoped).
 4. The plaintext is returned over the mTLS channel.
-5. Bun injects the plaintext as an environment variable. It is never written to disk.
+5. Bun injects the plaintext as an environment variable. The runtime needs the full launch spec on disk to start and adopt the instance, so plaintext reaches disk only in root-only files (mode 0600, in owner-only directories): the runc bundle's `config.json`, deleted when the instance retires; the agent's adoption record, removed with the instance; and the runtime's own launch intent. A retired intent keeps its copy until the same instance id starts again, which is a known gap.
 6. A decryption audit event is logged: which secret, which app, which node, timestamp.
 
 **Namespace-scoped keys (planned — not yet generated):** The intended design is that setting `secret_key = true` for a namespace makes `relish init` (or `relish namespace create`) generate a separate age keypair for it, stored in Raft wrapped with HKDF, so compromise of one namespace's key does not expose another's. **This is not shipped:** there is no `secret_key` config field, and no code path generates a namespace-scoped age keypair — the cluster runs on a single cluster-wide age key. The decryption and re-seal paths already *prefer* a namespace key when one exists and fall back to the cluster-wide key, so the consuming side is ready; only the key-creation side is missing.
