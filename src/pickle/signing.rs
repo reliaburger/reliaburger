@@ -686,9 +686,17 @@ gW44LD4On4yfIPRJkluhNQ5G35R5vZyQY5DspOlhl16ImqPQIVADgGQv
     }
 
     #[test]
+    fn cluster_artifact_signature_remains_valid_after_two_hours() {
+        let (sig, root) = codesigning_keyless_sig();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600);
+        verify_keyless_at(&sig, &test_digest(), &root, None, later)
+            .expect("artifact authority must outlive the runtime workload's one-hour identity");
+    }
+
+    #[test]
     fn verify_keyless_rejects_an_expired_chain() {
         let (sig, root) = codesigning_keyless_sig();
-        // Ten years hence, the (one-hour) leaf has long expired.
+        // Ten years hence, the signing leaf and its authority have expired.
         let future =
             std::time::SystemTime::now() + std::time::Duration::from_secs(10 * 365 * 24 * 3600);
         assert!(verify_keyless_at(&sig, &test_digest(), &root, None, future).is_err());
