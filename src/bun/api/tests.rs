@@ -5045,6 +5045,101 @@ async fn identity_jwks_returns_503_without_council() {
     shutdown.cancel();
 }
 
+/// F05 I1: the routes that change who can do what leave an audit event
+/// naming the credential that called them. Before, only fault inject and
+/// clear did; a token could be minted or a secret key rotated with no trace.
+#[tokio::test]
+async fn trust_changing_routes_record_who_called_them() {
+    let (admin, plaintext) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let council = seeded_council_with_ikm("audit-trust").await;
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+
+    let mut minted = Vec::new();
+    for (uri, body) in [
+        ("/v1/token/create", r#"{"name":"ci-bot","role":"deployer"}"#),
+        ("/v1/token/revoke", r#"{"name":"ci-bot"}"#),
+        ("/v1/join-token/create", r#"{"node_id":"node-7"}"#),
+        ("/v1/secret/rotate", ""),
+        ("/v1/secret/rotate", r#"{"finalize":true}"#),
+    ] {
+        let (status, response) = post_authenticated(app.clone(), uri, &plaintext, body, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        minted.push(String::from_utf8_lossy(&response).into_owned());
+    }
+
+    let recorded = events.read().await.recent(20, None, None);
+    let actions: Vec<&str> = recorded
+        .iter()
+        .filter_map(|event| event.action.as_deref())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "token.created",
+            "token.revoked",
+            "join_token.created",
+            "secret.rotated",
+            "secret.rotation_finalised",
+        ]
+    );
+    for event in &recorded {
+        assert!(
+            event
+                .principal
+                .as_deref()
+                .is_some_and(|principal| principal.starts_with("token:")),
+            "{event:?}"
+        );
+        assert_eq!(
+            event.details.get("token_name").map(String::as_str),
+            Some("root-op"),
+            "{event:?}"
+        );
+    }
+    assert_eq!(
+        recorded[0].details.get("token").map(String::as_str),
+        Some("ci-bot")
+    );
+    assert_eq!(
+        recorded[2].details.get("node_id").map(String::as_str),
+        Some("node-7")
+    );
+    // No credential the routes handed back appears in any event.
+    let all_events = serde_json::to_string(&recorded).unwrap();
+    for response in &minted {
+        let json: serde_json::Value = serde_json::from_str(response).unwrap_or_default();
+        for field in ["token", "join_token", "token_plaintext"] {
+            if let Some(secret) = json.get(field).and_then(|value| value.as_str()) {
+                assert!(!all_events.contains(secret), "{field} leaked into an event");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn token_create_writes_to_raft_and_returns_plaintext() {
     let (cmd_tx, _cmd_rx) = mpsc::channel(32);

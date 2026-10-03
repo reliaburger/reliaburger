@@ -172,6 +172,15 @@ short list never passes for a complete one. On the web dashboard, a node's
 page lists that node's apps (or says it didn't answer) and charts CPU and
 memory only on the node's own dashboard.
 
+Besides deploys, restarts, health, jobs, alerts and faults, the events record
+who changed trust: creating or revoking an API token (`token.created`,
+`token.revoked`), creating a join token (`join_token.created`), and rotating
+or finalising the secret key (`secret.rotated`, `secret.rotation_finalised`).
+Each names the credential that did it, as the token's name in its details and
+a stable `principal`, and never carries a secret. Events are kept per node, in
+memory (the newest 1024), so they're a recent record rather than a durable
+audit log.
+
 `relish dashboard` serves the web dashboard (Brioche) on a loopback port and
 opens a one-time link to it. It forwards read-only requests using the CLI's own
 token and CA, so you don't install a certificate in your browser or paste a
