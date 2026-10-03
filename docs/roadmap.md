@@ -184,16 +184,43 @@ migration and no feature gate
   ([#505](https://github.com/reliaburger/reliaburger/issues/505)), a pooled peer connection presenting an expired leaf
   ([#509](https://github.com/reliaburger/reliaburger/issues/509)), and the leader resigning for disk pressure over unexported logs
   ([#510](https://github.com/reliaburger/reliaburger/issues/510)).
-- [ ] **0.1.5: bug fixes, the next release**
+- [ ] **0.1.5: bug fixes, ready for release, qualification to follow**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/11), merge
-  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). Every bug and flake we know about: council recovery that
-  loses tokens, never runs workloads or refuses small clusters
-  ([#477](https://github.com/reliaburger/reliaburger/issues/477)–[#479](https://github.com/reliaburger/reliaburger/issues/479)), a voter with a full disk ([#480](https://github.com/reliaburger/reliaburger/issues/480)), the service VIP
-  withdrawn with the last local replica ([#481](https://github.com/reliaburger/reliaburger/issues/481)), snapshot commands on the
-  wrong node ([#482](https://github.com/reliaburger/reliaburger/issues/482)), the retired intent that keeps decrypted secrets
-  ([#476](https://github.com/reliaburger/reliaburger/issues/476)), the three soak findings from 0.1.4 ([#505](https://github.com/reliaburger/reliaburger/issues/505), [#509](https://github.com/reliaburger/reliaburger/issues/509),
-  [#510](https://github.com/reliaburger/reliaburger/issues/510)) and the flakes ([#497](https://github.com/reliaburger/reliaburger/issues/497), [#500](https://github.com/reliaburger/reliaburger/issues/500), [#508](https://github.com/reliaburger/reliaburger/issues/508), [#519](https://github.com/reliaburger/reliaburger/issues/519)). Token scope, last
-  use and expiry (F05 I2, [#483](https://github.com/reliaburger/reliaburger/pull/483)) is already on the train.
+  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). Every
+  item below has landed on `release-1-1-5`, apart from the two flake PRs
+  still in CI, and the crate says 0.1.5:
+  - [x] token list with scope, expiry and last use, and an hourly sweep of
+    expired tokens that never removes the last Admin (F05 I2,
+    [#483](https://github.com/reliaburger/reliaburger/pull/483));
+  - [x] council recovery that keeps its restored tokens, publishes above the
+    replaced council's catalogue generation and recovers from a log that was
+    never snapshotted ([#477](https://github.com/reliaburger/reliaburger/issues/477)–[#479](https://github.com/reliaburger/reliaburger/issues/479), [#513](https://github.com/reliaburger/reliaburger/pull/513));
+  - [x] disk pressure measured on the real disk, and a voter whose Raft core
+    stopped on a full disk restarts instead of lagging for good
+    ([#480](https://github.com/reliaburger/reliaburger/issues/480), [#510](https://github.com/reliaburger/reliaburger/issues/510), [#516](https://github.com/reliaburger/reliaburger/pull/516));
+  - [x] remote backends kept routed when a node stops or rolls its last
+    local replica ([#481](https://github.com/reliaburger/reliaburger/issues/481), [#515](https://github.com/reliaburger/reliaburger/pull/515));
+  - [x] snapshot commands routed to the node holding the app's volume
+    ([#482](https://github.com/reliaburger/reliaburger/issues/482), [#514](https://github.com/reliaburger/reliaburger/pull/514));
+  - [x] a retired runc intent scrubbed of decrypted environment values
+    ([#476](https://github.com/reliaburger/reliaburger/issues/476), [#512](https://github.com/reliaburger/reliaburger/pull/512));
+  - [x] the 0.1.4 soak findings: a consumer sync journals one write a turn
+    ([#505](https://github.com/reliaburger/reliaburger/issues/505), [#506](https://github.com/reliaburger/reliaburger/pull/506)), and a peer TLS connection retires when its
+    client leaf expires ([#509](https://github.com/reliaburger/reliaburger/issues/509), [#518](https://github.com/reliaburger/reliaburger/pull/518));
+  - [ ] flakes: `flock` guards that unlock on drop and a slow-disk scenario
+    that counts persists ([#497](https://github.com/reliaburger/reliaburger/issues/497), [#500](https://github.com/reliaburger/reliaburger/issues/500), [#508](https://github.com/reliaburger/reliaburger/issues/508), [#519](https://github.com/reliaburger/reliaburger/issues/519),
+    [#523](https://github.com/reliaburger/reliaburger/pull/523)), and a snapshot spool quota independent of the host disk
+    ([#524](https://github.com/reliaburger/reliaburger/issues/524), [#525](https://github.com/reliaburger/reliaburger/pull/525)), both still in CI.
+
+  Still open, with no fix yet: the quickstart runner's fake-`limactl` tests
+  failing when they share a process
+  ([#517](https://github.com/reliaburger/reliaburger/issues/517)), and three
+  flakes found while proving the others
+  ([#520](https://github.com/reliaburger/reliaburger/issues/520), [#521](https://github.com/reliaburger/reliaburger/issues/521), [#526](https://github.com/reliaburger/reliaburger/issues/526)); #523 adds them to the
+  [known flakes register](flakes.md). 0.1.5 changes the protocol and state
+  formats (34 and 49 in 0.1.4; 35 and 50 now, for the token sweep), so a
+  0.1.4 cluster can't roll to it: recreate the cluster
+  ([upgrading from 0.1.4](releasing.md#upgrading-from-014)).
 - [ ] **0.1.6: operations security**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/12)). The
   rest of the 0.1.4 security scope: upstream image trust, binding images to a
