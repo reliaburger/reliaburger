@@ -18,8 +18,16 @@ fn marker_phase(data: &std::path::Path) -> Option<MarkerPhase> {
         .map(|marker| marker.phase)
 }
 
-#[tokio::test]
-async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
+/// A node on 0.1.0 with an upgrade manager, and a signed directive to 0.2.0.
+struct Fixture {
+    _dir: tempfile::TempDir,
+    data: std::path::PathBuf,
+    store: crate::upgrade::store::BinaryStore,
+    manager: crate::upgrade::manager::UpgradeManager,
+    directive: crate::upgrade::types::UpgradeDirective,
+}
+
+fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let binary_dir = dir.path().join("bin");
     let data = dir.path().join("data");
@@ -72,6 +80,24 @@ async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
         allow_downgrade: false,
     };
 
+    Fixture {
+        _dir: dir,
+        data,
+        store,
+        manager,
+        directive,
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
+    let Fixture {
+        _dir,
+        data,
+        store,
+        manager,
+        directive,
+    } = fixture();
     let (mut agent, tx, shutdown) = test_agent();
     agent.set_upgrade_manager(manager);
     let running = tokio::spawn(async move { agent.run().await });
@@ -110,6 +136,47 @@ async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
     })
     .await
     .expect("the exec never followed the delivered answer");
+    shutdown.cancel();
+    let _ = running.await;
+}
+
+/// A directive re-sent to a node that has already exec'd (its marker is
+/// still verifying) is answered without starting anything, so it must not
+/// leave the node refusing new work.
+#[tokio::test]
+async fn a_redelivered_directive_leaves_the_node_taking_work() {
+    let fixture = fixture();
+    UpgradeMarker {
+        schema: 1,
+        upgrade_id: fixture.directive.upgrade_id.clone(),
+        previous_version: "0.0.9".parse().unwrap(),
+        previous_binary: "bun-v0.0.9".into(),
+        target_version: "0.1.0".parse().unwrap(),
+        target_binary: "bun-v0.1.0".into(),
+        phase: MarkerPhase::Executed,
+        boot_attempts: 1,
+        pre_upgrade_instances: vec![],
+    }
+    .store(&UpgradeMarker::path_in(&fixture.data))
+    .unwrap();
+    let (mut agent, tx, shutdown) = test_agent();
+    agent.set_upgrade_manager(fixture.manager);
+    let draining = Arc::clone(&agent.draining);
+    let running = tokio::spawn(async move { agent.run().await });
+    let (response, answer) = oneshot::channel();
+    tx.send(AgentCommand::UpgradeApply {
+        directive: fixture.directive,
+        response,
+        answer_delivered: None,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), answer)
+        .await
+        .expect("the re-delivery was never answered")
+        .unwrap()
+        .unwrap();
+    assert!(!draining.load(std::sync::atomic::Ordering::Relaxed));
     shutdown.cancel();
     let _ = running.await;
 }

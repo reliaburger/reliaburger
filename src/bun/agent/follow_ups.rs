@@ -262,7 +262,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let preparing = kind.clone();
         let task = self.follow_ups.spawn(async move {
             let inventory = read_inventory(&grill, entries).await;
-            let prepared = manager.prepare_rollback(version, inventory).await.map(Some);
+            let prepared = manager.prepare_rollback(version, inventory).await;
             FollowUp::UpgradePrepared(UpgradePreparation {
                 kind,
                 prepared,
@@ -291,7 +291,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let prepared = match prepared {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
-                // Same upgrade already in flight: idempotent OK.
+                // Same upgrade already in flight: idempotent OK. Nothing
+                // new starts, so the node takes work again; a re-delivery to
+                // a node that has already exec'd must not leave it draining.
+                self.draining
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 let _ = response.send(Ok(()));
                 return;
             }
