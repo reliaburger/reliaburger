@@ -978,6 +978,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // into ClusterParams.
     let (disk_pressured_tx, disk_pressured_rx) = tokio::sync::watch::channel(false);
 
+    // Why the council's Raft core stopped, when it stops on its own (#480).
+    // Set once by the watchdog below; bun then shuts down and exits non-zero.
+    let raft_failure: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
     let _cluster_runtime;
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
@@ -1047,6 +1050,29 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         upgrade_rejoin_rx = Some(cluster_runtime.gossip_rejoined_rx.clone());
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         api_council = handle.council.clone();
+        // A Raft core that stops on a storage error never restarts in process
+        // (#480). Shut down and exit non-zero instead of serving as a voter
+        // that no longer applies: systemd restarts bun, and the new core
+        // catches up from the leader once the disk has room again.
+        if let Some(council) = &handle.council {
+            let metrics = council.raft().metrics();
+            let watchdog_shutdown = shutdown.clone();
+            let failure = Arc::clone(&raft_failure);
+            tokio::spawn(async move {
+                let stopped = reliaburger::cluster::runtime::raft_core_stopped(
+                    metrics,
+                    watchdog_shutdown.clone(),
+                )
+                .await;
+                if let Some(reason) = stopped {
+                    eprintln!(
+                        "bun: council Raft core stopped: {reason}; shutting down so the service manager restarts bun"
+                    );
+                    let _ = failure.set(reason);
+                    watchdog_shutdown.cancel();
+                }
+            });
+        }
         crl_refresh = Some(handle.crl_handle.clone());
         // Cloned before the handle moves into the agent: the pickle
         // replication loop derives its peer list from gossip.
@@ -2070,20 +2096,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| "local".to_string());
         let dp_pressured_tx = disk_pressured_tx.clone();
+        // Resignation follows the filesystem the Raft log lives on (#510).
+        let dp_raft_dir = config.storage.data.join("raft");
         // Rollup retention (E): expire aggregated rollups older than the
         // configured window. Only present in cluster mode; 0 hours = keep all.
         let dp_rollup_store = api_rollup_store.clone();
         let rollup_retention_hours = config.metrics.rollup_retention_hours;
         tokio::spawn(async move {
             use reliaburger::bun::disk_pressure::{
-                DiskPressureResignation, ResignationVerdict, check_and_relieve, dir_parquet_size,
+                DiskPressureResignation, FilesystemUsage, ResignationVerdict, check_and_relieve,
             };
             use reliaburger::ketchup::export::ExportCheckpoint;
             let tick_period = std::time::Duration::from_secs(300);
             let mut tick = tokio::time::interval(tick_period);
             // Council resignation waits for two sustained ticks (~10 min) over
-            // the threshold before advertising, so a transient spike between
-            // export and prune doesn't churn the council (12b.2 T3).
+            // the threshold before advertising, so a transient spike doesn't
+            // churn the council (12b.2 T3).
             let mut resignation = DiskPressureResignation::new(tick_period * 2);
             tick.tick().await; // skip first immediate tick
 
@@ -2162,22 +2190,35 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
 
-                        // Council resignation (12b.2 T3): if either store stays
-                        // over its threshold AFTER export-and-prune, the disk is
-                        // genuinely full, not just holding stale data. Sustained
-                        // long enough, advertise resignation so the leader
-                        // replaces this voter.
-                        let over_threshold = (log_max_bytes > 0
-                            && dir_parquet_size(&log_data_dir) > log_max_bytes)
-                            || (metrics_max_bytes > 0
-                                && dir_parquet_size(&mayo_data_dir) > metrics_max_bytes);
+                        // Council resignation (12b.2 T3): a voter resigns when
+                        // the filesystem under its Raft log is nearly full, the
+                        // point where appends start failing. The stores'
+                        // `max_storage_mb` caps are retention limits that
+                        // export-and-prune enforce above; a store over its cap
+                        // on a mostly empty disk is no reason to resign (#510).
+                        let council_disk = match FilesystemUsage::of(&dp_raft_dir) {
+                            Ok(usage) => Some(usage),
+                            Err(error) => {
+                                eprintln!(
+                                    "bun: could not measure disk usage under {}: {error}",
+                                    dp_raft_dir.display()
+                                );
+                                None
+                            }
+                        };
+                        let over_threshold = council_disk.is_some_and(|usage| usage.is_pressured());
                         let verdict = resignation.observe(over_threshold, std::time::Instant::now());
                         let should_resign = verdict == ResignationVerdict::Resign;
                         if *dp_pressured_tx.borrow() != should_resign {
-                            if should_resign {
+                            if let (true, Some(usage)) = (should_resign, council_disk) {
                                 println!(
-                                    "bun: sustained disk pressure — advertising council resignation"
+                                    "bun: sustained disk pressure on {} ({}% used, {} bytes free) — advertising council resignation",
+                                    dp_raft_dir.display(),
+                                    usage.used_percent(),
+                                    usage.available_bytes
                                 );
+                            } else {
+                                println!("bun: disk pressure cleared — withdrawing council resignation");
                             }
                             let _ = dp_pressured_tx.send(should_resign);
                         }
@@ -3127,6 +3168,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         eprintln!("bun: final log flush error: {e}");
     }
     println!("bun: shutdown complete");
+    if let Some(reason) = raft_failure.get() {
+        anyhow::bail!("council Raft core stopped: {reason}");
+    }
 
     Ok(())
 }

@@ -2420,6 +2420,58 @@ Why gossip and not a new dedicated message? Because the directory extension is a
 
 Until this wiring existed, the production path fed the reconciler a permanently empty set — the resignation *machinery* was complete and tested, but nothing in a live cluster ever put a name into it. This is the piece that makes it engage.
 
+### Measuring the right disk
+
+The first version measured the wrong thing. It asked the log and metrics stores whether they were over their `max_storage_mb` caps after export and prune, and called that "disk pressure". The 0.1.4 soak caps both stores at 8 MB. Pruning only deletes files that have already been exported, so the unexported logs on the leader stayed over 8 MB for three ticks running, and the leader resigned. The disk was 38% full. Seven `relish test` cases failed with "no cluster leader known yet" while the council changed hands (#510).
+
+A retention cap is a promise about how much history a store keeps. It says nothing about whether Raft can write. So resignation now asks the filesystem that holds the Raft log, through `statvfs(2)`:
+
+```rust
+pub fn is_pressured(&self) -> bool {
+    self.available_bytes == 0 || self.used_percent() >= COUNCIL_DISK_PRESSURE_PERCENT
+}
+```
+
+`COUNCIL_DISK_PRESSURE_PERCENT` is 95, the level `relish wtf` already calls critical. `FilesystemUsage::of` walks up `path.ancestors()` to the nearest directory that exists, because a standalone node has no `raft/` directory yet. `ancestors()` is an iterator over a path and each of its parents, so `find` returns the first one that's there. The block counts come back as `u32` on macOS and `u64` on Linux, so each goes through `u64::from`. On Linux that conversion does nothing and clippy says so; an `#[allow(clippy::useless_conversion)]` keeps one source for both platforms. When the node does resign, the log line says which filesystem, how full it was and how many bytes were left.
+
+### When the disk fills anyway
+
+Resignation takes ten minutes. A disk can fill in less. An external test filled a follower's disk with `fallocate`, and the durable log's `append` returned a `StorageError` for ENOSPC. openraft treats any storage error as fatal: it stops its core task for good and records why in the metrics' `running_state`. Nothing in Bun noticed. The node still answered its API, so `relish wtf` counted it as a healthy member. It never applied another entry, even after the disk was freed, and the cluster was one more failure away from timing out every write (#480).
+
+Restarting the core in process isn't something openraft 0.9 offers, and a restart of bun fixed it at once in the report. So Bun does that. A small watchdog waits for the core to stop:
+
+```rust
+pub async fn raft_core_stopped(
+    mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    shutdown: CancellationToken,
+) -> Option<String> {
+    loop {
+        let running = metrics_rx.borrow_and_update().running_state.clone();
+        if let Err(fatal) = running {
+            return (!shutdown.is_cancelled()).then(|| fatal.to_string());
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            changed = metrics_rx.changed() => {
+                if changed.is_err() {
+                    return (!shutdown.is_cancelled()).then(|| "Raft core task ended".to_string());
+                }
+            }
+        }
+    }
+}
+```
+
+`borrow_and_update` reads the latest metrics and marks them seen, and we clone `running_state` out at once. A `watch` borrow holds a read lock, and holding it across the `.await` below would block the core from publishing. `bool::then` turns `true` into `Some(..)` and `false` into `None`, so an orderly shutdown, which also stops the core, reports nothing. The `changed()` error covers a core that panicked without publishing a reason.
+
+When it fires, Bun logs the reason, cancels its shutdown token and, after the usual orderly stop, returns an error from `main`, so the process exits non-zero. systemd's `Restart=always` starts it again. With the disk still full, the new core fails on its first append and the cycle repeats every few seconds, loudly, with the node down rather than quietly useless. Once there's room, the new core catches up from the leader.
+
+`relish wtf` also learned to see the quiet version. It already asks every node for its council view, which includes the last applied log index. A voter more than 100 entries behind the furthest-applied voter is now a `council-voter-lagging` warning, and `relish council status` prints the same warning. That threshold is generous: replication keeps a healthy voter within a few entries even under steady writes.
+
+The test for the watchdog needed a disk that fills on cue. The in-memory log store grew a test-only switch, compiled only under `#[cfg(test)]`, that makes every later append fail with `from_raw_os_error(28)`, which is ENOSPC. The test bootstraps a one-voter council, flips the switch, writes, and expects the watchdog to report "No space left on device". A second test checks that a cancelled shutdown reports nothing.
+
+On the testing side, `relish test` now waits out a short leader change. Lease creation that gets a 503 whose body says "retry shortly" tries again every 250 ms for up to 30 seconds. The server only says that when no lease was created, so asking again is safe.
+
 ### Testing the whole thing
 
 The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler and watches leadership move off it, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
