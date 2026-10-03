@@ -61,6 +61,8 @@ The [five-minute tour](../manual/08_five-minute-tour.md) from `relish apply`, wi
 image/tools/fleet-measure.sh ~/wyse 300 288    # every 5 minutes, 24 hours
 ```
 
+`~/wyse` is either the claim directory (`relish machines claim ~/wyse …`), whose `fleet.json` names the nodes (`wyse-1` to `wyse-10`), or the `seed-fleet.sh` directory from step 2 (nodes `node-01` to `node-10`). `fleet-measure.sh --relish ~/wyse 300 288` takes the nodes from `relish nodes --output json` instead, and only writes into `~/wyse`. The script logs in as root over SSH, so the machines need the key in their seeds: `relish machines claim --ssh-key ~/.ssh/id_ed25519.pub`, or `seed-fleet.sh init --ssh-key`, and a lab image (only lab images start sshd).
+
 Leave the tour's apps running for the first 12 hours, then remove them. One CSV per node lands in `~/wyse/measure/`.
 
 **Record, per node and for the fleet:**

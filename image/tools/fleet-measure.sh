@@ -1,22 +1,43 @@
 #!/bin/bash
-# Sample every node of a seeded fleet over SSH, for the spike's 24-hour
+# Sample every node of a fleet over SSH, for the spike's 24-hour
 # measurements on real hardware (research §9.7, step 6): memory, zram, bun's
 # RSS, bytes written to the system disk, disk use, load and temperature.
-# Needs root SSH on the nodes, so the fleet's seeds must carry a key
-# (seed-fleet.sh init --ssh-key).
+# Needs root SSH on the nodes, so their seeds must carry a key
+# (`relish machines claim --ssh-key`, or seed-fleet.sh init --ssh-key).
 #
-#   fleet-measure.sh <dir> [interval seconds] [samples]
+#   fleet-measure.sh [--relish] <dir> [interval seconds] [samples]
 #
-# <dir> is the seed-fleet.sh directory: its "fleet" file lists the nodes.
+# <dir> is where the fleet came from, and where the samples go:
+#   - a claim directory (`relish machines claim`): its fleet.json names the
+#     nodes and their addresses;
+#   - a seed-fleet.sh directory: its "fleet" file, nodes node-01, node-02, …
+# With --relish, the nodes come from `relish nodes --output json` instead
+# (RELISH names the binary), and <dir> only holds the samples.
+# fleet-nodes.py does the reading, again before every sample, so machines
+# claimed during the run join it.
 # Defaults: every 300 s, forever (Ctrl-C stops). Each node gets
 # <dir>/measure/<node>.csv, one row per sample; a node that doesn't answer
 # gets a row of its timestamp and nothing else, so gaps stay visible.
 set -euo pipefail
 
-dir=${1:?usage: fleet-measure.sh <dir> [interval seconds] [samples]}
+usage="usage: fleet-measure.sh [--relish] <dir> [interval seconds] [samples]"
+from_relish=
+if [ "${1:-}" = --relish ]; then
+    from_relish=1
+    shift
+fi
+dir=${1:?$usage}
 interval=${2:-300}
 samples=${3:-0}
-[ -f "$dir/fleet" ] || { echo "$dir has no fleet file" >&2; exit 1; }
+fleet_nodes=$(dirname "$0")/fleet-nodes.py
+nodes() {
+    if [ -n "$from_relish" ]; then
+        "${RELISH:-relish}" nodes --output json | python3 "$fleet_nodes" --relish-json -
+    else
+        python3 "$fleet_nodes" "$dir"
+    fi
+}
+nodes > /dev/null    # fail now, not at the first sample
 out=$dir/measure
 mkdir -p "$out"
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new ${SSH_OPTS:-})
@@ -44,8 +65,7 @@ echo "$(m MemTotal),$(m MemAvailable),$swap_used,$zo,$zc,$rss,$disk,$written,$1,
 taken=0
 while :; do
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    while read -r i mac ip; do
-        node=$(printf node-%02d "$i")
+    while read -r node ip; do
         csv=$out/$node.csv
         [ -s "$csv" ] || echo "$header" > "$csv"
         if row=$(ssh "${ssh_opts[@]}" "root@$ip" "$probe" < /dev/null 2>/dev/null); then
@@ -54,7 +74,7 @@ while :; do
             echo "$now" >> "$csv"
             echo "$now $node ($ip): no answer" >&2
         fi
-    done < "$dir/fleet"
+    done < <(nodes)
     taken=$((taken + 1))
     [ "$samples" -gt 0 ] && [ "$taken" -ge "$samples" ] && break
     sleep "$interval"

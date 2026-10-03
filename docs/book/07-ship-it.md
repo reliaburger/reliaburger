@@ -289,6 +289,8 @@ The fix threads through the whole path. Deploy history entries now carry the ful
 
 This is a small feature with a sharp lesson: a command that describes an action instead of performing it is worse than no command, because it looks done. `relish rollback` had a help string, a history lookup, and formatted output — everything except the rollback.
 
+"Last-but-one" was right on one node and wrong on a cluster, in three ways. The handler read only the history of the node you asked, which may never have run the app. Every node records its own rollout, so once history merged across the cluster (F07), the last-but-one entry was usually another node's copy of the *current* deploy. And a node records the spec it deployed, whose `replicas` is that node's share. Re-applying it as the app's spec would roll a three-replica app back to one replica. `rollback_target` now reads the merged history, treats the spec in Raft as the current version, compares specs with the replica count set aside (which collapses the per-node copies), and returns the newest one that differs, at the current scale. `rollback_skips_other_nodes_copies_of_the_current_version` and `rollback_keeps_the_apps_replica_count` pin both halves.
+
 ### Mock driver with failure injection
 
 The `MockDriver` uses the builder pattern to configure failures at specific steps:

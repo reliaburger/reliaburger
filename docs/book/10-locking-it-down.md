@@ -518,6 +518,8 @@ statuses.retain(|status| visible(&status.instance.app_name, &status.instance.nam
 
 `visible` is a closure: an anonymous function written `|arguments| body`, much like a Python `lambda` or a Go function literal. It captures `auth` from the surrounding scope by reference, so both branches of the handler can share one rule. `Vec::retain` keeps only the elements for which the closure returns `true`, filtering in place without building a second vector. The regression serves one peer and one local agent, each with an instance in `team-a` and one in `team-b`, and checks that a `team-a` token sees only the two `team-a` instances.
 
+The live event stream, `/v1/ws/events`, slipped past for the same reason. Its path names no app, the route matrix lets any token through, and the handler took no `AuthContext`, so a token scoped to `team-a` that `/v1/events` refused could open the WebSocket and watch every tenant's audit events arrive. Events can't be filtered the way instances are (an event about a node or the council belongs to no tenant), so the stream refuses a scoped token before the upgrade, as the listing does. A WebSocket route needs a real handshake in its test: `WebSocketUpgrade` is an extractor that rejects a hand-built request before the handler runs, so `scoped_token_is_refused_the_live_event_stream` binds a port and connects. `both_event_routes_refuse_scoped_tokens` adds the two handlers to the source checks, the same blunt instrument as above, pointed at routes the `{app}` scan can't see.
+
 The deploy-history endpoint had a quieter version of the same bug. It filtered on the bare app name, and since instance identity gained namespaces (chapter 2), two apps called `web` can live in different namespaces quite happily. Filtering by name alone returned both. The namespace now rides in as a query parameter, and the handler filters and scope-checks on it.
 
 ### The registry didn't know what a namespace was
@@ -774,6 +776,28 @@ The operator's re-encrypt step (encrypt against the new public key, `relish appl
 Is the record proof? No — it's the write-time assumption made explicit. Re-apply an unchanged config and the seal updates without any real re-encryption. What it catches is the case that actually eats data: finalising while a secret demonstrably hasn't been touched since the old generation.
 
 One more rule rounds it off: **one rotation at a time.** A second `RotateSecretKey` while a read-only key still exists for the scope is refused (finalise or re-encrypt first); a duplicate delivery of the *same* rotation is recognised by its generation number and accepted idempotently. Both refusals travel as a new `CouncilResponse::Refused { reason }` variant. Like `RaftRequest`, `CouncilResponse` is serialised as self-describing JSON (serde tags variants by name), so a new variant is safe to add; the rule that bites is renaming or removing one, which would leave an old peer unable to decode it. New variant, added — not a rename in sight.
+
+### Where the plaintext goes
+
+Decryption is only half the story. Where does the plaintext go next? The agent decrypts every `ENC[AGE:...]` value into the instance's environment before Grill builds the OCI spec, and runc reads that spec from a file: the bundle's `config.json`. So the decrypted `DB_PASSWORD` sat on disk, in plain JSON, next to the container's root filesystem.
+
+Two things made that a real leak rather than a theoretical one. `tokio::fs::write` creates files with the process umask, which on most hosts means 0644, so any local user could `cat` the file. And nothing ever deleted it. Stop the instance, `relish delete` the app, and the spec stayed in `bundles/<instance>/` indefinitely. Only the rootless path happened to rewrite it 0600, and only because it adds a hook to the spec after the first write.
+
+The fix lives in a small `grill::bundle` module with three functions. `create_private_directory` makes the bundle directory 0711 (and tightens one an older release left at 0755): searchable but not listable, because a container with a user namespace remounts its rootfs from inside that namespace and needs to pass through, which 0700 refused with `remount-private …: permission denied` the first time CI ran it. `write_spec` goes through the same `atomic_write_mode` helper the identity code uses: the temporary file gets mode 0600 *before* a single byte lands in it, then a rename swaps it into place, so there is never a moment when a readable copy exists. `remove_spec` deletes `config.json` once runc has deleted the container, along with any temporary a killed writer left behind (it holds the same plaintext).
+
+```rust
+tokio::task::spawn_blocking(move || super::super::bundle::remove_spec(&bundle))
+    .await
+    .map_err(io::Error::other)??;
+```
+
+The helpers are ordinary blocking `std::fs` code, so the async cleanup hands them to `spawn_blocking`. That returns a `Result` wrapped in another `Result`: the outer one says whether the blocking task itself survived (it could panic), the inner one is our I/O result. Hence the double `??`, which unwraps one layer each.
+
+Why delete only the spec and not the whole bundle directory? Because the bundle also holds the instance's private overlay upper, and we promised in chapter 5 that a restart of `default__web-0` on the same image keeps its files. Removing the spec keeps that promise and still takes the secret off the disk. It also sidesteps a nasty failure mode: a `remove_dir_all` through a rootfs that is still mounted would happily delete files inside the container's view.
+
+The tests come in two layers. The `grill::bundle` unit tests run on every development machine, including macOS where runc doesn't exist. They check the modes with `std::os::unix::fs::PermissionsExt` (an extension trait: importing it adds a `mode()` method to the standard `Permissions` type, which is how Rust exposes Unix-only details without putting them on every platform), and check that removal leaves the upper alone. The Linux runc tests then assert the same modes on a real bundle and that `config.json` is gone after `kill` and after a natural exit.
+
+We haven't closed every copy yet. The agent's adoption record and the runtime's own launch intent also hold the full spec, because a restarted agent must compare it with the running workload before adopting it. Both are 0600 inside owner-only directories, and the adoption record goes away with the instance. A retired intent, though, keeps its copy until the same instance id starts again. Scrubbing it means teaching every recovery comparison to ignore the environment, which is a bigger change than this fix.
 
 ## Certificate revocation
 

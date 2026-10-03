@@ -193,8 +193,19 @@ pub(super) async fn token_revoke_handler(
             Json(serde_json::json!({ "error": reason })),
         )
             .into_response(),
-        Ok(_) => Json(serde_json::json!({ "message": format!("token {} revoked", req.name) }))
-            .into_response(),
+        Ok(_) => {
+            record_caller_audit(
+                &state,
+                auth.as_deref(),
+                crate::bun::events::EventKind::Token,
+                "token.revoked",
+                std::collections::BTreeMap::from([("token".to_string(), req.name.clone())]),
+                format!("API token {} revoked", req.name),
+            )
+            .await;
+            Json(serde_json::json!({ "message": format!("token {} revoked", req.name) }))
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -408,6 +419,25 @@ pub(super) async fn token_create_handler(
     if let Err(response) = write_lease_request(council, request).await {
         return response;
     }
+    let mut details = std::collections::BTreeMap::from([
+        ("token".to_string(), req.name.clone()),
+        ("role".to_string(), req.role.clone()),
+    ]);
+    if let Some(apps) = &req.apps {
+        details.insert("apps".to_string(), apps.join(","));
+    }
+    if let Some(namespaces) = &req.namespaces {
+        details.insert("namespaces".to_string(), namespaces.join(","));
+    }
+    record_caller_audit(
+        &state,
+        auth.as_deref(),
+        crate::bun::events::EventKind::Token,
+        "token.created",
+        details,
+        format!("API token {} created with role {}", req.name, req.role),
+    )
+    .await;
     Json(serde_json::json!({
         "name": req.name,
         "role": req.role,
@@ -635,12 +665,26 @@ pub(super) async fn join_token_create_handler(
         .write(crate::council::RaftRequest::CreateJoinToken(join_token))
         .await
     {
-        Ok(_) => Json(serde_json::json!({
-            "token": plaintext,
-            "ttl_seconds": req.ttl_seconds,
-            "expires_at": expires_at,
-        }))
-        .into_response(),
+        Ok(_) => {
+            record_caller_audit(
+                &state,
+                auth.as_deref(),
+                crate::bun::events::EventKind::Token,
+                "join_token.created",
+                std::collections::BTreeMap::from([
+                    ("node_id".to_string(), req.node_id.clone()),
+                    ("ttl_seconds".to_string(), req.ttl_seconds.to_string()),
+                ]),
+                format!("join token created for node {}", req.node_id),
+            )
+            .await;
+            Json(serde_json::json!({
+                "token": plaintext,
+                "ttl_seconds": req.ttl_seconds,
+                "expires_at": expires_at,
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
