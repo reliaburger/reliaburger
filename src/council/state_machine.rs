@@ -908,6 +908,9 @@ impl StateMachineInner {
                 }
                 self.state.os_rollout = Some(*rollout.clone());
             }
+            RaftRequest::CouncilSize { voters } => {
+                self.state.council_size = Some(*voters);
+            }
             RaftRequest::OsRolloutClear { rollout_id } => {
                 if let Some(active) = self.state.os_rollout.take() {
                     if active.rollout_id == *rollout_id {
@@ -5531,6 +5534,25 @@ mod tests {
         assert_eq!(
             inner.state.os_rollout.as_ref().unwrap().rollout_id,
             "os-1-retry"
+        );
+    }
+
+    #[test]
+    fn the_council_size_is_cluster_state_that_survives_a_snapshot() {
+        let mut inner = StateMachineInner::default();
+        assert_eq!(inner.state.council_size, None);
+        inner.apply_request(&RaftRequest::CouncilSize {
+            voters: crate::council::CouncilSize::APPLIANCE,
+        });
+        assert_eq!(
+            inner.state.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
+        let json = serde_json::to_vec(&inner.state).unwrap();
+        let restored: DesiredState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            restored.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
         );
     }
 

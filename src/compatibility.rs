@@ -38,10 +38,12 @@ pub struct Compatibility {
 /// each placement's `Placement::ordinal` in council state, the ordinals a
 /// placement poll hands a node (`NodeAssignment::ordinals`) and the
 /// instance ids named after them (#398). The appliance OS rollout bumps
-/// both: a new Raft request and a new field in council state.
+/// both: a new Raft request and a new field in council state. So does the
+/// cluster-wide council size (`RaftRequest::CouncilSize` and
+/// `DesiredState::council_size`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 34,
-    state: 50,
+    protocol: 35,
+    state: 51,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

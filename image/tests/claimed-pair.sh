@@ -8,7 +8,9 @@
 # and wait to be claimed. `relish machines` must find both over mDNS; node 1
 # is claimed by MAC with --create, and no --network, so node 2, claimed by
 # address afterwards, can only enrol through the join window relish opens on
-# node 1's firewall. The test passes when relish sees both nodes alive.
+# node 1's firewall. The test passes when relish sees both nodes alive and
+# the council reports the default appliance size, five voters, which
+# --create recorded in fleet.json and node 1 committed when it bootstrapped.
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
 out=$(cd "${1:?usage: claimed-pair.sh <artefact dir> <version> <relish>}" && pwd)
@@ -66,10 +68,14 @@ wait_for() {
 }
 alive() { [ "$("$relish" nodes 2>/dev/null | grep -c alive)" = "$1" ]; }
 listed() { "$relish" machines --wait 3 | tee "$work/machines.txt" | grep -q "${macs[0]}" && grep -q "${macs[1]}" "$work/machines.txt"; }
+# The council size --create defaults to: in fleet.json, and in council state.
+sized() { grep -q '"council_size": 5' "$work/cluster/fleet.json" \
+    && "$relish" council --output json 2>/dev/null | grep -q '"council_size": 5'; }
 if wait_for listed \
     && "$relish" machines claim "$work/cluster" --create --name pair --operator 10.42.0.1 \
         --trust-lan "${macs[0]}" \
     && wait_for alive 1 \
+    && wait_for sized \
     && "$relish" machines claim "$work/cluster" --trust-lan "${ips[1]}" \
     && wait_for alive 2; then
     result=pass
@@ -84,6 +90,7 @@ done
     echo '```'
     cat "$work/machines.txt" 2>/dev/null || true
     "$relish" nodes 2>&1 || true
+    "$relish" council 2>&1 || true
     grep -a -h "reliaburger:" "$work"/node*.log | grep -v "reliaburger: journal:" || true
     echo '```'
 } >> "$summary"

@@ -546,6 +546,8 @@ A freshly installed appliance knows nothing. It has bun, an empty data partition
 
 From a *seed*: a small tarball with a `seed.toml` in it. Node 1's seed is a *create* seed, and carries the cluster's freshly made keys. Every other machine's is a *join* seed, and carries only a join token: single-use, bound to that machine's node name, and good for a week at most. `relish cluster create --bare-metal` makes all of them on the operator's laptop, so the cluster's keys are born there and nowhere else.
 
+The create seed carries one more thing: the council size. An appliance cluster grows its council to five voters rather than the usual seven (`--council-size` changes it), because the lab it was built for is ten 2 GB Wyses, and two more voters would buy one more tolerated failure at the price of two more machines doing council work. Node 1 commits the size to the council when it bootstraps, so every later leader reads the same number. Chapter 2's "Five voters, not seven" has the reconciler's side.
+
 ### A state machine that can lose power
 
 `bun appliance prepare` turns a seed into a node. It runs at every boot until there's a `node.toml`, and a machine can lose power at any point along the way. So rather than a script that does five things in order, it's a function that looks at what's on disk and says what to do next:

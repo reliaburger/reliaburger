@@ -981,11 +981,18 @@ raft_port = 9444
 
 # Reporting-tree state reports (TCP + mTLS). Default: 9445.
 reporting_port = 9445
+
+# How many voters the council grows to: odd, 1 to 7. Unset keeps the
+# default cap of 7. Read only by the node that bootstraps the cluster,
+# which commits it to council state (RaftRequest::CouncilSize).
+# `relish cluster create --bare-metal` and `relish machines claim --create`
+# write 5 into node 1's config unless --council-size says otherwise.
+# council_size = 5
 ```
 
 (The old `7946`/`7947` gossip/raft ports never shipped; the real defaults are `9443`/`9444`/`9445`. The node HTTP API is a separate port, `9117`.)
 
-The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section:
+The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section. The one exception is the cluster-wide council size above: when council state holds one (`DesiredState::council_size`), the reconciler caps `max_council_size` at it every tick, and lowers `min_council_size` to match when it's smaller (`CouncilSelectionConfig::sized`). It lives in council state rather than in each node's config so that every leader, after any failover, grows the council to the same size:
 
 ```text
 # Minimum council size (below this, the cluster enters degraded mode).
@@ -1334,7 +1341,7 @@ There is no production-quality Rust equivalent of HashiCorp's `memberlist` (Go).
 
 1. **Gossip library vs. custom implementation.** Should we use `foca` or write our own SWIM implementation? The fixed-size message constraint and HMAC authentication are non-standard requirements. A custom implementation is ~1000 lines and fully under our control, but a library gives us battle-tested edge case handling. Decision needed after evaluating `foca`'s extensibility.
 
-2. **Council size auto-tuning.** The whitepaper specifies a configurable council size of 3-7. Should the leader automatically adjust the council size based on cluster size (e.g., 3 at <50 nodes, 5 at 50-500 nodes, 7 at >500 nodes)? Or is a static default of 5 sufficient? Auto-tuning adds complexity but improves fault tolerance at scale.
+2. **Council size auto-tuning.** The whitepaper specifies a configurable council size of 3-7. Should the leader automatically adjust the council size based on cluster size (e.g., 3 at <50 nodes, 5 at 50-500 nodes, 7 at >500 nodes)? Or is a static default of 5 sufficient? Auto-tuning adds complexity but improves fault tolerance at scale. *Partly settled (0.3.0):* no auto-tuning. The cap stays 7 by default, and a cluster can be created with a fixed odd size from 1 to 7 (`[cluster] council_size`, committed to council state at bootstrap). Appliance clusters default to 5, for a ten-node lab of 2 GB machines. There's no command yet to change it on a running cluster.
 
 3. **Recovery candidate notification timing.** Recovery candidates are notified via the reporting tree's mTLS channel. If the reporting tree itself is disrupted (e.g., the candidate's council member parent dies), the notification may not arrive. Should candidates also be able to discover their priority from the encrypted gossip blob alone (requiring them to have a decryption key)? This changes the security model.
 
