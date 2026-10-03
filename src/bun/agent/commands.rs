@@ -1087,31 +1087,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 requested_at_ns,
                 response,
             } => {
-                // An answer after a lapse replaces the view in place. The
-                // kernel and Wrapper route only locally until the lease is
-                // renewed below, and the answer is the current catalogue, so
-                // every remote address it names is live.
-                let result = self
-                    .synchronise_consumer(generation, *catalog, ingress, withdrawals)
-                    .await;
-                if matches!(&result, Ok(update) if update.published) {
-                    self.renew_view_lease(requested_at_ns).await;
-                }
-                let result = match result {
-                    Err(error) => {
-                        let retry = self.consumer_update(false);
-                        if retry.receipts.is_empty() {
-                            Err(error)
-                        } else {
-                            // Capacity or candidate refusal must not starve
-                            // already-proven receipts needed to free capacity.
-                            eprintln!("bun: consumer publication awaits retry: {error}");
-                            Ok(retry)
-                        }
-                    }
-                    success => success,
-                };
-                let _ = response.send(result);
+                // Each journal write is a step of its own turn (#505); the
+                // answer, and the lease renewal, come after the last one.
+                self.request_consumer_sync(super::consumer::ConsumerRequest {
+                    generation,
+                    catalog: *catalog,
+                    ingress,
+                    withdrawals,
+                    answer: Some(super::consumer::ConsumerAnswer {
+                        requested_at_ns,
+                        response,
+                    }),
+                })
+                .await;
             }
             AgentCommand::ConfirmConsumerReceipt {
                 generation,

@@ -4515,6 +4515,92 @@ does. The slow-disk scenario stays at 250 ms, and it now waits for the
 `discovery:startup-cleanup` readiness to turn ready before judging, because
 the port goes back a tick before the last writes.
 
+#### One write a turn
+
+Two writes a tick held for a week. Then the 0.1.4 candidate's compressed
+soak ran on a hosted runner, three 2-vCPU VMs sharing one disk, and failed
+on nothing but the turn budget (#505). Every slow command turn in every
+journal had the same name: `sync_cluster_consumer`, 300 to 700 ms through
+setup, and then this after the leader kill:
+
+```
+12:44:12 node-2 bun: agent loop turn took 1095 ms in command (sync_cluster_consumer)
+```
+
+The code hadn't changed since 0.1.3, and the catalogue was three services.
+Nothing in that path scales with it. What the turn histograms did show was
+that 116 of node 2's 159 command turns finished within 10 ms, and a consumer
+sync arrives with every placement poll and reads the runtime inventory every
+time. So the read wasn't it, at least not usually. The slow syncs were the
+ones that changed the view,
+and changing the view is where the journal comes in. Publishing a new view
+writes it as `Publishing` before the kernel sees it, then `Active`, then a
+compacted history once the requests holding older views have let go. Three
+fsync'd writes, each of them a temporary file, an `fsync`, a rename and an
+`fsync` of the directory. A node's first answer after a restart is worse:
+`Withdrawing`, `Withdrawn`, the receipts it proved, `Publishing`, `Active`.
+Five. At roughly 400 ms a write on that disk, both add up to the journals.
+
+Persists are allowed inline (decision 2 of #351) only while a slow disk
+keeps every turn in budget, and here it didn't. The scenario that shows it,
+`status_answers_while_a_consumer_sync_journals_to_a_slow_disk`, recovers a
+consumer, sets `LoopStall::Persist` to 400 ms and sends two leader answers.
+On the old code a status queued behind the first one took 2.08 s.
+
+Moving the journal itself off the loop would mean a discovery journal that's
+somewhere else for a while, and some forty places read it. So the sync
+became a sequence of steps instead, one write each, and the loop takes them
+on separate turns:
+
+```rust
+enum ConsumerStep {
+    Withdraw(ConsumerPublication),
+    ProveReceipts(ConsumerPublication),
+    Publish(ConsumerPublication),
+    Activate,
+    Compact,
+}
+```
+
+A Rust enum variant can carry data, so the step knows which view it's
+publishing without a separate field that may or may not be set. The step
+reads the journal afresh each time, so a receipt the leader confirmed between
+two steps stays confirmed. The loop holds the sync that's under way, and the
+leader's reply channel with it, and answers after the last step. That's also
+when the view lease is renewed, exactly as before. A view installed a turn
+earlier after a lapse can't route anywhere it shouldn't meanwhile, because the
+kernel enforces the lapsed lease until then.
+
+Two `select!` branches drive the steps:
+
+```rust
+_ = std::future::ready(()), if self.consumer_syncs.step_first() => { ... }
+// ... deploy ops, then commands ...
+_ = std::future::ready(()), if !self.consumer_syncs.is_idle() => { ... }
+```
+
+`std::future::ready(())` is a future that's already finished, so the branch
+fires as soon as its `if` guard holds. The first branch sits above deploy ops
+and commands but stands aside for one turn after each step, and the second,
+below commands, takes the step when nothing else is waiting. Steps and
+commands take turns, so a burst of either can't hold the other back.
+
+Splitting the turns opened a gap the single turn never had. Between
+`Withdrawn` and `Publish`, other turns run, and a stop that asks
+`own_view_names` whether any view still names its instance would hear "no"
+from a journal that says everything is withdrawn. The view about to be
+published was built before, though, and might name it. So `own_view_names`
+also asks the step that's under way. `a_local_address_stays_held_between_a_withdrawal_and_its_publication`
+checks exactly that.
+
+As with #422, the guard that doesn't depend on the disk counts.
+`a_consumer_sync_journals_at_most_one_write_a_turn` drives both syncs one
+step at a time and checks the writes per turn: `[1, 1, 1, 1, 1, 0]` for the
+recovery's answer (the last step compacts a history that's already one view
+long) and `[1, 1, 1]` for a changed view, in the same order as before. The local republication that runs at the end of a turn after a
+health change takes the same steps, and a turn that took a step leaves it
+for the next one.
+
 #### A test that raced the clock
 
 One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`
