@@ -91,6 +91,46 @@ pub fn merge_deploy_history(
     history
 }
 
+/// The spec `relish rollback` re-applies: the newest successful deploy whose
+/// spec differs from `current`, with `current`'s replica count.
+///
+/// `history` is an app's records from every node, in any order. Each node
+/// records its own share of a deploy, so one rollout appears once per node,
+/// and each copy's `replicas` is that node's share. Comparing specs with the
+/// replica count set aside collapses the copies, and taking the count from
+/// `current` stops a rollback from shrinking the app to one node's share.
+/// So a rollback changes the version, never the scale.
+///
+/// `current` is the spec in Raft on a cluster. Without one (a single node),
+/// the newest record is the current version.
+pub fn rollback_target(
+    history: &[DeployHistoryEntry],
+    current: Option<&crate::config::app::AppSpec>,
+) -> Option<crate::config::app::AppSpec> {
+    let mut deployed: Vec<&DeployHistoryEntry> = history
+        .iter()
+        .filter(|entry| {
+            entry.result == crate::meat::deploy_types::DeployResult::Completed
+                && entry.spec.is_some()
+        })
+        .collect();
+    deployed.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+    let current = match current {
+        Some(spec) => spec.clone(),
+        None => (**deployed.first()?.spec.as_ref()?).clone(),
+    };
+    let at_current_scale = |spec: &crate::config::app::AppSpec| {
+        let mut spec = spec.clone();
+        spec.replicas = current.replicas;
+        spec
+    };
+    deployed
+        .iter()
+        .filter_map(|entry| entry.spec.as_deref())
+        .map(at_current_scale)
+        .find(|spec| *spec != current)
+}
+
 /// Merge each node's events and keep the newest `limit`, oldest first.
 ///
 /// Sequence numbers are per process, so they only break ties within one
@@ -176,6 +216,65 @@ mod tests {
             steps_total: 1,
             spec: None,
         }
+    }
+
+    /// What node `node` recorded for deploying `image` at `secs`, with its
+    /// share of `replicas`.
+    fn rolled_out(image: &str, share: u32, secs: u64) -> DeployHistoryEntry {
+        let mut entry = history_entry(secs, secs);
+        let spec: crate::config::app::AppSpec =
+            toml::from_str(&format!("image = {image:?}\nreplicas = {share}\n")).unwrap();
+        entry.image = image.into();
+        entry.spec = Some(Box::new(spec));
+        entry
+    }
+
+    fn spec(image: &str, replicas: u32) -> crate::config::app::AppSpec {
+        toml::from_str(&format!("image = {image:?}\nreplicas = {replicas}\n")).unwrap()
+    }
+
+    /// F07 part 2: on a cluster every node records its own share of each
+    /// deploy, so the merged history holds v2 three times. The version
+    /// before the current one is v1, not another copy of v2.
+    #[test]
+    fn rollback_skips_other_nodes_copies_of_the_current_version() {
+        let history = [
+            rolled_out("web:v1", 1, 10),
+            rolled_out("web:v1", 2, 11),
+            rolled_out("web:v2", 1, 20),
+            rolled_out("web:v2", 1, 21),
+            rolled_out("web:v2", 1, 22),
+        ];
+        let target = rollback_target(&history, Some(&spec("web:v2", 3))).unwrap();
+        assert_eq!(target.image.as_deref(), Some("web:v1"));
+    }
+
+    /// A node's record carries its share of the replicas, not the app's.
+    /// Rolling back with it would cut a three-replica app to one; rollback
+    /// changes the version and keeps the scale.
+    #[test]
+    fn rollback_keeps_the_apps_replica_count() {
+        let history = [rolled_out("web:v1", 1, 10), rolled_out("web:v2", 1, 20)];
+        let target = rollback_target(&history, Some(&spec("web:v2", 3))).unwrap();
+        assert_eq!(target.replicas, crate::config::Replicas::Fixed(3));
+    }
+
+    /// Without a council there's no spec in Raft: the newest record is the
+    /// current version.
+    #[test]
+    fn rollback_without_a_current_spec_takes_the_newest_record_as_current() {
+        let history = [rolled_out("web:v1", 2, 10), rolled_out("web:v2", 2, 20)];
+        let target = rollback_target(&history, None).unwrap();
+        assert_eq!(target.image.as_deref(), Some("web:v1"));
+        assert_eq!(target.replicas, crate::config::Replicas::Fixed(2));
+    }
+
+    #[test]
+    fn rollback_ignores_failed_deploys_and_has_nothing_without_an_earlier_version() {
+        let mut failed = rolled_out("web:broken", 1, 15);
+        failed.result = DeployResult::Failed;
+        let history = [rolled_out("web:v1", 1, 10), failed];
+        assert_eq!(rollback_target(&history, Some(&spec("web:v1", 1))), None);
     }
 
     fn job(name: &str) -> JobStatus {
