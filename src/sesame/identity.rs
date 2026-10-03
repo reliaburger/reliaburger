@@ -494,7 +494,7 @@ const ATOMIC_WRITE_PREFIX: &str = ".reliaburger-";
 /// A writer killed between creating its temporary and renaming it leaves
 /// the temporary in place. Call this only once nothing can still be writing
 /// into `directory`, before removing it.
-// Only the Linux rootless runtime needs it today.
+// Only the Linux runc runtime needs it today.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn remove_abandoned_atomic_writes(directory: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(directory)? {

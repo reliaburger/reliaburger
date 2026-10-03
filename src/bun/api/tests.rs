@@ -4351,6 +4351,51 @@ async fn scoped_token_is_refused_streaming_another_namespaces_logs() {
     let _ = server.await;
 }
 
+/// Audit events span every namespace, so `/v1/events` refuses a scoped
+/// token (C3). The live stream of the same events, `/v1/ws/events`, checked
+/// nothing: route authorisation lets any token through, and the handler
+/// upgraded straight away, so a token scoped to `team-a` streamed every
+/// tenant's events. It must refuse the upgrade the same way.
+#[tokio::test]
+async fn scoped_token_is_refused_the_live_event_stream() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+    assert_eq!(
+        get_status(app.clone(), "/v1/events", Some(&tok)).await,
+        StatusCode::FORBIDDEN,
+        "the HTTP route already refuses"
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+
+    let mut request = format!("ws://{address}/v1/ws/events")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {tok}").parse().unwrap());
+    let error = tokio_tungstenite::connect_async(request)
+        .await
+        .expect_err("the event stream upgraded for a scoped token");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        other => panic!("expected an HTTP refusal, got {other:?}"),
+    }
+
+    shutdown.cancel();
+    let _ = server.await;
+}
+
 /// `/v1/logs/sql` takes no app or namespace to check a scope against, and
 /// arbitrary SQL can't be rewritten into a tenant-filtered query. A scoped
 /// token is refused outright rather than served every tenant's logs (C3).
@@ -4407,6 +4452,97 @@ async fn logs_export_without_a_store_is_service_unavailable() {
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     shutdown.cancel();
+}
+
+/// F07 part 2: `grep` is a regular expression. One that won't compile is the
+/// caller's mistake, so both query routes answer 400 with the reason, not a
+/// 500 that reads like a broken store.
+#[tokio::test]
+async fn an_invalid_grep_pattern_is_a_bad_request() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    let app = router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    for uri in [
+        "/v1/logs/entries/web/default?grep=%28unclosed",
+        "/v1/logs/query/web/default?grep=%28unclosed",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("regular expression"), "{uri}: {body}");
+    }
+}
+
+/// `stream` is `stdout` or `stderr`; anything else is refused on both query
+/// routes, and following with a stream filter is refused too, since the
+/// raw tail can't honour it.
+#[tokio::test]
+async fn an_unknown_stream_or_a_followed_stream_filter_is_a_bad_request() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    let app = router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    for uri in [
+        "/v1/logs/entries/web/default?stream=stdin",
+        "/v1/logs/query/web/default?stream=stdin",
+        "/v1/logs/web/default?follow=true&stream=stderr",
+    ] {
+        let status = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
 }
 
 /// The export endpoint ships the store's Parquet files to the requested
@@ -4907,6 +5043,101 @@ async fn identity_jwks_returns_503_without_council() {
     // Single-node mode (no council) is untouched: the endpoint 503s cleanly.
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     shutdown.cancel();
+}
+
+/// F05 I1: the routes that change who can do what leave an audit event
+/// naming the credential that called them. Before, only fault inject and
+/// clear did; a token could be minted or a secret key rotated with no trace.
+#[tokio::test]
+async fn trust_changing_routes_record_who_called_them() {
+    let (admin, plaintext) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let council = seeded_council_with_ikm("audit-trust").await;
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+
+    let mut minted = Vec::new();
+    for (uri, body) in [
+        ("/v1/token/create", r#"{"name":"ci-bot","role":"deployer"}"#),
+        ("/v1/token/revoke", r#"{"name":"ci-bot"}"#),
+        ("/v1/join-token/create", r#"{"node_id":"node-7"}"#),
+        ("/v1/secret/rotate", ""),
+        ("/v1/secret/rotate", r#"{"finalize":true}"#),
+    ] {
+        let (status, response) = post_authenticated(app.clone(), uri, &plaintext, body, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        minted.push(String::from_utf8_lossy(&response).into_owned());
+    }
+
+    let recorded = events.read().await.recent(20, None, None);
+    let actions: Vec<&str> = recorded
+        .iter()
+        .filter_map(|event| event.action.as_deref())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "token.created",
+            "token.revoked",
+            "join_token.created",
+            "secret.rotated",
+            "secret.rotation_finalised",
+        ]
+    );
+    for event in &recorded {
+        assert!(
+            event
+                .principal
+                .as_deref()
+                .is_some_and(|principal| principal.starts_with("token:")),
+            "{event:?}"
+        );
+        assert_eq!(
+            event.details.get("token_name").map(String::as_str),
+            Some("root-op"),
+            "{event:?}"
+        );
+    }
+    assert_eq!(
+        recorded[0].details.get("token").map(String::as_str),
+        Some("ci-bot")
+    );
+    assert_eq!(
+        recorded[2].details.get("node_id").map(String::as_str),
+        Some("node-7")
+    );
+    // No credential the routes handed back appears in any event.
+    let all_events = serde_json::to_string(&recorded).unwrap();
+    for response in &minted {
+        let json: serde_json::Value = serde_json::from_str(response).unwrap_or_default();
+        for field in ["token", "join_token", "token_plaintext"] {
+            if let Some(secret) = json.get(field).and_then(|value| value.as_str()) {
+                assert!(!all_events.contains(secret), "{field} leaked into an event");
+            }
+        }
+    }
 }
 
 #[tokio::test]

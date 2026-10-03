@@ -6,6 +6,7 @@
 #[cfg(target_os = "macos")]
 pub mod apple;
 pub mod btrfs;
+mod bundle;
 pub mod capture;
 pub mod cgroup;
 pub mod command;

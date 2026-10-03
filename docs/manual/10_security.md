@@ -152,7 +152,9 @@ relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
 Encryption is local: `secret encrypt` never contacts the cluster. The node
 that starts the instance decrypts the value into its environment. If it can't
 decrypt, it refuses to start the instance rather than pass the ciphertext
-through.
+through. On the node, the plaintext goes only into files that root (or, for
+rootless runc, the user running Bun) alone can read, and the container spec
+that carries it is deleted when the instance stops.
 
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the
@@ -160,6 +162,12 @@ new key, re-apply, then run `relish secret rotate --finalize`. It refuses, and
 names the offenders, while any stored secret still needs the old key. Plain
 `secret pubkey` follows the rotation; the offline form reads the file from
 `init`, which still holds the original key.
+
+Finalising retires the old keys, except the very first one: `relish init`
+sealed the root CA's private key to it, in `<cluster>-root-ca.age`, so that key
+stays (read-only, never used for new secrets) and the root backup keeps
+opening. Keep that file with the master key; together they're how you'd
+recover the root.
 
 ## Workload identity
 

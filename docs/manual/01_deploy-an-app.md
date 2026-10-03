@@ -202,6 +202,13 @@ relish cancel-deploy <OPERATION_ID>
 get one row per node per deploy, with a NODE column. A node that doesn't answer
 prints `warning: history incomplete: …` on stderr.
 
+`relish rollback` reads the same cluster-wide history, from whichever node you
+ask. The previous version is the newest one that differs from what the app
+runs now, so the copies of the current deploy that every node recorded don't
+count. A rollback changes the version and keeps the scale: an app running
+three replicas still runs three, and a deploy that only changed `replicas`
+isn't a version to roll back to.
+
 A new instance that doesn't turn healthy within `health_timeout` fails the
 deploy, and with `auto_rollback` (the default) Bun restores the previous
 version. With `auto_rollback = false` the deploy stops where it failed.

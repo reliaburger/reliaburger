@@ -5213,7 +5213,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reliaburger"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "age",
  "anyhow",
@@ -5254,6 +5254,7 @@ dependencies = [
  "ratatui",
  "rcgen",
  "redb",
+ "regex",
  "reqwest 0.12.28",
  "ring",
  "rust-embed",

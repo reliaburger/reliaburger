@@ -193,6 +193,13 @@ fn verify_snapshot_checksum(
     Ok(())
 }
 
+/// Whether `keypair` is the age key `relish init` sealed the root CA backup
+/// to: the cluster-wide key of generation 0. Nothing else seals to it, so
+/// finalising a rotation keeps it, read-only.
+fn opens_root_ca_backup(keypair: &crate::sesame::types::AgeKeypair) -> bool {
+    keypair.scope == crate::sesame::types::AgeKeyScope::ClusterWide && keypair.generation == 0
+}
+
 impl StateMachineInner {
     fn registry_publication_is_current(
         &self,
@@ -805,10 +812,14 @@ impl StateMachineInner {
                         ),
                     });
                 }
+                // The cluster-wide generation-0 key stays, read-only: `relish
+                // init` sealed the root CA's private key to it
+                // (`<cluster>-root-ca.age`), and no seal record knows that, so
+                // retiring it would leave the root backup unopenable (F04 R0).
                 self.state
                     .security_state
                     .age_keypairs
-                    .retain(|kp| kp.scope != *scope || !kp.read_only);
+                    .retain(|kp| kp.scope != *scope || !kp.read_only || opens_root_ca_backup(kp));
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
@@ -4823,26 +4834,108 @@ mod tests {
     fn finalize_secret_rotation_retires_old_keys_once_a_replacement_exists() {
         use crate::sesame::types::AgeKeyScope;
         let mut inner = StateMachineInner::default();
-        // The rotation flow: mark gen 0 read-only, add the active gen 1.
-        inner
-            .state
-            .security_state
-            .age_keypairs
-            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, true));
-        inner
-            .state
-            .security_state
-            .age_keypairs
-            .push(test_age_keypair(AgeKeyScope::ClusterWide, 1, false));
+        // Two rotations: gens 0 and 1 are read-only, gen 2 is active.
+        for (generation, read_only) in [(0, true), (1, true), (2, false)] {
+            inner
+                .state
+                .security_state
+                .age_keypairs
+                .push(test_age_keypair(
+                    AgeKeyScope::ClusterWide,
+                    generation,
+                    read_only,
+                ));
+        }
 
         inner.apply_request(&RaftRequest::FinalizeSecretRotation {
             scope: AgeKeyScope::ClusterWide,
         });
 
-        let remaining = &inner.state.security_state.age_keypairs;
-        assert_eq!(remaining.len(), 1, "the retiring gen 0 key is dropped");
-        assert_eq!(remaining[0].generation, 1);
-        assert!(!remaining[0].read_only);
+        let remaining: Vec<(u64, bool)> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| (kp.generation, kp.read_only))
+            .collect();
+        // Gen 1 is retired; gen 0 stays, read-only, because it opens the
+        // root CA backup `relish init` wrote (F04 R0).
+        assert_eq!(remaining, [(0, true), (2, false)]);
+    }
+
+    /// Only the cluster-wide generation-0 key opens the root CA backup; a
+    /// namespace's old keys are retired as before.
+    #[test]
+    fn finalize_retires_a_namespaces_generation_zero() {
+        use crate::sesame::types::AgeKeyScope;
+        let scope = AgeKeyScope::Namespace("team-a".into());
+        let mut inner = StateMachineInner::default();
+        for (generation, read_only) in [(0, true), (1, false)] {
+            inner
+                .state
+                .security_state
+                .age_keypairs
+                .push(test_age_keypair(scope.clone(), generation, read_only));
+        }
+        inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: scope.clone(),
+        });
+        let remaining: Vec<u64> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| kp.generation)
+            .collect();
+        assert_eq!(remaining, [1]);
+    }
+
+    /// F04 R0: `relish init` seals the root CA's private key to the cluster's
+    /// generation-0 age key, in `<cluster>-root-ca.age`. Finalising a secret
+    /// rotation used to drop that key, after which nothing the cluster holds
+    /// could open the root backup.
+    #[test]
+    fn the_root_backup_still_opens_after_a_finalised_secret_rotation() {
+        use crate::sesame::types::AgeKeyScope;
+        let dir = tempfile::tempdir().unwrap();
+        let init = crate::sesame::init::initialize_cluster("prod", "node-1", dir.path()).unwrap();
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(
+            init.security_state.clone(),
+        )));
+        let (next, _) = crate::sesame::secret::generate_age_keypair(
+            AgeKeyScope::ClusterWide,
+            &init.master_secret,
+            1,
+        )
+        .unwrap();
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: next,
+        });
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+
+        let sealed = std::fs::read(&init.sealed_root_ca_path).unwrap();
+        let opened = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .filter(|kp| kp.scope == AgeKeyScope::ClusterWide)
+            .filter_map(|kp| {
+                crate::sesame::secret::unwrap_age_identity(kp, &init.master_secret).ok()
+            })
+            .find_map(|identity| crate::sesame::secret::unseal_with_age(&sealed, &identity).ok());
+        assert!(
+            opened.is_some(),
+            "no key left in the state opens the root CA backup"
+        );
     }
 
     #[test]
@@ -4962,9 +5055,16 @@ mod tests {
             !matches!(response, Some(CouncilResponse::Refused { .. })),
             "finalize proceeds once everything is re-sealed: {response:?}"
         );
-        let remaining = &inner.state.security_state.age_keypairs;
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].generation, 1);
+        let remaining: Vec<(u64, bool)> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| (kp.generation, kp.read_only))
+            .collect();
+        // Gen 1 is the only active key; gen 0 stays read-only for the root
+        // CA backup (F04 R0).
+        assert_eq!(remaining, [(0, true), (1, false)]);
     }
 
     /// PKI8: a second rotation while one is un-finalised is refused; the

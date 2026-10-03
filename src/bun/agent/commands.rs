@@ -128,6 +128,8 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         tail: Option<usize>,
+        /// Follow only this instance (`default__web-0`), not the whole app.
+        instance: Option<String>,
         /// `Some(node)` prefixes every line with `[node instance]`, so lines
         /// from several nodes stay attributable once they're merged.
         label: Option<String>,
@@ -592,10 +594,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 namespace,
                 tail,
+                instance,
                 label,
                 lines,
             } => {
-                self.spawn_logs_follow(&app_name, &namespace, tail, label, lines);
+                self.spawn_logs_follow(&app_name, &namespace, tail, instance, label, lines);
             }
             AgentCommand::Exec {
                 app_name,
