@@ -119,9 +119,12 @@ pub fn rollback_target(
         Some(spec) => spec.clone(),
         None => (**deployed.first()?.spec.as_ref()?).clone(),
     };
+    // A node records its share under the ordinals the leader gave it (#398);
+    // they belong to the placement, so they're set aside with the count.
     let at_current_scale = |spec: &crate::config::app::AppSpec| {
         let mut spec = spec.clone();
         spec.replicas = current.replicas;
+        spec.ordinals = current.ordinals.clone();
         spec
     };
     deployed
@@ -236,6 +239,29 @@ mod tests {
     /// F07 part 2: on a cluster every node records its own share of each
     /// deploy, so the merged history holds v2 three times. The version
     /// before the current one is v1, not another copy of v2.
+    #[test]
+    fn rollback_ignores_the_ordinals_each_node_recorded() {
+        // Each node records its share under the ordinals the leader gave it
+        // (#398); the spec in Raft has none. Compared as they are, every
+        // copy of v2 looked like an older version and v2 was "rolled back"
+        // to itself (found by the #459 cluster test).
+        let with_ordinals = |image: &str, ordinals: Vec<u32>, secs: u64| {
+            let mut entry = rolled_out(image, ordinals.len() as u32, secs);
+            entry.spec.as_mut().unwrap().ordinals = Some(ordinals);
+            entry
+        };
+        let history = [
+            with_ordinals("web:v1", vec![0], 10),
+            with_ordinals("web:v1", vec![1], 11),
+            with_ordinals("web:v2", vec![0], 20),
+            with_ordinals("web:v2", vec![1], 21),
+        ];
+        let target = rollback_target(&history, Some(&spec("web:v2", 2))).unwrap();
+        assert_eq!(target.image.as_deref(), Some("web:v1"));
+        assert_eq!(target.ordinals, None);
+        assert_eq!(target.replicas, crate::config::Replicas::Fixed(2));
+    }
+
     #[test]
     fn rollback_skips_other_nodes_copies_of_the_current_version() {
         let history = [

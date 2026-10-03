@@ -3284,13 +3284,28 @@ async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
         .find(|node| !running.contains(&node.name))
         .expect("a node without a web replica");
 
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        bystander.client.rollback("web", "default"),
-    )
-    .await
-    .expect("rollback did not hang")
-    .expect("rollback through a node that never ran the app");
+    // A follower that can't name the leader yet answers 503 and asks to be
+    // retried; that's the forwarding settling, not this test's subject. Any
+    // other refusal, a 404 above all (the old "no previous deploy here"),
+    // fails at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            bystander.client.rollback("web", "default"),
+        )
+        .await
+        .expect("rollback did not hang")
+        {
+            Ok(()) => break,
+            Err(reliaburger::relish::RelishError::ApiError { status: 503, .. })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => panic!("rollback through a node that never ran the app: {error}"),
+        }
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
