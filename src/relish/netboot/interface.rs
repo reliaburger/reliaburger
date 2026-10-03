@@ -125,8 +125,10 @@ pub fn find(choice: &InterfaceChoice) -> Result<Interface, NetbootError> {
 }
 
 /// A UDP socket on `address`, tied to `interface` when given, with
-/// `SO_BROADCAST` and `SO_REUSEADDR`. `what` names it in errors. Binding
-/// a privileged port without root fails with [`NetbootError::NeedsRoot`].
+/// `SO_BROADCAST`. It shares its port with nothing, so a second netboot
+/// server fails with [`NetbootError::PortInUse`]. `what` names it in
+/// errors. Binding a privileged port without root fails with
+/// [`NetbootError::NeedsRoot`].
 pub fn udp_socket(
     what: &'static str,
     address: SocketAddrV4,
@@ -140,12 +142,13 @@ pub fn udp_socket(
 ///
 /// The machine's own DHCP client may hold port 68 (configd's
 /// IPConfiguration on macOS, dhclient on Linux). `SO_REUSEPORT` lets the
-/// probe share the port with a socket that set it too, and since DHCP
-/// servers broadcast their answers to a probe, both sockets get a copy.
-/// A holder without `SO_REUSEPORT` still keeps the port to itself, and the
-/// bind fails with [`NetbootError::PortInUse`]. The servers' own sockets
-/// never set it: two netboot servers sharing port 67 would race for
-/// every machine instead of the second failing to start.
+/// probe share the port with a socket that set it too (and on Linux,
+/// `SO_REUSEADDR` with one that set that), and since DHCP servers
+/// broadcast their answers to a probe, both sockets get a copy. A holder
+/// that set neither keeps the port to itself, and the bind fails with
+/// [`NetbootError::PortInUse`]. The servers' own sockets set neither: two
+/// netboot servers sharing port 67 would race for every machine instead
+/// of the second failing to start.
 pub fn probe_socket(port: u16, interface: Option<&Interface>) -> Result<UdpSocket, NetbootError> {
     let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     bind_udp("the DHCP client port", address, interface, true)
@@ -159,8 +162,13 @@ fn bind_udp(
 ) -> Result<UdpSocket, NetbootError> {
     let fail = |e: std::io::Error| bind_error(what, address.port(), e);
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(fail)?;
-    socket.set_reuse_address(true).map_err(fail)?;
+    // Linux lets two UDP sockets that both set SO_REUSEADDR share a port,
+    // so a server socket sets neither option and stays exclusive on Linux
+    // as on macOS. UDP has no TIME_WAIT, so a restart doesn't need them.
+    // The probe sets both: SO_REUSEPORT to share with configd on macOS, and
+    // SO_REUSEADDR to share with a Linux DHCP client that set only that.
     if share_port {
+        socket.set_reuse_address(true).map_err(fail)?;
         socket.set_reuse_port(true).map_err(fail)?;
     }
     socket.set_broadcast(true).map_err(fail)?;
@@ -327,10 +335,10 @@ mod tests {
     }
 
     /// A socket bound to 0.0.0.0 on an ephemeral port, as the machine's own
-    /// DHCP client might hold port 68, with or without `SO_REUSEPORT`.
-    fn hold_a_port(reuse_port: bool) -> (Socket, u16) {
+    /// DHCP client might hold port 68, with the sharing options given.
+    fn hold_a_port(reuse_address: bool, reuse_port: bool) -> (Socket, u16) {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-        socket.set_reuse_address(true).unwrap();
+        socket.set_reuse_address(reuse_address).unwrap();
         socket.set_reuse_port(reuse_port).unwrap();
         let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
         socket.bind(&any.into()).unwrap();
@@ -338,9 +346,18 @@ mod tests {
         (socket, port)
     }
 
+    // The sharing rules differ between the kernels, and CI runs these on
+    // Linux while the lab runs relish on macOS:
+    // - Linux lets two UDP sockets bind one address and port when both set
+    //   SO_REUSEADDR, or when both set SO_REUSEPORT (same user).
+    // - BSD and macOS let them only when both set SO_REUSEPORT; their
+    //   SO_REUSEADDR shares only multicast addresses.
+    // A socket that sets neither is exclusive on both, whatever the other
+    // socket set. So the servers set neither, and the probe sets both.
+
     #[tokio::test]
     async fn the_probe_shares_a_port_another_socket_holds_with_so_reuseport() {
-        let (_holder, port) = hold_a_port(true);
+        let (_holder, port) = hold_a_port(true, true);
         let probe = probe_socket(port, None).unwrap();
         assert_eq!(probe.local_addr().unwrap().port(), port);
         assert!(probe.broadcast().unwrap());
@@ -348,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_probe_reports_a_port_another_socket_holds_alone() {
-        let (_holder, port) = hold_a_port(false);
+        let (_holder, port) = hold_a_port(false, false);
         let error = probe_socket(port, None).unwrap_err();
         assert!(
             matches!(error, NetbootError::PortInUse { port: p, .. } if p == port),
@@ -357,15 +374,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_servers_sockets_set_neither_sharing_option() {
+        let socket = udp_socket("test", SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
+        let socket = socket2::SockRef::from(&socket);
+        assert!(!socket.reuse_address().unwrap());
+        assert!(!socket.reuse_port().unwrap());
+    }
+
+    #[tokio::test]
     async fn the_servers_sockets_never_share_their_port() {
-        // Two relish netboots sharing port 67 would race for every machine,
-        // so only the probe sets SO_REUSEPORT.
-        let (_holder, port) = hold_a_port(true);
+        // Two relish netboots sharing port 67 would race for every machine
+        // instead of the second failing to start.
+        let first = udp_socket("DHCP", SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), None).unwrap();
+        let port = first.local_addr().unwrap().port();
         let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         assert!(matches!(
             udp_socket("DHCP", any, None),
             Err(NetbootError::PortInUse { .. })
         ));
+        // Nor with a socket that offers to share, such as the probe's.
+        for (reuse_address, reuse_port) in [(true, false), (false, true), (true, true)] {
+            let (_holder, port) = hold_a_port(reuse_address, reuse_port);
+            let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+            assert!(
+                matches!(
+                    udp_socket("DHCP", any, None),
+                    Err(NetbootError::PortInUse { .. })
+                ),
+                "SO_REUSEADDR {reuse_address}, SO_REUSEPORT {reuse_port}"
+            );
+        }
     }
 
     #[tokio::test]
