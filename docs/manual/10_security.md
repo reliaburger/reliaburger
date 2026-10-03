@@ -264,7 +264,10 @@ openssl pkey -in ci-signing.pem -pubout -outform DER | tail -c 65 | base64
 certificates last a year and cluster-issued ingress certificates 90 days. Nodes
 renew their certificates at the midpoint of their validity without restarting
 (a development cluster can shorten both lifetimes for soak testing, see
-`[security] leaf_lifetime_override_secs` in the reference), and a
+`[security] leaf_lifetime_override_secs` in the reference). A node's API and
+registry listeners close a connection, after letting in-flight requests finish,
+before the certificate its client presented expires, so a peer reconnects with
+its renewed certificate even over a connection that never goes idle. A
 new node joins with a single-use token and a certificate signing request, so
 its private key never leaves it. Every node needs the cluster's master key
 (`*-master.key` from `init`): it unwraps the CA keys and the secret keys, and

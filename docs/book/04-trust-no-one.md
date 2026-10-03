@@ -383,6 +383,35 @@ Replacement writes the new snapshot to disk first and publishes it to the `watch
 
 **Who is asking?** `POST /v1/cluster/renew` needs the internal service token *and* the client certificate from the TLS connection itself. The service token proves the request came from cluster automation; it doesn't say which node sent it, so trusting a node name in the request body would let one compromised node renew itself as any other. The leader reads the caller's current leaf (Bun puts it in a typed Axum extension after the handshake, where no header can reach it), checks the chain and revocation list again because a long-lived connection can outlive a revocation, and signs a CSR that must name the same node. As with joining, only the CSR's public key reaches the new certificate. Followers refuse rather than forward, since forwarding would present the follower's certificate and change who's asking.
 
+**The connection that never hung up.** The resolver trick has a blind spot, and the 0.1.4 soak found it. A resolver runs at the handshake, and only at the handshake. Pickle forwards registry writes to the leader through a pooled `reqwest` connection, about one request a second, so that connection never sat idle long enough to close. Node 1 renewed its hour-long leaf at 15:38 and kept presenting the old one on that socket. At 16:11 the old leaf expired. The leader checks the caller's certificate on every proposal (that's the revocation check above), so it answered 403 to every one, about 130 of them in three minutes, and image pushes came back 503. Renewal had worked perfectly. The new leaf just never got a chance to be sent.
+
+We could have rebuilt every pooled client on renewal, but `reqwest::Client` gets cloned into dozens of places, and missing one would bring the bug back quietly. The server is the one place every peer connection passes through, and it already retires connections after an hour. Now it also retires one when the certificate its client presented expires:
+
+```rust
+pub fn tls_connection_lifetime(peer_certificate: Option<&[u8]>, now: SystemTime) -> Duration {
+    let Some(certificate_der) = peer_certificate else {
+        return MAX_TLS_CONNECTION_LIFETIME;
+    };
+    let Ok((_, leaf)) = x509_parser::parse_x509_certificate(certificate_der) else {
+        return Duration::ZERO;
+    };
+    let expires = u64::try_from(leaf.validity().not_after.timestamp())
+        .ok()
+        .and_then(|seconds| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+    let Some(expires) = expires else {
+        return Duration::ZERO;
+    };
+    expires
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_TLS_CONNECTION_LIFETIME)
+}
+```
+
+A client with no certificate (a browser, `relish`) keeps the full hour. Anything the parser can't read gets zero, because a certificate we can't date is one we can't trust. `u64::try_from` refuses a negative timestamp instead of wrapping it the way a C cast would, and `checked_add` returns `None` rather than panicking if the date doesn't fit in a `SystemTime`. `duration_since` returns an error when `now` is already past expiry, which `unwrap_or` turns into zero. Draining then starts 30 seconds before the limit, or halfway through a lifetime shorter than a minute, so in-flight requests finish and the client opens a fresh connection with whatever leaf is current. Renewal happens at mid-life, so in practice that's always the new one.
+
+The regression test, `a_connection_opened_before_renewal_never_presents_the_expired_leaf`, does what Pickle did. It issues a four-second leaf, sends one request, renews to a new serial, then keeps a pooled client busy every 200 milliseconds until the old leaf has expired. The server echoes the serial it saw, and any request sent after expiry must see the new one. Before the fix, the first request after expiry still came back with the old serial.
+
 **Who notices it's broken?** A renewal loop runs inside each Bun. Once the current leaf is past the middle of its life, it generates a fresh key locally, asks whoever is leader right now, and retries every five seconds on any failure while the old identity keeps working. An expired identity gets no bypass: the operator re-enrols the node. The loop reports its progress through another `watch` channel, and the reading side has a neat trick:
 
 ```rust
@@ -397,7 +426,7 @@ pub fn state(&self) -> RenewalState {
 
 `has_changed()` returns an error once the sending half has been dropped. If the renewal task exits or panics, Rust drops its sender, and diagnostics report `Stopped` even though the last value it wrote said `Valid`. A dead background task can't keep claiming it's healthy, and nobody had to remember to write a final status.
 
-The ingress proxy's certificates for your domains follow the same rules with shorter loops. Their serials are 20 random bytes with the top bits fixed (`(serial[0] & 0x3f) | 0x40` keeps the six low bits and sets the next, giving a positive number of full length), because a per-process counter gave two ingress nodes restarting on the same CA identical serials. The handshake sends the leaf *and* its intermediate, since a client that trusts only the root can't connect the two otherwise; a unit test proved the signature correct, and a real client still said `UnknownIssuer`. Cached leaves renew at mid-life, operator-supplied files hot-reload only once the certificate and key match, and API, registry and ingress TLS connections get a one-hour maximum lifetime, so even a WebSocket eventually reconnects to the current certificate.
+The ingress proxy's certificates for your domains follow the same rules with shorter loops. Their serials are 20 random bytes with the top bits fixed (`(serial[0] & 0x3f) | 0x40` keeps the six low bits and sets the next, giving a positive number of full length), because a per-process counter gave two ingress nodes restarting on the same CA identical serials. The handshake sends the leaf *and* its intermediate, since a client that trusts only the root can't connect the two otherwise; a unit test proved the signature correct, and a real client still said `UnknownIssuer`. Cached leaves renew at mid-life, operator-supplied files hot-reload only once the certificate and key match, and API, registry and ingress TLS connections get a one-hour maximum lifetime (shorter when the client's own certificate expires sooner, as Pickle taught us above), so even a WebSocket eventually reconnects to the current certificate.
 
 **How do you test a six-month timer?** A node leaf lives a year and renews at six months. Our unit tests fake the clock by signing certificates whose windows are already half over, but that doesn't tell you what happens to a real cluster when renewal collides with a leader election, a SIGKILL or a power cut. For that we run a multi-day soak, and a soak that renews each node zero times proves nothing. So there's exactly one knob, and it's deliberately awkward to reach:
 
