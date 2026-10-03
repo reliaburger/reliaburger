@@ -118,7 +118,7 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 
 | Step | Command | State |
 |---|---|---|
-| Pi up as router | dnsmasq, nftables, chrony (`image/lab/pi/`, PR 4) | To write |
+| Pi up as router | dnsmasq, nftables, chrony (`image/lab/pi/`, PR 4) | Written and parse-checked in CI; not yet run on a Pi |
 | BIOS, each Wyse | F2, password `Fireport`: BIOS 1.2.5, UEFI with CSM off, UEFI network stack and PXE on, Secure Boot off, power on after AC loss | Manual, ~5 min a unit (S5 runbook step 1) |
 | relish for the Mac | `cargo build --release --bin relish` on `appliance-train` | Real |
 | Images | `gh run download … -n appliance-x86_64` (lab build) | Real, preview signing until 0.3.0 publishes |

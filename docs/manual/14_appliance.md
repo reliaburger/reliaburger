@@ -21,8 +21,13 @@ It's a **preview**, and the rough edges are part of what it's for:
   - wired to the same network.
 
   **The installer erases the largest built-in disk.**
-- **Your router**, with a DHCP reservation for each machine, so each keeps the
-  same address. Nodes find each other by address.
+- **A router you control**, with a DHCP reservation for each machine, so each
+  keeps the same address. Nodes find each other by address, and they need the
+  router's default route to work out their own. Your home router will do. On
+  an isolated switch, a Raspberry Pi can be the router:
+  [`image/lab/pi/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/pi/README.md)
+  sets one up with DHCP, DNS, NTP and NAT. Leave booting to `relish netboot`:
+  the router must not answer PXE.
 - **A machine on that network to serve the netboot**: your laptop (Linux or
   macOS), any spare box, or a VM bridged onto the LAN. It needs `relish` and
   root.
