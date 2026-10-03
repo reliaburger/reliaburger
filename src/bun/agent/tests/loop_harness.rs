@@ -58,6 +58,7 @@ impl RunningAgent {
     /// Forget the turns setup took, so the verdict covers the slow work only.
     fn measure_from_here(&self) {
         self.meter.reset_worst_turn();
+        self.stalls.reset_most_in_a_turn();
     }
 
     /// Queue a status command now and time its answer.
@@ -648,9 +649,20 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
 
 // ---- disk, kernel and subprocesses -------------------------------------------
 
+/// The most fsync'd persists one turn may make. Two writes at the 250 ms a
+/// loaded coverage runner measured (#421) leave half the budget; four would
+/// pass it, which is why a startup retirement splits its four (#422).
+const MOST_PERSISTS_IN_A_TURN: usize = 2;
+
 /// fsync'd persists may stay inline (#351, decision 2), as long as a slow disk
-/// can't stretch a turn past the budget. At 150 ms a persist, a deploy of
-/// three replicas, a job and a restart must still keep every turn short.
+/// can't stretch a turn past the budget. With every persist slowed to 150 ms,
+/// a deploy of three replicas, a job and a restart must make no more than
+/// [`MOST_PERSISTS_IN_A_TURN`] in any one turn, and status must still answer.
+///
+/// The verdict counts persists instead of timing turns. A turn also pays for
+/// the host's real fsyncs, which the slowed persist stands in for and the
+/// test can't control: on a hosted macOS runner, one restart turn with a
+/// single persist in it took 1109 ms (#508).
 #[tokio::test]
 async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
@@ -664,6 +676,7 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
         .stalls
         .set(LoopStall::Persist, std::time::Duration::from_millis(150));
     running.measure_from_here();
+    let persists_before = running.stalls.reached(LoopStall::Persist);
 
     let deploy = Config::parse(
         "[app.api]\nimage = 'api:v1'\nport = 9090\nreplicas = 3\n\n\
@@ -678,6 +691,7 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
     })
     .await
     .unwrap();
+    let crashed_at = std::time::SystemTime::now();
     crash(&grill);
     let mid_deploy = running.status_latency().await;
     let last_event = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -698,13 +712,39 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
             "{id} was never persisted"
         );
     }
+    // The restart records its replacement in the turn after the start call.
+    let restarted = crate::grill::records::record_path(records.path(), "default__web-0");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !std::fs::metadata(&restarted)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified > crashed_at)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("web's restart was never persisted");
+    let after_deploy = running.status_latency().await;
+    let persists = running.stalls.reached(LoopStall::Persist) - persists_before;
+    let most_in_a_turn = running.stalls.most_in_a_turn(LoopStall::Persist);
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(mid_deploy.is_some(), "status went unanswered mid-deploy");
     assert!(
-        mid_deploy.is_some_and(|latency| latency < TURN_BUDGET),
-        "status took {mid_deploy:?} mid-deploy on a slow disk"
+        after_deploy.is_some(),
+        "status went unanswered after the deploy"
     );
-    running
-        .assert_responsive("a deploy, a job and a restart persisted state to a slow disk")
-        .await;
+    // Three api records, the job's ledger and web's restart record at least.
+    assert!(
+        persists >= 5,
+        "only {persists} persists reached the slow disk"
+    );
+    assert!(
+        most_in_a_turn <= MOST_PERSISTS_IN_A_TURN,
+        "one turn made {most_in_a_turn} persists to a slow disk (the worst turn was \
+         {worst:?}); a turn may make {MOST_PERSISTS_IN_A_TURN}"
+    );
 }
 
 /// Retiring an instance removes its identity directory and record inline.
