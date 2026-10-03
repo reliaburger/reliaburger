@@ -18,7 +18,7 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.1.3 was released on 3 October 2026, and the one-line installer fetches
+0.1.4 was released on 3 October 2026, and the one-line installer fetches
 its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
 8 GiB of free memory and 15 GiB of disk.
 
@@ -311,7 +311,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.1.3
+## Limits in 0.1.4
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

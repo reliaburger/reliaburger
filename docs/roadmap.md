@@ -138,11 +138,11 @@ migration and no feature gate
   now), so a 0.1.2 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.2](releasing.md#upgrading-from-012)). 0.1.2's leader
   refuses the upgrade before it records a run.
-- [ ] **0.1.4: the next release, ready for qualification**
+- [x] **0.1.4: cross-node logs and events, security fixes.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.4)
+  on 3 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/8), merge
-  train [#474](https://github.com/reliaburger/reliaburger/pull/474)). Every
-  item has landed on `release-1-1-4` and the crate says 0.1.4. 0.1.4 is part 2
-  of F07 ([#392](https://github.com/reliaburger/reliaburger/issues/392)),
+  train [#474](https://github.com/reliaburger/reliaburger/pull/474)). 0.1.4 is
+  part 2 of F07 ([#392](https://github.com/reliaburger/reliaburger/issues/392)),
   security fixes, and the first steps of the operations-security work:
   - [x] separate stderr capture for process workloads
     ([#466](https://github.com/reliaburger/reliaburger/pull/466)) and a
@@ -177,22 +177,32 @@ migration and no feature gate
   changes the protocol (33 in 0.1.3; 34 now, for the new audit event kinds),
   so a 0.1.3 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.3](releasing.md#upgrading-from-013)).
-- [ ] **0.1.5: operations security**
+  The homepage tour was re-recorded against the published install. The
+  [compressed](qualification/2026-10-03-v0.1.4-soak-compressed.md) and
+  [full](qualification/2026-10-03-v0.1.4-soak-full.md) soaks found three bugs that 0.1.4 ships
+  with and 0.1.5 fixes: consumer syncs over the agent loop's turn budget
+  ([#505](https://github.com/reliaburger/reliaburger/issues/505)), a pooled peer connection presenting an expired leaf
+  ([#509](https://github.com/reliaburger/reliaburger/issues/509)), and the leader resigning for disk pressure over unexported logs
+  ([#510](https://github.com/reliaburger/reliaburger/issues/510)).
+- [ ] **0.1.5: bug fixes, the next release**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/11), merge
-  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). The rest
-  of the 0.1.4 security scope, moved here so 0.1.4 could ship soon after
-  0.1.3: upstream image trust, binding images to a digest at apply, the
-  upstream policy and cosign (F03a,
-  [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA backup
-  and intermediate rotation (F04 R1–R4,
-  [#362](https://github.com/reliaburger/reliaburger/issues/362)); token
-  visibility, expiry, rotation and per-namespace secret keys (F05 I2–I4,
-  [#363](https://github.com/reliaburger/reliaburger/issues/363)); and the
-  retired intent that keeps decrypted secrets
-  ([#476](https://github.com/reliaburger/reliaburger/issues/476)). Worker
-  key separation (F03b), root rotation and restore (F04 R5–R7) and per-app
-  audiences (F05 I5–I6) follow later. The security work comes before real
-  fleets in 0.3.0.
+  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). Every bug and flake we know about: council recovery that
+  loses tokens, never runs workloads or refuses small clusters
+  ([#477](https://github.com/reliaburger/reliaburger/issues/477)–[#479](https://github.com/reliaburger/reliaburger/issues/479)), a voter with a full disk ([#480](https://github.com/reliaburger/reliaburger/issues/480)), the service VIP
+  withdrawn with the last local replica ([#481](https://github.com/reliaburger/reliaburger/issues/481)), snapshot commands on the
+  wrong node ([#482](https://github.com/reliaburger/reliaburger/issues/482)), the retired intent that keeps decrypted secrets
+  ([#476](https://github.com/reliaburger/reliaburger/issues/476)), the three soak findings from 0.1.4 ([#505](https://github.com/reliaburger/reliaburger/issues/505), [#509](https://github.com/reliaburger/reliaburger/issues/509),
+  [#510](https://github.com/reliaburger/reliaburger/issues/510)) and the flakes ([#497](https://github.com/reliaburger/reliaburger/issues/497), [#500](https://github.com/reliaburger/reliaburger/issues/500), [#508](https://github.com/reliaburger/reliaburger/issues/508)). Token scope, last
+  use and expiry (F05 I2, [#483](https://github.com/reliaburger/reliaburger/pull/483)) is already on the train.
+- [ ] **0.1.6: operations security**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/12)). The
+  rest of the 0.1.4 security scope: upstream image trust, binding images to a
+  digest at apply, the upstream policy and cosign (F03a,
+  [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA backup and intermediate rotation (F04 R1–R4,
+  [#362](https://github.com/reliaburger/reliaburger/issues/362)); token rotation and per-namespace secret keys (F05 I3–I4,
+  [#363](https://github.com/reliaburger/reliaburger/issues/363)). Worker key separation (F03b), root rotation and restore
+  (F04 R5–R7) and per-app audiences (F05 I5–I6) follow later. The security
+  work comes before real fleets in 0.3.0.
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
@@ -211,6 +221,8 @@ migration and no feature gate
   pre-checks that read the leader's gossip view
   ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
   ten Dell Wyse 3040s from power-on to a cluster.
+  Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
+  which waits for 0.1.6.
 - [ ] **0.4.0: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [#268](https://github.com/reliaburger/reliaburger/pull/268)). Drain and
@@ -254,13 +266,18 @@ what's shipped and what's scheduled.
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
 - **Missing capabilities F01–F11**, one issue each, placed in
   [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
-  [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F03–F05,
-  F07 part 2),
+  [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F07 part 2
+  and the first steps of F03–F05, landed),
+  [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11) (F05 I2),
+  [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
+  F04 R1–R4, F05 I3–I4),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
   F06, F09, F11).
-- **Flakes.** The open ones are in the [known flakes register](flakes.md)
+- **Known bugs and flakes.** All of them are in
+  [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11); the open
+  flakes are also in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
 
 ## How we got to 0.1.0

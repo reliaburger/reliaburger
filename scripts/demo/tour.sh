@@ -25,6 +25,12 @@
 #       2 s), then play the setup step SETUP_SPEEDUP (4) times faster. Setup
 #       redraws its timers several times a second, so idle trimming alone
 #       would leave a minute and a half of VM boots. Both are said on screen.
+#   ... [--api-port PORT] [--ingress-port PORT] [--registry-port PORT]
+#       Give the tour's cluster these host ports instead of the defaults
+#       (19117, 18080, 15050), so it can run beside another laptop cluster.
+#       --install and --setup pass them to `relish setup --quickstart`, and
+#       the tour's requests use the ingress port. The recording says so and
+#       shows the commands with the ports it really used.
 #
 # Environment:
 #   RELISH             the relish binary to run (default: the one on PATH)
@@ -38,9 +44,9 @@ REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PAGE="${REPO_DIR}/docs/website/index.html"
 DEMO_URL="https://reliaburger.com/demo/podinfo.yaml"
 DEMO_FILE="examples/kubernetes/podinfo.yaml"
-INGRESS="http://podinfo.localhost:18080"
 BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
 BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
+# The order request as the page shows it, on the default ingress port.
 BURGER_ORDER="http://burger.localhost:18080/order"
 
 IDLE_LIMIT=2
@@ -50,12 +56,22 @@ MODE="run"
 SETUP_BINARIES=""
 INSTALL_VERSION=""
 CAST=""
+INGRESS_PORT=18080
+# Port options for `relish setup --quickstart`, each with a leading space.
+SETUP_PORTS=""
+port_number() {
+    [[ "$2" =~ ^[0-9]+$ ]] || { echo "$1 needs a port number" >&2; exit 64; }
+}
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --check) MODE="check"; shift ;;
         --setup) SETUP_BINARIES="${2:?--setup needs a directory}"; shift 2 ;;
         --install) INSTALL_VERSION="${2:?--install needs a version, such as v0.1.1}"; shift 2 ;;
         --record) MODE="record"; CAST="${2:?--record needs a file}"; shift 2 ;;
+        --api-port | --registry-port)
+            port_number "$1" "${2:-}"; SETUP_PORTS="${SETUP_PORTS} $1 $2"; shift 2 ;;
+        --ingress-port)
+            port_number "$1" "${2:-}"; INGRESS_PORT="$2"; SETUP_PORTS="${SETUP_PORTS} $1 $2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 64 ;;
     esac
 done
@@ -63,6 +79,8 @@ if [[ -n "${SETUP_BINARIES}" && -n "${INSTALL_VERSION}" ]]; then
     echo "--install and --setup are alternatives; pass one" >&2
     exit 64
 fi
+INGRESS="http://podinfo.localhost:${INGRESS_PORT}"
+BURGER_ORDER_SENT="http://burger.localhost:${INGRESS_PORT}/order"
 # Set when this script runs inside its own recording, so the narration only
 # mentions trimming and speed-ups that really happen.
 RECORDING="${TOUR_RECORDING:-}"
@@ -130,6 +148,7 @@ if [[ "${MODE}" == "record" ]]; then
     elif [[ -n "${INSTALL_VERSION}" ]]; then
         inner="${inner} --install ${INSTALL_VERSION}"
     fi
+    inner="${inner}${SETUP_PORTS}"
     TOUR_RECORDING=1 asciinema rec --headless --overwrite --return \
         --window-size 110x32 --idle-time-limit "${IDLE_LIMIT}" \
         --title "Reliaburger: the five-minute tour" -c "${inner}" "${CAST}"
@@ -268,7 +287,7 @@ two_burgers_running() {
 }
 
 burger_takes_orders() {
-    curl -fsS "${BURGER_ORDER}" >/dev/null 2>&1
+    curl -fsS "${BURGER_ORDER_SENT}" >/dev/null 2>&1
 }
 
 three_frontends_without_node_3() {
@@ -300,6 +319,9 @@ say "says to wait, and says how long each wait took."
 if [[ -n "${RECORDING}" ]]; then
     say "This recording cuts idle time to ${IDLE_LIMIT} s, so those numbers are the real ones."
 fi
+if [[ -n "${SETUP_PORTS}" ]]; then
+    say "Another laptop cluster holds the default ports, so this one uses${SETUP_PORTS}."
+fi
 printf '\n'
 sleep 2
 
@@ -315,7 +337,11 @@ while IFS= read -r command <&3; do
                 if [[ -n "${RECORDING}" ]]; then
                     say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
                 fi
-                show "${command}"
+                if [[ -n "${SETUP_PORTS}" ]]; then
+                    show "${command} -s --${SETUP_PORTS}"
+                else
+                    show "${command}"
+                fi
             elif [[ -z "${SETUP_BINARIES}" ]]; then
                 say "Step 1 ran before this recording: it installs relish and runs"
                 say "\`relish setup --quickstart\`. The cluster is up."
@@ -327,7 +353,7 @@ while IFS= read -r command <&3; do
                 if [[ -n "${RECORDING}" ]]; then
                     say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
                 fi
-                show "relish setup --quickstart --development-binaries ${SETUP_BINARIES}"
+                show "relish setup --quickstart --development-binaries ${SETUP_BINARIES}${SETUP_PORTS}"
             fi
             ;;
         "relish apply -f ${DEMO_URL}")
@@ -373,7 +399,7 @@ while IFS= read -r command <&3; do
         "curl ${BURGER_ORDER}")
             wait_for "both burger replicas to run" 180 two_burgers_running
             wait_for "the ingress to route burger.localhost" 60 burger_takes_orders
-            show "${command}"
+            show "curl ${BURGER_ORDER_SENT}"
             ;;
         "relish inspect frontend")
             wait_for "three frontends on the two surviving nodes" 240 three_frontends_without_node_3
