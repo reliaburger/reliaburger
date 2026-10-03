@@ -81,11 +81,9 @@ migration and no feature gate
   0.1.2 changes the protocol and state formats (27 and 46 in 0.1.1; 28 and 47
   now), so a 0.1.1 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
-- [ ] **0.1.3: ready for release, qualification in progress**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)). Every
-  item has landed and the crate says 0.1.3; what's left is building, staging,
-  soaking and promoting the candidate ([runbook](releasing.md)). 0.1.3 is about
-  the agent loop, observability and test quality:
+- [x] **0.1.3: agent loop, observability and test quality.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.3)
+  on 3 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)):
   - [x] an agent loop that's metered and never waits inline on slow work: a
     turn meter, a starvation harness and the inline-await rule, the status
     snapshot, parallel state reads and restarts off the loop, and the last
@@ -133,21 +131,68 @@ migration and no feature gate
     ([#419](https://github.com/reliaburger/reliaburger/issues/419), [#422](https://github.com/reliaburger/reliaburger/issues/422), [#448](https://github.com/reliaburger/reliaburger/issues/448), [#450](https://github.com/reliaburger/reliaburger/issues/450), [#456](https://github.com/reliaburger/reliaburger/issues/456), [#461](https://github.com/reliaburger/reliaburger/issues/461), [#420](https://github.com/reliaburger/reliaburger/pull/420), [#421](https://github.com/reliaburger/reliaburger/pull/421),
     [#449](https://github.com/reliaburger/reliaburger/pull/449), [#453](https://github.com/reliaburger/reliaburger/pull/453), [#464](https://github.com/reliaburger/reliaburger/pull/464), [#465](https://github.com/reliaburger/reliaburger/pull/465)).
 
+  The homepage tour was re-recorded against the published install, with
+  `relish council status`, the council line in `relish status` and replicas
+  numbered across the cluster.
   0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 33 and 49
   now), so a 0.1.2 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.2](releasing.md#upgrading-from-012)). 0.1.2's leader
   refuses the upgrade before it records a run.
-- [ ] **0.1.4: operations security**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/8)).
-  Upstream image trust: digest pinning, cosign and worker key separation (F03,
-  [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA recovery
-  and rotation (F04, [#362](https://github.com/reliaburger/reliaburger/issues/362));
-  namespace identity and the token lifecycle (F05,
-  [#363](https://github.com/reliaburger/reliaburger/issues/363)); and part 2
-  of F07: separate stderr capture, richer log filters, a merged live event
-  stream and rollback over merged history
-  ([#392](https://github.com/reliaburger/reliaburger/issues/392)). The
-  security work comes before real fleets in 0.3.0.
+- [ ] **0.1.4: the next release, ready for qualification**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/8), merge
+  train [#474](https://github.com/reliaburger/reliaburger/pull/474)). Every
+  item has landed on `release-1-1-4` and the crate says 0.1.4. 0.1.4 is part 2
+  of F07 ([#392](https://github.com/reliaburger/reliaburger/issues/392)),
+  security fixes, and the first steps of the operations-security work:
+  - [x] separate stderr capture for process workloads
+    ([#466](https://github.com/reliaburger/reliaburger/pull/466)) and a
+    `--stream` filter ([#467](https://github.com/reliaburger/reliaburger/pull/467));
+  - [x] `relish logs --until`, `--instance` and a regular-expression `--grep`
+    ([#458](https://github.com/reliaburger/reliaburger/pull/458));
+  - [x] a cluster-wide live event stream
+    ([#469](https://github.com/reliaburger/reliaburger/pull/469)), which a
+    namespace-scoped token can no longer read
+    ([#468](https://github.com/reliaburger/reliaburger/pull/468));
+  - [x] rollback over the merged history, at the app's scale
+    ([#459](https://github.com/reliaburger/reliaburger/pull/459),
+    [#489](https://github.com/reliaburger/reliaburger/pull/489)), and the TUI's
+    job detail showing the selected node's run
+    ([#460](https://github.com/reliaburger/reliaburger/pull/460));
+  - [x] decrypted secrets kept out of world-readable runc bundles and deleted
+    with the instance ([#475](https://github.com/reliaburger/reliaburger/pull/475));
+  - [x] finalising a secret rotation no longer strands the root CA backup
+    (F04 R0, [#472](https://github.com/reliaburger/reliaburger/pull/472));
+  - [x] audit events naming who minted or revoked a token or rotated the
+    secret key (F05 I1, [#473](https://github.com/reliaburger/reliaburger/pull/473));
+  - [x] image references with both a tag and a digest, so an unsigned Pickle
+    image can't pass for an external one (F03,
+    [#455](https://github.com/reliaburger/reliaburger/pull/455)), and the
+    plans for F03, F04 and F05 with their decisions
+    ([#471](https://github.com/reliaburger/reliaburger/pull/471));
+  - [x] CI on every PR into a release's merge train
+    ([#486](https://github.com/reliaburger/reliaburger/pull/486)) and a port
+    flake ([#488](https://github.com/reliaburger/reliaburger/pull/488)).
+
+  The live-metrics contract, the last item of F07 part 2, moves to F06. 0.1.4
+  changes the protocol (33 in 0.1.3; 34 now, for the new audit event kinds),
+  so a 0.1.3 cluster can't roll to it: recreate the cluster
+  ([upgrading from 0.1.3](releasing.md#upgrading-from-013)).
+- [ ] **0.1.5: operations security**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/11), merge
+  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). The rest
+  of the 0.1.4 security scope, moved here so 0.1.4 could ship soon after
+  0.1.3: upstream image trust, binding images to a digest at apply, the
+  upstream policy and cosign (F03a,
+  [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA backup
+  and intermediate rotation (F04 R1–R4,
+  [#362](https://github.com/reliaburger/reliaburger/issues/362)); token
+  visibility, expiry, rotation and per-namespace secret keys (F05 I2–I4,
+  [#363](https://github.com/reliaburger/reliaburger/issues/363)); and the
+  retired intent that keeps decrypted secrets
+  ([#476](https://github.com/reliaburger/reliaburger/issues/476)). Worker
+  key separation (F03b), root rotation and restore (F04 R5–R7) and per-app
+  audiences (F05 I5–I6) follow later. The security work comes before real
+  fleets in 0.3.0.
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays

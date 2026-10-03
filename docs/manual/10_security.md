@@ -188,7 +188,9 @@ relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
 Encryption is local: `secret encrypt` never contacts the cluster. The node
 that starts the instance decrypts the value into its environment. If it can't
 decrypt, it refuses to start the instance rather than pass the ciphertext
-through.
+through. On the node, the plaintext goes only into files that root (or, for
+rootless runc, the user running Bun) alone can read, and the container spec
+that carries it is deleted when the instance stops.
 
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the

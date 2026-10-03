@@ -4,7 +4,7 @@ Thanks for helping build Reliaburger. This repository is both a working `Rust` p
 
 ## Before You Start
 
-Read the project [documentation](docs/README.md) and [roadmap](docs/roadmap.md) before starting substantial work. 0.1.2 is released; the open work is in the roadmap's release list and known gaps, and in the GitHub milestones and issues they link.
+Read the project [documentation](docs/README.md) and [roadmap](docs/roadmap.md) before starting substantial work. 0.1.3 is released; the open work is in the roadmap's release list and known gaps, and in the GitHub milestones and issues they link.
 
 For a new feature or a change to public behaviour:
 

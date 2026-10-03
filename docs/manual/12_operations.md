@@ -94,7 +94,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.3: incompatible binary: found protocol 33, state 49; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47. …
+refusing to upgrade to v0.1.4: incompatible binary: found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49. …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -128,6 +128,9 @@ state format from 44 to 46, so a 0.1.0 cluster refuses it and stays on 0.1.0
 So is 0.1.3: protocol 33 and state format 49. A 0.1.2 cluster's leader refuses
 it before recording a run, with the message above
 ([upgrading from 0.1.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-012)).
+And 0.1.4: protocol 34, state format still 49. A 0.1.3 cluster's leader
+refuses it the same way
+([upgrading from 0.1.3](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-013)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -144,7 +147,7 @@ line says what it found and what it needs, so even a truncated journal line
 carries it:
 
 ```text
-incompatible state format: found 47; this binary (reliaburger v0.1.3 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: …
+incompatible state format: found 47; this binary (reliaburger v0.1.4 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: …
 ```
 
 A join between mismatched binaries fails the same way, starting

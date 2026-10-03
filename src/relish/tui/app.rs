@@ -250,6 +250,24 @@ mod tests {
         );
     }
 
+    /// F07 part 2: two nodes ran the same job. The detail page must show
+    /// the row that was selected, not the first job with that name.
+    #[test]
+    fn job_detail_shows_the_selected_nodes_instance() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        let mut second = app.data.jobs[0].clone();
+        second.node = "node-2".into();
+        second.row.state = "failed".into();
+        app.data.jobs.push(second);
+        app.view_stack.push(View::Jobs);
+        app.jobs_cursor = 1;
+        app.update(key(KeyCode::Enter));
+
+        let text = crate::relish::tui::fixtures::render_to_string(&app, 120, 40);
+        assert!(text.contains("node-2"), "{text}");
+        assert!(text.contains("failed"), "{text}");
+    }
+
     #[test]
     fn navigation_drills_in_and_tabs_wrap() {
         let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);

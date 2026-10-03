@@ -18,7 +18,7 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.1.2 was released on 1 October 2026, and the one-line installer fetches
+0.1.3 was released on 3 October 2026, and the one-line installer fetches
 its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
 8 GiB of free memory and 15 GiB of disk.
 
@@ -28,7 +28,8 @@ curl -fsSL https://reliaburger.com/install.sh | sh
 
 # Run a real Kubernetes app: podinfo's frontend, backend and Redis
 relish apply -f https://reliaburger.com/demo/podinfo.yaml
-relish status                        # three frontends, spread across the nodes
+relish status                        # frontend-0, -1 and -2, one on each node
+relish council status                # every node's view of the council
 open http://podinfo.localhost:18080  # through the built-in ingress
 
 # Build a small Go app on the cluster (Buildah on a node, into the built-in
@@ -310,7 +311,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.1.2
+## Limits in 0.1.3
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

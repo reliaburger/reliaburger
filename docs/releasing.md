@@ -101,8 +101,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 47; this binary (reliaburger v0.1.3 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 28, state 47; this binary (reliaburger v0.1.3 (465fdeb)) needs protocol 33, state 49. …
+incompatible state format: found 47; this binary (reliaburger v0.1.4 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 33, state 49; this binary (reliaburger v0.1.4 (465fdeb)) needs protocol 34, state 49. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -145,8 +145,8 @@ paused run, because no node moved.
 
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
-`start` fails with both format pairs. A 0.1.2 cluster refuses 0.1.3 like this:
-`refusing to upgrade to v0.1.3: incompatible binary: found protocol 33, state 49; this cluster (reliaburger v0.1.2 (…)) needs protocol 28, state 47`.
+`start` fails with both format pairs. A 0.1.3 cluster refuses 0.1.4 like this:
+`refusing to upgrade to v0.1.4: incompatible binary: found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -202,6 +202,18 @@ two-voter council before recording anything, with
 A run that loses a voter after it started still waits in the council phase,
 and the leader now logs `cluster upgrade ID waiting: N of M voters alive` once
 when the wait begins.
+
+### Upgrading from 0.1.3
+
+0.1.4 can't roll onto a 0.1.3 cluster. A peer's `/v1/events` answer can now
+carry the `token`, `secret` and `identity` audit kinds, which 0.1.3 can't
+read, and each node offers its own live events as a feed the others follow.
+So the protocol moved from 33 to 34; the state format stays at 49. Recreate
+the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data
+directories aside (or `relish local destroy --yes` a laptop cluster), install
+0.1.4 and re-apply your apps. 0.1.3's leader refuses the upgrade before it
+records a run, with
+`found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49`.
 
 ## Signing identity
 
@@ -302,7 +314,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.2` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.3` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -387,8 +399,9 @@ the real `curl … | sh` install against it on every host we advertise.
    cluster, uninstalls, and writes a Markdown record with the timings. It never
    uses `~/.reliaburger` and fails if that directory's top level or
    `~/.local/bin/relish` changed. Pass `setup --quickstart` options after
-   `--`, for example `-- --api-port 29117 --ingress-port 28080` when another
-   cluster holds the default ports, and `--keep` to leave a failed run for
+   `--`, for example `-- --api-port 29117 --ingress-port 28080 --registry-port 25050`
+   when another cluster holds the default ports (the registry forward, 15050,
+   clashes too), and `--keep` to leave a failed run for
    debugging (then `relish local destroy --yes` and `relish uninstall --yes`
    with the same `RELIABURGER_HOME`).
 

@@ -6,7 +6,7 @@ own next to it, walk its network path, measure it, break it and watch it
 heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install fetches the signed 0.1.2 release.
+15 GiB of disk. The one-line install fetches the signed 0.1.3 release.
 
 ## Install and build the cluster
 
@@ -34,11 +34,15 @@ to change. The same manifest is `examples/kubernetes/podinfo.yaml` in
 
 ```sh
 relish status
+relish council status
 ```
 
 Give it half a minute for the images to arrive. Three frontend replicas, one on
 each node, named `default__frontend-0`, `-1` and `-2`. The scheduler spread
-them and numbered them, not you.
+them and numbered them across the cluster, not you. `status` opens with a line
+on the council, the Raft group that holds the cluster's state, and `council
+status` asks every node for its own view of it: its role, term and log
+position, with the leader and quorum above the table.
 
 Now open <http://podinfo.localhost:18080> in a browser. The request comes in
 through the built-in ingress; reload and the hostname changes as each replica
