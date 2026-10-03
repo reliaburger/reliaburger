@@ -1,11 +1,12 @@
 //! Start the three servers, run them for `--for`, then stop.
 
+use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use super::artefacts::{self, Artefacts};
 use super::dhcp::{self, DhcpContext, ListenPort};
@@ -13,6 +14,7 @@ use super::http::{self, HttpState};
 use super::installed::{InstalledRecord, RECORD_FILE, chain_script};
 use super::interface::{self, Interface, udp_socket};
 use super::tftp::{self, Outcome, TftpFiles, TftpSettings};
+use super::wipe::{self, DiskSession, Question};
 use super::{Log, MacAddress, NetbootError, NetbootOptions};
 
 /// How long to listen for another ProxyDHCP before starting.
@@ -59,6 +61,10 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         installed: Mutex::new(record),
         allowed: options.allowed.clone(),
         reinstall: options.reinstall,
+        wipe: options.wipe.clone(),
+        operator: operator(),
+        question_timeout: wipe::QUESTION_TIMEOUT,
+        disks: Mutex::new(DiskSession::default()),
         log: log.clone(),
     });
 
@@ -85,6 +91,31 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
     };
     println!("relish netboot: {stopped}");
     Ok(())
+}
+
+/// When stdin is a terminal, a way to ask the operator about used disks:
+/// a thread reads stdin a line at a time (a blocking read can't be
+/// cancelled, so it gets a thread of its own, as tokio's docs advise for
+/// interactive input), and [`wipe::ask_operator`] asks one question at a
+/// time. Without a terminal there's nobody to ask: `None`.
+fn operator() -> Option<mpsc::UnboundedSender<Question>> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (send_line, lines) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else { break };
+            if send_line.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let (ask, questions) = mpsc::unbounded_channel();
+    tokio::spawn(wipe::ask_operator(questions, lines, |line| {
+        println!("relish netboot: {line}")
+    }));
+    Some(ask)
 }
 
 async fn check_artefacts(options: &NetbootOptions) -> Result<Artefacts, NetbootError> {
@@ -238,6 +269,20 @@ fn print_summary(
     } else {
         let macs: Vec<String> = options.allowed.iter().map(|m| m.to_string()).collect();
         println!("  answering only {}", macs.join(", "));
+    }
+    if !options.wipe.is_empty() {
+        let macs: Vec<String> = options.wipe.iter().map(|m| m.to_string()).collect();
+        println!(
+            "  --wipe: wiping the disk of {} without asking",
+            macs.join(", ")
+        );
+    }
+    if std::io::stdin().is_terminal() {
+        println!("  a machine whose disk isn't blank asks here first: answer y to wipe it");
+    } else {
+        println!(
+            "  no terminal to ask on: a disk that isn't blank is left alone unless --wipe lists its machine"
+        );
     }
     let installed = record.machines().len();
     if options.reinstall {
