@@ -1493,3 +1493,11 @@ of seconds to a fixed start. It exhausts a budget of one, gets a second
 delivery refused as rate-limited, moves the clock 61 seconds on, and expects
 that same delivery to be accepted, and a replay of it after that to still be
 refused. Before the fix the retry failed as "duplicate delivery ID (replay)".
+
+## Compiling a tree without losing namespace ownership
+
+Put `web` in both `prod/web.toml` and `staging/web.toml`, then compile the tree. The namespaces differ, but `Config` stores apps under their bare names. Inserting the second `web` used to replace the first without even a warning. The same problem affected jobs and builds.
+
+Until one serialised manifest can represent repeated names across namespaces, the compiler refuses this tree and names both namespaces in its error. Apply the manifests separately or give the resources distinct names. Treating an unrepresentable identity as an error keeps the output honest: a successful compile cannot quietly omit a namespace's workload. Same-namespace duplicate definitions keep the existing deterministic last-file-wins policy and its warning.
+
+The merge returns `Result<Vec<String>, RelishError>`: warnings are the successful value, while an identity collision is an error. The `?` operator on each recursive merge returns that error all the way to the CLI, so it cannot print a partial manifest. Regressions cover apps, jobs and builds with explicit namespaces, plus two directory-derived app namespaces.

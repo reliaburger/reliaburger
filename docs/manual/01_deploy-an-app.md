@@ -164,6 +164,12 @@ the namespace of the apps inside it, and a `_defaults.toml` fills in fields its
 apps leave unset. `diff` compares files, not the live cluster; `apply --dry-run`
 shows what would change on the cluster.
 
+A compiled manifest currently keys apps, jobs and builds by bare name. If two
+resources of the same kind have the same name in different namespaces,
+compilation fails rather than dropping one. Apply those manifests separately
+or give their resources distinct names. Duplicate definitions in one namespace
+use the later file in sorted order and produce a warning.
+
 ## Rolling deploys
 
 Apply a changed app and Bun replaces its instances one at a time, waiting for

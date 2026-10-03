@@ -99,7 +99,7 @@ fn compile_directory_with_defaults(
                     apply_namespace(&mut file_config, ns);
                 }
 
-                for collision in merge_into(&mut merged, file_config) {
+                for collision in merge_into(&mut merged, file_config)? {
                     warnings.push(format!("{}: {collision}", entry_path.display()));
                 }
                 merged_from.push(entry_path.clone());
@@ -126,7 +126,7 @@ fn compile_directory_with_defaults(
                     if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
                         apply_namespace(&mut sub_result.config, ns);
                     }
-                    for collision in merge_into(&mut merged, sub_result.config) {
+                    for collision in merge_into(&mut merged, sub_result.config)? {
                         warnings.push(format!("{}: {collision}", subdir.display()));
                     }
                     merged_from.extend(sub_result.merged_from);
@@ -218,7 +218,7 @@ fn derive_namespace(root: &Path, file: &Path) -> Option<String> {
     parent.file_name()?.to_str().map(String::from)
 }
 
-/// Apply a namespace to all apps and jobs in a config that don't
+/// Apply a namespace to all apps, jobs and builds in a config that don't
 /// already have one set.
 fn apply_namespace(config: &mut Config, namespace: &str) {
     for app in config.app.values_mut() {
@@ -231,52 +231,82 @@ fn apply_namespace(config: &mut Config, namespace: &str) {
             job.namespace = Some(namespace.to_string());
         }
     }
+    for build in config.build.values_mut() {
+        if build.namespace.is_none() {
+            build.namespace = Some(namespace.to_string());
+        }
+    }
 }
 
-/// Merge `source` into `target`, appending all resources.
-///
-/// Returns a warning for every resource the merge *overwrote* (O10). The
-/// maps are keyed by name, so `extend` silently replaced a same-named app
-/// from an earlier file — split your apps across two files, name one twice
-/// by accident, and `compile` would emit one of them with no hint that the
-/// other ever existed. Two apps of the same name in *different* namespaces
-/// are legitimate (DEP1) and are not reported.
-#[must_use]
-fn merge_into(target: &mut Config, source: Config) -> Vec<String> {
+/// Merge resources, refusing identities that the bare-name maps cannot express.
+/// Same-namespace duplicates retain the existing last-file-wins warning policy.
+fn merge_into(target: &mut Config, source: Config) -> Result<Vec<String>, RelishError> {
     let mut collisions = Vec::new();
 
     for (name, spec) in source.app {
-        let namespace = spec.namespace.clone();
-        if let Some(existing) = target.app.get(&name)
-            && existing.namespace == namespace
-        {
+        if let Some(existing) = target.app.get(&name) {
+            check_namespace_collision(
+                "app",
+                &name,
+                existing.namespace.as_deref(),
+                spec.namespace.as_deref(),
+            )?;
             collisions.push(format!(
-                "duplicate app {:?} in namespace {:?}: the later definition wins",
-                name,
-                namespace.as_deref().unwrap_or("default")
+                "duplicate app {name:?} in namespace {:?}: the later definition wins",
+                spec.namespace.as_deref().unwrap_or("default")
             ));
         }
         target.app.insert(name, spec);
     }
-
     for (name, spec) in source.job {
-        let namespace = spec.namespace.clone();
-        if let Some(existing) = target.job.get(&name)
-            && existing.namespace == namespace
-        {
+        if let Some(existing) = target.job.get(&name) {
+            check_namespace_collision(
+                "job",
+                &name,
+                existing.namespace.as_deref(),
+                spec.namespace.as_deref(),
+            )?;
             collisions.push(format!(
-                "duplicate job {:?} in namespace {:?}: the later definition wins",
-                name,
-                namespace.as_deref().unwrap_or("default")
+                "duplicate job {name:?} in namespace {:?}: the later definition wins",
+                spec.namespace.as_deref().unwrap_or("default")
             ));
         }
         target.job.insert(name, spec);
     }
-
+    for (name, spec) in source.build {
+        if let Some(existing) = target.build.get(&name) {
+            check_namespace_collision(
+                "build",
+                &name,
+                existing.namespace.as_deref(),
+                spec.namespace.as_deref(),
+            )?;
+            collisions.push(format!(
+                "duplicate build {name:?} in namespace {:?}: the later definition wins",
+                spec.namespace.as_deref().unwrap_or("default")
+            ));
+        }
+        target.build.insert(name, spec);
+    }
     target.namespace.extend(source.namespace);
     target.permission.extend(source.permission);
-    target.build.extend(source.build);
-    collisions
+    Ok(collisions)
+}
+
+fn check_namespace_collision(
+    kind: &str,
+    name: &str,
+    existing: Option<&str>,
+    incoming: Option<&str>,
+) -> Result<(), RelishError> {
+    let existing = existing.unwrap_or("default");
+    let incoming = incoming.unwrap_or("default");
+    if existing != incoming {
+        return Err(RelishError::FormatFailed(format!(
+            "cannot compile {kind}.{name} from namespaces {existing:?} and {incoming:?} into one manifest: use distinct resource names or apply separate manifests"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -355,30 +385,52 @@ mod tests {
         assert_eq!(result.config.app["web"].image.as_deref(), Some("second:1"));
     }
 
-    /// Two apps of the same name in different namespaces have been
-    /// legitimate since DEP1, and must not be reported as a collision.
     #[test]
-    fn same_app_name_in_two_namespaces_is_not_a_duplicate() {
-        let dir = TempDir::new().unwrap();
-        fs::create_dir(dir.path().join("team-a")).unwrap();
-        fs::create_dir(dir.path().join("team-b")).unwrap();
-        write_file(
-            &dir.path().join("team-a"),
-            "web.toml",
-            "[app.web]\nimage = \"a:1\"\n",
-        );
-        write_file(
-            &dir.path().join("team-b"),
-            "web.toml",
-            "[app.web]\nimage = \"b:1\"\n",
-        );
+    fn cross_namespace_workloads_cannot_be_silently_overwritten() {
+        for kind in ["app", "job", "build"] {
+            let dir = TempDir::new().unwrap();
+            for (file, namespace) in [("a.toml", "prod"), ("b.toml", "staging")] {
+                let fields = if kind == "build" {
+                    "context = \".\"\ndestination = \"pickle://web:1\"\n"
+                } else {
+                    "image = \"image:1\"\n"
+                };
+                write_file(
+                    dir.path(),
+                    file,
+                    &format!("[{kind}.web]\nnamespace = \"{namespace}\"\n{fields}"),
+                );
+            }
+            let error = compile(dir.path())
+                .expect_err("both namespaces cannot fit a bare-name map")
+                .to_string();
+            assert!(
+                error.contains("web") && error.contains("prod") && error.contains("staging"),
+                "{error}"
+            );
+        }
+    }
 
-        let result = compile(dir.path()).unwrap();
-        assert!(
-            !result.warnings.iter().any(|w| w.contains("duplicate app")),
-            "namespaced apps were reported as duplicates: {:?}",
-            result.warnings
-        );
+    #[test]
+    fn directory_namespaces_cannot_lose_same_named_workloads() {
+        for kind in ["app", "job", "build"] {
+            let dir = TempDir::new().unwrap();
+            for namespace in ["prod", "staging"] {
+                let subdir = dir.path().join(namespace);
+                fs::create_dir(&subdir).unwrap();
+                let fields = if kind == "build" {
+                    "context = \".\"\ndestination = \"pickle://web:1\"\n"
+                } else {
+                    "image = \"image:1\"\n"
+                };
+                write_file(&subdir, "web.toml", &format!("[{kind}.web]\n{fields}"));
+            }
+            let error = compile(dir.path()).unwrap_err().to_string();
+            assert!(
+                error.contains("prod") && error.contains("staging"),
+                "{error}"
+            );
+        }
     }
 
     /// O10: a malformed `_defaults.toml` used to be indistinguishable from
