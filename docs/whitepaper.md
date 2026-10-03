@@ -935,7 +935,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 
 ## 23. Comparison Matrix
 
-The Reliaburger column describes 0.1.3. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
+The Reliaburger column describes 0.1.4. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
 
 | | Kubernetes | k3s / k0s | Nomad | Docker Compose | **Reliaburger** |
 |---|---|---|---|---|---|
