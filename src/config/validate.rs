@@ -399,6 +399,15 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
 }
 
 fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
+    if let Some(expression) = &job.schedule {
+        crate::meat::cron::CronSchedule::parse(expression).map_err(|error| {
+            ConfigError::Validation {
+                field: "schedule".to_string(),
+                context: format!("job {name:?}"),
+                reason: error.to_string(),
+            }
+        })?;
+    }
     // Must have at least one of image, exec, or script
     if job.image.is_none() && job.exec.is_none() && job.script.is_none() {
         return Err(ConfigError::MissingImage {
@@ -1519,6 +1528,20 @@ mod tests {
             ))
             .unwrap();
             config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_cron_schedule_is_rejected_during_config_validation() {
+        for expression in ["61 * * * *", "*/0 * * * *", "not a schedule"] {
+            let raw = format!("[job.tick]\nimage=\"busybox\"\nschedule={expression:?}\n");
+            let error = Config::parse(&raw)
+                .unwrap()
+                .validate()
+                .expect_err("invalid schedule must fail admission");
+            assert!(
+                matches!(error, ConfigError::Validation { ref field, .. } if field == "schedule")
+            );
         }
     }
 
