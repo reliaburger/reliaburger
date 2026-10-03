@@ -5,10 +5,12 @@
 #   claimed-pair.sh <artefact dir> <version> <relish>
 #
 # The same bridge LAN as seeded-pair.sh, but the machines boot with no seed
-# and wait to be claimed. `relish machines` must find both over mDNS; node 1
-# is claimed by MAC with --create, and no --network, so node 2, claimed by
-# address afterwards, can only enrol through the join window relish opens on
-# node 1's firewall. The test passes when relish sees both nodes alive.
+# and wait to be claimed. `relish machines` must find both over mDNS. The
+# claims don't wait on that, so a discovery failure can't hide whether the
+# claims work: node 1 is claimed by address with --create, and no --network,
+# so node 2, claimed by address afterwards, can only enrol through the join
+# window relish opens on node 1's firewall. The test passes when relish
+# found both machines over mDNS and sees both nodes alive.
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
 out=$(cd "${1:?usage: claimed-pair.sh <artefact dir> <version> <relish>}" && pwd)
@@ -57,34 +59,65 @@ done
 start=$(date +%s)
 deadline=$((start + 900))
 result=fail
-# Wait until $1 succeeds, or the deadline passes.
+discovery=fail
+# Wait until $1 succeeds, or $deadline passes. relish's errors are kept.
 wait_for() {
-    until "$@" >/dev/null 2>&1; do
+    until "$@" >/dev/null 2>>"$work/relish.err"; do
         [ "$(date +%s)" -lt "$deadline" ] || return 1
         sleep 5
     done
 }
-alive() { [ "$("$relish" nodes 2>/dev/null | grep -c alive)" = "$1" ]; }
-listed() { "$relish" machines --wait 3 | tee "$work/machines.txt" | grep -q "${macs[0]}" && grep -q "${macs[1]}" "$work/machines.txt"; }
-if wait_for listed \
-    && "$relish" machines claim "$work/cluster" --create --name pair --operator 10.42.0.1 \
-        --trust-lan "${macs[0]}" \
+answering() { curl -fsSk --max-time 3 "https://$1:9119/v1/claim"; }
+alive() { [ "$("$relish" nodes 2>>"$work/relish.err" | grep -c alive)" = "$1" ]; }
+listed() {
+    "$relish" machines --wait 3 >"$work/machines.txt" \
+        && grep -q "${macs[0]}" "$work/machines.txt" \
+        && grep -q "${macs[1]}" "$work/machines.txt"
+}
+# Both claim APIs answer first, so discovery gets the same bounded window
+# on every run, however long the boot took.
+if wait_for answering "${ips[0]}" && wait_for answering "${ips[1]}"; then
+    echo "both machines answer on port 9119 after $(($(date +%s) - start)) s"
+    full=$deadline
+    deadline=$(($(date +%s) + 120))
+    if wait_for listed; then
+        discovery=pass
+    fi
+    echo "mDNS discovery: $discovery after $(($(date +%s) - start)) s"
+    deadline=$full
+fi
+if "$relish" machines claim "$work/cluster" --create --name pair --operator 10.42.0.1 \
+        --trust-lan "${ips[0]}" \
     && wait_for alive 1 \
     && "$relish" machines claim "$work/cluster" --trust-lan "${ips[1]}" \
     && wait_for alive 2; then
     result=pass
 fi
-elapsed=$(( $(date +%s) - start ))
+elapsed=$(($(date +%s) - start))
+verdict="claims $result, mDNS discovery $discovery, after ${elapsed} s"
+echo "Claimed pair: $verdict"
+if [ "$result" != pass ] || [ "$discovery" != pass ]; then
+    echo "--- relish machines ---"
+    cat "$work/machines.txt" 2>/dev/null || true
+    echo "--- relish stderr ---"
+    cat "$work/relish.err" 2>/dev/null || true
+    echo "--- dnsmasq log ---"
+    sudo cat "$work/dnsmasq.log" 2>/dev/null || true
+    echo "--- ip route get 224.0.0.251 ---"
+    ip route get 224.0.0.251 || true
+    echo "--- ip -d link show rbbr0 ---"
+    ip -d link show rbbr0 || true
+fi
 for i in 0 1; do
     echo "--- node $((i + 1)) console ---"
     cat "$work/node$i.log" || true
 done
 {
-    echo "### Claimed pair: $result after ${elapsed} s"
+    echo "### Claimed pair: $verdict"
     echo '```'
     cat "$work/machines.txt" 2>/dev/null || true
     "$relish" nodes 2>&1 || true
     grep -a -h "reliaburger:" "$work"/node*.log | grep -v "reliaburger: journal:" || true
     echo '```'
-} >> "$summary"
-[ "$result" = pass ]
+} >>"$summary"
+[ "$result" = pass ] && [ "$discovery" = pass ]

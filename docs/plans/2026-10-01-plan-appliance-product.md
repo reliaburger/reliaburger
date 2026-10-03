@@ -92,7 +92,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 
 ### W5. Claiming machines over the LAN (~3 weeks), [#405](https://github.com/reliaburger/reliaburger/issues/405)
 
-- **Unclaimed nodes:** a claim server (self-signed key, kept until claimed; its fingerprint on tty1) on port 9119 and an mDNS announcement `_reliaburger-unclaimed._tcp` (`mdns-sd`), with no secrets in TXT records. The first valid seed posted wins.
+- **Unclaimed nodes:** a claim server (self-signed key, kept until claimed; its fingerprint on tty1) on port 9119 and an mDNS announcement `_rb-unclaimed._tcp` (`mdns-sd`; RFC 6763 caps a service name at 15 bytes, so not `_reliaburger-unclaimed`), with no secrets in TXT records. The first valid seed posted wins.
 - **On the laptop:**
   - `relish machines` lists unclaimed machines with their fingerprints;
   - `relish machines claim <dir> --create --name <cluster> ... <mac|ip>...` creates a cluster from the machines it claims, node 1 first;
@@ -102,7 +102,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 - **G2, the join window (moved here from W2):** instead of rewriting every node's `bootstrap_peers`, a joining claim asks every node to admit the new address for 15 minutes (`POST /v1/perimeter/admit`, admin, at most 60). The agent's firewall loop re-applies the ruleset when the open windows change. Once the machine has joined, gossip membership keeps it in.
 - **Tests:**
   - the claim API (one valid seed, then 409), the pinned verifier over real TLS on loopback (a wrong pin never delivers the seed), target resolution, join windows and the admit handler's bounds;
-  - `image/tests/claimed-pair.sh` in the appliance workflow: two unseeded VMs found over mDNS, node 1 claimed with `--create` and no `--network`, node 2 claimed afterwards through the join window;
+  - `image/tests/claimed-pair.sh` in the appliance workflow: two unseeded VMs found over mDNS, node 1 claimed by address with `--create` and no `--network`, node 2 claimed afterwards through the join window;
   - a scripted Mac-lab qualification: netboot five VMs, claim them, run the tour, kill one, and write a record in `docs/qualification/`.
 - **Deferred:** a QR code on tty1 (the short fingerprint is what people compare); claiming with `--all`, which would trust whatever answers mDNS.
 
