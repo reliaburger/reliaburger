@@ -211,7 +211,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     record.instance_id
                 ))
             })?;
-            if launch.spec != record.oci_spec
+            if !launch.launched(&record.oci_spec)
                 || jobs
                     .get(&record.instance_id)
                     .is_some_and(|job| job.phase == JobPhase::Preparing)

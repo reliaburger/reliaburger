@@ -563,6 +563,53 @@ async fn reporting_binds_execution_to_the_original_runtime_specification() {
     }
 }
 
+/// #476: a retired Runc intent keeps environment names, not values. Its
+/// launch must still bind to the instance that started it.
+#[tokio::test]
+async fn reporting_binds_a_retired_launch_whose_environment_values_were_scrubbed() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let config = Config::parse(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\n[app.web.env]\nAPI_TOKEN = 'decrypted'\n",
+    )
+    .unwrap();
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    let id = InstanceId("default__web-0".into());
+    let spec = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    assert!(spec.process.env.contains(&"API_TOKEN=decrypted".into()));
+    let launch = crate::grill::RuntimeLaunch {
+        instance_id: id.clone(),
+        spec: spec.without_environment_values(),
+        generation: crate::grill::RuntimeGeneration::process("retired"),
+        network_reference: None,
+    };
+    let expected = crate::grill::RuntimeExecution {
+        instance_id: id.clone(),
+        generation: launch.generation.clone(),
+    };
+    grill.set_launch_inventory(vec![launch.clone()]).await;
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    assert_eq!(rx.await.unwrap().instances[0].execution, Some(expected));
+
+    // Dropping a variable is still a different request.
+    let mut other = launch;
+    other.spec.process.env.clear();
+    grill.set_launch_inventory(vec![other]).await;
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    assert!(rx.await.unwrap().instances[0].execution.is_none());
+}
+
 #[tokio::test]
 async fn late_discovery_subscribers_receive_the_latest_service_snapshot() {
     let (mut agent, _commands, _shutdown) = test_agent();
