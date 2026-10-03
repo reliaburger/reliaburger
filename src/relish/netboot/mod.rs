@@ -79,12 +79,14 @@ impl Arch {
     }
 
     /// The name PXE firmware is told to fetch over TFTP: `ipxe-<a>.efi`.
+    /// It's also the release's full-driver iPXE build's name, but TFTP
+    /// serves whichever build `--ipxe` chose under it.
     pub fn boot_file(self) -> String {
         format!("ipxe-{}.efi", self.ipxe_name())
     }
 
     /// The release's iPXE build that uses the firmware's own network
-    /// driver (SNP), the safer default; `boot_file` serves this one.
+    /// driver (SNP), the safer default.
     pub fn snp_file(self) -> String {
         format!("ipxe-snp-{}.efi", self.ipxe_name())
     }
@@ -93,6 +95,50 @@ impl Arch {
 impl fmt::Display for Arch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.directory())
+    }
+}
+
+/// Which of the release's two iPXE builds TFTP hands to PXE firmware
+/// (`--ipxe`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpxeBuild {
+    /// `snp.efi`, which drives the NIC through the firmware's own network
+    /// driver: what odd NICs (the Wyse's Realtek) need.
+    #[default]
+    Snp,
+    /// `ipxe.efi`, with iPXE's own drivers: for firmware whose network
+    /// stack is broken but whose NIC iPXE knows.
+    Full,
+}
+
+impl IpxeBuild {
+    /// The build's file name in the release, under `netboot/`.
+    pub fn file(self, arch: Arch) -> String {
+        match self {
+            IpxeBuild::Snp => arch.snp_file(),
+            IpxeBuild::Full => arch.boot_file(),
+        }
+    }
+}
+
+impl FromStr for IpxeBuild {
+    type Err = NetbootError;
+
+    fn from_str(input: &str) -> Result<Self, NetbootError> {
+        match input {
+            "snp" => Ok(IpxeBuild::Snp),
+            "full" => Ok(IpxeBuild::Full),
+            _ => Err(NetbootError::InvalidIpxe(input.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for IpxeBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            IpxeBuild::Snp => "snp",
+            IpxeBuild::Full => "full",
+        })
     }
 }
 
@@ -158,6 +204,8 @@ pub struct NetbootOptions {
     pub reinstall: bool,
     /// Machines whose used disk is wiped without asking (`--wipe`).
     pub wipe: Vec<MacAddress>,
+    /// The iPXE build PXE firmware gets.
+    pub ipxe: IpxeBuild,
 }
 
 /// Why `relish netboot` refused to start or stopped.
@@ -193,6 +241,12 @@ pub enum NetbootError {
     InvalidKey(String),
     #[error("invalid MAC address {0:?} (want aa:bb:cc:dd:ee:ff)")]
     InvalidMac(String),
+    #[error("invalid iPXE build {0:?} (want full or snp)")]
+    InvalidIpxe(String),
+    #[error(
+        "--ipxe full needs {file}, which this release doesn't have or doesn't list in its SHA256SUMS; --ipxe snp serves the SNP build instead"
+    )]
+    IpxeMissing { file: PathBuf },
     #[error("invalid duration {0:?} (want a number and s, m, h or d, such as 90m)")]
     InvalidDuration(String),
     #[error("{context}: {source}")]
@@ -275,6 +329,18 @@ mod tests {
         assert_eq!(Arch::from_ipxe_name("i386"), None);
         assert_eq!(Arch::Arm64.boot_file(), "ipxe-arm64.efi");
         assert_eq!(Arch::X86_64.snp_file(), "ipxe-snp-x86_64.efi");
+    }
+
+    #[test]
+    fn the_ipxe_build_is_snp_unless_full_is_asked_for() {
+        assert_eq!(IpxeBuild::default(), IpxeBuild::Snp);
+        assert_eq!("snp".parse::<IpxeBuild>().unwrap(), IpxeBuild::Snp);
+        assert_eq!("full".parse::<IpxeBuild>().unwrap(), IpxeBuild::Full);
+        let error = "ipxe".parse::<IpxeBuild>().unwrap_err().to_string();
+        assert!(error.contains("full or snp"), "{error}");
+        assert_eq!(IpxeBuild::Full.to_string(), "full");
+        assert_eq!(IpxeBuild::Snp.file(Arch::X86_64), "ipxe-snp-x86_64.efi");
+        assert_eq!(IpxeBuild::Full.file(Arch::X86_64), "ipxe-x86_64.efi");
     }
 
     #[test]

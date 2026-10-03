@@ -13,7 +13,8 @@
 # installer reports the used disk, and relish wipes it because --wipe lists
 # the VM's MAC: there's no terminal here to answer the question. The test
 # passes once bun is healthy on it, relish has remembered the machine as
-# installed, and relish's log shows it decided to wipe.
+# installed, relish's log shows it decided to wipe, and relish's start-up
+# probe saw the router's DHCP.
 # Needs root (the bridge, port 67, a loop device), qemu-system-x86, ovmf,
 # dnsmasq, sfdisk, e2fsprogs and /dev/kvm.
 set -euo pipefail
@@ -93,6 +94,10 @@ if [ "$result" = pass ] && ! sudo grep -qi "$mac" "$work/serve/netboot-installed
 fi
 if [ "$result" = pass ] && ! grep -q "$mac.*: disk .*: wiping it and installing (--wipe lists it)" "$work/netboot.log"; then
     result="installed, but relish netboot's log doesn't show the used disk being wiped"
+fi
+# Its start-up probe should have seen the router's dnsmasq hand out addresses.
+if [ "$result" = pass ] && ! grep -q "hands out addresses on rbbr0" "$work/netboot.log"; then
+    result="installed, but relish netboot's probe didn't see the router's DHCP"
 fi
 echo "--- serial console ---"
 cat "$log" || true

@@ -271,7 +271,36 @@ chain --autofree http://192.168.1.20:8080/boot.ipxe?mac=${netX/mac}&uuid=${uuid}
 
 The HTTP handler reads the MAC and SMBIOS UUID from the query and answers with the install script, or with `exit 1` if that machine has fetched the installer before. It remembers machines in a small JSON file next to the artefacts, and only once the whole installer has streamed out, so a download that dies halfway doesn't count. `exit 1` rather than `exit`: UEFI firmware may stop at its boot menu when a boot option returns success, but it moves on to the next one, the disk, after a failure.
 
-The safety rails are small. `--mac` limits who gets answered, `--for` (an hour by default) stops a forgotten server, and before binding anything it broadcasts a PXE DISCOVER of its own and refuses to start if another boot server answers within two seconds, because two ProxyDHCPs race for every machine.
+The safety rails are small. `--mac` limits who gets answered, `--for` (an hour by default) stops a forgotten server, and before binding anything it broadcasts a PXE DISCOVER of its own and listens for two seconds. Another boot server answering stops the start, because two ProxyDHCPs race for every machine. The router answering is what we want. Nothing answering gets a warning but no refusal: "nothing hands out addresses on en7". A ProxyDHCP with no DHCP server beside it boots nothing, and the most likely reason in the lab is a Raspberry Pi that's still booting or a cable in the wrong port.
+
+The listening loop reads well once you know two small idioms:
+
+```rust
+let mut address_server = None;
+let deadline = tokio::time::Instant::now() + wait;
+while let Ok(received) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
+{
+    let (len, source) = received?;
+    …
+    if let Some(server) = dhcp::competing_server(&reply, xid, *source.ip())
+        && server != own
+    {
+        return Ok(Network::BootServer(server));
+    }
+    if let Some(server) = dhcp::address_server(&reply, xid, *source.ip()) {
+        address_server.get_or_insert(server);
+    }
+}
+Ok(address_server.map_or(Network::Silent, Network::AddressServer))
+```
+
+`timeout_at` wraps a future and returns `Err(Elapsed)` if the deadline passes first, so `while let Ok(…)` keeps reading until time's up, and the deadline is fixed once rather than restarted by every packet. `get_or_insert` keeps the first router we hear. `map_or` turns the `Option` into the answer: `Silent` for `None`, and for `Some(server)` the enum variant itself, used as a function. In Rust a tuple variant like `Network::AddressServer` *is* a function from `Ipv4Addr` to `Network`, which reads better than `|s| Network::AddressServer(s)`. The probe takes its socket and its target as arguments, so the tests run it on loopback against a fake router, a fake competitor and silence, without root or a LAN.
+
+Making it work on a Mac taught us two things about BSD sockets. The probe listens on UDP 68, the DHCP client port, which the machine's own DHCP client may hold. On macOS, `configd` didn't hold it at all on our M2 while idle, but it may open it to renew a lease. Linux's `SO_REUSEADDR` lets two UDP sockets share a port loosely; BSD's doesn't, and the flag that does is `SO_REUSEPORT`, which both sockets must set. When they do, a broadcast goes to both, so the probe gets its copy of the router's offer without stealing it from anyone. The probe sets both flags. The servers' own sockets on 67, 69 and 4011 set neither: two netboot servers sharing port 67 would split the requests between them instead of the second one failing to start, which is the race we refuse elsewhere. They used to set `SO_REUSEADDR` out of habit, which is harmless on a Mac. CI caught it on the first Linux run: there, two sockets that both set it share the port, and a test that expected the second bind to fail watched it succeed. UDP has no `TIME_WAIT`, so the flag was buying nothing anyway.
+
+The second thing: since Mojave, macOS lets any user bind a port below 1024 on `0.0.0.0`, but not on a specific address. So DHCP binds without sudo on a Mac, and TFTP, which listens on the interface's own address, is what asks for root.
+
+Two smaller fixes came from the Mac lab plan. An interface whose DHCP never answered gets a self-assigned `169.254.x.x` address from macOS, and relish used to serve from it, telling machines to fetch iPXE from an address they can't reach. `interface::pick` now refuses one and says what to check. And TFTP can hand out either of the two iPXE builds CI makes: `snp`, the default, or `full` with `--ipxe full`, for a machine whose firmware network stack misbehaves. Both are hashed and held in memory at start-up like the SNP build always was, so the choice is just which bytes go under the name DHCP gave out.
 
 What `relish netboot` serves comes from `relish image download`, and that command first guessed the wrong architecture. Its `--arch` defaulted to `std::env::consts::ARCH`, the architecture relish itself was compiled for. On the maintainer's lab, an M2 MacBook serving ten x86_64 Wyses, that's `aarch64`: the download worked, the signatures checked out, and not one Wyse could have booted what it saved. The laptop that serves the files is rarely the architecture of the machines that run them. So the download now fetches every architecture the release offers, and `--arch` narrows it:
 
