@@ -688,7 +688,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 result => result?,
             }
         }
-        self.withdraw_service_ebpf(&service_id).await?;
+        // In a cluster the kernel entry also names other nodes' backends and
+        // the new replicas; only the old instances leave it (#481). The
+        // stepped rollout took them out of the local map, not the installed
+        // view, so every local backend there that isn't a replacement is old.
+        let replaced: Vec<InstanceId> = self
+            .service_map_tx
+            .borrow()
+            .resolve(&service_id)
+            .map(|entry| {
+                entry
+                    .backends
+                    .iter()
+                    .filter(|backend| backend.local)
+                    .filter(|backend| !new_ids.iter().any(|new| new.0 == backend.instance_id))
+                    .map(|backend| InstanceId(backend.instance_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !self
+            .withdraw_backends_from_view(&service_id, &replaced)
+            .await?
+        {
+            self.withdraw_service_ebpf(&service_id).await?;
+        }
         // Re-registration can be refused: a stop that withdrew the council's
         // allocation mid-rollout leaves nothing to register against. The
         // retained replacements then retire by proving withdrawal against
