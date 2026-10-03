@@ -279,6 +279,33 @@ pub struct NewCluster {
     pub network: Option<String>,
     pub faults: bool,
     pub external_signing_key: Option<String>,
+    /// How many voters the council grows to.
+    pub council_size: crate::council::CouncilSize,
+}
+
+impl NewCluster {
+    /// What `bare_metal::create` is asked for when this cluster is made
+    /// from the claimed `machines`, node 1 first.
+    pub fn create_options(
+        &self,
+        directory: &std::path::Path,
+        machines: Vec<(String, IpAddr)>,
+        token_ttl: Duration,
+        ssh_key: Option<Vec<u8>>,
+    ) -> bare_metal::CreateOptions {
+        bare_metal::CreateOptions {
+            directory: directory.to_path_buf(),
+            cluster: self.name.clone(),
+            machines,
+            operators: self.operators.clone(),
+            network: self.network.clone(),
+            faults: self.faults,
+            ssh_key,
+            token_ttl,
+            external_signing_key: self.external_signing_key.clone(),
+            council_size: self.council_size,
+        }
+    }
 }
 
 /// What `relish machines claim` was asked to do.
@@ -363,17 +390,12 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         .collect();
     let (created, seeds) = match &options.create {
         Some(cluster) => {
-            let created = bare_metal::create(&bare_metal::CreateOptions {
-                directory: options.directory.clone(),
-                cluster: cluster.name.clone(),
-                machines: pairs,
-                operators: cluster.operators.clone(),
-                network: cluster.network.clone(),
-                faults: cluster.faults,
-                ssh_key: options.ssh_key.clone(),
-                token_ttl: options.token_ttl,
-                external_signing_key: cluster.external_signing_key.clone(),
-            })?;
+            let created = bare_metal::create(&cluster.create_options(
+                &options.directory,
+                pairs,
+                options.token_ttl,
+                options.ssh_key.clone(),
+            ))?;
             let seeds = created
                 .fleet
                 .nodes
@@ -553,6 +575,33 @@ mod tests {
             "an address that also announced itself is checked against its announcement"
         );
         assert!(resolve(&["d8:9e:f3:00:00:00".to_string()], &machines).is_err());
+    }
+
+    #[test]
+    fn claim_create_hands_the_council_size_to_the_new_cluster() {
+        let cluster = NewCluster {
+            name: "lab".into(),
+            operators: vec!["10.42.0.1".into()],
+            network: None,
+            faults: false,
+            external_signing_key: None,
+            council_size: crate::council::CouncilSize::APPLIANCE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let options = cluster.create_options(
+            dir.path(),
+            vec![("d8:9e:f3:00:00:01".into(), "10.42.0.11".parse().unwrap())],
+            Duration::from_secs(3600),
+            None,
+        );
+        assert_eq!(options.council_size, crate::council::CouncilSize::APPLIANCE);
+        assert_eq!(options.cluster, "lab");
+        let created = bare_metal::create(&options).unwrap();
+        assert_eq!(
+            created.fleet.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE),
+            "fleet.json records it"
+        );
     }
 
     /// The whole claim over real TLS on loopback: inspect learns the key,

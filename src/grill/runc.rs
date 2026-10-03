@@ -184,8 +184,12 @@ impl RuncGrill {
         commands: &impl RuntimeCommandExecutor,
     ) -> Result<(), GrillError> {
         let bundle_dir = self.bundle_base.join(&instance.0);
-        tokio::fs::create_dir_all(&bundle_dir)
+        // The bundle will hold the decrypted environment: root-only.
+        let private = bundle_dir.clone();
+        tokio::task::spawn_blocking(move || super::bundle::create_private_directory(&private))
             .await
+            .map_err(std::io::Error::other)
+            .and_then(|result| result)
             .map_err(|e| GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: format!("failed to create bundle dir: {e}"),
@@ -368,14 +372,18 @@ impl RuncGrill {
                 reason: format!("failed to create runc state dir: {e}"),
             })?;
 
-        // Write the OCI spec as config.json
-        let spec_json =
-            serde_json::to_string_pretty(&spec).map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to serialise OCI spec: {e}"),
-            })?;
-        tokio::fs::write(bundle_dir.join("config.json"), spec_json)
+        // Write the OCI spec as config.json. Its env holds decrypted
+        // secrets, so only the owner may read it, and a crash mid-write
+        // never leaves a truncated spec for runc.
+        let spec_json = serde_json::to_vec_pretty(&spec).map_err(|e| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("failed to serialise OCI spec: {e}"),
+        })?;
+        let private = bundle_dir.clone();
+        tokio::task::spawn_blocking(move || super::bundle::write_spec(&private, &spec_json))
             .await
+            .map_err(std::io::Error::other)
+            .and_then(|result| result)
             .map_err(|e| GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: format!("failed to write config.json: {e}"),
@@ -675,6 +683,15 @@ mod tests {
         .unwrap()
     }
 
+    /// The bundle holds decrypted env: only its owner may list or read it.
+    fn assert_private_bundle(bundle: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(bundle), 0o711, "bundle directory mode");
+        assert_eq!(mode(&bundle.join("config.json")), 0o600, "config.json mode");
+    }
+
     #[tokio::test]
     async fn duplicate_rootless_create_preserves_preparation_until_retirement() {
         let root = tempfile::tempdir().unwrap();
@@ -689,16 +706,22 @@ mod tests {
         let id = InstanceId("default__duplicate-0".into());
         let bundle = root.path().join("bundles").join(&id.0).join("config.json");
         grill.create(&id, &preparation_spec("first")).await.unwrap();
+        assert_private_bundle(bundle.parent().unwrap());
         let original = std::fs::read(&bundle).unwrap();
         let replacement = grill.create(&id, &preparation_spec("second")).await;
         let preserved = std::fs::read(&bundle).unwrap() == original;
         grill.kill(&id).await.unwrap();
+        assert!(
+            !bundle.exists(),
+            "retirement must delete the spec and its decrypted env"
+        );
         grill
             .create(&id, &preparation_spec("second"))
             .await
             .unwrap();
         let replaced = std::fs::read(&bundle).unwrap() != original;
         grill.kill(&id).await.unwrap();
+        assert!(!bundle.exists());
         assert!(
             replacement.is_err(),
             "duplicate create discarded the existing runtime owner"
@@ -1031,11 +1054,23 @@ mod tests {
             },
         };
 
+        // Read the first instance's spec while it still owns its bundle: once
+        // the DNS client exits, cleanup deletes `config.json` (it holds the
+        // decrypted environment).
+        let config_path = tmp
+            .path()
+            .join("bundles")
+            .join(&ids[0].0)
+            .join("config.json");
+        let mut first_config = None;
         for id in &ids {
             grill
                 .create(id, &spec)
                 .await
                 .expect("create a rootful runc workload and netns");
+            if first_config.is_none() {
+                first_config = Some(std::fs::read(&config_path).unwrap());
+            }
             grill.start(id).await.expect("start a DNS client");
         }
 
@@ -1082,16 +1117,8 @@ mod tests {
             );
         }
 
-        let config: crate::grill::oci::OciSpec = serde_json::from_slice(
-            &std::fs::read(
-                tmp.path()
-                    .join("bundles")
-                    .join(&ids[0].0)
-                    .join("config.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let config: crate::grill::oci::OciSpec =
+            serde_json::from_slice(&first_config.expect("the first spec was read")).unwrap();
         let resolver_mount = config
             .mounts
             .iter()
@@ -1187,6 +1214,9 @@ mod tests {
             grill.start(id).await.expect("start rootfs writer");
         }
 
+        for id in &ids {
+            assert_private_bundle(&tmp.path().join("bundles").join(&id.0));
+        }
         let configs: Vec<crate::grill::oci::OciSpec> = ids
             .iter()
             .map(|id| {
@@ -1237,6 +1267,16 @@ mod tests {
             assert!(
                 !crate::grill::rootfs::is_mountpoint(rootfs),
                 "natural exit must not leak an overlay mount"
+            );
+        }
+        for id in &ids {
+            assert!(
+                !tmp.path()
+                    .join("bundles")
+                    .join(&id.0)
+                    .join("config.json")
+                    .exists(),
+                "natural exit must delete the spec and its decrypted env"
             );
         }
 

@@ -163,15 +163,18 @@ impl TuiApp {
                     });
                 }
             }
-            for job in self.data.jobs.iter().map(|job| &job.row) {
+            for tagged in &self.data.jobs {
+                let job = &tagged.row;
                 if job.name.to_lowercase().contains(&query) {
                     hits.push(SearchHit {
                         kind: "job".into(),
                         name: job.name.clone(),
-                        context: job.namespace.clone(),
+                        context: format!("{} on {}", job.namespace, tagged.node),
                         target: View::JobDetail {
                             name: job.name.clone(),
                             namespace: job.namespace.clone(),
+                            node: tagged.node.clone(),
+                            instance: job.instance_id.clone(),
                         },
                     });
                 }

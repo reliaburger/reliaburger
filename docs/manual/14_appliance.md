@@ -21,8 +21,13 @@ It's a **preview**, and the rough edges are part of what it's for:
   - wired to the same network.
 
   **The installer erases the largest built-in disk.**
-- **Your router**, with a DHCP reservation for each machine, so each keeps the
-  same address. Nodes find each other by address.
+- **A router you control**, with a DHCP reservation for each machine, so each
+  keeps the same address. Nodes find each other by address, and they need the
+  router's default route to work out their own. Your home router will do. On
+  an isolated switch, a Raspberry Pi can be the router:
+  [`image/lab/pi/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/pi/README.md)
+  sets one up with DHCP, DNS, NTP and NAT. Leave booting to `relish netboot`:
+  the router must not answer PXE.
 - **A machine on that network to serve the netboot**: your laptop (Linux or
   macOS), any spare box, or a VM bridged onto the LAN. It needs `relish` and
   root.
@@ -265,6 +270,14 @@ relish cluster create --bare-metal ~/home-cluster --name home \
   cluster ports before they've joined (those ports all need the cluster's
   certificates). Without it, only the machines listed here get through.
 - The machines become `home-1`, `home-2` and `home-3`.
+- The council, the machines that hold the cluster's state and vote on every
+  change, grows to five voters. Five ride out two failures at once. Seven
+  would ride out three, but every voter keeps the council's log and votes on
+  every write, which 2 GB machines feel.
+  `--council-size` takes another odd number from 1 to 7. An even size is
+  refused: four voters survive no more failures than three. A cluster with
+  fewer machines than its size makes every machine a voter. `relish council`
+  shows the size as `Size: up to 5 voters`.
 
 The cluster's keys are made here, on your laptop, and never anywhere else
 until node 1's seed carries them. `~/home-cluster/secrets` holds the master
@@ -348,7 +361,8 @@ ADDRESS           MAC               ARCH     CLAIM KEY
 ```
 
 Create the cluster from them, node 1 first. relish takes the same options as
-`relish cluster create`, and the machines by MAC or by address:
+`relish cluster create`, `--council-size` included, and the machines by MAC
+or by address:
 
 ```sh
 relish machines claim ~/home-cluster --create --name home \

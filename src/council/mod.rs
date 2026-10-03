@@ -25,7 +25,9 @@ pub mod types;
 
 pub use apply::{config_to_desired_writes, config_to_leased_writes};
 pub use node::CouncilNode;
-pub use selection::{CouncilSelectionConfig, select_council_candidates};
+pub use selection::{
+    CouncilSelectionConfig, CouncilSize, CouncilSizeError, select_council_candidates,
+};
 pub use state_machine::SnapshotStoreError;
 pub use types::{
     CouncilConfig, CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig,

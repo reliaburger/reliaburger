@@ -118,7 +118,7 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 
 | Step | Command | State |
 |---|---|---|
-| Pi up as router | dnsmasq, nftables, chrony (`image/lab/pi/`, PR 4) | To write |
+| Pi up as router | dnsmasq, nftables, chrony (`image/lab/pi/`, PR 4) | Written and parse-checked in CI; not yet run on a Pi |
 | BIOS, each Wyse | F2, password `Fireport`: BIOS 1.2.5, UEFI with CSM off, UEFI network stack and PXE on, Secure Boot off, power on after AC loss | Manual, ~5 min a unit (S5 runbook step 1) |
 | relish for the Mac | `cargo build --release --bin relish` on `appliance-train` | Real |
 | Images | `gh run download … -n appliance-x86_64` (lab build) | Real, preview signing until 0.3.0 publishes |
@@ -127,7 +127,7 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 | Claim | `relish machines`, then `relish machines claim ~/wyse --create --name wyse --operator 10.77.0.2 --network 10.77.0.0/24 <mac-1> <mac-2> <mac-3>`, then `relish machines claim ~/wyse <mac-4> … <mac-10>` | Real; CI covers two VMs (`image/tests/claimed-pair.sh`) |
 | Check | `relish nodes`, `relish council`, `relish wtf` | Real |
 | Tour | `relish apply …`, ingress on port 80 of each node | Real |
-| Measure | `image/tools/fleet-measure.sh` | Preview script; reads a `seed-fleet.sh` directory, not a claim directory (PR 6) |
+| Measure | `image/tools/fleet-measure.sh ~/wyse` | Preview script; reads a claim directory, a `seed-fleet.sh` directory or `relish nodes` (PR 6) |
 | OS update | `relish os upgrade <next> --channel http://10.77.0.2:8000/…/os-channel.json` | Real; needs a next version from the same run (PR 5) |
 
 The claim asks you to compare each machine's claim key with its monitor. With one DisplayPort monitor and ten machines, that's ten cable swaps; `--trust-lan` skips it, which is fine on an isolated switch with nothing else on it.

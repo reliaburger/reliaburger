@@ -3,7 +3,7 @@
 //! A machine that boots with no seed becomes *unclaimed*. It makes a
 //! self-signed key (kept until it's claimed), shows the key's fingerprint
 //! on its console, announces itself over mDNS as
-//! `_reliaburger-unclaimed._tcp` (no secrets in the announcement) and
+//! `_rb-unclaimed._tcp` (no secrets in the announcement) and
 //! serves a claim API over TLS on [`CLAIM_PORT`]. `relish machines claim`
 //! posts it a seed, over a connection pinned to that fingerprint, so the
 //! seed's secrets can only reach the machine whose console shows it. From
@@ -32,8 +32,10 @@ use super::seed::Seed;
 /// The claim API's port.
 pub const CLAIM_PORT: u16 = 9119;
 
-/// The mDNS service an unclaimed machine announces.
-pub const SERVICE_TYPE: &str = "_reliaburger-unclaimed._tcp.local.";
+/// The mDNS service an unclaimed machine announces. RFC 6763 §7.2 allows
+/// a service name of at most 15 bytes, and mdns-sd silently drops a
+/// registration with a longer one (`_reliaburger-unclaimed` was 21).
+pub const SERVICE_TYPE: &str = "_rb-unclaimed._tcp.local.";
 
 /// What an unclaimed machine tells whoever asks (and its mDNS TXT record):
 /// nothing secret.
@@ -165,7 +167,13 @@ pub async fn serve_until_claimed(
 ) -> std::io::Result<()> {
     let listener =
         tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], CLAIM_PORT))).await?;
-    let announcement = announce(&info);
+    let announcement = match announce(&info) {
+        Ok(daemon) => Some(daemon),
+        Err(error) => {
+            eprintln!("reliaburger: not announcing over mDNS ({error}); claim by address");
+            None
+        }
+    };
     let served = serve(listener, key, info, seed_path).await;
     if let Some(daemon) = announcement {
         let _ = daemon.shutdown();
@@ -210,11 +218,11 @@ pub async fn serve(
     Ok(())
 }
 
-/// Announce `_reliaburger-unclaimed._tcp` with the machine's MACs,
+/// Announce `_rb-unclaimed._tcp` with the machine's MACs,
 /// architecture and short fingerprint. Best effort: claiming by address
 /// works without it.
-fn announce(info: &MachineInfo) -> Option<mdns_sd::ServiceDaemon> {
-    let daemon = mdns_sd::ServiceDaemon::new().ok()?;
+fn announce(info: &MachineInfo) -> mdns_sd::Result<mdns_sd::ServiceDaemon> {
+    let daemon = mdns_sd::ServiceDaemon::new()?;
     let instance = info
         .macs
         .first()
@@ -233,11 +241,10 @@ fn announce(info: &MachineInfo) -> Option<mdns_sd::ServiceDaemon> {
         "",
         CLAIM_PORT,
         &properties[..],
-    )
-    .ok()?
+    )?
     .enable_addr_auto();
-    daemon.register(service).ok()?;
-    Some(daemon)
+    daemon.register(service)?;
+    Ok(daemon)
 }
 
 #[cfg(test)]
@@ -260,6 +267,40 @@ mod tests {
             short_fingerprint("sha256:3f9a12bc77de0a41ffffeeee"),
             "3f9a-12bc-77de-0a41"
         );
+    }
+
+    /// RFC 6763 §7.2 caps a service name at 15 bytes, and mdns-sd enforces
+    /// it inside its daemon thread: `register` still returns `Ok`, the
+    /// announcement is dropped, and nothing on the LAN ever sees the machine.
+    #[test]
+    fn the_service_type_fits_the_mdns_service_name_limit() {
+        let name = SERVICE_TYPE
+            .strip_prefix('_')
+            .and_then(|rest| rest.strip_suffix("._tcp.local."))
+            .unwrap();
+        assert!(
+            name.len() <= mdns_sd::SERVICE_NAME_LEN_MAX_DEFAULT as usize,
+            "{name:?} is {} bytes",
+            name.len()
+        );
+    }
+
+    /// The announcement and `relish machines`' browse, through real mDNS
+    /// over this host's interfaces.
+    #[test]
+    fn an_announced_machine_is_found_by_browsing() {
+        let mut machine = info();
+        machine.macs = vec!["02:00:5e:10:00:01".into()];
+        let daemon = announce(&machine).unwrap();
+        let found = crate::relish::machines::browse(std::time::Duration::from_secs(4)).unwrap();
+        let _ = daemon.shutdown();
+        let ours = crate::relish::machines::find(&found, "02:00:5e:10:00:01")
+            .unwrap_or_else(|| panic!("not among {found:?}"));
+        assert_eq!(
+            ours.short_fingerprint,
+            short_fingerprint(&machine.fingerprint)
+        );
+        assert_eq!(ours.arch, "x86_64");
     }
 
     #[test]

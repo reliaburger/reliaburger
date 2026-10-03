@@ -115,7 +115,8 @@ step() {
 # Two burger instances running: the demo app's replicas.
 burgers_running() {
     "$relish" status 2>/dev/null | awk '
-        NR > 1 && $3 == "burger" && $5 == "running" { n++ } END { exit !(n >= 2) }'
+        $1 == "NODE" { rows = 1; next }
+        rows && $3 == "burger" && $5 == "running" { n++ } END { exit !(n >= 2) }'
 }
 
 # The quickstart's ingress forward, from the context setup saved.
@@ -126,7 +127,8 @@ ingress_origin() {
 # Every instance running, with at least one of each tour app.
 apps_running() {
     "$relish" status 2>/dev/null | awk '
-        NR > 1 && NF >= 5 { seen[$3] = 1; if ($5 != "running") pending = 1 }
+        $1 == "NODE" { rows = 1; next }
+        rows && NF >= 5 { seen[$3] = 1; if ($5 != "running") pending = 1 }
         END { exit !(!pending && seen["frontend"] && seen["backend"] && seen["redis"] && seen["loadgen"]) }'
 }
 

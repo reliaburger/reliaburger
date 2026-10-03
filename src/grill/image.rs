@@ -125,20 +125,28 @@ impl ImageReference {
 /// the tag position — content addressing makes a tag redundant, and
 /// downstream code recognises the `sha256:` prefix.
 fn split_name_tag(s: &str) -> (&str, String) {
+    // A digest wins over a tag. A reference bound at apply carries both
+    // (`nginx:1.27@sha256:…`): the tag is for people, so drop it here.
     if let Some((name, digest)) = s.split_once('@') {
+        let (name, _tag) = split_tag(name);
         return (name, digest.to_string());
     }
+    match split_tag(s) {
+        (name, Some(tag)) => (name, tag.to_string()),
+        (name, None) => (name, "latest".to_string()),
+    }
+}
 
-    // Find the last `/` to separate the path from the potential tag
+/// Split `name:tag` at the tag's `:`. Only a `:` after the last `/` starts a
+/// tag; one before it is a registry port (`localhost:5000/app`).
+fn split_tag(s: &str) -> (&str, Option<&str>) {
     let after_last_slash = s.rfind('/').map(|i| i + 1).unwrap_or(0);
-    let tail = &s[after_last_slash..];
-
-    // Look for `:` in the tail portion (after the last `/`)
-    if let Some(colon_pos) = tail.rfind(':') {
-        let absolute_colon = after_last_slash + colon_pos;
-        (&s[..absolute_colon], s[absolute_colon + 1..].to_string())
-    } else {
-        (s, "latest".to_string())
+    match s[after_last_slash..].rfind(':') {
+        Some(colon) => {
+            let at = after_last_slash + colon;
+            (&s[..at], Some(&s[at + 1..]))
+        }
+        None => (s, None),
     }
 }
 
@@ -1091,6 +1099,36 @@ mod tests {
             format!("docker.io/library/myapp@{digest}")
         );
         assert!(r.to_oci_reference().is_ok());
+    }
+
+    /// F03 U1: a reference bound at apply keeps its tag for people to read
+    /// and its digest for the pull (`nginx:1.27@sha256:…`). The digest
+    /// decides what's pulled; the tag must not leak into the repository.
+    #[test]
+    fn parse_tag_and_digest_reference() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        for (input, registry, repository) in [
+            ("nginx:1.27", "docker.io", "library/nginx"),
+            ("acme/web:v2", "docker.io", "acme/web"),
+            ("ghcr.io/org/app:v1", "ghcr.io", "org/app"),
+            ("localhost:5000/app:v1", "localhost:5000", "app"),
+        ] {
+            let r = ImageReference::parse(&format!("{input}@{digest}")).unwrap();
+            assert_eq!(r.registry, registry, "{input}");
+            assert_eq!(r.repository, repository, "{input}");
+            assert_eq!(r.tag, digest, "{input}");
+            assert!(r.to_oci_reference().is_ok(), "{input}");
+        }
+    }
+
+    /// A port in the registry is not a tag, with or without a digest.
+    #[test]
+    fn parse_registry_port_with_digest_and_no_tag() {
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let r = ImageReference::parse(&format!("localhost:5000/app@{digest}")).unwrap();
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.repository, "app");
+        assert_eq!(r.tag, digest);
     }
 
     // -- Store path construction -----------------------------------------------

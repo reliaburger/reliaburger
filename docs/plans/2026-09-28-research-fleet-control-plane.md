@@ -388,7 +388,7 @@ Today `join-token create` and node decommission require `ApiRole::Admin` (`src/s
 
 ### 6.1 mDNS on the LAN (v0)
 
-bun in appliance mode announces `_reliaburger-machine._tcp` (the appliance note's `_reliaburger-unclaimed._tcp`, generalised to every state), with no secrets in the TXT record:
+bun in appliance mode announces `_reliaburger-machine._tcp` (the appliance note's `_reliaburger-unclaimed._tcp`, generalised to every state; both names break RFC 6763's 15-byte limit, so the code uses `_rb-unclaimed._tcp` and this needs a short name too), with no secrets in the TXT record:
 - `v=1` (the protocol version);
 - `mk=<machine key fingerprint>`;
 - `st=unclaimed|available|member`;

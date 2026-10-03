@@ -49,6 +49,9 @@ pub struct CouncilNodeObservation {
     pub last_log_index: Option<u64>,
     /// The council membership it holds.
     pub members: Vec<CouncilMemberObservation>,
+    /// How many voters the council grows to, when the cluster set a size.
+    #[serde(default)]
+    pub council_size: Option<crate::council::CouncilSize>,
 }
 
 impl CouncilNodeObservation {
@@ -72,6 +75,7 @@ impl CouncilNodeObservation {
                     voter: member.voter,
                 })
                 .collect(),
+            council_size: status.council_size,
         }
     }
 
@@ -88,6 +92,7 @@ impl CouncilNodeObservation {
             last_applied: None,
             last_log_index: None,
             members: Vec::new(),
+            council_size: None,
         }
     }
 
@@ -391,6 +396,13 @@ pub fn render_council_status(
     let _ = writeln!(out, "Epoch:   {epoch}");
     let _ = writeln!(out, "Leader:  {leader}");
     let _ = writeln!(out, "Quorum:  {quorum}");
+    if let Some(size) = observations
+        .iter()
+        .filter(|node| node.serving())
+        .find_map(|node| node.council_size)
+    {
+        let _ = writeln!(out, "Size:    up to {size} voters");
+    }
     out.push('\n');
 
     let width = observations
@@ -494,6 +506,7 @@ mod tests {
                 member("node-2", true),
                 member("node-3", true),
             ],
+            council_size: None,
         }
     }
 
@@ -598,6 +611,23 @@ mod tests {
     fn council_status_table_for_a_healthy_council() {
         let nodes = healthy();
         insta::assert_snapshot!(render_council_status(&nodes, &summarise(&nodes)));
+    }
+
+    #[test]
+    fn council_status_names_the_size_the_cluster_was_created_with() {
+        let mut nodes = healthy();
+        let table = render_council_status(&nodes, &summarise(&nodes));
+        assert!(!table.contains("Size:"), "no size set, no line:\n{table}");
+        for node in &mut nodes {
+            node.council_size = Some(crate::council::CouncilSize::APPLIANCE);
+        }
+        let table = render_council_status(&nodes, &summarise(&nodes));
+        assert!(
+            table.contains("Quorum:  3/3 voters, quorum ok\nSize:    up to 5 voters\n"),
+            "{table}"
+        );
+        let json = serde_json::to_value(&nodes[0]).unwrap();
+        assert_eq!(json["council_size"], 5);
     }
 
     #[test]

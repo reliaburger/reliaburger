@@ -636,6 +636,7 @@ async fn logs_follow_returns_output_for_completed_job() {
             app_name: "echoer2".to_string(),
             namespace: "default".to_string(),
             tail: None,
+            instance: None,
             label: None,
             lines: event_tx,
         })

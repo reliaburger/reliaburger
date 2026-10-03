@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod authority;
+pub mod binding;
 pub mod build;
 pub mod capability;
 pub mod copy;
