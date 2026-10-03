@@ -11091,6 +11091,7 @@ async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
     };
     let (response, reply) = oneshot::channel();
     agent.handle_command(answer(1, response)).await;
+    agent.finish_consumer_syncs().await;
     assert!(reply.await.unwrap().unwrap().published);
     assert!(lease.is_valid(), "publishing the leader's answer renews it");
     assert_eq!(backends(&agent, "web"), Some(vec![own.clone()]));
@@ -11130,6 +11131,7 @@ async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
     // The next answer, even for the same catalogue, restores the rest.
     let (response, reply) = oneshot::channel();
     agent.handle_command(answer(1, response)).await;
+    agent.finish_consumer_syncs().await;
     assert!(reply.await.unwrap().unwrap().published);
     assert!(lease.is_valid());
     assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
