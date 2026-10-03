@@ -8,8 +8,9 @@ boots from the network once, installs itself in under a minute, and from then
 on it's a node.
 
 It's a **preview**, and the rough edges are part of what it's for:
-- The images come from CI runs of the appliance branch, kept for a day, each
-  signed with a throwaway key.
+- The images come from CI runs of the appliance branch, each signed with a
+  throwaway key. A run you start by hand keeps them for a week; a pull
+  request's run, for a day.
 - We've run all of it in QEMU VMs, both aarch64 and x86_64. Real hardware (a
   fleet of Dell Wyse 3040s) comes next, so expect firmware surprises.
 
@@ -34,11 +35,14 @@ It's a **preview**, and the rough edges are part of what it's for:
 
 ## Get the images
 
-The appliance workflow builds both architectures on every change. Take the
-newest green run:
+The appliance workflow builds both architectures on every change. For a lab
+day, start a run by hand (Actions → Appliance image → Run workflow, on the
+appliance branch, with `publish` left off), so its artefacts last a week rather
+than a day. GitHub only offers that once the workflow is on `main`; until
+then, take the newest green pull request run and download it the same day:
 
 ```sh
-gh run list --workflow appliance.yml --branch feat/appliance-image
+gh run list --workflow appliance.yml --status success
 gh run download <run-id> -n appliance-x86_64 -D art/x86_64
 gh run download <run-id> -n appliance-aarch64 -D art/aarch64
 ```
@@ -369,10 +373,47 @@ Nodes installed from an image older than 2026.40.51 have no record of what
 their image shipped, so their first update keeps every file that differs
 from the new image; reinstall them to start clean.
 
+### Updating a CI build
+
+A CI run's images trust only that run's throwaway key, so they can't update
+to a published release or to another run's build. So each x86_64 run also
+builds the next version, one build number on (`2026.41.7` → `2026.41.8`),
+signed with the same key, and uploads it as `appliance-x86_64-next`, laid out
+like a GitHub release beside a lab `os-channel.json` that names it. Serve it
+from your laptop, on the machines' network:
+
+```sh
+gh run download <run-id> -n appliance-x86_64-next -D next
+(cd next && python3 -m http.server 8000)
+```
+
+Then name the version when you roll it out:
+
+```sh
+relish os upgrade 2026.41.8 \
+  --channel http://192.168.1.10:8000/releases/download/os-channel/os-channel.json
+relish os status
+```
+
+The nodes fetch the release from beside that channel and check it against
+the key their own image carries. relish itself trusts only the release key,
+so `relish os list --channel …` warns that it can't read this channel and
+shows the newest release as unknown, and `relish os upgrade` without a
+version refuses it. To check the channel by hand, it's signed like a
+published one:
+
+```sh
+openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \
+  -in next/releases/download/os-channel/os-channel.json \
+  -sigfile next/releases/download/os-channel/os-channel.json.sig
+```
+
 ## What's missing
 
-- **OS updates need published releases.** Each CI run's images trust only
-  that run's throwaway key, so they can't update to another run's.
+- **A CI build can only update to its own next version.** Each run's images
+  trust only that run's throwaway key. Published releases update to each
+  other, and to anything the release key signs.
+- **CI builds no next version for arm64**, only for x86_64.
 - **Secure Boot** has to be off.
 - **Two machines can't roll a bun upgrade.** Both are in the council, and
   upgrading one would leave the other without a majority, so

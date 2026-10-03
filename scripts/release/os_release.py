@@ -14,6 +14,10 @@ Subcommands, each run by .github/workflows/appliance.yml:
       os-channel.json.sig. The SHA256SUMS lists every artefact's digest, so
       the channel vouches for the whole release; bun and relish verify it
       (src/os/channel.rs).
+  lab-channel --key KEY.der --version V --out DIR ARCH=SUMS...
+      The same channel for a CI lab build, signed with that run's throwaway
+      key (DER PKCS#8) instead of the release key, which it never reads. It
+      names the run's next version, the one the lab updates to.
   next-version --week YYYY.WW TAG...
       Print the next YYYY.WW.N given the existing os-<version>-<arch> tags.
   unchanged --previous MANIFEST --current MANIFEST [--previous-record F --current-record F]
@@ -173,6 +177,11 @@ def main(argv=None):
     c.add_argument("--version", required=True)
     c.add_argument("--out", required=True)
     c.add_argument("sums", nargs="+", help="ARCH=path/to/reliaburger-os_V.SHA256SUMS")
+    lab = sub.add_parser("lab-channel")
+    lab.add_argument("--key", required=True, help="the run's throwaway Ed25519 key, DER PKCS#8")
+    lab.add_argument("--version", required=True)
+    lab.add_argument("--out", required=True)
+    lab.add_argument("sums", nargs="+", help="ARCH=path/to/reliaburger-os_V.SHA256SUMS")
     n = sub.add_parser("next-version")
     n.add_argument("--week", required=True)
     n.add_argument("tags", nargs="*")
@@ -192,6 +201,12 @@ def main(argv=None):
     elif args.command == "channel":
         sums = dict(item.split("=", 1) for item in args.sums)
         print(with_key(lambda key: write_channel(args.version, sums, args.out, key)))
+    elif args.command == "lab-channel":
+        key = Path(args.key)
+        if not key.is_file():
+            raise FileNotFoundError(f"no key at {key}")
+        sums = dict(item.split("=", 1) for item in args.sums)
+        print(write_channel(args.version, sums, args.out, key))
     elif args.command == "next-version":
         print(next_version(args.week, args.tags))
     elif args.command == "unchanged":

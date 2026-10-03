@@ -13,6 +13,8 @@
 # the machine as installed.
 # Needs root (the bridge, port 67), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
+# shellcheck source=image/tests/disk.sh
+. "$(dirname "$0")/disk.sh"
 out=$(cd "${1:?usage: relish-netboot-install.sh <artefact dir> <version> <relish>}" && pwd)
 version=${2:?usage}
 relish=$(readlink -f "${3:?usage}")
@@ -54,7 +56,7 @@ server=$!
 
 sudo ip tuntap add rbtap0 mode tap user "$(id -un)"
 sudo ip link set rbtap0 master rbbr0 up
-truncate -s 8G "$work/blank.raw"
+blank_disk "$work/blank.raw" "$out/reliaburger-os_$version.raw.zst"
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
 log="$work/serial.log"
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \

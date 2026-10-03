@@ -4,7 +4,12 @@ name: Appliance image
 # per architecture (docs/plans/2026-10-01-plan-appliance-product.md, W1).
 #
 # Pull requests build the `lab` profile, boot-test it and sign it with a
-# throwaway key, for the QEMU lab. A weekly run on main (or a dispatch with
+# throwaway key, for the QEMU lab. On x86-64 they also build a next version
+# and a lab os-channel.json naming it, signed with the same key, so the OS
+# update runs end to end in CI and in the Wyse lab. A dispatched lab build's
+# artefacts are kept a week, for the lab; a pull request's for a day. Every
+# QEMU test uses a 7.25 GiB disk, a Wyse 3040's eMMC (image/tests/disk.sh).
+# A weekly run on main (or a dispatch with
 # `publish`) builds the production image with the release public key inside;
 # then a job that runs no third-party actions signs it with the release key
 # (RELIABURGER_RELEASE_KEY), the netboot install test re-runs on the signed
@@ -253,7 +258,9 @@ jobs:
       - name: Build the next version (x86-64 lab builds)
         # A second build, one version on, for the OS update test: same
         # sources, but a different version makes it a different /usr.
-        if: matrix.arch == 'x86_64' && env.PUBLISH != 'true' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        # Every x86-64 lab build, so the Wyse lab can update to it too
+        # (appliance-x86_64-next).
+        if: matrix.arch == 'x86_64' && env.PUBLISH != 'true' && env.BROKEN_BUN != '1'
         run: |
           set -euo pipefail
           next="${IMAGE_VERSION%.*}.$(( ${IMAGE_VERSION##*.} + 1 ))"
@@ -330,7 +337,25 @@ jobs:
             openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
             openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
           done
-          rm -f "$RUNNER_TEMP/spike.key"
+          if [ -n "${NEXT_VERSION:-}" ]; then
+            # The lab channel: the published channel's format and signing
+            # (os_release.py), naming the next version, with this run's key.
+            next="$RUNNER_TEMP/next"
+            (umask 077 && openssl pkey -in "$RUNNER_TEMP/spike.key" -outform DER -out "$RUNNER_TEMP/spike.der")
+            python3 "$GITHUB_WORKSPACE/scripts/release/os_release.py" lab-channel \
+              --key "$RUNNER_TEMP/spike.der" --version "$NEXT_VERSION" --out "$next" \
+              "x86_64=$next/reliaburger-os_$NEXT_VERSION.SHA256SUMS"
+            openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin \
+              -in "$next/os-channel.json" -sigfile "$next/os-channel.json.sig"
+            cp spike-signing-key.pub.pem "$next/"
+          fi
+          rm -f "$RUNNER_TEMP/spike.key" "$RUNNER_TEMP/spike.der"
+
+      - name: Lay out the next version as a release
+        # As GitHub would: the next version's release beside the lab channel,
+        # for the OS update test and for appliance-x86_64-next.
+        if: env.NEXT_VERSION != ''
+        run: image/tests/lab-release.sh "$RUNNER_TEMP/next" "$NEXT_VERSION" "$RUNNER_TEMP/lab-release"
 
       - name: Boot test
         if: env.BROKEN_BUN != '1'
@@ -359,9 +384,11 @@ jobs:
           fi
           echo "Booting with $qemu_bin, accel=$accel"
           zstd -q -d "image/mkosi.output/reliaburger-os_${IMAGE_VERSION}.raw.zst" -o "$RUNNER_TEMP/disk.raw"
-          # An 8 GB disk, like the Wyse 3040: first boot adds slot B and grows
-          # the data partition into the free space.
-          truncate -s 8G "$RUNNER_TEMP/disk.raw"
+          # A 7.25 GiB disk, like the Wyse 3040's eMMC: first boot adds slot B
+          # and grows the data partition into the free space. It fails here,
+          # saying so, if the image doesn't leave room for slot B.
+          . image/tests/disk.sh
+          disk_from_image "$RUNNER_TEMP/disk.raw"
           cp "$vars" "$RUNNER_TEMP/vars.fd"
           log="$RUNNER_TEMP/serial.log"
           # 2 GiB, like the Wyse 3040.
@@ -432,14 +459,15 @@ jobs:
       - name: OS update (x86-64, KVM)
         # bun rolls the next version onto a one-node cluster: staging,
         # sysupdate, the reboot and the boot checks, end to end.
-        if: env.NEXT_VERSION != ''
+        # It needs the commit's relish (lab builds of bun from source).
+        if: env.NEXT_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 30
         run: |
           set -euo pipefail
           sudo apt-get install -y -qq dnsmasq-base
           chmod +x source-bin/relish-linux-x86_64
           image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
-            "$RUNNER_TEMP/next" "$NEXT_VERSION" source-bin/relish-linux-x86_64
+            "$RUNNER_TEMP/lab-release" "$NEXT_VERSION" source-bin/relish-linux-x86_64
 
       - name: Upload the image
         uses: actions/upload-artifact@v4
@@ -456,10 +484,24 @@ jobs:
             image/mkosi.output/spike-signing-key.pub.pem
             image/mkosi.output/netboot/
           if-no-files-found: error
-          # zstd-compressed already. Lab artefacts are for the next day's lab;
-          # a published build's go into its releases within the run.
+          # zstd-compressed already. A published build's go into its releases
+          # within the run; a dispatched lab build's are for the Wyse lab, so
+          # they last a week; a pull request's are for the next day.
           compression-level: 0
-          retention-days: ${{ env.PUBLISH == 'true' && 3 || 1 }}
+          retention-days: ${{ env.PUBLISH == 'true' && 3 || github.event_name == 'workflow_dispatch' && 7 || 1 }}
+
+      - name: Upload the next version
+        # Ready to serve: `gh run download <run> -n appliance-x86_64-next -D
+        # next`, then any web server on next/, and `relish os upgrade <next
+        # version> --channel http://<server>/releases/download/os-channel/os-channel.json`.
+        if: env.NEXT_VERSION != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: appliance-x86_64-next
+          path: ${{ runner.temp }}/lab-release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 1 }}
 
   # Sign a published build with the release key. Only first-party actions
   # run here: this job holds the key that every bun trusts.
@@ -562,7 +604,7 @@ jobs:
           set -euo pipefail
           cp signed/x86_64/*.sig art/
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 ovmf
+          sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
           sudo chmod 666 /dev/kvm
           image/tests/netboot-install.sh art "$VERSION"
 

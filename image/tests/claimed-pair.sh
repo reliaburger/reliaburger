@@ -11,6 +11,8 @@
 # node 1's firewall. The test passes when relish sees both nodes alive.
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
+# shellcheck source=image/tests/disk.sh
+. "$(dirname "$0")/disk.sh"
 out=$(cd "${1:?usage: claimed-pair.sh <artefact dir> <version> <relish>}" && pwd)
 version=${2:?usage}
 relish=$(readlink -f "${3:?usage}")
@@ -42,7 +44,7 @@ for i in 0 1; do
     sudo ip tuntap add "rbtap$i" mode tap user "$(id -un)"
     sudo ip link set "rbtap$i" master rbbr0 up
     zstd -q -d "$out/reliaburger-os_$version.raw.zst" -o "$work/disk$i.raw"
-    truncate -s 8G "$work/disk$i.raw"
+    disk_from_image "$work/disk$i.raw"
     cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars$i.fd"
     qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
         -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \

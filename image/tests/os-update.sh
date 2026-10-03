@@ -2,23 +2,33 @@
 # bun rolls an OS update (x86-64, KVM): run by .github/workflows/appliance.yml
 # on lab builds, which build a second, newer version for it.
 #
-#   os-update.sh <artefact dir> <version> <next dir> <next version> <relish>
+#   os-update.sh <artefact dir> <version> <release tree> <next version> <relish>
 #
 # One appliance on the bridge LAN forms a cluster from its seed, on
-# <version>. The runner serves <next version> laid out like a GitHub release
-# (…/releases/download/os-<version>-x86_64/), signed with the same throwaway
-# key both images carry. `relish os upgrade` starts the rollout; the node
+# <version>, on a 7.25 GiB disk (disk.sh). The runner serves <release tree>,
+# which lab-release.sh laid out like GitHub releases: <next version> in
+# …/releases/download/os-<next>-x86_64/ beside the lab channel in
+# …/os-channel/, all signed with the throwaway key both images carry. It's
+# what the run uploads as appliance-x86_64-next, so the test serves exactly
+# what the lab gets. `relish os upgrade` starts the rollout; the node
 # drains, stages the release, lets systemd-sysupdate write the spare slot,
 # reboots into it and passes its boot checks. The test passes when the
 # rollout completes and the node is healthy on <next version>.
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
-usage="usage: os-update.sh <artefact dir> <version> <next dir> <next version> <relish>"
+# shellcheck source=image/tests/disk.sh
+. "$(dirname "$0")/disk.sh"
+usage="usage: os-update.sh <artefact dir> <version> <release tree> <next version> <relish>"
 out=$(cd "${1:?$usage}" && pwd)
 version=${2:?$usage}
-next_dir=$(cd "${3:?$usage}" && pwd)
+tree=$(cd "${3:?$usage}" && pwd)
 next=${4:?$usage}
 relish=$(readlink -f "${5:?$usage}")
+# The lab channel names the version the node updates to. relish checks a
+# channel against the release keys only, so `relish os list` warns about this
+# one, and the upgrade names its version.
+grep -q "\"version\":\"$next\"" "$tree/releases/download/os-channel/os-channel.json" \
+    || { echo "os-update.sh: the lab channel doesn't name $next" >&2; exit 1; }
 work=$(mktemp -d)
 mac=52:54:00:42:00:31
 ip=10.42.0.31
@@ -39,14 +49,8 @@ sudo dnsmasq --interface=rbbr0 --bind-interfaces --port=0 \
     --dhcp-host="$mac,$ip" --pid-file="$work/dnsmasq.pid" --log-facility="$work/dnsmasq.log"
 
 # The release, where the node looks for it beside the channel.
-release="$work/web/releases/download/os-$next-x86_64"
-mkdir -p "$release"
-for f in "$next_dir"/reliaburger-os_"$next".{efi,SHA256SUMS,SHA256SUMS.sig} \
-    "$next_dir"/reliaburger-os_"$next".usr*.raw.zst; do
-    ln -s "$f" "$release/"
-done
-ls -l "$release"
-(cd "$work/web" && exec python3 -m http.server 8000 --bind 10.42.0.1 >"$work/http.log" 2>&1) &
+ls -lR "$tree/releases/download"
+(cd "$tree" && exec python3 -m http.server 8000 --bind 10.42.0.1 >"$work/http.log" 2>&1) &
 http=$!
 channel="http://10.42.0.1:8000/releases/download/os-channel/os-channel.json"
 
@@ -57,7 +61,7 @@ mkdir -p "$RELIABURGER_HOME"
 sudo ip tuntap add rbtap0 mode tap user "$(id -un)"
 sudo ip link set rbtap0 master rbbr0 up
 zstd -q -d "$out/reliaburger-os_$version.raw.zst" -o "$work/disk.raw"
-truncate -s 8G "$work/disk.raw"
+disk_from_image "$work/disk.raw"
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
 seed="$work/cluster/stick/seeds/$(echo "$mac" | tr : -).seed"
 log="$work/serial.log"
