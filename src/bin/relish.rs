@@ -430,6 +430,11 @@ enum Command {
         /// Install again on machines that installed from here already.
         #[arg(long)]
         reinstall: bool,
+        /// Which iPXE build PXE firmware gets: snp drives the network card
+        /// through the firmware's own driver; full brings iPXE's drivers,
+        /// for firmware whose network stack misbehaves.
+        #[arg(long, value_name = "BUILD", default_value = "snp", value_parser = parse_ipxe)]
+        ipxe: reliaburger::relish::netboot::IpxeBuild,
         /// Trust only this key (ed25519:BASE64) instead of the release keys.
         /// Debug builds only, for tests.
         #[arg(long, hide = true)]
@@ -965,6 +970,12 @@ fn parse_mac(value: &str) -> Result<reliaburger::relish::netboot::MacAddress, St
         .map_err(|e: reliaburger::relish::netboot::NetbootError| e.to_string())
 }
 
+fn parse_ipxe(value: &str) -> Result<reliaburger::relish::netboot::IpxeBuild, String> {
+    value
+        .parse()
+        .map_err(|e: reliaburger::relish::netboot::NetbootError| e.to_string())
+}
+
 fn parse_netboot_duration(value: &str) -> Result<std::time::Duration, String> {
     reliaburger::relish::netboot::parse_duration(value).map_err(|e| e.to_string())
 }
@@ -980,6 +991,7 @@ async fn netboot(
     duration: std::time::Duration,
     key: Option<PathBuf>,
     reinstall: bool,
+    ipxe: reliaburger::relish::netboot::IpxeBuild,
     trust_key: Option<String>,
 ) -> Result<(), reliaburger::relish::RelishError> {
     use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
@@ -998,6 +1010,7 @@ async fn netboot(
         duration,
         keys,
         reinstall,
+        ipxe,
     })
     .await?;
     Ok(())
@@ -2032,10 +2045,11 @@ async fn main() -> ExitCode {
             duration,
             key,
             reinstall,
+            ipxe,
             trust_key,
         } => {
             netboot(
-                dir, interface, address, http_port, macs, duration, key, reinstall, trust_key,
+                dir, interface, address, http_port, macs, duration, key, reinstall, ipxe, trust_key,
             )
             .await
         }
@@ -3304,6 +3318,7 @@ mod tests {
             duration,
             key,
             reinstall,
+            ipxe,
             trust_key,
         } = cli.command
         else {
@@ -3315,6 +3330,17 @@ mod tests {
         assert!(macs.is_empty());
         assert_eq!(duration, std::time::Duration::from_secs(3600));
         assert_eq!((key, reinstall, trust_key), (None, false, None));
+        assert_eq!(ipxe, reliaburger::relish::netboot::IpxeBuild::Snp);
+    }
+
+    #[test]
+    fn netboot_serves_the_full_ipxe_build_when_asked_and_refuses_others() {
+        let cli = parse(&["relish", "netboot", "os", "--ipxe", "full"]).unwrap();
+        let Command::Netboot { ipxe, .. } = cli.command else {
+            panic!("expected netboot");
+        };
+        assert_eq!(ipxe, reliaburger::relish::netboot::IpxeBuild::Full);
+        assert!(parse(&["relish", "netboot", "os", "--ipxe", "undi"]).is_err());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::time::SystemTime;
 use crate::os::{OsError, OsVersion, check_asset, signed_sums};
 use crate::upgrade::signing::{PublicKey, sha256_hex};
 
-use super::{Arch, NetbootError};
+use super::{Arch, IpxeBuild, NetbootError};
 
 /// One file the HTTP server may send, as it was when it was checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,9 +61,20 @@ pub struct ArchArtefacts {
     /// The SNP iPXE build, held in memory so TFTP sends exactly the bytes
     /// that were checked.
     pub ipxe: Arc<[u8]>,
+    /// The full-driver iPXE build (`ipxe-<arch>.efi`), held the same way,
+    /// when the release has it and lists it. Only `--ipxe full` needs it.
+    pub ipxe_full: Option<Arc<[u8]>>,
 }
 
 impl ArchArtefacts {
+    /// The checked bytes of `build`, if this release has it.
+    pub fn ipxe_build(&self, build: IpxeBuild) -> Option<&Arc<[u8]>> {
+        match build {
+            IpxeBuild::Snp => Some(&self.ipxe),
+            IpxeBuild::Full => self.ipxe_full.as_ref(),
+        }
+    }
+
     /// The installer UKI's name in this release.
     pub fn installer_name(&self) -> String {
         format!("reliaburger-os-installer_{}.efi", self.version)
@@ -124,8 +135,10 @@ fn load_arch(
         format!("reliaburger-os_{version}.raw.zst"),
         snp.clone(),
     ];
+    let full = IpxeBuild::Full.file(arch);
     let mut files = BTreeMap::new();
     let mut ipxe: Option<Arc<[u8]>> = None;
+    let mut ipxe_full: Option<Arc<[u8]>> = None;
     for entry in &entries {
         let path = crate::relish::image::local_path(arch_dir, &entry.name);
         if !path.is_file() {
@@ -134,10 +147,14 @@ fn load_arch(
             }
             continue;
         }
-        let digest = if entry.name == snp {
+        let digest = if entry.name == snp || entry.name == full {
             let bytes = read(&path)?;
             let digest = sha256_hex(&bytes);
-            ipxe = Some(bytes.into());
+            if entry.name == snp {
+                ipxe = Some(bytes.into());
+            } else {
+                ipxe_full = Some(bytes.into());
+            }
             digest
         } else {
             progress(&format!("checking {}", path.display()));
@@ -167,6 +184,7 @@ fn load_arch(
         version,
         files,
         ipxe,
+        ipxe_full,
     })
 }
 
@@ -272,6 +290,7 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::{VERSION, borrowed, release, write, write_signed};
     use super::*;
+    use crate::relish::netboot::IpxeBuild;
     use crate::upgrade::signing::generate_keypair;
 
     fn silent(_: &str) {}
@@ -297,6 +316,28 @@ mod tests {
                 .contains_key(&format!("reliaburger-os_{VERSION}.SHA256SUMS.sig"))
         );
         assert!(!artefacts.architectures.contains_key(&Arch::Arm64));
+    }
+
+    #[test]
+    fn both_ipxe_builds_are_held_but_only_the_snp_one_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, key) = write(dir.path(), "x86_64", &borrowed(&release("x86_64")));
+        let artefacts = load(dir.path(), &[key], silent).unwrap();
+        let x86 = &artefacts.architectures[&Arch::X86_64];
+        assert_eq!(x86.ipxe_full.as_deref(), Some(&b"ipxe with drivers"[..]));
+        assert_eq!(x86.ipxe_build(IpxeBuild::Snp), Some(&x86.ipxe));
+        assert_eq!(x86.ipxe_build(IpxeBuild::Full), x86.ipxe_full.as_ref());
+
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<_> = release("x86_64")
+            .into_iter()
+            .filter(|(name, _)| name != "ipxe-x86_64.efi")
+            .collect();
+        let (_, key) = write(dir.path(), "x86_64", &borrowed(&files));
+        let artefacts = load(dir.path(), &[key], silent).unwrap();
+        let x86 = &artefacts.architectures[&Arch::X86_64];
+        assert_eq!(x86.ipxe_full, None);
+        assert_eq!(x86.ipxe_build(IpxeBuild::Full), None);
     }
 
     #[test]

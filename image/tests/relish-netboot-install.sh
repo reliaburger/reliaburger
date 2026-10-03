@@ -9,8 +9,8 @@
 # runs `relish netboot` on the bridge as a ProxyDHCP, TFTP and HTTP server,
 # exactly as an operator's laptop would. A VM with a blank disk boots from
 # the network (disk first, so the second boot starts the installed system),
-# and the test passes once bun is healthy on it and relish has remembered
-# the machine as installed.
+# and the test passes once bun is healthy on it, relish has remembered the
+# machine as installed, and relish's start-up probe saw the router's DHCP.
 # Needs root (the bridge, port 67), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
 out=$(cd "${1:?usage: relish-netboot-install.sh <artefact dir> <version> <relish>}" && pwd)
@@ -78,6 +78,10 @@ done
 elapsed=$(( $(date +%s) - start ))
 if [ "$result" = pass ] && ! sudo grep -qi "$mac" "$work/serve/netboot-installed.json" 2>/dev/null; then
     result="installed, but relish netboot didn't remember the machine"
+fi
+# Its start-up probe should have seen the router's dnsmasq hand out addresses.
+if [ "$result" = pass ] && ! grep -q "hands out addresses on rbbr0" "$work/netboot.log"; then
+    result="installed, but relish netboot's probe didn't see the router's DHCP"
 fi
 echo "--- serial console ---"
 cat "$log" || true
