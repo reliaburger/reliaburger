@@ -275,7 +275,9 @@ which destinations hold each one.
 
 Archives are streamed to a spool file in `<volumes>/.snapshot-spool` and
 uploaded in 8 MiB parts, so a large volume doesn't need its size in memory.
-The spool never takes the volumes filesystem below 5% free. Objects land under
+The spool always leaves 5% of the volumes filesystem free, or 10 GiB on a
+filesystem larger than 200 GiB; an archive that would cut into that reserve
+fails and is retried on the next sweep. Objects land under
 `<prefix>/<namespace>/<app>/<node>/<volume>/`: the archive is
 `archives/sha256-<digest>.tar.gz`, and a JSON manifest in `manifests/` names
 the snapshot, its volume, node and creation time. Two nodes running the same
