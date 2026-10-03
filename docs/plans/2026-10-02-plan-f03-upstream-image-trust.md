@@ -102,3 +102,15 @@ U1 first (about a week): it fixes the drift on its own and everything else build
 
 - The reference parser reads `repo:tag@sha256:…`, and the trust-policy lookup drops the tag before its digest lookup. Without that second fix, an unsigned Pickle image written as `app:v1@sha256:…` would have counted as external and skipped `require_signatures` once the pull worked.
 - `pickle::binding::bind_image` resolves a tag from the catalogue, upstream, or the cached copy, with unit tests. It isn't wired into apply until questions 1, 2 and 5 are settled.
+
+## Decisions (maintainer, 2 October 2026)
+
+The recommendations were approved as written:
+
+1. **Bind at apply,** on the leader, so every node and restart runs the same bytes from the first deploy.
+2. **Upstream down at apply:** fail, unless the pull-through cache holds the tag, in which case bind from the cache and say so.
+3. **Policy in `node.toml` only.** A later `relish wtf` check flags nodes whose policy hashes differ.
+4. **Cosign:** classic `.sig` first, after checking what the images we care about publish. The Sigstore bundle is a follow-up.
+5. **Images nobody pulls:** bind only when the leader's own runtime pulls images, and document that a cluster runs one runtime kind.
+
+**Scope:** U1's wiring and U2–U4 are 0.1.5. The tag-and-digest parser fix and `bind_image` shipped in 0.1.4.
