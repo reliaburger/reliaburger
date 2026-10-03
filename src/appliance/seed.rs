@@ -107,6 +107,10 @@ pub struct SeedConfig {
     pub join: Option<JoinSeed>,
     #[serde(default)]
     pub upgrades: UpgradeSeed,
+    /// How many voters the council grows to: `[cluster] council_size` on
+    /// the node that creates the cluster. A join seed has none.
+    #[serde(default)]
+    pub council_size: Option<crate::council::CouncilSize>,
 }
 
 /// A parsed seed.
@@ -222,6 +226,9 @@ impl SeedConfig {
                 bad("a join seed must not carry the master key: the node fetches it".into())
             }
             (SeedRole::Create, Some(_)) => bad("a create seed has no [join]".into()),
+            (SeedRole::Join, Some(_)) if self.council_size.is_some() => bad(
+                "a join seed has no council_size: the node that creates the cluster sets it".into(),
+            ),
             (SeedRole::Create, None) => {
                 for file in CREATE_FILES {
                     if !files.contains_key(file) {
@@ -244,6 +251,7 @@ impl SeedConfig {
         let mut config = NodeConfig::default();
         config.node.name = Some(self.node.clone());
         config.cluster.name = self.cluster.clone();
+        config.cluster.council_size = self.council_size;
         if let Some(join) = &self.join {
             config.cluster.join = join
                 .members
@@ -398,6 +406,39 @@ advertise = "192.168.1.51"
     }
 
     #[test]
+    fn a_create_seed_carries_the_council_size_into_node_toml() {
+        let bootstrap: [(&str, &[u8]); 3] = [
+            ("master.key", b"00"),
+            ("security-bootstrap.json", b"{}"),
+            ("identity/bundle.committed", b""),
+        ];
+        let sized = format!("{CREATE_TOML}council_size = 5\n");
+        let mut entries = vec![("seed.toml", sized.as_bytes())];
+        entries.extend(bootstrap);
+        let Seed::V1 { config, .. } = Seed::from_tar_gz(&tarball(&entries)).unwrap() else {
+            panic!("not a v1 seed")
+        };
+        assert_eq!(
+            config.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
+        let node = config.node_config("192.168.1.51".parse().unwrap());
+        assert_eq!(
+            node.cluster.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
+        assert!(toml::to_string(&node).unwrap().contains("council_size = 5"));
+
+        let even = format!("{CREATE_TOML}council_size = 4\n");
+        let mut entries = vec![("seed.toml", even.as_bytes())];
+        entries.extend(bootstrap);
+        assert!(matches!(
+            Seed::from_tar_gz(&tarball(&entries)),
+            Err(SeedError::Config(_))
+        ));
+    }
+
+    #[test]
     fn a_join_seed_carrying_the_master_key_is_refused() {
         let seed = Seed::from_tar_gz(&tarball(&[
             ("seed.toml", JOIN_TOML.as_bytes()),
@@ -454,6 +495,8 @@ advertise = "192.168.1.51"
             ("members = [\"192.168.1.51\"]", "members = []"),
             ("role = \"join\"", "role = \"join\"\nfaults = \"anything\""),
             ("role = \"join\"", "role = \"join\"\nextra = 1"),
+            // Only the node that creates the cluster commits its size.
+            ("role = \"join\"", "role = \"join\"\ncouncil_size = 5"),
         ] {
             let text = JOIN_TOML.replace(from, to);
             let seed = Seed::from_tar_gz(&tarball(&[("seed.toml", text.as_bytes())]));

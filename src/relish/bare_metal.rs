@@ -42,6 +42,10 @@ pub struct Fleet {
     pub operators: Vec<String>,
     pub network: Option<String>,
     pub faults: bool,
+    /// How many voters the council grows to, as the cluster was created
+    /// with. Absent in directories made before it was recorded.
+    #[serde(default)]
+    pub council_size: Option<crate::council::CouncilSize>,
     pub nodes: Vec<FleetNode>,
 }
 
@@ -58,6 +62,8 @@ pub struct CreateOptions {
     pub ssh_key: Option<Vec<u8>>,
     pub token_ttl: Duration,
     pub external_signing_key: Option<String>,
+    /// How many voters the council grows to.
+    pub council_size: crate::council::CouncilSize,
 }
 
 /// Parse `aa:bb:cc:dd:ee:ff@192.168.1.51` (any case, `-` or `:`).
@@ -128,6 +134,7 @@ impl Fleet {
             upgrades: UpgradeSeed {
                 external_signing_key: external_signing_key.clone(),
             },
+            council_size: self.council_size.filter(|_| role == SeedRole::Create),
         }
     }
 }
@@ -241,6 +248,7 @@ pub fn create(options: &CreateOptions) -> Result<Created, RelishError> {
         operators: options.operators.clone(),
         network: options.network.clone(),
         faults: options.faults,
+        council_size: Some(options.council_size),
         nodes: nodes.clone(),
     };
 
@@ -451,6 +459,7 @@ pub fn run_create(options: &CreateOptions) -> Result<(), RelishError> {
     let dir = options.directory.display();
     println!("cluster {} created in {dir}", created.fleet.cluster);
     println!("  root CA: {}", created.fleet.ca_fingerprint);
+    println!("  council: up to {} voters", options.council_size);
     for (node, seed) in created.fleet.nodes.iter().zip(&created.seeds) {
         println!(
             "  {} ({} at {}): {}",
@@ -555,6 +564,7 @@ mod tests {
             ssh_key: None,
             token_ttl: crate::sesame::join::MAX_SEED_JOIN_TOKEN_TTL,
             external_signing_key: None,
+            council_size: crate::council::CouncilSize::APPLIANCE,
         }
     }
 
@@ -607,6 +617,11 @@ mod tests {
             panic!("v1")
         };
         assert_eq!(config.role, SeedRole::Create);
+        assert_eq!(
+            config.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE),
+            "node 1 commits the council size when it bootstraps"
+        );
         assert!(
             files.contains_key("master.key") && files.contains_key("identity/bundle.committed")
         );
@@ -627,6 +642,7 @@ mod tests {
             panic!("v1")
         };
         assert_eq!(config.role, SeedRole::Join);
+        assert_eq!(config.council_size, None);
         assert!(
             !files.contains_key("master.key"),
             "a joiner's seed has no master key"
@@ -645,6 +661,12 @@ mod tests {
         crate::sesame::join::check_join_token(&join.token, "home-2", &bootstrap).unwrap();
         assert!(crate::sesame::join::check_join_token(&join.token, "home-3", &bootstrap).is_err());
         assert!(created.admin_token.starts_with("rbrg_"));
+        let recorded: Fleet =
+            serde_json::from_slice(&std::fs::read(dir.path().join("fleet.json")).unwrap()).unwrap();
+        assert_eq!(
+            recorded.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
 
         use std::os::unix::fs::PermissionsExt;
         for secret in ["secrets/master.key", "secrets/admin.token", "fleet.json"] {
@@ -669,6 +691,7 @@ mod tests {
             operators: vec![],
             network: Some("192.168.1.0/24".into()),
             faults: false,
+            council_size: None,
             nodes: vec![
                 FleetNode {
                     name: "home-1".into(),
@@ -726,6 +749,24 @@ mod tests {
             },
             "192.168.1.54".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn create_records_the_council_size_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let three = crate::council::CouncilSize::new(3).unwrap();
+        let created = create(&CreateOptions {
+            council_size: three,
+            ..options(dir.path(), &["d8:9e:f3:00:00:01@192.168.1.51"])
+        })
+        .unwrap();
+        assert_eq!(created.fleet.council_size, Some(three));
+        let Seed::V1 { config, .. } =
+            Seed::from_tar_gz(&std::fs::read(&created.seeds[0]).unwrap()).unwrap()
+        else {
+            panic!("v1")
+        };
+        assert_eq!(config.council_size, Some(three));
     }
 
     #[test]

@@ -252,6 +252,7 @@ fn cluster_params_from_config(
         seeds,
         wrapping_ikm,
         bootstrap_security_state,
+        bootstrap_council_size: config.cluster.council_size,
         data_dir: config.storage.data.clone(),
         // The MayoStore doesn't exist yet when params are built; the
         // caller sets it before starting the runtime.

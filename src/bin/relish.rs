@@ -853,6 +853,9 @@ enum ClusterAction {
         /// Operator countersignature key for cluster bun upgrades.
         #[arg(long)]
         external_signing_key: Option<String>,
+        /// How many voters the council grows to: an odd number from 1 to 7.
+        #[arg(long, value_name = "N", default_value = "5")]
+        council_size: reliaburger::council::CouncilSize,
         /// Each machine as MAC@IP, node 1 first.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
@@ -955,6 +958,9 @@ enum MachinesAction {
         /// Operator countersignature key for cluster bun upgrades (with --create).
         #[arg(long)]
         external_signing_key: Option<String>,
+        /// How many voters the new council grows to: an odd number from 1 to 7 (with --create; default 5).
+        #[arg(long, value_name = "N", requires = "create")]
+        council_size: Option<reliaburger::council::CouncilSize>,
         /// Public key for root SSH on lab images.
         #[arg(long)]
         ssh_key: Option<PathBuf>,
@@ -1962,6 +1968,7 @@ async fn main() -> ExitCode {
                     ssh_key,
                     ttl,
                     external_signing_key,
+                    council_size,
                     machines,
                 },
         } => match ssh_key.as_deref().map(std::fs::read).transpose() {
@@ -1977,6 +1984,7 @@ async fn main() -> ExitCode {
                     ssh_key,
                     token_ttl: std::time::Duration::from_secs(ttl),
                     external_signing_key,
+                    council_size,
                 },
             ),
         },
@@ -2021,6 +2029,7 @@ async fn main() -> ExitCode {
                 network,
                 faults,
                 external_signing_key,
+                council_size,
                 ssh_key,
                 ttl,
                 trust_lan,
@@ -2038,6 +2047,8 @@ async fn main() -> ExitCode {
                                 network,
                                 faults,
                                 external_signing_key,
+                                council_size: council_size
+                                    .unwrap_or(reliaburger::council::CouncilSize::APPLIANCE),
                             }),
                             token_ttl: std::time::Duration::from_secs(ttl),
                             ssh_key,
@@ -2443,6 +2454,65 @@ mod tests {
                 action: SecretAction::Pubkey { dir: Some(ref dir) }
             }) if dir == std::path::Path::new("cluster")
         ));
+    }
+
+    #[test]
+    fn appliance_clusters_default_to_five_council_voters() {
+        use reliaburger::council::CouncilSize;
+        let create = |extra: &[&str]| {
+            let mut args = vec![
+                "relish",
+                "cluster",
+                "create",
+                "--bare-metal",
+                "lab",
+                "--name",
+                "lab",
+                "--operator",
+                "10.42.0.1",
+            ];
+            args.extend_from_slice(extra);
+            args.push("d8:9e:f3:00:00:01@10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Cluster {
+                    action: ClusterAction::Create { council_size, .. },
+                }) => council_size,
+                _ => panic!("not cluster create"),
+            })
+        };
+        assert_eq!(create(&[]).unwrap(), CouncilSize::APPLIANCE);
+        assert_eq!(create(&["--council-size", "3"]).unwrap().get(), 3);
+        for bad in ["4", "0", "9", "five"] {
+            let error = create(&["--council-size", bad]).err().unwrap().to_string();
+            assert!(error.contains("--council-size"), "{bad}: {error}");
+        }
+        let even = create(&["--council-size", "4"]).err().unwrap().to_string();
+        assert!(even.contains("pick an odd size from 1 to 7"), "{even}");
+
+        let claim = |extra: &[&str]| {
+            let mut args = vec!["relish", "machines", "claim", "lab"];
+            args.extend_from_slice(extra);
+            args.push("10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Machines {
+                    action: Some(MachinesAction::Claim { council_size, .. }),
+                    ..
+                }) => council_size,
+                _ => panic!("not machines claim"),
+            })
+        };
+        let new = ["--create", "--name", "lab", "--operator", "10.42.0.1"];
+        assert_eq!(claim(&new).unwrap(), None, "the default is applied later");
+        let mut sized = new.to_vec();
+        sized.extend(["--council-size", "7"]);
+        assert_eq!(claim(&sized).unwrap().map(CouncilSize::get), Some(7));
+        let mut even = new.to_vec();
+        even.extend(["--council-size", "6"]);
+        assert!(claim(&even).is_err());
+        assert!(
+            claim(&["--council-size", "5"]).is_err(),
+            "a council size only means something with --create"
+        );
     }
 
     #[test]
