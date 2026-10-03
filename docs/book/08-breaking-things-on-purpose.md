@@ -1085,6 +1085,15 @@ stop, and each due minute is claimed on disk before launch. If Bun dies in
 between, that occurrence is skipped, not replayed. We'd rather miss a backup
 than run a migration twice.
 
+A cron step can be larger than the field it advances. `59/255` still means
+minute 59, once an hour. The parser walks a bounded inclusive range with
+`step_by`, which stops at its upper bound. Adding the step to a `u8` by hand
+used to overflow: debug builds panicked, and release builds wrapped the same
+expression into every minute. The regression checks single values, ranges
+and wildcards with the largest accepted step. Configuration admission parses
+the expression too, so a malformed schedule fails before it reaches the
+agent's command loop.
+
 ## Batch scheduling
 
 The Meat scheduler's Filter→Score→Select→Commit pipeline evaluates every node for every placement. That's the right trade-off for long-running apps where quality of placement matters — you want the best node, not just any node. But for batch jobs (short-lived, many identical instances), you need throughput.
@@ -1390,4 +1399,3 @@ relish test --chaos --yes                    # the guarded catalogue (real clust
 cargo test --lib council::node                # partition recovery
 relish dev test onion                         # eBPF fault enforcement (Lima)
 ```
-

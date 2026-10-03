@@ -174,10 +174,8 @@ fn parse_field(token: &str, field: &'static str, min: u8, max: u8) -> Result<Cro
         if start > end {
             return Err(malformed());
         }
-        let mut v = start;
-        while v <= end {
-            values.insert(normalise(field, v));
-            v += step;
+        for value in (start..=end).step_by(usize::from(step)) {
+            values.insert(normalise(field, value));
         }
     }
 
@@ -249,6 +247,20 @@ mod tests {
         assert!(s.matches(utc(2026, 8, 13, 9, 15)));
         assert!(s.matches(utc(2026, 8, 13, 9, 30)));
         assert!(!s.matches(utc(2026, 8, 13, 9, 16)));
+    }
+
+    #[test]
+    fn large_steps_do_not_wrap_into_other_minutes() {
+        for expression in ["59/255 * * * *", "59-59/255 * * * *"] {
+            let s = schedule(expression);
+            for minute in 0..60 {
+                assert_eq!(s.matches(utc(2026, 8, 13, 9, minute)), minute == 59);
+            }
+        }
+        let s = schedule("*/255 * * * *");
+        for minute in 0..60 {
+            assert_eq!(s.matches(utc(2026, 8, 13, 9, minute)), minute == 0);
+        }
     }
 
     #[test]
