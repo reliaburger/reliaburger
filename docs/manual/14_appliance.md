@@ -92,13 +92,66 @@ A few options for real networks:
   `--interface eth0` (or `--address 192.168.1.20`).
 - `--mac d8:9e:f3:12:34:56`, once per machine, answers only those machines.
   Anything else on the LAN that network-boots is left alone.
-- Two netboot servers on one LAN race to boot every machine, so it refuses
-  to start when another one answers.
+- `--ipxe full` hands machines iPXE's full-driver build instead of the
+  default `snp` one. `snp` drives the network card through the firmware's
+  own driver, which suits odd cards; `full` brings iPXE's drivers, for
+  firmware whose network stack misbehaves. It refuses to start if the
+  release you serve doesn't have the full build.
+
+Once the files check out, it broadcasts a network-boot request of its own
+and listens for two seconds:
+- If another netboot server answers, it refuses to start. Two on one LAN
+  race to boot every machine.
+- If your router answers, it says so (`192.168.1.1 hands out addresses on
+  eth0`) and starts.
+- If nothing answers, it warns that nothing hands out addresses there and
+  starts anyway. Machines that network-boot need an address before they ask
+  relish anything, so check that the router is up and on the same switch. A
+  DHCP server that only answers machines it knows (reservations with no
+  range) stays quiet too, and then the warning is harmless.
+
+It also refuses to serve from a self-assigned address (`169.254.x.x`). An
+interface gets one when no DHCP server answered it, and the machines you
+boot couldn't reach it. Check the cable and the router, then reconnect the
+interface, or give it a fixed address and pass that with `--address`.
 
 It remembers each machine that downloaded the installer, by MAC address and
 SMBIOS UUID, in `netboot-installed.json` in the directory it serves. Next time that machine
 network-boots, it's told to boot its disk instead. Pass `--reinstall` to
 install over them again.
+
+### Serving from a Mac
+
+`relish netboot` runs on macOS too. A Mac usually joins a wired LAN through
+a USB-C or Thunderbolt Ethernet adapter, and a few things are different:
+- **Name the adapter.** The default route is usually Wi-Fi, so pass
+  `--interface` with the adapter's name. `networksetup
+  -listallhardwareports` lists them; the adapter is the `Device:` under its
+  `Hardware Port:` (often `USB 10/100/1000 LAN`), something like `en7`.
+  `ifconfig en7` shows its address.
+- **Use sudo.** macOS lets anyone listen on low ports on every address, but
+  relish's TFTP and HTTP listen on the adapter's own address, and that still
+  needs root.
+- **The application firewall.** If it's on, macOS may ask whether `relish`
+  may accept incoming connections, or silently drop them for a binary run
+  under sudo. Check it, and allow relish if it's on:
+
+  ```sh
+  /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$(which relish)"
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$(which relish)"
+  ```
+
+- **Keep it awake.** A Mac that sleeps mid-install stops TFTP and HTTP, and
+  the machine installing gives up. `caffeinate -i` keeps it awake for as
+  long as relish runs:
+
+  ```sh
+  caffeinate -i sudo relish netboot os --interface en7
+  ```
+
+- **Internet Sharing** runs its own DHCP server, which holds the port relish
+  needs. Turn it off for the adapter (relish says so if it's on).
 
 ## Prepare the machines
 
