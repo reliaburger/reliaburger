@@ -163,16 +163,17 @@ Each is a small PR on top of the train (or on main once it merges), with tests. 
 
 | # | PR | Tests | Estimate | Needs hardware? |
 |---|---|---|---|---|
-| 1 | **`relish netboot --wipe`**: adds `reliaburger.wipe=1` to the chain script for machines not yet installed; requires `--mac` (no wiping whatever network-boots on the LAN); the summary lists the MACs it will wipe. `installed::chain_script`, `NetbootOptions`, `Command::Netboot`. | Unit tests on the chain script with and without it; CLI parse tests (refused without `--mac`); `relish-netboot-install.sh` writes a GPT and a filesystem onto the blank disk first, so CI installs over a used disk | 1–1.5 | No |
+| 1 | **Confirm, then wipe a used disk.** Some Wyses still hold ThinOS, some are blank. The installer first reports what's on the eMMC (partition table, filesystem labels, size) to `relish netboot` over HTTP and waits. A blank disk installs at once. A used one is shown per machine (`6c:4b:90:…: ThinOS, 4 partitions, 7.3 GB — wipe? [y/N]`) and installs only after a yes; `--wipe <mac>` (repeatable) pre-approves machines for an unattended run. Nothing is ever wiped without a yes or a listed MAC, and a refusal leaves the machine untouched and remembered as declined. `installed::chain_script`, the installer's disk check, a new `POST /disk` report on the HTTP server, `NetbootOptions`, `Command::Netboot`. | Unit tests: the disk report's parsing, the decision table (blank / used + yes / used + listed / used + no / no answer within the timeout), the chain script; an HTTP test of the report-and-wait exchange; `relish-netboot-install.sh` writes a GPT and a filesystem onto the disk first and installs with `--wipe <its mac>`, so CI installs over a used disk | 2–3 | No |
 | 2 | **`relish image download` fetches every architecture** unless `--arch` narrows it, and prints which it saved. `src/relish/image.rs::download`, `ImageAction::Download`. | Unit test on the architecture selection; snapshot of the output | 0.5 | No |
 | 3 | **macOS hardening and qualification of `relish netboot`**: refuse a link-local server address (`interface::pick`); make the probe work while configd holds port 68; `--ipxe full` (or `snp`, the default); warn when the probe sees no DHCP offer at all ("nothing hands out addresses here"), which also catches a Pi that's down; manual notes on `--interface`, the firewall, vmnet and `caffeinate`. A Mac run against one x86_64 VM, recorded in `docs/qualification/`. | Unit tests for the link-local refusal and the no-offer warning (`competing_server`'s sibling); loopback probe test; the recorded run | 2–3 | Pi and a cable; a Wyse helps but a VM will do |
 | 4 | **The Pi router**: `image/lab/pi/` with `dnsmasq.conf`, `nftables.conf`, `chrony.conf` and a README; the manual's "What you need" mentions a router you control. | `shellcheck`/`dnsmasq --test` in CI on the config | 0.5–1 | Pi |
 | 5 | **CI for S5**: upload the next-version image (`appliance-x86_64-next`) and a lab `os-channel.json` signed with the run's key, keep dispatch-run artefacts 7 days, and test on a 7.25 GiB disk. `.github/workflows/appliance.yml`, `image/tests/*.sh`. | The appliance workflow itself | 1 | No |
 | 6 | **`fleet-measure.sh` reads a claim directory** (node names and addresses from `relish nodes --output json`, not seed-fleet's `fleet` file). Or, better, a `relish` command that samples the same numbers from bun's metrics, which also works on published images without SSH **[larger: ~3 days]**. | `image/tests/test_*` style unit test on the parser | 0.5 (script) | No |
 | 7 | **The S5 runbook and manual rewritten** around `relish netboot` and `relish machines claim`, with the Pi topology (the part of W7 the lab needs). | Docs | 0.5–1 | No |
+| 8 | **Five council voters on an appliance cluster.** The reconciler caps the council at seven, so ten Wyses would get seven voters on 2 GB nodes. `relish machines claim --create` and `relish cluster create --bare-metal` record a council size (default 5, `--council-size`), and the reconciler honours it. Check first whether a council-size setting already exists in the council config. | Unit tests: the reconciler stops at the configured size, and a claim records it; the claimed-pair CI test asserts the size | 1 | No |
 | — | Optional: **`relish netboot --dhcp`** as designed above | as above | 7–10 | No |
 
-Total for the lab path: **about 6–8 days**, then the S5 day itself (the runbook's estimate is a day of hands-on plus the 24-hour measurement).
+Total for the lab path: **about 8–10 days**, then the S5 day itself (the runbook's estimate is a day of hands-on plus the 24-hour measurement).
 
 ### Before the hardware
 
@@ -183,12 +184,12 @@ Most of this needs no Wyse:
 
 ### Hardware and setup checklist
 
-- **Switch:** an unmanaged gigabit switch is simplest. If the eBay one is managed, turn spanning tree off or set every port to edge/portfast: STP's 30-second listening delay makes PXE's DHCP time out. Turn off "green Ethernet" (EEE) if links flap.
+- **Switch:** a Netgear JGS524E (24-port gigabit, "Smart Managed Plus"). Those switches act unmanaged out of the box. If spanning tree is on, turn it off in the web UI, because STP's 30-second listening delay makes PXE's DHCP time out **[unverified: whether STP is on by default on this model]**. Turn off "green Ethernet" (EEE) if links flap. Its VLANs can later separate the lab from anything else plugged in.
 - **Cables:** 12 patch leads (ten Wyses, the Mac, the Pi), Cat5e or better.
 - **Power:** ten Wyse supplies. Batches differ, 5 V or 12 V barrel (research §9.1), so use each unit's own supply and don't mix them up. Two 6-way strips or one 12-way. Ten 3040s draw well under 100 W in total **[estimate]**. A switched strip makes the S5 cord-pull and power-loss tests repeatable.
 - **Console:** a DisplayPort monitor (or a DP-to-HDMI adapter) and a USB keyboard. The 3040 has no serial port, so this is the only console, and it's where the claim key shows.
 - **The Mac's adapter:** gigabit, on a chipset macOS drives natively (Realtek RTL8153 or ASIX AX88179A are the common ones **[unverified for your adapter: check it shows up in `networksetup -listallhardwareports` without a driver]**). It doesn't need PXE support itself: the Mac never netboots. Plug it straight into the Mac, not through a USB hub dock that might sleep it.
-- **The Pi:** any model with wired Ethernet and Wi-Fi (3B+, 4 or 5). The 3B+'s Ethernet is USB 2-bound (~300 Mbit/s), which is fine: installs flow Mac → switch → Wyse, and only internet traffic crosses the Pi. Raspberry Pi OS Lite 64-bit on a decent SD card.
+- **The Pi:** to buy. A **Pi 5 with 4 GB**, or a Pi 4 with 4 GB if that's cheaper: gigabit Ethernet for the switch and Wi-Fi for the uplink. The official power supply, a 32 GB microSD card, and a case with a fan for a Pi 5. Raspberry Pi OS Lite 64-bit. If its Wi-Fi doesn't reach the home router, a second USB Ethernet adapter on the Pi does the same job.
 - **Labels:** each Wyse's MAC (on the label underneath), its reservation and its node number, on the unit.
 - **A USB stick** for the BIOS 1.2.5 update, if any unit is older **[unverified: how Dell ships the 3040 BIOS update outside ThinOS]**.
 
@@ -201,12 +202,14 @@ Most of this needs no Wyse:
 | Eleventh cluster member | No. The appliance image is UEFI-only; a Pi 4 needs community UEFI firmware to boot it, there's no CI for that, and a mixed-architecture cluster is a different test **[unverified that the aarch64 image boots on Pi UEFI firmware at all]**. |
 | Out-of-band console | No. The Wyses have no serial port; the console is DisplayPort. |
 
-## Open questions for the maintainer
+## Decisions (maintainer, 3 October 2026)
 
-1. **Which Pi model** is it, and is its Wi-Fi in range of the home router? (The plan assumes Wi-Fi uplink. If not, a second USB Ethernet adapter on the Pi does the same.)
-2. **Are the Wyses' eMMCs blank?** If any still runs ThinOS or ThinLinux, PR 1 (`--wipe`) blocks the lab; if they're all blank, it's still needed for reinstalls, but not urgently.
-3. **How many council voters** on 2 GB nodes? The reconciler caps the council at seven; research §9.2 suggests three or five. Should claim or `cluster create --bare-metal` set a smaller cap for appliance clusters?
-4. **Is the switch managed?** (Spanning tree; see the checklist.)
-5. **Do we want `relish netboot --dhcp` at all?** The plan says not for this lab. If the product should work on a bare switch with only a laptop, it's 1.5–2 weeks and belongs after 0.3.0.
-6. **Run S5 before or after 0.3.0 publishes a signed OS release?** Before means lab builds and `--key` (and the OS-update step needs PR 5); after means `relish image download --arch x86_64` and the real channel, which is the product path and what the exit test should prove.
-7. **Trust on the isolated switch:** is `--trust-lan` acceptable for the lab's claims, or should the run compare all ten claim keys on the monitor, as a user would?
+1. **The Pi:** not bought yet. A Pi 5 with 4 GB (or a Pi 4 with 4 GB) is the recommendation, as the lab's router, DHCP, DNS and NTP, and the backup netboot server.
+2. **Disks:** some Wyses still hold ThinOS and some are blank, so `relish netboot` gets a confirm-then-wipe flow (PR 1). A used disk is wiped only after a yes, or when its MAC is listed with `--wipe`.
+3. **Council size: five voters** (PR 8).
+4. **Switch:** not bought yet. A Netgear JGS524E is fine; something simpler would do too.
+5. **No `relish netboot --dhcp`** for now.
+6. **S5:** first lab runs on CI lab builds (PR 5); the formal S5 run on the signed channel after 0.3.0 publishes one.
+7. **Trust:** `--trust-lan` for day-to-day lab runs; the formal S5 run compares all ten claim keys on the monitor, as a user would.
+
+**The train:** `release-1-3-0` (gate PR #490). It's renumbered for compatibility when it lands on top of 0.1.5.
