@@ -973,6 +973,209 @@ async fn status_answers_while_a_large_catalogue_is_published() {
         .await;
 }
 
+// ---- consumer synchronisation (#505) ------------------------------------------
+
+/// How long one discovery-journal write takes in the consumer scenarios.
+/// The 0.1.4 candidate's compressed soak logged consumer syncs of 1.0 to
+/// 1.2 s that journalled three writes each, so about 400 ms a write.
+const SOAK_JOURNAL_WRITE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// An agent enrolled as a cluster consumer that has just recovered its
+/// ownership, so its view is withdrawn and nothing routes yet. Returns the
+/// agent, its state directory, and a leader answer to publish.
+async fn recovered_consumer() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::catalog::EndpointCatalog,
+    Vec<crate::cluster::orchestrate::IngressAssignment>,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let (mut agent, _, _) = test_cluster_fault_agent().await;
+    agent.set_records_dir(root.path().to_owned());
+    agent
+        .supervisor
+        .grill()
+        .set_launch_inventory(Vec::new())
+        .await;
+    let identity = crate::bun::consumer_owners::ConsumerIdentity {
+        node_id: crate::meat::NodeId::new("test"),
+        cluster_identity: [42; 32],
+    };
+    agent
+        .recover_consumer_ownership(&root.path().join("discovery"), identity)
+        .await
+        .unwrap();
+    let (catalog, ingress) = cluster_publication_fixture();
+    (agent, root, catalog, ingress)
+}
+
+/// The fixture's catalogue with its one remote backend moved to another
+/// port: a new view, replaced in place.
+fn moved_remote_backend() -> crate::onion::catalog::EndpointCatalog {
+    crate::onion::catalog::EndpointCatalog::rebuild([(
+        crate::onion::service_id::ServiceId::new("default", "remote"),
+        8080,
+        vec![crate::onion::catalog::CatalogBackend {
+            execution: None,
+            node_id: "other-node".into(),
+            node_ip: "192.168.1.2".parse().unwrap(),
+            host_port: 30011,
+            healthy: true,
+        }],
+    )])
+    .unwrap()
+}
+
+/// Send one leader answer, as the placement poll does.
+async fn sync_consumer(
+    tx: &mpsc::Sender<AgentCommand>,
+    generation: u64,
+    catalog: crate::onion::catalog::EndpointCatalog,
+    ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+) -> oneshot::Receiver<Result<ConsumerUpdate, BunError>> {
+    let (response, reply) = oneshot::channel();
+    tx.send(AgentCommand::SyncClusterConsumer {
+        generation,
+        catalog: Box::new(catalog),
+        ingress,
+        withdrawals: vec![],
+        requested_at_ns: crate::onion::lease::boot_clock_ns(),
+        response,
+    })
+    .await
+    .unwrap();
+    reply
+}
+
+/// The 0.1.4 candidate's compressed soak (#505): every slow command turn
+/// was `sync_cluster_consumer`, 300 to 700 ms through setup and 1.0 to
+/// 1.2 s after a leader kill. A sync that changes the view journals it
+/// before installing it, then marks it active, then forgets the views it
+/// replaced: three fsync'd writes in one turn, and five when the first
+/// answer after a recovery withdraws everything first. At the soak's
+/// 400 ms a write, either sync must still keep every turn, and a status
+/// queued behind it, inside the budget.
+#[tokio::test]
+async fn status_answers_while_a_consumer_sync_journals_to_a_slow_disk() {
+    let (agent, _root, catalog, ingress) = recovered_consumer().await;
+    let lease = agent.view_lease_handle();
+    let running = run_restarted(agent);
+    running.stalls.set(LoopStall::Persist, SOAK_JOURNAL_WRITE);
+    running.measure_from_here();
+    for (generation, catalog, view) in [
+        (1, catalog, "the first answer after a recovery"),
+        (2, moved_remote_backend(), "a changed view"),
+    ] {
+        let reply = sync_consumer(&running.tx, generation, catalog, ingress.clone()).await;
+        let mid_sync = running.status_latency().await;
+        assert!(
+            mid_sync.is_some_and(|latency| latency < TURN_BUDGET),
+            "status took {mid_sync:?} while {view} journalled to a slow disk"
+        );
+        let update = tokio::time::timeout(std::time::Duration::from_secs(10), reply)
+            .await
+            .expect("the sync was never answered")
+            .unwrap()
+            .unwrap();
+        assert!(update.published, "{view} was not published");
+        assert!(lease.is_valid(), "{view} did not renew the view lease");
+    }
+    running
+        .assert_responsive("consumer syncs journalled their views to a slow disk")
+        .await;
+}
+
+/// Counting the writes makes the split independent of the disk: whatever a
+/// write costs, no consumer step pays for two. A recovery's first answer
+/// journals five (withdrawing, withdrawn, receipts proven, publishing,
+/// active) and a changed view three (publishing, active, compacted), in
+/// that order, as they did in one turn before (#505).
+#[tokio::test]
+async fn a_consumer_sync_journals_at_most_one_write_a_turn() {
+    let (mut agent, _root, catalog, ingress) = recovered_consumer().await;
+    let lease = agent.view_lease_handle();
+    for (generation, catalog, total) in [(1, catalog, 5), (2, moved_remote_backend(), 3)] {
+        let (response, mut reply) = oneshot::channel();
+        let mut writes_per_turn = Vec::new();
+        let before = agent.loop_stalls.reached(LoopStall::Persist);
+        agent
+            .handle_command(AgentCommand::SyncClusterConsumer {
+                generation,
+                catalog: Box::new(catalog),
+                ingress: ingress.clone(),
+                withdrawals: vec![],
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            })
+            .await;
+        writes_per_turn.push(agent.loop_stalls.reached(LoopStall::Persist) - before);
+        while !agent.consumer_syncs.is_idle() {
+            assert!(
+                reply.try_recv().is_err(),
+                "generation {generation} was answered before its last step"
+            );
+            let before = agent.loop_stalls.reached(LoopStall::Persist);
+            agent.continue_consumer_sync().await;
+            writes_per_turn.push(agent.loop_stalls.reached(LoopStall::Persist) - before);
+        }
+        let update = reply.await.unwrap().unwrap();
+        assert!(update.published);
+        assert!(lease.is_valid());
+        assert_eq!(
+            agent.consumer_owner().unwrap().phase,
+            crate::bun::consumer_owners::ConsumerPhase::Active
+        );
+        assert_eq!(
+            writes_per_turn.iter().sum::<usize>(),
+            total,
+            "generation {generation}'s writes per turn: {writes_per_turn:?}"
+        );
+        assert!(
+            writes_per_turn.iter().all(|writes| *writes <= 1),
+            "a turn of generation {generation} journalled more than one write: \
+             {writes_per_turn:?}"
+        );
+    }
+}
+
+/// Between a recovery's withdrawal and its publication the journal says
+/// Withdrawn, and other turns run in between. The view about to be
+/// published was built before, so the local addresses it names stay held.
+#[tokio::test]
+async fn a_local_address_stays_held_between_a_withdrawal_and_its_publication() {
+    let (mut agent, _root, _catalog, _ingress) = recovered_consumer().await;
+    let local = InstanceId("default__web-0".into());
+    let backend = agent.local_backend(
+        &local,
+        &crate::onion::service_id::ServiceId::new("default", "web"),
+        Some("10.0.2.2".parse().unwrap()),
+        30002,
+        true,
+    );
+    let vip = crate::onion::vip::VirtualIP(std::net::Ipv4Addr::new(127, 128, 0, 1));
+    let publication = crate::bun::consumer_owners::ConsumerPublication {
+        generation: 1,
+        catalog: Default::default(),
+        effective_services: vec![crate::onion::types::ServiceEntry {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            namespace_id: crate::onion::vip::name_to_id("default"),
+            app_id: u32::from(vip.0),
+            vip,
+            port: 8080,
+            backends: vec![backend],
+            firewall_allow_from: None,
+        }],
+        ingress: vec![],
+    };
+    assert!(
+        !agent.own_view_names(&local),
+        "a withdrawn view names nothing"
+    );
+    agent.consumer_syncs.hold_for_test(publication);
+    assert!(agent.own_view_names(&local));
+}
+
 // ---- callers that can hold a turn ---------------------------------------------
 
 /// `relish logs -f --tail` sends the tail lines into the API's 64-slot
