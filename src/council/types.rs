@@ -491,6 +491,23 @@ pub struct DesiredState {
     pub last_membership: StoredMembership<u64, CouncilNodeInfo>,
 }
 
+impl DesiredState {
+    /// Turn a restored state into the first state of a new recovery epoch
+    /// (12b.2 D21/CP12).
+    ///
+    /// Bumps the epoch, drops the dead council's log position and
+    /// membership so the recovered node starts a fresh term line, and lifts
+    /// the catalogue generation above anything the old epoch published
+    /// (#478).
+    pub fn enter_recovery_epoch(&mut self) {
+        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+        self.last_applied_log = None;
+        self.last_membership = StoredMembership::default();
+        self.endpoint_withdrawals
+            .enter_recovery_epoch(self.recovery_epoch);
+    }
+}
+
 /// Serialises a `HashMap<K, V>` as a `Vec<(K, V)>`.
 ///
 /// JSON requires string keys, but `AppId` is a struct. We serialise

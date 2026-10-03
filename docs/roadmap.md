@@ -189,7 +189,10 @@ migration and no feature gate
   visibility, expiry, rotation and per-namespace secret keys (F05 I2–I4,
   [#363](https://github.com/reliaburger/reliaburger/issues/363)); and the
   retired intent that keeps decrypted secrets
-  ([#476](https://github.com/reliaburger/reliaburger/issues/476)). Worker
+  ([#476](https://github.com/reliaburger/reliaburger/issues/476)). It also
+  fixes three council-recovery bugs: lost tokens, a refused catalogue and a
+  refused log-only recovery
+  ([#477](https://github.com/reliaburger/reliaburger/issues/477)–[#479](https://github.com/reliaburger/reliaburger/issues/479)). Worker
   key separation (F03b), root rotation and restore (F04 R5–R7) and per-app
   audiences (F05 I5–I6) follow later. The security work comes before real
   fleets in 0.3.0.
