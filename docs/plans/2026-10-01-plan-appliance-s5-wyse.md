@@ -1,17 +1,48 @@
 # Plan: spike S5, the ten Dell Wyse 3040s
 
-*Written 1 October 2026, before the hardware run. The checklist is research §9.7; the commands are [`docs/manual/14_appliance.md`](../manual/14_appliance.md), which ran word for word on two virtual Wyses (see the [lab plan's log](2026-09-28-plan-appliance-lab.md)). What to record at each step is in **Record**; it all goes into `docs/qualification/<date>-wyse-3040.md`.*
+*Written 1 October 2026, before the hardware run, and rewritten on 3 October around the 0.3.0 train (`release-1-3-0`): `relish netboot` from the Mac, the Raspberry Pi as the lab's router, and claiming over the network instead of `netboot-server.sh` and `seed-fleet.sh`. The checklist is research §9.7; the lab and the reasons behind it are the [Wyse lab plan](2026-10-02-plan-appliance-wyse-lab.md); the commands are the [manual's appliance chapter](../manual/14_appliance.md). What to record at each step is in **Record**; it all goes into `docs/qualification/<date>-wyse-3040.md`.*
+
+## The lab
+
+```
+home Wi-Fi ── wlan0  Raspberry Pi  eth0 10.77.0.1 ── Netgear JGS524E ─┬─ M2 MacBook Pro, USB-C Ethernet (en7) 10.77.0.2, relish netboot
+                     DHCP, DNS, NTP, NAT                              ├─ wyse-1  10.77.0.11
+                                                                      ├─ …
+                                                                      └─ wyse-10 10.77.0.20
+```
+
+- **The Pi** (a Pi 5 or Pi 4 with 4 GB) is the lab's router: DHCP with a reservation per Wyse and one for the Mac's adapter, DNS, NTP, and NAT out through its Wi-Fi. Set it up with [`image/lab/pi/README.md`](../../image/lab/pi/README.md). It answers nothing about booting.
+- **The Mac** runs `relish netboot`, a ProxyDHCP beside the Pi's DHCP: it adds the boot file to the conversation and never hands out an address. That's the topology CI tests (`image/tests/relish-netboot-install.sh`). There's no `--dhcp` mode, and the lab doesn't need one (maintainer, 3 October 2026).
+- **The switch**, a Netgear JGS524E, with spanning tree off. STP's listening delay outlasts PXE's DHCP timeout. Turn "green Ethernet" (EEE) off too if links flap.
+- **Ten Wyse 3040s**: x86_64, 2 GB, 8 GB eMMC, UEFI PXE on a Realtek RTL8111/8168. Some still hold ThinOS, some are blank.
+
+## Two kinds of run
+
+| | Lab runs | The formal S5 run |
+|---|---|---|
+| Images | A CI lab build of the train (throwaway key per run) | The signed channel, once 0.3.0 publishes an OS release |
+| relish on the Mac | Built from the lab build's commit | The 0.3.0 release |
+| `relish netboot` | `art --key art/x86_64/spike-signing-key.pub.pem` | `os`, no `--key` |
+| Claim keys | `--trust-lan` | All ten compared on the monitor |
+| sshd, so `fleet-measure.sh` and the fallback test | Yes (lab profile) | No: published images have no sshd |
+| OS update | To the run's own next version, over a lab channel | To the next published release, if one exists by then |
+
+Do the lab runs first. Each step below gives both where they differ.
 
 ## Before the day
 
-- **Which images (maintainer, 3 October 2026):** the first lab runs use CI lab builds; the formal S5 run uses the signed channel once 0.3.0 publishes one (`relish image download`, and `relish os upgrade` with no version).
-- **A lab build:** 2026.40.46 or later (zram, `noatime,compress=zstd:1`, journald at 32 MB, one old bun kept). Start a fresh build: Actions → Appliance image → Run workflow, with `publish` off. A run started by hand keeps its artefacts for 7 days; a pull request's run, for one. Dispatch needs the workflow on `main`, so until 0.3.0 merges, take the newest green pull request run of the train and download it that day. Note the run ID.
-- **The version to update to comes with it.** Every x86_64 lab build also builds the next version (one build number on) and uploads it as `appliance-x86_64-next`: the release laid out as on GitHub beside a lab `os-channel.json`, all signed with the run's key. Step 7 serves it. For the fallback test, run the workflow once more with `broken_bun` ticked; that run makes no next version.
+- **The Pi**, set up and checked as its README says, with all ten reservations and the Mac's filled in. Label each Wyse with its MAC, its address and its node number.
+- **The Mac:**
+  - `relish`. For a lab run, build it from the commit the lab build came from, because the image's bun is built from that commit (the appliance workflow's `bun` job): `git checkout <sha>` then `cargo build --release --bin relish`, and use `./target/release/relish`. For the formal run, the 0.3.0 release.
+  - `gh`, and `python3` for serving the next version.
+  - The adapter's name: `networksetup -listallhardwareports`, the `Device:` under the USB Ethernet port, say `en7`. `ipconfig getifaddr en7` should print `10.77.0.2` once the Pi is up, and `route -n get default` should still name the Wi-Fi.
+  - The application firewall: `/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate`. If it's on, allow relish (manual, "Serving from a Mac"), and `python3` for step 7.
+  - Internet Sharing off, and no VM with shared or host networking running: either may hold UDP 67. `sudo lsof -nP -iUDP:67` should print nothing.
+  - An SSH key for the lab runs: `~/.ssh/id_ed25519.pub`.
+- **A lab build** (lab runs only): 2026.40.46 or later, from a green run of the train. Dispatching the appliance workflow needs it on `main`, so until 0.3.0 merges, take the newest green pull request run into `release-1-3-0` and download it the same day: a pull request's artefacts last one day, a dispatched run's seven. Note the run ID and the image version (`IMAGE_VERSION`, the run's summary). Every x86_64 lab build also uploads `appliance-x86_64-next`: the next version, one build number on, laid out as a GitHub release beside a lab `os-channel.json`, all signed with the run's key. Step 7 serves it.
+- **A broken build** (lab runs only), for step 7's fallback: a second run whose bun never starts. Until the workflow is on `main`, open a throwaway draft pull request into `release-1-3-0` that adds an empty `image/spike-broken-bun` (never merge it); after that, dispatch with `broken_bun` ticked. Its image version must sort above the lab build's next version, so start it at least two runs after the lab build: lab versions are `<week>.<run number>`, and a run numbered exactly one after the lab build would carry the same version as its next.
 - **Disk size:** CI tests on a 7.25 GiB disk (`image/tests/disk.sh`), a little under the 3040's ~7.3 GiB eMMC, so the data partition the tests see is the one the Wyses get.
-- **A Linux machine on the Wyse network** for `netboot-server.sh` (`apt install dnsmasq-base python3`), on wired Ethernet. The lab Mac can't bridge a VM onto a physical LAN without root.
-- **The laptop** with `relish` 0.1.1, `gh`, `rustup`, `mtools` and a USB stick for the seeds.
-- **A router** with a DHCP reservation per Wyse. The MAC is on the label under each unit, or in the BIOS.
-- A DisplayPort monitor and a USB keyboard: the 3040 has no serial port.
+- A DisplayPort monitor and a USB keyboard: the 3040 has no serial port, and its monitor is where the installer's progress and the claim key show.
 
 ## 1. BIOS, all ten units
 
@@ -20,37 +51,76 @@ F2 at power-on (default password `Fireport`):
 - UEFI boot, legacy (CSM) off. Once off, it can't be turned back on;
 - the network stack and UEFI PXE (IPv4) on;
 - Secure Boot off (it ships off);
-- the eMMC first, the network second. A blank eMMC falls through to PXE;
+- the eMMC first, the network second;
 - optionally, power on after AC loss.
 
-**Record:** the BIOS version found, the exact menu names, the PXE boot entry's name, and the minutes per unit.
+A blank eMMC falls through to PXE. A unit that still holds ThinOS boots ThinOS instead, so for its first install press F12 and pick the UEFI IPv4 Realtek entry, or put the network first until it has installed. After the install, the installer puts the disk first by itself.
 
-## 2. Serve and seed
+**Record:** the BIOS version found, the exact menu names, the PXE boot entry's name, which units held ThinOS, and the minutes per unit.
+
+## 2. Serve
+
+Lab run:
 
 ```sh
-# Linux box: the build's x86_64 artefact and its next version, unpacked
 gh run download <run> -R reliaburger/reliaburger -n appliance-x86_64 -D art/x86_64
 gh run download <run> -R reliaburger/reliaburger -n appliance-x86_64-next -D next
-sudo image/tools/netboot-server.sh "$PWD/art" eth0
-
-# Laptop: all ten nodes now (released buns can't take --network yet)
-image/tools/seed-fleet.sh init ~/wyse --cluster wyse --operator <laptop IP> \
-  --ssh-key ~/.ssh/id_ed25519.pub <MAC1>@<IP1> ... <MAC10>@<IP10>
+caffeinate -i sudo ./target/release/relish netboot art \
+  --key art/x86_64/spike-signing-key.pub.pem --interface en7 --for 3h \
+  --mac <mac-1> --mac <mac-2> … --mac <mac-10>
 ```
 
-Then write the stick as the manual's "Create the cluster" says, once node 1's seed exists.
+Formal run:
+
+```sh
+relish image download --dir os
+caffeinate -i sudo relish netboot os --interface en7 --for 3h \
+  --mac <mac-1> … --mac <mac-10> \
+  --wipe <mac-1> … --wipe <mac-10>
+```
+
+`relish image download` saves every architecture the release has (`os/x86_64/` and `os/aarch64/`); `--arch x86_64` saves only the Wyses'. `--mac` keeps relish away from anything else on the switch that network-boots.
+
+Attended or not: without `--wipe`, each unit that still holds ThinOS reports its disk and waits for a `y` at this terminal (manual, "A disk that isn't blank"). Answer the first lab run's questions by hand, to see each disk report; pass `--wipe <mac>` for every unit, as in the formal run, to install unattended. A blank disk never asks.
+
+**Record:** the start-up lines: the signature checks, the probe's verdict (`10.77.0.1 hands out addresses on en7, and no other netboot server answers`), and what it serves. If the probe says nothing hands out addresses, the Pi is down or on the wrong port: stop and fix that first.
 
 ## 3. Netboot all ten at once
 
-Power them all on together. Watch the netboot server's log and one console.
+Power them all on together. Watch relish's log and one monitor.
 
-**Record:** the time from power-on to the last `installed … in N s`; the installer's peak memory line; whether `target` is `/dev/mmcblk0` (never `mmcblk0boot0`/`boot1`); and the NIC name and driver (`r8169`).
+**Record:** the time from power-on to the last `installed … in N s`; each unit's disk report and decision; the installer's peak memory line; whether `target` is `/dev/mmcblk0` (never `mmcblk0boot0`/`boot1`); the option 93 architecture the firmware sent; and the NIC name and driver (`r8169`). If the SNP iPXE misbehaves on the Realtek, stop relish and start it again with `--ipxe full`, and record that.
 
-## 4. Form the cluster
+## 4. Claim the cluster
 
-Follow the manual's "Start node 1" and "Add the others" (`seed-fleet.sh join ~/wyse`).
+Each installed unit reboots into the appliance, finds no seed and becomes unclaimed: its monitor shows its address, MAC and claim key, and it announces itself over mDNS as `_rb-unclaimed._tcp`.
 
-**Record:** the time from node 1 up to `relish nodes` showing 10/10; who is in the council (the reconciler caps it at seven voters); `relish wtf`.
+```sh
+relish machines                  # ten rows, ARCH x86_64
+```
+
+Lab run, trusting the isolated switch:
+
+```sh
+relish machines claim ~/wyse --create --name wyse \
+  --operator 10.77.0.2 --network 10.77.0.0/24 \
+  --ssh-key ~/.ssh/id_ed25519.pub --trust-lan \
+  <mac-1> <mac-2> … <mac-10>
+```
+
+Formal run: the same without `--trust-lan` and `--ssh-key`. relish asks, for each unit in turn, whether its monitor shows the claim key it got. Move the monitor from unit to unit and compare all ten. Answer anything but `y` and nothing is claimed.
+
+The units become `wyse-1` to `wyse-10` in the order given, so list them in label order, `<mac-1>` first. The council grows to five voters (the appliance default; `relish machines claim --create --council-size` changes it). If `relish machines` misses a unit, give its address instead of its MAC; `dns-sd -B _rb-unclaimed._tcp` shows what the Mac hears.
+
+Then:
+
+```sh
+relish nodes
+relish council          # Size: up to 5 voters
+relish wtf
+```
+
+**Record:** whether all ten showed in `relish machines`, and how long that took; for the formal run, the minutes it took to compare ten keys; the time from the claim to `relish nodes` showing 10/10; who is in the council; `relish wtf`.
 
 ## 5. Tour, then pull a cord
 
@@ -58,13 +128,13 @@ The [five-minute tour](../manual/08_five-minute-tour.md) from `relish apply`, wi
 
 **Record:** the time per tour step against the laptop quickstart (deploy and image pull especially); how long the pulled node took to come back and rejoin; whether the reboot hung (`dw_dmac`: a clean `systemctl reboot` on two units counts).
 
-## 6. Measure for 24 hours
+## 6. Measure for 24 hours (lab run)
 
 ```sh
 image/tools/fleet-measure.sh ~/wyse 300 288    # every 5 minutes, 24 hours
 ```
 
-`~/wyse` is either the claim directory (`relish machines claim ~/wyse …`), whose `fleet.json` names the nodes (`wyse-1` to `wyse-10`), or the `seed-fleet.sh` directory from step 2 (nodes `node-01` to `node-10`). `fleet-measure.sh --relish ~/wyse 300 288` takes the nodes from `relish nodes --output json` instead, and only writes into `~/wyse`. The script logs in as root over SSH, so the machines need the key in their seeds: `relish machines claim --ssh-key ~/.ssh/id_ed25519.pub`, or `seed-fleet.sh init --ssh-key`, and a lab image (only lab images start sshd).
+`~/wyse` is the claim directory, whose `fleet.json` names the nodes (`wyse-1` to `wyse-10`) and their addresses. `fleet-measure.sh --relish ~/wyse 300 288` takes them from `relish nodes --output json` instead. The script logs in as root over SSH, so it needs a lab image and the key from the claim's `--ssh-key`. Published images have no sshd, so the formal run doesn't repeat this.
 
 Leave the tour's apps running for the first 12 hours, then remove them. One CSV per node lands in `~/wyse/measure/`.
 
@@ -78,9 +148,30 @@ Leave the tour's apps running for the first 12 hours, then remove them. One CSV 
 
 ## 7. OS update and fallback
 
-Roll the next version across the fleet as the manual's "Updating a CI build" says: serve `next/` (`cd next && python3 -m http.server 8000`), then `relish os upgrade <next version> --channel http://<laptop IP>:8000/releases/download/os-channel/os-channel.json`. The leader takes one node at a time, itself last. Name the version: relish checks a channel against the release keys only, so it can't read the lab channel (`relish os list` shows the newest release as unknown). Then stage the `broken_bun` build on one worker and leave it.
+**The update.** Lab run: serve the next version from the Mac and roll it out, as the manual's "Updating a CI build" says:
 
-**Record:** the time per node from `systemctl reboot` to blessed; that the cluster stayed quorate; for the broken one, the time to fall back on its own (about 16 minutes in VMs: three 300 s health checks) and whether the Wyse firmware kept counting tries.
+```sh
+(cd next && python3 -m http.server 8000)
+relish os upgrade <next version> \
+  --channel http://10.77.0.2:8000/releases/download/os-channel/os-channel.json
+relish os status
+```
+
+Name the version: relish checks a channel against the release keys only, so it can't read the lab channel (`relish os list` shows the newest release as unknown). Formal run: `relish os list`, then `relish os upgrade` with no version, if a release newer than the installed one exists by then. The leader takes one node at a time, workers first and itself last.
+
+**The fallback** (lab run only). The broken build can't go through `relish os upgrade`. It comes from another run, signed with that run's throwaway key, and the fleet trusts only its own run's key; that run makes no next version and no lab channel either. So stage it by hand on one worker, with the image's `os-stage`, which takes the key to check against. Pick a worker that isn't in the council (`relish council`), say wyse-9:
+
+```sh
+gh run download <broken run> -R reliaburger/reliaburger -n appliance-x86_64 -D broken
+(cd broken && python3 -m http.server 8001)
+scp broken/spike-signing-key.pub.pem root@10.77.0.19:/run/broken.pem
+ssh root@10.77.0.19 /usr/lib/reliaburger/os-stage http://10.77.0.2:8001 <broken version> /run/broken.pem
+ssh root@10.77.0.19 systemctl reboot
+```
+
+Then leave it. Each of the three tries waits for bun before the boot check reboots it, and after the third systemd-boot falls back to the version it ran before.
+
+**Record:** the time per node from reboot to blessed; that the cluster stayed quorate; for the broken one, the time to fall back on its own (about 16 minutes in VMs with three 300 s checks; a counted boot now waits 120 s) and whether the Wyse firmware kept counting tries.
 
 ## 8. Write it up (S6)
 

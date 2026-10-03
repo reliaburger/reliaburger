@@ -8,20 +8,27 @@ boots from the network once, installs itself in under a minute, and from then
 on it's a node.
 
 It's a **preview**, and the rough edges are part of what it's for:
-- The images come from CI runs of the appliance branch, each signed with a
-  throwaway key. A run you start by hand keeps them for a week; a pull
-  request's run, for a day.
-- We've run all of it in QEMU VMs, both aarch64 and x86_64. Real hardware (a
-  fleet of Dell Wyse 3040s) comes next, so expect firmware surprises.
+- Until 0.3.0 publishes the first signed OS release, the images come from CI
+  lab builds, each signed with a throwaway key. A run you start by hand keeps
+  them for a week; a pull request's run, for a day.
+- We've run all of it in QEMU VMs, both aarch64 and x86_64. Real hardware (ten
+  Dell Wyse 3040s, netbooted from a Mac) comes next, so expect firmware
+  surprises.
+
+The short version: `relish image download` fetches the OS, `sudo relish
+netboot` installs it on every machine that network-boots, and `relish machines
+claim` turns the installed machines into a cluster.
 
 ## What you need
 
-- **Two to seven machines**, ideally three or more:
+- **Two or more machines**, ideally three or more:
   - x86_64 or arm64, with UEFI and network boot (PXE);
   - at least 2 GiB of RAM and an 8 GB disk;
   - wired to the same network.
 
-  **The installer erases the largest built-in disk.**
+  **The installer erases the largest built-in disk.** A blank one goes
+  without asking; one that holds anything else is wiped only after you say
+  yes at the `relish netboot` terminal, or name the machine with `--wipe`.
 - **A router you control**, with a DHCP reservation for each machine, so each
   keeps the same address. Nodes find each other by address, and they need the
   router's default route to work out their own. Your home router will do. On
@@ -31,20 +38,25 @@ It's a **preview**, and the rough edges are part of what it's for:
   the router must not answer PXE.
 - **A machine on that network to serve the netboot**: your laptop (Linux or
   macOS), any spare box, or a VM bridged onto the LAN. It needs `relish` and
-  root.
-- **Your laptop**, on the same network, with:
-  - `relish`, from the same release as the images' bun;
-  - `gh`, `openssl`, `python3`, and Rust (`rustup`), for a small helper;
-  - a checkout of the repository;
-  - a USB stick you can erase.
+  root. A Mac on a USB-C Ethernet adapter does fine (see "Serving from a
+  Mac").
+- **Your laptop**, on the same network, with `relish` from the same release
+  as the images' bun. For a CI build, that's relish built from the same
+  commit (`cargo build --release --bin relish`), plus `gh` to download it and
+  `python3` to serve its update.
+- Optionally, a USB stick you can erase, if you'd rather carry seeds to the
+  machines than claim them over the network.
 
 ## Get the images
 
+Once an OS release is published, `relish image download --dir os` fetches the
+newest one (below). Until then, take a CI lab build.
+
 The appliance workflow builds both architectures on every change. For a lab
-day, start a run by hand (Actions → Appliance image → Run workflow, on the
-appliance branch, with `publish` left off), so its artefacts last a week rather
-than a day. GitHub only offers that once the workflow is on `main`; until
-then, take the newest green pull request run and download it the same day:
+day, start a run by hand (Actions → Appliance image → Run workflow, with
+`publish` left off), so its artefacts last a week rather than a day. GitHub
+only offers that once the workflow is on `main`; until then, take the newest
+green pull request run and download it the same day:
 
 ```sh
 gh run list --workflow appliance.yml --status success
@@ -60,13 +72,14 @@ You only need the architecture of your machines. Each artefact holds:
 - iPXE and its boot script, in `netboot/`.
 
 The installer checks that signature before it writes anything. It carries the
-same run's public key.
+same run's public key. The x86_64 run also uploads `appliance-x86_64-next`,
+the version to update to ("Updating a CI build").
 
-Once an OS release is published, `relish image download --dir os` fetches the
-newest one instead. It fetches every architecture the release has, whatever
-the machine you run it on, so an arm64 Mac serving x86_64 machines gets the
-right image. It checks each one against the key relish carries, writes the same
-layout, `os/x86_64/` and `os/aarch64/`, and ends by naming what it saved:
+For a published release, `relish image download --dir os` fetches every
+architecture the release has, whatever the machine you run it on, so an arm64
+Mac serving x86_64 machines gets the right image. It checks each one against
+the key relish carries, writes the same layout, `os/x86_64/` and
+`os/aarch64/`, and ends by naming what it saved:
 
 ```
 Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)
@@ -175,7 +188,39 @@ a USB-C or Thunderbolt Ethernet adapter, and a few things are different:
   ```
 
 - **Internet Sharing** runs its own DHCP server, which holds the port relish
-  needs. Turn it off for the adapter (relish says so if it's on).
+  needs. Turn it off for the adapter (relish says so if it's on). A VM tool
+  with shared or host-only networking may run one too.
+  `sudo lsof -nP -iUDP:67` shows who holds the port.
+
+### A lab of its own
+
+The lab we built this for keeps the machines off the home network: a Mac on a
+USB-C Ethernet adapter, a gigabit switch, ten Dell Wyse 3040s, and a
+Raspberry Pi as the router.
+
+```
+home Wi-Fi ── Raspberry Pi 10.77.0.1 ── switch ─┬─ Mac, USB-C Ethernet (en7) 10.77.0.2
+              DHCP, DNS, NTP, NAT               ├─ wyse-1  10.77.0.11
+                                                ├─ …
+                                                └─ wyse-10 10.77.0.20
+```
+
+The Pi hands out the addresses, one reservation per machine and one for the
+Mac's adapter (with no default route, so the Mac's internet stays on Wi-Fi),
+and routes the machines to the internet through its Wi-Fi. NTP from the Pi
+matters on second-hand machines, whose clock batteries may be flat: a node
+whose clock is years out rejects every certificate.
+[`image/lab/pi/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/pi/README.md)
+sets it up. relish runs on the Mac and does only the boot part:
+
+```sh
+caffeinate -i sudo relish netboot os --interface en7 --for 3h
+```
+
+If the switch has spanning tree, turn it off, or turn on its fast-start
+setting for every port (often called PortFast or edge port). A port that
+spends thirty seconds listening before it forwards makes the firmware's
+network boot time out.
 
 ## Prepare the machines
 
@@ -185,7 +230,10 @@ In each machine's firmware setup:
 - put the disk before the network in the boot order.
 
 A blank disk isn't bootable, so the first boot falls through to the network.
-After that, the disk boots.
+After that, the disk boots. A disk that still holds its old system boots that
+instead, so for the first install pick the network from the firmware's boot
+menu (F12 on a Dell), or put the network first until it has installed. The
+installer puts the disk first again by itself.
 
 If you leave the network first, it still works, only slower. With the netboot
 server running, an installed machine is told to boot its disk, which costs a
@@ -250,15 +298,109 @@ http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wipi
 
 If several machines report at once, the questions come one at a time.
 
-Write down each machine's MAC address and address from the `this machine`
-line. You'll need them next. (Your router's list of reservations has them
-too.)
+## Claim them
 
-## Create the cluster
+After the install, each machine reboots into the appliance and looks for a
+*seed*: a small file that tells it which cluster it belongs to and who it is.
+It has none yet, so it becomes *unclaimed*. It makes a key, shows a short
+fingerprint of it on its monitor, and announces itself on the LAN over mDNS
+until someone sends it a seed:
 
-Back on your laptop, create the cluster and a *seed* for every machine: a
-small file that tells it who it is. List the machine that will be node 1
-first:
+```
+  Address    192.168.1.51
+  MAC        d8:9e:f3:12:34:56
+  Claim key  3f9a-12bc-77de-0a41
+```
+
+From your laptop, on the same LAN:
+
+```sh
+relish machines
+```
+
+```
+ADDRESS           MAC               ARCH     CLAIM KEY
+192.168.1.51      d8:9e:f3:12:34:56 x86_64   3f9a-12bc-77de-0a41
+192.168.1.52      d8:9e:f3:12:34:57 x86_64   77c0-9e1d-4b2a-e816
+192.168.1.53      d8:9e:f3:12:34:58 x86_64   c5d1-03aa-9f72-1b60
+```
+
+It listens for three seconds; `relish machines --wait 10` listens longer.
+Create the cluster from them, node 1 first, by MAC or by address:
+
+```sh
+relish machines claim ~/home-cluster --create --name home \
+  --operator 192.168.1.10 --network 192.168.1.0/24 \
+  d8:9e:f3:12:34:56 d8:9e:f3:12:34:57 d8:9e:f3:12:34:58
+```
+
+- `--operator` is your laptop's address, the one relish connects from. Only
+  that address can reach the nodes' API.
+- `--network` is your LAN. Each node's firewall lets machines on it reach the
+  cluster ports before they've joined (those ports all need the cluster's
+  certificates). Without it, only the machines listed here get through.
+- The machines become `home-1`, `home-2` and `home-3`, in the order given.
+- The council, the machines that hold the cluster's state and vote on every
+  change, grows to five voters. Five ride out two failures at once. Seven
+  would ride out three, but every voter keeps the council's log and votes on
+  every write, which 2 GB machines feel. The rest are workers.
+  `--council-size` takes another odd number from 1 to 7. An even size is
+  refused: four voters survive no more failures than three. A cluster with
+  fewer machines than its size makes every machine a voter. `relish council`
+  shows the size as `Size: up to 5 voters`.
+
+For each machine, relish shows the claim key it got and asks whether the
+machine's monitor shows the same:
+
+```
+Does the console of d8:9e:f3:12:34:56 (192.168.1.51) show claim key 3f9a-12bc-77de-0a41? [y/N]
+```
+
+Check: anything on your LAN can announce itself, and this is what stops node
+1's seed, which carries the cluster's keys, going to the wrong machine.
+Anything but `y` claims nothing. relish then sends each seed over a
+connection pinned to that key, and the machines carry on as if the seeds had
+come on a stick.
+
+With ten machines and one monitor, that's a lot of cable swaps. If you trust
+everything on the network, on an isolated switch with nothing else on it,
+say, `--trust-lan` skips the questions. relish refuses to claim without
+either a terminal to ask at or `--trust-lan`.
+
+The cluster's keys are made here, on your laptop, and never anywhere else
+until node 1's seed carries them. `~/home-cluster/secrets` holds the master
+key and the sealed root CA key: back them up, because `relish council
+recover` needs them if the cluster ever loses its quorum. Every other
+machine's seed holds only a join token: single-use, bound to that machine's
+name, and good for an hour (`--ttl` to change). Each machine fetches its
+certificate and the master key from the cluster itself when it joins. relish
+now points at node 1, with an admin token. Then:
+
+```sh
+relish nodes
+relish council
+relish wtf
+```
+
+All of them alive, all three in the council, and nothing to fix. Each
+machine's monitor shows its name, address and whether bun is running.
+
+The claim uses each machine's current address as its node address, so
+reserve those addresses for their MACs in your router first. mDNS doesn't
+cross routers; if relish can't see a machine, give its address instead of
+its MAC. To see what your laptop hears, `dns-sd -B _rb-unclaimed._tcp` on
+macOS or `avahi-browse -r _rb-unclaimed._tcp` on Linux lists the machines'
+announcements.
+
+`--ssh-key ~/.ssh/id_ed25519.pub` puts a key for root SSH into the seeds.
+Only CI lab builds run sshd; published images ignore it.
+
+## Or carry the seeds on a USB stick
+
+If the machines can't be reached over the network from your laptop, make the
+cluster and its seeds on your laptop, then walk them round on a stick. List
+the machine that will be node 1 first, each as its MAC and address, from the
+installer's `this machine` line or your router's reservations:
 
 ```sh
 relish cluster create --bare-metal ~/home-cluster --name home \
@@ -268,29 +410,10 @@ relish cluster create --bare-metal ~/home-cluster --name home \
   d8:9e:f3:12:34:58@192.168.1.53
 ```
 
-- `--operator` is your laptop's address, the one relish connects from. Only
-  that address can reach the nodes' API.
-- `--network` is your LAN. Each node's firewall lets machines on it reach the
-  cluster ports before they've joined (those ports all need the cluster's
-  certificates). Without it, only the machines listed here get through.
-- The machines become `home-1`, `home-2` and `home-3`.
-- The council, the machines that hold the cluster's state and vote on every
-  change, grows to five voters. Five ride out two failures at once. Seven
-  would ride out three, but every voter keeps the council's log and votes on
-  every write, which 2 GB machines feel.
-  `--council-size` takes another odd number from 1 to 7. An even size is
-  refused: four voters survive no more failures than three. A cluster with
-  fewer machines than its size makes every machine a voter. `relish council`
-  shows the size as `Size: up to 5 voters`.
-
-The cluster's keys are made here, on your laptop, and never anywhere else
-until node 1's seed carries them. `~/home-cluster/secrets` holds the master
-key and the sealed root CA key: back them up, because `relish council
-recover` needs them if the cluster ever loses its quorum. Every other
-machine's seed holds only a join token: single-use, bound to that machine's
-name, and good for a week (`--ttl` to change). Each machine fetches its
-certificate and the master key from the cluster itself when it joins. relish
-now points at node 1, with an admin token.
+`--operator`, `--network` and `--council-size` mean what they mean for a
+claim, and the secrets land in `~/home-cluster/secrets` the same way. A
+stick's join tokens are good for a week (`--ttl` to change), since a stick
+travels slower than a claim.
 
 Make the USB stick: a FAT filesystem labelled `RBSEED`, then copy the `seeds`
 folder onto it. On macOS, check the disk number with `diskutil list` first,
@@ -304,7 +427,7 @@ cp -R ~/home-cluster/stick/seeds /Volumes/RBSEED/
 On Linux, use `mkfs.vfat -n RBSEED /dev/sdX1`, then mount the stick and copy
 the folder.
 
-## Start the machines
+### Start the machines
 
 Plug the stick into node 1 and restart it (a power cycle is fine). While it
 boots, it finds the seed with its own MAC address on the stick and becomes
@@ -339,53 +462,6 @@ monitor shows its name, address and whether bun is running.
 
 A machine only looks for a seed until it has one, and waits up to ten
 seconds for the stick. So a stick left in later changes nothing.
-
-## Or claim them over the network
-
-You don't need the stick. A machine that boots with no seed becomes
-*unclaimed*: it makes a key, shows a short fingerprint of it on its monitor,
-and announces itself on the LAN until someone sends it a seed:
-
-```
-  Address    192.168.1.51
-  MAC        d8:9e:f3:12:34:56
-  Claim key  3f9a-12bc-77de-0a41
-```
-
-From your laptop, on the same LAN:
-
-```sh
-relish machines
-```
-
-```
-ADDRESS           MAC               ARCH     CLAIM KEY
-192.168.1.51      d8:9e:f3:12:34:56 x86_64   3f9a-12bc-77de-0a41
-192.168.1.52      d8:9e:f3:12:34:57 x86_64   77c0-9e1d-4b2a-e816
-```
-
-Create the cluster from them, node 1 first. relish takes the same options as
-`relish cluster create`, `--council-size` included, and the machines by MAC
-or by address:
-
-```sh
-relish machines claim ~/home-cluster --create --name home \
-  --operator 192.168.1.10 --network 192.168.1.0/24 \
-  d8:9e:f3:12:34:56 d8:9e:f3:12:34:57
-```
-
-For each machine, relish shows the claim key it got and asks whether the
-machine's monitor shows the same. Check: anything on your LAN can announce
-itself, and this is what stops node 1's seed, which carries the cluster's
-keys, going to the wrong machine. relish then sends each seed over a
-connection pinned to that key, and the machines carry on as if the seeds had
-come on a stick. If you trust everything on the network, `--trust-lan` skips
-the questions.
-
-The claim uses each machine's current address as its node address, so
-reserve those addresses for their MACs in your router first. mDNS doesn't
-cross routers; if relish can't see a machine, give its address instead of
-its MAC.
 
 ## Add machines later
 
