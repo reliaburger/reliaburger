@@ -1505,6 +1505,24 @@ mod tests {
     }
 
     #[test]
+    fn autoscale_admission_refuses_nonpositive_and_nonfinite_targets() {
+        for target in ["0%", "-20%", "NaN", "NaN%", "inf", "inf%", "-inf"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            assert!(config.validate().is_err(), "accepted target {target}");
+        }
+        for target in ["70%", "0.7", "150%"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn validate_job_exec_and_image_mutually_exclusive() {
         let job: crate::config::job::JobSpec = toml::from_str(
             r#"

@@ -115,6 +115,13 @@ fn compute_desired(current: u32, metric: f64, config: &AutoscaleConfig) -> u32 {
 
 ### Hysteresis and cooldown
 
+The target must be positive and finite. Parsing a Rust `f64` accepts `NaN`
+and infinity as well as ordinary numbers, so parsing alone isn't validation.
+We reject those values, zero and negative targets before apply. A finite
+target above 100% remains useful: requests aren't limits, and a replica may
+legitimately use more than it requested. If a collected sample isn't finite,
+the controller leaves the replica count alone for that evaluation.
+
 Without hysteresis, the autoscaler oscillates. CPU drops to 60% (below the 70% target), it scales down, load per instance jumps back to 90%, it scales up, and you're stuck in a loop.
 
 The fix: a scale-down threshold. The default is 0.8, meaning the metric must drop below `target * 0.8 = 56%` before scaling down. At 60%? No change. At 50%? Scale down. The gap between the scale-up trigger (> 70%) and the scale-down trigger (< 56%) prevents oscillation.
