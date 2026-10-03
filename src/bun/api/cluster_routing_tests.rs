@@ -338,6 +338,7 @@ async fn start_cluster_with_desired(
             None,
             None,
             None,
+            None,
         )
         .layer(axum::Extension(known.clone()));
         let url = format!("http://{}", listener.local_addr().unwrap());

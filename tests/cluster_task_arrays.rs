@@ -89,6 +89,7 @@ async fn start_node(
         operator_token: None,
         fault_injection: false,
         labels: Default::default(),
+        keep_data_dir: false,
         task_arrays: Some(service(data)),
     })
     .await
@@ -143,7 +144,7 @@ async fn status(http: &reqwest::Client, node: &WiredNode, batch_id: u64) -> Opti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn a_task_array_survives_losing_a_node_mid_run() {
     assert!(
         cluster_tests_enabled(),

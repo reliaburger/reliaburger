@@ -1,0 +1,13 @@
+running 5 tests
+leader succeeded=1, failed=0; failed-only result rows=[TaskResultRow { index: 0, attempts: 1, succeeded: false, exit_code: Some(1), run_ms: 1 }]
+test failed_only_results_keep_a_failure_from_a_superseded_run ... ok
+after append following torn tail: Err(Corrupt { offset: 30 })
+test appending_after_a_torn_tail_poisoned_the_ledger ... ok
+after stale sync: grant attempt 1, task attempts started 20
+test a_delayed_assignment_can_roll_a_worker_back_to_an_older_attempt ... ok
+node configured for 2 slots, two arrays have 4 running attempts
+test two_arrays_each_get_the_full_node_capacity ... ok
+completed 12, durable 0 (150ms after start, 10ms commit interval)
+test completed_tasks_have_no_ledger_records_until_the_chunk_finishes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s

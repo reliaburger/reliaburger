@@ -2,7 +2,7 @@
 
 Status: in progress on `feat/million-jobs`, for **0.2.0** ("A million jobs").
 Task arrays are wired into Raft, the API and `relish` (M5). The wiring bumped
-the compatibility generations to protocol 28 and state 45, so 0.2.0 needs a
+the compatibility generations to protocol 35 and state 50, so 0.2.0 needs a
 fresh cluster: the maintainer decided on 28 September 2026 that there's no
 backwards compatibility before 1.0.0 (see [Compatibility](#compatibility)).
 
@@ -15,9 +15,14 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
 
 *Keep this section current. Another agent resumes from here.*
 
-- **Branch:** `feat/million-jobs` (from `origin/main` at `087d882f`, plus a
-  merge of `plans/million-jobs`). Draft PR #266, "Million jobs: task arrays
-  at scale (0.2.0)", labelled `full-ci`.
+**3 October review:** keep the array/chunk concept, but resource accounting,
+durable outcomes and stale-grant fencing need correction before finishing the
+feature. Five defects reproduced; see the [review and qualification evidence](../qualification/2026-10-03-task-array-review/README.md).
+The next implementation step awaits the maintainer's decision after this review.
+
+- **Branch:** `feat/million-jobs`, rebased onto `main` at `41dfc9ba` on
+  3 October 2026 (the original base was `087d882f`). Draft PR #266, "Million jobs:
+  task arrays at scale (0.2.0)", labelled `full-ci`.
 - **Done (library, M1-M4):** `src/meat/index_set.rs`, `task_array.rs`,
   `task_array_state.rs`, `latency_histogram.rs`; `src/bun/task_executor.rs`,
   `task_ledger.rs`; `tests/suite/task_array_million.rs` (100k default,
@@ -30,7 +35,7 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
     `TaskArrays::apply` in `src/meat/task_array_store.rs`;
     `DesiredState::task_arrays`; `CouncilResponse::TaskArrayRegistered`. Ids
     come from `batch_state`'s counter. Finished arrays are pruned after an
-    hour or past 20; at most 64 run at once. Compatibility 28/45.
+    hour or past 20; at most 64 run at once. Compatibility 35/50.
   - Node: `src/bun/task_array_node.rs` (`TaskArrayNode::sync`, results,
     failed-task output; resume from the ledger via
     `TaskPool::resume_chunk`; zero slots plus a reason for a binary off the
@@ -53,10 +58,10 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
     cancel, refusal); gated `tests/cluster_task_arrays.rs` (three wired
     nodes, follower killed mid-run) in `make test-cluster`.
   - Docs: manual `01_deploy-an-app.md` "Task arrays"; book Chapter 12
-    "Wiring it in"; `docs/progress.md`; README; `docs/testing.md`.
+    "Wiring it in"; `docs/roadmap.md`; README; `docs/testing.md`.
 - **Next, in order:**
-  1. CI on PR #266 is green with `full-ci` (run 36486408185, commit
-     `348db40f`: lint, portable Linux and macOS, privileged Linux, minimum
+  1. Before the rebase, CI on PR #266 was green with `full-ci` (run
+     36486408185, commit `348db40f`: lint, portable Linux and macOS, privileged Linux, minimum
      Rust, benchmarks, acceptance, and the multi-node cluster job, which
      runs `cluster_task_arrays`). Keep `full-ci` on while the wiring moves.
   2. After the soak (about 03:30 BST): record `make bench-task-arrays`
@@ -78,8 +83,9 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
      so two arrays on one node can use twice its CPUs; results and logs
      fan out to nodes one at a time (3 s timeout each); gossip-dead nodes
      wait out the 30 s silence rather than being requeued at once.
-- **Local build constraints while the release soak runs:**
+- **Historical local build constraints during the September release soak:**
   `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=$HOME/.cache/rb-target-millionjobs`;
+  The following applied during that soak, not to the October rebase review:
   run only targeted tests (`cargo test --lib task_array`,
   `cargo test --test suite task_arrays`) and leave the full suite to CI. No
   Lima VMs, quickstart clusters, in-process multi-node clusters or
@@ -490,7 +496,7 @@ changes, so the bump is deliberate and the tests know where to look.
 | Change | Where | Encoding | Handling |
 |---|---|---|---|
 | `IndexRangeSet`, `TaskArraySpec`, `TaskArrayState`, ledger | new library types | JSON / local file | library only until M5 |
-| `RaftRequest::TaskArray(TaskArrayWrite)`, one variant wrapping `Register`, `Sync`, `Cancel` and `Requeue` (`src/meat/task_array_store.rs`) | `src/council/types.rs` | JSON, externally tagged | new variant: **protocol and state bump** (done: protocol 28, state 45) |
+| `RaftRequest::TaskArray(TaskArrayWrite)`, one variant wrapping `Register`, `Sync`, `Cancel` and `Requeue` (`src/meat/task_array_store.rs`) | `src/council/types.rs` | JSON, externally tagged | new variant: **protocol and state bump** (done: protocol 35, state 50) |
 | `CouncilResponse::TaskArrayRegistered { batch_id }` | same | JSON | same bump |
 | `DesiredState::task_arrays` | `src/council/types.rs` | JSON snapshot | same bump |
 | `JobStatus`, `BatchRecord`, `BatchJobUpdate` | `src/meat/batch_tracker.rs` | JSON | **unchanged**; arrays never reuse them |
@@ -675,13 +681,13 @@ k3s cluster of the same size, and publish both scripts.
 ### M5: wiring
 
 - [x] compatibility decision recorded (28 September 2026): no gate, bump and start fresh
-- [x] bump `protocol` and `state` in `src/compatibility.rs` (27/44 to 28/45); test that peers and state from before are refused
+- [x] bump `protocol` and `state` in `src/compatibility.rs` (34/49 to 35/50); test that peers and state from before are refused
 - [x] `RaftRequest::TaskArray(TaskArrayWrite)` and `DesiredState::task_arrays` (`src/meat/task_array_store.rs`; ids share the batch counter)
 - [x] node side of the sync (`src/bun/task_array_node.rs`): runs held chunks through `TaskPool` with the ledger, fences by attempt, resumes from the ledger after a restart (`TaskPool::resume_chunk`), refuses binaries off the allowlist and nodes with `mount_isolation` (M7 decides), keeps failed tasks' output, deletes an array's files once the cluster stops listing it
 - [x] `POST /v1/batch/array`, `POST /v1/batch/array/sync`, `POST /v1/batch/{id}/cancel`, `GET /v1/batch/{id}` for arrays (`"kind": "array"`, per-node slots, counters and refusal reasons), `GET /v1/batch/{id}/results`, `GET /v1/batch/{id}/tasks/{index}/logs`, plus the two node-local reads (`src/bun/task_array_api.rs`, authz matrix rows, scope checks on submit, cancel, results and logs)
 - [x] leader sync loop with requeue on silence (`src/bun/task_array_leader.rs`: one `Sync` entry per array per tick, grants planned against the state with that tick's results applied; standalone nodes use an in-memory copy). Portable suite `tests/suite/task_arrays.rs`: 100,000 fake tasks through a single-node council in 51 Raft entries; real processes standalone and with failures, results and logs; cancel; refusal reasons
 - [x] `relish run --batch --count` (with `--chunk`, `--max-attempts`, `--max-failed`, `--timeout`, `--concurrency`, `--env`, args after `--`; `--help` states at-least-once), `relish batch cancel`, arrays in `relish batch-status` (counts, chunks, failed indices, per-node slots or refusal); `relish batch FILE` keeps working beside the new subcommands
-- [x] multi-node in-process cluster test: `tests/cluster_task_arrays.rs` in `make test-cluster` (three wired nodes, 100,000 fake tasks submitted through a follower, a follower killed mid-run and requeued after a 3 s silence timeout). Passed in CI run 36486408185 (`full-ci`, "multi-node cluster" job, 28 September); never run locally
+- [x] multi-node in-process cluster test: `tests/cluster_task_arrays.rs` in `make test-cluster` (three wired nodes, 100,000 fake tasks submitted through a follower, a follower killed mid-run and requeued after a 3 s silence timeout). Passed in CI run 36486408185 (`full-ci`, "multi-node cluster" job, 28 September); also passed locally on 3 October 2026 (100,000 tasks, 27 Raft entries, 27.63 s)
 
 ### M6: views and data
 

@@ -307,7 +307,8 @@ mod tests {
         std::fs::write(&stamp, &old).unwrap();
         assert!(matches!(
             ensure_state_compatible(directory.path()),
-            Err(CompatibilityError::InvalidState(_))
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_TASK_ARRAYS.state && expected == CURRENT.state
         ));
         assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }
