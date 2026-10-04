@@ -946,27 +946,36 @@ let public = Router::new()
 and the handler does the checking itself, over the raw bytes of the body, before it nudges anything:
 
 ```rust
-async fn gitops_webhook_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    let Some(validator) = &state.gitops_webhook_validator else {
-        return service_unavailable("webhook secret not configured");  // fail closed
-    };
-    let mut guard = validator.lock().await;
-    match guard.validate(&body, signature, delivery_id, branch) {
-        Ok(_)  => { let _ = tx.send(()).await; accepted() }
-        Err(e) => unauthorized_or_rate_limited(e),
-    }
+// After reserving standalone queue capacity, or selecting the cluster leader:
+let mut guard = validator.lock().await;
+let admission = guard.reserve(
+    &body, signature, gitlab_token, delivery_id, &branch,
+)?;
+
+// The standalone handler consumes its reserved channel permit. On the
+// cluster leader, admission must be replicated before the HTTP 202:
+let receipt = Sha256::digest(delivery_id.unwrap().as_bytes());
+let response = council.write(RaftRequest::GitOpsSyncRequested {
+    delivery: receipt.into(),
+}).await?;
+if let CouncilResponse::GitOpsSyncRequested { generation } = response {
+    admission.commit();
+    let _ = tx.try_send(()); // wakeup only; the committed generation owns the work
+    return (StatusCode::ACCEPTED, Json(serde_json::json!({
+        "message": "sync admitted", "generation": generation,
+    }))).into_response();
 }
+// Dropping an uncommitted admission restores the replay and rate reservation.
+
 ```
 
-Three checks, in order. The signature must verify against the configured secret — `ring::hmac::verify` does this in constant time, so a wrong signature leaks nothing about how close it was. The delivery id must be one we haven't seen, or a replayed POST (the same signed body, captured and re-sent) would trigger a fresh sync every time. And the request must fit under a rate limit, so a flood of valid hooks can't hammer the sync loop. Only when all three pass does the handler send `()` down the channel to wake the runner.
+Three checks, in order. The signature must verify against the configured secret — `ring::hmac::verify` does this in constant time, so a wrong signature leaks nothing about how close it was. The delivery id must be one we haven't seen, or a replayed POST (the same signed body, captured and re-sent) would trigger a fresh sync every time. And the request must fit under a rate limit, so a flood of valid hooks can't hammer the sync loop. Only when all three pass can the handler admit the delivery. A standalone API consumes its reserved queue slot. A cluster follower forwards the original authenticated request to the leader; the leader commits a trigger generation through Raft before returning 202 and waking its runner.
 
 Two design choices are worth pausing on. First, **fail closed**: if no `[gitops] webhook_secret` is configured, there's no validator, and the handler returns 503 rather than triggering an unauthenticated sync. A public route with no way to authenticate the caller is worse than no route at all. Second, the validator is `Arc<Mutex<WebhookValidator>>` — shared and *mutable*, because the replay set and the rate-limit window are state that changes on every request. `Mutex` here isn't guarding against data races in the C sense; it's making sure two hooks arriving at once can't both slip past the "have I seen this delivery id?" check. Rust's type system won't let you mutate shared state without saying how you're synchronising it, so the `Mutex` is the compiler asking you to be explicit, and the right answer.
 
-The tests exercise the whole contract with no bearer token in sight: a bad signature is a 401 and triggers no sync (observed by an empty channel), a missing signature is a 401, a replayed delivery id is a 401 the second time, a rate-limit flood is a 429, and a correctly-signed GitHub-shaped POST is a 202 that *does* nudge the channel. That last one is the point of the whole exercise — a real git host, sending exactly what it sends, gets through.
+The tests exercise the whole contract with no bearer token in sight: a bad signature is a 401 and triggers no sync (observed by an empty channel), a missing signature is a 401, a replayed delivery id is a 401 the second time, a rate-limit flood is a 429, and a correctly-signed GitHub-shaped POST is a 202 that nudges the standalone channel or commits a cluster trigger. Cluster tests send the signed body through a follower, replace the leader before its run starts, and check that the accepted generation and replay receipt survive the handover.
+
+This admission changes both the wire and durable-state formats. The new Council request is also stored in the Raft log; an older binary cannot decode it. Defaulting absent JSON fields does not make an old reader preserve pending generations or receipts. We increment both compatibility generations when this change joins the release train. Before 1.0 we do not migrate these logs or snapshots: start a fresh cluster with the same new binary on every node and re-apply the repository.
 
 ## Refuses to be tricked by a filename
 
@@ -1511,8 +1520,8 @@ Phase 7 adds 48 tests, bringing the total to 1047.
 
 A valid signature doesn't prove the sync loop received a notification. The HTTP
 handler used to discard a failed channel send and return 202 even after the
-receiver had gone away. It now reserves queue capacity first and returns 503 if
-the loop is unavailable or its queue is full. Only an authenticated, validated
+receiver had gone away. On a standalone API it reserves queue capacity first
+and returns 503 if the loop is unavailable or its queue is full. Only an authenticated, validated
 delivery uses the reservation and receives “sync queued”.
 
 The reservation also prevents an awkward retry bug. Validation records the
@@ -1520,6 +1529,14 @@ delivery ID for replay protection; doing that before discovering a full queue
 would make the provider's retry look like a replay. We reserve before validation,
 so a rejected delivery can be retried after capacity becomes available. Tests
 close the receiver and fill the queue, then drain one slot and retry the same ID.
+
+In a cluster, a local notification is too weak: a follower can consume it while it is idle, and a leader can lose it during handover. An authenticated request arriving at a follower is forwarded with its original raw body, signature or GitLab token and delivery ID. The leader returns 202 only after Raft commits a pending trigger generation and a bounded delivery receipt. An unavailable leader, rejected write or forwarding loop returns 503; a canceled or failed admission restores the local replay and rate reservation so the provider can retry.
+
+The runner watches committed trigger generations and leadership changes as well as the polling timer. A new leader sees accepted pending work immediately. A successful run acknowledges the generation it captured before starting; a newer webhook arriving during that run stays pending for another run. Failure keeps the trigger pending and uses the existing retry backoff. Stale status updates preserve newer generations and the bounded replay receipt inventory instead of overwriting them. That inventory retains the most recent 1,000 committed delivery IDs; an older delivery can be admitted again after eviction.
+
+The handover tests cover the persisted trigger and replay receipt before a run starts. Resource and status writes continue to use the runner’s existing Raft writes and periodic drift reconciliation. An entire Git sync has no captured leadership-term guard or atomic transaction.
+
+The five-second admission budget surrounds the whole handler, including waiting for the validator mutex and reading follower metadata. Timing just the eventual HTTP exchange leaves an unbounded queue before that timer starts. If the whole budget expires, dropping the inner future drops its admission guard and restores the local reservations. The tests hold each real lock across an HTTP request, require a 503 with no trigger or wakeup, then release it and retry the exact delivery ID with a one-request rate budget.
 
 The same idea had one more place to go. Inside the validator, the replay check
 recorded the delivery ID and only then asked the rate limiter (B10). A delivery

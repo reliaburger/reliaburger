@@ -357,6 +357,8 @@ pub enum RaftRequest {
         expected_log_id: Option<openraft::LogId<u64>>,
         decisions: Vec<SchedulingDecision>,
     },
+    /// Admit an authenticated webhook before returning 202 to its provider.
+    GitOpsSyncRequested { delivery: [u8; 32] },
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +410,8 @@ pub enum CouncilResponse {
     /// A `SweepExpiredApiTokens` entry was applied; carries the names of the
     /// tokens it removed, in store order (empty when nothing was due).
     ApiTokensSwept { removed: Vec<String> },
+    /// Replicated webhook admission committed at this trigger generation.
+    GitOpsSyncRequested { generation: u64 },
 }
 
 // ---------------------------------------------------------------------------

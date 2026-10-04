@@ -166,3 +166,57 @@ selector cannot be reported as proving another case.
 The corrected local portable run on the inherited #535 source selected 5,598 cases with profile `ci` and zero retries. It passed 5,597 and failed `grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli` after 2.198 seconds: the shell PID marker was missing at `src/grill/apple.rs:673`. This fixture and its production deadlines were unchanged. The complete log is `/tmp/reliaburger-review2-534-inherited535-ci2.log`; its JUnit is `/tmp/reliaburger-review2-534-inherited535-evidence/corrected-full-ci-junit.xml`.
 
 One exact library diagnostic passed in 2.052 seconds, retained separately in `/tmp/reliaburger-review2-534-apple-diagnostic.log` and `/tmp/reliaburger-review2-534-inherited535-evidence/apple-diagnostic-junit.xml`. The cause remains unknown. This pass does not replace the failed complete run. [#555](https://github.com/reliaburger/reliaburger/issues/555) owns the explicit subprocess observation and bounded fixture changes; retries, production deadlines and the coverage floor remain unchanged.
+
+### 4 October 2026: repeated Apple PID-marker failure during #553 qualification
+
+The complete local `make ci` run for #553 selected 5,484 portable tests with
+profile `ci`, two workers and zero retries. It passed 5,483 and failed
+`grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli` after
+2.160 seconds: reading the fixture's shell PID marker returned `NotFound` at
+`src/grill/apple.rs:673`. The unchanged fixture then passed its one exact
+diagnostic in 2.047 seconds. The full-run failure remains a failure; the
+diagnostic does not establish its cause. The missing marker is observed,
+while the cause is unknown. #555 owns the planned actual-spawn PID observer
+and readiness evidence, preserving the existing command deadlines.
+
+The complete run and diagnostic are retained at
+`/tmp/reliaburger-review2-26-ci-currenta41-fixed-lints.log` and
+`/tmp/reliaburger-review2-26-apple-diagnostic.log`. The commands were
+`make ci NEXTEST_PROFILE=ci 'NEXTEST=cargo nextest run --profile ci --no-tests=fail --test-threads 2'`
+and `cargo nextest run --profile ci --no-tests=fail --test-threads 2 --lib -E 'test(=grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli)'`.
+Both used the same source and owned target directory; no retry, exclusion,
+fixture change or deadline increase was applied.
+
+### 4 October 2026: first-run startup and enrolment during actual #553 qualification
+
+The actual inherited webhook branch's full `make ci` selected 5,650 tests
+with profile `ci`, two test workers and zero retries. It passed 5,648, failed
+`secure_cluster_first_run_initialises_authenticates_and_deploys` after
+30.142 seconds and timed out
+`post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed` after
+60.005 seconds. The startup failure was at `tests/support/bun_process.rs:177`:
+Bun's own listener announcement had not been observed and the captured
+diagnostic was empty. Port zero is intentional in this fixture. The enrolment
+timeout has no established phase. Neither observation establishes the cause.
+
+One unchanged diagnostic selected exactly those two cases with the same
+profile, deadlines, two workers and zero retries. Startup passed in 20.923
+seconds and enrolment in 23.496 seconds. Their causes remain unknown; those
+passes do not replace the failed complete run. [#555](https://github.com/reliaburger/reliaburger/issues/555)
+owns bounded subprocess/phase diagnostics. No fixture, production deadline,
+retry or exclusion was changed for #553.
+
+Full-run log, JUnit, source manifest, failure details and receipt were saved
+before the diagnostic in
+`/tmp/reliaburger-review2-26-actual-branch-evidence/full-ci/`. The diagnostic
+log, JUnit and receipt remain separate in
+`/tmp/reliaburger-review2-26-actual-branch-evidence/one-unchanged-diagnostic/`.
+The complete invocation was
+`make ci NEXTEST_PROFILE=ci 'NEXTEST=cargo nextest run --profile ci --no-tests=fail --test-threads 2'`;
+the diagnostic was
+`cargo nextest run --profile ci --no-tests=fail --test-threads 2 --test documentation_first_run -E 'test(=secure_cluster_first_run_initialises_authenticates_and_deploys) | test(=post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed)'`.
+Both used `CARGO_TARGET_DIR=/tmp/reliaburger-review2-network-target`,
+`CARGO_BUILD_JOBS=2` and offline Cargo. Formatting and both Clippy
+configurations passed before the full run. Since Make stopped at the failed
+test target, doctests 2/2, CI scripts 52/52, ignored-owner checks and final
+formatting were run separately and passed.

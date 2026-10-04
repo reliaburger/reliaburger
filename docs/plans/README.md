@@ -10,6 +10,7 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [GitOps webhook admission](2026-10-04-gitops-webhook-admission.md) | Replicate authenticated triggers before 202, with bounded admission and generation-aware retry. | [#553](https://github.com/reliaburger/reliaburger/issues/553) |
 | [GitOps job refusal](2026-10-04-gitops-job-refusal.md) | Refuse unsupported jobs before publishing their dependent apps or advancing the applied revision. | #549 |
 | [Shared configuration tree](2026-10-04-shared-config-tree.md) | Resolve defaults and directory namespaces consistently through CLI and GitOps adapters. | #548 |
 | [Desired-spec previews](2026-10-04-desired-spec-preview.md) | Complete scoped comparison evidence with explicit offline and unknown actions. | #550 |

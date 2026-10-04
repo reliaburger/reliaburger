@@ -872,7 +872,43 @@ impl StateMachineInner {
                 self.state.gitops_coordinator = Some(election.clone());
             }
             RaftRequest::GitOpsSyncUpdate(sync_state) => {
-                self.state.gitops_sync_state = Some(*sync_state.clone());
+                let mut next = *sync_state.clone();
+                let previous = self
+                    .state
+                    .gitops_sync_state
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_default();
+                // A stale run cannot erase triggers accepted while it was busy.
+                next.requested_generation = previous.requested_generation;
+                next.webhook_receipts = previous.webhook_receipts;
+                next.completed_generation = next
+                    .completed_generation
+                    .min(next.requested_generation)
+                    .max(previous.completed_generation);
+                self.state.gitops_sync_state = Some(next);
+            }
+            RaftRequest::GitOpsSyncRequested { delivery } => {
+                let sync = self
+                    .state
+                    .gitops_sync_state
+                    .get_or_insert_with(Default::default);
+                if sync.webhook_receipts.contains(delivery) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "duplicate delivery ID (replay)".into(),
+                    });
+                }
+                let Some(generation) = sync.requested_generation.checked_add(1) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "GitOps trigger generation exhausted".into(),
+                    });
+                };
+                sync.requested_generation = generation;
+                sync.webhook_receipts.push_back(*delivery);
+                while sync.webhook_receipts.len() > 1000 {
+                    sync.webhook_receipts.pop_front();
+                }
+                return Some(CouncilResponse::GitOpsSyncRequested { generation });
             }
             RaftRequest::AttachSignature(attach) => {
                 // An unknown digest is refused, not silently dropped
@@ -2278,12 +2314,48 @@ impl StateMachineInner {
 ///
 /// Shared via `Arc<RwLock<_>>` so the snapshot builder can take a
 /// read lock while the Raft core continues applying.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CouncilStateMachine {
     inner: Arc<RwLock<StateMachineInner>>,
+    gitops_triggers: Arc<tokio::sync::watch::Sender<(u64, u64)>>,
+}
+
+impl Default for CouncilStateMachine {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(StateMachineInner::default())),
+            gitops_triggers: Self::trigger_sender(&DesiredState::default()),
+        }
+    }
 }
 
 impl CouncilStateMachine {
+    fn trigger_sender(state: &DesiredState) -> Arc<tokio::sync::watch::Sender<(u64, u64)>> {
+        let generations = state.gitops_sync_state.as_ref().map_or((0, 0), |sync| {
+            (sync.requested_generation, sync.completed_generation)
+        });
+        Arc::new(tokio::sync::watch::channel(generations).0)
+    }
+
+    /// Observe committed requested and completed GitOps trigger generations.
+    pub fn gitops_trigger_updates(&self) -> tokio::sync::watch::Receiver<(u64, u64)> {
+        self.gitops_triggers.subscribe()
+    }
+
+    fn publish_gitops_triggers(&self, state: &DesiredState) {
+        let generations = state.gitops_sync_state.as_ref().map_or((0, 0), |sync| {
+            (sync.requested_generation, sync.completed_generation)
+        });
+        self.gitops_triggers.send_if_modified(|current| {
+            if *current == generations {
+                false
+            } else {
+                *current = generations;
+                true
+            }
+        });
+    }
+
     /// Create a new empty in-memory state machine (tests).
     pub fn new() -> Self {
         Self::default()
@@ -2375,6 +2447,7 @@ impl CouncilStateMachine {
         }
         inner.db = Some(db);
         Ok(Self {
+            gitops_triggers: Self::trigger_sender(&inner.state),
             inner: Arc::new(RwLock::new(inner)),
         })
     }
@@ -2399,6 +2472,7 @@ impl CouncilStateMachine {
             ..StateMachineInner::default()
         };
         Self {
+            gitops_triggers: Self::trigger_sender(&inner.state),
             inner: Arc::new(RwLock::new(inner)),
         }
     }
@@ -2526,6 +2600,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
                 }
             }
         }
+        self.publish_gitops_triggers(&guard.state);
         Ok(responses)
     }
 
@@ -2555,6 +2630,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             guard.state = new_state;
             guard.state.last_applied_log = meta.last_log_id;
             guard.state.last_membership = meta.last_membership.clone();
+            self.publish_gitops_triggers(&guard.state);
             guard.snapshot_index += 1;
             guard.snapshot_data = Some(data.clone());
             guard.snapshot_last_log_id = meta.last_log_id;
@@ -8991,6 +9067,119 @@ mod tests {
             ),
         );
         assert_oversized_claim_refuses_before_staging(config).await;
+    }
+    #[tokio::test]
+    async fn a_stale_sync_completion_cannot_consume_a_newer_admitted_webhook() {
+        let mut machine = CouncilStateMachine::new();
+        machine
+            .apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::GitOpsSyncRequested { delivery: [1; 32] },
+            )])
+            .await
+            .unwrap();
+        let mut captured = machine.desired_state().await.gitops_sync_state.unwrap();
+        machine
+            .apply(vec![normal_entry(
+                1,
+                2,
+                RaftRequest::GitOpsSyncRequested { delivery: [2; 32] },
+            )])
+            .await
+            .unwrap();
+        captured.completed_generation = captured.requested_generation;
+        machine
+            .apply(vec![normal_entry(
+                1,
+                3,
+                RaftRequest::GitOpsSyncUpdate(Box::new(captured)),
+            )])
+            .await
+            .unwrap();
+        let state = machine.desired_state().await.gitops_sync_state.unwrap();
+        assert_eq!(
+            (state.requested_generation, state.completed_generation),
+            (2, 1)
+        );
+        assert_eq!(state.webhook_receipts.len(), 2);
+        let refused = machine
+            .apply(vec![normal_entry(
+                1,
+                4,
+                RaftRequest::GitOpsSyncRequested { delivery: [2; 32] },
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&refused[0], CouncilResponse::Refused { reason } if reason.contains("replay"))
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_webhooks_and_their_watch_survive_snapshot_install_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(root.path().join("state.redb")).unwrap());
+        let mut machine = CouncilStateMachine::with_store(db.clone()).unwrap();
+        let mut updates = machine.gitops_trigger_updates();
+        machine
+            .apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::GitOpsSyncRequested { delivery: [7; 32] },
+            )])
+            .await
+            .unwrap();
+        updates.changed().await.unwrap();
+        assert_eq!(*updates.borrow(), (1, 0));
+        let snapshot = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut follower = CouncilStateMachine::new();
+        let mut followed = follower.gitops_trigger_updates();
+        follower
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        followed.changed().await.unwrap();
+        assert_eq!(*followed.borrow(), (1, 0));
+        let restarted = CouncilStateMachine::with_store(db).unwrap();
+        assert_eq!(*restarted.gitops_trigger_updates().borrow(), (1, 0));
+        assert_eq!(
+            restarted
+                .desired_state()
+                .await
+                .gitops_sync_state
+                .unwrap()
+                .webhook_receipts,
+            std::collections::VecDeque::from([[7; 32]])
+        );
+    }
+
+    #[test]
+    fn webhook_receipts_are_bounded_and_generation_exhaustion_refuses_admission() {
+        let mut inner = StateMachineInner::default();
+        for index in 1u64..=1001 {
+            let mut delivery = [0; 32];
+            delivery[..8].copy_from_slice(&index.to_be_bytes());
+            assert!(
+                matches!(inner.apply_request(&RaftRequest::GitOpsSyncRequested { delivery }), Some(CouncilResponse::GitOpsSyncRequested { generation }) if generation == index)
+            );
+        }
+        let state = inner.state.gitops_sync_state.as_mut().unwrap();
+        assert_eq!(state.webhook_receipts.len(), 1000);
+        state.requested_generation = u64::MAX;
+        let before = state.clone();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::GitOpsSyncRequested {
+                delivery: [255; 32]
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.gitops_sync_state.unwrap(), before);
     }
 }
 

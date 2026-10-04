@@ -48,9 +48,10 @@ pub struct Compatibility {
 /// Durable owned attempts, compact retired proofs and retained execution ownership (#535).
 /// Shared batch requests and whole-pass placement admission revisions (#543).
 /// Replicated migration/job intent and original-generation settlement fences (#534).
+/// Authenticated webhook trigger admission and delivery receipts in durable Raft (#553).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 39,
-    state: 55,
+    protocol: 40,
+    state: 56,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
