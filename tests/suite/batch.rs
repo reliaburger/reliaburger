@@ -2035,9 +2035,10 @@ async fn a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retri
     })
     .await;
     let http = reqwest::Client::new();
-    // ProcessGrill ignores image bytes. Large valid specifications exercise
-    // the actual 16 MiB checkpoint bound without oversized process arguments.
-    let image = format!("proc-grill:{}", "x".repeat(1024 * 1024));
+    // ProcessGrill ignores image bytes. Near-limit valid requests reach the
+    // actual 16 MiB checkpoint bound with fewer whole-inventory publications,
+    // while keeping each JSON request below the production 2 MiB body limit.
+    let image = format!("proc-grill:{}", "x".repeat(15 * 128 * 1024));
     let mut first = None;
     let mut accepted = 0;
     let mut refused = false;
@@ -2052,6 +2053,10 @@ async fn a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retri
                 "name": format!("migration-{index}"), "namespace": "default"
             }}
         });
+        assert!(
+            serde_json::to_vec(&request).unwrap().len() < 2 * 1024 * 1024,
+            "capacity fixture must pass the production request-body bound"
+        );
         let response = http
             .post(format!("{}/v1/batch/run", runner.base_url))
             .bearer_auth(TEST_SERVICE_TOKEN)
@@ -2094,6 +2099,12 @@ async fn a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retri
             .unwrap()
             .len()
             <= 16 * 1024 * 1024
+    );
+    eprintln!(
+        "batch-checkpoint fixture accepted={accepted} checkpoint-bytes={}",
+        std::fs::metadata(records_dir.join("job-attempts.checkpoint"))
+            .unwrap()
+            .len()
     );
     for recover in [false, true] {
         if recover {
