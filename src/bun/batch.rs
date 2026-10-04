@@ -123,7 +123,11 @@ pub struct BatchReportRequest {
 pub fn resolve_job_namespaces(
     mut jobs: Vec<BatchJobSubmission>,
 ) -> Result<Vec<BatchJobSubmission>, String> {
+    let mut names = std::collections::HashSet::new();
     for job in &mut jobs {
+        if !names.insert(job.name.clone()) {
+            return Err(format!("duplicate batch job name {:?}", job.name));
+        }
         let effective = match (&job.namespace, &job.spec.namespace) {
             (Some(a), Some(b)) if a != b => {
                 return Err(format!(
@@ -1228,6 +1232,79 @@ mod tests {
         )])
         .unwrap_err();
         assert!(err.contains("two namespaces"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_names_are_refused_even_across_namespaces() {
+        for other_namespace in ["one", "two"] {
+            let err = resolve_job_namespaces(vec![
+                submission("same", Some("one"), r#"command = ["true"]"#),
+                submission("same", Some(other_namespace), r#"command = ["false"]"#),
+            ])
+            .expect_err("duplicate batch identity must be refused before dispatch");
+            assert!(err.contains("duplicate"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_submission_never_registers_or_dispatches_jobs() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let router = crate::bun::api::router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+        );
+        for namespace in ["one", "two"] {
+            let request = Request::post("/v1/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"jobs": [
+                    {"name": "same", "namespace": "one", "spec": {"image": "busybox", "command": ["true"]}},
+                    {"name": "same", "namespace": namespace, "spec": {"image": "busybox", "command": ["false"]}}
+                ]}).to_string()))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            let response = router
+                .clone()
+                .oneshot(Request::get("/v1/batch/1").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_internal_dispatch_never_launches_jobs() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let router = crate::bun::api::router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+        )
+        .layer(axum::Extension(crate::sesame::auth::system_context()));
+        for namespace in ["one", "two"] {
+            let request = Request::post("/v1/batch/run")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"batch_id": 1, "jobs": [
+                    {"name": "same", "namespace": "one", "spec": {"image": "busybox", "command": ["true"]}},
+                    {"name": "same", "namespace": namespace, "spec": {"image": "busybox", "command": ["false"]}}
+                ]}).to_string()))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[test]
