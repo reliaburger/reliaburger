@@ -367,6 +367,13 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         }
     }
 
+    crate::grill::volume::validate_managed_volume_layout(&app.volumes).map_err(|reason| {
+        ConfigError::InvalidVolume {
+            name: name.to_string(),
+            reason,
+        }
+    })?;
+
     // Deploy block: `max_surge = 0` with `max_unavailable = 0` leaves a rolling
     // deploy no legal move in either direction, so reject it here rather than
     // let the rollout wedge (M7).
@@ -1383,6 +1390,50 @@ mod tests {
             nc.validate(),
             Err(ConfigError::NonAbsolutePath { .. })
         ));
+    }
+
+    #[test]
+    fn managed_volume_artifact_overlaps_are_rejected() {
+        for paths in [
+            ["/data", "/data/child"],
+            ["/data", "/data.img"],
+            ["/data", "/data.volume.json"],
+            ["/data", "/data.volume.json.tmp"],
+            ["/data", "/data.restore-staged"],
+            ["/data", "/data.restore-old"],
+            ["/data", "/data.restore.json"],
+            ["/data", "/data"],
+            ["/", "/data"],
+        ] {
+            let mut app = minimal_app();
+            app.volumes = paths
+                .map(|path| crate::config::types::VolumeSpec {
+                    path: PathBuf::from(path),
+                    source: None,
+                    size: Some("16Mi".into()),
+                })
+                .to_vec();
+            assert!(
+                matches!(
+                    config_with_app("db", app).validate(),
+                    Err(ConfigError::InvalidVolume { .. })
+                ),
+                "accepted {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_managed_volume_paths_remain_distinct() {
+        let mut app = minimal_app();
+        app.volumes = ["/data.a", "/data.b"]
+            .map(|path| crate::config::types::VolumeSpec {
+                path: PathBuf::from(path),
+                source: None,
+                size: Some("16Mi".into()),
+            })
+            .to_vec();
+        config_with_app("db", app).validate().unwrap();
     }
 
     #[test]
