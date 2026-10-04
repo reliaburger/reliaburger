@@ -803,6 +803,8 @@ A concurrent connection limit (default 10,000) rejects new connections with 503 
 
 A backend redirect belongs to the external client. Suppose your login handler returns `302`, a `Location` and a session cookie. Reqwest follows redirects by default, so using it unchanged inside a reverse proxy quietly replaces that response with the destination page and drops the login cookie. Both our pooled upstream client and the fresh-connection retry client use `redirect(Policy::none())`. Wrapper forwards the original status, location, cookies and body; the client chooses whether to follow. Tests cover relative and absolute destinations and all five common redirect statuses with POST requests. Neither upstream client contacts the destination on its own.
 
+Streaming responses can stay open longer than thirty seconds. Both upstream clients bound connection setup and each inactive read to thirty seconds, including the wait for response headers. They have no total response lifetime deadline: a server-sent event arriving every second keeps its response alive, while a backend that stops producing bytes still times out. The real listener tests stream for thirty-four seconds through both clients, and separately stall headers and a body after its first chunk. Shutdown still uses Wrapper's bounded drain and cancellation path.
+
 ### The routing table
 
 The routing table maps `(host, path)` pairs to backend pools:
