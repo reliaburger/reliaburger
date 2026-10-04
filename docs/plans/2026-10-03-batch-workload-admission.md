@@ -33,3 +33,11 @@ file-backed, so the separate memory-reader capture repair is not claimed to
 resolve it. The branch inherited train `7b7575b7` through a normal merge without
 rewriting its verified admission commit; republishing waits for qualification
 of the separately identified final-file-rescan boundary.
+
+Normally refreshed through qualified live namespace validation 9cf9eeb2 and
+inherited the qualified file-backed capture rescan repair 3335b71c. The new
+focused run passed all 64 batch, token API and ProcessGrill cases in
+/tmp/runtime-530-refreshed-focused.log; formatting and diff checks passed.
+Original local full-suite deadline failures and remote EOF failure remain
+recorded; the refresh is not claimed as a new full local CI pass. This child
+depends on #551 and #572; they must integrate into the train first.
