@@ -500,12 +500,25 @@ impl UpgradeManager {
     /// Prepare a rollback to `version` (default: the newest installed
     /// version older than the running one). No download, no signature
     /// re-check — the binary was verified when it was first staged.
+    ///
+    /// Returns `Ok(None)` if a rollback to the same explicit `version` is
+    /// already in flight (idempotent re-delivery, as for
+    /// [`prepare`](Self::prepare)).
     pub async fn prepare_rollback(
         &self,
         version: Option<BinaryVersion>,
         pre_upgrade_instances: Vec<InstanceInventory>,
-    ) -> Result<PreparedUpgrade, UpgradeError> {
+    ) -> Result<Option<PreparedUpgrade>, UpgradeError> {
         if let Some(existing) = UpgradeMarker::load(&self.marker_path)? {
+            // A leader rolling itself back execs once its answer is written,
+            // before it records sending the directive, so its successor sends
+            // the same rollback again while this marker verifies (#526).
+            if version
+                .as_ref()
+                .is_some_and(|version| existing.upgrade_id == rollback_id(version))
+            {
+                return Ok(None);
+            }
             return Err(UpgradeError::AlreadyInFlight {
                 upgrade_id: existing.upgrade_id,
             });
@@ -578,7 +591,7 @@ impl UpgradeManager {
         self.adopt_running_binary_if_missing()?;
         let marker = UpgradeMarker {
             schema: 1,
-            upgrade_id: format!("rollback-to-{target}"),
+            upgrade_id: rollback_id(&target),
             previous_version: self.running_version.clone(),
             previous_binary: self.running_version.file_name(&stem),
             target_version: target.clone(),
@@ -588,7 +601,7 @@ impl UpgradeManager {
             pre_upgrade_instances,
         };
         marker.store(&self.marker_path)?;
-        Ok(PreparedUpgrade { marker })
+        Ok(Some(PreparedUpgrade { marker }))
     }
 
     // -----------------------------------------------------------------
@@ -924,6 +937,11 @@ fn running_executable() -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The marker id of a rollback to `target`.
+fn rollback_id(target: &BinaryVersion) -> String {
+    format!("rollback-to-{target}")
+}
 
 #[cfg(test)]
 mod tests {
@@ -1445,6 +1463,46 @@ mod tests {
         assert_eq!(status.in_flight.unwrap().phase, MarkerPhase::RevertPending);
     }
 
+    /// A leader that rolls itself back execs as soon as its answer is
+    /// written, before it records that it sent the directive, so its
+    /// successor sends the same rollback again while the marker is still
+    /// verifying (#526). That re-delivery is answered, not refused.
+    #[tokio::test]
+    async fn a_redelivered_rollback_to_the_same_version_is_idempotent() {
+        let fixture = fixture();
+        let marker = UpgradeMarker {
+            schema: 1,
+            upgrade_id: "rollback-to-v0.0.9".to_string(),
+            previous_version: v("0.1.0"),
+            previous_binary: v("0.1.0").file_name("bun"),
+            target_version: v("0.0.9"),
+            target_binary: v("0.0.9").file_name("bun"),
+            phase: MarkerPhase::Executed,
+            boot_attempts: 1,
+            pre_upgrade_instances: vec![],
+        };
+        marker.store(&fixture.manager.marker_path).unwrap();
+
+        assert!(
+            fixture
+                .manager
+                .prepare_rollback(Some(v("0.0.9")), vec![])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for other in [Some(v("0.0.8")), None] {
+            assert!(matches!(
+                fixture.manager.prepare_rollback(other, vec![]).await,
+                Err(UpgradeError::AlreadyInFlight { .. })
+            ));
+        }
+        assert_eq!(
+            UpgradeMarker::load(&fixture.manager.marker_path).unwrap(),
+            Some(marker)
+        );
+    }
+
     #[tokio::test]
     async fn rollback_rejects_version_not_on_disk() {
         let fixture = fixture();
@@ -1539,7 +1597,11 @@ mod tests {
         )
         .unwrap();
 
-        let prepared = manager.prepare_rollback(None, vec![]).await.unwrap();
+        let prepared = manager
+            .prepare_rollback(None, vec![])
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(prepared.target_version(), &v("0.2.0"));
     }
 
