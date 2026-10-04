@@ -10,6 +10,58 @@ use std::path::{Path, PathBuf};
 
 use crate::config::types::parse_byte_size;
 
+fn loop_image_path(path: &Path) -> PathBuf {
+    sibling_artifact_path(path, ".img")
+}
+
+fn sibling_artifact_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn volume_artifact_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![path.to_path_buf(), loop_image_path(path)];
+    for suffix in [
+        ".volume.json",
+        ".volume.json.tmp",
+        ".restore.json",
+        ".restore-staged",
+        ".restore-old",
+    ] {
+        paths.push(sibling_artifact_path(path, suffix));
+    }
+    paths
+}
+
+/// Refuse managed mount paths whose storage or restore artifacts overlap.
+/// Check the complete app before provisioning its first volume.
+pub(crate) fn validate_managed_volume_layout(
+    volumes: &[crate::config::types::VolumeSpec],
+) -> Result<(), String> {
+    let mut previous: Vec<(&PathBuf, Vec<PathBuf>)> = Vec::new();
+    for volume in volumes.iter().filter(|volume| volume.source.is_none()) {
+        if volume.path.file_name().is_none() {
+            return Err("managed volume cannot use the filesystem root as its mount path".into());
+        }
+        let artifacts = volume_artifact_paths(&volume.path);
+        for (path, previous_artifacts) in &previous {
+            if artifacts.iter().any(|left| {
+                previous_artifacts
+                    .iter()
+                    .any(|right| left.starts_with(right) || right.starts_with(left))
+            }) {
+                return Err(format!(
+                    "managed volume paths {:?} and {:?} or their artifacts overlap",
+                    path, volume.path
+                ));
+            }
+        }
+        previous.push((&volume.path, artifacts));
+    }
+    Ok(())
+}
+
 /// Errors from volume operations.
 #[derive(Debug, thiserror::Error)]
 pub enum VolumeError {
@@ -308,7 +360,7 @@ impl VolumeManager {
     fn setup_loop_mount(&self, path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
         use std::process::Command;
 
-        let img_path = path.with_extension("img");
+        let img_path = loop_image_path(path);
 
         // Create sparse file
         let status = Command::new("fallocate")
@@ -380,7 +432,7 @@ impl VolumeManager {
         if super::rootfs::is_mountpoint(path) {
             return Ok(());
         }
-        let img_path = path.with_extension("img");
+        let img_path = loop_image_path(path);
         let failed = |reason: String| VolumeError::CreateFailed {
             path: path.display().to_string(),
             reason,
@@ -718,6 +770,58 @@ pub fn parse_volume_size(s: &str) -> Result<u64, VolumeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root with mkfs.ext4 and loop devices; run with make test-linux"]
+    fn dotted_loop_volumes_keep_independent_data_after_remount() {
+        struct MountedVolumes(Vec<PathBuf>);
+        impl Drop for MountedVolumes {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::process::Command::new("umount").arg(path).status();
+                }
+            }
+        }
+        assert!(nix::unistd::geteuid().is_root());
+        let scratch = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(scratch.path());
+        let first = vm
+            .create_managed_volume("default", "db", Path::new("/data.a"), Some("16Mi"))
+            .unwrap();
+        let mut mounted = MountedVolumes(vec![first.clone()]);
+        assert_eq!(
+            vm.backend_of(&first),
+            Some(super::super::btrfs::VolumeBackend::LoopMount),
+            "this regression requires a non-Btrfs filesystem to exercise loop storage"
+        );
+        std::fs::write(first.join("sentinel"), b"first").unwrap();
+        let second_result =
+            vm.create_managed_volume("default", "db", Path::new("/data.b"), Some("16Mi"));
+        if let Ok(second) = &second_result {
+            mounted.0.push(second.clone());
+        }
+        let result = (|| -> Result<(), VolumeError> {
+            let second = second_result
+                .as_ref()
+                .map_err(|error| VolumeError::CreateFailed {
+                    path: "/data.b".into(),
+                    reason: error.to_string(),
+                })?;
+            std::fs::write(second.join("sentinel"), b"second")?;
+            assert_eq!(std::fs::read(first.join("sentinel"))?, b"first");
+            run_cmd("umount", &[first.to_str().unwrap()]);
+            run_cmd("umount", &[second.to_str().unwrap()]);
+            let first =
+                vm.create_managed_volume("default", "db", Path::new("/data.a"), Some("16Mi"))?;
+            let second =
+                vm.create_managed_volume("default", "db", Path::new("/data.b"), Some("16Mi"))?;
+            assert_eq!(std::fs::read(first.join("sentinel"))?, b"first");
+            assert_eq!(std::fs::read(second.join("sentinel"))?, b"second");
+            Ok(())
+        })();
+        result.unwrap();
+    }
 
     #[test]
     fn parse_volume_size_gi() {
