@@ -260,6 +260,34 @@ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ci-signing.p
 openssl pkey -in ci-signing.pem -pubout -outform DER | tail -c 65 | base64
 ```
 
+### Cosign signatures
+
+`relish sign` signatures aren't cosign signatures. They sign the digest
+string, not cosign's payload, and they live in the cluster's registry
+catalogue rather than in a `.sig` tag, so `cosign verify` can't check them and
+Reliaburger doesn't read them as cosign.
+
+For images outside the cluster's registry, Reliaburger reads key-based cosign
+signatures in cosign's classic layout: the `sha256-<hex>.sig` tag beside the
+image, made by `cosign sign --key` with an ECDSA P-256 key (cosign's default).
+A signature counts when it verifies under a trusted `cosign.pub` and names the
+exact digest being deployed. With the pull-through cache on, the `.sig` image
+is cached beside the image, so each signature is fetched from upstream once.
+
+cosign 3 writes the newer Sigstore bundle by default, which Reliaburger doesn't
+read yet. Ask for the classic layout when you sign:
+
+```bash
+cosign sign --key cosign.key --new-bundle-format=false ghcr.io/acme/web@sha256:…
+```
+
+Keyless signatures (a Fulcio certificate, as Chainguard and distroless images
+carry) aren't checked: there's no key to trust. The per-registry rules that
+turn these checks on (`require_signatures` and `cosign_keys` for each upstream
+repository pattern) are still being built under
+[#361](https://github.com/reliaburger/reliaburger/issues/361); until they ship,
+upstream images aren't signature-checked, so pin them by digest.
+
 ## Between nodes
 
 `relish init` generates the root, node, workload and ingress CAs. Node
