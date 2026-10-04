@@ -139,9 +139,14 @@ pub enum RaftRequest {
     AllocateSerial,
     /// Start a secret key rotation: add a new age keypair, mark the
     /// current one as read-only.
+    ///
+    /// A namespace's first key (F05 I4) carries `resealed`: the namespace's
+    /// stored values sealed again under the new key, applied in the same
+    /// entry. Every other rotation leaves it empty.
     RotateSecretKey {
         scope: crate::sesame::types::AgeKeyScope,
         new_keypair: crate::sesame::types::AgeKeypair,
+        resealed: Vec<crate::sesame::types::ResealedSecret>,
     },
     /// Finalise a secret key rotation: remove old read-only keypairs.
     FinalizeSecretRotation {
@@ -767,6 +772,7 @@ mod tests {
                     gpu: Some(2),
                     max_apps: Some(50),
                     max_replicas: Some(200),
+                    secret_key: false,
                 }),
             },
             RaftRequest::NamespaceDelete {

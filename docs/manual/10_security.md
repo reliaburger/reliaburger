@@ -184,7 +184,7 @@ do only what the block lists:
 | `host-exec` | jobs and process workloads that run host commands |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
-| `secret-write` | `relish secret rotate` (needs `apps = ["*"]` and no `namespaces`) |
+| `secret-write` | `relish secret rotate`, for the cluster or one namespace (needs `apps = ["*"]` and no `namespaces`) |
 | `admin` | every action above, plus tokens, join tokens, upgrades, elections, node decommissioning, image signing, log export and `[permission]`/`[namespace]` declarations |
 | `secret-read` | nothing yet: no API route returns a decrypted secret |
 
@@ -269,6 +269,69 @@ stays (read-only, never used for new secrets) and the root backup keeps
 opening. Keep that file with the master key; together they're how you'd
 recover the root.
 
+### A key per namespace
+
+By default every namespace shares the cluster key, so a value encrypted for
+one namespace decrypts in any other: anyone who can deploy to namespace B and
+has a copy of namespace A's ciphertext can read it. Give a namespace its own
+key to stop that:
+
+```toml
+[namespace.team-a]
+secret_key = true
+```
+
+After you apply it, the leader creates team-a's key within a few seconds and
+re-seals every encrypted value team-a's apps already have, in the same step,
+so they keep starting. Each of those apps rolls once, because its stored
+spec changed. From then on:
+
+- team-a's values decrypt only with team-a's key. A value encrypted to the
+  cluster key, or to another namespace's key, no longer decrypts in team-a,
+  and the instance refuses to start.
+- other namespaces can't decrypt team-a's values.
+
+Re-encrypt the values in your own config (or GitOps repo) with the new key,
+or the next apply puts the old cluster-sealed values back and those apps stop
+starting:
+
+```sh
+relish secret pubkey --namespace team-a
+relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" 'the plaintext'
+```
+
+The re-seal covers apps only. Encrypt a job's values in an opted-in
+namespace with the namespace key from the start.
+
+Rotate and finalise a namespace's key the same way as the cluster key, with
+`--namespace`. It doesn't touch the cluster key or any other namespace's:
+
+```sh
+relish secret rotate --namespace team-a
+relish secret rotate --finalize --namespace team-a
+```
+
+Only an Admin token with no scope can rotate a namespace's key, even one
+scoped to that namespace can't. Rotating a namespace that hasn't set
+`secret_key = true` fails; opt in first. Turning `secret_key` off again
+doesn't remove the key, and its values keep needing it.
+
+What this doesn't do:
+
+- **It doesn't protect against a compromised node.** Until the master key is
+  split (F03b), every node holds the master key, and the master key unwraps
+  every namespace's key. The boundary is between tenants' tokens and
+  workloads, not between a tenant and someone with root on a node.
+- **It doesn't recall old copies.** A value encrypted to the cluster key still
+  decrypts in every namespace that hasn't opted in. If team-a's ciphertext
+  might have leaked, change the secret itself, or rotate and finalise the
+  cluster key.
+
+The leader records `secret.namespace_key_created` (with how many values it
+re-sealed, never the values), and every rotation or finalise records
+`secret.rotated` or `secret.rotation_finalised` with the namespace in its
+details. See them with `relish events`.
+
 ## Workload identity
 
 Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`
@@ -321,6 +384,34 @@ prints its public key in the form `keys` wants:
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ci-signing.pem
 openssl pkey -in ci-signing.pem -pubout -outform DER | tail -c 65 | base64
 ```
+
+### Cosign signatures
+
+`relish sign` signatures aren't cosign signatures. They sign the digest
+string, not cosign's payload, and they live in the cluster's registry
+catalogue rather than in a `.sig` tag, so `cosign verify` can't check them and
+Reliaburger doesn't read them as cosign.
+
+For images outside the cluster's registry, Reliaburger reads key-based cosign
+signatures in cosign's classic layout: the `sha256-<hex>.sig` tag beside the
+image, made by `cosign sign --key` with an ECDSA P-256 key (cosign's default).
+A signature counts when it verifies under a trusted `cosign.pub` and names the
+exact digest being deployed. With the pull-through cache on, the `.sig` image
+is cached beside the image, so each signature is fetched from upstream once.
+
+cosign 3 writes the newer Sigstore bundle by default, which Reliaburger doesn't
+read yet. Ask for the classic layout when you sign:
+
+```bash
+cosign sign --key cosign.key --new-bundle-format=false ghcr.io/acme/web@sha256:…
+```
+
+Keyless signatures (a Fulcio certificate, as Chainguard and distroless images
+carry) aren't checked: there's no key to trust. The per-registry rules that
+turn these checks on (`require_signatures` and `cosign_keys` for each upstream
+repository pattern) are still being built under
+[#361](https://github.com/reliaburger/reliaburger/issues/361); until they ship,
+upstream images aren't signature-checked, so pin them by digest.
 
 ## Between nodes
 

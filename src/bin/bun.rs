@@ -1655,6 +1655,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             node_name.clone(),
             shutdown.clone(),
         ));
+        // Leader-only: give each namespace that opted in with
+        // `secret_key = true` its first key, re-sealing its values (F05 I4).
+        tokio::spawn(reliaburger::bun::namespace_keys::run_namespace_key_loop(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        ));
     }
     // Create the log store before the agent adopts anything: its checkpoint
     // tells each adopted instance's forwarder where to resume (#308). (The

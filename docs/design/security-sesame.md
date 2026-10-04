@@ -981,7 +981,7 @@ $ relish secret encrypt --pubkey age1qy8m5kz... "my-secret-value"
 ENC[AGE:YWdlLWVuY3J5cHRpb24...]
 ```
 
-> **Status:** `relish secret pubkey`, `relish secret encrypt` and `relish secret rotate` (start and `--finalize`) are all implemented. Rotation drives `RaftRequest::RotateSecretKey` / `FinalizeSecretRotation` through the council state machine. It currently rotates the **cluster-wide** age key only; per-namespace key rotation is planned (see the namespace-scoped keys note below).
+> **Status:** `relish secret pubkey`, `relish secret encrypt` and `relish secret rotate` (start and `--finalize`) are all implemented. Rotation drives `RaftRequest::RotateSecretKey` / `FinalizeSecretRotation` through the council state machine. `--namespace` rotates and finalises one namespace's own key instead of the cluster-wide one (F05 I4, see the namespace-scoped keys note below).
 
 The `relish` CLI uses the age public key to encrypt. No cluster access required. The ciphertext is embedded in the TOML app configuration and checked into git.
 
@@ -994,7 +994,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 5. Bun injects the plaintext as an environment variable. The runtime needs the full launch spec on disk to start and adopt the instance, so plaintext reaches disk only in root-only files (mode 0600, in owner-only directories): the runc bundle's `config.json`, deleted when the instance retires; the agent's adoption record, removed with the instance; and the runtime's own launch intent. Retiring the intent cuts every environment entry down to its variable name, so a retired intent keeps no value (`OciSpec::without_environment_values`); recovery compares a spec with an intent's copy through `OciSpec::matches_journal`, which accepts the scrubbed form.
 6. A decryption audit event is logged: which secret, which app, which node, timestamp.
 
-**Namespace-scoped keys (planned — not yet generated):** The intended design is that setting `secret_key = true` for a namespace makes `relish init` (or `relish namespace create`) generate a separate age keypair for it, stored in Raft wrapped with HKDF, so compromise of one namespace's key does not expose another's. **This is not shipped:** there is no `secret_key` config field, and no code path generates a namespace-scoped age keypair — the cluster runs on a single cluster-wide age key. The decryption and re-seal paths already *prefer* a namespace key when one exists and fall back to the cluster-wide key, so the consuming side is ready; only the key-creation side is missing.
+**Namespace-scoped keys (F05 I4, opt-in):** `secret_key = true` in `[namespace.X]` gives the namespace its own age keypair, wrapped with HKDF like the cluster key. Raft apply must be deterministic, so the state machine can't generate it: the leader's `bun::namespace_keys` loop finds opted-in namespaces with no key, generates generation 0, decrypts the namespace's stored `ENC[AGE:...]` app values with the cluster-wide keys, seals them again to the new key, and proposes key and values as one `RaftRequest::RotateSecretKey { scope: Namespace(X), resealed, .. }`. Each `ResealedSecret` carries the ciphertext the leader read; the state machine refuses the whole entry if any value changed since, belongs to another namespace, or the scope already has a key, and the leader retries on its next tick. Once a namespace has a key, its values decrypt **only** with that namespace's keys (`SecurityState::decryption_keypairs`): there is no fallback to the cluster-wide key, or a cluster-sealed value would still open there. A namespace without a key uses the cluster-wide keys only. Rotation and finalise are per namespace (`relish secret rotate [--finalize] --namespace X`, `POST /v1/secret/rotate {"namespace": "X"}`), refused for a namespace with no key, and limited to unscoped Admins; `GET /v1/secret/public-key?namespace=X` serves its active public key. Job specs aren't stored desired state, so they aren't re-sealed. **Limitation:** until the master key is split (F03b), every node holds the master key and can unwrap every namespace's key, so the boundary is against other tenants' tokens and workloads, not against a compromised node.
 
 **Key rotation (`relish secret rotate`):**
 
@@ -1244,14 +1244,11 @@ setting, and per-token rate limiting is not part of F05.
 ### 6.4 Secret Encryption
 
 ```toml
-# Namespace-scoped secret keys (opt-in per namespace).
-# PLANNED — not parsed or acted on today. There is no `secret_key` config
-# field, and nothing generates a per-namespace age keypair (§5.5): init and
-# join create a single cluster-wide age key. The decrypt/seal paths already
-# look up a namespace key and fall back to the cluster-wide one, so the
-# lookup side is ready, but no namespace key is ever created.
+# Namespace-scoped secret keys (opt-in per namespace, F05 I4).
+# The leader creates the namespace's key and re-seals its stored app values
+# (§5.5). From then on its values decrypt only with its own key.
 [namespace.team-payments]
-secret_key = true    # generate a separate age keypair for this namespace (planned)
+secret_key = true    # a separate age keypair for this namespace
 ```
 
 ### 6.5 Network Security
@@ -1456,7 +1453,7 @@ The threat model assumes:
 
 - Obtain certificates for workloads on other nodes (CSR validation checks Meat's scheduling state — this *is* enforced).
 - Forge certificates for arbitrary workloads — **not yet guaranteed:** CA private keys are currently derivable on every node.
-- Decrypt secrets for other namespaces — **not yet guaranteed:** there is a single cluster-wide age key today (§5.5), and it is derivable on every node.
+- Decrypt secrets for other namespaces — **not yet guaranteed:** a namespace with `secret_key = true` has its own age key (§5.5), but every node can still unwrap every namespace's key until the master key is split (F03b).
 - Access the age private key, CA private keys, or OIDC signing key — **not yet guaranteed** (see the note above).
 - Modify the Raft log or cluster state (requires council consensus — this *is* enforced).
 - Bypass nftables perimeter rules on other nodes.
@@ -1634,7 +1631,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 ### 10.5 Secret Encryption Round-Trip
 
 - **Encrypt/decrypt test:** Encrypt a value with the cluster's public key. Deploy an app referencing the encrypted value. Verify that the workload receives the correct plaintext as an env var.
-- **Namespace isolation test:** Encrypt a value with namespace A's public key. Attempt to use it in namespace B's app. Verify decryption failure.
+- **Namespace isolation test:** Encrypt a value with namespace A's public key. Attempt to use it in namespace B's app. Verify decryption failure. Implemented as `a_value_sealed_for_one_namespace_fails_closed_in_another` and `after_opting_in_a_cluster_sealed_value_fails_closed_in_that_namespace` (`src/bun/agent/tests/namespace_secrets.rs`).
 - **Key rotation test:** Encrypt values with key generation N. Run `relish secret rotate`. Verify that old ciphertexts still decrypt (old key is read-only). Encrypt new values with generation N+1. Run `relish secret rotate --finalize`. Verify that old ciphertexts no longer decrypt.
 
 ### 10.6 CRL Distribution

@@ -328,6 +328,84 @@ RaftRequest::AttachSignature(attach) => {
 
 Once written to Raft, the signature is replicated to all council nodes. The scheduler reads it directly from `DesiredState` without re-verifying -- first-write wins.
 
+### Cosign, for images we didn't build
+
+Everything above covers images that live in Pickle. Most clusters also run images somebody else built: `nginx`, a Chainguard base, your company's images on GHCR. We can't sign those, and the people who did sign them didn't use our format. They used cosign.
+
+Before writing a line, we went and looked at what real images publish, with nothing but `curl` against the registry API. For each image we resolved a tag to its digest, then asked for the tag `sha256-<hex>.sig` (cosign's classic layout) and for the OCI referrers of that digest (where the newer Sigstore bundle lives):
+
+| Image | `.sig` tag | Referrers | Signed with |
+|-------|-----------|-----------|-------------|
+| `cgr.dev/chainguard/static` | yes | none | keyless (Fulcio certificate) |
+| `gcr.io/distroless/static-debian12` | yes | none | keyless |
+| `ghcr.io/sigstore/cosign/cosign` | yes | not supported | keyless |
+| `ghcr.io/fluxcd/source-controller` | yes | not supported | keyless |
+| `docker.io/library/nginx` | no | none | not signed with cosign |
+| `quay.io/prometheus/prometheus` | no | none | not signed with cosign |
+
+So the classic `.sig` tag is what's out there. Every one of those signatures is keyless, though: a short-lived Fulcio certificate rather than a key you could put in a config file. Checking those means trusting Sigstore's roots and their rotation, which is a bigger job and a separate one. What we built first is the part a team can use today: you sign your own images with `cosign sign --key`, list the public key, and a node only runs what that key signed.
+
+One more surprise. cosign 3 writes the new bundle format by default, as a referrer, and you have to ask for the old layout with `--new-bundle-format=false` (deprecated already). The bundle will be next, and the payload inside it is the same.
+
+#### What cosign actually signs
+
+For `ghcr.io/acme/web@sha256:5a90…`, cosign pushes a second image into the same repository, tagged `sha256-5a90….sig`. Each of its layers has the media type `application/vnd.dev.cosign.simplesigning.v1+json`, and the layer's bytes are a tiny JSON document:
+
+```json
+{"critical":{"identity":{"docker-reference":"ghcr.io/acme/web"},
+  "image":{"docker-manifest-digest":"sha256:5a90…"},
+  "type":"cosign container image signature"},"optional":null}
+```
+
+The signature isn't in the layer. It sits in the layer's `dev.cosignproject.cosign/signature` annotation in the manifest: base64 of an ASN.1 DER ECDSA P-256 signature over those exact payload bytes. That's the same curve and encoding `relish sign` uses, which is why `ring` covers it and we didn't add a crypto crate. Only the message differs: cosign signs the payload, we sign the digest string.
+
+#### The verifier
+
+`src/pickle/cosign.rs` has three steps: read the key, fetch the payloads, verify.
+
+A `cosign.pub` file is a PEM `PUBLIC KEY` block holding a DER SubjectPublicKeyInfo. `ring` wants the raw 65-byte point instead. For P-256 the DER wrapper is always the same 26 bytes, so we strip them rather than pull in an ASN.1 parser:
+
+```rust
+match der.strip_prefix(&P256_SPKI_PREFIX[..]) {
+    Some(point) if point.len() == P256_POINT_LEN && point[0] == 0x04 => Ok(Self {
+        point: point.to_vec(),
+    }),
+    _ => Err(CosignError::InvalidKey(/* … */)),
+}
+```
+
+`strip_prefix` on a slice returns `Option<&[u8]>`: `Some(rest)` when the slice starts with the prefix, `None` otherwise. The `if` after the pattern is a *match guard*. The arm only matches when the pattern fits and the condition holds, so a short key, a compressed point or an RSA key all fall through to the `_` arm. Python has nothing quite like it; in Go you'd write the `if` inside the `case`.
+
+Fetching goes through the `UpstreamRegistry` trait the pull-through cache already uses, so the verifier doesn't know or care whether it's talking to GHCR or a test registry. `fetch_root` reads the `.sig` manifest, and `fetch_blob` reads each payload. We hash every payload against its layer digest before we keep it. When the cache is on, `ClusterSource::cosign_signature` caches the `.sig` image under `cache/<host>/<repo>` like any other tag, so the cluster asks upstream once and every later check reads the cluster's copy.
+
+Verification is where the order matters:
+
+```rust
+if !keys
+    .iter()
+    .any(|key| key.verifies(&signed.payload, &signature))
+{
+    return Err("signature doesn't verify under any trusted key".to_string());
+}
+// Signed by a trusted key, so the bytes are the signer's; now read them.
+let payload: Payload = serde_json::from_slice(&signed.payload)
+    .map_err(|e| format!("signed payload isn't a cosign payload: {e}"))?;
+```
+
+We check the signature *before* we parse the JSON. Until a trusted key has vouched for those bytes they're attacker input, and there's no reason to hand attacker input to a parser when a byte comparison will do. Once the signature holds, the payload must name the digest the image was bound to. Without that check, a perfectly valid signature for last month's image would vouch for this month's.
+
+The payload's field names have hyphens in them, which Rust identifiers can't. `#[serde(rename = "docker-manifest-digest")]` maps the JSON name onto a normal field, and `#[serde(rename = "type")]` does the same for `type`, a reserved word in Rust. Serde ignores fields a struct doesn't declare, so `identity` and `optional` never get parsed at all.
+
+Any payload that verifies under any trusted key is enough. A repository signed by two teams, or re-signed after a key rotation, carries several layers, and one good one is all we need. When nothing verifies, the error lists why each payload failed, so "signed with the wrong key" and "signed, but for a different digest" read differently at 3 a.m.
+
+#### Testing against the real thing
+
+It's easy to write a verifier that agrees with your own signer and with nothing else. So the fixtures in `tests/fixtures/cosign/` come from cosign itself: we pushed a one-file image to a throwaway local registry (`crane registry serve`), ran `cosign sign --key cosign.key --tlog-upload=false --new-bundle-format=false`, checked it with `cosign verify`, and saved the image, the `.sig` manifest, the payload, the signature and both public keys. The private key wasn't kept.
+
+The unit tests read those files with `include_bytes!`, a macro that embeds a file's bytes into the test binary at compile time, so the tests can't run against a missing fixture. Alongside the one that should pass, they cover the refusals: another key, a payload for another digest, a payload edited after signing, a missing `.sig` tag, no keys at all. Two tests in `tests/suite/pickle_cluster.rs` push the same bytes into an in-process Pickle standing in for the upstream registry and fetch them over the real OCI protocol, once directly and once through the pull-through cache. The cache test also counts requests, to show a second check doesn't touch upstream.
+
+What isn't done yet is the policy around it. The upstream rules (`[[images.trust_policy.upstream]]` with `require_signatures` and `cosign_keys`) are a separate change, and the verifier gets wired into the deploy gate when they land.
+
 ## SecurityState in Raft
 
 The CA hierarchy, API tokens, join tokens, age keypairs, and OIDC signing config all live in a single `SecurityState` struct. During `relish init`, this struct is generated alongside a 32-byte master secret. The master secret wraps all private keys using HKDF + AES-256-GCM. The struct itself (with its wrapped keys) is safe to replicate, but the master secret must stay off the wire.
@@ -817,9 +895,11 @@ Rotation happens in two steps:
 The Raft commands:
 
 ```rust
-RotateSecretKey { scope, new_keypair }   // mark old as read-only, add new
-FinalizeSecretRotation { scope }          // delete read-only keypairs
+RotateSecretKey { scope, new_keypair, resealed }  // mark old as read-only, add new
+FinalizeSecretRotation { scope }                   // delete read-only keypairs
 ```
+
+(`resealed` is empty for every rotation but one, a namespace's first key; we'll get to it in "One key per namespace" below.)
 
 This dual-key window means rotation is never a cliff. You start it, re-encrypt your secrets at your own pace, then finalise when ready.
 
@@ -949,6 +1029,100 @@ pub fn matches_journal(&self, journal: &OciSpec) -> bool {
 A live intent must be equal, as before. A retired one must be equal once the values are gone. The trick that keeps this honest is that a launched entry is always `NAME=value`. A scrubbed entry has no `=`, so a live intent can never pass for a scrubbed one, and scrubbing twice changes nothing (retiring an already retired intent is idempotent, so that matters).
 
 The test that pins it lives in `tests/runc_intent.rs`. It builds a spec from an app whose `API_TOKEN` is `ENC[AGE:...]`, decrypts it with a stand-in decryptor, publishes and retires the intent, then walks every file under the bundle base looking for the plaintext. Before the fix it found `intent.json`. The Linux runc tests now carry a fake decrypted secret in every workload and make the same check on each instance's bundle and intent once it has stopped.
+
+### One key per namespace
+
+Here's an awkward question. Team A and team B share a cluster, and every `ENC[AGE:...]` value in it is sealed to the one cluster key. Team B finds team A's database password in an old commit, still encrypted. Can they read it?
+
+Not directly. But they can paste the ciphertext into one of their own apps, deploy it, and print the environment. The node decrypts whatever it's handed with the cluster key, because that key opens every value in every namespace. Encryption kept the password out of git; it did nothing to keep it inside team A.
+
+`AgeKeyScope` has had a `Namespace(String)` variant since chapter 4, and the agent already tried a namespace's keys before the cluster's. Two things were missing. Nothing ever created a namespace key, and even if something had, the agent fell back to the cluster key whenever the namespace key didn't open a value. A boundary you can step around by sealing to the other key isn't one.
+
+So a namespace now opts in:
+
+```toml
+[namespace.team-a]
+secret_key = true
+```
+
+Why opt in rather than give every namespace its own key? Because switching changes what decrypts. Every value already sealed to the cluster key has to move, and a GitOps repo full of cluster-sealed values will fail its next deploy until someone re-encrypts them. That's a decision the operator should make on purpose, one namespace at a time.
+
+**Who makes the key.** The obvious place is the state machine: apply the `[namespace.team-a]` write, see `secret_key = true`, generate a keypair. That would be a bug. Every replica applies every entry, and each would roll its own random key, so three nodes would hold three different "team-a keys" and agree on nothing. Raft apply has to be deterministic; we met the same rule with the CRL's clock. So the randomness happens on the leader, before the entry exists. `bun::namespace_keys` runs a loop on every node (followers do nothing, like the token sweep) that asks the local state which namespaces are waiting:
+
+```rust
+pub fn namespaces_awaiting_a_key(state: &DesiredState) -> Vec<String> {
+    state
+        .namespaces
+        .iter()
+        .filter(|(name, spec)| {
+            spec.secret_key && !state.security_state.has_namespace_key(name.as_str())
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+```
+
+The loop ticks every five seconds, and it doesn't clone the desired state to ask. `CouncilNode::read_desired` takes a closure and runs it against the state under a read lock, so the check borrows: `council.read_desired(namespaces_awaiting_a_key)` passes the function itself as the closure, since a plain `fn(&DesiredState) -> Vec<String>` satisfies `impl FnOnce(&DesiredState) -> T`. A quiet cluster pays for one read lock and writes nothing.
+
+**Moving the values.** Creating the key is the easy half. The namespace's apps still carry values sealed to the cluster key, and the moment the namespace has a key of its own, those values stop opening there. The leader re-seals them: it unwraps the cluster identities, decrypts each of the namespace's `ENC[AGE:...]` values, and encrypts the same plaintext to the new public key. Age is quick, but it's still CPU work, so it runs under `spawn_blocking`, and the plaintext never leaves that call.
+
+Then comes the part that's easy to get wrong. If the key went into one Raft entry and the re-sealed values into another, there'd be a window between them in which the namespace had a key and none of its values opened, and a leader crash in that window would leave it there for good. So both ride in the same entry, the `resealed` field on `RotateSecretKey`:
+
+```rust
+pub struct ResealedSecret {
+    pub app_id: AppId,
+    pub env_key: String,
+    pub previous: String, // the ciphertext the leader read
+    pub sealed: String,   // the same plaintext, sealed to the namespace key
+}
+```
+
+Why carry `previous`? Because the leader read the apps a moment before it proposed the entry, and an apply could have landed in between. Overwriting that newer value with a re-sealed copy of the old one would silently undo someone's deploy. The state machine checks every entry before it applies any of them: the app must still hold exactly `previous`, it must live in that namespace (a namespace's key never rewrites another namespace's values), and only a namespace's *first* key may re-seal at all. Any mismatch refuses the whole entry, no key and no values, and the leader tries again on the next tick. It's optimistic concurrency, the same compare-and-swap idea as an etcd transaction, done with the data the entry already carries.
+
+The check uses a let chain with an `Err` pattern:
+
+```rust
+if !resealed.is_empty()
+    && let Err(reason) = self.check_reseal(scope, first_key, resealed)
+{
+    return Some(CouncilResponse::Refused { reason });
+}
+```
+
+and the apply that follows uses another, `if first_key && let AgeKeyScope::Namespace(namespace) = scope`, which only binds `namespace` when the scope really is a namespace. After writing the values, it re-records the seals of every app in the namespace under the new scope, so a later cluster finalise doesn't wait on values that no longer need the cluster key.
+
+**No fallback.** With the key in place, the decryption side gets simpler, not more complicated:
+
+```rust
+pub fn decryption_keypairs(&self, namespace: &str) -> Vec<&AgeKeypair> {
+    if self.has_namespace_key(namespace) {
+        self.age_keypairs_for_scope(&AgeKeyScope::Namespace(namespace.to_string()))
+    } else {
+        self.age_keypairs_for_scope(&AgeKeyScope::ClusterWide)
+    }
+}
+```
+
+One set or the other, never both. The return type is a vector of borrows, `Vec<&AgeKeypair>`: the keypairs stay where they are in `SecurityState`, and the caller can't keep the vector longer than it holds the state, which the borrow checker enforces without us writing a lifetime (elision ties the output borrows to `&self`). A value that no key in the set opens fails the deploy closed, exactly as an undecryptable cluster value always has.
+
+Does re-sealing disturb what the previous section built for runc intents? It changes the ciphertext, not the plaintext, so the launched spec is identical before and after, and a retired intent's scrubbed copy, names only, still matches it. `resealing_keeps_the_launched_spec_and_its_scrubbed_journal_copy` pins exactly that. The stored app spec does change, though, so each app with encrypted values rolls once when its namespace opts in.
+
+**Rotation per namespace.** `relish secret rotate --namespace team-a` and `--finalize --namespace team-a` run the same two-step dance as the cluster key, on that scope only; the state machine already scoped everything by `AgeKeyScope`, which is why it needed no change. Rotating a namespace that never opted in is a `409`, since a rotation can't do the re-seal that opting in does. `relish secret pubkey --namespace team-a` prints the key to encrypt with. The rotate body is now parsed with `#[serde(deny_unknown_fields)]`, because `{"namespcae": "team-a"}` used to parse as an empty request and would have rotated the *cluster* key.
+
+Who may rotate? The maintainer's answer was: only an Admin scoped to the whole cluster, for now. An Admin scoped to team-a can't rotate team-a's key. That's stricter than it needs to be, but loosening it later is easy, and tightening it after people rely on it isn't.
+
+**What it doesn't protect against.** Every node still holds the master key, which unwraps every namespace's private key. So the boundary stands between tenants' tokens and workloads, not between a tenant and a compromised node; a root shell on any node reads every namespace's secrets. Splitting the master key (F03b in the roadmap) is what changes that. Re-sealing also can't recall copies: a cluster-sealed value from an old commit still opens in any namespace that hasn't opted in, until you rotate and finalise the cluster key or change the secret itself. And job specs aren't stored desired state, so they're not re-sealed; a job in an opted-in namespace needs its values encrypted to the namespace key.
+
+The tests sit at four levels:
+
+- `sesame::types`: `a_namespace_with_its_own_key_never_falls_back_to_the_cluster_key` and its mirror for a namespace without one.
+- `council::state_machine`: `a_namespaces_first_key_reseals_its_values_in_the_same_entry`, `a_stale_reseal_is_refused_and_creates_no_key`, `a_namespace_key_cannot_reseal_another_namespaces_values`, `only_a_namespaces_first_key_reseals`, and `namespace_rotation_and_finalise_leave_the_cluster_scope_alone`.
+- the agent: `a_value_sealed_for_one_namespace_fails_closed_in_another`, `after_opting_in_a_cluster_sealed_value_fails_closed_in_that_namespace` (the test `security-sesame.md` §10 always listed), and the intent check above.
+- the leader loop and the API: `the_leader_creates_an_opted_in_namespaces_key_and_reseals_its_values` (including its `secret.namespace_key_created` audit event, with no plaintext in it), `namespace_rotation_and_finalise_are_per_namespace_and_audited`, `only_an_unscoped_admin_rotates_a_namespace_key`, and `secret_public_key_serves_a_namespaces_own_key`.
+
+We checked the fallback tests the cheap way: put the old "namespace keys, then cluster keys" order back and watch four of them fail.
+
+`RotateSecretKey` grew a field and `NamespaceSpec` a flag, both in the Raft log and the snapshot, so the protocol and state generations in `src/compatibility.rs` went up by one each.
 
 ## Certificate revocation
 
