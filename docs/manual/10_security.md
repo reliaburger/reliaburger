@@ -274,3 +274,17 @@ new node joins with a single-use token and a certificate signing request, so
 its private key never leaves it. Every node needs the cluster's master key
 (`*-master.key` from `init`): it unwraps the CA keys and the secret keys, and
 seals council backups. Keep it safe and backed up.
+
+### Cluster build signing authority
+
+Cluster build signers receive code-signing certificates valid for at most five
+years, bounded by the Workload CA's expiry. The build runner renews cached
+signers before expiry. Workload mTLS certificates continue to last one hour.
+
+An image signature is checked against its certificate chain at deployment time.
+The leaf, every intermediate and the trusted root must be currently valid; expiry
+or revocation of an authority can shorten the signature's usable lifetime.
+Renewing a signer does not extend signatures already attached to images. Re-sign
+retained images before their chain expires, and after retiring or revoking their
+signing authority. Images signed under the previous one-hour certificate policy
+also need re-signing. The signature timestamp does not extend certificate validity.

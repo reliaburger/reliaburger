@@ -8,6 +8,7 @@
 /// Both parse from TOML and validate in a separate pass.
 pub mod app;
 pub mod build;
+pub(crate) mod defaults;
 pub mod error;
 pub mod job;
 pub mod namespace;
