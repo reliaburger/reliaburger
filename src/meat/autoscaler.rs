@@ -99,7 +99,7 @@ pub struct AutoscaleConfig {
 /// (DEP8: `min > max` used to be quietly clamped, hiding operator error).
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum AutoscaleConfigError {
-    #[error("autoscale target {target:?} is not a valid percentage or fraction")]
+    #[error("autoscale target {target:?} must be a positive finite percentage or fraction")]
     InvalidTarget { target: String },
     #[error("autoscale min ({min}) must not exceed max ({max})")]
     MinExceedsMax { min: u32, max: u32 },
@@ -131,7 +131,7 @@ impl AutoscaleConfig {
     /// `memory` ranges, applying defaults for optional fields. Rejects an
     /// unsupported metric, a missing or zero request for the chosen
     /// metric, `min > max`, a zero max, a zero min (no scale-to-zero),
-    /// unparseable or zero windows/cooldowns, and an out-of-range
+    /// nonpositive or nonfinite targets, unparseable or zero windows/cooldowns, and an out-of-range
     /// hysteresis threshold. An
     /// invalid block is an error, never a silent clamp or a silent no-op.
     pub fn from_spec(
@@ -270,6 +270,9 @@ pub fn evaluate(
     current_metric: f64,
     now: Instant,
 ) -> Option<AutoscaleDecision> {
+    if !current_metric.is_finite() {
+        return None;
+    }
     // Check cooldown
     if let Some(last) = state.last_scale_event
         && now.duration_since(last) < config.cooldown
@@ -384,12 +387,13 @@ impl AutoscaleTracker {
 /// Parse a percentage string like "70%" into a fraction (0.70).
 fn parse_percentage(s: &str) -> Option<f64> {
     let s = s.trim();
-    if let Some(pct) = s.strip_suffix('%') {
+    let target = if let Some(pct) = s.strip_suffix('%') {
         pct.trim().parse::<f64>().ok().map(|v| v / 100.0)
     } else {
         // Try as a raw fraction
         s.parse::<f64>().ok()
-    }
+    }?;
+    (target.is_finite() && target > 0.0).then_some(target)
 }
 
 /// Parse a duration string like "5m", "30s", "3m".
@@ -558,6 +562,49 @@ mod tests {
     #[test]
     fn parse_percentage_invalid() {
         assert_eq!(parse_percentage("abc"), None);
+    }
+
+    #[test]
+    fn nonpositive_and_nonfinite_targets_are_refused() {
+        for target in ["0%", "-20%", "NaN", "NaN%", "inf", "inf%", "-inf"] {
+            let mut spec = cpu_spec();
+            spec.target = target.into();
+            assert!(
+                matches!(
+                    AutoscaleConfig::from_spec(&spec, CPU_REQUEST, None),
+                    Err(AutoscaleConfigError::InvalidTarget { .. })
+                ),
+                "accepted {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn targets_above_one_request_are_supported() {
+        let mut spec = cpu_spec();
+        spec.target = "150%".into();
+        assert_eq!(
+            AutoscaleConfig::from_spec(&spec, CPU_REQUEST, None)
+                .unwrap()
+                .target,
+            1.5
+        );
+    }
+
+    #[test]
+    fn nonfinite_metrics_never_change_the_replica_count() {
+        for metric in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                evaluate(
+                    &test_app(),
+                    &test_config(),
+                    &test_state(3),
+                    metric,
+                    Instant::now()
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
