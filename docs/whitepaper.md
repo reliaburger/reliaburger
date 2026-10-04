@@ -1085,6 +1085,43 @@ throughput target remains unqualified until real workloads sustain at least
 failure recovery and bounded memory and storage. A short simulated burst doesn't
 establish that result.
 
+### AI workloads: resident models and coordinated training
+
+Preparing a million dataset records, running a hundred training experiments
+and serving inference requests require different execution contracts. The
+same batch foundation can provide stable task identities, resource profiles,
+bounded queues, retries and durable outcomes. Data, models and checkpoints
+should remain in artifact storage, with small immutable references in the
+control plane. Job throughput alone does not describe model throughput or
+accelerator utilisation.
+
+For inference, a container pool that starts a new model process for every task
+would still repeat model initialisation. The proposed AI path keeps model
+workers resident and feeds separately tracked requests through a built-in
+engine adapter. Reliaburger would allocate and own the workers; engines such
+as [vLLM](https://docs.vllm.ai/en/stable/) would manage continuous batching and
+attention memory. The worker holds its resource reservation while requests
+share bounded engine capacity. Scheduler chunks and model batches are separate
+units. Interactive inference remains a long-lived application with latency
+protection from background batches.
+
+Independent training experiments fit the task model. Distributed training
+requires group allocation, rendezvous and coordinated recovery; its workers
+cannot be retried as unrelated array elements. For example,
+[PyTorch's elastic launcher](https://docs.pytorch.org/docs/main/elastic/run.html#failure-modes)
+can restart a worker group after failure. Reliaburger would need an explicit
+group contract and application checkpoint references before supporting those
+runs. Accelerator placement must consider device identity, memory and topology,
+with exclusive whole-device allocation before any supported sharing scheme.
+
+These are design extensions. Current delegated jobs refuse GPU requests, and
+resident model adapters and distributed training groups are not implemented.
+GPU cluster placement and container device assignment remain tracked in F01
+([#359](https://github.com/reliaburger/reliaburger/issues/359)). Their validation
+must measure useful records/tokens or training samples per second, queue and
+serving latency, accelerator utilisation and recovery, as well as task counts.
+See the [AI implementation sequence](plans/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
+
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
 100M jobs a day remains an unqualified design target (§2). The 0.2.0 development implementation keeps arrays compact in Raft and expands them on workers. On-demand and cron jobs still use the ordinary per-job path; high-volume callers use arrays or mixed-profile manifests.

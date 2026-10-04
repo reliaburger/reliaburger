@@ -242,3 +242,125 @@ compaction, or that Kubernetes cannot run large batches. A numerical performance
 comparison needs a matched Kubernetes benchmark and stated execution semantics.
 See the official [Jobs documentation](https://kubernetes.io/docs/concepts/workloads/controllers/job/)
 and [API server compaction option](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/#options).
+
+
+## AI training and inference
+
+Consider a pipeline that prepares dataset shards, generates embeddings or
+synthetic examples, runs training experiments and evaluates the resulting
+models. Its units of work have different lifetimes and resource needs. The
+batch substrate should carry stable identities, bounded queues, resource
+profiles, retries and durable outcomes across those stages. Models, datasets,
+checkpoints and generated results belong in external artifact storage; control
+messages carry bounded references and immutable revisions. A dependency-aware
+pipeline interface is a separate extension, not implemented by today's arrays.
+
+| Workload | Execution and placement contract | Useful measures |
+| --- | --- | --- |
+| Dataset preparation and evaluation commands | Independent CPU/container tasks, grouped by resource profile, with data locality and bounded output. | Records or bytes/s, CPU time, queue age, failures. |
+| Training sweeps and independent fine-tuning runs | One experiment per task, exclusive assigned devices, explicit data/model/checkpoint references. | Experiments completed, accelerator utilisation, GPU-hours, checkpoint progress. |
+| Distributed training | One group owns all participating workers; reserve the required devices together, establish rendezvous, and apply a group recovery policy. | Time waiting for a feasible group, samples/s, step time, checkpoint age, lost work. |
+| Offline inference, embedding, scoring and rollout generation | Resident model workers handle many separately tracked requests, with bounded engine admission and request/result accounting. | Records and tokens/s, queue age, retries, GPU utilisation and memory. |
+| Interactive inference | A long-lived application/engine with latency-aware admission and capacity protection from background batches. | Time to first token, inter-token latency, tail latency, rejected requests. |
+
+### Resident model workers
+
+Container reuse amortises container setup. Process reuse also amortises Python,
+CUDA context and model initialisation. Therefore an explicit persistent worker
+mode is a first-class AI design requirement, even though the initial command
+demo still launches a process per task. An inference request is individually
+identified and accounted, but does not require a new process or container.
+Reserve the worker's resident CPU, RAM and accelerator resources for its
+lifetime, then admit requests into its bounded capacity. Do not charge a whole
+GPU independently to every concurrent request in the same model worker.
+
+Reliaburger should place, own, recover and feed worker pools; existing engines
+should execute models and choose tensor/token batches. For example, vLLM
+already implements continuous batching and attention-memory management. A
+built-in adapter should submit bounded requests to a supported engine using
+its normal interface, rather than require users to write a queue consumer or
+reimplement the engine inside Reliaburger. Specify and version that adapter's
+request, cancellation and completion contract before implementation. See the
+[vLLM overview](https://docs.vllm.ai/en/stable/).
+
+Compatible worker pools include pinned engine/image and model revisions,
+adapter identity, execution settings, credentials and tenant boundary. Model
+and dataset caches influence placement, subject to hard resource constraints
+and fairness. Admission considers input size and output-token limits as well
+as request count; 1,000 short embedding inputs and 1,000 long generations do
+not have the same footprint. Keep engine batching distinct from scheduler
+chunks. A chunk is a bounded dispatch grant, not a tensor batch size.
+
+A dead engine can interrupt many in-flight requests. Retry only logical tasks
+without accepted durable outcomes, preserve request identities and expose
+ambiguous execution; model computation or external side effects can repeat.
+Attempt completion requires the result artifact to be durably published as well
+as the outcome record. Define whether cancellation is acknowledged per request
+or requires retiring the worker and retrying its other unfinished requests.
+Protect credentials and cached state between tenants. Interactive streams use
+the application path, with explicit policies for partial output and failure;
+do not create a durable cluster job for each emitted token.
+
+### GPU and training prerequisites
+
+The current batch implementation refuses GPU tasks. Whole-device cluster
+placement and runtime device assignment are tracked in the existing GPU work
+(F01, [#359](https://github.com/reliaburger/reliaburger/issues/359)) and remain
+outside this PR's implemented contract. A GPU demo requires that work first.
+CPU preparation and CPU model inference can establish useful behaviour before
+accelerator support exists, without substituting for GPU evidence.
+
+Track healthy physical device identities, accelerator type, memory capacity,
+driver/runtime compatibility and topology. Assign and isolate devices, rather
+than treating GPU count as a fungible scalar. Start with exclusive whole-device
+allocation and account for resident model memory plus working/cache headroom.
+A host-memory cgroup limit does not enforce GPU-memory isolation. Fractional
+allocation must wait for an explicit supported partitioning/sharing contract;
+a declared fractional request alone is not an enforceable resource limit.
+
+Distributed training needs group admission (all required workers can be placed
+before starting the run), rendezvous, placement constraints for communication,
+and group-scoped termination/retry. It cannot reuse independent array-task
+completion rules unchanged. PyTorch's elastic launcher can restart its worker
+group after a worker failure; define which recovery decisions belong to the
+launcher and which to Reliaburger to prevent conflicting retry loops. Resume
+from published application checkpoints, not from an assumption that a process
+restart reconstructs training state. See the
+[torchrun failure contract](https://docs.pytorch.org/docs/main/elastic/run.html#failure-modes).
+
+The current FIFO policy has utilisation and waiting-time trade-offs. GPU pools
+and long training runs need measured tenant allocation and capacity reservations
+for online serving, plus explicit starvation protection. Avoid reserving part
+of a training group indefinitely while waiting for the remaining devices.
+Pre-emption requires checkpoint/graceful-stop support and a policy for the
+cost of lost training work; it is a separate capability rather than an assumed
+consequence of high task throughput.
+
+### AI evidence and sequence
+
+Keep the compact CPU throughput demo as the orchestration benchmark. Add an
+AI example with a reproducible model revision and dataset: submit an embedding
+or scoring batch to a warm engine, keep a latency-sensitive service responsive,
+inspect selected results, and restart an owned worker to demonstrate recovery.
+Use a CPU-capable small model for an initial reproducible example. Once GPU
+support exists, repeat on stated accelerator hardware and report loading time,
+steady-state throughput, GPU utilisation, peak GPU memory and serving latency.
+Count orchestration tasks, input records and engine requests separately; a
+single task containing 1,000 records is still one task. Do not label synthetic
+hashing throughput as model inference or promise a million model generations
+from the process-launch benchmark.
+
+Compare direct engine execution with the Reliaburger adapter on the same warm
+model, dataset, batching limits, hardware and result-durability contract. Report
+engine compute and orchestration costs independently. Operator views need
+worker readiness/model loading, queue age by bounded workload class, records
+and tokens/s, device utilisation, out-of-memory failures and checkpoint/group
+status. Keep IDs out of metric labels; detailed request and experiment views
+remain indexed and bounded. These are proposed additions, not current metrics.
+
+Implement in this order: reusable command executors and their matched benchmark;
+resident CPU model workers with a supported adapter; whole-device GPU placement
+and isolation; then GPU inference and independent training experiments. Add
+distributed training group semantics and checkpoint-aware fairness as explicit
+subsequent work. This sequence keeps the initial feature useful while avoiding
+claims of GPU, model-worker or distributed-training support before its gates pass.
