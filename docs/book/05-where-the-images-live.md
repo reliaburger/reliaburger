@@ -1169,6 +1169,24 @@ authority and shared content. The regressions cover foreign configurations,
 layers and index children, successful ordinary pushes, persisted receipts,
 failed digest checks, receipt-write failures and exact-generation retirement.
 
+### A warm cache still has to earn trust
+
+A layer file can have the right name and length while containing the wrong
+bytes. The runtime pull now asks the shared blob store to hash an existing
+layer before using it. A mismatch removes the corrupt blob and its repository
+receipts, then fetches and verifies a replacement. An unreadable file produces
+an error; it cannot masquerade as a healthy hit or an ordinary cache miss.
+A healthy hit still avoids the layer download, and the descriptor size is
+checked before use. Hashing runs in `spawn_blocking`, so reading a large layer
+doesn't occupy a Tokio worker.
+
+A second path matters too. Internal cache fills can reuse an already verified
+blob, but reuse still confirms the file and directory writes. The same physical
+hash can serve several repositories while each repository keeps its own upload
+evidence. If the shared bytes fail verification, their old receipts cannot make
+them trustworthy. This covers payload validation and repository authority;
+it doesn't promise that every remote registry or local disk is available.
+
 ### Count the bytes before writing them
 
 A catalogue total cannot protect a disk. A client can upload blobs without ever
@@ -1187,10 +1205,21 @@ capacity only after confirmed removal; an uncertain cleanup keeps the charge.
 An existing verified blob can be reused without storing another copy. Reuse
 still syncs the payload and directory before acknowledgement; a previous write
 might have renamed successfully but failed its final durability sync. These
-transactions sync files and their containing directories. Syncing the parent
-entries of newly created digest directories remains part of the final lifecycle
-hardening ([#555](https://github.com/reliaburger/reliaburger/issues/555));
-the quota fix alone does not prove those entries survive power loss.
+transactions confirm directory entries before descending into them. Creating
+`blobs`, `sha256` and a digest directory can leave visible names even when a
+parent sync fails. A later retry therefore confirms existing entries too,
+including when the configured store path was initially missing. An error stops
+the transaction before publishing the child payload or reporting success.
+The store also confirms the entries needed by repository receipts. A verified
+same-hash reuse follows the same confirmation boundary instead of bypassing it.
+
+The reservation stays owned while a write or cleanup remains uncertain.
+Uploading into the CAS transfers that charge only after the payload and both
+containing directories acknowledge the move. These are explicit local file and
+directory confirmation checks, including retries after injected failures.
+They don't establish behaviour under arbitrary power loss, filesystem faults
+or cloud storage. The final qualification report keeps those evidence limits
+separate from the owned local transaction contract.
 
 The runtime receives the same `Arc<BlobStore>` before it starts pulling images.
 Registry uploads, peer transfers, replication, upstream cache fills and runtime

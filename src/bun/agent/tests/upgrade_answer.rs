@@ -28,6 +28,8 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    let fixture_started = std::time::Instant::now();
+    eprintln!("upgrade-fixture phase=fixture-begin");
     let dir = tempfile::tempdir().unwrap();
     let binary_dir = dir.path().join("bin");
     let data = dir.path().join("data");
@@ -47,6 +49,10 @@ fn fixture() -> Fixture {
         )
         .unwrap();
     store.activate(&running_version).unwrap();
+    eprintln!(
+        "upgrade-fixture phase=running-binary-staged elapsed={:?}",
+        fixture_started.elapsed()
+    );
     let (release_pkcs8, release_public) = generate_keypair().unwrap();
     let manager = crate::upgrade::manager::UpgradeManager::new(
         &crate::config::node::UpgradeSection {
@@ -65,7 +71,7 @@ fn fixture() -> Fixture {
     // process carries on; that failure is what shows the exec was tried.
     let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
     let binary =
-        format!("#!/bin/sh\n[ \"$1\" = --compatibility ] || exit 1\nprintf '%s' '{formats}'\n")
+        format!("#!/bin/sh\n[ \"$1\" = --compatibility ] || exit 1\ndir=${{0%/*}}\nprintf '%s' reached > \"$dir/probe-entered\"\nprintf '%s' '{formats}'\n")
             .into_bytes();
     let source = dir.path().join("next-bun");
     std::fs::write(&source, &binary).unwrap();
@@ -80,6 +86,10 @@ fn fixture() -> Fixture {
         allow_downgrade: false,
     };
 
+    eprintln!(
+        "upgrade-fixture phase=candidate-written-and-signed elapsed={:?}",
+        fixture_started.elapsed()
+    );
     Fixture {
         _dir: dir,
         data,
@@ -91,6 +101,7 @@ fn fixture() -> Fixture {
 
 #[tokio::test]
 async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
+    let started = tokio::time::Instant::now();
     let Fixture {
         _dir,
         data,
@@ -100,6 +111,10 @@ async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
     } = fixture();
     let (mut agent, tx, shutdown) = test_agent();
     agent.set_upgrade_manager(manager);
+    eprintln!(
+        "upgrade-fixture phase=agent-spawn elapsed={:?}",
+        started.elapsed()
+    );
     let running = tokio::spawn(async move { agent.run().await });
     let delivered = CancellationToken::new();
     let (response, answer) = oneshot::channel();
@@ -114,9 +129,14 @@ async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
     .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), answer)
         .await
-        .expect("the upgrade was never answered")
+        .unwrap_or_else(|error| panic!("upgrade-fixture phase=initial-answer elapsed={:?} candidate-probe-reached={} timeout={error}",
+            started.elapsed(), _dir.path().join("bin/probe-entered").exists()))
         .unwrap()
         .unwrap();
+    eprintln!(
+        "upgrade-fixture phase=initial-answer-received elapsed={:?}",
+        started.elapsed()
+    );
     std::fs::write(
         store.binary_path(&"0.2.0".parse().unwrap()),
         b"not an executable",
@@ -128,6 +148,10 @@ async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(marker_phase(&data), Some(MarkerPhase::Staged));
 
+    eprintln!(
+        "upgrade-fixture phase=undelivered-marker-still-staged elapsed={:?}",
+        started.elapsed()
+    );
     delivered.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while marker_phase(&data).is_some() {
@@ -136,6 +160,10 @@ async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
     })
     .await
     .expect("the exec never followed the delivered answer");
+    eprintln!(
+        "upgrade-fixture phase=delivered-exec-observed elapsed={:?}",
+        started.elapsed()
+    );
     shutdown.cancel();
     let _ = running.await;
 }

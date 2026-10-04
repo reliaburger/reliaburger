@@ -494,6 +494,22 @@ The apply handler checked a manifest's apps against the caller's scope and then 
 
 Finally, the check has to survive a network hop. A follower that forwards an apply to the leader passes along the *user's* token or session cookie. Swapping in the node's own service token would erase the identity whose permissions the leader needs to check. Each fix got a test that looks at Raft state and the agent's command queue, not just the HTTP status, and a positive test next to it. A permission system that refuses everything is secure and useless.
 
+Apply and batch submission now use the same `authorize_workload` function for
+these target checks. Each handler passes the authenticated caller, workload
+name, effective namespace, whether `exec` or `script` requests host execution,
+and its replicated permission snapshot. The function checks scope first,
+`Deploy` next, and `HostExec` when needed. It returns `Result<(), Response>`;
+Rust's `?` operator passes an existing refusal straight back without replacing
+its status or message. Roles, lease ownership and administrator policy still
+belong to their existing handlers.
+
+A source control keeps both handlers on that path and detects a copied decision
+or a missing host-exec check. A separate transport regression uses one real
+scoped bearer for leader apply and follower batch requests. It checks allowed
+paths as well as refusals, unchanged Raft state and an acknowledged empty
+mutation queue. Its finite command actor records dispatch; actual child
+execution belongs to the ProcessGrill and owned-runc suites.
+
 ### Evaluating a policy isn't enforcing it
 
 Roles and scopes are blunt. A `[permission]` block sharpens them: it names a token and lists what that token may do, and to which apps.
@@ -1061,3 +1077,10 @@ the next successful connection to present the renewed certificate. A handler
 records old-identity requests after the test deadline even if no response reaches
 the client. Keeping retirement disabled in a negative control proves the test
 would catch the original bug. Production still uses the current system time.
+
+The route permission guardian follows the same shared workload rule. It parses
+the actual helper and credits Deploy only when that permission is checked
+unconditionally and its error is propagated. A handler must call the exact
+shared helper and return its refusal. Conditional host-execution permission
+does not satisfy an unconditional route gate. Source controls catch missing
+wiring; the paired HTTP tests still exercise the actual token and refusal.

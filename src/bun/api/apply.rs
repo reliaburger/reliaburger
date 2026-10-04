@@ -276,30 +276,14 @@ pub(super) async fn apply_handler(
             )
         }));
     for (app_name, namespace, host_execution) in targets {
-        if let Err(resp) =
-            crate::sesame::auth::authorize_scoped(auth.as_deref(), app_name, namespace)
-        {
-            return resp;
-        }
-        if let Err(resp) = crate::sesame::auth::authorize_permission(
+        if let Err(response) = crate::sesame::auth::authorize_workload(
             auth.as_deref(),
-            crate::config::PermissionAction::Deploy,
             app_name,
             namespace,
+            host_execution,
             &permissions,
         ) {
-            return resp;
-        }
-        if host_execution
-            && let Err(resp) = crate::sesame::auth::authorize_permission(
-                auth.as_deref(),
-                crate::config::PermissionAction::HostExec,
-                app_name,
-                namespace,
-                &permissions,
-            )
-        {
-            return resp;
+            return response;
         }
     }
 

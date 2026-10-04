@@ -285,7 +285,16 @@ impl UpgradeManager {
         directive: &UpgradeDirective,
         fetch: Fetch,
     ) -> Result<(Vec<u8>, SignatureEnvelope), UpgradeError> {
+        #[cfg(test)]
+        let fixture_phase_started = std::time::Instant::now();
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=fetch-begin");
         let bytes = self.fetch_binary(directive, fetch).await?;
+        #[cfg(test)]
+        eprintln!(
+            "upgrade-fixture phase=fetch-end elapsed={:?}",
+            fixture_phase_started.elapsed()
+        );
         let envelope = SignatureEnvelope {
             schema: 1,
             sha256: directive.binary_sha256.clone(),
@@ -304,6 +313,11 @@ impl UpgradeManager {
             is_network,
         )?;
 
+        #[cfg(test)]
+        eprintln!(
+            "upgrade-fixture phase=signature-verified-probe-begin elapsed={:?}",
+            fixture_phase_started.elapsed()
+        );
         super::compatibility::check_binary(
             bytes.clone(),
             self.store.symlink_path().parent().ok_or_else(|| {
@@ -311,6 +325,11 @@ impl UpgradeManager {
             })?,
         )
         .await?;
+        #[cfg(test)]
+        eprintln!(
+            "upgrade-fixture phase=compatibility-probe-end elapsed={:?}",
+            fixture_phase_started.elapsed()
+        );
         Ok((bytes, envelope))
     }
 
@@ -386,8 +405,17 @@ impl UpgradeManager {
         // binary into the store so rollback has something to return to.
         self.adopt_running_binary_if_missing()?;
 
+        #[cfg(test)]
+        let fixture_stage_started = std::time::Instant::now();
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=stage-begin");
         self.store
             .stage(&directive.target_version, &bytes, &envelope)?;
+        #[cfg(test)]
+        eprintln!(
+            "upgrade-fixture phase=stage-end elapsed={:?}",
+            fixture_stage_started.elapsed()
+        );
 
         let marker = UpgradeMarker {
             schema: 1,

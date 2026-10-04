@@ -1015,10 +1015,8 @@ impl super::Grill for ProcessGrill {
             let mut no_new_data = true;
             let mut backlog = false;
             for (reader, buffer) in &mut readers {
-                let new_data = if let Some(file) = reader.file() {
-                    crate::grill::capture::read_capture_chunk(file, reader.read_offset())
-                        .await
-                        .unwrap_or_default()
+                let new_data = if reader.file().is_some() {
+                    reader.read_chunk().await.unwrap_or_default()
                 } else {
                     let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
                     let buf = buffer.lock().await;
@@ -1485,6 +1483,9 @@ mod tests {
             Some(crate::ketchup::types::CapturePosition {
                 file: dir.path().join("test-0.stdout"),
                 end_offset: "ACK 1\n".len() as u64,
+                identity: Some(crate::ketchup::types::CaptureFileIdentity::of(
+                    &std::fs::metadata(dir.path().join("test-0.stdout")).unwrap(),
+                )),
             })
         );
         assert_eq!(after_restart, before_restart);
@@ -2446,6 +2447,18 @@ mod tests {
         let mut resume = crate::ketchup::types::CaptureOffsets::default();
         resume.0.insert(stdout.clone(), prefix.len() as u64);
         resume.0.insert(stderr.clone(), prefix.len() as u64);
+        // The child is still gated. Bind each checkpointed prefix to the
+        // actual descriptor that supplies its bytes, as the log store does.
+        for file in [&stdout, &stderr] {
+            let mut input = std::fs::File::open(file).unwrap();
+            let mut observed = Vec::new();
+            std::io::Read::read_to_end(&mut input, &mut observed).unwrap();
+            assert_eq!(observed, prefix);
+            resume.1.insert(
+                file.clone(),
+                crate::ketchup::types::CaptureFileIdentity::of(&input.metadata().unwrap()),
+            );
+        }
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let follow = grill.follow_logs(&id, sender, &resume);
         tokio::pin!(follow);

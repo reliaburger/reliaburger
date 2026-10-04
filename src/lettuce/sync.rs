@@ -330,6 +330,18 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("team/app.toml"), "[app.web]\nport = 8080\n").unwrap();
         let expected = crate::relish::compile::compile(&root).unwrap().config.app["web"].clone();
+        // Independent fixture expectations also catch a defect shared by both callers.
+        assert_eq!(expected.image.as_deref(), Some("web:v2"));
+        assert_eq!(expected.namespace.as_deref(), Some("team"));
+        assert_eq!(expected.port, Some(8080));
+        assert_eq!(
+            expected.memory.as_ref().map(|range| range.request),
+            Some(128 * 1024 * 1024)
+        );
+        assert_eq!(
+            expected.env["SOURCE"],
+            crate::config::EnvValue::Plain("shared".into())
+        );
         for signed in [false, true] {
             let sha = commit_in(&repository.work, "watched config tree", signed);
             let mut config = repository.config();
@@ -400,6 +412,26 @@ mod tests {
             .config;
         let (git, errors) = parse_toml_files(&files);
         assert!(errors.is_empty(), "{errors:?}");
+        // These literals describe the input, independently of the common resolver.
+        assert_eq!(cli.app["web"].image.as_deref(), Some("web:v1"));
+        assert_eq!(cli.app["worker"].image.as_deref(), Some("worker:v1"));
+        assert_eq!(cli.app["web"].port, Some(8080));
+        for app in ["web", "worker"] {
+            let spec = &cli.app[app];
+            assert_eq!(
+                spec.memory.as_ref().map(|range| range.request),
+                Some(128 * 1024 * 1024)
+            );
+            assert_eq!(spec.cpu.as_ref().map(|range| range.request), Some(250));
+            assert_eq!(
+                spec.env["PARENT"],
+                crate::config::EnvValue::Plain("yes".into())
+            );
+            assert_eq!(
+                spec.env["CHILD"],
+                crate::config::EnvValue::Plain("yes".into())
+            );
+        }
         assert_eq!(git, cli);
         assert_eq!(git.app["web"].namespace.as_deref(), Some("team"));
         assert_eq!(git.app["worker"].namespace.as_deref(), Some("deep"));

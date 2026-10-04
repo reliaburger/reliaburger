@@ -588,6 +588,38 @@ pub fn authorize_scoped(
     }
 }
 
+/// Authorise one resolved workload before any desired write or dispatch.
+/// Scope is checked first, then Deploy, then HostExec for host binaries/scripts.
+/// The caller supplies its authoritative permission snapshot and still owns
+/// role, lease, resource validation and transport admission.
+#[allow(clippy::result_large_err)]
+pub fn authorize_workload(
+    ctx: Option<&AuthContext>,
+    app: &str,
+    namespace: &str,
+    host_execution: bool,
+    permissions: &std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+) -> Result<(), Response> {
+    authorize_scoped(ctx, app, namespace)?;
+    authorize_permission(
+        ctx,
+        crate::config::PermissionAction::Deploy,
+        app,
+        namespace,
+        permissions,
+    )?;
+    if host_execution {
+        authorize_permission(
+            ctx,
+            crate::config::PermissionAction::HostExec,
+            app,
+            namespace,
+            permissions,
+        )?;
+    }
+    Ok(())
+}
+
 /// Enforce a principal's `[permission]` spec on a specific action + target.
 ///
 /// Permissions are an **additional** allow-list keyed by token name, layered on

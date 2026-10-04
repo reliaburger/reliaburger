@@ -20,7 +20,10 @@ use datafusion::datasource::listing::{
 };
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::basic::{Compression, ZstdLevel};
+use datafusion::parquet::file::metadata::KeyValue;
 use datafusion::parquet::file::properties::WriterProperties;
+use datafusion::parquet::file::reader::FileReader;
+use datafusion::parquet::file::serialized_reader::SerializedFileReader;
 use datafusion::prelude::*;
 
 use super::types::{KetchupError, LogEntry, LogStream};
@@ -204,6 +207,7 @@ fn optional_column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Option
 
 /// Name of the ingest checkpoint kept beside the Parquet files.
 const CHECKPOINT_FILE: &str = "ingest-checkpoint.json";
+const CHECKPOINT_FOOTER: &str = "reliaburger.ingest-checkpoint.v1";
 
 /// What the store has durably ingested, saved after every successful flush.
 ///
@@ -212,7 +216,7 @@ const CHECKPOINT_FILE: &str = "ingest-checkpoint.json";
 /// at its offset (see [`LogStore::capture_offsets`]), and the store still
 /// skips every line at or below it, so a line is never stored a second time
 /// under a new timestamp. `files` records which file each offset belongs to
-/// (device and inode, taken when the checkpoint is saved), so a capture file
+/// (device and inode, taken from the descriptor that supplied the bytes), so a capture file
 /// replaced under the same path isn't mistaken for the one the offset
 /// counted. `last_sequence` keeps [`LogEntry::sequence`] rising across a
 /// restart even if the clock stepped back while the node was down.
@@ -223,22 +227,7 @@ struct IngestCheckpoint {
     files: std::collections::BTreeMap<PathBuf, FileIdentity>,
 }
 
-/// Which file a path named when the checkpoint was saved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl FileIdentity {
-    fn of(metadata: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-}
+type FileIdentity = super::types::CaptureFileIdentity;
 
 impl IngestCheckpoint {
     /// Load the checkpoint from `data_dir`. A missing or unreadable
@@ -262,6 +251,32 @@ impl IngestCheckpoint {
             }),
             Err(_) => Self::default(),
         };
+        // The Parquet footer and its rows are published by the same rename.
+        // Recover the latest frozen checkpoint even if the later JSON update
+        // was interrupted. Older files without this metadata remain readable.
+        if let Ok(entries) = std::fs::read_dir(data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_none_or(|extension| extension != "parquet")
+                {
+                    continue;
+                }
+                let recovered = (|| {
+                    let reader =
+                        SerializedFileReader::new(std::fs::File::open(&path).ok()?).ok()?;
+                    let metadata = reader.metadata().file_metadata().key_value_metadata()?;
+                    let item = metadata.iter().find(|item| item.key == CHECKPOINT_FOOTER)?;
+                    serde_json::from_str::<Self>(item.value.as_deref()?).ok()
+                })();
+                if let Some(recovered) = recovered
+                    && recovered.last_sequence >= checkpoint.last_sequence
+                {
+                    checkpoint = recovered;
+                }
+            }
+        }
         let files = std::mem::take(&mut checkpoint.files);
         checkpoint.offsets.retain(|file, offset| {
             let Ok(metadata) = std::fs::metadata(file) else {
@@ -280,17 +295,9 @@ impl IngestCheckpoint {
     /// the old one, then fsync the directory. A reader sees the old
     /// checkpoint or the new one, never half of either.
     ///
-    /// Records the identity of every capture file it has an offset for first.
-    /// This runs on the blocking pool, off the ingest path.
-    fn save(mut self, data_dir: &std::path::Path) -> Result<(), KetchupError> {
-        self.files = self
-            .offsets
-            .keys()
-            .filter_map(|file| {
-                let metadata = std::fs::metadata(file).ok()?;
-                Some((file.clone(), FileIdentity::of(&metadata)))
-            })
-            .collect();
+    /// Keeps the immutable identities captured with the input bytes. Re-statting
+    /// a pathname here would bind an old offset to a later replacement.
+    fn save(self, data_dir: &std::path::Path) -> Result<(), KetchupError> {
         let bytes = serde_json::to_vec(&self)
             .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
         crate::sesame::identity::atomic_write(&data_dir.join(CHECKPOINT_FILE), &bytes)?;
@@ -362,17 +369,90 @@ pub struct LogPendingFlush {
     completed: Arc<AtomicBool>,
     #[cfg(test)]
     test_gate: Arc<std::sync::Mutex<Option<Arc<LogFlushGate>>>>,
+    #[cfg(test)]
+    checkpoint_test_gate: Arc<std::sync::Mutex<Option<Arc<LogFlushGate>>>>,
+    #[cfg(test)]
+    test_dir_sync_failure: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_parent_confirmation_fault: Arc<std::sync::Mutex<Option<Arc<LogParentConfirmationFault>>>>,
+}
+
+#[cfg(test)]
+struct LogParentConfirmationFault {
+    child: PathBuf,
+    failing: AtomicBool,
+    visits: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+/// Sync each newly created directory's parent before descending further.
+/// An existing directory also re-confirms its parent: it may be a visible
+/// mkdir left by an earlier failed sync. Preserve the configured path aliases.
+fn prepare_log_directory(
+    data_dir: &std::path::Path,
+    #[cfg(test)] fault: Option<&LogParentConfirmationFault>,
+) -> std::io::Result<()> {
+    match std::fs::metadata(data_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(std::io::Error::other("log directory is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = data_dir
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                prepare_log_directory(
+                    parent,
+                    #[cfg(test)]
+                    fault,
+                )?;
+            }
+            if let Err(error) = std::fs::create_dir(data_dir)
+                && (error.kind() != std::io::ErrorKind::AlreadyExists
+                    || !std::fs::metadata(data_dir)?.is_dir())
+            {
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = data_dir.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        #[cfg(test)]
+        if let Some(fault) = fault {
+            fault.visits.lock().unwrap().push(data_dir.to_path_buf());
+            if fault.child == data_dir && fault.failing.load(Ordering::Acquire) {
+                return Err(std::io::Error::other(
+                    "controlled log parent-entry confirmation failure",
+                ));
+            }
+        }
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Persist a [`LogPendingFlush`] on the blocking pool, with no lock held so
 /// concurrent appends/queries proceed while the write is in flight (M7).
 /// Durable write (M6): temp file, fsync, atomic rename, dir fsync. The ingest
-/// checkpoint follows the Parquet file, never precedes it, so a crash between
-/// the two re-ingests one batch rather than losing it.
+/// frozen checkpoint also lives in the Parquet footer. A restart recovers that
+/// checkpoint when the later JSON replace fails, without replaying stored rows.
 pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupError> {
     let writing = pending.writing.clone().lock_owned().await;
     #[cfg(test)]
     let test_gate = pending.test_gate.lock().unwrap().clone();
+    #[cfg(test)]
+    let checkpoint_test_gate = pending.checkpoint_test_gate.lock().unwrap().clone();
+    #[cfg(test)]
+    let test_dir_sync_failure = pending.test_dir_sync_failure.clone();
+    #[cfg(test)]
+    let test_parent_confirmation_fault = pending
+        .test_parent_confirmation_fault
+        .lock()
+        .unwrap()
+        .clone();
     let LogPendingFlush {
         data_dir,
         path,
@@ -394,12 +474,24 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
                 released = gate.release.wait(released).unwrap();
             }
         }
-        std::fs::create_dir_all(&data_dir)?;
+        prepare_log_directory(
+            &data_dir,
+            #[cfg(test)]
+            test_parent_confirmation_fault.as_deref(),
+        )?;
         let tmp = path.with_extension("parquet.tmp");
         let file = std::fs::File::create(&tmp)?;
-        let mut writer =
-            ArrowWriter::try_new(file, Arc::new(log_schema()), Some(log_writer_properties()))
-                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        let checkpoint_json = serde_json::to_string(&checkpoint)
+            .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
+        let properties = log_writer_properties()
+            .into_builder()
+            .set_key_value_metadata(Some(vec![KeyValue {
+                key: CHECKPOINT_FOOTER.into(),
+                value: Some(checkpoint_json),
+            }]))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, Arc::new(log_schema()), Some(properties))
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         writer
             .write(&batch)
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
@@ -408,10 +500,22 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
-        if let Some(dir) = path.parent()
-            && let Ok(dir_file) = std::fs::File::open(dir)
-        {
-            let _ = dir_file.sync_all();
+        let directory_sync = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            if test_dir_sync_failure.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("injected log directory sync failure"));
+            }
+            std::fs::File::open(path.parent().unwrap())?.sync_all()
+        })();
+        // A visible rename alone is not acknowledgement of durable publication.
+        directory_sync?;
+        #[cfg(test)]
+        if let Some(gate) = checkpoint_test_gate {
+            gate.entered.notify_one();
+            let mut released = gate.released.lock().unwrap();
+            while !*released {
+                released = gate.release.wait(released).unwrap();
+            }
         }
         checkpoint.save(&data_dir)?;
         completed.store(true, Ordering::Release);
@@ -502,7 +606,7 @@ impl LogStore {
     /// Right after [`new`](Self::new) this is the loaded checkpoint, already
     /// cleared of files that were deleted, replaced or truncated.
     pub fn capture_offsets(&self) -> super::types::CaptureOffsets {
-        super::types::CaptureOffsets(self.ingested.offsets.clone())
+        super::types::CaptureOffsets(self.ingested.offsets.clone(), self.ingested.files.clone())
     }
 
     /// The directory where Parquet files are stored.
@@ -556,15 +660,21 @@ impl LogStore {
     }
 
     fn ingest_at_nanos(&mut self, nanos: u64, record: &super::types::LogRecord) -> bool {
-        if let Some(position) = &record.position {
+        if let Some(position) = &record.position
+            && let Some(identity) = position.identity
+        {
+            let same_file = self.ingested.files.get(&position.file) == Some(&identity);
             let seen = self.ingested.offsets.get(&position.file).copied();
-            if seen.is_some_and(|offset| position.end_offset <= offset) {
+            if same_file && seen.is_some_and(|offset| position.end_offset <= offset) {
                 return false;
             }
+            self.ingested.files.insert(position.file.clone(), identity);
             self.ingested
                 .offsets
                 .insert(position.file.clone(), position.end_offset);
         }
+        // An unknown identity is not evidence for skipping future bytes.
+        // Such a line remains queryable but cannot advance a durable offset.
         self.push(
             nanos / NANOS_PER_SECOND,
             nanos,
@@ -694,6 +804,12 @@ impl LogStore {
             completed: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            checkpoint_test_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_dir_sync_failure: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_parent_confirmation_fault: Arc::new(std::sync::Mutex::new(None)),
         };
         self.pending = Some(pending.clone());
         Ok(Some(pending))
@@ -1270,6 +1386,9 @@ mod tests {
             position: Some(crate::ketchup::types::CapturePosition {
                 file: file.to_path_buf(),
                 end_offset: n * LINE_BYTES,
+                identity: std::fs::metadata(file)
+                    .ok()
+                    .map(|metadata| FileIdentity::of(&metadata)),
             }),
         }
     }
@@ -2128,5 +2247,473 @@ mod tests {
             Some(2 * LINE_BYTES)
         );
         assert_eq!(writer_lines(&reopened).await, acks(1..=2));
+    }
+
+    /// Stop after Parquet publication but before checkpoint publication, then
+    /// reopen as a restarted node would. Replaying the capture is not allowed
+    /// to duplicate records already stored in the durable Parquet file.
+    #[tokio::test]
+    async fn restart_recovers_capture_offsets_after_parquet_before_checkpoint_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        let checkpoint = dir.path().join(CHECKPOINT_FILE);
+        {
+            let mut store = LogStore::new(dir.path().to_path_buf());
+            for n in 1..=2 {
+                assert!(store.ingest_at(100, &writer_line(&file, n)));
+            }
+            store.flush().await.unwrap();
+            // A directory refuses only the later atomic checkpoint replace.
+            // The production writer has already published its Parquet file.
+            std::fs::remove_file(&checkpoint).unwrap();
+            std::fs::create_dir(&checkpoint).unwrap();
+            for n in 3..=4 {
+                assert!(store.ingest_at(200, &writer_line(&file, n)));
+            }
+            assert!(
+                store.flush().await.is_err(),
+                "checkpoint fault must remain visible"
+            );
+            let parquet = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "parquet")
+                })
+                .count();
+            assert_eq!(
+                parquet, 2,
+                "fault must follow the second Parquet publication"
+            );
+        }
+        std::fs::remove_dir(checkpoint).unwrap();
+        let mut reopened = LogStore::new(dir.path().to_path_buf());
+        for n in 1..=4 {
+            assert!(
+                !reopened.ingest_at(4000, &writer_line(&file, n)),
+                "persisted capture line {n} was replayed after restart"
+            );
+        }
+        assert_eq!(writer_lines(&reopened).await, acks(1..=4));
+        assert_eq!(reopened.capture_offsets().0[&file], 4 * LINE_BYTES);
+    }
+
+    // Final #555 draft only: insert in log_store.rs tests. This uses the same
+    // opened/read capture bytes and CaptureReader path as the runtime, rather
+    // than inventing offsets through writer_line(). Compile/red still required.
+    async fn read_identity_test_capture(
+        file: &std::path::Path,
+        offsets: &crate::ketchup::types::CaptureOffsets,
+    ) -> Vec<crate::ketchup::types::LogRecord> {
+        let mut reader = crate::grill::capture::CaptureReader::resume(
+            LogStream::Stdout,
+            file.to_path_buf(),
+            offsets,
+        )
+        .await;
+        let bytes = reader.read_chunk().await.unwrap();
+        reader
+            .push(&bytes)
+            .into_iter()
+            .map(|line| crate::ketchup::types::LogRecord {
+                app: "writer".into(),
+                namespace: "default".into(),
+                instance: "writer-0".into(),
+                stream: line.stream,
+                line: line.line,
+                position: line.position,
+            })
+            .collect()
+    }
+
+    async fn assert_capture_replacement_after_read_before_checkpoint(publication_gate: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = captures.path().join("writer.stdout");
+        std::fs::write(&file, b"old-line\n").unwrap();
+        let mut store = LogStore::new(directory.path().to_path_buf());
+        let records = read_identity_test_capture(&file, &Default::default()).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].line, "old-line");
+        assert!(store.ingest_at(100, &records[0]));
+        // Keep the old inode alive so the filesystem cannot reuse it and
+        // accidentally make a replacement control look like the same file.
+        let old_file = std::fs::File::open(&file).unwrap();
+        let replacement = captures.path().join("replacement.stdout");
+        std::fs::write(&replacement, b"new-line\nreplacement-longer-than-old\n").unwrap();
+
+        if publication_gate {
+            // The tests-only gate draft below belongs immediately after the
+            // Parquet rename, before checkpoint.save. It acknowledges the
+            // actual publication so this has no timing-dependent sleeps.
+            let pending = store.take_flush_batch().unwrap().unwrap();
+            let gate = Arc::new(LogFlushGate::default());
+            let _release_on_failure = ReleaseLogFlushGate(gate.clone());
+            *pending.checkpoint_test_gate.lock().unwrap() = Some(gate.clone());
+            let flushing = tokio::spawn(write_log_pending(pending));
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+                .await
+                .unwrap();
+            let parquet_count = std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "parquet")
+                })
+                .count();
+            assert_eq!(
+                parquet_count, 1,
+                "gate must follow durable Parquet publication"
+            );
+            std::fs::rename(&replacement, &file).unwrap();
+            *gate.released.lock().unwrap() = true;
+            gate.release.notify_all();
+            tokio::time::timeout(std::time::Duration::from_secs(10), flushing)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        } else {
+            // The old line is already emitted and ingested. No writer has
+            // started yet; changing the name now proves that freeze-at-flush
+            // or re-stat-at-save cannot establish where those bytes came from.
+            std::fs::rename(&replacement, &file).unwrap();
+            store.flush().await.unwrap();
+        }
+        drop(store);
+        let mut reopened = LogStore::new(directory.path().to_path_buf());
+        assert_eq!(
+            reopened.capture_offsets().get(&file),
+            None,
+            "offset from the old opened capture must not be bound to the replacement inode"
+        );
+        let replacement_lines =
+            read_identity_test_capture(&file, &reopened.capture_offsets()).await;
+        assert_eq!(
+            replacement_lines
+                .iter()
+                .map(|record| record.line.as_str())
+                .collect::<Vec<_>>(),
+            ["new-line", "replacement-longer-than-old"],
+            "replacement must resume at byte zero"
+        );
+        for record in &replacement_lines {
+            assert!(reopened.ingest_at(200, record));
+        }
+        assert_eq!(
+            writer_lines(&reopened).await,
+            ["old-line", "new-line", "replacement-longer-than-old"]
+        );
+        drop(old_file);
+    }
+
+    #[tokio::test]
+    async fn replacement_after_capture_read_before_flush_does_not_skip_the_replacement() {
+        assert_capture_replacement_after_read_before_checkpoint(false).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_after_parquet_publication_before_checkpoint_does_not_skip_the_replacement()
+    {
+        assert_capture_replacement_after_read_before_checkpoint(true).await;
+    }
+
+    async fn assert_footer_recovers_without_checkpoint(corrupt: bool) {
+        let logs = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        let mut store = LogStore::new(logs.path().to_path_buf());
+        for n in 1..=3 {
+            assert!(store.ingest_at(100, &writer_line(&file, n)));
+        }
+        store.flush().await.unwrap();
+        let sequence = store.ingested.last_sequence;
+        drop(store);
+        let checkpoint = logs.path().join(CHECKPOINT_FILE);
+        if corrupt {
+            std::fs::write(checkpoint, b"{broken checkpoint").unwrap();
+        } else {
+            std::fs::remove_file(checkpoint).unwrap();
+        }
+        let mut reopened = LogStore::new(logs.path().to_path_buf());
+        for n in 1..=3 {
+            assert!(
+                !reopened.ingest_at(1, &writer_line(&file, n)),
+                "durable footer did not suppress capture replay {n}"
+            );
+        }
+        assert_eq!(reopened.ingested.last_sequence, sequence);
+        assert!(reopened.ingest_at(1, &writer_line(&file, 4)));
+        assert!(reopened.ingested.last_sequence > sequence);
+        reopened.flush().await.unwrap();
+        assert_eq!(writer_lines(&reopened).await, acks(1..=4));
+    }
+
+    #[tokio::test]
+    async fn missing_json_checkpoint_recovers_capture_and_sequence_from_parquet_footer() {
+        assert_footer_recovers_without_checkpoint(false).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_json_checkpoint_recovers_capture_and_sequence_from_parquet_footer() {
+        assert_footer_recovers_without_checkpoint(true).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_between_checkpoint_load_and_reader_resume_starts_at_byte_zero() {
+        let logs = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = captures.path().join("writer.stdout");
+        std::fs::write(&file, b"old-line\n").unwrap();
+        let mut store = LogStore::new(logs.path().to_path_buf());
+        for record in read_identity_test_capture(&file, &Default::default()).await {
+            assert!(store.ingest_at(100, &record));
+        }
+        store.flush().await.unwrap();
+        let reopened = LogStore::new(logs.path().to_path_buf());
+        let offsets = reopened.capture_offsets();
+        assert_eq!(offsets.get(&file), Some(9));
+        let held_old_inode = std::fs::File::open(&file).unwrap();
+        let replacement = captures.path().join("replacement.stdout");
+        std::fs::write(&replacement, b"new-line\nlonger-replacement\n").unwrap();
+        std::fs::rename(replacement, &file).unwrap();
+        let records = read_identity_test_capture(&file, &offsets).await;
+        assert_eq!(
+            records
+                .iter()
+                .map(|row| row.line.as_str())
+                .collect::<Vec<_>>(),
+            ["new-line", "longer-replacement"]
+        );
+        drop(held_old_inode);
+    }
+
+    #[tokio::test]
+    async fn directory_sync_failure_keeps_log_batch_owned_and_retryable() {
+        let logs = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = capture_file(&captures, "writer.stdout");
+        let mut store = LogStore::new(logs.path().to_path_buf());
+        for n in 1..=2 {
+            assert!(store.ingest_at(100, &writer_line(&file, n)));
+        }
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        pending.test_dir_sync_failure.store(true, Ordering::Release);
+        let result = write_log_pending(pending.clone()).await;
+        assert!(
+            result.is_err(),
+            "directory sync failure was acknowledged as durable"
+        );
+        assert!(!pending.completed.load(Ordering::Acquire));
+        assert!(!logs.path().join(CHECKPOINT_FILE).exists());
+        assert_eq!(store.buffer_len(), 2);
+        assert_eq!(writer_lines(&store).await, acks(1..=2));
+        pending
+            .test_dir_sync_failure
+            .store(false, Ordering::Release);
+        store.flush().await.unwrap();
+        assert_eq!(store.buffer_len(), 0);
+        assert_eq!(writer_lines(&store).await, acks(1..=2));
+    }
+
+    fn inject_log_parent_confirmation(
+        pending: &LogPendingFlush,
+        child: &std::path::Path,
+    ) -> Arc<LogParentConfirmationFault> {
+        let fault = Arc::new(LogParentConfirmationFault {
+            child: child.to_path_buf(),
+            failing: AtomicBool::new(true),
+            visits: std::sync::Mutex::new(Vec::new()),
+        });
+        *pending.test_parent_confirmation_fault.lock().unwrap() = Some(fault.clone());
+        fault
+    }
+
+    async fn assert_parent_retry_has_one_durable_capture_copy(
+        store: &mut LogStore,
+        logs: &std::path::Path,
+        capture: &std::path::Path,
+    ) {
+        use datafusion::parquet::file::reader::FileReader;
+        store.flush().await.unwrap();
+        assert_eq!(store.buffer_len(), 0);
+        assert_eq!(writer_lines(store).await, acks(1..=2));
+        let checkpoint: IngestCheckpoint =
+            serde_json::from_slice(&std::fs::read(logs.join(CHECKPOINT_FILE)).unwrap()).unwrap();
+        assert_eq!(checkpoint.offsets.get(capture), Some(&(2 * LINE_BYTES)));
+        let parquet: Vec<_> = std::fs::read_dir(logs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "parquet")
+            })
+            .collect();
+        assert_eq!(parquet.len(), 1, "retry allocated a duplicate publication");
+        let reader = datafusion::parquet::file::serialized_reader::SerializedFileReader::new(
+            std::fs::File::open(&parquet[0]).unwrap(),
+        )
+        .unwrap();
+        let metadata = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        let footer = metadata
+            .iter()
+            .find(|item| item.key == "reliaburger.ingest-checkpoint.v1")
+            .expect("durable publication must carry the frozen checkpoint");
+        let recovered: IngestCheckpoint =
+            serde_json::from_str(footer.value.as_deref().unwrap()).unwrap();
+        assert_eq!(recovered, checkpoint);
+        // The JSON and footer must independently preserve the same position.
+        let with_json = LogStore::new(logs.to_path_buf());
+        assert_eq!(
+            with_json.capture_offsets().get(capture),
+            Some(2 * LINE_BYTES)
+        );
+        assert_eq!(writer_lines(&with_json).await, acks(1..=2));
+        std::fs::remove_file(logs.join(CHECKPOINT_FILE)).unwrap();
+        let mut footer_only = LogStore::new(logs.to_path_buf());
+        assert_eq!(
+            footer_only.capture_offsets().get(capture),
+            Some(2 * LINE_BYTES)
+        );
+        assert_eq!(footer_only.ingested.last_sequence, checkpoint.last_sequence);
+        for n in 1..=2 {
+            assert!(!footer_only.ingest_at(1, &writer_line(capture, n)));
+        }
+        assert_eq!(writer_lines(&footer_only).await, acks(1..=2));
+    }
+
+    #[tokio::test]
+    async fn missing_log_ancestor_confirmation_fails_before_child_creation_and_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let capture = capture_file(&captures, "writer.stdout");
+        let ancestor = root.path().join("owned-outer");
+        let child = ancestor.join("owned-inner");
+        let logs = child.join("logs");
+        let mut store = LogStore::new(logs.clone());
+        for n in 1..=2 {
+            assert!(store.ingest_at(100, &writer_line(&capture, n)));
+        }
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        let fault = inject_log_parent_confirmation(&pending, &ancestor);
+        let result = write_log_pending(pending.clone()).await;
+        assert!(
+            matches!(result, Err(KetchupError::Io(ref error))
+            if error.to_string().contains("controlled log parent-entry confirmation failure")),
+            "ancestor confirmation was not refused: {result:?}"
+        );
+        assert!(ancestor.is_dir(), "fault must follow the real mkdir");
+        assert!(
+            !child.exists(),
+            "child created before its ancestor entry was confirmed"
+        );
+        assert!(!logs.exists());
+        assert!(!pending.completed.load(Ordering::Acquire));
+        assert_eq!(store.buffer_len(), 2);
+        assert_eq!(writer_lines(&store).await, acks(1..=2));
+        assert_eq!(
+            fault
+                .visits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| *path == &ancestor)
+                .count(),
+            1
+        );
+        fault.failing.store(false, Ordering::Release);
+        assert_parent_retry_has_one_durable_capture_copy(&mut store, &logs, &capture).await;
+        assert_eq!(
+            fault
+                .visits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| *path == &ancestor)
+                .count(),
+            2,
+            "retry forgot the visible ancestor left by its failed confirmation"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_log_store_reconfirms_a_visible_directory_entry_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let capture = capture_file(&captures, "writer.stdout");
+        let logs = root.path().join("owned-logs");
+        let mut first = LogStore::new(logs.clone());
+        first.append_at(
+            100,
+            "writer",
+            "default",
+            LogStream::Stdout,
+            "unacknowledged-old-buffer",
+        );
+        let first_pending = first.take_flush_batch().unwrap().unwrap();
+        let first_fault = inject_log_parent_confirmation(&first_pending, &logs);
+        let result = write_log_pending(first_pending.clone()).await;
+        assert!(
+            matches!(result, Err(KetchupError::Io(ref error))
+            if error.to_string().contains("controlled log parent-entry confirmation failure")),
+            "first writer never reached visible-entry uncertainty: {result:?}"
+        );
+        assert!(logs.is_dir());
+        assert!(!first_pending.completed.load(Ordering::Acquire));
+        assert_eq!(first.buffer_len(), 1);
+        assert_eq!(
+            writer_lines(&first).await,
+            vec!["unacknowledged-old-buffer"]
+        );
+        assert_eq!(
+            first_fault
+                .visits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| *path == &logs)
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 0);
+        drop(first_pending);
+        drop(first);
+        // No Parquet was published. Process loss cannot preserve an uncommitted
+        // in-memory buffer; this control asserts only fresh entry confirmation.
+        let mut fresh = LogStore::new(logs.clone());
+        for n in 1..=2 {
+            assert!(fresh.ingest_at(101, &writer_line(&capture, n)));
+        }
+        let pending = fresh.take_flush_batch().unwrap().unwrap();
+        let fault = inject_log_parent_confirmation(&pending, &logs);
+        let result = write_log_pending(pending.clone()).await;
+        assert!(
+            matches!(result, Err(KetchupError::Io(ref error))
+            if error.to_string().contains("controlled log parent-entry confirmation failure")),
+            "fresh store acknowledged an unconfirmed visible entry: {result:?}"
+        );
+        assert!(!pending.completed.load(Ordering::Acquire));
+        assert_eq!(&*fault.visits.lock().unwrap(), std::slice::from_ref(&logs));
+        assert_eq!(
+            std::fs::read_dir(&logs).unwrap().count(),
+            0,
+            "publication or JSON checkpoint preceded parent confirmation"
+        );
+        assert_eq!(fresh.buffer_len(), 2);
+        assert_eq!(writer_lines(&fresh).await, acks(1..=2));
+        fault.failing.store(false, Ordering::Release);
+        assert_parent_retry_has_one_durable_capture_copy(&mut fresh, &logs, &capture).await;
+        assert_eq!(&*fault.visits.lock().unwrap(), &[logs.clone(), logs]);
     }
 }

@@ -195,10 +195,10 @@ impl BlobStore {
         // (REG5). A concurrent write of the same digest is harmless — both
         // rename identical content-addressed bytes over the same target.
         if path.is_file() && sha256_file(&path)? == *expected_digest {
-            self.budget.sync_verified(&path)?;
+            self.budget.sync_verified(&self.base_dir, &path)?;
             return Ok(());
         }
-        self.budget.write_file(&path, data, None)?;
+        self.budget.write_file(&self.base_dir, &path, data, None)?;
         Ok(())
     }
 
@@ -424,6 +424,7 @@ impl BlobStore {
         let upload = self.upload_path(upload_id);
         let destination = self.blob_path(expected_digest);
         let expected = expected_digest.clone();
+        let root = self.base_dir.clone();
         let budget = self.budget.clone();
         tokio::task::spawn_blocking(move || -> Result<(), PickleError> {
             use std::io::Read as _;
@@ -445,17 +446,16 @@ impl BlobStore {
                 return Err(PickleError::DigestMismatch { expected, actual });
             }
             drop(file);
-            budget.publish(&upload, &destination)?;
+            budget.publish(&root, &upload, &destination)?;
             if let Some((path, identity)) = receipt {
                 let directory = path
                     .parent()
                     .ok_or_else(|| std::io::Error::other("receipt has no parent directory"))?;
-                std::fs::create_dir_all(directory)?;
-                budget.write_file(&path, &identity, Some(0o600))?;
+                budget.write_file(&root, &path, &identity, Some(0o600))?;
                 let blob_directory = directory
                     .parent()
                     .ok_or_else(|| std::io::Error::other("receipt parent missing"))?;
-                std::fs::File::open(blob_directory)?.sync_all()?;
+                budget.sync_directory(blob_directory)?;
             }
             Ok(())
         })
@@ -488,7 +488,8 @@ impl BlobStore {
         // digest renames identical content-addressed bytes over the same
         // target — harmless.
         let budget = self.budget.clone();
-        tokio::task::spawn_blocking(move || budget.publish(&upload_path, &blob_path))
+        let root = self.base_dir.clone();
+        tokio::task::spawn_blocking(move || budget.publish(&root, &upload_path, &blob_path))
             .await
             .map_err(|e| PickleError::CatalogPersist(format!("blob commit task failed: {e}")))??;
         Ok(())
@@ -605,6 +606,253 @@ mod tests {
                 repository,
             )
             .await
+    }
+
+    // Insert into pickle::store::tests after final555 adds the per-store seam
+    // `budget.set_directory_sync_hook(Arc<dyn Fn(&Path)->io::Result<()> + Send + Sync>)`.
+    // These are drafts and have not been compiled or claimed green.
+
+    #[tokio::test]
+    async fn new_blob_publication_syncs_each_parent_entry_before_success() {
+        use std::sync::{Arc, Mutex};
+        let directory = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(directory.path().join("new-store"));
+        store.configure_storage_limit(2).await.unwrap();
+        let synced = Arc::new(Mutex::new(Vec::new()));
+        let observation = synced.clone();
+        store
+            .budget
+            .set_directory_sync_hook(Arc::new(move |path: &Path| {
+                std::fs::File::open(path)?.sync_all()?;
+                observation.lock().unwrap().push(path.to_owned());
+                Ok(())
+            }));
+        let digest = compute_sha256(b"aa");
+        store.write_blob(b"aa", &digest).unwrap();
+        let parents = synced.lock().unwrap();
+        for required in [
+            directory.path().to_path_buf(),
+            store.base_dir().to_path_buf(),
+            store.base_dir().join("blobs"),
+            store.base_dir().join("blobs/sha256"),
+            store.blob_path(&digest).parent().unwrap().to_path_buf(),
+        ] {
+            assert!(
+                parents.contains(&required),
+                "missing successful parent sync: {required:?}"
+            );
+        }
+        assert_eq!(store.read_blob(&digest).unwrap(), b"aa");
+    }
+
+    #[tokio::test]
+    async fn failed_new_digest_parent_sync_keeps_upload_reserved_and_retry_resyncs_visible_entry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let (store, _directory) = test_store();
+        store.configure_storage_limit(2).await.unwrap();
+        let digest = compute_sha256(b"aa");
+        let failed_parent = store.base_dir().join("blobs/sha256");
+        let enabled = Arc::new(AtomicBool::new(true));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let fault = enabled.clone();
+        let observed = failures.clone();
+        store
+            .budget
+            .set_directory_sync_hook(Arc::new(move |path: &Path| {
+                if path == failed_parent {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    if fault.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::other(
+                            "injected new-directory parent sync failure",
+                        ));
+                    }
+                }
+                std::fs::File::open(path)?.sync_all()
+            }));
+        let upload = store.initiate_upload().await.unwrap();
+        store.write_upload_chunk(&upload, b"aa").await.unwrap();
+        assert!(store.complete_upload(&upload, &digest).await.is_err());
+        assert_eq!(store.upload_size(&upload).await.unwrap(), 2);
+        assert!(!store.has_blob(&digest));
+        assert!(
+            store.blob_path(&digest).parent().unwrap().is_dir(),
+            "create happened before injected sync failure"
+        );
+        assert!(matches!(
+            store.write_blob(b"b", &compute_sha256(b"b")),
+            Err(PickleError::StorageQuotaExceeded)
+        ));
+        enabled.store(false, Ordering::SeqCst);
+        store.complete_upload(&upload, &digest).await.unwrap();
+        assert!(
+            failures.load(Ordering::SeqCst) >= 2,
+            "visible entry was not resynced on retry"
+        );
+        assert_eq!(store.read_blob(&digest).unwrap(), b"aa");
+    }
+
+    #[tokio::test]
+    async fn verified_reuse_refuses_an_uncertain_containing_directory_sync() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (store, _directory) = test_store();
+        store.configure_storage_limit(2).await.unwrap();
+        let digest = compute_sha256(b"aa");
+        let failed_directory = store.blob_path(&digest).parent().unwrap().to_path_buf();
+        let enabled = Arc::new(AtomicBool::new(true));
+        let fault = enabled.clone();
+        store
+            .budget
+            .set_directory_sync_hook(Arc::new(move |path: &Path| {
+                if path == failed_directory && fault.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::other("injected post-rename sync failure"));
+                }
+                std::fs::File::open(path)?.sync_all()
+            }));
+        assert!(store.write_blob(b"aa", &digest).is_err());
+        assert_eq!(
+            store.read_blob(&digest).unwrap(),
+            b"aa",
+            "rename happened before sync failure"
+        );
+        assert!(
+            store.write_blob(b"aa", &digest).is_err(),
+            "existing bytes do not excuse failed durability sync"
+        );
+        assert!(matches!(
+            store.write_blob(b"b", &compute_sha256(b"b")),
+            Err(PickleError::StorageQuotaExceeded)
+        ));
+        enabled.store(false, Ordering::SeqCst);
+        store.write_blob(b"aa", &digest).unwrap();
+        // Uncertain old reservation remains conservative until an explicit
+        // reconciliation/confirmed cleanup or restart. Do not assert free bytes.
+    }
+
+    #[tokio::test]
+    async fn all_upload_publication_paths_sync_new_payload_ancestor_entries() {
+        use std::sync::{Arc, Mutex};
+        for streamed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = BlobStore::new(directory.path().join("new-store"));
+            store.configure_storage_limit(2).await.unwrap();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recording = observed.clone();
+            store
+                .budget
+                .set_directory_sync_hook(Arc::new(move |path: &Path| {
+                    std::fs::File::open(path)?.sync_all()?;
+                    recording.lock().unwrap().push(path.to_owned());
+                    Ok(())
+                }));
+            let digest = compute_sha256(b"aa");
+            let upload = store.initiate_upload().await.unwrap();
+            store.write_upload_chunk(&upload, b"aa").await.unwrap();
+            if streamed {
+                store.commit_upload_as_blob(&upload, &digest).await.unwrap();
+            } else {
+                store.complete_upload(&upload, &digest).await.unwrap();
+            }
+            let parents = observed.lock().unwrap();
+            for expected in [
+                directory.path().to_path_buf(),
+                store.base_dir().to_path_buf(),
+                store.base_dir().join("blobs"),
+                store.base_dir().join("blobs/sha256"),
+            ] {
+                assert!(
+                    parents.contains(&expected),
+                    "streamed={streamed}, missing durable ancestor: {expected:?}"
+                );
+            }
+            assert_eq!(store.read_blob(&digest).unwrap(), b"aa");
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_receipt_parent_entry_is_synced_after_the_directory_exists() {
+        use std::sync::{Arc, Mutex};
+        let (store, _directory) = test_store();
+        let digest = compute_sha256(b"receipt content");
+        let blob_directory = store.blob_path(&digest).parent().unwrap().to_path_buf();
+        let repositories = blob_directory.join("repositories");
+        let observation = Arc::new(Mutex::new(Vec::new()));
+        let recording = observation.clone();
+        store
+            .budget
+            .set_directory_sync_hook(Arc::new(move |path: &Path| {
+                std::fs::File::open(path)?.sync_all()?;
+                recording
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), repositories.is_dir()));
+                Ok(())
+            }));
+        repository_upload(
+            &store,
+            b"receipt content",
+            "rbtest-sync/web",
+            Some("run-a"),
+            &digest,
+        )
+        .await
+        .unwrap();
+        let records = observation.lock().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|(path, exists)| path == &blob_directory && *exists),
+            "new repositories entry was not synced after its creation"
+        );
+        assert!(
+            store
+                .has_repository_upload(&digest, "rbtest-sync/web", Some("run-a"))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_removal_directory_sync_retains_capacity_until_confirmed_retry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (store, _directory) = test_store();
+        store.configure_storage_limit(2).await.unwrap();
+        let digest = compute_sha256(b"aa");
+        store.write_blob(b"aa", &digest).unwrap();
+        let parent = store.blob_path(&digest).parent().unwrap().to_path_buf();
+        let enabled = Arc::new(AtomicBool::new(true));
+        let fault = enabled.clone();
+        store
+            .budget
+            .set_directory_sync_hook(Arc::new(move |path: &Path| {
+                if path == parent && fault.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::other("injected removal sync failure"));
+                }
+                std::fs::File::open(path)?.sync_all()
+            }));
+        assert!(store.delete_blob(&digest).is_err());
+        assert!(
+            !store.has_blob(&digest),
+            "unlink completed before its directory sync failed"
+        );
+        assert!(
+            matches!(
+                store.write_blob(b"b", &compute_sha256(b"b")),
+                Err(PickleError::StorageQuotaExceeded)
+            ),
+            "uncertain unlink incorrectly returned physical payload capacity"
+        );
+        enabled.store(false, Ordering::SeqCst);
+        store.delete_blob(&digest).unwrap();
+        store.write_blob(b"bb", &compute_sha256(b"bb")).unwrap();
+        assert_eq!(store.read_blob(&compute_sha256(b"bb")).unwrap(), b"bb");
     }
 
     #[tokio::test]

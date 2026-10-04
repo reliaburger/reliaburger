@@ -208,6 +208,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         response: oneshot::Sender<Result<(), BunError>>,
         answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     ) {
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=agent-command-received");
         let Some(manager) = self.upgrade.clone() else {
             let _ = response.send(Err(BunError::UpgradesUnavailable));
             return;
@@ -226,8 +228,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let grill = self.supervisor.grill().clone();
         let preparing = kind.clone();
         let task = self.follow_ups.spawn(async move {
+            #[cfg(test)]
+            let fixture_started = std::time::Instant::now();
+            #[cfg(test)]
+            eprintln!("upgrade-fixture phase=inventory-begin");
             let inventory = read_inventory(&grill, entries).await;
+            #[cfg(test)]
+            eprintln!(
+                "upgrade-fixture phase=inventory-end-prepare-begin elapsed={:?}",
+                fixture_started.elapsed()
+            );
             let prepared = manager.prepare(&directive, inventory).await;
+            #[cfg(test)]
+            eprintln!(
+                "upgrade-fixture phase=prepare-end elapsed={:?} successful={}",
+                fixture_started.elapsed(),
+                prepared.is_ok()
+            );
             FollowUp::UpgradePrepared(UpgradePreparation {
                 kind,
                 prepared,
@@ -321,6 +338,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // pause used to stand in for that wait, and on a loaded host the
         // exec sometimes won, so the caller saw a dropped connection for an
         // upgrade that went ahead (#526).
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=answer-send");
         let _ = response.send(Ok(()));
         if let Some(delivered) = answer_delivered {
             // LOOP-INLINE: the exec must follow the delivered answer, and ANSWER_DELIVERY_BOUND caps the wait
@@ -328,6 +347,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // Only returns on failure (the symlink is already reverted then).
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=answer-wait-ended-exec-begin");
         let error = manager.execute(prepared);
         self.draining
             .store(false, std::sync::atomic::Ordering::Relaxed);

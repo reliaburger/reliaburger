@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::*;
-use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader, read_capture_chunk};
+use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader};
 use crate::grill::command::{
     ClaimedCommandExecutor, CommandOutput, CommandState, RuntimeCommandExecutor,
 };
@@ -1035,10 +1035,7 @@ impl RuncGrill {
             // holding a runtime worker (it once starved startup adoption).
             let mut backlog = false;
             for reader in &mut readers {
-                let Some(file) = reader.file().map(std::path::Path::to_path_buf) else {
-                    continue;
-                };
-                let Ok(bytes) = read_capture_chunk(&file, reader.read_offset()).await else {
+                let Ok(bytes) = reader.read_chunk().await else {
                     continue;
                 };
                 backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;
