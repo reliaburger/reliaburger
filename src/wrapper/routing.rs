@@ -35,8 +35,8 @@ pub struct Backend {
     /// health from the reporting tree).
     pub healthy: bool,
     /// Whether Wrapper's own active L7 probes consider this backend reachable
-    /// from *this* node. Starts `true` on rebuild (trust the service map) and
-    /// is flipped by the probe loop. A backend is only routable when both this
+    /// from *this* node. New endpoints start trusted; unchanged endpoints retain
+    /// their verdict through rebuilds and are re-evaluated by the probe loop. A backend is only routable when both this
     /// and [`healthy`](Self::healthy) hold, so an instance that is healthy
     /// cluster-wide but unreachable locally is skipped.
     pub locally_healthy: bool,
@@ -214,7 +214,9 @@ impl RoutingTable {
         service_map: &ServiceMap,
         ingress_configs: &HashMap<(String, String), IngressSpec>,
     ) -> Result<(), RoutingError> {
-        self.routes.clear();
+        let previous = RoutingTable {
+            routes: std::mem::take(&mut self.routes),
+        };
         let mut rejected = Vec::new();
 
         for ((namespace, app_name), ingress) in ingress_configs {
@@ -239,6 +241,8 @@ impl RoutingTable {
 
             self.routes.entry(host).or_default().push(route);
         }
+
+        self.inherit_local_health(&previous);
 
         // Sort each host's routes longest-prefix first, breaking ties on the
         // path then app name so equal-length routes have a deterministic order
@@ -328,6 +332,47 @@ impl RoutingTable {
             }
         }
         targets
+    }
+
+    /// Preserve active health for unchanged instance/address pairs in a new view.
+    pub fn inherit_local_health(&mut self, previous: &RoutingTable) {
+        let known: HashMap<_, _> = previous
+            .routes
+            .values()
+            .flatten()
+            .flat_map(|route| &route.backends)
+            .map(|backend| {
+                (
+                    (backend.instance_id.as_str(), backend.addr),
+                    backend.locally_healthy,
+                )
+            })
+            .collect();
+        for backend in self
+            .routes
+            .values_mut()
+            .flatten()
+            .flat_map(|route| &mut route.backends)
+        {
+            if let Some(healthy) = known.get(&(backend.instance_id.as_str(), backend.addr)) {
+                backend.locally_healthy = *healthy;
+            }
+        }
+    }
+
+    fn set_endpoint_health(&mut self, instance_id: &str, address: SocketAddr, healthy: bool) {
+        for backend in self
+            .routes
+            .values_mut()
+            .flatten()
+            .flat_map(|route| &mut route.backends)
+        {
+            // The table may have replaced this endpoint while its old probe
+            // awaited I/O. An old result cannot judge the new address.
+            if backend.instance_id == instance_id && backend.addr == address {
+                backend.locally_healthy = healthy;
+            }
+        }
     }
 
     /// Set the active-probe health flag for every backend with `instance_id`.
@@ -539,6 +584,7 @@ pub struct ProbeTracker {
     threshold_unhealthy: u32,
     threshold_healthy: u32,
     states: HashMap<String, ProbeCounters>,
+    addresses: HashMap<String, SocketAddr>,
 }
 
 impl ProbeTracker {
@@ -548,6 +594,7 @@ impl ProbeTracker {
             threshold_unhealthy: threshold_unhealthy.max(1),
             threshold_healthy: threshold_healthy.max(1),
             states: HashMap::new(),
+            addresses: HashMap::new(),
         }
     }
 
@@ -583,6 +630,20 @@ impl ProbeTracker {
         None
     }
 
+    fn record_endpoint(&mut self, instance_id: &str, address: SocketAddr, success: bool) -> bool {
+        if self
+            .addresses
+            .insert(instance_id.to_owned(), address)
+            .is_some_and(|old| old != address)
+        {
+            self.states.remove(instance_id);
+        }
+        self.record(instance_id, success);
+        self.states
+            .get(instance_id)
+            .is_none_or(|state| state.locally_healthy)
+    }
+
     /// Drop tracker state for instances no longer present in `live`.
     ///
     /// Called each sweep so a retired instance's counters don't leak; a new
@@ -590,6 +651,7 @@ impl ProbeTracker {
     /// inheriting a stale unhealthy verdict.
     fn retain_only(&mut self, live: &std::collections::HashSet<String>) {
         self.states.retain(|id, _| live.contains(id));
+        self.addresses.retain(|id, _| live.contains(id));
     }
 }
 
@@ -613,9 +675,9 @@ async fn probe_backend_once(
 /// Run Wrapper's active L7 health-probe loop until `shutdown` fires.
 ///
 /// Every `config.interval` it probes each backend in the routing table and
-/// feeds the result to a [`ProbeTracker`]. When an instance flips routable
-/// state, it updates the routing table so [`PathRoute::select_backend`] starts
-/// (or stops) skipping it. This catches backends that are healthy cluster-wide
+/// feeds the result to a [`ProbeTracker`]. Every sweep reapplies the current
+/// verdict to the same instance/address pair, including after view replacement,
+/// so [`PathRoute::select_backend`] skips a backend until it recovers. This catches backends that are healthy cluster-wide
 /// but unreachable from this node — a signal the passive service map can't see.
 pub async fn run_health_probes(
     routing_table: Arc<RwLock<RoutingTable>>,
@@ -642,12 +704,11 @@ pub async fn run_health_probes(
 
         for (instance_id, addr) in &targets {
             let ok = probe_backend_once(&client, *addr, &config.path, config.timeout).await;
-            if let Some(now_healthy) = tracker.record(instance_id, ok) {
-                routing_table
-                    .write()
-                    .await
-                    .set_local_health(instance_id, now_healthy);
-            }
+            let now_healthy = tracker.record_endpoint(instance_id, *addr, ok);
+            routing_table
+                .write()
+                .await
+                .set_endpoint_health(instance_id, *addr, now_healthy);
         }
 
         tracker.retain_only(&live);
@@ -1357,5 +1418,225 @@ mod tests {
         assert_eq!(tracker.record("web-0", false), None);
         assert_eq!(tracker.record("web-0", false), None);
         assert_eq!(tracker.record("web-0", false), Some(false));
+    }
+    #[test]
+    fn rebuilding_routes_preserves_failed_health_for_unchanged_endpoints() {
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+        table.set_local_health("web-1", false);
+        table.rebuild(&map, &configs).unwrap();
+        assert_eq!(table.lookup("myapp.com", "/").unwrap().healthy_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn continued_failed_probes_exclude_a_backend_after_table_replacement_and_allow_recovery()
+    {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let reachable = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let healthy = reachable.clone();
+        let counted = requests.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let healthy = healthy.clone();
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    if healthy.load(Ordering::SeqCst) {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }
+            }),
+        );
+        let backend = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut map = ServiceMap::new();
+        map.register_app("web", "default", 80, None).unwrap();
+        map.add_backend(
+            &ServiceId::new("default", "web"),
+            BackendInstance {
+                instance_id: "web-0".into(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: port,
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+        let configs = HashMap::from([(ns_key("default", "web"), spec_with_path("web.test", "/"))]);
+        let mut initial = RoutingTable::new();
+        initial.rebuild(&map, &configs).unwrap();
+        let table = Arc::new(RwLock::new(initial));
+        let shutdown = CancellationToken::new();
+        let probes = tokio::spawn(run_health_probes(
+            table.clone(),
+            HealthProbeConfig {
+                interval: Duration::from_millis(5),
+                timeout: Duration::from_millis(100),
+                threshold_unhealthy: 1,
+                threshold_healthy: 2,
+                ..Default::default()
+            },
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while table
+                .read()
+                .await
+                .lookup("web.test", "/")
+                .unwrap()
+                .healthy_count()
+                != 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut replacement = RoutingTable::new();
+        replacement.rebuild(&map, &configs).unwrap();
+        *table.write().await = replacement;
+        let count = requests.load(Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while requests.load(Ordering::SeqCst) < count + 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            table
+                .read()
+                .await
+                .lookup("web.test", "/")
+                .unwrap()
+                .healthy_count(),
+            0
+        );
+        reachable.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while table
+                .read()
+                .await
+                .lookup("web.test", "/")
+                .unwrap()
+                .healthy_count()
+                != 1
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        probes.await.unwrap();
+        backend.abort();
+    }
+
+    #[tokio::test]
+    async fn a_probe_of_an_old_address_cannot_mark_its_replacement_unhealthy() {
+        let old_entered = Arc::new(tokio::sync::Notify::new());
+        let old_release = Arc::new(tokio::sync::Notify::new());
+        let new_entered = Arc::new(tokio::sync::Notify::new());
+        let new_release = Arc::new(tokio::sync::Notify::new());
+        let old = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_port = old.local_addr().unwrap().port();
+        let new_port = new.local_addr().unwrap().port();
+        let gated =
+            |entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>, status| {
+                axum::Router::new().route(
+                    "/",
+                    axum::routing::get(move || {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            status
+                        }
+                    }),
+                )
+            };
+        let old_app = gated(
+            old_entered.clone(),
+            old_release.clone(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        let new_app = gated(
+            new_entered.clone(),
+            new_release.clone(),
+            axum::http::StatusCode::OK,
+        );
+        let old_server = tokio::spawn(async move { axum::serve(old, old_app).await.unwrap() });
+        let new_server = tokio::spawn(async move { axum::serve(new, new_app).await.unwrap() });
+        let mut map = ServiceMap::new();
+        map.register_app("web", "default", 80, None).unwrap();
+        map.add_backend(
+            &ServiceId::new("default", "web"),
+            BackendInstance {
+                instance_id: "web-0".into(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: old_port,
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+        let configs = HashMap::from([(ns_key("default", "web"), spec_with_path("web.test", "/"))]);
+        let mut initial = RoutingTable::new();
+        initial.rebuild(&map, &configs).unwrap();
+        let table = Arc::new(RwLock::new(initial));
+        let shutdown = CancellationToken::new();
+        let probes = tokio::spawn(run_health_probes(
+            table.clone(),
+            HealthProbeConfig {
+                interval: Duration::from_millis(5),
+                timeout: Duration::from_secs(3),
+                threshold_unhealthy: 1,
+                threshold_healthy: 1,
+                ..Default::default()
+            },
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), old_entered.notified())
+            .await
+            .unwrap();
+        map.add_backend(
+            &ServiceId::new("default", "web"),
+            BackendInstance {
+                instance_id: "web-0".into(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: new_port,
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+        table.write().await.rebuild(&map, &configs).unwrap();
+        old_release.notify_one();
+        // Entering the next probe acknowledges that the old result has been applied.
+        tokio::time::timeout(Duration::from_secs(2), new_entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .read()
+                .await
+                .lookup("web.test", "/")
+                .unwrap()
+                .healthy_count(),
+            1
+        );
+        new_release.notify_one();
+        shutdown.cancel();
+        probes.await.unwrap();
+        old_server.abort();
+        new_server.abort();
     }
 }
