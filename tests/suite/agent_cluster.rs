@@ -90,7 +90,11 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
     assert!(matches!(response, CouncilResponse::Applied { .. }));
     let shutdown = CancellationToken::new();
     let (_members, membership_rx) = watch::channel(Vec::new());
-    let (_reports, reports_rx) = watch::channel(Default::default());
+    let (_reports, reports_rx) =
+        watch::channel(reliaburger::reporting::aggregator::AggregatedState {
+            leadership_epoch: Some(council.current_term()),
+            ..Default::default()
+        });
     let _admission = spawn_leader_scheduler(
         council.clone(),
         membership_rx,

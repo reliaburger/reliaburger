@@ -694,11 +694,14 @@ fn write_job_checkpoint(directory: &Path, phase: &str) {
     let job = serde_json::json!({
         "name":"work", "namespace":"default", "spec": config.job["work"],
         "runtime":"Process", "generation":1, "restart_count":1,
-        "phase":phase, "runtime_absent":false,
+        "phase":phase, "runtime_absent":false, "batch_execution":null,
     });
     std::fs::write(
         directory.join("job-attempts.checkpoint"),
-        serde_json::to_vec(&serde_json::json!({"schema":2, "jobs":[job]})).unwrap(),
+        serde_json::to_vec(
+            &serde_json::json!({"schema":3, "jobs":[job], "retired_batch_executions":[]}),
+        )
+        .unwrap(),
     )
     .unwrap();
 }

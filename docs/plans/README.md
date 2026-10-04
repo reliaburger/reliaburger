@@ -10,10 +10,12 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [GitOps webhook admission](2026-10-04-gitops-webhook-admission.md) | Replicate authenticated triggers before 202, with bounded admission and generation-aware retry. | [#553](https://github.com/reliaburger/reliaburger/issues/553) |
 | [GitOps job refusal](2026-10-04-gitops-job-refusal.md) | Refuse unsupported jobs before publishing their dependent apps or advancing the applied revision. | #549 |
 | [Shared configuration tree](2026-10-04-shared-config-tree.md) | Resolve defaults and directory namespaces consistently through CLI and GitOps adapters. | #548 |
 | [Desired-spec previews](2026-10-04-desired-spec-preview.md) | Complete scoped comparison evidence with explicit offline and unknown actions. | #550 |
 | [Autoscale target validation](2026-10-03-autoscale-target-validation.md) | Refuse nonpositive or nonfinite controller targets and measurements. | #554 |
+| [Batch execution identities](2026-10-03-batch-execution-identities.md) | Bind batch outcomes, scope and durable retries to one execution per submitted job. | #535 |
 | [Physical image storage quota](2026-10-03-plan-physical-image-quota.md) | Bound committed blobs and concurrent temporary payloads across all image writers ([#540](https://github.com/reliaburger/reliaburger/issues/540)). | Regressions, shared budget, production wiring and CI |
 | [Review 2: audit fixes](2026-10-03-review2-audit-fixes.md) | The approved 28-issue audit, implemented through one merge train with cross-path hardening last. | [#528–#555](https://github.com/reliaburger/reliaburger/milestone/11) |
 | [Registry verification admission](2026-10-03-plan-registry-verification.md) | Share the bounded Sesame verifier across API and OCI registry requests ([#539](https://github.com/reliaburger/reliaburger/issues/539)). | Router regression, implementation and portable CI |
@@ -22,6 +24,9 @@ the detail is in the GitHub milestones and issues.
 | [Live namespace validation](2026-10-04-live-namespace-validation.md) | Keep intrinsic field checks local and resolve permission/build namespace existence on the leader. | #551 |
 | [Managed volume image identities](2026-10-03-managed-volume-image-identities.md) | Preserve full volume filenames and refuse overlapping storage artifacts. | #528 |
 | [Batch duplicate identities](2026-10-03-batch-duplicate-identities.md) | Refuse ambiguous duplicate labels before any batch dispatch. | #542 |
+| [Batch workload admission](2026-10-03-batch-workload-admission.md) | Enforce workload validation, scope and host-execution grants on batch submission. | #530 |
+| [Cluster migration prerequisites](2026-10-04-cluster-migration-prerequisites.md) | Execute migration gates before app desired-state writes, retaining operation ownership and refusing uncertain handovers. | [#534](https://github.com/reliaburger/reliaburger/issues/534) |
+| [Batch capacity reservations](2026-10-04-batch-capacity-reservations.md) | Shared, committed admission for app placements and batch executions, with unknown outcomes fenced across leader handover. | [#543](https://github.com/reliaburger/reliaburger/issues/543) |
 | [V02: sustained qualification](2026-09-25-v02-sustained.md) | The design, invariants and pass/fail thresholds of the sustained soak. `scripts/release/qualify-sustained.sh`, `sustained_check.py` and the [release runbook](../releasing.md) run every release against it. | Snapshot uploader under power cuts and the `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)) |
 | [Review: the agent loop](2026-09-30-agent-loop-review.md) | A review brief on Bun's `run_loop`: how it works, every soak failure it caused, what's still inline, and three options for restructuring it. For discussion. | The maintainer's decision on the recommendation (keep the loop, add a turn meter and a starvation harness) and its six open questions |
 | [F07: cross-node views and log streams](2026-10-01-plan-f07-cross-node-views.md) | Which views and streams still answered for one node, and the split of [#365](https://github.com/reliaburger/reliaburger/issues/365): part 1 (every view and stream covers the cluster) ships in 0.1.3. | Part 2: separate stderr capture, `--until`/`--instance`/regex filters, a merged live event stream and a live-metrics contract |

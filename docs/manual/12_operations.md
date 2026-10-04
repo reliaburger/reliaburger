@@ -216,6 +216,24 @@ GitLab's `X-Gitlab-Token`. It refuses replays and is rate-limited
 (`webhook_rate_limit`, 10 a minute by default). A delivery refused for the
 rate limit isn't counted as seen, so the provider's retry gets through.
 
+A follower forwards an authenticated webhook to the leader. A clustered
+`202 Accepted` confirms that the cluster has durably accepted the delivery;
+the sync finishes later and pending work survives a leader change. A push
+arriving during a sync remains pending for a later run. If leadership or
+replication cannot be confirmed, the endpoint returns `503`; retrying the
+original delivery ID is safe. Admission has one five-second budget, including
+waiting for the validator, resolving the leader and forwarding or replicating
+the trigger. Timing out releases the local rate and replay reservation.
+The cluster retains the most recent 1,000
+committed delivery IDs across restarts and leader changes. A delivery still
+in that inventory is refused as a replay; one that was not admitted can be
+tried again. Older delivery IDs can be admitted again after eviction.
+
+Durable webhook admission changes both protocol and state formats. Check
+`bun --compatibility` before upgrading. Before 1.0, recreate the cluster
+with matching new binaries and re-apply the repository; older-format logs
+and snapshots are refused rather than migrated.
+
 ## Backing up the council
 
 The council holds the cluster's desired state: apps, jobs, tokens and the

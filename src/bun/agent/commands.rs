@@ -37,8 +37,40 @@ pub struct FaultClearance {
     pub reservation: Option<u64>,
 }
 
+/// Trusted local resolution used before public status/log authorisation.
+#[derive(Debug)]
+pub struct LogExecutionSelection {
+    pub logical_name: String,
+    pub instances: Vec<String>,
+    pub selected_instance: Option<String>,
+}
+
 /// Commands sent to the agent over the command channel.
 pub enum AgentCommand {
+    ResolveExecutionLogs {
+        app_name: String,
+        namespace: String,
+        instance: Option<String>,
+        response: oneshot::Sender<Result<LogExecutionSelection, BunError>>,
+    },
+    LogCaptures {
+        instances: Vec<String>,
+        tail: Option<usize>,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Internal authenticated dispatch; admission must be durable before acknowledgement.
+    RunJobsWithLabels {
+        batch_id: u64,
+        config: Config,
+        execution_labels: BTreeMap<String, crate::bun::batch::BatchExecutionLabel>,
+        events: mpsc::Sender<ApplyEvent>,
+        response: oneshot::Sender<Result<BTreeMap<String, i32>, BunError>>,
+    },
+    /// Query explicit local ownership before enforcing first-launch allocation.
+    BatchOwnedExecutions {
+        identities: Vec<(String, String)>,
+        response: oneshot::Sender<std::collections::BTreeSet<String>>,
+    },
     /// Deploy workloads from a parsed Config.
     ///
     /// Progress events are streamed over the `events` channel so the
@@ -46,6 +78,29 @@ pub enum AgentCommand {
     Deploy {
         config: Config,
         events: mpsc::Sender<ApplyEvent>,
+    },
+    /// Admit and prepare migration images without launching any workload.
+    PreparePrerequisites {
+        config: Config,
+        response: oneshot::Sender<
+            Result<(Config, crate::bun::deploy_operations::DeployOperationHandle), String>,
+        >,
+    },
+    /// Execute the prepared migrations under the operation's existing ownership.
+    RunPrerequisites {
+        config: Config,
+        operation: crate::bun::deploy_operations::DeployOperationHandle,
+        response: oneshot::Sender<Result<(), super::launch::PrerequisiteFailure>>,
+    },
+    /// Bind startup acknowledgement to the actual ordinary job generations.
+    CaptureClusterJobs {
+        config: Config,
+        response: oneshot::Sender<Result<Arc<super::cluster_jobs::ClusterJobReceipt>, String>>,
+    },
+    /// Read positive completion or retirement evidence for that exact receipt.
+    ClusterJobsSettlement {
+        receipt: Arc<super::cluster_jobs::ClusterJobReceipt>,
+        response: oneshot::Sender<super::cluster_jobs::ClusterJobSettlement>,
     },
     /// Explicit operator authorisation to rerun unknown node-local jobs.
     RerunJobs {
@@ -344,7 +399,15 @@ impl AgentCommand {
     /// The variant's name, for the loop meter's slow-turn log.
     pub(super) fn name(&self) -> &'static str {
         match self {
+            AgentCommand::RunJobsWithLabels { .. } => "run_jobs_with_labels",
+            AgentCommand::BatchOwnedExecutions { .. } => "batch_owned_executions",
+            AgentCommand::ResolveExecutionLogs { .. } => "resolve_execution_logs",
+            AgentCommand::LogCaptures { .. } => "log_captures",
             AgentCommand::Deploy { .. } => "deploy",
+            AgentCommand::PreparePrerequisites { .. } => "prepare_prerequisites",
+            AgentCommand::CaptureClusterJobs { .. } => "capture_cluster_jobs",
+            AgentCommand::ClusterJobsSettlement { .. } => "cluster_jobs_settlement",
+            AgentCommand::RunPrerequisites { .. } => "run_prerequisites",
             AgentCommand::RerunJobs { .. } => "rerun_jobs",
             AgentCommand::Stop { .. } => "stop",
             AgentCommand::Retire { .. } => "retire",
@@ -419,6 +482,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Handle a single command.
     pub(super) async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
+            AgentCommand::ResolveExecutionLogs {
+                app_name,
+                namespace,
+                instance,
+                response,
+            } => {
+                let _ = response.send(self.resolve_execution_logs(
+                    &app_name,
+                    &namespace,
+                    instance.as_deref(),
+                ));
+            }
+            AgentCommand::LogCaptures {
+                instances,
+                tail,
+                response,
+            } => {
+                self.spawn_selected_logs_read(
+                    instances.into_iter().map(InstanceId).collect(),
+                    tail,
+                    response,
+                );
+            }
+            AgentCommand::RunJobsWithLabels {
+                batch_id,
+                config,
+                execution_labels,
+                events,
+                response,
+            } => {
+                let result = self
+                    .begin_owned_batch(batch_id, config, execution_labels, events)
+                    .await;
+                let _ = response.send(result);
+            }
+            AgentCommand::BatchOwnedExecutions {
+                identities,
+                response,
+            } => {
+                let _ = response.send(self.batch_owned_identities(&identities));
+            }
+            AgentCommand::CaptureClusterJobs { config, response } => {
+                let _ = response.send(self.capture_cluster_jobs(&config));
+            }
+            AgentCommand::ClusterJobsSettlement { receipt, response } => {
+                let _ = response.send(self.cluster_jobs_settlement(&receipt));
+            }
+            AgentCommand::PreparePrerequisites { config, response } => {
+                self.prepare_prerequisites(config, response).await;
+            }
+            AgentCommand::RunPrerequisites {
+                config,
+                operation,
+                response,
+            } => {
+                self.run_prepared_prerequisites(config, operation, response);
+            }
             AgentCommand::Deploy { config, events } => {
                 self.begin_deploy(config, events, true, false).await;
             }

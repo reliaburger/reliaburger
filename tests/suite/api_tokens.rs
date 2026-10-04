@@ -19,6 +19,10 @@ use std::{
 use tower::ServiceExt;
 
 async fn api() -> (Arc<CouncilNode>, Router) {
+    api_with_capacity(false).await
+}
+
+async fn api_with_capacity(capacity: bool) -> (Arc<CouncilNode>, Router) {
     let network = InMemoryRaftRouter::new();
     let council = Arc::new(
         CouncilNode::new(
@@ -44,8 +48,80 @@ async fn api() -> (Arc<CouncilNode>, Router) {
     })
     .await
     .unwrap();
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    let router = reliaburger::bun::api::router_with_upgrade(
+    let router = router_for_council(council.clone(), None, None, capacity);
+    (council, router)
+}
+
+fn router_for_council(
+    council: Arc<CouncilNode>,
+    membership: Option<Arc<tokio::sync::RwLock<Vec<reliaburger::bun::api::NodeMembershipInfo>>>>,
+    service_token: Option<String>,
+    capacity: bool,
+) -> Router {
+    let (capacity_publisher, aggregated_rx) = if capacity {
+        let node = reliaburger::meat::NodeId::new("local");
+        let mut state = reliaburger::reporting::aggregator::AggregatedState {
+            leadership_epoch: Some(council.current_term()),
+            ..Default::default()
+        };
+        state.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        );
+        state.reports.insert(
+            node.clone(),
+            reliaburger::reporting::types::StateReport {
+                node_id: node,
+                timestamp: SystemTime::UNIX_EPOCH,
+                running_apps: vec![],
+                cached_specs: vec![],
+                resource_usage: reliaburger::reporting::types::ResourceUsage {
+                    cpu_total_millicores: 8000,
+                    memory_total_mb: 16384,
+                    ..Default::default()
+                },
+                event_log: vec![],
+                has_buildah: false,
+            },
+        );
+        let (publisher, receiver) = tokio::sync::watch::channel(state);
+        (Some(publisher), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let membership = if capacity {
+        Some(Arc::new(tokio::sync::RwLock::new(vec![
+            reliaburger::bun::api::NodeMembershipInfo {
+                node_id: reliaburger::meat::NodeId::new("local"),
+                address: "127.0.0.1:1".parse().unwrap(),
+                api_advertised: true,
+            },
+        ])))
+    } else {
+        membership
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move {
+        let _capacity_publisher = capacity_publisher;
+        while let Some(command) = rx.recv().await {
+            match command {
+                reliaburger::bun::agent::AgentCommand::RunJobsWithLabels {
+                    config,
+                    execution_labels,
+                    response,
+                    ..
+                } => {
+                    assert_eq!(config.job.len(), execution_labels.len());
+                    let _ = response.send(Ok(BTreeMap::new()));
+                }
+                reliaburger::bun::agent::AgentCommand::Status { response } => {
+                    let _ = response.send(Vec::new());
+                }
+                _ => {}
+            }
+        }
+    });
+    reliaburger::bun::api::router_with_upgrade(
         tx,
         None,
         None,
@@ -54,17 +130,17 @@ async fn api() -> (Arc<CouncilNode>, Router) {
         None,
         Some(council.clone()),
         None,
+        service_token,
         None,
-        None,
-        None,
+        membership,
         None,
         None,
         0,
         None,
         None,
-        None,
+        aggregated_rx,
         "test".into(),
-        None,
+        capacity.then(|| "local".into()),
         reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
         reliaburger::cluster::ClusterHttp::plaintext(),
         5050,
@@ -86,8 +162,7 @@ async fn api() -> (Arc<CouncilNode>, Router) {
         None,
         None,
         None,
-    );
-    (council, router)
+    )
 }
 
 async fn create(router: Router, name: &str, ttl: Option<u64>) -> StatusCode {
@@ -164,6 +239,244 @@ fn owner() -> reliaburger::sesame::auth::AuthContext {
         scoped_apps: None,
         scoped_namespaces: None,
     }
+}
+
+#[tokio::test]
+async fn batch_submission_checks_every_job_against_token_scope_before_dispatch() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let router = reliaburger::bun::api::router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    let mut auth = owner();
+    auth.role = reliaburger::sesame::types::ApiRole::Deployer;
+    auth.scoped_apps = Some(vec!["allowed".into(), "valid".into()]);
+    auth.scoped_namespaces = Some(vec!["team".into()]);
+    for (name, namespace) in [("forbidden", "team"), ("allowed", "other")] {
+        let mut request = Request::post("/v1/batch").header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"jobs":[{"name":"valid","namespace":"team","spec":{"image":"busybox","command":["true"]}},{"name":name,"namespace":namespace,"spec":{"image":"busybox","command":["true"]}}]}).to_string())).unwrap();
+        request.extensions_mut().insert(auth.clone());
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
+    let (council, router) = api_with_capacity(true).await;
+    for (actions, spec) in [
+        (
+            vec!["logs"],
+            serde_json::json!({"image":"busybox","command":["true"]}),
+        ),
+        (vec!["deploy"], serde_json::json!({"script":"echo denied"})),
+        (vec!["deploy"], serde_json::json!({"exec":"/bin/true"})),
+    ] {
+        council
+            .write(reliaburger::council::types::RaftRequest::PermissionSpec {
+                name: "ci".into(),
+                spec: Box::new(reliaburger::config::PermissionSpec {
+                    actions: actions.into_iter().map(str::to_string).collect(),
+                    apps: vec!["*".into()],
+                    namespaces: None,
+                }),
+            })
+            .await
+            .unwrap();
+        let mut request = Request::post("/v1/batch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"jobs":[{"name":"migration","spec":spec}]}).to_string(),
+            ))
+            .unwrap();
+        request.extensions_mut().insert(owner());
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(council.desired_state().await.batch_state.get(1).is_none());
+    }
+    council
+        .write(reliaburger::council::types::RaftRequest::PermissionSpec {
+            name: "ci".into(),
+            spec: Box::new(reliaburger::config::PermissionSpec {
+                actions: vec!["deploy".into(), "host-exec".into()],
+                apps: vec!["migration".into()],
+                namespaces: Some(vec!["default".into()]),
+            }),
+        })
+        .await
+        .unwrap();
+    let mut request = Request::post("/v1/batch")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"jobs":[{"name":"migration","spec":{"exec":"/bin/true"}}]})
+                .to_string(),
+        ))
+        .unwrap();
+    request.extensions_mut().insert(owner());
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(council.desired_state().await.batch_state.get(1).is_some());
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_submission_refuses_unowned_test_namespaces_and_images() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let router = reliaburger::bun::api::router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    for (namespace, image) in [
+        ("rbtest-batch", "busybox"),
+        ("default", "localhost:5050/rbtest-image/work:test"),
+    ] {
+        let request = Request::post("/v1/batch").header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"jobs":[{"name":"migration","namespace":namespace,"spec":{"image":image,"command":["true"]}}]}).to_string())).unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+}
+
+#[tokio::test]
+async fn batch_submission_validates_every_spec_before_registering_or_dispatching() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let router = reliaburger::bun::api::router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    for spec in [
+        serde_json::json!({}),
+        serde_json::json!({"image":"busybox","exec":"/bin/true"}),
+        serde_json::json!({"script":"echo invalid","exec":"/bin/true"}),
+    ] {
+        let request = Request::post("/v1/batch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"jobs":[
+                    {"name":"valid","spec":{"image":"busybox","command":["true"]}},
+                    {"name":"invalid","spec":spec}
+                ]})
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let response = router
+            .clone()
+            .oneshot(Request::get("/v1/batch/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn follower_batch_submission_preserves_the_callers_credential_for_leader_admission() {
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let leader_api = Router::new().route(
+        "/v1/batch",
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let received_tx = received_tx.clone();
+            async move {
+                let credential = headers
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let status = if credential == "Bearer caller-credential" {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::ACCEPTED
+                };
+                received_tx.send(credential).await.unwrap();
+                status
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, leader_api).await.unwrap() });
+    let network = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    for id in [1, 2] {
+        let council = Arc::new(
+            CouncilNode::new(
+                id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, council.raft().clone()).await;
+        nodes.push(council);
+    }
+    nodes[0]
+        .initialize(BTreeMap::from([(
+            1,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "leader"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !nodes[0].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    nodes[0]
+        .add_learner(
+            2,
+            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "follower"),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while nodes[1].current_leader().await != Some(1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let membership = Arc::new(tokio::sync::RwLock::new(vec![
+        reliaburger::bun::api::NodeMembershipInfo {
+            node_id: reliaburger::meat::NodeId::new("leader"),
+            address,
+            api_advertised: true,
+        },
+    ]));
+    let router = router_for_council(
+        nodes[1].clone(),
+        Some(membership),
+        Some("cluster-service-credential".into()),
+        false,
+    );
+    let mut request = Request::post("/v1/batch")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer caller-credential")
+        .body(Body::from(serde_json::json!({"jobs":[{"name":"migration","spec":{"image":"busybox","command":["true"]}}]}).to_string())).unwrap();
+    request.extensions_mut().insert(owner());
+    let response = router.oneshot(request).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(5), received_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+    assert_eq!(received, "Bearer caller-credential");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 async fn create_leased(

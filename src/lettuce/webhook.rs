@@ -34,6 +34,31 @@ pub struct WebhookValidator {
     clock: Clock,
 }
 
+/// An authenticated reservation is committed only after durable admission.
+/// Dropping a canceled or failed request restores the bounded local budgets.
+pub struct WebhookAdmission<'a> {
+    validator: &'a mut WebhookValidator,
+    ids: VecDeque<String>,
+    triggers: VecDeque<Instant>,
+    committed: bool,
+}
+
+impl WebhookAdmission<'_> {
+    /// Retain the local replay and rate reservations after successful admission.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WebhookAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.validator.recent_ids = std::mem::take(&mut self.ids);
+            self.validator.recent_triggers = std::mem::take(&mut self.triggers);
+        }
+    }
+}
+
 impl WebhookValidator {
     /// Create a new validator with the given HMAC secret and rate limit.
     pub fn new(secret: &str, rate_limit: u32) -> Self {
@@ -50,6 +75,30 @@ impl WebhookValidator {
             recent_triggers: VecDeque::with_capacity(rate_limit as usize),
             clock,
         }
+    }
+
+    /// Authenticate and reserve local budgets until admission commits or drops.
+    pub fn reserve<'a>(
+        &'a mut self,
+        body: &[u8],
+        signature: Option<&str>,
+        gitlab_token: Option<&str>,
+        delivery: Option<&str>,
+        branch: &str,
+    ) -> Result<WebhookAdmission<'a>, LettuceError> {
+        let ids = self.recent_ids.clone();
+        let triggers = self.recent_triggers.clone();
+        if let Some(token) = gitlab_token {
+            self.validate_gitlab(body, token, delivery, branch)?;
+        } else {
+            self.validate(body, signature, delivery, branch)?;
+        }
+        Ok(WebhookAdmission {
+            validator: self,
+            ids,
+            triggers,
+            committed: false,
+        })
     }
 
     /// Validate a webhook request.
@@ -376,5 +425,34 @@ mod tests {
     fn extract_head_commit_missing() {
         let body = br#"{"ref": "refs/heads/main"}"#;
         assert_eq!(extract_head_commit(body), None);
+    }
+    #[test]
+    fn canceled_admission_restores_both_delivery_and_rate_reservations() {
+        let body = b"{}";
+        let signature = sign_payload("secret", body);
+        let mut validator = WebhookValidator::new("secret", 1);
+        drop(
+            validator
+                .reserve(body, Some(&signature), None, Some("retry"), "main")
+                .unwrap(),
+        );
+        validator
+            .reserve(body, Some(&signature), None, Some("retry"), "main")
+            .unwrap()
+            .commit();
+        assert!(
+            validator
+                .validate(body, Some(&signature), Some("retry"), "main")
+                .unwrap_err()
+                .to_string()
+                .contains("replay")
+        );
+        assert!(
+            validator
+                .validate(body, Some(&signature), Some("different"), "main")
+                .unwrap_err()
+                .to_string()
+                .contains("rate limit")
+        );
     }
 }

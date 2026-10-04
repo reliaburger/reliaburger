@@ -269,6 +269,11 @@ impl CouncilNode {
         }
     }
 
+    /// Observe committed requested and completed GitOps trigger generations.
+    pub fn gitops_trigger_updates(&self) -> watch::Receiver<(u64, u64)> {
+        self.state_machine.gitops_trigger_updates()
+    }
+
     /// Read the current desired state from the state machine.
     pub async fn desired_state(&self) -> DesiredState {
         self.state_machine.desired_state().await
@@ -780,6 +785,25 @@ mod tests {
         }
     }
 
+    async fn write_admission_fixture(
+        council: &crate::council::CouncilNode,
+        mut request: crate::council::RaftRequest,
+    ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
+        let previous = council.desired_state().await.last_applied_log;
+        match &mut request {
+            crate::council::RaftRequest::BatchRegister {
+                expected_log_id, ..
+            } => *expected_log_id = previous,
+            crate::council::RaftRequest::SchedulingDecision(decision) => {
+                request = crate::council::RaftRequest::SchedulingDecisions {
+                    expected_log_id: previous,
+                    decisions: vec![decision.clone()],
+                }
+            }
+            _ => {}
+        }
+        council.write(request).await
+    }
     // -----------------------------------------------------------------------
     // Bootstrap tests
     // -----------------------------------------------------------------------
@@ -1018,8 +1042,7 @@ mod tests {
                 ordinal: 0,
             }],
         };
-        leader
-            .write(RaftRequest::SchedulingDecision(decision))
+        write_admission_fixture(leader, RaftRequest::SchedulingDecision(decision))
             .await
             .unwrap();
 

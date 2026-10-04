@@ -4623,6 +4623,15 @@ looser. Put three persists into the record write and the new verdict fails
 straight away, while the old one would have passed: every turn came in under
 500 ms.
 
+The consumer-sync scenario from #505 had the same stopwatch, and the next
+day it failed the same way (#585): a status took 1.39 s behind a changed
+view on a hosted macOS runner. A status may wait two turns, each holding one
+400 ms slowed journal write, so the host's real fsyncs had about 200 ms of
+the budget left, and they took about 570 ms. It now counts too: status must
+answer, and no turn may journal more than one write. Run two sync steps in
+one turn and it fails straight away, with a worst turn of 840 ms that the
+stopwatch would have passed.
+
 #### A test that raced the clock
 
 One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`
@@ -5511,6 +5520,8 @@ One gap we closed by adding a test rather than fixing code. An app exits, Bun st
 The testing assessment after 0.1.0 found three pieces of evidence that couldn't say no.
 
 The cgroup v2 detector's test called the detector on Linux and threw the answer away (`let _ = result;`). It proved the function didn't panic. It would have passed if the detector said "v1" on a v2 host, or "v2" on a host with no cgroups at all. The fix is a small filesystem boundary: `check_cgroup_v2` now just passes `/sys/fs/cgroup` to `check_cgroup_v2_at(root: &Path)`, and three tests hand it fake mount trees in a temporary directory, one with `cgroup.controllers` (v2), one with a per-controller directory and no controllers file (v1), and one that doesn't exist. The host test still runs, and now it asserts: every Linux host that runs the suite is provisioned with v2, so a failure there is a real finding. How do we know the new tests can fail? We broke the detector on purpose, dropping the controllers check, and watched the v1 test go red.
+
+A checkpoint-capacity fixture has a different trap: it can spend most of its watchdog rewriting an ever larger inventory before reaching the boundary it wants to test. The batch fixture still submits real HTTP requests, waits for real completed jobs, reaches the actual 16 MiB checkpoint limit and retries an admitted execution before and after restart. Its valid image specifications now approach the API's 2 MiB request limit, so fewer whole-inventory writes reach that same capacity. An independent serialized-size assertion keeps every request within the production limit. We retain the hosted timeout separately; a shorter local run doesn't establish its complete cause.
 
 The node-pressure acceptance test was `#[ignore]`d (good) but, when selected without `RELIABURGER_NODE_PRESSURE_TESTS=1`, printed "skipped" and returned. Nextest has no idea what "skipped" means in a test's stderr. It saw a function return and reported a pass. Selecting an ignored test is a request to run it, so a missing prerequisite is now an `assert_eq!` failure with a message saying which variable to set. The one pattern we left alone is the subprocess fixture: a test that exists only to be re-executed by its parent (its `#[ignore]` reason says so) still returns when the parent didn't start it, because `make test-linux` selects whole binaries and would otherwise fail on every fixture.
 

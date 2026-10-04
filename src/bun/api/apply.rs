@@ -303,6 +303,67 @@ pub(super) async fn apply_handler(
         }
     }
 
+    let identities: Vec<(String, String)> = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.clone(),
+                spec.namespace.clone().unwrap_or_else(|| "default".into()),
+            )
+        })
+        .chain(config.job.iter().map(|(name, spec)| {
+            (
+                name.clone(),
+                spec.namespace.clone().unwrap_or_else(|| "default".into()),
+            )
+        }))
+        .collect();
+    if !identities.is_empty() {
+        let ownership = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if let Some(council) = &state.council {
+                let desired = council.desired_state().await;
+                if identities.iter().any(|(name, namespace)| {
+                    desired
+                        .batch_state
+                        .execution_owner(namespace, name)
+                        .is_some()
+                }) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "workload identity belongs to a retained batch execution",
+                    )
+                        .into_response());
+                }
+            }
+            let owned = match ask_agent_bounded(&state.cmd_tx, |response| {
+                AgentCommand::BatchOwnedExecutions {
+                    identities,
+                    response,
+                }
+            })
+            .await
+            {
+                Ok(owned) => owned,
+                Err(response) => return Err(response),
+            };
+            if !owned.is_empty() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "workload identity belongs to a retained local batch execution",
+                )
+                    .into_response());
+            }
+            Ok(())
+        })
+        .await;
+        match ownership {
+            Ok(Ok(())) => {}
+            Ok(Err(response)) => return response,
+            Err(_) => return agent_unavailable(),
+        }
+    }
+
     // Cluster mode (L1): apps, namespaces and permissions become desired
     // state in Raft; the leader schedules apps and every node's reconciler
     // converges. Jobs stay on the receiving node (cluster-wide job
@@ -313,7 +374,8 @@ pub(super) async fn apply_handler(
         && (!config.app.is_empty()
             || !config.namespace.is_empty()
             || !config.permission.is_empty()
-            || !config.build.is_empty())
+            || !config.build.is_empty()
+            || (lease_id.is_none() && !config.job.is_empty()))
     {
         return cluster_apply(
             state.clone(),
@@ -475,6 +537,9 @@ pub(super) async fn cluster_apply(
         // The leader must evaluate the user's current grants, not the
         // follower's internal service identity. ClusterHttp has no default
         // bearer; node-to-node requests attach theirs explicitly.
+        if let Some(value) = caller_headers.get("x-reliaburger-rerun-jobs") {
+            request = request.header("x-reliaburger-rerun-jobs", value.as_bytes());
+        }
         request = copy_forwarded_auth(request, &caller_headers);
         let response =
             tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await;
@@ -522,6 +587,20 @@ pub(super) async fn cluster_apply(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
+    }
+
+    let desired = council.desired_state().await;
+    if let Some(owner) =
+        crate::council::prerequisites::conflict(&desired.prerequisite_claims, &config)
+    {
+        return (StatusCode::CONFLICT, format!("prerequisite operation {owner} still owns a workload; its outcome must be established before another apply")).into_response();
+    }
+    if config.job.values().any(|job| job.schedule.is_some()) {
+        return (StatusCode::UNPROCESSABLE_ENTITY,
+            "cluster apply cannot safely own recurring schedules; use a standalone node for cron jobs").into_response();
+    }
+    if !config.job.is_empty() {
+        return cluster_prerequisite_apply(state, council, config, &caller_headers).await;
     }
 
     if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
@@ -662,6 +741,314 @@ pub(super) async fn cluster_apply(
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
     Sse::new(stream).into_response()
+}
+
+/// A proposal deadline bounds the caller, never proves that Raft did not commit.
+/// Uncertain admission cannot dispatch work or release a replicated ownership fence.
+async fn write_job_claim(
+    council: &crate::council::CouncilNode,
+    request: crate::council::RaftRequest,
+) -> Result<crate::council::CouncilResponse, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), council.write(request))
+        .await
+        .map_err(|_| {
+            "job ownership write timed out; outcome unknown and ownership may remain held"
+                .to_string()
+        })?
+        .map_err(|error| error.to_string())
+}
+
+/// Acquire durable intent before spawning the worker; conflicts are HTTP 409,
+/// while execution errors are terminal SSE events under the retained claim.
+async fn cluster_prerequisite_apply(
+    state: ApiState,
+    council: Arc<crate::council::CouncilNode>,
+    config: Config,
+    caller_headers: &HeaderMap,
+) -> Response {
+    let rerun_jobs = caller_headers
+        .get("x-reliaburger-rerun-jobs")
+        .is_some_and(|value| value.as_bytes() == b"acknowledged");
+    use crate::bun::deploy_operations::DeployOperationOutcome;
+    use crate::council::{CouncilResponse, RaftRequest};
+    let term = council.current_term();
+    let (response, answer) = oneshot::channel();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        state
+            .cmd_tx
+            .send(AgentCommand::PreparePrerequisites { config, response })
+            .await
+            .map_err(|_| "agent unavailable during prerequisite preparation".to_string())?;
+        answer
+            .await
+            .map_err(|_| "prerequisite preparation disappeared".to_string())?
+    })
+    .await;
+    let (config, operation) = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(message)) => return (StatusCode::CONFLICT, message).into_response(),
+        Err(_) => {
+            return unavailable_response("prerequisite preparation timed out before launch".into());
+        }
+    };
+    let operation_id = hex::encode(rand::random::<[u8; 16]>());
+    match write_job_claim(
+        &council,
+        RaftRequest::PrerequisiteBegin {
+            operation_id: operation_id.clone(),
+            term,
+            config: Box::new(config.clone()),
+        },
+    )
+    .await
+    {
+        Ok(CouncilResponse::Refused { reason }) => {
+            operation
+                .finish(DeployOperationOutcome::Failed, reason.clone())
+                .await;
+            return (StatusCode::CONFLICT, reason).into_response();
+        }
+        Err(error) => {
+            operation
+                .finish(DeployOperationOutcome::Unknown, error.to_string())
+                .await;
+            return unavailable_response(error.to_string());
+        }
+        Ok(_) => {}
+    }
+    let (events, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    tokio::spawn(async move {
+        let result: Result<usize, String> = async {
+            if !council.is_leader().await || council.current_term() != term {
+                return Err(
+                    "leadership changed before prerequisite dispatch; ownership remains held"
+                        .into(),
+                );
+            }
+            if config.job.values().any(|job| !job.run_before.is_empty()) {
+                let (response, answer) = oneshot::channel();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state.cmd_tx.send(AgentCommand::RunPrerequisites {
+                        config: config.clone(),
+                        operation: operation.clone(),
+                        response,
+                    }),
+                )
+                .await
+                .map_err(|_| "agent prerequisite queue timed out; ownership remains held")?
+                .map_err(
+                    |_| "agent stopped before prerequisite dispatch; ownership remains held",
+                )?;
+                match answer
+                    .await
+                    .map_err(|_| "prerequisite worker disappeared; ownership remains held")?
+                {
+                    Ok(()) => {}
+                    Err(failure) => {
+                        if failure.settled {
+                            // A positively observed and persisted nonzero exit may
+                            // release intent. A different term cannot release it.
+                            match write_job_claim(
+                                &council,
+                                RaftRequest::PrerequisiteFailed {
+                                    operation_id: operation_id.clone(),
+                                },
+                            )
+                            .await
+                            {
+                                Ok(CouncilResponse::Refused { reason }) => {
+                                    return Err(format!(
+                                        "{}; ownership remains held: {reason}",
+                                        failure.message
+                                    ));
+                                }
+                                Err(error) => return Err(format!("{}; {error}", failure.message)),
+                                Ok(_) => {}
+                            }
+                        }
+                        return Err(failure.message);
+                    }
+                }
+            }
+            // Cancellation may arrive after the actor's success response.
+            // Once submitted, a Raft transaction cannot be undone by cancellation.
+            if operation.cancellation_requested() {
+                return Err(
+                    "prerequisite cancelled before app publication; ownership remains held".into(),
+                );
+            }
+            match write_job_claim(
+                &council,
+                RaftRequest::PrerequisiteCommit {
+                    operation_id: operation_id.clone(),
+                },
+            )
+            .await
+            {
+                Ok(CouncilResponse::Refused { reason }) => Err(reason),
+                Err(error) => Err(error.to_string()),
+                Ok(_) => Ok(crate::council::config_to_desired_writes(&config).len()),
+            }
+        }
+        .await;
+        operation
+            .finish(
+                if result.is_ok() {
+                    DeployOperationOutcome::Completed
+                } else {
+                    DeployOperationOutcome::Unknown
+                },
+                "prerequisite execution and desired-state transaction settled",
+            )
+            .await;
+        match result {
+            Err(message) => {
+                let _ = events.send(ApplyEvent::Error { message }).await;
+            }
+            Ok(created) => {
+                let remaining: std::collections::BTreeMap<_, _> = config
+                    .job
+                    .into_iter()
+                    .filter(|(_, spec)| spec.run_before.is_empty())
+                    .collect();
+                if remaining.is_empty() {
+                    let _ = events
+                        .send(ApplyEvent::Complete {
+                            created,
+                            instances: vec![],
+                        })
+                        .await;
+                } else {
+                    let config = Config {
+                        job: remaining,
+                        ..Config::default()
+                    };
+                    let (launch_events, mut launch_rx) = mpsc::channel(32);
+                    let command = if rerun_jobs {
+                        AgentCommand::RerunJobs {
+                            config: config.clone(),
+                            events: launch_events,
+                        }
+                    } else {
+                        AgentCommand::Deploy {
+                            config: config.clone(),
+                            events: launch_events,
+                        }
+                    };
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("{} job(s) deploying on this node", config.job.len()),
+                        })
+                        .await;
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        state.cmd_tx.send(command),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        _ => {
+                            let _ = events.send(ApplyEvent::Error { message: "agent unavailable after app commitment; job ownership remains held".into() }).await;
+                            return;
+                        }
+                    }
+                    while let Some(event) = launch_rx.recv().await {
+                        if matches!(event, ApplyEvent::Complete { .. }) {
+                            // Capture before exposing startup completion. The separate
+                            // watcher retains intent until a positive terminal outcome.
+                            let (response, answer) = oneshot::channel();
+                            let receipt =
+                                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                                    state
+                                        .cmd_tx
+                                        .send(AgentCommand::CaptureClusterJobs {
+                                            config: config.clone(),
+                                            response,
+                                        })
+                                        .await
+                                        .ok()?;
+                                    answer.await.ok()?.ok()
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                            if let Some(receipt) = receipt {
+                                spawn_job_apply_settlement(
+                                    state.cmd_tx.clone(),
+                                    council.clone(),
+                                    operation_id.clone(),
+                                    receipt,
+                                );
+                            }
+                            let _ = events.send(event).await;
+                            return;
+                        }
+                        if matches!(event, ApplyEvent::Error { .. }) {
+                            let _ = events.send(event).await;
+                            return;
+                        }
+                        // Slow clients may coalesce progress, while terminal
+                        // outcomes retain their delivery and ownership guarantees.
+                        let _ = events.try_send(event);
+                    }
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: "job worker disappeared; ownership remains held".into(),
+                        })
+                        .await;
+                }
+            }
+        }
+    });
+    let stream = ReceiverStream::new(event_rx).map(|event| {
+        Ok::<_, std::convert::Infallible>(
+            Event::default().data(serde_json::to_string(&event).unwrap_or_default()),
+        )
+    });
+    Sse::new(stream).into_response()
+}
+
+/// One bounded metadata request per tick, at most one watcher per held claim.
+/// A missing actor, uncertain receipt or different leader retains the fence.
+pub(super) fn spawn_job_apply_settlement(
+    commands: mpsc::Sender<AgentCommand>,
+    council: Arc<crate::council::CouncilNode>,
+    operation_id: String,
+    receipt: Arc<crate::bun::agent::ClusterJobReceipt>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (response, answer) = oneshot::channel();
+            let observation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                commands
+                    .send(AgentCommand::ClusterJobsSettlement {
+                        receipt: receipt.clone(),
+                        response,
+                    })
+                    .await
+                    .ok()?;
+                answer.await.ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            match observation {
+                Some(crate::bun::agent::ClusterJobSettlement::Terminal) => {
+                    let _ = write_job_claim(
+                        &council,
+                        crate::council::RaftRequest::JobApplyComplete { operation_id },
+                    )
+                    .await;
+                    return;
+                }
+                Some(crate::bun::agent::ClusterJobSettlement::Pending) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                _ => return,
+            }
+        }
+    })
 }
 
 /// A short human-readable label for an apply progress message.

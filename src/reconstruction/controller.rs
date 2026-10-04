@@ -289,6 +289,8 @@ mod tests {
             );
         }
         AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
             reports,
             stale_nodes: vec![],
             capabilities: HashMap::new(),
