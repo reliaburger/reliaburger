@@ -284,6 +284,8 @@ pub struct ProcessGrill {
     control: Option<ProcessControl>,
     #[cfg(test)]
     capture_gate: Option<Arc<CaptureGate>>,
+    #[cfg(test)]
+    file_eof_gate: Option<Arc<CaptureGate>>,
 }
 
 impl ProcessGrill {
@@ -295,6 +297,8 @@ impl ProcessGrill {
             control: None,
             #[cfg(test)]
             capture_gate: None,
+            #[cfg(test)]
+            file_eof_gate: None,
         }
     }
 
@@ -307,6 +311,8 @@ impl ProcessGrill {
             control: None,
             #[cfg(test)]
             capture_gate: None,
+            #[cfg(test)]
+            file_eof_gate: None,
         }
     }
 
@@ -320,6 +326,8 @@ impl ProcessGrill {
             control: Some(control),
             #[cfg(test)]
             capture_gate: None,
+            #[cfg(test)]
+            file_eof_gate: None,
         }
     }
 
@@ -997,6 +1005,8 @@ impl super::Grill for ProcessGrill {
         }
 
         let mut drained = false;
+        #[cfg(test)]
+        let mut eof_gated = false;
         loop {
             // New bytes since the last poll, from each file or buffer, at
             // most one bounded chunk per stream at a time: a capture with no
@@ -1031,6 +1041,17 @@ impl super::Grill for ProcessGrill {
                 continue;
             }
 
+            #[cfg(test)]
+            if no_new_data
+                && !eof_gated
+                && log_stem.is_some()
+                && let Some(gate) = &self.file_eof_gate
+            {
+                eof_gated = true;
+                gate.entered.send_modify(|count| *count += 1);
+                gate.release.acquire().await.unwrap().forget();
+            }
+
             // Check if the process has exited and no more data is coming
             let exited = match self.state(instance).await {
                 Ok(ContainerState::Stopped) => true,
@@ -1038,11 +1059,14 @@ impl super::Grill for ProcessGrill {
                 _ => false,
             };
             if exited && no_new_data {
-                if !drained && let Some(capture) = &capture {
-                    capture.wait().await;
+                if !drained {
+                    if let Some(capture) = &capture {
+                        capture.wait().await;
+                    }
                     drained = true;
-                    // Re-scan after completion: a reader could publish its last
-                    // bytes between the earlier empty read and this observation.
+                    // Re-scan after confirmed exit/completion. Both a file
+                    // writer and an owned pipe reader can publish final bytes
+                    // between the earlier empty read and state observation.
                     continue;
                 }
                 for (reader, _) in &mut readers {
@@ -2380,5 +2404,125 @@ mod tests {
         assert_eq!(*capture.done.borrow(), [true; 2]);
         assert!(first.await.unwrap_err().is_cancelled());
         assert!(second.await.unwrap_err().is_cancelled());
+    }
+
+    async fn assert_file_follow_rescans_after_empty_read_then_child_exit(resuming: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let release_child = directory.path().join("release-child");
+        let id = InstanceId("gated-file-final-output".into());
+        let stem = directory.path().join(&id.0);
+        let stdout = log_file(&stem, "stdout");
+        let stderr = log_file(&stem, "stderr");
+        let prefix = if resuming {
+            b"already-seen\n".as_slice()
+        } else {
+            b"".as_slice()
+        };
+        std::fs::write(&stdout, prefix).unwrap();
+        std::fs::write(&stderr, prefix).unwrap();
+        let gate = Arc::new(CaptureGate::default());
+        let mut entered = gate.entered.subscribe();
+        let _release_on_failure = ReleaseCaptureGate(gate.clone());
+        let mut grill = ProcessGrill::with_log_dir(directory.path().to_path_buf());
+        grill.file_eof_gate = Some(gate.clone());
+        let script = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'final-out\\n'; printf 'final-err\\n' >&2",
+            release_child.display()
+        );
+        grill
+            .create(&id, &spec_with_args(vec!["sh".into(), "-c".into(), script]))
+            .await
+            .unwrap();
+        // This test owns a gated foreground child. Unlike production file
+        // capture, it must be killed if an assertion unwinds before release.
+        grill
+            .processes
+            .lock()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .cleanup_on_drop = true;
+        grill.start(&id).await.unwrap();
+        let mut resume = crate::ketchup::types::CaptureOffsets::default();
+        resume.0.insert(stdout.clone(), prefix.len() as u64);
+        resume.0.insert(stderr.clone(), prefix.len() as u64);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let follow = grill.follow_logs(&id, sender, &resume);
+        tokio::pin!(follow);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while *entered.borrow_and_update() == 0 {
+                tokio::select! {
+                    _ = follow.as_mut() => panic!("file follow returned before its empty-scan gate"),
+                    change = entered.changed() => change.unwrap(),
+                }
+            }
+        }).await.unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "fixture emitted before the empty scan"
+        );
+        // The first file reads have already returned EOF. Only now does the
+        // real child publish both final writes and exit; the follower is
+        // still held before its state observation.
+        std::fs::write(&release_child, "release").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            grill
+                .processes
+                .lock()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .child
+                .as_mut()
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), follow.as_mut())
+            .await
+            .unwrap();
+        let mut captured = Vec::new();
+        while let Some(line) = receiver.recv().await {
+            captured.push(line);
+        }
+        assert_eq!(
+            captured.len(),
+            2,
+            "file follower treated its pre-exit EOF as final"
+        );
+        for (line, stream, file, text) in [
+            (
+                &captured[0],
+                crate::ketchup::types::LogStream::Stdout,
+                &stdout,
+                "final-out",
+            ),
+            (
+                &captured[1],
+                crate::ketchup::types::LogStream::Stderr,
+                &stderr,
+                "final-err",
+            ),
+        ] {
+            assert_eq!(line.stream, stream);
+            assert_eq!(line.line, text);
+            let position = line.position.as_ref().unwrap();
+            assert_eq!(&position.file, file);
+            assert_eq!(position.end_offset, prefix.len() as u64 + 10);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_follow_rescans_after_eof_before_actual_child_exit() {
+        assert_file_follow_rescans_after_empty_read_then_child_exit(false).await;
+    }
+
+    #[tokio::test]
+    async fn resumed_file_follow_keeps_offsets_across_eof_before_actual_child_exit() {
+        assert_file_follow_rescans_after_empty_read_then_child_exit(true).await;
     }
 }
