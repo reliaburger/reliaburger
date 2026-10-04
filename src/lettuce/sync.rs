@@ -154,6 +154,23 @@ pub fn execute_sync(
         return failed(Some(commit), format!("config validation failed: {e}"));
     }
 
+    // Jobs have no durable GitOps execution identity or dispatch path. Refuse
+    // the entire validated tree before a dependent app can become desired state.
+    if !git_config.job.is_empty() {
+        let jobs = git_config
+            .job
+            .keys()
+            .map(|name| format!("job.{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return failed(
+            Some(commit),
+            format!(
+                "GitOps does not reconcile jobs ({jobs}); use relish apply for jobs and run_before migrations, or relish batch for batch submission"
+            ),
+        );
+    }
+
     // Step 3c: A script change needs a trusted signature even when
     // signing isn't required globally.
     if !config.require_signed_commits
@@ -954,5 +971,76 @@ mod tests {
     fn backoff_capped_at_8x() {
         let base = Duration::from_secs(30);
         assert_eq!(backoff_delay(base, 10), Duration::from_secs(240));
+    }
+    #[test]
+    fn gitops_refuses_jobs_before_reporting_a_successful_app_sync() {
+        for signed in [false, true] {
+            let mut repository = SigningRepo::new();
+            let sha = repository.commit_apps(
+                "[app.web]\nimage = 'web:v1'\n[job.migrate]\nimage = 'migrate:v1'\n",
+                signed,
+            );
+            let mut config = repository.config();
+            config.require_signed_commits = signed;
+            for last_applied in [None, Some(sha.as_str())] {
+                let outcome = execute_sync(
+                    &repository.repo,
+                    &config,
+                    &HashMap::new(),
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &[],
+                    last_applied,
+                );
+                let SyncResult::Failure { error } = &outcome.result else {
+                    panic!(
+                        "signed={signed}, last={last_applied:?}: unsupported jobs were silently accepted: {:?}",
+                        outcome.result
+                    );
+                };
+                assert!(error.contains("GitOps does not reconcile jobs"), "{error}");
+                assert!(error.contains("job.migrate"), "{error}");
+                assert!(
+                    error.contains("relish apply") && error.contains("relish batch"),
+                    "{error}"
+                );
+                assert!(
+                    outcome.changes.is_empty(),
+                    "partial app changes escaped: {:?}",
+                    outcome.changes
+                );
+                assert!(outcome.diff_summary.is_none());
+                if signed {
+                    assert_eq!(outcome.commit.unwrap().signature, SignatureStatus::Verified);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gitops_refuses_migration_prerequisites_and_standalone_jobs() {
+        for manifest in [
+            "[job.migrate]\nimage = 'migrate:v1'\n",
+            "[app.web]\nimage = 'web:v1'\n[job.migrate]\nimage = 'migrate:v1'\nrun_before = ['app.web']\n",
+            "[job.migrate]\nimage = 'migrate:v1'\nschedule = '* * * * *'\n",
+        ] {
+            let mut repository = SigningRepo::new();
+            // A job-only watched tree must also refuse, even with no app diff.
+            std::fs::remove_file(repository.work.join("base.toml")).unwrap();
+            repository.commit_apps(manifest, false);
+            let outcome = repository.sync(None);
+            let SyncResult::Failure { error } = &outcome.result else {
+                panic!(
+                    "unsupported migration/jobs reported success: {:?}",
+                    outcome.result
+                );
+            };
+            assert!(
+                error.contains("GitOps does not reconcile jobs") && error.contains("job.migrate"),
+                "{error}"
+            );
+            assert!(outcome.changes.is_empty());
+            assert!(outcome.diff_summary.is_none());
+        }
     }
 }

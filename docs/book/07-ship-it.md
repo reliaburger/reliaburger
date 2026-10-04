@@ -742,7 +742,7 @@ Two tests pin the behaviour down. The first deploys an app whose `create` sleeps
 
 ## One config, two front doors, one path
 
-A Reliaburger config file describes more than apps. It can declare namespaces (with resource budgets), permissions (who can do what), jobs, and image builds — all in the same TOML. And there are two ways to get that file into the cluster. You can run `relish apply` by hand, or you can commit it to a git repo and let the Lettuce GitOps engine sync it. Same file, two front doors.
+A Reliaburger config file describes more than apps. It can declare namespaces (with resource budgets), permissions (who can do what), jobs, and image builds — all in the same TOML. Apps, namespaces and permissions have two routes into desired state: manual `relish apply` and the Lettuce GitOps engine. Manual apply additionally executes jobs. GitOps refuses a tree containing any job before it writes desired state; sharing the configuration format does not give Lettuce a job execution path.
 
 Here's the question that keeps you up at night: do those two doors lead to the same room? If `relish apply` writes an app but silently drops the namespace, while GitOps writes the namespace but mangles the app's identity, then "declarative" is a lie. The cluster's state depends on *how* you applied the config, not *what's in it*. That's the worst kind of bug, because it only shows up when someone switches from one door to the other and wonders why their quota vanished.
 

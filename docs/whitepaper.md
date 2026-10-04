@@ -249,7 +249,7 @@ schedule = "0 3 * * *"
 
 **High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions. The bin-packing allocator ships; the full delegated dispatch-and-completion pipeline is a Phase 12 deliverable (see [design/scheduler-meat.md](design/scheduler-meat.md) §5.2). On-demand and scheduled Jobs run today.
 
-**Build jobs:** Jobs can build container images and push them to the Pickle registry via the `pickle://` scheme. Build jobs require a `destination` field (a `pickle://` reference) that scopes registry access. Lettuce injects `${GIT_SHA}` for tag synchronisation.
+**Image builds:** `relish build` builds container images from `[build.*]` declarations and pushes them to Pickle. A `destination` field (a `pickle://` reference) scopes registry access. This is a manual build path; Lettuce does not dispatch build jobs or inject `${GIT_SHA}` into their tags.
 
 > For batch scheduling and build job details, see [design/scheduler-meat.md](design/scheduler-meat.md) and [design/registry-pickle.md](design/registry-pickle.md).
 
@@ -662,6 +662,8 @@ Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the n
 Lettuce is Reliaburger's built-in GitOps engine, replacing ArgoCD and Flux with a sync loop compiled directly into the Bun binary.
 
 CLI compilation and Lettuce share the resolver for inherited `_defaults.toml` values and directory-derived namespaces. Lettuce resolves the configured watch directory from the verified Git commit; defaults outside that directory are not inherited. Malformed input or an unrepresentable namespace collision refuses the whole sync before desired-state changes. GitOps refuses duplicate resource definitions, while CLI compilation reports deterministic overrides within a namespace.
+
+Lettuce reconciles apps, namespaces and permissions. Any job declaration, including a scheduled job or a `run_before` migration, refuses the entire validated commit before desired-state changes. The failed sync leaves the previous applied SHA intact. Execute migration jobs and their dependent apps together through `relish apply`, or submit batch work through `relish batch`. GitOps job execution awaits a durable revision-to-run identity and dispatch path.
 
 **Configuration:**
 

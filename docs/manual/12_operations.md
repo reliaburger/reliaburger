@@ -170,6 +170,14 @@ namespace, and defaults outside it are not inherited. A workload's explicit
 namespace wins. GitOps reconciles deletions too: delete an app from the
 repository and it goes from the cluster.
 
+GitOps reconciles apps, namespaces and permissions. Any `[job.*]` declaration,
+including a cron registration or a `run_before = ["app.web"]` migration, refuses
+the whole commit before desired-state writes. The failed sync names the jobs;
+the applied SHA stays at the previous successful commit. Use `relish apply`
+with the migration and dependent app in the same manifest to execute their
+ordering, or `relish batch` for batch work. Lettuce has no durable job identity
+or dispatch path tied to a Git revision yet.
+
 ```toml
 [gitops]
 repo = "https://deploy-bot:TOKEN@git.example.com/org/infra.git"
