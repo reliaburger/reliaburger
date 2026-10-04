@@ -715,11 +715,11 @@ There is **no `[service_discovery]` config section**. Onion's core sizing is fix
 | Constant | Value | Where |
 |----------|-------|-------|
 | VIP range | `127.128.0.0/16` (`VIP_PREFIX 0x7F800000` / `VIP_MASK 0xFFFF0000`) | `ebpf/onion_common.h`, `src/onion/vip.rs` |
-| Backends per service | `MAX_BACKENDS = 32` | BPF `backend_value` struct |
+| Kernel backend pool per service and consumer | `MAX_BACKENDS = 32` | BPF `backend_value` struct |
 | Services (map max entries) | `65534` (matches the /16) | BPF map definition |
 | Firewall map max entries | `262144` | BPF map definition |
 
-Expanding the VIP range or the backend cap means changing the constant and recompiling (and, for the range, a rolling restart) — it is **not** a live cluster-config change today. A `[service_discovery]` section that would make these runtime-tunable is a possible future addition, not current behaviour.
+Expanding the VIP range or the kernel backend pool means changing the constant and recompiling (and, for the range, a rolling restart) — it is **not** a live cluster-config change today. A `[service_discovery]` section that would make these runtime-tunable is a possible future addition, not current behaviour.
 
 ### Node-level (`node.toml`)
 
@@ -782,13 +782,13 @@ These are embedded in the `reliaburger` binary and extracted to disk at install 
 
 ### 7.3 BPF Map Capacity Limits
 
-**Scenario:** The number of distinct services exceeds `max_services` (default 65,534), or a single service exceeds `MAX_BACKENDS` (default 32 backends).
+**Scenario:** The number of distinct services exceeds the BPF map capacity (65,534), or a service has more backends than one consumer's kernel pool can hold (`MAX_BACKENDS = 32`).
 
 **Impact for service limit:** `bpf_map_update_elem()` returns `-E2BIG`. Bun logs an error, fires an alert, and the new service is not discoverable via Onion.
 
-**Impact for backend limit:** Bun silently drops backends beyond the 32nd. This is logged as a warning. The eBPF program only sees the first 32 backends.
+**Behaviour for an oversized service:** The userspace catalogue retains every backend and publishes the complete view to DNS and ingress. Each node chooses a deterministic kernel pool of at most 32 backends, preferring healthy local endpoints and then healthy remote ones. Stable consumer node identity distributes remote choices across nodes; catalogue order does not choose the pool. A client using one node's kernel map reaches that selected pool, not every replica at once. An oversized service cannot make an unrelated service fail catalogue validation.
 
-**Mitigation:** Monitor service and backend counts via Mayo metrics (`onion_services_total`, `onion_backends_per_service_max`). Increase `max_services` or `max_backends_per_service` in cluster configuration if approaching limits. The backend limit of 32 is sufficient for the vast majority of services -- services needing more replicas than 32 are rare, and the operator is warned well in advance.
+**Sizing:** The kernel array remains fixed at 32 entries; there is no runtime `max_backends_per_service` setting. Scaling beyond 32 retains the full catalogue without expanding that array. Changing the kernel pool or service map capacity requires updating the compile-time constants and rebuilding. It is not a live cluster-config change.
 
 ### 7.4 Backend Rescheduled While Bun Offline
 
@@ -1137,10 +1137,10 @@ IPv6 is split: the **firewall/egress** hooks (`connect6`, `sendmsg6`) ship and a
 
 - **Question:** Is 65,534 services (matching the /16 VIP range) sufficient? How many clusters will approach this limit?
 - **Analysis:** 65,534 unique app names is a very large number. Most clusters run hundreds to low thousands of distinct services. The limit can be raised to ~4 million by expanding the VIP range to /10, but this requires a rolling restart.
-- **Question:** Is 32 backends per service sufficient? Services with >32 replicas are uncommon but exist (large web tiers, worker pools).
+- **Question:** Is a 32-backend kernel pool per service and consumer sufficient? The catalogue can hold larger services, but a client on one node reaches only its selected pool.
 - **Option A:** Increase `MAX_BACKENDS` to 64 or 128. Cost: larger `backend_value` struct (each additional slot costs 8 bytes in the map).
 - **Option B:** Use a BPF array-of-maps or hash-of-maps to support variable-length backend lists. Cost: additional BPF map indirection, more complex eBPF program logic.
-- **Current position:** 32 backends is the default. The constant is configurable at compile time. Option A (increase to 64) is the likely first step if needed.
+- **Current position:** Keep the complete catalogue and bounded deterministic pools of 32 per consumer, without changing the BPF ABI. Healthy/local preference and stable consumer identity choose those pools. Expanding the array or introducing another map structure remains a future kernel dataplane change, rather than a limit on the catalogue or replica count.
 
 ### 13.4 Multi-Port Services
 

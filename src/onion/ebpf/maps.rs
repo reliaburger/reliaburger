@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 /// BPF map operations for Onion service discovery.
 ///
 /// When the `ebpf` feature is enabled, wraps aya map handles and
@@ -33,11 +34,20 @@ pub enum BpfMapError {
 /// Manages BPF map synchronisation from the userspace `ServiceMap`.
 pub struct BpfServiceMap {
     initialised: bool,
+    consumer: String,
 }
 
 impl BpfServiceMap {
     pub fn new() -> Self {
-        Self { initialised: false }
+        Self::for_consumer("")
+    }
+
+    /// Stable consumer identity spreads oversized remote pools across nodes.
+    pub fn for_consumer(consumer: &str) -> Self {
+        Self {
+            initialised: false,
+            consumer: consumer.to_owned(),
+        }
     }
 
     #[cfg(feature = "ebpf")]
@@ -74,7 +84,7 @@ impl BpfServiceMap {
                 port: entry.port.to_be(),
                 _pad: 0,
             };
-            let backend_value = service_entry_to_backend_value(entry);
+            let backend_value = service_entry_to_backend_value_for_consumer(entry, &self.consumer);
 
             if let Err(source) = backend_map.insert(backend_key, backend_value, 0)
                 && first_error.is_none()
@@ -103,7 +113,7 @@ impl BpfServiceMap {
                 port: entry.port.to_be(),
                 _pad: 0,
             };
-            let _value = service_entry_to_backend_value(entry);
+            let _value = service_entry_to_backend_value_for_consumer(entry, &self.consumer);
         }
         self.initialised = true;
     }
@@ -124,7 +134,7 @@ impl BpfServiceMap {
             port: port.to_be(),
             _pad: 0,
         };
-        let value = service_entry_to_backend_value(entry);
+        let value = service_entry_to_backend_value_for_consumer(entry, &self.consumer);
         backend_map
             .insert(key, value, 0)
             .map_err(|source| BpfMapError::Operation {
@@ -226,6 +236,38 @@ impl Default for BpfServiceMap {
 
 /// Convert a `ServiceEntry` into a `BackendValue` for the BPF map.
 pub fn service_entry_to_backend_value(entry: &super::super::types::ServiceEntry) -> BackendValue {
+    service_entry_to_backend_value_for_consumer(entry, "")
+}
+
+/// The full catalogue remains available to DNS and ingress. A consumer's BPF
+/// array holds at most 32, with healthy local endpoints first and stable
+/// rendezvous scores distributing the remaining remote choices across nodes.
+pub fn service_entry_to_backend_value_for_consumer(
+    entry: &super::super::types::ServiceEntry,
+    consumer: &str,
+) -> BackendValue {
+    let mut selected: Vec<_> = entry.backends.iter().collect();
+    if selected.len() > MAX_BACKENDS {
+        selected.sort_by_cached_key(|backend| {
+            let mut score = Sha256::new();
+            for part in [
+                consumer,
+                &entry.namespace,
+                &entry.app_name,
+                &backend.instance_id,
+            ] {
+                score.update((part.len() as u64).to_be_bytes());
+                score.update(part.as_bytes());
+            }
+            score.update(backend.node_ip.octets());
+            score.update(backend.host_port.to_be_bytes());
+            (
+                (!backend.healthy, !backend.local),
+                <[u8; 32]>::from(score.finalize()),
+            )
+        });
+        selected.truncate(MAX_BACKENDS);
+    }
     let mut backends = [BackendEndpoint {
         host_ip: 0,
         host_port: 0,
@@ -234,7 +276,7 @@ pub fn service_entry_to_backend_value(entry: &super::super::types::ServiceEntry)
     }; MAX_BACKENDS];
 
     let count = entry.backends.len().min(MAX_BACKENDS);
-    for (i, backend) in entry.backends.iter().take(MAX_BACKENDS).enumerate() {
+    for (i, backend) in selected.iter().enumerate() {
         backends[i] = BackendEndpoint {
             host_ip: ip_to_network_byte_order(backend.node_ip),
             host_port: backend.host_port.to_be(),
@@ -363,5 +405,69 @@ mod tests {
             .unwrap()
             .trim_end_matches('\0');
         assert_eq!(name, "redis.internal");
+    }
+    fn oversized_entry() -> ServiceEntry {
+        let mut entry = test_entry();
+        entry.backends = (0..96)
+            .map(|index| BackendInstance {
+                instance_id: format!("redis-{index}"),
+                node_ip: Ipv4Addr::new(10, 0, 1, index + 1),
+                host_port: 30000 + index as u16,
+                healthy: true,
+                local: false,
+            })
+            .collect();
+        entry
+    }
+
+    fn pool_addresses(pool: &BackendValue) -> Vec<(u32, u16)> {
+        pool.backends[..pool.count as usize]
+            .iter()
+            .map(|backend| (backend.host_ip, backend.host_port))
+            .collect()
+    }
+
+    #[test]
+    fn oversized_dataplane_pools_are_stable_and_distributed_by_consumer_identity() {
+        let mut entry = oversized_entry();
+        let first = service_entry_to_backend_value_for_consumer(&entry, "consumer-a");
+        let second = service_entry_to_backend_value_for_consumer(&entry, "consumer-b");
+        assert_eq!(first.count as usize, MAX_BACKENDS);
+        assert_eq!(second.count as usize, MAX_BACKENDS);
+        assert_ne!(pool_addresses(&first), pool_addresses(&second));
+        entry.backends.reverse();
+        let reordered = service_entry_to_backend_value_for_consumer(&entry, "consumer-a");
+        assert_eq!(pool_addresses(&first), pool_addresses(&reordered));
+        assert!(
+            first.backends.iter().all(|backend| backend.host_ip != 0
+                && backend.host_port != 0
+                && backend.healthy == 1)
+        );
+    }
+
+    #[test]
+    fn oversized_dataplane_pools_keep_healthy_local_endpoints_and_avoid_failed_slots() {
+        let mut entry = oversized_entry();
+        entry.backends[95].local = true;
+        let local = (
+            ip_to_network_byte_order(entry.backends[95].node_ip),
+            entry.backends[95].host_port.to_be(),
+        );
+        entry.backends[0].healthy = false;
+        entry.backends[0].local = true;
+        let failed = (
+            ip_to_network_byte_order(entry.backends[0].node_ip),
+            entry.backends[0].host_port.to_be(),
+        );
+        let pool = service_entry_to_backend_value_for_consumer(&entry, "consumer-a");
+        assert_eq!(pool.count as usize, MAX_BACKENDS);
+        assert_eq!(pool.backends[0].local, 1);
+        assert_eq!(pool_addresses(&pool)[0], local);
+        assert!(!pool_addresses(&pool).contains(&failed));
+        assert_eq!(
+            entry.backends.len(),
+            96,
+            "pool selection must not mutate the published catalogue"
+        );
     }
 }
