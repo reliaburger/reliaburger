@@ -1136,3 +1136,31 @@ A registry request used to call the synchronous Argon2 verifier directly. The to
 Pickle now uses the same asynchronous verifier as the API and browser login. It rejects malformed tokens before hashing, waits for one of four process-wide permits, and runs the expensive verification with `spawn_blocking`. A permit is a borrowed place in that shared budget; holding it inside the blocking closure keeps the place occupied until the hash really finishes, even if the HTTP caller disconnects.
 
 The regression holds every verification permit and sends real registry reads and uploads, with both Bearer and TLS Basic credentials. Each request waits until admission opens, while malformed credentials return 401 immediately. Role and repository scope checks still happen after authentication. A different HTTP port doesn't buy a second CPU budget.
+
+### A shared digest needs repository authority
+
+A content-addressed store shares identical bytes across repositories. That saves
+space, but physical presence cannot establish who may use those bytes. A scoped
+publisher used to be able to name another repository's blob in its own manifest,
+then read the newly referenced content through its ordinary repository grant.
+
+Publication now checks every configuration, layer and index child against the
+destination repository. A current catalogue reference proves authority. A
+completed upload proves it too: after verifying the complete payload's digest,
+the blocking transaction writes a receipt for the repository and its exact lease
+generation before acknowledging success. The receipt filename hashes that
+identity, so repository strings cannot become filesystem paths. Missing or
+unreadable evidence never confers authority.
+
+Scoped blob probes use the same rule. If HEAD reported global presence while
+publication required a destination upload, a normal client would skip the upload
+and fail later. Returning 404 prompts it to send the bytes it owns. Shared storage
+still keeps one final copy, and an existing catalogue reference lets subsequent
+pushes reuse it. Bare blobs from the old format need another upload before scoped
+publication; catalogue references remain valid after restart.
+
+Collecting or rejecting corrupt bytes removes their receipts. Retiring a leased
+repository removes only that generation's evidence, preserving other repositories'
+authority and shared content. The regressions cover foreign configurations,
+layers and index children, successful ordinary pushes, persisted receipts,
+failed digest checks, receipt-write failures and exact-generation retirement.

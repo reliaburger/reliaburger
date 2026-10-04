@@ -239,6 +239,7 @@ impl BlobStore {
         let actual = match sha256_file(&path) {
             Ok(actual) => actual,
             Err(PickleError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.delete_blob(digest)?;
                 return Ok(false);
             }
             Err(error) => return Err(error),
@@ -247,19 +248,81 @@ impl BlobStore {
             return Ok(true);
         }
         // Corrupt: remove it so the next pull refetches clean bytes.
-        std::fs::remove_file(&path)?;
+        self.delete_blob(digest)?;
         Ok(false)
     }
 
-    /// Delete a blob.
+    /// An upload receipt identifies the exact repository and, for test-owned
+    /// repositories, its current lease generation. Hash the encoded identity
+    /// for the filename; repository strings never become filesystem paths.
+    fn repository_upload_evidence(
+        &self,
+        digest: &Digest,
+        repository: &str,
+        lease: Option<&str>,
+    ) -> Result<(PathBuf, Vec<u8>), PickleError> {
+        let identity = serde_json::to_vec(&(repository, lease)).map_err(std::io::Error::other)?;
+        let key = compute_sha256(&identity);
+        let directory = self
+            .blob_path(digest)
+            .parent()
+            .ok_or_else(|| std::io::Error::other("blob has no parent directory"))?
+            .join("repositories");
+        Ok((directory.join(key.hex()), identity))
+    }
+
+    pub(super) fn has_repository_upload(
+        &self,
+        digest: &Digest,
+        repository: &str,
+        lease: Option<&str>,
+    ) -> Result<bool, PickleError> {
+        let (path, identity) = self.repository_upload_evidence(digest, repository, lease)?;
+        match std::fs::read(path) {
+            Ok(stored) => Ok(stored == identity),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Retirement removes only this generation's evidence. Shared blob bytes
+    /// and other repositories' upload receipts remain available.
+    pub(super) fn retire_repository_uploads(
+        &self,
+        repository: &str,
+        lease: &str,
+    ) -> Result<(), PickleError> {
+        for digest in self.list_blobs()? {
+            let (path, _) = self.repository_upload_evidence(&digest, repository, Some(lease))?;
+            match std::fs::remove_file(&path) {
+                Ok(()) => std::fs::File::open(
+                    path.parent()
+                        .ok_or_else(|| std::io::Error::other("receipt has no parent directory"))?,
+                )?
+                .sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete blob payload and any upload authority, including receipts left
+    /// behind by an interrupted or externally missing payload removal.
     pub fn delete_blob(&self, digest: &Digest) -> Result<(), PickleError> {
         let path = self.blob_path(digest);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            // Clean up empty parent directories
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::remove_dir(parent);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(parent) = path.parent() {
+            match std::fs::remove_dir_all(parent.join("repositories")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
+            let _ = std::fs::remove_dir(parent);
         }
         Ok(())
     }
@@ -318,7 +381,51 @@ impl BlobStore {
         writer: Option<tokio::sync::OwnedSemaphorePermit>,
         repository_writer: Option<super::lease::RepositoryReadGuard>,
     ) -> Result<(), PickleError> {
+        self.complete_upload_with_repository(
+            upload_id,
+            expected_digest,
+            writer,
+            repository_writer,
+            None,
+        )
+        .await
+    }
+
+    /// A public upload proves its bytes for one admitted repository. Commit
+    /// evidence before acknowledging success, retaining writer fencing even
+    /// when the HTTP caller disconnects.
+    pub(super) async fn complete_repository_upload_guarded(
+        &self,
+        upload_id: &str,
+        expected_digest: &Digest,
+        writer: tokio::sync::OwnedSemaphorePermit,
+        access: super::lease::RegistryWriteAccess,
+        repository: &str,
+    ) -> Result<(), PickleError> {
+        self.complete_upload_with_repository(
+            upload_id,
+            expected_digest,
+            Some(writer),
+            access.guard,
+            Some((repository.to_owned(), access.lease_id)),
+        )
+        .await
+    }
+
+    async fn complete_upload_with_repository(
+        &self,
+        upload_id: &str,
+        expected_digest: &Digest,
+        writer: Option<tokio::sync::OwnedSemaphorePermit>,
+        repository_writer: Option<super::lease::RepositoryReadGuard>,
+        repository: Option<(String, Option<String>)>,
+    ) -> Result<(), PickleError> {
         validate_upload_id(upload_id)?;
+        let receipt = repository
+            .map(|(repository, lease)| {
+                self.repository_upload_evidence(expected_digest, &repository, lease.as_deref())
+            })
+            .transpose()?;
         let upload = self.upload_path(upload_id);
         let destination = self.blob_path(expected_digest);
         let expected = expected_digest.clone();
@@ -349,6 +456,14 @@ impl BlobStore {
             std::fs::create_dir_all(parent)?;
             std::fs::rename(&upload, &destination)?;
             std::fs::File::open(parent)?.sync_all()?;
+            if let Some((path, identity)) = receipt {
+                let directory = path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("receipt has no parent directory"))?;
+                std::fs::create_dir_all(directory)?;
+                crate::sesame::identity::atomic_write_mode(&path, &identity, Some(0o600))?;
+                std::fs::File::open(parent)?.sync_all()?;
+            }
             Ok(())
         })
         .await
@@ -487,6 +602,140 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
         (store, dir)
+    }
+
+    async fn repository_upload(
+        store: &BlobStore,
+        bytes: &[u8],
+        repository: &str,
+        lease: Option<&str>,
+        expected: &Digest,
+    ) -> Result<(), PickleError> {
+        let upload = store.initiate_upload().await?;
+        store.write_upload_chunk(&upload, bytes).await?;
+        let writer = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        store
+            .complete_repository_upload_guarded(
+                &upload,
+                expected,
+                writer,
+                crate::pickle::lease::RegistryWriteAccess {
+                    lease_id: lease.map(str::to_owned),
+                    guard: None,
+                },
+                repository,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn repository_upload_evidence_survives_restart_and_is_not_global() {
+        let (store, directory) = test_store();
+        let digest = compute_sha256(b"shared");
+        repository_upload(&store, b"shared", "team-a/web", None, &digest)
+            .await
+            .unwrap();
+        let restarted = BlobStore::new(directory.path());
+        assert!(
+            restarted
+                .has_repository_upload(&digest, "team-a/web", None)
+                .unwrap()
+        );
+        assert!(
+            !restarted
+                .has_repository_upload(&digest, "team-b/web", None)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_digest_completion_never_grants_existing_blob_authority() {
+        let (store, _directory) = test_store();
+        let digest = compute_sha256(b"private bytes");
+        store.write_blob(b"private bytes", &digest).unwrap();
+        assert!(
+            repository_upload(&store, b"different bytes", "team-a/web", None, &digest)
+                .await
+                .is_err()
+        );
+        assert!(
+            !store
+                .has_repository_upload(&digest, "team-a/web", None)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_evidence_failure_prevents_successful_upload_acknowledgement() {
+        let (store, _directory) = test_store();
+        let digest = compute_sha256(b"data");
+        let (receipt, _) = store
+            .repository_upload_evidence(&digest, "team-a/web", None)
+            .unwrap();
+        std::fs::create_dir_all(receipt).unwrap();
+        assert!(
+            repository_upload(&store, b"data", "team-a/web", None, &digest)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_forgets_only_the_exact_repository_generation() {
+        let (store, _directory) = test_store();
+        let digest = compute_sha256(b"shared");
+        for (repo, lease) in [("rbtest-a/web", "run-a"), ("rbtest-b/web", "run-b")] {
+            repository_upload(&store, b"shared", repo, Some(lease), &digest)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !store
+                .has_repository_upload(&digest, "rbtest-a/web", Some("replacement"))
+                .unwrap()
+        );
+        store
+            .retire_repository_uploads("rbtest-a/web", "run-a")
+            .unwrap();
+        assert!(
+            !store
+                .has_repository_upload(&digest, "rbtest-a/web", Some("run-a"))
+                .unwrap()
+        );
+        assert!(
+            store
+                .has_repository_upload(&digest, "rbtest-b/web", Some("run-b"))
+                .unwrap()
+        );
+        assert_eq!(store.read_blob(&digest).unwrap(), b"shared");
+    }
+
+    #[tokio::test]
+    async fn collection_and_corruption_remove_repository_upload_evidence() {
+        let (store, _directory) = test_store();
+        let digest = compute_sha256(b"data");
+        repository_upload(&store, b"data", "team-a/web", None, &digest)
+            .await
+            .unwrap();
+        store.delete_blob(&digest).unwrap();
+        assert!(
+            !store
+                .has_repository_upload(&digest, "team-a/web", None)
+                .unwrap()
+        );
+        repository_upload(&store, b"data", "team-a/web", None, &digest)
+            .await
+            .unwrap();
+        std::fs::write(store.blob_path(&digest), b"corrupt").unwrap();
+        assert!(!store.revalidate_blob(&digest).unwrap());
+        assert!(
+            !store
+                .has_repository_upload(&digest, "team-a/web", None)
+                .unwrap()
+        );
     }
 
     #[test]
