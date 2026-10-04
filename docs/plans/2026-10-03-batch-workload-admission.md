@@ -24,3 +24,12 @@ The two previously recorded lifecycle failures remain tracked in #555; the
 cause of these observations is not established here. Doctests, CI-script and
 ignored-owner checks, and the real cluster gate pass. The full local `make ci`
 result is therefore not green.
+
+Remote verification of original head `0f4ef1ee` failed in one portable Linux
+case: `graceful_restart_does_not_reingest_a_retired_instances_capture_file`
+reported "follow ended early" at `process.rs:1568`; the other 5,478 cases passed.
+The original failed job log is retained, and #555 records it. The fixture is
+file-backed, so the separate memory-reader capture repair is not claimed to
+resolve it. The branch inherited train `7b7575b7` through a normal merge without
+rewriting its verified admission commit; republishing waits for qualification
+of the separately identified final-file-rescan boundary.
