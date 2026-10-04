@@ -88,9 +88,18 @@ pub struct BatchSubmitRequest {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchSubmitResponse {
+    pub executions: BTreeMap<String, String>,
     pub batch_id: u64,
     pub assigned: usize,
     pub unschedulable: Vec<String>,
+}
+
+/// Trusted logical label for exactly one configured runtime execution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchExecutionLabel {
+    pub name: String,
+    pub namespace: String,
 }
 
 /// Node-to-node dispatch: run these jobs, report to the callback.
@@ -101,11 +110,15 @@ pub struct BatchRunRequest {
     /// reports; `None` when the leader runs its own share in-process.
     pub callback_base_url: Option<String>,
     pub jobs: Vec<BatchJobSubmission>,
+    #[serde(default)]
+    pub execution_labels: BTreeMap<String, BatchExecutionLabel>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchReportRequest {
     pub job_name: String,
+    pub namespace: String,
+    pub exit_code: Option<i32>,
     /// `"completed"`, `"failed"` or `"running"`.
     pub status: String,
 }
@@ -123,7 +136,11 @@ pub struct BatchReportRequest {
 pub fn resolve_job_namespaces(
     mut jobs: Vec<BatchJobSubmission>,
 ) -> Result<Vec<BatchJobSubmission>, String> {
+    let mut names = std::collections::HashSet::new();
     for job in &mut jobs {
+        if !names.insert(job.name.clone()) {
+            return Err(format!("duplicate batch job name {:?}", job.name));
+        }
         let effective = match (&job.namespace, &job.spec.namespace) {
             (Some(a), Some(b)) if a != b => {
                 return Err(format!(
@@ -139,6 +156,67 @@ pub fn resolve_job_namespaces(
         job.spec.namespace = Some(effective);
     }
     Ok(jobs)
+}
+
+/// Admit the complete group before either tracker registration or agent dispatch.
+async fn validate_batch_jobs(
+    state: &ApiState,
+    jobs: &[BatchJobSubmission],
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    if jobs.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "batch has no jobs".into()));
+    }
+    if headers.contains_key("x-reliaburger-test-lease") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "batch jobs do not support test leases".into(),
+        ));
+    }
+    // Batch dispatch has no application-lease ownership registration. A
+    // service credential cannot turn a reserved namespace/image into ordinary work.
+    if jobs
+        .iter()
+        .any(|job| crate::testkit::lease::valid_test_namespace(job.namespace()))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "batch jobs cannot use test lease namespaces without lease ownership".into(),
+        ));
+    }
+    crate::testkit::lease::authorise_image_references(
+        jobs.iter().filter_map(|job| job.spec.image.as_deref()),
+        None,
+    )
+    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    if jobs
+        .iter()
+        .any(|job| job.spec.schedule.is_some() || !job.spec.run_before.is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "batch jobs cannot declare schedule or run_before; use ordinary apply".into(),
+        ));
+    }
+    let config = Config {
+        job: jobs
+            .iter()
+            .map(|job| (job.name.clone(), job.spec.clone()))
+            .collect(),
+        ..Config::default()
+    };
+    let known_namespaces = match &state.council {
+        Some(council) => council
+            .desired_state()
+            .await
+            .namespaces
+            .into_keys()
+            .collect(),
+        None => Vec::new(),
+    };
+    config
+        .validate_against(&known_namespaces)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -216,9 +294,9 @@ fn map_report_error(error: ReportError) -> BatchRejection {
         ReportError::UnknownBatch { .. } | ReportError::UnknownJob { .. } => {
             BatchRejection::NotFound(error.to_string())
         }
-        ReportError::IllegalTransition { .. } | ReportError::NotReportable { .. } => {
-            BatchRejection::Conflict(error.to_string())
-        }
+        ReportError::IllegalTransition { .. }
+        | ReportError::NotReportable { .. }
+        | ReportError::UnprovenExit => BatchRejection::Conflict(error.to_string()),
     }
 }
 
@@ -227,17 +305,34 @@ fn map_report_error(error: ReportError) -> BatchRejection {
 /// the in-memory tracker standalone.
 pub(crate) async fn register_batch(state: &ApiState, record: BatchRecord) -> Result<u64, String> {
     match &state.council {
-        Some(council) => match council
-            .write(crate::council::types::RaftRequest::BatchRegister { batch: record })
-            .await
-        {
-            Ok(crate::council::types::CouncilResponse::BatchRegistered { batch_id }) => {
-                Ok(batch_id)
+        Some(council) => {
+            let desired = council.desired_state().await;
+            desired.batch_state.preflight_registration(&record)?;
+            if record.jobs.iter().any(|job| {
+                desired.apps.contains_key(&crate::meat::types::AppId::new(
+                    &job.execution_name,
+                    &job.namespace,
+                ))
+            }) {
+                return Err("execution identity already belongs to an app".into());
             }
-            Ok(other) => Err(format!("unexpected raft response: {other:?}")),
-            Err(e) => Err(format!("raft register failed: {e}")),
-        },
-        None => Ok(state.batch_tracker.lock().await.register(record).0),
+            match council
+                .write(crate::council::types::RaftRequest::BatchRegister { batch: record })
+                .await
+            {
+                Ok(crate::council::types::CouncilResponse::BatchRegistered { batch_id }) => {
+                    Ok(batch_id)
+                }
+                Ok(other) => Err(format!("unexpected raft response: {other:?}")),
+                Err(e) => Err(format!("raft register failed: {e}")),
+            }
+        }
+        None => state
+            .batch_tracker
+            .lock()
+            .await
+            .register(record)
+            .map(|id| id.0),
     }
 }
 
@@ -261,19 +356,24 @@ pub(crate) async fn report_batch_job(
     state: &ApiState,
     batch_id: u64,
     job_name: &str,
+    namespace: &str,
     status: JobStatus,
+    exit_code: Option<i32>,
 ) -> Result<ReportOutcome, BatchRejection> {
     let Some(council) = &state.council else {
         return state
             .batch_tracker
             .lock()
             .await
-            .report(batch_id, job_name, status)
+            .report(batch_id, job_name, namespace, status, exit_code)
             .map_err(map_report_error);
     };
 
     if !council.is_leader().await {
-        return forward_report_to_leader(state, council, batch_id, job_name, status).await;
+        return forward_report_to_leader(
+            state, council, batch_id, job_name, namespace, status, exit_code,
+        )
+        .await;
     }
 
     // Pre-validate against the leader's (authoritative) replica so the
@@ -290,7 +390,7 @@ pub(crate) async fn report_batch_job(
         ));
     };
     let mut probe = record;
-    match probe.report(job_name, status) {
+    match probe.report(job_name, namespace, status, exit_code) {
         Err(e) => return Err(map_report_error(e)),
         Ok(ReportOutcome::Duplicate) => return Ok(ReportOutcome::Duplicate),
         Ok(ReportOutcome::Applied) => {}
@@ -299,7 +399,9 @@ pub(crate) async fn report_batch_job(
         .write(crate::council::types::RaftRequest::BatchJobUpdate {
             batch_id,
             job_name: job_name.to_string(),
+            namespace: namespace.to_string(),
             status,
+            exit_code,
         })
         .await
     {
@@ -321,7 +423,9 @@ async fn forward_report_to_leader(
     council: &crate::council::CouncilNode,
     batch_id: u64,
     job_name: &str,
+    namespace: &str,
     status: JobStatus,
+    exit_code: Option<i32>,
 ) -> Result<ReportOutcome, BatchRejection> {
     let Some(leader_url) = super::api::leader_api_url(state, council).await else {
         return Err(BatchRejection::Unavailable(
@@ -330,6 +434,8 @@ async fn forward_report_to_leader(
     };
     let body = BatchReportRequest {
         job_name: job_name.to_string(),
+        namespace: namespace.to_string(),
+        exit_code,
         status: status_to_wire(status).to_string(),
     };
     let mut request = state
@@ -395,15 +501,24 @@ pub enum Reporter {
 }
 
 impl Reporter {
-    async fn report(&self, batch_id: u64, job_name: &str, completed: bool) {
-        let status = if completed {
+    async fn report(&self, batch_id: u64, job_name: &str, namespace: &str, exit_code: i32) {
+        let status = if exit_code == 0 {
             JobStatus::Completed
         } else {
             JobStatus::Failed
         };
         match self {
             Reporter::Leader(state) => {
-                if let Err(e) = report_batch_job(state, batch_id, job_name, status).await {
+                if let Err(e) = report_batch_job(
+                    state,
+                    batch_id,
+                    job_name,
+                    namespace,
+                    status,
+                    Some(exit_code),
+                )
+                .await
+                {
                     eprintln!("bun: batch {batch_id}: local report for {job_name} rejected: {e:?}");
                 }
             }
@@ -415,6 +530,8 @@ impl Reporter {
                 let url = format!("{base_url}/v1/batch/{batch_id}/report");
                 let body = BatchReportRequest {
                     job_name: job_name.to_string(),
+                    namespace: namespace.to_string(),
+                    exit_code: Some(exit_code),
                     status: status_to_wire(status).to_string(),
                 };
                 for attempt in 0..CALLBACK_ATTEMPTS {
@@ -449,93 +566,110 @@ impl Reporter {
     }
 }
 
-/// Map instance statuses to a job outcome: `Some(true)` completed,
-/// `Some(false)` failed, `None` still running/unknown.
+/// Map instance statuses to a job outcome: `Some(0)` completed,
+/// `Some(1)` failed, `None` still running/unknown.
 ///
 /// `stopped` alone is ambiguous: a failing job passes through it
 /// between retries (any exit maps to Stopped; the code is tracked
 /// separately). Success is stopped with exit 0; a non-zero stop is
 /// backoff, not terminal — the agent marks the instance `failed` once
 /// retries exhaust. Runtimes without exit codes (runc, review H13)
-/// report `None`: treat their stops as success rather than hanging.
-fn job_outcome(statuses: &[InstanceStatus], name: &str, namespace: &str) -> Option<bool> {
-    for status in statuses
+/// report `None`: preserve an unknown outcome until positive exit evidence exists.
+fn job_outcome(statuses: &[InstanceStatus], name: &str, namespace: &str) -> Option<i32> {
+    let expected = crate::grill::InstanceIdentity::new(namespace, name, 0).instance_id();
+    statuses
         .iter()
-        .filter(|s| s.app_name == name && s.namespace == namespace)
-    {
-        let outcome = match (status.state.as_str(), status.exit_code) {
-            ("failed", _) => Some(false),
-            ("stopped", Some(0) | None) => Some(true),
+        .find(|status| status.id == expected.0 && status.namespace == namespace)
+        .and_then(|status| match (status.state.as_str(), status.exit_code) {
+            ("stopped", Some(0)) => Some(0),
+            ("failed", Some(code)) if code != 0 => Some(code),
             _ => None,
-        };
-        if outcome.is_some() {
-            return outcome;
-        }
+        })
+}
+
+/// Preflight and durably admit this entire group, then watch its exact executions.
+// Admission errors already carry the HTTP status and body for this route.
+#[allow(clippy::result_large_err)]
+async fn admit_jobs_and_watch(
+    state: &ApiState,
+    batch_id: u64,
+    jobs: Vec<BatchJobSubmission>,
+    labels: BTreeMap<String, BatchExecutionLabel>,
+    reporter: Reporter,
+) -> Result<(), Response> {
+    let mut config = Config::default();
+    for job in &jobs {
+        config.job.insert(job.name.clone(), job.spec.clone());
     }
-    None
+    let (events, event_rx) = mpsc::channel(64);
+    let terminal =
+        super::api::ask_agent_bounded(&state.cmd_tx, |response| AgentCommand::RunJobsWithLabels {
+            batch_id,
+            config,
+            execution_labels: labels,
+            events,
+            response,
+        })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "durable batch admission remains uncertain or unavailable",
+            )
+                .into_response()
+        })?
+        .map_err(|error| {
+            let status = if matches!(error, crate::bun::BunError::BatchConflict(_)) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response()
+        })?;
+    tokio::spawn(run_jobs_and_watch(
+        state.cmd_tx.clone(),
+        batch_id,
+        jobs,
+        reporter,
+        event_rx,
+        terminal,
+    ));
+    Ok(())
 }
 
 /// Deploy this node's share of a batch and watch each job to a
 /// terminal state, reporting as they finish. Spawned; never blocks a
 /// handler.
-pub async fn run_jobs_and_watch(
+async fn run_jobs_and_watch(
     cmd_tx: mpsc::Sender<AgentCommand>,
     batch_id: u64,
     jobs: Vec<BatchJobSubmission>,
     reporter: Reporter,
+    mut event_rx: mpsc::Receiver<crate::bun::agent::ApplyEvent>,
+    terminal: BTreeMap<String, i32>,
 ) {
-    // Synthesise a Config holding only these jobs and deploy it
-    // through the normal path (retries, init, records — all standard).
-    let mut config = match Config::parse("") {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("bun: batch config synthesis failed: {e}");
-            for job in &jobs {
-                reporter.report(batch_id, &job.name, false).await;
-            }
-            return;
-        }
-    };
+    // Deployment errors do not prove an execution exited; retain the original
+    // owned attempt and let positive runtime evidence decide its result.
+    while event_rx.recv().await.is_some() {}
+    let mut pending = Vec::new();
     for job in &jobs {
-        config.job.insert(job.name.clone(), job.spec.clone());
-    }
-
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-    if cmd_tx
-        .send(AgentCommand::Deploy {
-            config,
-            events: event_tx,
-        })
-        .await
-        .is_err()
-    {
-        for job in &jobs {
-            reporter.report(batch_id, &job.name, false).await;
-        }
-        return;
-    }
-    // Drain deploy events; a deploy-level error fails the whole share.
-    let mut deploy_failed = false;
-    while let Some(event) = event_rx.recv().await {
-        if matches!(event, crate::bun::agent::ApplyEvent::Error { .. }) {
-            deploy_failed = true;
+        if let Some(code) = terminal.get(&job.name) {
+            reporter
+                .report(batch_id, &job.name, job.namespace(), *code)
+                .await;
+        } else {
+            pending.push(job);
         }
     }
-    if deploy_failed {
-        for job in &jobs {
-            reporter.report(batch_id, &job.name, false).await;
-        }
-        return;
-    }
-
-    // Watch each job to a terminal state.
-    let mut pending: Vec<&BatchJobSubmission> = jobs.iter().collect();
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(JOB_WATCH_TIMEOUT_SECS);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     while !pending.is_empty() && tokio::time::Instant::now() < deadline {
         ticker.tick().await;
-
         let (status_tx, status_rx) = oneshot::channel();
         if cmd_tx
             .send(AgentCommand::Status {
@@ -544,24 +678,24 @@ pub async fn run_jobs_and_watch(
             .await
             .is_err()
         {
-            break;
+            return;
         }
-        let Ok(statuses) = status_rx.await else { break };
-
+        let Ok(statuses) = status_rx.await else {
+            return;
+        };
         let mut still_pending = Vec::new();
         for job in pending {
-            match job_outcome(&statuses, &job.name, job.namespace()) {
-                Some(completed) => reporter.report(batch_id, &job.name, completed).await,
-                None => still_pending.push(job),
+            if let Some(code) = job_outcome(&statuses, &job.name, job.namespace()) {
+                reporter
+                    .report(batch_id, &job.name, job.namespace(), code)
+                    .await;
+            } else {
+                still_pending.push(job);
             }
         }
         pending = still_pending;
     }
-    // Anything still pending at the deadline is reported failed — the
-    // tracker must reach a terminal count, not hang forever.
-    for job in pending {
-        reporter.report(batch_id, &job.name, false).await;
-    }
+    // Timeout/drop is an unknown boundary, not positive terminal evidence.
 }
 
 // ---------------------------------------------------------------------------
@@ -603,9 +737,6 @@ async fn watch_batch(state: &ApiState, batch_id: u64) {
         let now = epoch_now_secs();
         let deadline = record.submitted_at_epoch_secs + JOB_WATCH_TIMEOUT_SECS + WATCH_GRACE_SECS;
         if now > deadline {
-            for job in record.jobs.iter().filter(|j| !j.status.is_terminal()) {
-                let _ = report_batch_job(state, batch_id, &job.name, JobStatus::Failed).await;
-            }
             return;
         }
 
@@ -629,17 +760,25 @@ async fn watch_batch(state: &ApiState, batch_id: u64) {
             let outcome = if node.0 == self_name {
                 local_statuses
                     .as_deref()
-                    .and_then(|statuses| job_outcome(statuses, &job.name, &job.namespace))
+                    .and_then(|statuses| job_outcome(statuses, &job.execution_name, &job.namespace))
             } else {
-                fetch_remote_outcome(state, node, &job.name, &job.namespace).await
+                fetch_remote_outcome(state, node, &job.execution_name, &job.namespace).await
             };
-            if let Some(completed) = outcome {
-                let status = if completed {
+            if let Some(code) = outcome {
+                let status = if code == 0 {
                     JobStatus::Completed
                 } else {
                     JobStatus::Failed
                 };
-                let _ = report_batch_job(state, batch_id, &job.name, status).await;
+                let _ = report_batch_job(
+                    state,
+                    batch_id,
+                    &job.execution_name,
+                    &job.namespace,
+                    status,
+                    Some(code),
+                )
+                .await;
             }
         }
 
@@ -670,12 +809,9 @@ async fn fetch_remote_outcome(
     node: &NodeId,
     job_name: &str,
     namespace: &str,
-) -> Option<bool> {
+) -> Option<i32> {
     let url = node_api_url(state, node).await?;
-    let mut request = state
-        .cluster_http
-        .client()
-        .get(format!("{url}/v1/status/{job_name}/{namespace}"));
+    let mut request = state.cluster_http.client().get(format!("{url}/v1/status"));
     if let Some(token) = &state.service_token {
         request = request.bearer_auth(token);
     }
@@ -695,6 +831,7 @@ async fn fetch_remote_outcome(
 pub async fn batch_submit_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
     // Submitting work is a Deployer action (AUTH2 — it used to take no auth).
@@ -703,14 +840,6 @@ pub async fn batch_submit_handler(
     {
         return resp;
     }
-    // Followers forward the raw body to the leader (the tracker and
-    // the aggregated capacity view live there).
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
-        return forward_to_leader(&state, council, "/v1/batch", body).await;
-    }
-
     let request: BatchSubmitRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -739,6 +868,39 @@ pub async fn batch_submit_handler(
                 .into_response();
         }
     };
+    if let Err((status, error)) = validate_batch_jobs(&state, &jobs, &headers).await {
+        return (status, Json(serde_json::json!({"error": error}))).into_response();
+    }
+    let permissions = super::api::permission_map(&state).await;
+    for job in &jobs {
+        if let Err(response) =
+            crate::sesame::auth::authorize_scoped(auth.as_deref(), &job.name, job.namespace())
+        {
+            return response;
+        }
+        let actions = [crate::config::PermissionAction::Deploy].into_iter().chain(
+            (job.spec.exec.is_some() || job.spec.script.is_some())
+                .then_some(crate::config::PermissionAction::HostExec),
+        );
+        for action in actions {
+            if let Err(response) = crate::sesame::auth::authorize_permission(
+                auth.as_deref(),
+                action,
+                &job.name,
+                job.namespace(),
+                &permissions,
+            ) {
+                return response;
+            }
+        }
+    }
+    // Preserve the caller on the second hop so the leader repeats admission
+    // against its authoritative grants, without granting system authority.
+    if let Some(council) = &state.council
+        && !council.is_leader().await
+    {
+        return forward_to_leader(&state, council, "/v1/batch", body, &headers).await;
+    }
     // Stable input order: together with the scheduler's ordered
     // profile groups this pins the assignment plan (the old
     // allocation-order finding).
@@ -779,6 +941,15 @@ pub async fn batch_submit_handler(
 
     // The durable record includes unschedulable jobs (JOB3): they are
     // part of the batch's story, not an omission.
+    let executions: BTreeMap<String, String> = jobs
+        .iter()
+        .map(|job| {
+            (
+                job.name.clone(),
+                format!("batch-{:032x}", rand::random::<u128>()),
+            )
+        })
+        .collect();
     let mut job_records = Vec::with_capacity(jobs.len());
     for job in &jobs {
         let node = allocation
@@ -786,8 +957,18 @@ pub async fn batch_submit_handler(
             .iter()
             .find(|(name, _)| name == &job.name)
             .map(|(_, node)| node.clone());
+        let digest = match crate::meat::batch_execution::spec_digest(
+            job.namespace(),
+            &job.name,
+            &job.spec,
+        ) {
+            Ok(digest) => digest,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
         job_records.push(BatchJobRecord {
             name: job.name.clone(),
+            execution_name: executions[&job.name].clone(),
+            spec_digest: digest,
             namespace: job.namespace().to_string(),
             status: if node.is_some() {
                 JobStatus::Pending
@@ -822,45 +1003,63 @@ pub async fn batch_submit_handler(
             by_node
                 .entry(node_id.clone())
                 .or_default()
-                .push(submission.clone());
+                .push(BatchJobSubmission {
+                    name: executions[&submission.name].clone(),
+                    ..submission.clone()
+                });
         }
     }
 
+    let all_labels: BTreeMap<String, BatchExecutionLabel> = jobs
+        .iter()
+        .map(|job| {
+            (
+                executions[&job.name].clone(),
+                BatchExecutionLabel {
+                    name: job.name.clone(),
+                    namespace: job.namespace().to_string(),
+                },
+            )
+        })
+        .collect();
     let callback_base_url = self_callback_url(&state, &self_name).await;
     for (node_id, node_jobs) in by_node {
+        let execution_labels = node_jobs
+            .iter()
+            .map(|job| (job.name.clone(), all_labels[&job.name].clone()))
+            .collect();
         if node_id.0 == self_name {
-            // Our own share: no HTTP, report straight into the tracker.
-            tokio::spawn(run_jobs_and_watch(
-                state.cmd_tx.clone(),
+            if let Err(response) = admit_jobs_and_watch(
+                &state,
                 batch_id,
                 node_jobs,
+                execution_labels,
                 Reporter::Leader(Box::new(state.clone())),
-            ));
+            )
+            .await
+            {
+                return response;
+            }
             continue;
         }
-
-        // Remote share: POST the group to the target node, with
-        // bounded retries; exhausted retries fail the jobs honestly
-        // instead of leaving them pending forever (JOB3).
         let Some(url) = node_api_url(&state, &node_id).await else {
-            eprintln!("bun: batch {batch_id}: no address for {node_id:?}; failing its jobs");
-            for job in &node_jobs {
-                let _ = report_batch_job(&state, batch_id, &job.name, JobStatus::Failed).await;
-            }
+            eprintln!(
+                "bun: batch {batch_id}: no address for {node_id:?}; execution remains unknown"
+            );
             continue;
         };
         let run = BatchRunRequest {
             batch_id,
             callback_base_url: callback_base_url.clone(),
             jobs: node_jobs,
+            execution_labels,
         };
         let dispatch_state = state.clone();
         tokio::spawn(async move {
             let client = dispatch_state.cluster_http.client().clone();
-            let token = dispatch_state.service_token.clone();
             for attempt in 0..DISPATCH_ATTEMPTS {
                 let mut request = client.post(format!("{url}/v1/batch/run")).json(&run);
-                if let Some(token) = &token {
+                if let Some(token) = &dispatch_state.service_token {
                     request = request.bearer_auth(token);
                 }
                 match request.send().await {
@@ -870,12 +1069,7 @@ pub async fn batch_submit_handler(
                         response.status(),
                         attempt + 1
                     ),
-                    Err(e) => {
-                        eprintln!(
-                            "bun: batch dispatch to {url} failed (attempt {}): {e}",
-                            attempt + 1
-                        )
-                    }
+                    Err(error) => eprintln!("bun: batch dispatch to {url} failed: {error}"),
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(
                     500 * u64::from(attempt + 1),
@@ -883,13 +1077,8 @@ pub async fn batch_submit_handler(
                 .await;
             }
             eprintln!(
-                "bun: batch {batch_id}: dispatch to {url} exhausted \
-                 {DISPATCH_ATTEMPTS} attempts; failing its jobs"
+                "bun: batch {batch_id}: dispatch exhausted; original execution remains unknown"
             );
-            for job in &run.jobs {
-                let _ =
-                    report_batch_job(&dispatch_state, batch_id, &job.name, JobStatus::Failed).await;
-            }
         });
     }
 
@@ -900,6 +1089,7 @@ pub async fn batch_submit_handler(
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!(BatchSubmitResponse {
+            executions,
             batch_id,
             assigned: allocation.assignments.len(),
             unschedulable: allocation.unschedulable,
@@ -912,6 +1102,7 @@ pub async fn batch_submit_handler(
 pub async fn batch_run_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    headers: axum::http::HeaderMap,
     Json(run): Json<BatchRunRequest>,
 ) -> Response {
     // Node-to-node only: reject anything that isn't the system principal
@@ -955,12 +1146,102 @@ pub async fn batch_run_handler(
                 .into_response();
         }
     };
-    tokio::spawn(run_jobs_and_watch(
-        state.cmd_tx.clone(),
-        run.batch_id,
-        jobs,
-        reporter,
-    ));
+    if let Err((status, error)) = validate_batch_jobs(&state, &jobs, &headers).await {
+        return (status, Json(serde_json::json!({"error": error}))).into_response();
+    }
+    if run.batch_id == 0
+        || run.execution_labels.len() != jobs.len()
+        || jobs.iter().any(|job| {
+            run.execution_labels.get(&job.name).is_none_or(|label| {
+                label.namespace != job.namespace()
+                    || !crate::config::valid_workload_label(&label.name)
+            })
+        })
+    {
+        return (StatusCode::BAD_REQUEST, "execution_labels must exactly match configured executions with valid labels in the same namespace").into_response();
+    }
+    if let Some(council) = &state.council {
+        let allocation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let local = super::api::ask_agent_bounded(&state.cmd_tx, |response| {
+            AgentCommand::BatchOwnedExecutions {
+                identities: jobs
+                    .iter()
+                    .map(|job| (job.name.clone(), job.namespace().to_string()))
+                    .collect(),
+                response,
+            }
+        })
+        .await;
+        let owned = match local {
+            Ok(owned) => owned,
+            Err(response) => return Err(response),
+        };
+        let desired = council.desired_state().await;
+        for job in &jobs {
+            let id =
+                crate::grill::InstanceIdentity::new(job.namespace(), &job.name, 0).instance_id();
+            if owned.contains(&id.0) {
+                continue;
+            }
+            let Some(owner) = desired
+                .batch_state
+                .execution_owner(job.namespace(), &job.name)
+            else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "committed batch allocation is not available for this new execution",
+                )
+                    .into_response());
+            };
+            let label = &run.execution_labels[&job.name];
+            let digest = match crate::meat::batch_execution::spec_digest(
+                job.namespace(),
+                &label.name,
+                &job.spec,
+            ) {
+                Ok(digest) => digest,
+                Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string()).into_response()),
+            };
+            let allocated = desired.batch_state.get(run.batch_id).is_some_and(|record| {
+                record.jobs.iter().any(|recorded| {
+                    recorded.execution_name == job.name
+                        && recorded.namespace == job.namespace()
+                        && recorded.name == label.name
+                        && recorded.spec_digest == digest
+                        && !recorded.status.is_terminal()
+                        && recorded
+                            .node
+                            .as_ref()
+                            .is_some_and(|node| state.node_name.as_deref() == Some(node.0.as_str()))
+                })
+            });
+            if owner.batch_id != run.batch_id
+                || owner.logical_name != label.name
+                || owner.spec_digest != digest
+                || !allocated
+            {
+                return Err((StatusCode::CONFLICT, "new execution does not match its live committed batch allocation and original specification").into_response());
+            }
+        }
+        Ok(())
+        }).await;
+        match allocation {
+            Ok(Ok(())) => {}
+            Ok(Err(response)) => return response,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "batch allocation metadata unavailable",
+                )
+                    .into_response();
+            }
+        }
+    }
+    if let Err(response) =
+        admit_jobs_and_watch(&state, run.batch_id, jobs, run.execution_labels, reporter).await
+    {
+        return response;
+    }
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "accepted": true })),
@@ -993,7 +1274,16 @@ pub async fn batch_report_handler(
         )
             .into_response();
     };
-    match report_batch_job(&state, batch_id, &report.job_name, status).await {
+    match report_batch_job(
+        &state,
+        batch_id,
+        &report.job_name,
+        &report.namespace,
+        status,
+        report.exit_code,
+    )
+    .await
+    {
         Ok(outcome) => Json(serde_json::json!({
             "recorded": true,
             "duplicate": outcome == ReportOutcome::Duplicate,
@@ -1057,6 +1347,7 @@ async fn forward_to_leader(
     council: &crate::council::CouncilNode,
     path: &str,
     body: String,
+    headers: &axum::http::HeaderMap,
 ) -> Response {
     let Some(leader_url) = super::api::leader_api_url(state, council).await else {
         return (
@@ -1065,15 +1356,13 @@ async fn forward_to_leader(
         )
             .into_response();
     };
-    let mut request = state
+    let request = state
         .cluster_http
         .client()
         .post(format!("{leader_url}{path}"))
         .header("content-type", "application/json")
         .body(body);
-    if let Some(token) = &state.service_token {
-        request = request.bearer_auth(token);
-    }
+    let request = super::api::copy_forwarded_auth(request, headers);
     proxy_response(request.send().await).await
 }
 
@@ -1230,6 +1519,136 @@ mod tests {
         assert!(err.contains("two namespaces"), "{err}");
     }
 
+    #[tokio::test]
+    async fn internal_batch_dispatch_validates_specs_and_refuses_unowned_test_resources() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let router = crate::bun::api::router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+        )
+        .layer(axum::Extension(crate::sesame::auth::system_context()));
+        let cases = [
+            ("default", serde_json::json!({}), StatusCode::BAD_REQUEST),
+            (
+                "default",
+                serde_json::json!({"image": "busybox", "exec": "true"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "default",
+                serde_json::json!({"exec": "true", "script": "true"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "rbtest-batch",
+                serde_json::json!({"image": "busybox"}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "default",
+                serde_json::json!({"image": "localhost:5050/rbtest-image/work:test"}),
+                StatusCode::CONFLICT,
+            ),
+        ];
+        for (namespace, spec, expected) in cases {
+            let request = Request::post("/v1/batch/run")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"batch_id": 1, "jobs": [
+                        {"name": "migration", "namespace": namespace, "spec": spec}
+                    ]})
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "namespace={namespace}, spec={spec}"
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_names_are_refused_even_across_namespaces() {
+        for other_namespace in ["one", "two"] {
+            let err = resolve_job_namespaces(vec![
+                submission("same", Some("one"), r#"command = ["true"]"#),
+                submission("same", Some(other_namespace), r#"command = ["false"]"#),
+            ])
+            .expect_err("duplicate batch identity must be refused before dispatch");
+            assert!(err.contains("duplicate"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_submission_never_registers_or_dispatches_jobs() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let router = crate::bun::api::router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+        );
+        for namespace in ["one", "two"] {
+            let request = Request::post("/v1/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"jobs": [
+                    {"name": "same", "namespace": "one", "spec": {"image": "busybox", "command": ["true"]}},
+                    {"name": "same", "namespace": namespace, "spec": {"image": "busybox", "command": ["false"]}}
+                ]}).to_string()))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            let response = router
+                .clone()
+                .oneshot(Request::get("/v1/batch/1").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_internal_dispatch_never_launches_jobs() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let router = crate::bun::api::router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+        )
+        .layer(axum::Extension(crate::sesame::auth::system_context()));
+        for namespace in ["one", "two"] {
+            let request = Request::post("/v1/batch/run")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"batch_id": 1, "jobs": [
+                    {"name": "same", "namespace": "one", "spec": {"image": "busybox", "command": ["true"]}},
+                    {"name": "same", "namespace": namespace, "spec": {"image": "busybox", "command": ["false"]}}
+                ]}).to_string()))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
     #[test]
     fn agreeing_namespaces_are_accepted() {
         let jobs = resolve_job_namespaces(vec![submission(
@@ -1318,7 +1737,9 @@ mod tests {
     #[test]
     fn job_outcome_maps_terminal_states() {
         let status = |state: &str, exit: Option<i32>| InstanceStatus {
-            id: "i1".to_string(),
+            id: crate::grill::InstanceIdentity::new("default", "j", 0)
+                .instance_id()
+                .0,
             app_name: "j".to_string(),
             namespace: "default".to_string(),
             state: state.to_string(),
@@ -1331,15 +1752,15 @@ mod tests {
         };
         assert_eq!(
             job_outcome(&[status("stopped", Some(0))], "j", "default"),
-            Some(true)
+            Some(0)
         );
         assert_eq!(
             job_outcome(&[status("stopped", None)], "j", "default"),
-            Some(true)
+            None
         );
         assert_eq!(
             job_outcome(&[status("failed", Some(1))], "j", "default"),
-            Some(false)
+            Some(1)
         );
         // Non-zero stop is retry backoff, not terminal.
         assert_eq!(

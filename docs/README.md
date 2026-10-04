@@ -123,6 +123,19 @@ lease's lifetime. Creation needs an unscoped credential and the server's
 isolated-workload test grant. Ordinary jobs stay node-local; there's no cluster
 job scheduling.
 
+`relish batch` gives each accepted job a distinct execution identity. Repeated
+logical labels retain their original namespace for scoped status and logs;
+select an explicit instance to read a particular run. Internal dispatch retries
+reuse the durably owned attempt and cannot launch it twice. Batch submission
+rejects `schedule` and `run_before`; use ordinary apply for those declarations.
+
+Replay history is finite and never pruned into identity reuse. The council keeps
+at most 131,072 ownership entries or 32 MiB of encoded history, and each runner's
+job checkpoint is limited to 16 MiB with room reserved for active transitions.
+Full history refuses new admission while preserving existing executions. Further
+admission then requires a fresh cluster. See [batch execution ownership](book/08-breaking-things-on-purpose.md)
+for acknowledgement uncertainty, retry and retirement semantics.
+
 ### Registry behaviour
 
 - A manifest push persists its catalogue before acknowledging. 201 means the

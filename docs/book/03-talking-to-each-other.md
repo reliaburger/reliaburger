@@ -389,7 +389,7 @@ The eBPF programs don't call back to Bun. They read from kernel-resident hash ma
 
 **`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string, value is a 4-byte IPv4 address in network byte order. It's a leftover from the abandoned in-kernel DNS design (see "Why userspace DNS" below) — the userspace responder resolves names straight from the `ServiceMap` instead, so this map isn't on the resolution path today.
 
-**`backend_map`**: Maps `(VIP, port)` pairs to backend arrays. Each entry holds up to 32 backends with their real IPs, ports, and health flags, plus a round-robin counter. When the connect hook intercepts a VIP connection, it looks up this map and picks a healthy backend.
+**`backend_map`**: Maps `(VIP, port)` pairs to backend arrays. Each entry holds up to 32 backends with their real IPs, ports, and health flags, plus a round-robin counter. When the connect hook intercepts a VIP connection, it looks up this map and picks a healthy backend. The userspace catalogue keeps every replica, including a thirty-third backend; DNS, ingress and unrelated services can still install the complete snapshot. For a service above the kernel array's capacity, each consumer chooses a deterministic pool of at most 32. Healthy local backends come first, then healthy remote backends, with a stable score from the consumer's node ID distributing remote choices across nodes. A client on one node reaches that node's selected pool; it is not promised access to all replicas through that one kernel array. Reordering the catalogue cannot change the selected pool.
 
 **`firewall_map`**: Maps `(source_cgroup_id, destination_app_id)` to allow/deny. This is how we enforce namespace isolation and per-app firewall rules at the connection level.
 
@@ -612,6 +612,8 @@ The first version of the responder worked in the demo and would have been a disa
 
 The hardened version fixes each in turn. Receive errors log and `continue` — the loop is never allowed to die. Public-name forwards spawn a task each (bounded by a `Semaphore` with 64 permits, so a query flood can't spawn unbounded tasks), and each forward uses a *fresh connected socket*: `connect` makes the kernel drop datagrams from any other source, and we additionally check the reply's transaction ID against the query's. A wrong-ID reply — a spoof or a stale packet — is ignored and the client eventually gets SERVFAIL, never the attacker's bytes.
 
+External answers need TCP too. A resolver that receives a UDP answer with the truncated flag retries the same question over TCP against its configured nameserver, which is our node. The TCP listener relays external questions to the configured upstream over TCP, reads the two-byte length prefix, and allows the full 65,535-byte DNS frame. The 4 KiB UDP buffer would defeat the point of that retry. A timeout covers connecting, writing and reading, and we check the response's transaction ID, operation and complete question before passing it on. Internal names still stay local, and the source ACL applies before either path. The regression test serves a valid answer larger than the UDP buffer and exercises both a UDP retry and a direct TCP request, with wrong-ID and wrong-question frames arriving first.
+
 The responder is now properly authoritative for `.internal`: unknown names get NXDOMAIN locally and are never forwarded, AAAA on a known name gets an empty NOERROR ("the name exists, it just has no IPv6"), and unsupported types get NOTIMP. Not one internal byte reaches the upstream.
 
 A later audit sent a question with the last byte of its class field missing. We answered it anyway. The hand-rolled decoder read the name and type, trusted the header's counts, and assumed the rest was fine. Rather than patch our own parser one hole at a time, we swapped it for Hickory's protocol codec (just the wire format, with no resolver or DNSSEC engine attached) and kept only the policy on our side:
@@ -803,6 +805,8 @@ A concurrent connection limit (default 10,000) rejects new connections with 503 
 
 A backend redirect belongs to the external client. Suppose your login handler returns `302`, a `Location` and a session cookie. Reqwest follows redirects by default, so using it unchanged inside a reverse proxy quietly replaces that response with the destination page and drops the login cookie. Both our pooled upstream client and the fresh-connection retry client use `redirect(Policy::none())`. Wrapper forwards the original status, location, cookies and body; the client chooses whether to follow. Tests cover relative and absolute destinations and all five common redirect statuses with POST requests. Neither upstream client contacts the destination on its own.
 
+Streaming responses can stay open longer than thirty seconds. Both upstream clients bound connection setup and each inactive read to thirty seconds, including the wait for response headers. They have no total response lifetime deadline: a server-sent event arriving every second keeps its response alive, while a backend that stops producing bytes still times out. The real listener tests stream for thirty-four seconds through both clients, and separately stall headers and a body after its first chunk. Shutdown still uses Wrapper's bounded drain and cancellation path.
+
 ### The routing table
 
 The routing table maps `(host, path)` pairs to backend pools:
@@ -816,6 +820,8 @@ pub struct RoutingTable {
 Each host maps to a list of path routes, sorted by path length descending. When a request arrives, we extract the `Host` header, find the matching host (case-insensitive), then walk the path routes looking for the first prefix match. Longest prefix wins — `/api/v1` matches before `/api`, which matches before `/`.
 
 The table is rebuilt from the `ServiceMap` whenever apps with ingress config are deployed, stopped, or have health changes. Rebuilding is cheap (microseconds for typical clusters) and writes are behind a `RwLock`. In-flight requests hold a read lock and are never blocked by a rebuild.
+
+An unrelated catalogue update mustn't make a failed backend healthy again. We preserve the active probe verdict when the instance ID and socket address stay the same, including when the agent installs a newly constructed table. The probe loop also reapplies its current verdict on every sweep rather than reporting transitions alone. It resets counters when an instance changes address and checks that address again before updating the table: a probe that finishes after replacement belongs to the old endpoint. Regression tests rebuild an unhealthy route, replace the whole table while failures continue, and allow recovery only after the configured successful probes.
 
 The ingress specs the agent feeds into the rebuild are keyed by `(namespace, app_name)`, not the bare name — the same collision fix as the VIPs. Two teams both running an `api` app, each with its own ingress on its own host, need two independent routes. Keyed by name alone, the second would clobber the first; keyed by the pair, they coexist, and each rebuild looks its backends up through the namespaced `ServiceId`.
 

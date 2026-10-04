@@ -2081,11 +2081,16 @@ async fn a_probe_that_lands_after_a_kill_keeps_the_restarted_instance_probed() {
 }
 
 #[tokio::test]
-async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
+async fn deployment_publishes_thirty_three_backends_and_retains_runtime_owners() {
     let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
     let mut config = basic_config();
-    config.app.get_mut("web").unwrap().replicas =
-        crate::config::Replicas::Fixed(crate::onion::types::MAX_BACKENDS as u32 + 1);
+    let app = config.app.get_mut("web").unwrap();
+    let replicas = crate::onion::types::MAX_BACKENDS + 1;
+    app.replicas = crate::config::Replicas::Fixed(replicas as u32);
+    app.ingress = Some(toml::from_str("host = 'large.web.test'\ntls = 'disabled'").unwrap());
+    let view = agent.service_map_watch();
+    let routes = agent.routing_table_handle();
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
     let events = drain_deploy(&mut agent, config).await;
     let owners: std::collections::HashSet<_> = agent
         .supervisor
@@ -2098,18 +2103,40 @@ async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
         .into_iter()
         .filter(|(call, id)| call == "create" && !owners.contains(id))
         .collect();
+    let published = view
+        .borrow()
+        .resolve(&service)
+        .map(|entry| entry.backends.len());
+    let routed = routes
+        .read()
+        .await
+        .lookup("large.web.test", "/")
+        .map(|route| route.backends.len());
     agent.retire_workload("web", "default").await.unwrap();
     assert!(
         unowned.is_empty(),
         "created runtimes lost their cleanup owner: {unowned:?}"
     );
+    assert_eq!(expect_complete(&events).0, replicas);
+    assert_eq!(owners.len(), replicas);
+    assert_eq!(published, Some(replicas), "DNS must see the full catalogue");
+    assert_eq!(
+        routed,
+        Some(replicas),
+        "Wrapper must see the full catalogue"
+    );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, ApplyEvent::Complete { .. })),
-        "deployment completed despite refusing an endpoint: {events:?}"
+            .any(|event| matches!(event, ApplyEvent::Error { .. }))
     );
-    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("cannot publish backend"))));
+    assert!(view.borrow().resolve(&service).is_none());
+    assert!(routes.read().await.lookup("large.web.test", "/").is_none());
+    assert!(
+        owners
+            .iter()
+            .all(|id| agent.supervisor.get_instance(id).is_none())
+    );
 }
 
 #[tokio::test]
@@ -2381,6 +2408,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rerun_unknown_jobs: bool,
     ) {
         let worker = DeployWorker {
+            prepared_batch_jobs: None,
             rerun_unknown_jobs,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
@@ -3220,6 +3248,29 @@ async fn deploy_creates_managed_volume_directories() {
 
     shutdown.cancel();
     let _ = handle.await;
+}
+
+/// The agent rechecks the full layout before creating the first directory.
+#[tokio::test]
+async fn overlapping_volume_layout_is_refused_before_any_directory_is_provisioned() {
+    let volumes = tempfile::tempdir().unwrap();
+    let (mut agent, tx, shutdown) = test_agent();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let handle = tokio::spawn(async move { agent.run().await });
+    let config = Config::parse(
+        "[app.web]\nimage='myapp:v1'\n[[app.web.volumes]]\npath='/data'\n[[app.web.volumes]]\npath='/data.img'\n",
+    ).unwrap();
+    // Direct agent dispatch deliberately bypasses HTTP configuration admission.
+    let events = send_deploy(&tx, config).await;
+    shutdown.cancel();
+    handle.await.unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, ApplyEvent::Error { message } if message.contains("overlap"))
+        ),
+        "{events:?}"
+    );
+    assert!(!volumes.path().join("default/web").exists());
 }
 
 /// Host-path volumes are the operator's responsibility — deploys
@@ -12663,4 +12714,109 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
     );
     shutdown.cancel();
     task.await.unwrap();
+}
+
+async fn recovered_owned_exit_preserves_retirement_provenance(
+    runtime: crate::grill::records::RuntimeKind,
+) {
+    use crate::bun::jobs::{BatchExecutionOwnership, JobInventory, JobPhase, RecordedJob};
+    let records = tempfile::tempdir().unwrap();
+    let volumes = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(runtime);
+    let id = InstanceId("default__batch-retained-object-0".into());
+    let name = "batch-retained-object";
+    let spec = Config::parse(&format!("[job.{name}]\nimage='myapp:v1'\n"))
+        .unwrap()
+        .job
+        .remove(name)
+        .unwrap();
+    let job = RecordedJob {
+        name: name.into(),
+        namespace: "default".into(),
+        batch_execution: Some(BatchExecutionOwnership {
+            batch_id: 42,
+            logical_name: "migration".into(),
+            spec_digest: crate::meat::batch_execution::spec_digest("default", "migration", &spec)
+                .unwrap(),
+            observed_exit_code: Some(0),
+            observed_restart_count: Some(0),
+        }),
+        spec,
+        runtime,
+        generation: 1,
+        restart_count: 0,
+        phase: JobPhase::Exited { code: 0 },
+        runtime_absent: false,
+    };
+    crate::bun::jobs::persist_inventory(
+        records.path(),
+        JobInventory {
+            jobs: BTreeMap::from([(id.0.clone(), job)]),
+            retired: BTreeMap::new(),
+        },
+    )
+    .unwrap();
+    let mut record = adoption_record(&id.0, name, false);
+    record.is_job = true;
+    record.app_spec = None;
+    record.runtime = runtime;
+    record.runc_container_id =
+        (runtime == crate::grill::records::RuntimeKind::Runc).then(|| id.0.clone());
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_adopt_result(&id, false);
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+    assert_eq!(agent.recorded_jobs[&id.0].batch_terminal_exit(), Some(0));
+    // A confirmed process stop must retain the same object-absence distinction.
+    agent
+        .finish_app_stop(
+            name,
+            "default",
+            app_stop::AppStop {
+                instances: vec![id.clone()],
+                owns_job: true,
+                taken_restarts: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let compact = agent.release_retired_workload(name, "default").await;
+    if runtime == crate::grill::records::RuntimeKind::Process {
+        compact.unwrap();
+        assert_eq!(
+            agent.retired_batch_executions[&id.0].terminal_exit(),
+            Some(0)
+        );
+    } else {
+        assert!(
+            compact.is_err(),
+            "a retained stopped OCI object was compacted as absent"
+        );
+        assert!(
+            !agent.recorded_jobs[&id.0].runtime_absent,
+            "process exit became object-absence provenance"
+        );
+        assert!(agent.retired_batch_executions.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recovered_owned_process_exit_allows_positive_compact_retirement() {
+    recovered_owned_exit_preserves_retirement_provenance(
+        crate::grill::records::RuntimeKind::Process,
+    )
+    .await;
+}
+#[tokio::test]
+async fn recovered_owned_apple_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Apple)
+        .await;
+}
+#[tokio::test]
+async fn recovered_owned_runc_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Runc)
+        .await;
 }

@@ -44,6 +44,12 @@ use crate::grill::{GrillError, InstanceId};
 /// Errors from Bun agent operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BunError {
+    /// Trusted dispatch attempted to change an existing execution owner.
+    #[error("batch execution conflict: {0}")]
+    BatchConflict(String),
+    /// Predictable admission limit; existing executions remain available.
+    #[error("batch execution capacity is unavailable: {0}")]
+    BatchCapacity(String),
     /// Durable job execution evidence cannot be established.
     #[error("job state is unavailable: {0}")]
     JobState(String),

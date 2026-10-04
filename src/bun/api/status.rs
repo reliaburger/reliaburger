@@ -8,44 +8,93 @@ use super::*;
 /// identifier format, for `relish apply --dry-run` diffing.
 ///
 /// Cluster mode answers from the council's desired state (authoritative and
-/// cluster-wide: apps with images, declared namespaces and permissions),
+/// cluster-wide: complete app, namespace and permission specifications),
 /// merged over the local agent's view (which contributes node-local jobs —
 /// jobs don't live in desired state). Standalone answers from the local
 /// agent alone.
-pub(super) async fn current_apps_handler(State(state): State<ApiState>) -> Response {
-    // Plan-key → image; later inserts overwrite, so the council's
-    // authoritative entries land last.
-    let mut resources: std::collections::BTreeMap<String, Option<String>> =
-        std::collections::BTreeMap::new();
-
-    if let Ok(local) = ask_agent(&state.cmd_tx, |response| AgentCommand::CurrentResources {
+pub(super) async fn current_apps_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    use crate::bun::agent::CurrentResourceStatus;
+    use crate::config::fingerprint::{app_fingerprint_in, app_resource_key, spec_fingerprint};
+    let mut resources = std::collections::BTreeMap::<String, CurrentResourceStatus>::new();
+    let local = match ask_agent(&state.cmd_tx, |response| AgentCommand::CurrentResources {
         response,
     })
     .await
     {
-        for entry in local {
-            resources.insert(entry.resource, entry.image);
-        }
+        Ok(local) => local,
+        Err(_) => return agent_unavailable(),
+    };
+    for entry in local {
+        resources.insert(entry.resource.clone(), entry);
     }
-
     if let Some(council) = &state.council {
         let desired = council.desired_state().await;
         for (app_id, spec) in &desired.apps {
-            resources.insert(format!("app.{}", app_id.name), spec.image.clone());
+            let resource = app_resource_key(&app_id.name, &app_id.namespace);
+            resources.insert(
+                resource.clone(),
+                CurrentResourceStatus {
+                    resource,
+                    image: spec.image.clone(),
+                    fingerprint: app_fingerprint_in(spec, &app_id.namespace),
+                },
+            );
         }
-        for name in desired.namespaces.keys() {
-            resources.insert(format!("namespace.{name}"), None);
+        for (name, spec) in &desired.namespaces {
+            let resource = format!("namespace.{name}");
+            resources.insert(
+                resource.clone(),
+                CurrentResourceStatus {
+                    resource,
+                    image: None,
+                    fingerprint: spec_fingerprint(spec),
+                },
+            );
         }
-        for name in desired.permissions.keys() {
-            resources.insert(format!("permission.{name}"), None);
+        for (name, spec) in &desired.permissions {
+            let resource = format!("permission.{name}");
+            resources.insert(
+                resource.clone(),
+                CurrentResourceStatus {
+                    resource,
+                    image: None,
+                    fingerprint: spec_fingerprint(spec),
+                },
+            );
         }
     }
-
-    let rows: Vec<crate::bun::agent::CurrentResourceStatus> = resources
-        .into_iter()
-        .map(|(resource, image)| crate::bun::agent::CurrentResourceStatus { resource, image })
+    let rows: Vec<_> = resources
+        .into_values()
+        .filter(|row| current_resource_visible(&row.resource, auth.as_deref()))
         .collect();
     Json(rows).into_response()
+}
+
+/// The preview endpoint must retain the caller's resource scope as status does.
+fn current_resource_visible(
+    resource: &str,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> bool {
+    let Some((kind, label)) = resource.split_once('.') else {
+        return false;
+    };
+    match kind {
+        "app" | "job" => {
+            let (namespace, name) = label.split_once('/').unwrap_or(("default", label));
+            crate::sesame::auth::authorize_scoped(auth, name, namespace).is_ok()
+        }
+        "namespace" => auth
+            .and_then(|context| context.scoped_namespaces.as_ref())
+            .is_none_or(|namespaces| namespaces.iter().any(|namespace| namespace == label)),
+        "permission" => auth.is_none_or(|context| {
+            (context.scoped_namespaces.is_none() && context.scoped_apps.is_none())
+                || context.token_name == label
+        }),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -569,6 +618,12 @@ pub(super) async fn status_app_handler(
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    let selection = match super::logs::resolve_log_path(&state, &app, &namespace, None).await {
+        Ok(selection) => selection,
+        Err(response) => return response,
+    };
+    let app = selection.logical_name;
+
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
@@ -576,7 +631,14 @@ pub(super) async fn status_app_handler(
         Ok(statuses) => {
             let filtered: Vec<&InstanceStatus> = statuses
                 .iter()
-                .filter(|s| s.app_name == app && s.namespace == namespace)
+                .filter(|s| {
+                    s.app_name == app
+                        && s.namespace == namespace
+                        && selection
+                            .selected_instance
+                            .as_ref()
+                            .is_none_or(|id| &s.id == id)
+                })
                 .collect();
             if filtered.is_empty() {
                 (

@@ -24,17 +24,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         next: BTreeMap<String, crate::bun::jobs::RecordedJob>,
     ) -> Result<(), BunError> {
+        self.commit_job_inventory(crate::bun::jobs::JobInventory {
+            jobs: next,
+            retired: self.retired_batch_executions.clone(),
+        })
+        .await
+    }
+
+    pub(super) async fn commit_job_inventory(
+        &mut self,
+        next: crate::bun::jobs::JobInventory,
+    ) -> Result<(), BunError> {
+        // A no-op retirement of an unrelated app changes no job ownership.
+        if next.jobs == self.recorded_jobs && next.retired == self.retired_batch_executions {
+            return Ok(());
+        }
         if self.job_store_uncertain {
             return Err(BunError::JobState(
                 "a previous write is uncertain; restart Bun to reload it".into(),
             ));
         }
-        if next == self.recorded_jobs {
-            return Ok(());
+        let new_admission = next.jobs.iter().any(|(id, job)| {
+            self.recorded_jobs
+                .get(id)
+                .is_none_or(|previous| previous.generation != job.generation)
+        });
+        if new_admission {
+            self.preflight_job_inventory(next.clone()).await?;
         }
         if let Some(directory) = self.records_dir.clone() {
             self.job_store_uncertain = true;
-            for (id, job) in &next {
+            // New identities are fenced even when publication has an uncertain outcome.
+            // A failed retirement move keeps the active owner until recovery.
+            for (id, job) in &next.jobs {
                 self.recorded_jobs
                     .entry(id.clone())
                     .or_insert_with(|| job.clone());
@@ -42,13 +64,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let records = next.clone();
             #[cfg(test)]
             self.loop_stalls.hold(LoopStall::Persist).await;
-            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
-            tokio::task::spawn_blocking(move || crate::bun::jobs::persist(&directory, records))
-                .await
+            let publication = tokio::task::spawn_blocking(move || {
+                crate::bun::jobs::persist_inventory(&directory, records)
+            });
+            // LOOP-INLINE: detached checkpoint IO has a two-second bound and retains the ownership fence on timeout.
+            tokio::time::timeout(std::time::Duration::from_secs(2), publication).await
+                .map_err(|_| BunError::JobState("job checkpoint publication timed out; execution ownership remains uncertain".into()))?
                 .map_err(|error| BunError::JobState(error.to_string()))?
-                .map_err(|error| BunError::JobState(error.to_string()))?;
+                .map_err(|error| BunError::JobState(format!("job checkpoint publication is uncertain: {error}")))?;
         }
-        self.recorded_jobs = next;
+        self.recorded_jobs = next.jobs;
+        self.retired_batch_executions = next.retired;
         self.job_store_uncertain = false;
         Ok(())
     }
@@ -62,7 +88,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let job = next
             .get_mut(&id.0)
             .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
-        job.phase = phase;
+        job.observe_phase(phase);
         // A short process can exit before a PID adoption record is available.
         // Persist its positive exit observation with the outcome, rather than
         // asking a replacement ProcessGrill to signal an unadoptable handle.
@@ -79,7 +105,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> Result<(), BunError> {
         let mut jobs = self.recorded_jobs.clone();
         if let Some(job) = jobs.get_mut(&id.0) {
-            job.runtime_absent = true;
+            job.runtime_absent = if job.batch_execution.is_some()
+                && job.runtime != crate::grill::records::RuntimeKind::Process
+            {
+                // A stopped OCI process can still own a named container.
+                // Refuse compact retirement unless inspection proves it absent.
+                // LOOP-INLINE: one-second read-only inspection bounds positive OCI absence evidence.
+                matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        self.supervisor.grill().state(id),
+                    )
+                    .await,
+                    Ok(Err(crate::grill::GrillError::NotFound { .. }))
+                )
+            } else {
+                true
+            };
         }
         self.commit_jobs(jobs).await
     }
@@ -170,6 +212,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 restart_count: 0,
                 phase: JobPhase::Preparing,
                 runtime_absent: false,
+                batch_execution: None,
             },
         );
         self.commit_jobs(next).await?;
@@ -205,6 +248,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             )));
         }
         job.restart_count = count;
+        if let Some(owner) = &mut job.batch_execution {
+            owner.observed_exit_code = None;
+            owner.observed_restart_count = None;
+        }
         job.phase = JobPhase::Preparing;
         job.runtime_absent = false;
         self.commit_jobs(next).await

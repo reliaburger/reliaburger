@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use datafusion::arrow::array::UInt64Array;
@@ -327,14 +328,40 @@ fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct LogFlushGate {
+    entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct ReleaseLogFlushGate(Arc<LogFlushGate>);
+
+#[cfg(test)]
+impl Drop for ReleaseLogFlushGate {
+    fn drop(&mut self) {
+        *self.0.released.lock().unwrap() = true;
+        self.0.release.notify_all();
+    }
+}
+
 /// A drained log buffer ready to be written to Parquet, decoupled from the
 /// store so the caller can release its lock before the (blocking) write (M7).
+#[derive(Clone)]
 pub struct LogPendingFlush {
     data_dir: std::path::PathBuf,
     path: std::path::PathBuf,
     batch: RecordBatch,
     /// What the store will have durably ingested once `batch` is on disk.
     checkpoint: IngestCheckpoint,
+    // The store retains this batch. Each attempt holds this owned mutex guard
+    // inside the blocking task, including when its async caller is canceled.
+    writing: Arc<tokio::sync::Mutex<()>>,
+    completed: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_gate: Arc<std::sync::Mutex<Option<Arc<LogFlushGate>>>>,
 }
 
 /// Persist a [`LogPendingFlush`] on the blocking pool, with no lock held so
@@ -343,13 +370,30 @@ pub struct LogPendingFlush {
 /// checkpoint follows the Parquet file, never precedes it, so a crash between
 /// the two re-ingests one batch rather than losing it.
 pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupError> {
+    let writing = pending.writing.clone().lock_owned().await;
+    #[cfg(test)]
+    let test_gate = pending.test_gate.lock().unwrap().clone();
     let LogPendingFlush {
         data_dir,
         path,
         batch,
         checkpoint,
+        completed,
+        ..
     } = pending;
     tokio::task::spawn_blocking(move || -> Result<(), KetchupError> {
+        let _writing = writing;
+        if completed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(gate) = test_gate {
+            gate.entered.notify_one();
+            let mut released = gate.released.lock().unwrap();
+            while !*released {
+                released = gate.release.wait(released).unwrap();
+            }
+        }
         std::fs::create_dir_all(&data_dir)?;
         let tmp = path.with_extension("parquet.tmp");
         let file = std::fs::File::create(&tmp)?;
@@ -369,7 +413,9 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
         {
             let _ = dir_file.sync_all();
         }
-        checkpoint.save(&data_dir)
+        checkpoint.save(&data_dir)?;
+        completed.store(true, Ordering::Release);
+        Ok(())
     })
     .await
     .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?
@@ -385,16 +431,23 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
 pub async fn flush_shared(
     store: &std::sync::Arc<tokio::sync::RwLock<LogStore>>,
 ) -> Result<bool, KetchupError> {
-    let pending = {
-        let mut guard = store.write().await;
-        guard.take_flush_batch()?
-    };
-    match pending {
-        Some(p) => {
-            write_log_pending(p).await?;
-            Ok(true)
+    // Flush the rows already owned when this call began. A canceled attempt
+    // leaves its batch in the store; later callers must complete it before a
+    // newer checkpoint can advance beyond it.
+    let target = store.read().await.ingested.last_sequence;
+    let mut wrote = false;
+    loop {
+        let pending = store.write().await.take_flush_batch()?;
+        let Some(pending) = pending else {
+            return Ok(wrote);
+        };
+        let through = pending.checkpoint.last_sequence;
+        write_log_pending(pending).await?;
+        wrote = true;
+        store.write().await.clear_completed_flush();
+        if through >= target {
+            return Ok(true);
         }
-        None => Ok(false),
     }
 }
 
@@ -417,6 +470,7 @@ struct BufferedLogEntry {
 /// bounded to the buffer.
 pub struct LogStore {
     buffer: Vec<BufferedLogEntry>,
+    pending: Option<LogPendingFlush>,
     data_dir: PathBuf,
     /// Seeded past any existing `logs_NNNNNN.parquet` so restarts don't clobber.
     flush_counter: u64,
@@ -435,6 +489,7 @@ impl LogStore {
         let ingested = IngestCheckpoint::load(&data_dir);
         Self {
             buffer: Vec::new(),
+            pending: None,
             data_dir,
             flush_counter,
             ingested,
@@ -534,6 +589,7 @@ impl LogStore {
         stream: LogStream,
         line: &str,
     ) {
+        self.clear_completed_flush();
         // Wall-clock nanoseconds order lines across nodes; the bump keeps the
         // order strict within this node when two lines share a clock reading
         // or the clock steps back.
@@ -550,8 +606,13 @@ impl LogStore {
         });
         // Bound memory if flushing is failing (M8): drop the oldest entries
         // rather than let a stuck flush grow the buffer until the node OOMs.
-        if self.buffer.len() > MAX_BUFFER_ROWS {
-            let overflow = self.buffer.len() - MAX_BUFFER_ROWS;
+        let buffered_limit = MAX_BUFFER_ROWS.saturating_sub(
+            self.pending
+                .as_ref()
+                .map_or(0, |pending| pending.batch.num_rows()),
+        );
+        if self.buffer.len() > buffered_limit {
+            let overflow = self.buffer.len() - buffered_limit;
             self.buffer.drain(0..overflow);
         }
     }
@@ -559,6 +620,21 @@ impl LogStore {
     /// Number of unflushed entries.
     pub fn buffer_len(&self) -> usize {
         self.buffer.len()
+            + self
+                .pending
+                .as_ref()
+                .filter(|pending| !pending.completed.load(Ordering::Acquire))
+                .map_or(0, |pending| pending.batch.num_rows())
+    }
+
+    fn clear_completed_flush(&mut self) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.completed.load(Ordering::Acquire))
+        {
+            self.pending = None;
+        }
     }
 
     /// Convert the buffer to an Arrow RecordBatch.
@@ -593,11 +669,15 @@ impl LogStore {
         Ok(Some(batch))
     }
 
-    /// Drain the buffer into a self-contained [`LogPendingFlush`] the caller
-    /// writes later, outside any lock (M7). Bumps the flush counter and clears
-    /// the buffer immediately, so the file name is reserved before the (slow)
-    /// write. Returns `None` when there's nothing to flush.
+    /// Reserve a self-contained [`LogPendingFlush`] for I/O outside the store
+    /// lock. The store keeps the batch and its file name until Parquet and its
+    /// checkpoint are durable; failures and canceled callers retry that batch
+    /// before newer rows. Returns `None` when nothing remains to flush.
     pub fn take_flush_batch(&mut self) -> Result<Option<LogPendingFlush>, KetchupError> {
+        self.clear_completed_flush();
+        if let Some(pending) = &self.pending {
+            return Ok(Some(pending.clone()));
+        }
         let Some(batch) = self.buffer_to_batch()? else {
             return Ok(None);
         };
@@ -605,12 +685,18 @@ impl LogStore {
         let path = self.data_dir.join(filename);
         self.buffer.clear();
         self.flush_counter += 1;
-        Ok(Some(LogPendingFlush {
+        let pending = LogPendingFlush {
             data_dir: self.data_dir.clone(),
             path,
             batch,
             checkpoint: self.ingested.clone(),
-        }))
+            writing: Arc::new(tokio::sync::Mutex::new(())),
+            completed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_gate: Arc::new(std::sync::Mutex::new(None)),
+        };
+        self.pending = Some(pending.clone());
+        Ok(Some(pending))
     }
 
     /// Flush the buffer to Parquet.
@@ -620,10 +706,16 @@ impl LogStore {
     /// across readers should prefer [`take_flush_batch`](Self::take_flush_batch)
     /// + [`write_log_pending`] so the lock is released during the I/O.
     pub async fn flush(&mut self) -> Result<(), KetchupError> {
-        let Some(pending) = self.take_flush_batch()? else {
-            return Ok(());
-        };
-        write_log_pending(pending).await
+        let target = self.ingested.last_sequence;
+        while let Some(pending) = self.take_flush_batch()? {
+            let through = pending.checkpoint.last_sequence;
+            write_log_pending(pending).await?;
+            self.clear_completed_flush();
+            if through >= target {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Build a DataFusion session exposing a `logs` table over the on-disk
@@ -681,19 +773,39 @@ impl LogStore {
                 .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        // Unflushed buffer: a small MemTable (bounded by the flush interval).
-        let buffer_batch = self
-            .buffer_to_batch()?
-            .unwrap_or_else(|| RecordBatch::new_empty(schema.clone()));
-        let buffer_table = MemTable::try_new(schema.clone(), vec![vec![buffer_batch]])
+        // A query keeps its own batch/range snapshot. A concurrent Parquet
+        // rename must not make the same pending rows appear on disk and in
+        // memory, even if the disk scan starts after that rename.
+        let mut memory_batches = Vec::new();
+        if let Some(batch) = self.buffer_to_batch()? {
+            memory_batches.push(batch)
+        }
+        let disk_selection = if let Some(pending) = &self.pending {
+            memory_batches.push(pending.batch.clone());
+            let sequence = pending
+                .batch
+                .column_by_name("sequence")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            format!(
+                "SELECT * FROM logs_disk WHERE sequence < {} OR sequence > {}",
+                sequence.value(0),
+                sequence.value(sequence.len() - 1)
+            )
+        } else {
+            "SELECT * FROM logs_disk".to_owned()
+        };
+        let buffer_table = MemTable::try_new(schema.clone(), vec![memory_batches])
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         ctx.register_table("logs_buffer", Arc::new(buffer_table))
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        // Expose the union as `logs` so queries are unchanged.
-        ctx.sql("CREATE VIEW logs AS SELECT * FROM logs_disk UNION ALL SELECT * FROM logs_buffer")
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        ctx.sql(&format!(
+            "CREATE VIEW logs AS {disk_selection} UNION ALL SELECT * FROM logs_buffer"
+        ))
+        .await
+        .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         Ok(ctx)
     }
 
@@ -1896,5 +2008,125 @@ mod tests {
             rate < 0.01,
             "false-positive rate {rate} exceeds 1% ({fp}/{probes})"
         );
+    }
+    async fn assert_failed_flush_preserves_capture_rows(shared: bool, checkpoint_failure: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let capture = capture_file(&captures, "writer.stdout");
+        let directory = root.path().join("logs");
+        if checkpoint_failure {
+            std::fs::create_dir_all(directory.join(CHECKPOINT_FILE)).unwrap();
+        } else {
+            std::fs::write(&directory, "temporary filesystem obstruction").unwrap();
+        }
+        let store = Arc::new(tokio::sync::RwLock::new(LogStore::new(directory.clone())));
+        store
+            .write()
+            .await
+            .ingest_at(100, &writer_line(&capture, 1));
+        let failed = if shared {
+            flush_shared(&store).await.map(|_| ())
+        } else {
+            store.write().await.flush().await
+        };
+        assert!(failed.is_err());
+        assert_eq!(
+            store.read().await.buffer_len(),
+            1,
+            "failed batch is no longer owned by the store"
+        );
+        assert_eq!(writer_lines(&*store.read().await).await, acks(1..=1));
+        assert!(
+            !store
+                .write()
+                .await
+                .ingest_at(101, &writer_line(&capture, 1)),
+            "retained capture row was duplicated"
+        );
+        store
+            .write()
+            .await
+            .ingest_at(102, &writer_line(&capture, 2));
+        if checkpoint_failure {
+            std::fs::remove_dir(directory.join(CHECKPOINT_FILE)).unwrap();
+        } else {
+            std::fs::remove_file(&directory).unwrap();
+            std::fs::create_dir(&directory).unwrap();
+        }
+        if shared {
+            assert!(flush_shared(&store).await.unwrap());
+        } else {
+            store.write().await.flush().await.unwrap();
+        }
+        assert_eq!(store.read().await.buffer_len(), 0);
+        let reopened = LogStore::new(directory);
+        assert_eq!(
+            reopened.capture_offsets().get(&capture),
+            Some(2 * LINE_BYTES)
+        );
+        assert_eq!(writer_lines(&reopened).await, acks(1..=2));
+    }
+
+    #[tokio::test]
+    async fn failed_direct_flush_preserves_rows_until_data_and_checkpoint_are_durable() {
+        for checkpoint_failure in [false, true] {
+            assert_failed_flush_preserves_capture_rows(false, checkpoint_failure).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_shared_flush_preserves_rows_until_data_and_checkpoint_are_durable() {
+        for checkpoint_failure in [false, true] {
+            assert_failed_flush_preserves_capture_rows(true, checkpoint_failure).await;
+        }
+    }
+    #[tokio::test]
+    async fn canceling_an_inflight_log_flush_keeps_rows_queryable_and_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let capture = capture_file(&directory, "writer.stdout");
+        let logs = directory.path().join("logs");
+        let store = Arc::new(tokio::sync::RwLock::new(LogStore::new(logs.clone())));
+        let line_one = writer_line(&capture, 1);
+        assert!(store.write().await.ingest_at(100, &line_one));
+        let pending = store.write().await.take_flush_batch().unwrap().unwrap();
+        let gate = Arc::new(LogFlushGate::default());
+        let _release_on_failure = ReleaseLogFlushGate(gate.clone());
+        *pending.test_gate.lock().unwrap() = Some(gate.clone());
+        let first_store = store.clone();
+        let first = tokio::spawn(async move { flush_shared(&first_store).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+            .await
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        // A canceled async writer must not own the only copy. Reads and new
+        // appends still proceed while its blocking task is explicitly paused.
+        assert_eq!(writer_lines(&*store.read().await).await, acks(1..=1));
+        assert!(
+            store
+                .write()
+                .await
+                .ingest_at(101, &writer_line(&capture, 2))
+        );
+        assert_eq!(writer_lines(&*store.read().await).await, acks(1..=2));
+        let retry_store = store.clone();
+        let retry = tokio::spawn(async move { flush_shared(&retry_store).await });
+        *gate.released.lock().unwrap() = true;
+        gate.release.notify_all();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), retry)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(store.read().await.buffer_len(), 0);
+        assert_eq!(writer_lines(&*store.read().await).await, acks(1..=2));
+        let reopened = LogStore::new(logs);
+        assert_eq!(
+            reopened.capture_offsets().get(&capture),
+            Some(2 * LINE_BYTES)
+        );
+        assert_eq!(writer_lines(&reopened).await, acks(1..=2));
     }
 }

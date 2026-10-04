@@ -32,7 +32,12 @@ pub(super) async fn apply_handler(
         }
     };
 
-    if let Err(e) = config.validate() {
+    let validation = if state.council.is_some() {
+        config.validate_intrinsic()
+    } else {
+        config.validate()
+    };
+    if let Err(e) = validation {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -298,13 +303,78 @@ pub(super) async fn apply_handler(
         }
     }
 
+    let identities: Vec<(String, String)> = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.clone(),
+                spec.namespace.clone().unwrap_or_else(|| "default".into()),
+            )
+        })
+        .chain(config.job.iter().map(|(name, spec)| {
+            (
+                name.clone(),
+                spec.namespace.clone().unwrap_or_else(|| "default".into()),
+            )
+        }))
+        .collect();
+    if !identities.is_empty() {
+        let ownership = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if let Some(council) = &state.council {
+                let desired = council.desired_state().await;
+                if identities.iter().any(|(name, namespace)| {
+                    desired
+                        .batch_state
+                        .execution_owner(namespace, name)
+                        .is_some()
+                }) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "workload identity belongs to a retained batch execution",
+                    )
+                        .into_response());
+                }
+            }
+            let owned = match ask_agent_bounded(&state.cmd_tx, |response| {
+                AgentCommand::BatchOwnedExecutions {
+                    identities,
+                    response,
+                }
+            })
+            .await
+            {
+                Ok(owned) => owned,
+                Err(response) => return Err(response),
+            };
+            if !owned.is_empty() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "workload identity belongs to a retained local batch execution",
+                )
+                    .into_response());
+            }
+            Ok(())
+        })
+        .await;
+        match ownership {
+            Ok(Ok(())) => {}
+            Ok(Err(response)) => return response,
+            Err(_) => return agent_unavailable(),
+        }
+    }
+
     // Cluster mode (L1): apps, namespaces and permissions become desired
     // state in Raft; the leader schedules apps and every node's reconciler
     // converges. Jobs stay on the receiving node (cluster-wide job
     // scheduling is later work). A namespace/permission-only config still
-    // routes through the cluster path so its resources are committed.
+    // routes through the cluster path so its resources are committed. Build-only
+    // manifests also need the leader's namespace context before acceptance.
     if let Some(council) = &state.council
-        && (!config.app.is_empty() || !config.namespace.is_empty() || !config.permission.is_empty())
+        && (!config.app.is_empty()
+            || !config.namespace.is_empty()
+            || !config.permission.is_empty()
+            || !config.build.is_empty())
     {
         return cluster_apply(
             state.clone(),

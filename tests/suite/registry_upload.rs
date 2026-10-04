@@ -111,7 +111,22 @@ async fn failed_upload_cleanup_stays_fenced_and_retries_without_blocking_other_u
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 400);
+    // The PATCH is valid; a server-owned upload path becoming a directory is
+    // an I/O failure. Keep it fenced and report 500, rather than blaming the
+    // client with the old generic upload-write 400 mapping.
+    assert_eq!(response.status(), 500);
+    let malformed = http
+        .patch(format!("{origin}/v2/owned/blobs/uploads/not-an-upload-id"))
+        .bearer_auth("fixture-registry-token")
+        .body("partial")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        malformed.status(),
+        400,
+        "malformed sessions remain client errors"
+    );
     assert!(
         state
             .sessions

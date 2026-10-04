@@ -115,7 +115,7 @@ later) places the app and clears the reason.
 
 ```sh
 relish apply app.toml            # deploy (or converge) everything in the file
-relish apply app.toml --dry-run  # preview; exits 0 even with no agent
+relish apply app.toml --dry-run  # preview; no-agent output states its offline assumption
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
 relish exec web env              # run a command inside an instance, on whichever node runs it
@@ -124,6 +124,8 @@ relish inspect web               # every instance on every node, desired vs runn
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
+
+`apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 
 In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
@@ -162,13 +164,25 @@ relish apply all.toml
 `compile` walks the directory recursively. Each subdirectory's name becomes
 the namespace of the apps inside it, and a `_defaults.toml` fills in fields its
 apps leave unset. `diff` compares files, not the live cluster; `apply --dry-run`
-shows what would change on the cluster.
+compares complete desired specifications, including replicas, environment,
+resources, namespace quotas and permissions. Namespace-qualified workloads have
+separate identities. Incomplete live evidence is shown as `?` (`unknown` in JSON),
+never as unchanged. With no reachable agent, the output states that creates are
+an offline assumption; JSON includes `comparison_available: false`. If a live
+agent answers but cannot supply the comparison, the command fails.
 
 A compiled manifest currently keys apps, jobs and builds by bare name. If two
 resources of the same kind have the same name in different namespaces,
 compilation fails rather than dropping one. Apply those manifests separately
 or give their resources distinct names. Duplicate definitions in one namespace
 use the later file in sorted order and produce a warning.
+
+GitOps resolves its watched tree with these same defaults and directory rules.
+The configured watch directory is the root; only directories below it contribute
+namespaces, and defaults outside that root are not inherited. GitOps refuses
+duplicate resource definitions, while `relish compile` warns about overrides
+within one namespace. Parse, read and namespace-identity errors refuse the whole
+tree in both paths.
 
 ## Rolling deploys
 
@@ -254,5 +268,33 @@ Cron doesn't catch up: firings missed while a node was down are skipped.
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
 - Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
   `relish batch-status <ID> --wait`
+  Batch jobs must be non-scheduled and have no `run_before` declarations. Use
+  ordinary apply for cron schedules and jobs that gate apps in the same manifest.
+
+Repeated batches may reuse a logical job label; each gets a distinct execution
+identity. Status and logs retain the original namespace and label for token
+scope. Select an explicit instance to read one run, especially when a label also
+names an older opaque execution. The cluster retains execution ownership after
+terminal progress records expire, and each runner retains replay proof after
+retirement. This history is finite: the cluster index is limited to 131,072
+entries or 32 MiB, and each runner's checkpoint to 16 MiB. Full history refuses
+new admissions while preserving existing runs and their replay fences. Further
+admissions then require a fresh cluster.
+
+A batch admission response of 503 can mean its acknowledgement was lost after
+publication started. That original owned attempt may still run. Retrying the
+same internal dispatch preserves the attempt and cannot launch a second one.
+An ownership metadata timeout admits no work. OCI executions whose container
+resource absence is unproven retain their full replay record, using more of
+the finite node history than compact retirement proofs.
 
 Directory defaults support `image`, `memory`, `cpu`, `[env]` and `[deploy]`. Child directories override individual fields; environment and deployment tables merge by key, and explicit workload values win. Common fields apply to jobs too, while deployment strategies apply to apps. Unknown defaults keys fail compilation.
+
+For a batch log follow, select the execution's instance ID. A cluster reader
+checks the committed allocation and follows that worker, even when an ordinary
+app has the same submitted label. It refuses a missing or unadvertised worker,
+or an allocation whose progress record has already been pruned, before opening
+an SSE or WebSocket stream. Stored log queries still use the original logical
+label; retained replay ownership does not itself supply a remote follow route.
+Predictable node policy rejection happens before the whole group's checkpoint,
+so correcting a rejected member does not leave healthy jobs permanently fenced.
