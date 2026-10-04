@@ -1374,6 +1374,14 @@ again and re-encrypt if that generation has been finalised before deployment.
 `relish test --filter secrets-config` checks actual container decryption and
 config-file mounting on a cluster with a container runtime.
 
+A namespace with `secret_key = true` in `[namespace.X]` gets its own key, and
+its values then decrypt only with that key. Fetch it with
+`GET /v1/secret/public-key?namespace=X` (`relish secret pubkey --namespace X`);
+a token scoped to other namespaces gets 403. Rotate it with
+`relish secret rotate [--finalize] --namespace X`, which takes an unscoped
+Admin. Until the master key is split, every node can still unwrap every
+namespace's key.
+
 ### OCI release qualification
 
 These scripts exercise crash and reboot recovery on real hosts. They're manual:

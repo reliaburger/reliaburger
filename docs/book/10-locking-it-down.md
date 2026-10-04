@@ -800,9 +800,11 @@ Rotation happens in two steps:
 The Raft commands:
 
 ```rust
-RotateSecretKey { scope, new_keypair }   // mark old as read-only, add new
-FinalizeSecretRotation { scope }          // delete read-only keypairs
+RotateSecretKey { scope, new_keypair, resealed }  // mark old as read-only, add new
+FinalizeSecretRotation { scope }                   // delete read-only keypairs
 ```
+
+(`resealed` is empty for every rotation but one, a namespace's first key; we'll get to it in "One key per namespace" below.)
 
 This dual-key window means rotation is never a cliff. You start it, re-encrypt your secrets at your own pace, then finalise when ready.
 
@@ -932,6 +934,100 @@ pub fn matches_journal(&self, journal: &OciSpec) -> bool {
 A live intent must be equal, as before. A retired one must be equal once the values are gone. The trick that keeps this honest is that a launched entry is always `NAME=value`. A scrubbed entry has no `=`, so a live intent can never pass for a scrubbed one, and scrubbing twice changes nothing (retiring an already retired intent is idempotent, so that matters).
 
 The test that pins it lives in `tests/runc_intent.rs`. It builds a spec from an app whose `API_TOKEN` is `ENC[AGE:...]`, decrypts it with a stand-in decryptor, publishes and retires the intent, then walks every file under the bundle base looking for the plaintext. Before the fix it found `intent.json`. The Linux runc tests now carry a fake decrypted secret in every workload and make the same check on each instance's bundle and intent once it has stopped.
+
+### One key per namespace
+
+Here's an awkward question. Team A and team B share a cluster, and every `ENC[AGE:...]` value in it is sealed to the one cluster key. Team B finds team A's database password in an old commit, still encrypted. Can they read it?
+
+Not directly. But they can paste the ciphertext into one of their own apps, deploy it, and print the environment. The node decrypts whatever it's handed with the cluster key, because that key opens every value in every namespace. Encryption kept the password out of git; it did nothing to keep it inside team A.
+
+`AgeKeyScope` has had a `Namespace(String)` variant since chapter 4, and the agent already tried a namespace's keys before the cluster's. Two things were missing. Nothing ever created a namespace key, and even if something had, the agent fell back to the cluster key whenever the namespace key didn't open a value. A boundary you can step around by sealing to the other key isn't one.
+
+So a namespace now opts in:
+
+```toml
+[namespace.team-a]
+secret_key = true
+```
+
+Why opt in rather than give every namespace its own key? Because switching changes what decrypts. Every value already sealed to the cluster key has to move, and a GitOps repo full of cluster-sealed values will fail its next deploy until someone re-encrypts them. That's a decision the operator should make on purpose, one namespace at a time.
+
+**Who makes the key.** The obvious place is the state machine: apply the `[namespace.team-a]` write, see `secret_key = true`, generate a keypair. That would be a bug. Every replica applies every entry, and each would roll its own random key, so three nodes would hold three different "team-a keys" and agree on nothing. Raft apply has to be deterministic; we met the same rule with the CRL's clock. So the randomness happens on the leader, before the entry exists. `bun::namespace_keys` runs a loop on every node (followers do nothing, like the token sweep) that asks the local state which namespaces are waiting:
+
+```rust
+pub fn namespaces_awaiting_a_key(state: &DesiredState) -> Vec<String> {
+    state
+        .namespaces
+        .iter()
+        .filter(|(name, spec)| {
+            spec.secret_key && !state.security_state.has_namespace_key(name.as_str())
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+```
+
+The loop ticks every five seconds, and it doesn't clone the desired state to ask. `CouncilNode::read_desired` takes a closure and runs it against the state under a read lock, so the check borrows: `council.read_desired(namespaces_awaiting_a_key)` passes the function itself as the closure, since a plain `fn(&DesiredState) -> Vec<String>` satisfies `impl FnOnce(&DesiredState) -> T`. A quiet cluster pays for one read lock and writes nothing.
+
+**Moving the values.** Creating the key is the easy half. The namespace's apps still carry values sealed to the cluster key, and the moment the namespace has a key of its own, those values stop opening there. The leader re-seals them: it unwraps the cluster identities, decrypts each of the namespace's `ENC[AGE:...]` values, and encrypts the same plaintext to the new public key. Age is quick, but it's still CPU work, so it runs under `spawn_blocking`, and the plaintext never leaves that call.
+
+Then comes the part that's easy to get wrong. If the key went into one Raft entry and the re-sealed values into another, there'd be a window between them in which the namespace had a key and none of its values opened, and a leader crash in that window would leave it there for good. So both ride in the same entry, the `resealed` field on `RotateSecretKey`:
+
+```rust
+pub struct ResealedSecret {
+    pub app_id: AppId,
+    pub env_key: String,
+    pub previous: String, // the ciphertext the leader read
+    pub sealed: String,   // the same plaintext, sealed to the namespace key
+}
+```
+
+Why carry `previous`? Because the leader read the apps a moment before it proposed the entry, and an apply could have landed in between. Overwriting that newer value with a re-sealed copy of the old one would silently undo someone's deploy. The state machine checks every entry before it applies any of them: the app must still hold exactly `previous`, it must live in that namespace (a namespace's key never rewrites another namespace's values), and only a namespace's *first* key may re-seal at all. Any mismatch refuses the whole entry, no key and no values, and the leader tries again on the next tick. It's optimistic concurrency, the same compare-and-swap idea as an etcd transaction, done with the data the entry already carries.
+
+The check uses a let chain with an `Err` pattern:
+
+```rust
+if !resealed.is_empty()
+    && let Err(reason) = self.check_reseal(scope, first_key, resealed)
+{
+    return Some(CouncilResponse::Refused { reason });
+}
+```
+
+and the apply that follows uses another, `if first_key && let AgeKeyScope::Namespace(namespace) = scope`, which only binds `namespace` when the scope really is a namespace. After writing the values, it re-records the seals of every app in the namespace under the new scope, so a later cluster finalise doesn't wait on values that no longer need the cluster key.
+
+**No fallback.** With the key in place, the decryption side gets simpler, not more complicated:
+
+```rust
+pub fn decryption_keypairs(&self, namespace: &str) -> Vec<&AgeKeypair> {
+    if self.has_namespace_key(namespace) {
+        self.age_keypairs_for_scope(&AgeKeyScope::Namespace(namespace.to_string()))
+    } else {
+        self.age_keypairs_for_scope(&AgeKeyScope::ClusterWide)
+    }
+}
+```
+
+One set or the other, never both. The return type is a vector of borrows, `Vec<&AgeKeypair>`: the keypairs stay where they are in `SecurityState`, and the caller can't keep the vector longer than it holds the state, which the borrow checker enforces without us writing a lifetime (elision ties the output borrows to `&self`). A value that no key in the set opens fails the deploy closed, exactly as an undecryptable cluster value always has.
+
+Does re-sealing disturb what the previous section built for runc intents? It changes the ciphertext, not the plaintext, so the launched spec is identical before and after, and a retired intent's scrubbed copy, names only, still matches it. `resealing_keeps_the_launched_spec_and_its_scrubbed_journal_copy` pins exactly that. The stored app spec does change, though, so each app with encrypted values rolls once when its namespace opts in.
+
+**Rotation per namespace.** `relish secret rotate --namespace team-a` and `--finalize --namespace team-a` run the same two-step dance as the cluster key, on that scope only; the state machine already scoped everything by `AgeKeyScope`, which is why it needed no change. Rotating a namespace that never opted in is a `409`, since a rotation can't do the re-seal that opting in does. `relish secret pubkey --namespace team-a` prints the key to encrypt with. The rotate body is now parsed with `#[serde(deny_unknown_fields)]`, because `{"namespcae": "team-a"}` used to parse as an empty request and would have rotated the *cluster* key.
+
+Who may rotate? The maintainer's answer was: only an Admin scoped to the whole cluster, for now. An Admin scoped to team-a can't rotate team-a's key. That's stricter than it needs to be, but loosening it later is easy, and tightening it after people rely on it isn't.
+
+**What it doesn't protect against.** Every node still holds the master key, which unwraps every namespace's private key. So the boundary stands between tenants' tokens and workloads, not between a tenant and a compromised node; a root shell on any node reads every namespace's secrets. Splitting the master key (F03b in the roadmap) is what changes that. Re-sealing also can't recall copies: a cluster-sealed value from an old commit still opens in any namespace that hasn't opted in, until you rotate and finalise the cluster key or change the secret itself. And job specs aren't stored desired state, so they're not re-sealed; a job in an opted-in namespace needs its values encrypted to the namespace key.
+
+The tests sit at four levels:
+
+- `sesame::types`: `a_namespace_with_its_own_key_never_falls_back_to_the_cluster_key` and its mirror for a namespace without one.
+- `council::state_machine`: `a_namespaces_first_key_reseals_its_values_in_the_same_entry`, `a_stale_reseal_is_refused_and_creates_no_key`, `a_namespace_key_cannot_reseal_another_namespaces_values`, `only_a_namespaces_first_key_reseals`, and `namespace_rotation_and_finalise_leave_the_cluster_scope_alone`.
+- the agent: `a_value_sealed_for_one_namespace_fails_closed_in_another`, `after_opting_in_a_cluster_sealed_value_fails_closed_in_that_namespace` (the test `security-sesame.md` §10 always listed), and the intent check above.
+- the leader loop and the API: `the_leader_creates_an_opted_in_namespaces_key_and_reseals_its_values` (including its `secret.namespace_key_created` audit event, with no plaintext in it), `namespace_rotation_and_finalise_are_per_namespace_and_audited`, `only_an_unscoped_admin_rotates_a_namespace_key`, and `secret_public_key_serves_a_namespaces_own_key`.
+
+We checked the fallback tests the cheap way: put the old "namespace keys, then cluster keys" order back and watch four of them fail.
+
+`RotateSecretKey` grew a field and `NamespaceSpec` a flag, both in the Raft log and the snapshot, so the protocol and state generations in `src/compatibility.rs` went up by one each.
 
 ## Certificate revocation
 

@@ -59,7 +59,7 @@ async fn encrypted_environment_roundtrip(
         .deadline
         .run(
             "fetch public encryption key",
-            ctx.client.secret_public_key(),
+            ctx.client.secret_public_key(None),
         )
         .await
         .map_err(|error| error.to_string())?
