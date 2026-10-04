@@ -7,6 +7,7 @@ use super::*;
 /// binary is verified and staged; the process execs moments later.
 pub(super) async fn upgrade_apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    connection: Option<axum::Extension<crate::sesame::connection::ConnectionClosed>>,
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
@@ -24,17 +25,15 @@ pub(super) async fn upgrade_apply_handler(
         }
     };
 
+    let answer_delivered = connection.map(|axum::Extension(closed)| closed);
     match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeApply {
         directive,
         response,
+        answer_delivered,
     })
     .await
     {
-        Ok(Ok(())) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "status": "upgrading" })),
-        )
-            .into_response(),
+        Ok(Ok(())) => exec_follows(serde_json::json!({ "status": "upgrading" })),
         Ok(Err(crate::bun::BunError::Upgrade(
             error @ crate::upgrade::UpgradeError::AlreadyRunning { .. },
         ))) => (
@@ -60,6 +59,18 @@ pub(super) async fn upgrade_apply_handler(
             .into_response(),
         Err(_) => agent_unavailable(),
     }
+}
+
+/// A 202 the node execs straight after. `Connection: close` makes Hyper
+/// close the connection once this answer is written, which is what the
+/// agent waits for before it execs (see `ConnectionClosed`).
+fn exec_follows(body: serde_json::Value) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        [(axum::http::header::CONNECTION, "close")],
+        Json(body),
+    )
+        .into_response()
 }
 
 /// Node-level upgrade status: running version, in-flight marker, history.
@@ -90,6 +101,7 @@ pub(super) async fn upgrade_status_handler(
 /// Revert this node to a previous binary version (admin).
 pub(super) async fn upgrade_rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    connection: Option<axum::Extension<crate::sesame::connection::ConnectionClosed>>,
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
@@ -116,17 +128,15 @@ pub(super) async fn upgrade_rollback_handler(
         }
     };
 
+    let answer_delivered = connection.map(|axum::Extension(closed)| closed);
     match ask_agent(&state.cmd_tx, |response| AgentCommand::UpgradeRollback {
         version: request.version,
         response,
+        answer_delivered,
     })
     .await
     {
-        Ok(Ok(())) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "status": "rolling back" })),
-        )
-            .into_response(),
+        Ok(Ok(())) => exec_follows(serde_json::json!({ "status": "rolling back" })),
         Ok(Err(e)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": e.to_string() })),
