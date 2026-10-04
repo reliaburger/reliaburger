@@ -10,6 +10,7 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [Autoscale target validation](2026-10-03-autoscale-target-validation.md) | Refuse nonpositive or nonfinite controller targets and measurements. | #554 |
 | [Review 2: audit fixes](2026-10-03-review2-audit-fixes.md) | The approved 28-issue audit, implemented through one merge train with cross-path hardening last. | [#528–#555](https://github.com/reliaburger/reliaburger/milestone/11) |
 | [Blob repository authority](2026-10-03-plan-blob-repository-authority.md) | Require destination upload or catalogue evidence for shared CAS bytes ([#531](https://github.com/reliaburger/reliaburger/issues/531)). | Regressions, durable receipts, lifecycle and CI |
 | [Build signing lifetime](2026-10-03-plan-build-signing-lifetime.md) | Separate artefact authority from runtime mTLS and refresh the cached signer ([#529](https://github.com/reliaburger/reliaburger/issues/529)). | Regression, implementation and validation |
