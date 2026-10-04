@@ -1735,7 +1735,7 @@ mod tests {
                 },
             ),
         );
-        aggregated.stale_nodes.insert(node.clone());
+        aggregated.stale_nodes.push(node.clone());
         let members = vec![NodeMembershipInfo {
             node_id: node,
             address: "127.0.0.1:9117".parse().unwrap(),

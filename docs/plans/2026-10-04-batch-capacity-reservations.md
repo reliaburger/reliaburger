@@ -78,3 +78,7 @@ tail jobs remain held until the whole claim clears. Double-counting a reported
 job may reduce utilization. No term-to-node inference is safe across handover.
 The parent will integrate these claim hooks/tests after #543 because #534 has
 not entered this branch yet.
+
+The first baseline compile stopped on a test fixture using insert on the
+aggregator's Vec stale_nodes (/tmp/runtime-543-baseline.log). No behavioral red
+is counted. Changed only fixture insertion to push and retained the attempt.
