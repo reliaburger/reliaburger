@@ -686,6 +686,10 @@ relish secret encrypt --pubkey <key> <value> # Encrypt a value for ENC[AGE:...] 
 relish secret rotate                # Start secret-key rotation
 relish secret rotate --finalize     # Finalise rotation (drop the old read-only keypair)
 
+# Root CA backup (offline)
+relish ca backup --out <file> [--dir <init-dir>] [--cluster-name <name>] [--recipient <age1...> | --passphrase-file <path>]
+relish ca verify <file> --fingerprint sha256:... [--passphrase-file <path> | --identity <path>]
+
 # Tokens
 relish token create --name <name>   # Create an API token (default role: read-only)
 relish token create --name <name> --role <admin|deployer|read-only>

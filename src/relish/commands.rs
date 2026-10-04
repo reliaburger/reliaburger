@@ -1706,7 +1706,7 @@ pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
 /// `[images.trust_policy] keys` expects.
 pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
     let key = crate::pickle::signing::SigningKey::generate()?;
-    write_private_key(out, &key.to_pem())?;
+    write_private_key(out, key.to_pem().as_bytes())?;
     let public_key = key.public_key_base64();
     println!("wrote image signing key to {}", out.display());
     println!("public key: {public_key}");
@@ -1720,7 +1720,7 @@ pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
 }
 
 /// Write a private key, refusing to overwrite and keeping it owner-only.
-fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
+pub(crate) fn write_private_key(path: &Path, contents: &[u8]) -> Result<(), RelishError> {
     use std::io::Write as _;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1735,7 +1735,7 @@ fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
         },
         _ => RelishError::Io(e),
     })?;
-    file.write_all(pem.as_bytes())?;
+    file.write_all(contents)?;
     Ok(())
 }
 
