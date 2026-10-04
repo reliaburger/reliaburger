@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands
+.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -84,6 +84,15 @@ fmt-check: ## Check formatting without modifying files
 lint: ## Run clippy for every target, with all features and with none, warnings as errors
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
 	$(CARGO) clippy --all-targets --no-default-features -- -D warnings
+
+# One Clippy pass for the macOS CI job. The `lint` job on Linux runs both
+# passes. What only macOS compiles is `cfg(target_os = "macos")` code and the
+# `not(all(feature = "ebpf", target_os = "linux"))` fallbacks, and every
+# feature leaves both in, so the all-features pass covers them. The code that
+# only the no-features pass reaches is gated on a feature alone, and that
+# compiles the same on Linux. A second pass here took about three minutes.
+lint-macos: ## Run clippy once, every target with all features (the macOS CI job; `lint` runs both)
+	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
 audit: ## Fail on new RustSec findings or an expired advisory exception
 	@today=$$(date -u +%Y%m%d); expiry=20261118; \
