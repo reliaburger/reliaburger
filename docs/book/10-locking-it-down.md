@@ -328,6 +328,84 @@ RaftRequest::AttachSignature(attach) => {
 
 Once written to Raft, the signature is replicated to all council nodes. The scheduler reads it directly from `DesiredState` without re-verifying -- first-write wins.
 
+### Cosign, for images we didn't build
+
+Everything above covers images that live in Pickle. Most clusters also run images somebody else built: `nginx`, a Chainguard base, your company's images on GHCR. We can't sign those, and the people who did sign them didn't use our format. They used cosign.
+
+Before writing a line, we went and looked at what real images publish, with nothing but `curl` against the registry API. For each image we resolved a tag to its digest, then asked for the tag `sha256-<hex>.sig` (cosign's classic layout) and for the OCI referrers of that digest (where the newer Sigstore bundle lives):
+
+| Image | `.sig` tag | Referrers | Signed with |
+|-------|-----------|-----------|-------------|
+| `cgr.dev/chainguard/static` | yes | none | keyless (Fulcio certificate) |
+| `gcr.io/distroless/static-debian12` | yes | none | keyless |
+| `ghcr.io/sigstore/cosign/cosign` | yes | not supported | keyless |
+| `ghcr.io/fluxcd/source-controller` | yes | not supported | keyless |
+| `docker.io/library/nginx` | no | none | not signed with cosign |
+| `quay.io/prometheus/prometheus` | no | none | not signed with cosign |
+
+So the classic `.sig` tag is what's out there. Every one of those signatures is keyless, though: a short-lived Fulcio certificate rather than a key you could put in a config file. Checking those means trusting Sigstore's roots and their rotation, which is a bigger job and a separate one. What we built first is the part a team can use today: you sign your own images with `cosign sign --key`, list the public key, and a node only runs what that key signed.
+
+One more surprise. cosign 3 writes the new bundle format by default, as a referrer, and you have to ask for the old layout with `--new-bundle-format=false` (deprecated already). The bundle will be next, and the payload inside it is the same.
+
+#### What cosign actually signs
+
+For `ghcr.io/acme/web@sha256:5a90…`, cosign pushes a second image into the same repository, tagged `sha256-5a90….sig`. Each of its layers has the media type `application/vnd.dev.cosign.simplesigning.v1+json`, and the layer's bytes are a tiny JSON document:
+
+```json
+{"critical":{"identity":{"docker-reference":"ghcr.io/acme/web"},
+  "image":{"docker-manifest-digest":"sha256:5a90…"},
+  "type":"cosign container image signature"},"optional":null}
+```
+
+The signature isn't in the layer. It sits in the layer's `dev.cosignproject.cosign/signature` annotation in the manifest: base64 of an ASN.1 DER ECDSA P-256 signature over those exact payload bytes. That's the same curve and encoding `relish sign` uses, which is why `ring` covers it and we didn't add a crypto crate. Only the message differs: cosign signs the payload, we sign the digest string.
+
+#### The verifier
+
+`src/pickle/cosign.rs` has three steps: read the key, fetch the payloads, verify.
+
+A `cosign.pub` file is a PEM `PUBLIC KEY` block holding a DER SubjectPublicKeyInfo. `ring` wants the raw 65-byte point instead. For P-256 the DER wrapper is always the same 26 bytes, so we strip them rather than pull in an ASN.1 parser:
+
+```rust
+match der.strip_prefix(&P256_SPKI_PREFIX[..]) {
+    Some(point) if point.len() == P256_POINT_LEN && point[0] == 0x04 => Ok(Self {
+        point: point.to_vec(),
+    }),
+    _ => Err(CosignError::InvalidKey(/* … */)),
+}
+```
+
+`strip_prefix` on a slice returns `Option<&[u8]>`: `Some(rest)` when the slice starts with the prefix, `None` otherwise. The `if` after the pattern is a *match guard*. The arm only matches when the pattern fits and the condition holds, so a short key, a compressed point or an RSA key all fall through to the `_` arm. Python has nothing quite like it; in Go you'd write the `if` inside the `case`.
+
+Fetching goes through the `UpstreamRegistry` trait the pull-through cache already uses, so the verifier doesn't know or care whether it's talking to GHCR or a test registry. `fetch_root` reads the `.sig` manifest, and `fetch_blob` reads each payload. We hash every payload against its layer digest before we keep it. When the cache is on, `ClusterSource::cosign_signature` caches the `.sig` image under `cache/<host>/<repo>` like any other tag, so the cluster asks upstream once and every later check reads the cluster's copy.
+
+Verification is where the order matters:
+
+```rust
+if !keys
+    .iter()
+    .any(|key| key.verifies(&signed.payload, &signature))
+{
+    return Err("signature doesn't verify under any trusted key".to_string());
+}
+// Signed by a trusted key, so the bytes are the signer's; now read them.
+let payload: Payload = serde_json::from_slice(&signed.payload)
+    .map_err(|e| format!("signed payload isn't a cosign payload: {e}"))?;
+```
+
+We check the signature *before* we parse the JSON. Until a trusted key has vouched for those bytes they're attacker input, and there's no reason to hand attacker input to a parser when a byte comparison will do. Once the signature holds, the payload must name the digest the image was bound to. Without that check, a perfectly valid signature for last month's image would vouch for this month's.
+
+The payload's field names have hyphens in them, which Rust identifiers can't. `#[serde(rename = "docker-manifest-digest")]` maps the JSON name onto a normal field, and `#[serde(rename = "type")]` does the same for `type`, a reserved word in Rust. Serde ignores fields a struct doesn't declare, so `identity` and `optional` never get parsed at all.
+
+Any payload that verifies under any trusted key is enough. A repository signed by two teams, or re-signed after a key rotation, carries several layers, and one good one is all we need. When nothing verifies, the error lists why each payload failed, so "signed with the wrong key" and "signed, but for a different digest" read differently at 3 a.m.
+
+#### Testing against the real thing
+
+It's easy to write a verifier that agrees with your own signer and with nothing else. So the fixtures in `tests/fixtures/cosign/` come from cosign itself: we pushed a one-file image to a throwaway local registry (`crane registry serve`), ran `cosign sign --key cosign.key --tlog-upload=false --new-bundle-format=false`, checked it with `cosign verify`, and saved the image, the `.sig` manifest, the payload, the signature and both public keys. The private key wasn't kept.
+
+The unit tests read those files with `include_bytes!`, a macro that embeds a file's bytes into the test binary at compile time, so the tests can't run against a missing fixture. Alongside the one that should pass, they cover the refusals: another key, a payload for another digest, a payload edited after signing, a missing `.sig` tag, no keys at all. Two tests in `tests/suite/pickle_cluster.rs` push the same bytes into an in-process Pickle standing in for the upstream registry and fetch them over the real OCI protocol, once directly and once through the pull-through cache. The cache test also counts requests, to show a second check doesn't touch upstream.
+
+What isn't done yet is the policy around it. The upstream rules (`[[images.trust_policy.upstream]]` with `require_signatures` and `cosign_keys`) are a separate change, and the verifier gets wired into the deploy gate when they land.
+
 ## SecurityState in Raft
 
 The CA hierarchy, API tokens, join tokens, age keypairs, and OIDC signing config all live in a single `SecurityState` struct. During `relish init`, this struct is generated alongside a 32-byte master secret. The master secret wraps all private keys using HKDF + AES-256-GCM. The struct itself (with its wrapped keys) is safe to replicate, but the master secret must stay off the wire.
