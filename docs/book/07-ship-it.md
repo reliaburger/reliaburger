@@ -1513,3 +1513,25 @@ Parsing and reading errors now return through `Result` and `?`, including errors
 A shared `memory` limit is useful only if it reaches the resolved app. The old directory compiler accepted any TOML keys in `_defaults.toml`, but copied only `image`. Typed defaults now carry image, memory, CPU and environment into apps and jobs, plus deployment settings into apps. Unknown keys and malformed values fail with the defaults file's path. A default image does not turn an explicit host executable or script into a container.
 
 Inheritance merges fields: a child directory can change CPU while keeping its parent's image and memory. Environment keys and deployment options merge individually. A workload's explicit fields win, including `max_unavailable = 0` and `auto_rollback = false`; omitted options inherit. An empty environment table adds no overrides. Regression fixtures resolve parent, child and workload values, then round-trip the manifest to prove its resource settings survive serialization.
+
+### Comparing a complete deployment specification
+
+A dry run used to compare only image strings. Keeping an image unchanged while
+changing replicas, a port, environment variables or resource limits therefore
+printed an unchanged workload. The preview now fingerprints the complete
+serialized desired specification. Namespace is part of the resource identity:
+`app.team/web` and `app.other/web` have separate evidence. Replica ordinals are
+placement details, so they do not alter an app's desired-spec fingerprint.
+
+The API returns this evidence for apps, jobs, namespace quotas and permissions.
+Council state supplies the authoritative app, namespace and permission specs;
+local job checkpoints supply job specs. The endpoint filters the result through
+the caller's app and namespace scope. If different executions of one logical
+job have different specifications, their combined evidence is unknown.
+
+An absent fingerprint cannot prove equality. The plan prints `?` and serializes
+`unknown` for incomplete evidence, while a known image change still proves an
+update. An offline preview states that its creates assume no live comparison.
+A failed live lookup returns an error instead of manufacturing an empty cluster.
+Tests exercise the client-to-router-to-agent path and same-image changes, along
+with quotas, permissions, namespace separation and incomplete evidence.
