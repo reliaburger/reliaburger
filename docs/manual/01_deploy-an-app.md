@@ -249,7 +249,23 @@ image = "ghcr.io/example/report:2"
 schedule = "0 3 * * *"    # cron, UTC
 ```
 
-A failed job retries up to three times. A job whose exit Bun couldn't observe
+A `run_before` migration must name an app in the same manifest and effective
+namespace. The example's migration needs an `[app.api]` declaration too. Apply
+migrations and their dependent apps together. Cluster apply waits for a
+positively observed, durably recorded zero exit before publishing the new app
+revision. A failed migration leaves the old revision in place and does not
+retry automatically. A corrected apply can start a new generation after a
+known failure is settled.
+
+Cluster migration cancellation is checked after job settlement and immediately before desired-state publication is proposed. A transaction already submitted to Raft may still commit. Ownership-write timeouts return uncertainty and retain the fence; they do not authorize automatic reruns or imply that the proposal was rejected.
+
+The cron example is for a standalone node. Cluster apply refuses any manifest
+containing recurring schedules before changing desired state or launching work.
+It also refuses an overlapping app or job while an earlier cluster job claim
+has an uncertain outcome. Leadership changes or recovery preserve that fence;
+there is no automatic expiry or replay of an uncertain migration.
+
+A failed ordinary job retries up to three times. A job whose exit Bun couldn't observe
 (say, the node crashed) is `unknown`, and an ordinary apply won't rerun it,
 because it may already have done its work. Check, then ask explicitly:
 
@@ -311,3 +327,13 @@ an SSE or WebSocket stream. Stored log queries still use the original logical
 label; retained replay ownership does not itself supply a remote follow route.
 Predictable node policy rejection happens before the whole group's checkpoint,
 so correcting a rejected member does not leave healthy jobs permanently fenced.
+
+Held migration and ordinary-job claims also protect placement capacity. These
+jobs run on the receiving leader; the claim records no authoritative worker
+assignment. Both app and batch planners therefore reserve the complete held
+CPU/memory request on every candidate, without crediting a guessed replica or
+an unrelated report. Before app publication this includes all jobs; afterwards
+it includes only the ordinary tail. This can over-reserve capacity, including
+capacity already reported locally. It prevents new placements from spending
+uncertain commitments; it does not add initial job capacity or quota admission.
+Positive terminal settlement releases the corresponding held request.

@@ -120,8 +120,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
     /// Deploy all apps and jobs from a config, streaming progress events. The
     /// mirror of the former `BunAgent::deploy`, but off the command loop.
-    pub(super) async fn run_deploy(self, config: Config, events: mpsc::Sender<ApplyEvent>) {
+    pub(super) async fn run_deploy(self, mut config: Config, events: mpsc::Sender<ApplyEvent>) {
         if self.report_cancellation(&events).await {
+            return;
+        }
+        if let Err(message) = self.preflight_prerequisites(&mut config).await {
+            let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
         let now = Instant::now();
@@ -698,6 +702,39 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
     }
 
+    /// Verify and pin every referenced image before a migration can execute.
+    /// Ordinary applies with no prerequisites retain their existing admission.
+    pub(super) async fn preflight_prerequisites(&self, config: &mut Config) -> Result<(), String> {
+        if !config.job.values().any(|job| !job.run_before.is_empty()) {
+            return Ok(());
+        }
+        for spec in config.app.values_mut() {
+            if let Some(image) = self
+                .ops
+                .enforce_image_reference(spec.image.as_deref())
+                .await?
+            {
+                spec.image = Some(image);
+            }
+            for init in &mut spec.init {
+                let reference = init.image.as_deref().or(spec.image.as_deref());
+                if let Some(image) = self.ops.enforce_image_reference(reference).await? {
+                    init.image = Some(image);
+                }
+            }
+        }
+        for job in config.job.values_mut() {
+            if let Some(image) = self
+                .ops
+                .enforce_image_reference(job.image.as_deref())
+                .await?
+            {
+                job.image = Some(image);
+            }
+        }
+        Ok(())
+    }
+
     /// Run a `run_before` prerequisite job to completion for dependency
     /// ordering. Deploys the job, then polls the runtime until every instance
     /// exits. Returns `Ok(())` only when all instances exit cleanly (code 0);
@@ -725,6 +762,13 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     if exit_code == Some(0) {
                         self.ops.confirm_job_success(id).await?;
                         break;
+                    }
+                    if let Some(code) = exit_code {
+                        self.ops.confirm_job_exit(id, code).await?;
+                        return Err(BunError::PrerequisiteFailed {
+                            app_name: job_name.to_string(),
+                            code,
+                        });
                     }
                     return Err(BunError::DeployFailed {
                         app_name: job_name.to_string(),

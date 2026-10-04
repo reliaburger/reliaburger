@@ -81,6 +81,8 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 mod adopted_placements;
 mod app_stop;
 mod batch_jobs;
+mod cluster_jobs;
+pub use cluster_jobs::{ClusterJobReceipt, ClusterJobSettlement};
 mod commands;
 mod consumer;
 mod council_requests;
@@ -97,6 +99,10 @@ mod identity;
 mod identity_signing;
 mod job_runs;
 mod launch;
+#[cfg(test)]
+pub(crate) use cluster_jobs::ClusterJobExecution;
+#[cfg(test)]
+pub(crate) use launch::PrerequisiteFailure;
 mod launch_evidence;
 mod logs;
 mod networking;

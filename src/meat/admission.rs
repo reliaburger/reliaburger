@@ -23,6 +23,25 @@ pub fn job_requests(spec: &JobSpec) -> Resources {
     )
 }
 
+/// Conservative footprint for node-local work whose claim has no placement.
+/// Every candidate reserves this full amount; neither report presence nor an
+/// owner term is proof that the work settled or where it can safely be credited.
+/// Precommit includes migrations and ordinary jobs; postcommit keeps only the
+/// ordinary tail. This protects new placements, not initial job admission.
+pub fn held_job_requests(desired: &DesiredState) -> Resources {
+    desired
+        .prerequisite_claims
+        .values()
+        .fold(Resources::default(), |total, claim| {
+            claim
+                .config
+                .job
+                .values()
+                .filter(|job| !claim.apps_committed || job.run_before.is_empty())
+                .fold(total, |held, job| held.saturating_add(&job_requests(job)))
+        })
+}
+
 /// Requests not already represented by this node's exact reported instances.
 /// A missing report never releases an assigned execution's reservation.
 pub fn unreported_commitments(
@@ -45,7 +64,7 @@ pub fn unreported_commitments(
         let total = reported.entry(key).or_default();
         *total = total.saturating_add(&requests);
     }
-    let mut missing = Resources::default();
+    let mut missing = held_job_requests(desired);
     let mut seen = std::collections::HashSet::new();
     let mut add = |name: &str, namespace: &str, ordinal: u32, request: Resources| {
         if !seen.insert((name.to_string(), namespace.to_string(), ordinal)) {
@@ -82,6 +101,16 @@ pub fn unreported_commitments(
 /// Reconstruct both app and batch commitments using exact reported ordinals.
 /// A partial request credits only that amount, never the whole placement.
 pub fn reserve_commitments(cache: &mut ClusterStateCache, desired: &DesiredState) {
+    // Called once per freshly reconstructed planning cache. Held jobs have
+    // no authoritative node; reserve on every candidate without inventing a
+    // replica identity or crediting a possibly unrelated report.
+    let held = held_job_requests(desired);
+    for node_id in cache.node_ids() {
+        if let Some(mut node) = cache.get_node(&node_id).cloned() {
+            node.allocated = node.allocated.saturating_add(&held);
+            cache.set_node(node);
+        }
+    }
     for (app, placements) in &desired.scheduling {
         for placement in placements {
             cache.reserve_committed_instance(

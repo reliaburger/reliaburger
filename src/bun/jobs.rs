@@ -563,4 +563,46 @@ mod tests {
             "an inconsistent phase fabricated terminal success"
         );
     }
+    fn prerequisite_attempt() -> RecordedJob {
+        let spec = crate::config::Config::parse(
+            "[job.migration]\nimage='proc-grill:image-ignored'\ncommand=['true']\nrun_before=['app.web']\n",
+        )
+        .unwrap()
+        .job
+        .remove("migration")
+        .unwrap();
+        serde_json::from_value(serde_json::json!({
+            "name": "migration", "namespace": "default", "spec": spec,
+            "runtime": "Process", "generation": 1, "restart_count": 0,
+            "phase": {"Exited": {"code": 0}}, "runtime_absent": true, "batch_execution": null,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_admitted_prerequisite_persists_and_recovers_without_its_apply_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = crate::grill::InstanceIdentity::new("default", "migration", 0)
+            .instance_id()
+            .0;
+        let attempt = prerequisite_attempt();
+        persist(
+            directory.path(),
+            BTreeMap::from([(identity.clone(), attempt.clone())]),
+        )
+        .unwrap();
+        assert_eq!(load(directory.path()).unwrap()[&identity], attempt);
+    }
+
+    #[test]
+    fn intrinsic_job_validation_still_refuses_malformed_prerequisite_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = crate::grill::InstanceIdentity::new("default", "migration", 0)
+            .instance_id()
+            .0;
+        let mut attempt = prerequisite_attempt();
+        attempt.spec.exec = Some("/bin/true".into());
+        assert!(persist(directory.path(), BTreeMap::from([(identity, attempt)])).is_err());
+        assert!(!directory.path().join(CHECKPOINT_FILE).exists());
+    }
 }

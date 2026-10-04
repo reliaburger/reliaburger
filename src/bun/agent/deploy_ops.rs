@@ -22,8 +22,13 @@ pub(super) enum DeployOp {
         reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
     },
     /// A prerequisite's observed success must be durable before its dependent app runs.
+    EnforceImageReference {
+        image: Option<String>,
+        reply: oneshot::Sender<Result<Option<String>, String>>,
+    },
     ConfirmJobSuccess {
         instance_id: InstanceId,
+        code: i32,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// A bounded probe completes off-loop; only the agent mutates health state.
@@ -292,6 +297,7 @@ impl DeployOp {
     pub(super) fn name(&self) -> &'static str {
         match self {
             DeployOp::ConfirmJobSuccess { .. } => "confirm_job_success",
+            DeployOp::EnforceImageReference { .. } => "enforce_image_reference",
             DeployOp::HealthProbeResult { .. } => "health_probe_result",
             DeployOp::EnforceImageSignature { .. } => "enforce_image_signature",
             DeployOp::StoreDeployedSpec { .. } => "store_deployed_spec",
@@ -560,17 +566,40 @@ impl DeployOps {
         .await
     }
 
+    pub(super) async fn enforce_image_reference(
+        &self,
+        image: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        self.call(
+            |reply| DeployOp::EnforceImageReference {
+                image: image.map(str::to_owned),
+                reply,
+            },
+            Err("agent shutting down during prerequisite trust admission".into()),
+        )
+        .await
+    }
+
     pub(super) async fn confirm_job_success(
         &self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
+        self.confirm_job_exit(instance_id, 0).await
+    }
+
+    pub(super) async fn confirm_job_exit(
+        &self,
+        instance_id: &InstanceId,
+        code: i32,
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::ConfirmJobSuccess {
                 instance_id: instance_id.clone(),
+                code,
                 reply,
             },
             Err(BunError::JobState(
-                "agent unavailable before job success was persisted".into(),
+                "agent unavailable before job exit was persisted".into(),
             )),
         )
         .await
@@ -1233,11 +1262,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 let _ = reply.send(result);
             }
-            DeployOp::ConfirmJobSuccess { instance_id, reply } => {
+            DeployOp::EnforceImageReference { image, reply } => {
+                let _ = reply.send(
+                    self.enforce_image_reference_signature(image.as_deref())
+                        .await,
+                );
+            }
+            DeployOp::ConfirmJobSuccess {
+                instance_id,
+                code,
+                reply,
+            } => {
                 let result = self
                     .record_observed_job_exit(
                         &instance_id,
-                        crate::bun::jobs::JobPhase::Exited { code: 0 },
+                        crate::bun::jobs::JobPhase::Exited { code },
                     )
                     .await;
                 if result.is_ok()

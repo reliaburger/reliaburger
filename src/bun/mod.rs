@@ -160,6 +160,9 @@ pub enum BunError {
     /// Deploy was rejected (e.g. process workload binary not in allowlist).
     #[error("deploy failed for {app_name:?}: {reason}")]
     DeployFailed { app_name: String, reason: String },
+    /// The prerequisite's observed nonzero status was durably settled.
+    #[error("run_before job {app_name} exited with {code}")]
+    PrerequisiteFailed { app_name: String, code: i32 },
 
     /// A fault injection was rejected (safety rail, or unsupported on
     /// this platform / without the eBPF feature).

@@ -79,6 +79,29 @@ pub enum AgentCommand {
         config: Config,
         events: mpsc::Sender<ApplyEvent>,
     },
+    /// Admit and prepare migration images without launching any workload.
+    PreparePrerequisites {
+        config: Config,
+        response: oneshot::Sender<
+            Result<(Config, crate::bun::deploy_operations::DeployOperationHandle), String>,
+        >,
+    },
+    /// Execute the prepared migrations under the operation's existing ownership.
+    RunPrerequisites {
+        config: Config,
+        operation: crate::bun::deploy_operations::DeployOperationHandle,
+        response: oneshot::Sender<Result<(), super::launch::PrerequisiteFailure>>,
+    },
+    /// Bind startup acknowledgement to the actual ordinary job generations.
+    CaptureClusterJobs {
+        config: Config,
+        response: oneshot::Sender<Result<Arc<super::cluster_jobs::ClusterJobReceipt>, String>>,
+    },
+    /// Read positive completion or retirement evidence for that exact receipt.
+    ClusterJobsSettlement {
+        receipt: Arc<super::cluster_jobs::ClusterJobReceipt>,
+        response: oneshot::Sender<super::cluster_jobs::ClusterJobSettlement>,
+    },
     /// Explicit operator authorisation to rerun unknown node-local jobs.
     RerunJobs {
         config: Config,
@@ -381,6 +404,10 @@ impl AgentCommand {
             AgentCommand::ResolveExecutionLogs { .. } => "resolve_execution_logs",
             AgentCommand::LogCaptures { .. } => "log_captures",
             AgentCommand::Deploy { .. } => "deploy",
+            AgentCommand::PreparePrerequisites { .. } => "prepare_prerequisites",
+            AgentCommand::CaptureClusterJobs { .. } => "capture_cluster_jobs",
+            AgentCommand::ClusterJobsSettlement { .. } => "cluster_jobs_settlement",
+            AgentCommand::RunPrerequisites { .. } => "run_prerequisites",
             AgentCommand::RerunJobs { .. } => "rerun_jobs",
             AgentCommand::Stop { .. } => "stop",
             AgentCommand::Retire { .. } => "retire",
@@ -495,6 +522,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 response,
             } => {
                 let _ = response.send(self.batch_owned_identities(&identities));
+            }
+            AgentCommand::CaptureClusterJobs { config, response } => {
+                let _ = response.send(self.capture_cluster_jobs(&config));
+            }
+            AgentCommand::ClusterJobsSettlement { receipt, response } => {
+                let _ = response.send(self.cluster_jobs_settlement(&receipt));
+            }
+            AgentCommand::PreparePrerequisites { config, response } => {
+                self.prepare_prerequisites(config, response).await;
+            }
+            AgentCommand::RunPrerequisites {
+                config,
+                operation,
+                response,
+            } => {
+                self.run_prepared_prerequisites(config, operation, response);
             }
             AgentCommand::Deploy { config, events } => {
                 self.begin_deploy(config, events, true, false).await;

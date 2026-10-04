@@ -152,6 +152,50 @@ Jobs can declare `run_before = ["app.web"]`, meaning they must complete before t
 
 The orchestrator models this as a `RunningPreDeps` phase. If any pre-deploy job fails, the deploy fails immediately and no instances are modified.
 
+Cluster apply has another gate to protect: the app spec in Raft. Once that spec
+commits, another node can schedule the new app. The agent first reserves the
+local operation and checks image trust for the complete manifest. Raft then
+records a bounded claim owning every app and job identity, without publishing
+the new desired state. Prerequisites must reference an app in the same apply
+and effective namespace.
+
+A migration opens the gate only after a positive zero exit and a durable job
+checkpoint. A negative exit is recorded before reporting failure; failed
+migrations never enter the ordinary automatic retry path. The claim's original
+leadership term and recovery epoch fence an old worker. A new leader cannot
+infer the outcome from its own local records, so uncertainty retains ownership
+and prevents a changed app-only or job-only submission from repeating the work.
+
+After success, one Raft entry checks the complete manifest again and publishes
+its desired writes atomically. If ordinary jobs remain, their identities stay
+reserved until exact namespace, spec and generation receipts establish positive
+terminal outcomes. A startup acknowledgment or an empty receipt cannot release
+that ownership. Registered cron work has no finite execution receipt: cluster
+apply refuses recurring schedules before creating claims or launching work.
+Standalone cron registration remains supported.
+
+Migration cancellation also needs a boundary after the job settles. An accepted cancellation remains meaningful when the child subsequently exits zero: check it after settlement and immediately before proposing the desired-state transaction. A proposal already submitted to Raft can still commit; cancellation cannot roll that transaction back. Each replicated ownership write has a five-second caller deadline. A timeout does not tell us whether Raft committed, so we keep the uncertain fence and report an error. This is why the terminal job watcher ends without inventing a release when its settlement write stalls.
+
+The tests hold real Process migrations while inspecting desired state, forward
+a failed migration through a follower and change leaders while an old runner
+is blocked. A cold restart preserves a failed generation; an explicitly
+corrected apply launches a new one. State-machine and actor tests also cover
+atomic refusals, overlapping identities, malformed snapshots, pending retries
+and missing or uncertain ordinary-job receipts. Old-term or recovered claims
+stay held; there is no automatic expiry or replay, and administrator recovery
+is a separately proposed extension.
+
+
+Held migration and ordinary-job claims also protect placement capacity. These
+jobs run on the receiving leader; the claim records no authoritative worker
+assignment. Both app and batch planners therefore reserve the complete held
+CPU/memory request on every candidate, without crediting a guessed replica or
+an unrelated report. Before app publication this includes all jobs; afterwards
+it includes only the ordinary tail. This can over-reserve capacity, including
+capacity already reported locally. It prevents new placements from spending
+uncertain commitments; it does not add initial job capacity or quota admission.
+Positive terminal settlement releases the corresponding held request.
+
 ## From the model to the wired path
 
 Here's a honesty note that's easy to skip past. Everything above — `DeployOrchestrator`, the `DeployDriver` trait, `execute_blue_green`, the exhaustive rollback tests — is a *model* of the deploy state machine. It's driven in tests by `MockDriver`, and it's where we work out the tricky transitions in microseconds. But it is not the code that runs on a node. The path that actually deploys your app lives in the Bun agent: `rolling_redeploy`, `blue_green_redeploy`, and an inline `run_before` gate, each calling the supervisor and the container runtime directly.

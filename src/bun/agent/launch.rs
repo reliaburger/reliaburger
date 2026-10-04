@@ -4,6 +4,13 @@
 
 use super::*;
 
+/// A known terminal failure may release the replicated gate; uncertainty cannot.
+#[derive(Debug)]
+pub struct PrerequisiteFailure {
+    pub message: String,
+    pub settled: bool,
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) fn validate_deploy_names(&self, config: &Config) -> Result<(), String> {
         use crate::bun::deploy_operations::DeployTargetKind;
@@ -52,15 +59,151 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .map_err(|error| error.to_string())?;
         }
         for (name, spec) in &config.job {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if !spec.run_before.is_empty()
+                && self
+                    .scheduled_jobs
+                    .contains_key(&(name.clone(), namespace.into()))
+            {
+                return Err(format!(
+                    "workload {namespace}/{name} belongs to a registered cron job; stop it before running a migration"
+                ));
+            }
             self.supervisor
-                .admit_workload_kind(
-                    name,
-                    spec.namespace.as_deref().unwrap_or("default"),
-                    DeployTargetKind::Job,
-                )
+                .admit_job(name, namespace, spec)
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    /// Reserve all local targets and perform trust admission before Raft intent
+    /// or any execution. Failure here can release ownership without uncertainty.
+    pub(super) async fn prepare_prerequisites(
+        &mut self,
+        config: Config,
+        response: oneshot::Sender<
+            Result<(Config, crate::bun::deploy_operations::DeployOperationHandle), String>,
+        >,
+    ) {
+        if self.startup_cleanup_pending
+            || self.draining.load(std::sync::atomic::Ordering::Relaxed)
+            || self.stopping_target(&config).is_some()
+            || self.restoring_target(&config).is_some()
+        {
+            let _ = response.send(Err(
+                "node cleanup, stop, restore or drain still owns a target".into(),
+            ));
+            return;
+        }
+        if let Err(error) = self.validate_deploy_names(&config) {
+            let _ = response.send(Err(error));
+            return;
+        }
+        // LOOP-INLINE: in-memory target ownership, no I/O
+        let operation = match self.deploy_operations.start(&config).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                let _ = response.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let worker = self.prerequisite_worker(operation.clone());
+        tokio::spawn(async move {
+            let mut config = config;
+            // This shared preflight performs no runtime create or start.
+            let result = worker.preflight_prerequisites(&mut config).await;
+            if let Err(message) = result {
+                operation
+                    .finish(
+                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                        message.clone(),
+                    )
+                    .await;
+                let _ = response.send(Err(message));
+            } else if response.send(Ok((config, operation.clone()))).is_err() {
+                operation
+                    .finish(
+                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                        "prepared prerequisite receiver disappeared before dispatch",
+                    )
+                    .await;
+            }
+        });
+    }
+
+    fn prerequisite_worker(
+        &self,
+        operation: crate::bun::deploy_operations::DeployOperationHandle,
+    ) -> DeployWorker<G> {
+        DeployWorker {
+            rerun_unknown_jobs: false,
+            prepared_batch_jobs: None,
+            grill: self.supervisor.grill().clone(),
+            ops: DeployOps {
+                tx: self.deploy_ops_tx.clone(),
+            },
+            drains: self.drains.clone(),
+            operation: Some(operation),
+            stop_confirmation_timeout: self.stop_confirmation_timeout,
+            egress: self.egress_resolver(),
+        }
+    }
+
+    /// Run only migration jobs; the API retains the operation through commit.
+    pub(super) fn run_prepared_prerequisites(
+        &self,
+        config: Config,
+        operation: crate::bun::deploy_operations::DeployOperationHandle,
+        response: oneshot::Sender<Result<(), PrerequisiteFailure>>,
+    ) {
+        let worker = self.prerequisite_worker(operation.clone());
+        tokio::spawn(async move {
+            let result = async {
+                for (name, spec) in config
+                    .job
+                    .iter()
+                    .filter(|(_, job)| !job.run_before.is_empty())
+                {
+                    if operation.cancellation_requested() {
+                        return Err(PrerequisiteFailure {
+                            message: "prerequisite cancellation retains uncertain ownership".into(),
+                            settled: false,
+                        });
+                    }
+                    worker
+                        .run_prerequisite_job(
+                            name,
+                            spec.namespace.as_deref().unwrap_or("default"),
+                            spec,
+                        )
+                        .await
+                        .map_err(|error| PrerequisiteFailure {
+                            settled: matches!(error, BunError::PrerequisiteFailed { .. }),
+                            message: error.to_string(),
+                        })?;
+                }
+                // Match standalone deploy's boundary after migration settlement.
+                // A positive exit does not erase an accepted cancellation.
+                if operation.cancellation_requested() {
+                    return Err(PrerequisiteFailure {
+                        message:
+                            "prerequisite cancelled before app publication; ownership remains held"
+                                .into(),
+                        settled: false,
+                    });
+                }
+                Ok(())
+            }
+            .await;
+            if response.send(result).is_err() {
+                operation
+                    .finish(
+                        crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
+                        "prerequisite result receiver disappeared; replicated claim remains held",
+                    )
+                    .await;
+            }
+        });
     }
 
     /// Admit and track either an operator apply or one cron firing through
@@ -293,17 +436,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         spec: &AppSpec,
     ) -> Result<Option<String>, String> {
+        self.enforce_image_reference_signature(spec.image.as_deref())
+            .await
+    }
+
+    pub(super) async fn enforce_image_reference_signature(
+        &self,
+        image: Option<&str>,
+    ) -> Result<Option<String>, String> {
         if !self.trust_policy.require_signatures {
             return Ok(None);
         }
         // A process workload has no image; nothing to verify.
-        if spec.image.is_none() {
+        if image.is_none() {
             return Ok(None);
         }
         let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
             return Err(format!(
                 "image {} requires a signature but this node has no cluster trust state to verify it against (require_signatures is enabled); run in cluster mode or disable require_signatures",
-                spec.image.as_deref().unwrap_or("<none>")
+                image.unwrap_or("<none>")
             ));
         };
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
@@ -314,14 +465,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .get_ca(crate::sesame::types::CaRole::Root)
             .map(|ca| ca.certificate_der.clone());
         let verified = crate::meat::scheduler::verify_image_signature(
-            spec.image.as_deref(),
+            image,
             &catalog,
             &self.trust_policy,
             root_ca.as_deref(),
             Some(&security_state.crl),
         )
         .map_err(|e| e.to_string())?;
-        Ok(match (spec.image.as_deref(), verified) {
+        Ok(match (image, verified) {
             (Some(image), Some(digest)) => {
                 Some(crate::meat::scheduler::pin_image_reference(image, &digest))
             }
