@@ -254,3 +254,5 @@ Cron doesn't catch up: firings missed while a node was down are skipped.
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
 - Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
   `relish batch-status <ID> --wait`
+
+Directory defaults support `image`, `memory`, `cpu`, `[env]` and `[deploy]`. Child directories override individual fields; environment and deployment tables merge by key, and explicit workload values win. Common fields apply to jobs too, while deployment strategies apply to apps. Unknown defaults keys fail compilation.

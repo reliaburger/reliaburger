@@ -1336,3 +1336,33 @@ This remains an audit guard, not the authorisation mechanism. The existing
 request tests still prove that read-only users cannot mutate resources and
 scoped users cannot access another tenant. The new regression places a GET and
 a POST on one path and verifies that both are collected independently.
+
+
+### Build signatures need an artefact lifetime
+
+The build signer used to receive the same one-hour certificate as a running
+workload, then retain it in a namespace cache indefinitely. A later build failed
+its local signature check. An image that had already passed could also stop
+deploying after an hour: the deployment gate verifies the certificate chain at
+the current time.
+
+Code signing now gets a separate leaf lifetime of at most five years, capped by
+the Workload CA's expiry. Its validity starts no earlier than the CA's. The
+one-hour mTLS policy stays in place for running workloads. Each build checks the
+cached signing chain and renews the signer before its leaf expires, with a day's
+lead time or half the issued leaf's lifetime when the CA is nearly expired.
+The cache owns both the key and its certificate, so renewal replaces them together.
+
+The gate checks the leaf, every intermediate and the trusted root at the current
+time, and refuses expired or revoked authority. These signatures still have a
+finite lifetime. Renewing a build signer does not
+extend an existing image's certificate. Operators must re-sign retained images
+before their chain expires, and after revoking an authority they used. The stored
+signature's timestamp supplies no cryptographic proof of when it was made, so it
+cannot override expiry or revocation. Images signed under the old one-hour policy
+need re-signing too.
+
+The regressions verify an actual cluster signature two hours after issuance,
+shorten an issuer's lifetime to check the leaf's upper bound, and place an expired
+certificate in the live build cache before asking for the next signer. The
+existing expired-chain and revocation tests continue to refuse expired authority.
