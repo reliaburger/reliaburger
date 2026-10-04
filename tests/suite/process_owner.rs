@@ -137,20 +137,52 @@ impl Owner {
         std::fs::read_to_string(self.directory.path().join("owner.log")).unwrap()
     }
 
+    /// Send one request and parse the owner's one-line reply.
+    ///
+    /// The owner gives each client 100 ms from accepting it to receiving the
+    /// whole line, then hangs up without acting (#521). The request goes out
+    /// in a single write, as the agent's client sends it: `writeln!` with a
+    /// JSON value issued one write per token, 18 for a kill, and a test
+    /// thread descheduled between two of them missed the deadline. Even one
+    /// write can miss it on a loaded machine if the thread stalls between
+    /// connecting and writing, so a hang-up before any reply is sent again.
+    /// That is safe: the owner always answers a request it has read.
     fn request(&self, nonce: &str, action: &str) -> serde_json::Value {
-        let mut socket = UnixStream::connect(&self.socket).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        writeln!(
-            socket,
-            "{}",
+        let request = format!(
+            "{}\n",
             serde_json::json!({"nonce": nonce, "action": action})
+        );
+        let mut dropped = Vec::new();
+        for _ in 0..5 {
+            let mut socket = UnixStream::connect(&self.socket).unwrap_or_else(|error| {
+                panic!(
+                    "connect for {action}: {error}; earlier attempts {dropped:?}; owner log: {}",
+                    self.diagnostics()
+                )
+            });
+            let mut line = String::new();
+            let sent = socket
+                .write_all(request.as_bytes())
+                .and_then(|()| socket.set_read_timeout(Some(Duration::from_secs(2))))
+                .and_then(|()| BufReader::new(&socket).read_line(&mut line));
+            match sent {
+                // A hang-up before the owner read the request: try again.
+                Ok(0) | Err(_) if line.is_empty() => dropped.push(format!("{sent:?}")),
+                _ => {
+                    return serde_json::from_str(&line).unwrap_or_else(|error| {
+                        panic!(
+                            "owner reply to {action} was unreadable ({error}, raw {line:?}); \
+                             owner log: {}",
+                            self.diagnostics()
+                        )
+                    });
+                }
+            }
+        }
+        panic!(
+            "owner hung up on {action} without a reply every time: {dropped:?}; owner log: {}",
+            self.diagnostics()
         )
-        .unwrap();
-        let mut line = String::new();
-        BufReader::new(socket).read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
     }
 }
 
