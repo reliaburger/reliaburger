@@ -133,3 +133,26 @@ a subsequent connection. The handler records any expired old-identity request
 even if its response is dropped. A negative control keeps the connection alive
 and proves that the same fixture rejects continued use of the old identity.
 Certificate verification and production clocks stay unchanged.
+
+### 2026-10-04: CLI subprocess fixtures during namespace validation (#551, #555)
+
+The complete local `make ci` run for #551 selected 5,421 portable tests with
+profile `ci`, two workers and zero retries. It passed 5,419, failed
+`grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli` after
+2.208 seconds because its shell PID marker was absent, and timed out
+`documentation_first_run::post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed`
+at 60.008 seconds with only the test-start message. Neither fixture was changed
+by #551. The original failure log and JUnit report are retained at
+`/tmp/reliaburger-review2-24-ci.log` and
+`/tmp/reliaburger-review2-24-evidence/full/junit.xml`.
+
+Each passed one exact diagnostic run: Apple cleanup in 2.079 seconds and
+join-token enrolment in 25.840 seconds. These are diagnostics, not a replacement
+for the failed complete run; the cause remains unknown. Their logs are
+`/tmp/reliaburger-review2-24-diagnostic.log` and
+`/tmp/reliaburger-review2-24-enrol-diagnostic.log`. The first diagnostic selected
+only the Apple library test; the enrolment case was explicitly selected from its
+standalone `documentation_first_run` binary in the second command. #555 must
+retain the deadlines, record subprocess readiness and phase evidence without
+credentials, and require exact binary/test inventory so a successful partial
+selector cannot be reported as proving another case.

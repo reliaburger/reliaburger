@@ -13,7 +13,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::*;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
+use sha2::{Digest, Sha256};
 
 use super::scan::{ParquetTable, list_local, list_remote, streaming_session};
 use super::types::{MayoError, MetricKey, Sample};
@@ -52,29 +53,6 @@ fn parse_object_store(
     let (store, prefix) = crate::object_storage::open(&url)
         .map_err(|e| MayoError::ObjectStore(format!("unsupported object_store_url: {e}")))?;
     Ok((Arc::from(store), prefix))
-}
-
-/// Seed the flush counter for a remote backend by listing existing
-/// `metrics_NNNNNN.parquet` objects under `prefix` and returning one past the
-/// highest — so a restart resumes numbering instead of clobbering data.
-async fn next_remote_flush_counter(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &object_store::path::Path,
-) -> Result<u64, MayoError> {
-    use futures_util::StreamExt;
-    let mut listing = store.list(Some(prefix));
-    let mut max_seen: Option<u64> = None;
-    while let Some(item) = listing.next().await {
-        let meta = item.map_err(|e| MayoError::ObjectStore(e.to_string()))?;
-        let name = meta.location.filename().unwrap_or("");
-        if let Some(rest) = name.strip_prefix("metrics_")
-            && let Some(digits) = rest.strip_suffix(".parquet")
-            && let Ok(n) = digits.parse::<u64>()
-        {
-            max_seen = Some(max_seen.map_or(n, |m| m.max(n)));
-        }
-    }
-    Ok(max_seen.map_or(0, |m| m + 1))
 }
 
 /// Serialise a RecordBatch to in-memory Parquet bytes (for object-store PUT).
@@ -241,7 +219,14 @@ pub async fn write_pending_flush(pending: PendingFlush) -> Result<(), MayoError>
                 .await
                 .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))??;
             store
-                .put(&key, object_store::PutPayload::from(bytes))
+                .put_opts(
+                    &key,
+                    object_store::PutPayload::from(bytes),
+                    object_store::PutOptions {
+                        mode: object_store::PutMode::Create,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .map_err(|e| MayoError::ObjectStore(e.to_string()))?;
             Ok(())
@@ -305,9 +290,9 @@ impl MayoStore {
     }
 
     /// Open a store, backing it with an object store when `object_store_url` is
-    /// set (H8) or a local `data_dir` otherwise. For the remote backend the
-    /// flush counter is seeded by listing existing `metrics_*.parquet` objects,
-    /// so a restart resumes numbering instead of clobbering prior data.
+    /// set (H8) or a local `data_dir` otherwise. Generic opens read the whole
+    /// configured archive. Remote chunks use fresh random 128-bit names and
+    /// create-only PUTs, so simultaneous writers never replace existing data.
     pub async fn open(
         data_dir: PathBuf,
         object_store_url: Option<&str>,
@@ -316,13 +301,35 @@ impl MayoStore {
             return Ok(Self::new(data_dir));
         };
         let (store, prefix) = parse_object_store(url)?;
-        let flush_counter = next_remote_flush_counter(&store, &prefix).await?;
+        let flush_counter = 0;
         Ok(Self {
             buffer: Vec::new(),
             data_dir,
             backend: Backend::Remote { store, prefix },
             flush_counter,
         })
+    }
+
+    /// Open a production node's archive within the configured bucket. The
+    /// stable opaque owner is hashed, so labels and path characters cannot
+    /// accidentally merge writers. Generic `open` still reads the full archive.
+    pub async fn open_for_node(
+        data_dir: PathBuf,
+        object_store_url: Option<&str>,
+        owner: &str,
+    ) -> Result<Self, MayoError> {
+        let mut store = Self::open(data_dir, object_store_url).await?;
+        if let Backend::Remote { prefix, .. } = &mut store.backend {
+            if owner.is_empty() {
+                return Err(MayoError::ObjectStore(
+                    "node archive owner is required".into(),
+                ));
+            }
+            *prefix = prefix
+                .clone()
+                .join(format!("nodes/{:x}", Sha256::digest(owner.as_bytes())).as_str());
+        }
+        Ok(store)
     }
 
     /// The local directory where Parquet files are stored (the configured
@@ -437,7 +444,9 @@ impl MayoStore {
             },
             Backend::Remote { store, prefix, .. } => FlushTarget::Remote {
                 store: Arc::clone(store),
-                key: prefix.clone().join(filename.as_str()),
+                key: prefix
+                    .clone()
+                    .join(format!("metrics_{:032x}.parquet", rand::random::<u128>()).as_str()),
             },
         };
         Ok(Some(PendingFlush { batch, target }))
@@ -1854,5 +1863,170 @@ mod tests {
             let store = format!("{store:?}");
             assert!(store.contains("fsync: true"), "{destination}: {store}");
         }
+    }
+    #[tokio::test]
+    async fn simultaneous_object_store_writers_keep_both_nodes_history() {
+        let bucket = tempfile::tempdir().unwrap();
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
+        let mut first = MayoStore::open(first_dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        let mut second = MayoStore::open(second_dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        let first_key = MetricKey::with_labels(
+            "cpu",
+            std::collections::BTreeMap::from([("node".into(), "a".into())]),
+        );
+        let second_key = MetricKey::with_labels(
+            "cpu",
+            std::collections::BTreeMap::from([("node".into(), "b".into())]),
+        );
+        first.insert(&first_key, Sample::at(100, 11.0));
+        second.insert(&second_key, Sample::at(100, 22.0));
+        let (a, b) = tokio::join!(first.flush(), second.flush());
+        a.unwrap();
+        b.unwrap();
+        let rows = first.query("cpu", 0, 200).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one node overwrote the other node's first chunk"
+        );
+        assert!(rows.iter().any(|row| row.3 == 11.0));
+        assert!(rows.iter().any(|row| row.3 == 22.0));
+        first.insert(&first_key, Sample::at(101, 12.0));
+        second.insert(&second_key, Sample::at(101, 23.0));
+        let (a, b) = tokio::join!(first.flush(), second.flush());
+        a.unwrap();
+        b.unwrap();
+        let restarted = MayoStore::open(first_dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        assert_eq!(restarted.query("cpu", 0, 200).await.unwrap().len(), 4);
+        assert_eq!(std::fs::read_dir(bucket.path()).unwrap().count(), 4);
+    }
+    #[tokio::test]
+    async fn node_archives_are_scoped_but_generic_queries_read_all_owners() {
+        let bucket = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
+        let mut one =
+            MayoStore::open_for_node(local.path().join("one"), Some(&url), "cluster:a/node:a")
+                .await
+                .unwrap();
+        let mut two =
+            MayoStore::open_for_node(local.path().join("two"), Some(&url), "cluster:a/node:b")
+                .await
+                .unwrap();
+        let key = MetricKey::simple("cpu");
+        one.insert(&key, Sample::at(100, 11.0));
+        two.insert(&key, Sample::at(100, 22.0));
+        one.flush().await.unwrap();
+        two.flush().await.unwrap();
+        assert_eq!(
+            one.query("cpu", 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.3)
+                .collect::<Vec<_>>(),
+            vec![11.0]
+        );
+        assert_eq!(
+            two.query("cpu", 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.3)
+                .collect::<Vec<_>>(),
+            vec![22.0]
+        );
+        let recovered = MayoStore::open_for_node(
+            local.path().join("lost-local-dir"),
+            Some(&url),
+            "cluster:a/node:a",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered
+                .query("cpu", 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.3)
+                .collect::<Vec<_>>(),
+            vec![11.0]
+        );
+        let all = MayoStore::open(local.path().join("archive-reader"), Some(&url))
+            .await
+            .unwrap();
+        assert_eq!(all.query("cpu", 0, 200).await.unwrap().len(), 2);
+        assert!(
+            MayoStore::open_for_node(local.path().join("empty-owner"), Some(&url), "")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_only_remote_chunks_refuse_collisions_without_replacing_history() {
+        let bucket = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
+        let mut store = MayoStore::open(local.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        let key = MetricKey::simple("cpu");
+        store.insert(&key, Sample::at(100, 11.0));
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        let retry_batch = pending.batch.clone();
+        let FlushTarget::Remote {
+            store: remote,
+            key: location,
+        } = &pending.target
+        else {
+            panic!("expected remote flush")
+        };
+        let mut earlier = MayoStore::new(local.path().join("earlier"));
+        earlier.insert(&key, Sample::at(100, 99.0));
+        let bytes = batch_to_parquet_bytes(&earlier.buffer_to_batch().unwrap().unwrap()).unwrap();
+        remote
+            .put_opts(
+                location,
+                object_store::PutPayload::from(bytes),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(write_pending_flush(pending).await.is_err());
+        assert_eq!(
+            store
+                .query("cpu", 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.3)
+                .collect::<Vec<_>>(),
+            vec![99.0]
+        );
+        // This is the rollback that both ordinary production flush APIs own.
+        store.reabsorb_batch(&retry_batch);
+        store.flush().await.unwrap();
+        let mut values: Vec<_> = store
+            .query("cpu", 0, 200)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.3)
+            .collect();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![11.0, 99.0]);
     }
 }
