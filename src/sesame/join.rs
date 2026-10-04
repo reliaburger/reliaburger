@@ -782,8 +782,8 @@ mod tests {
             trusted_node_cas_b64: vec![BASE64.encode(&result.node_ca_der)],
         };
         let trust = ca.decode().unwrap();
-        assert_eq!(trust.node_cas, [result.node_ca_der.clone()]);
-        assert_eq!(trust.roots, [result.root_ca_der.clone()]);
+        assert_eq!(trust.node_cas, std::slice::from_ref(&result.node_ca_der));
+        assert_eq!(trust.roots, std::slice::from_ref(&result.root_ca_der));
         let expected = crate::sesame::identity_store::root_ca_fingerprint(&result.root_ca_der);
         assert_eq!(ca.root_ca_fingerprint().unwrap(), expected);
     }
