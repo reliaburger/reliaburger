@@ -114,9 +114,7 @@ impl Harness {
                 );
             }
             for name in &options.stale_capacity_nodes {
-                state
-                    .stale_nodes
-                    .insert(reliaburger::meat::NodeId::new(name));
+                state.stale_nodes.push(reliaburger::meat::NodeId::new(name));
             }
             state
         };
