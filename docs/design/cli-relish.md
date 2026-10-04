@@ -685,6 +685,8 @@ relish secret pubkey [dir]          # Print the cluster age public key (API, or 
 relish secret encrypt --pubkey <key> <value> # Encrypt a value for ENC[AGE:...] fields
 relish secret rotate                # Start secret-key rotation
 relish secret rotate --finalize     # Finalise rotation (drop the old read-only keypair)
+relish secret pubkey --namespace <ns>               # A namespace's own key (secret_key = true)
+relish secret rotate [--finalize] --namespace <ns>  # Rotate one namespace's key (unscoped Admin)
 
 # Root CA backup (offline)
 relish ca backup --out <file> [--dir <init-dir>] [--cluster-name <name>] [--recipient <age1...> | --passphrase-file <path>]

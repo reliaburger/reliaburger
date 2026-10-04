@@ -21,6 +21,7 @@ pub mod gpu;
 pub mod health;
 pub(crate) mod jobs;
 pub mod loop_meter;
+pub mod namespace_keys;
 pub mod probe;
 pub mod readiness;
 pub mod restart;

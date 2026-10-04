@@ -10,6 +10,7 @@ pub mod binding;
 pub mod build;
 pub mod capability;
 pub mod copy;
+pub mod cosign;
 pub mod gc;
 pub mod lease;
 pub mod p2p;

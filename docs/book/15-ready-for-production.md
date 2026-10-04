@@ -587,7 +587,16 @@ The rest of the fix follows one idea: build once, then fan out.
   files after extraction.
 - **One cache per build, saved from `main`.** Thirteen per-job caches overflowed GitHub's
   10 GB limit, so every pull request evicted the last and most jobs started cold. Jobs that
-  build the same profile now share a key, and only `main` writes it.
+  build the same profile now share a key, and only `main` writes it. We thought about letting
+  release trains write too, then read the logs: a train's macOS job already restored main's
+  cache on a full match. rust-cache builds the key from the toolchain, the environment,
+  `Cargo.lock` and `Cargo.toml` (ignoring version numbers), so a branch with main's
+  dependencies hits it. Most of the build is our own crate, and that is never cached.
+- **One Clippy pass on macOS.** The `lint` job runs Clippy twice on Linux, with every feature
+  and with none. macOS only needs the first pass. Its own code is behind
+  `cfg(target_os = "macos")`, and no feature switches it off, so the all-features pass covers
+  it. Code that only the no-features pass compiles depends on a feature alone and builds the
+  same on Linux. Dropping the second pass on macOS saves about three minutes.
 
 The last piece is choosing what a run needs. A small script diffs a pull request against its
 base and sets three outputs, and every expensive job asks one of them:

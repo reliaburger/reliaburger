@@ -9,6 +9,7 @@ use crate::grill::mock::MockGrill;
 
 mod loop_harness;
 mod loop_rule;
+mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
 mod upgrade_answer;
