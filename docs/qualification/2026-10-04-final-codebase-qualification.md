@@ -49,7 +49,7 @@ cloud/power-cut qualifications require their declared owners.
 | Shared workload authorization | Four source-policy architecture assertions failed; paired real HTTP authority control already passed the existing implementation | Four architecture controls and all 247 authorization/apply/batch cases passed; original principal and refusal effects observed |
 | Static permission guardian | Existing matrix guardian and actual shared-Deploy control failed after the helper extraction | Six source controls and all 23 adjacent authorization/permission tests passed; exact helper, propagated error and unconditional Deploy required |
 | Optimized cron owner | Real Cargo metadata refused two transitive thiserror versions | Direct root production dependency lookup verified equal actual versions/features; all eleven optimized production-module tests passed |
-| Evidence front doors | Original incomplete/completion, context, source, ownership and whole-command refusal controls retained | 314 Python controls passed in the complete corrective-source snapshot |
+| Evidence front doors | Original incomplete/completion, context, source, ownership and whole-command refusal controls retained | 317 Python controls passed in the complete corrective-source snapshot |
 
 Compiler/fixture setup failures are retained separately: Mayo read-guard borrow
 correction, capture test-hook Debug derive, authoritative EOF checkpoint fixture
@@ -130,6 +130,17 @@ queries; all 314 Python controls passed in isolated qualification. The actual co
 corrective source also passed all 314 in 23.543s with both ambient GitHub mode
 and the local build override present, plus the ignored-owner check. That failed
 run remains retained; the corrected head requires fresh owner qualification.
+
+The second hosted head `7f2243b5` passed CI policy but coverage refused before
+execution: the pinned tool emits `--no-tests=fail` before `--profile ci`, whereas
+the owner expected the reverse order. The retained actual command and upstream
+parser establish the canonical plan. Three new controls require that exact order
+and reject changed or missing selectors. The Make input remains unchanged;
+there is no argument sorting or broader selector admission. All 317 Python
+controls passed in isolated qualification. The assembled correction passed all
+317 in 26.259s with ambient GitHub mode and the local target override present,
+plus the ignored-owner check; genuine instrumentation and the
+coverage floor still require fresh current-head CI.
 
 ## Failure ledger
 

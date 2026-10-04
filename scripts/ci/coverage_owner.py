@@ -382,9 +382,9 @@ def execute(root, directory, context, source_files, run=subprocess.run, commands
         str(root / 'Cargo.toml'),
         '--target-dir',
         target,
+        '--no-tests=fail',
         '--profile',
         profile,
-        '--no-tests=fail',
     ]
     expected = dict(
         context=copy.deepcopy(context),

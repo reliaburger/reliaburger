@@ -5632,3 +5632,9 @@ called directly. The coverage owner observes `cargo-llvm-cov llvm-cov --version`
 then binds that exact query to the pinned tool bytes. Manual-operation fixtures
 also use the same controlled environment for subprocesses and direct Python
 calls, so the host CI marker cannot silently change which refusal they test.
+
+The pinned coverage tool also reorders its nextest arguments: it appends the
+parsed profile after passthrough flags. The owner predicts that observed order
+exactly, including the manifest and instrumented target directory. A recorded
+command fixture checks the prediction; changing or omitting a selector still
+fails before discovery or execution.

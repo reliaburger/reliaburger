@@ -3,6 +3,7 @@ import copy
 import importlib
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,10 +116,16 @@ class Owner(unittest.TestCase):
                     str(self.root / 'Cargo.toml'),
                     '--target-dir',
                     target,
+                    '--no-tests=fail',
                     '--profile',
                     'ci',
-                    '--no-tests=fail',
                 ]
+                if self.mode == 'legacy-order':
+                    actual[-3:] = ['--profile', 'ci', '--no-tests=fail']
+                if self.mode == 'profile-change':
+                    actual[-1] = 'default'
+                if self.mode == 'missing-no-tests':
+                    actual.remove('--no-tests=fail')
                 if self.mode == 'selector':
                     actual += ['--features=ebpf']
                 if self.mode == 'tool-change':
@@ -311,5 +318,36 @@ class Owner(unittest.TestCase):
                 dict(kind='handshake', nonce='late-self-authored', argv=expected['run_argv'], environment=expected['instrumentation']),
             )
         self.assertEqual(self.child_count, 1)
+
+    def test_owner_accepts_exact_recorded_091_generated_child_order(self):
+        self.execute()
+        configuration = c.read_json(self.directory / 'config.json')
+        self.assertEqual(configuration['expected']['run_argv'], [
+            str(self.root / 'nextest'), 'nextest', 'run',
+            '--manifest-path', str(self.root / 'Cargo.toml'),
+            '--target-dir', str(self.root / 'target/llvm-cov-target'),
+            '--no-tests=fail', '--profile', 'ci',
+        ])
+        self.assertEqual(self.child_count, 1)
+        self.assertEqual(configuration['expected']['stages'][1][2:],
+                         ['--no-report', 'nextest', '--profile', 'ci', '--no-tests=fail'])
+
+    def test_owner_refuses_old_order_without_normalizing_equivalent_flags(self):
+        self.mode = 'legacy-order'
+        with self.assertRaisesRegex(c.Invalid, 'handshake|interception'):
+            self.execute()
+        self.assertEqual(self.child_count, 0)
+        self.assertIn('actual finite child selectors differ', self.refusal)
+
+    def test_owner_refuses_changed_or_missing_recorded_finite_selectors(self):
+        for mode in ('profile-change', 'missing-no-tests'):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                with self.assertRaisesRegex(c.Invalid, 'handshake|interception'):
+                    self.execute()
+                self.assertEqual(self.child_count, 0)
+                self.assertIn('actual finite child selectors differ', self.refusal)
+                shutil.rmtree(self.directory)
+
 if __name__ == '__main__':
     unittest.main()
