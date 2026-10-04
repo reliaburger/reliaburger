@@ -173,10 +173,9 @@ pub fn spawn_gitops_sync(
             }
 
             // Apply each change through the SAME desired-state writes a
-            // manual `relish apply` makes (12b.2 T6). Every kind now maps
-            // to a request — apps, namespaces, permissions — so nothing is
-            // silently skipped the way a `None` used to drop jobs and
-            // namespaces on the floor.
+            // manual `relish apply` makes (12b.2 T6). Every supported kind
+            // maps to a request: apps, namespaces and permissions. Trees
+            // containing jobs were explicitly refused by `execute_sync`.
             //
             // Atomicity (D12): `last_applied_commit` advances only if
             // EVERY write in the sync succeeds. The old code advanced the
