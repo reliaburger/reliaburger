@@ -243,10 +243,12 @@ impl PickleState {
         let repository = receipt.repository.clone();
         let lease_id = receipt.lease_id.clone();
         let persist = self.persist_path.clone();
+        let store = self.store.clone();
         let (guard, result) = tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let mut next = catalog.clone();
                 next.retire_leased_repository(&repository, &lease_id)?;
+                store.retire_repository_uploads(&repository, &lease_id)?;
                 if let Some(path) = persist {
                     next.persist_to(&path)?;
                 }
