@@ -5831,6 +5831,208 @@ mod tests {
         }
     }
 
+    fn owned_batch_record(
+        execution: &str,
+        namespace: &str,
+    ) -> crate::meat::batch_tracker::BatchRecord {
+        serde_json::from_value(serde_json::json!({
+            "jobs": [{
+                "name": "migration",
+                "execution_name": execution,
+                "spec_digest": "a".repeat(64),
+                "namespace": namespace,
+                "node": "worker",
+                "status": "Pending"
+            }],
+            "submitted_at_epoch_secs": 1_000_000
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn committing_an_app_first_prevents_batch_execution_ownership_from_taking_it() {
+        let mut inner = StateMachineInner::default();
+        let identity = AppId::new("owned-execution", "default");
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: identity.clone(),
+            spec: Box::new(default_spec()),
+        });
+        let before = inner.state.batch_state.clone();
+        let response = inner.apply_request(&RaftRequest::BatchRegister {
+            batch: owned_batch_record(&identity.name, &identity.namespace),
+        });
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert_eq!(inner.state.batch_state, before);
+        assert_eq!(inner.state.apps[&identity], default_spec());
+    }
+
+    #[test]
+    fn committing_batch_ownership_first_atomically_refuses_app_and_leased_app_writes() {
+        for leased in [false, true] {
+            let mut inner = StateMachineInner::default();
+            let namespace = if leased { "rbtest-run1" } else { "default" };
+            if leased {
+                inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+            }
+            let identity = AppId::new("owned-execution", namespace);
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::BatchRegister {
+                    batch: owned_batch_record(&identity.name, namespace),
+                }),
+                Some(CouncilResponse::BatchRegistered { .. })
+            ));
+            let request = if leased {
+                RaftRequest::TestLeaseAppSpec {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    app_id: identity.clone(),
+                    spec: Box::new(default_spec()),
+                }
+            } else {
+                RaftRequest::AppSpec {
+                    app_id: identity.clone(),
+                    spec: Box::new(default_spec()),
+                }
+            };
+            let response = inner.apply_request(&request);
+            assert!(
+                matches!(response, Some(CouncilResponse::Refused { .. })),
+                "leased={leased}: {response:?}"
+            );
+            assert!(!inner.state.apps.contains_key(&identity));
+            if leased {
+                assert!(inner.state.test_leases["run1"].resources.is_empty());
+            }
+            // Ownership is namespaced: the same name elsewhere remains ordinary.
+            assert!(
+                inner
+                    .apply_request(&RaftRequest::AppSpec {
+                        app_id: AppId::new(&identity.name, "other"),
+                        spec: Box::new(default_spec()),
+                    })
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_registration_cannot_borrow_another_batchs_execution_identity() {
+        let mut inner = StateMachineInner::default();
+        let request = RaftRequest::BatchRegister {
+            batch: owned_batch_record("owned-execution", "default"),
+        };
+        assert!(matches!(
+            inner.apply_request(&request),
+            Some(CouncilResponse::BatchRegistered { batch_id: 1 })
+        ));
+        let before = inner.state.batch_state.clone();
+        let response = inner.apply_request(&request);
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert_eq!(inner.state.batch_state, before);
+    }
+
+    fn ownership_capacity_record(
+        count: usize,
+        long_labels: bool,
+    ) -> crate::meat::batch_tracker::BatchRecord {
+        let namespace = if long_labels {
+            "n".repeat(63)
+        } else {
+            "default".to_string()
+        };
+        crate::meat::batch_tracker::BatchRecord {
+            jobs: (0..count)
+                .map(|i| {
+                    let short_name = format!("execution-{i:08}");
+                    let execution = if long_labels {
+                        format!("{}-{i:08}", "e".repeat(54))
+                    } else {
+                        short_name.clone()
+                    };
+                    serde_json::from_value(serde_json::json!({
+                        "name": if long_labels { format!("{}-{i:08}", "l".repeat(54)) } else { short_name },
+                        "execution_name": execution,
+                "spec_digest": "a".repeat(64),
+                        "namespace": namespace,
+                        "node": "worker",
+                        "status": "Pending"
+                    })).unwrap()
+                })
+                .collect(),
+            submitted_at_epoch_secs: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn a_full_execution_ownership_index_refuses_registration_but_keeps_active_transitions() {
+        let mut inner = StateMachineInner::default();
+        // The published admission contract has a 131,072-entry bound independent
+        // of its encoded-byte bound. Short valid labels fit beneath both.
+        let response = inner.apply_request(&RaftRequest::BatchRegister {
+            batch: ownership_capacity_record(131_072, false),
+        });
+        assert!(
+            matches!(
+                response,
+                Some(CouncilResponse::BatchRegistered { batch_id: 1 })
+            ),
+            "{response:?}"
+        );
+        let before = inner.state.batch_state.clone();
+        let response = inner.apply_request(&RaftRequest::BatchRegister {
+            batch: owned_batch_record("overflow-execution", "default"),
+        });
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert_eq!(inner.state.batch_state, before);
+        // Exhaustion must not prevent an already-admitted execution from
+        // publishing the positive terminal result that its watcher needs.
+        assert!(
+            inner
+                .apply_request(&RaftRequest::BatchJobUpdate {
+                    batch_id: 1,
+                    job_name: "execution-00000000".into(),
+                    status: crate::meat::batch_tracker::JobStatus::Completed,
+                })
+                .is_none()
+        );
+        assert_eq!(
+            inner.state.batch_state.get(1).unwrap().jobs[0].status,
+            crate::meat::batch_tracker::JobStatus::Completed
+        );
+    }
+
+    #[test]
+    fn an_oversized_execution_ownership_index_refuses_the_whole_registration_before_mutation() {
+        let mut inner = StateMachineInner::default();
+        let before = inner.state.batch_state.clone();
+        // Valid maximum-length labels exceed the independent 32 MiB encoded
+        // bound while still obeying the entry bound. No partial ownership or
+        // allocated batch ID may leak from the rejected group.
+        let response = inner.apply_request(&RaftRequest::BatchRegister {
+            batch: ownership_capacity_record(131_072, true),
+        });
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert_eq!(inner.state.batch_state, before);
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::BatchRegister {
+                batch: owned_batch_record("small-execution", "default"),
+            }),
+            Some(CouncilResponse::BatchRegistered { batch_id: 1 })
+        ));
+    }
+
     fn build_record(name: &str) -> crate::bun::build_runner::BuildRecord {
         crate::bun::build_runner::BuildRecord {
             name: name.to_string(),

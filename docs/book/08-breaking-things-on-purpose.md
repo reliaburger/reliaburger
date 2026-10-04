@@ -1125,6 +1125,71 @@ The `BatchTracker` handles the async side. Submission returns immediately with a
 
 Each job name must be unique within its batch, including jobs in different namespaces. Dispatch builds a map keyed by that name, and completion reports identify jobs by name too. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.
 
+Suppose yesterday's batch had a job called `migration`, and today's batch uses the same name. Yesterday's stopped process still appears in status, but it says nothing about today's outcome. We give each submitted job a fresh UUID runtime name, persist that execution name with its batch record, and dispatch and poll using it. Submitted names remain useful labels. The submit response's `executions` map gives you the runtime name to use for logs or status queries. A leader restart reads the same identities from Raft; it doesn't invent replacements.
+
+The worker also records that the execution belongs to a batch. A delayed dispatch with the same execution name, specification and logical label reuses that attempt and its result, even after successful completion or a worker restart. Changing either the specification or label for an existing execution is a conflict. We don't infer ownership from a name prefix, and a public manifest can't set the internal ownership marker or take over that execution through a job rerun.
+
+Batch jobs run once. A `schedule` belongs in ordinary apply, and `run_before`
+requires an app in the same apply. We refuse both fields on batch submission
+before registering ownership instead of accepting work that this worker skips.
+Automatic retries remain part of that one execution: the retry counter advances,
+and the checkpoint clears the previous exit before a new attempt starts. A
+nonzero exit during retry backoff doesn't finish the batch. The replay regression
+blocks the second attempt after the first failed, then confirms that the final
+exit zero survives recovery without another launch.
+
+Before returning 202, the agent preflights the complete dispatched group and
+publishes its ownership in one atomic checkpoint. Each worker receives the
+exact prepared generation. Checkpoint IO runs off the async runtime with a
+bounded wait; a failed or uncertain publication returns 503 and keeps the
+identities fenced. Removing a filesystem obstruction doesn't authorise an
+extra launch on retry. An uncertain original attempt remains visibly unknown.
+
+The council keeps a compact ownership index after it prunes a terminal batch's
+progress record. The index binds each namespace and execution name to its batch
+and logical label, together with a digest of the original specification. A new
+runner must match that digest and its live committed allocation before creating
+anything. The retained index alone cannot authorise a first launch after
+progress pruning. An app write cannot acquire an indexed identity, even on a
+worker that never ran that batch. Registration and app writes enforce the same
+rule atomically in Raft, so their ordering decides ownership. The index has
+a 131,072-entry limit and an independent 32 MiB encoded-byte limit. When full, it
+refuses new batches before dispatch;
+existing attempts can still record outcomes. We keep the replay fences rather
+than pruning names into availability again. Eventually, repeated admissions
+fill that finite history. Further admissions then require a fresh cluster. The
+100,000-job example above describes allocation complexity across enough nodes;
+it does not promise unlimited retained execution history.
+
+Retiring a batch execution moves its replay proof into a compact inventory in
+the same atomic checkpoint. Active records keep their complete specifications;
+retired proofs retain the batch, label, specification digest, generation and
+original exit evidence without keeping the full specification. Unknown exit
+remains unknown after retirement. A delayed service request
+still refers to that original attempt after retirement and recovery; it cannot
+turn a removed runtime into permission to launch again. The checkpoint has a
+16 MiB limit, so admission checks the whole proposed inventory before writing
+and leaves room for active attempts to record their outcomes. When retained
+history fills that space, new admission fails clearly. Existing executions
+remain usable, and their durable fences remain intact.
+
+Completion callbacks carry execution names too. A report for an earlier run cannot complete a later run just because you reused a label. Our regression holds the new deploy's acknowledgement while the agent reports a successful old `migration`: the new batch must remain pending. Different batches can therefore run jobs with the same submitted name without replacing one another's runtime.
+
+You still want a token scoped to `migration` to see those runs. The internal
+dispatch includes a map from every execution name to its original label and
+namespace. We check the complete map at the service-authenticated boundary,
+then pass it through a typed agent command. The public configuration can't
+provide aliases. The worker records the label before launching the runtime,
+and checkpoint recovery validates it before adopting that execution.
+
+The supervisor keeps the opaque execution name for runtime ownership. Status
+presents the logical label and keeps the existing instance ID for identifying
+the actual run. Raw log authorisation resolves that ID using the runner's
+durable job record, so it also works on a worker without the leader's batch
+tracker. Forwarded log rows use the logical label with the same namespace and
+opaque instance ID. You can therefore query all `migration` logs within your
+scope, or select one execution without accidentally authorising another job.
+
 ```rust
 pub struct BatchSummary {
     pub batch_id: u64,

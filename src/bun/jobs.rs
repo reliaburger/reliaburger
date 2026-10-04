@@ -149,3 +149,66 @@ pub(crate) fn validate_rerun(config: &crate::config::Config) -> Result<(), &'sta
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labelled_job(label: &str) -> RecordedJob {
+        let spec = crate::config::Config::parse("[job.batch-111]\nimage='proc-grill:image-ignored'\ncommand=['true']\nnamespace='team'\n")
+            .unwrap().job.remove("batch-111").unwrap();
+        use sha2::{Digest, Sha256};
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&("team", label, &spec)).unwrap())
+        );
+        serde_json::from_value(serde_json::json!({
+            "name": "batch-111", "namespace": "team",
+            "batch_execution": {
+                "batch_id": 99,
+                "logical_name": label,
+                "spec_digest": digest,
+                "observed_exit_code": null
+            },
+            "spec": spec, "runtime": "Process", "generation": 1,
+            "restart_count": 0, "phase": "Unknown", "runtime_absent": false,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn checkpoint_recovery_preserves_a_batchs_logical_label_and_execution_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = crate::grill::InstanceIdentity::new("team", "batch-111", 0)
+            .instance_id()
+            .0;
+        persist(
+            directory.path(),
+            BTreeMap::from([(id.clone(), labelled_job("migration"))]),
+        )
+        .unwrap();
+        let loaded = load(directory.path()).unwrap();
+        assert_eq!(loaded[&id].name, "batch-111");
+        assert_eq!(loaded[&id].namespace, "team");
+        let value = serde_json::to_value(&loaded[&id]).unwrap();
+        assert_eq!(value["batch_execution"]["logical_name"], "migration");
+    }
+
+    #[test]
+    fn invalid_logical_labels_cannot_enter_durable_job_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = crate::grill::InstanceIdentity::new("team", "batch-111", 0)
+            .instance_id()
+            .0;
+        for label in ["../migration", "", "Migration", "team/migration"] {
+            assert!(
+                persist(
+                    directory.path(),
+                    BTreeMap::from([(id.clone(), labelled_job(label))])
+                )
+                .is_err()
+            );
+            assert!(!directory.path().join(CHECKPOINT_FILE).exists());
+        }
+    }
+}
