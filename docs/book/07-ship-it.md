@@ -1507,3 +1507,9 @@ The merge returns `Result<Vec<String>, RelishError>`: warnings are the successfu
 A malformed workload next to a valid one used to produce a warning and a successful partial manifest. The CLI printed that manifest and exited zero, so a build pipeline could deploy it as if every file had been processed. Malformed defaults and unreadable subdirectories had similar escape paths.
 
 Parsing and reading errors now return through `Result` and `?`, including errors from recursive directories. Defaults must load successfully before the compiler considers workloads, and a broken TOML symlink is an error with its path. Duplicate-definition warnings remain separate from missing input. Regression fixtures mix good and bad files, repeat the case in a nested namespace directory, break a defaults file and supply an unreadable symlink. Each must fail before the CLI can emit a partial manifest.
+
+## Defaults must survive compilation
+
+A shared `memory` limit is useful only if it reaches the resolved app. The old directory compiler accepted any TOML keys in `_defaults.toml`, but copied only `image`. Typed defaults now carry image, memory, CPU and environment into apps and jobs, plus deployment settings into apps. Unknown keys and malformed values fail with the defaults file's path. A default image does not turn an explicit host executable or script into a container.
+
+Inheritance merges fields: a child directory can change CPU while keeping its parent's image and memory. Environment keys and deployment options merge individually. A workload's explicit fields win, including `max_unavailable = 0` and `auto_rollback = false`; omitted options inherit. An empty environment table adds no overrides. Regression fixtures resolve parent, child and workload values, then round-trip the manifest to prove its resource settings survive serialization.

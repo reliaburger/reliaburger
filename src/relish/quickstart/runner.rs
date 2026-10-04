@@ -937,17 +937,38 @@ mod tests {
         } else {
             "sleep 30"
         };
-        std::fs::write(
+        install_warm_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"$*\" >> \"$LIMA_HOME/calls\"\n\
                  case \"$3\" in --name=*) {console};; esac\n"
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         Lima::new(script, Duration::from_secs(5)).with_home(home.to_owned())
+    }
+
+    /// Write an executable script and run it once before the test starts.
+    ///
+    /// macOS checks a new executable file the first time it runs. The check
+    /// takes over 100 ms, and concurrent first runs of different new files
+    /// wait for each other (issue #517). Two tests that each start a fresh
+    /// fake `limactl` under a 200 ms watchdog therefore lost the race to each
+    /// other. Running the script once here pays for the check before the
+    /// timed part of the test; later runs start in a few milliseconds. The
+    /// warm-up's arguments go to a throwaway `LIMA_HOME`, not the test's.
+    fn install_warm_executable(path: &Path, script: &str) {
+        std::fs::write(path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let throwaway = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(path)
+            .arg("--version")
+            .env("LIMA_HOME", throwaway.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "fake limactl failed its warm-up run");
     }
 
     #[tokio::test]
@@ -982,7 +1003,7 @@ mod tests {
     /// from the first VM's start, as in issue #333.
     fn fake_lima_with_shared_network(home: &Path) -> Lima {
         let script = home.join("limactl");
-        std::fs::write(
+        install_warm_executable(
             &script,
             r#"#!/bin/sh
 echo "$*" >> "$LIMA_HOME/calls"
@@ -1010,10 +1031,7 @@ list)
   done;;
 esac
 "#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         Lima::new(script, Duration::from_secs(10)).with_home(home.to_owned())
     }
 

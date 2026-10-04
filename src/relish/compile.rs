@@ -3,10 +3,10 @@
 /// Walks a directory of TOML files, discovers `_defaults.toml` files,
 /// merges defaults into each app/job spec, and returns a single resolved
 /// `Config`. Directory names become namespaces.
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::config::defaults::WorkloadDefaults;
 
 use super::RelishError;
 
@@ -60,15 +60,19 @@ fn compile_directory(dir: &Path) -> Result<CompileResult, RelishError> {
 /// directory doesn't have its own `_defaults.toml`.
 fn compile_directory_with_defaults(
     dir: &Path,
-    parent_defaults: Option<&BTreeMap<String, toml::Value>>,
+    parent_defaults: Option<&WorkloadDefaults>,
 ) -> Result<CompileResult, RelishError> {
     let mut merged = Config::default();
     let mut merged_from = Vec::new();
     let mut warnings = Vec::new();
 
-    // Load defaults: own file takes priority, fall back to parent's
+    // Resolve inheritance field by field, including nested table keys.
     let own_defaults = load_defaults(dir)?;
-    let defaults = own_defaults.as_ref().or(parent_defaults);
+    let resolved_defaults = own_defaults
+        .as_ref()
+        .map(|own| own.inherit(parent_defaults))
+        .or_else(|| parent_defaults.cloned());
+    let defaults = resolved_defaults.as_ref();
 
     // Process all .toml files in this directory (except _defaults.toml)
     let entries = collect_toml_files(dir)?;
@@ -87,7 +91,7 @@ fn compile_directory_with_defaults(
                 // Apply defaults: merge default fields into apps/jobs
                 // that don't have them set
                 if let Some(defaults_toml) = defaults {
-                    apply_defaults(&mut file_config, defaults_toml);
+                    defaults_toml.apply(&mut file_config);
                 }
 
                 // Derive namespace from subdirectory name relative to root
@@ -168,7 +172,7 @@ fn collect_toml_files(dir: &Path) -> Result<Vec<PathBuf>, RelishError> {
 }
 
 /// Read defaults strictly: errors must not turn a tree into a partial manifest.
-fn load_defaults(dir: &Path) -> Result<Option<BTreeMap<String, toml::Value>>, RelishError> {
+fn load_defaults(dir: &Path) -> Result<Option<WorkloadDefaults>, RelishError> {
     let path = dir.join("_defaults.toml");
     match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -185,23 +189,6 @@ fn load_defaults(dir: &Path) -> Result<Option<BTreeMap<String, toml::Value>>, Re
     toml::from_str(&content)
         .map(Some)
         .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))
-}
-
-/// Apply defaults to a config. For each app, if a field from defaults
-/// is missing, inject it. Currently supports the `image` default.
-fn apply_defaults(config: &mut Config, defaults: &BTreeMap<String, toml::Value>) {
-    let default_image = defaults
-        .get("image")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    for app in config.app.values_mut() {
-        if app.image.is_none()
-            && let Some(ref img) = default_image
-        {
-            app.image = Some(img.clone());
-        }
-    }
 }
 
 /// Derive namespace from the path relative to the root directory.
@@ -555,5 +542,152 @@ mod tests {
     fn compile_nonexistent_path_errors() {
         let result = compile(Path::new("/nonexistent/path/nothing.toml"));
         assert!(result.is_err());
+    }
+    #[test]
+    fn typed_defaults_preserve_resources_environment_and_partial_deploy_overrides() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "_defaults.toml",
+            r#"
+image = "web:1"
+memory = "256Mi-512Mi"
+cpu = "100m-500m"
+[env]
+MODE = "prod"
+KEEP = "default"
+[deploy]
+strategy = "rolling"
+max_unavailable = 0
+auto_rollback = true
+"#,
+        );
+        write_file(
+            dir.path(),
+            "web.toml",
+            r#"
+[app.web]
+[app.web.env]
+KEEP = "explicit"
+[app.web.deploy]
+auto_rollback = false
+"#,
+        );
+        let result = compile(dir.path()).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(
+            app.memory.as_ref().map(|r| r.request),
+            Some(256 * 1024 * 1024)
+        );
+        assert_eq!(app.cpu.as_ref().map(|r| r.request), Some(100));
+        assert_eq!(
+            app.env["MODE"],
+            crate::config::EnvValue::Plain("prod".into())
+        );
+        assert_eq!(
+            app.env["KEEP"],
+            crate::config::EnvValue::Plain("explicit".into())
+        );
+        let deploy = app.deploy.as_ref().unwrap();
+        assert_eq!(deploy.max_unavailable, Some(0));
+        assert_eq!(deploy.auto_rollback, Some(false));
+        assert_eq!(deploy.strategy.as_deref(), Some("rolling"));
+        let encoded = toml::to_string(&result.config).unwrap();
+        assert_eq!(
+            crate::config::Config::parse(&encoded).unwrap(),
+            result.config
+        );
+    }
+
+    #[test]
+    fn nested_defaults_merge_parent_tables_and_explicit_scalars_win() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("prod")).unwrap();
+        write_file(
+            dir.path(),
+            "_defaults.toml",
+            "image='parent:1'\nmemory='256Mi'\n[env]\nPARENT='yes'\nVALUE='parent'\n[deploy]\nmax_unavailable=0\nauto_rollback=true\n",
+        );
+        write_file(
+            &dir.path().join("prod"),
+            "_defaults.toml",
+            "cpu='300m'\n[env]\nVALUE='child'\n[deploy]\nauto_rollback=false\n",
+        );
+        write_file(
+            &dir.path().join("prod"),
+            "web.toml",
+            "[app.web]\nimage='explicit:1'\nmemory='128Mi'\n[app.web.deploy]\nmax_surge=0\n",
+        );
+        let result = compile(dir.path()).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.image.as_deref(), Some("explicit:1"));
+        assert_eq!(
+            app.memory.as_ref().map(|r| r.request),
+            Some(128 * 1024 * 1024)
+        );
+        assert_eq!(app.cpu.as_ref().map(|r| r.request), Some(300));
+        assert_eq!(
+            app.env["PARENT"],
+            crate::config::EnvValue::Plain("yes".into())
+        );
+        assert_eq!(
+            app.env["VALUE"],
+            crate::config::EnvValue::Plain("child".into())
+        );
+        let deploy = app.deploy.as_ref().unwrap();
+        assert_eq!(deploy.max_surge, Some(0));
+        assert_eq!(deploy.max_unavailable, Some(0));
+        assert_eq!(deploy.auto_rollback, Some(false));
+    }
+
+    #[test]
+    fn defaults_reject_unknown_keys_and_invalid_values_with_the_path() {
+        for raw in [
+            "memroy='256Mi'",
+            "memory='nonsense'",
+            "cpu='bad'",
+            "[deploy]\nmax_unavailble=0",
+        ] {
+            let dir = TempDir::new().unwrap();
+            write_file(dir.path(), "_defaults.toml", raw);
+            write_file(dir.path(), "web.toml", "[app.web]\nimage='web:1'\n");
+            let error = compile(dir.path())
+                .expect_err("unsupported defaults must not disappear")
+                .to_string();
+            assert!(error.contains("_defaults.toml"), "{error}");
+        }
+    }
+    #[test]
+    fn common_defaults_preserve_explicit_host_execution_for_apps_and_jobs() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "_defaults.toml",
+            "image='container:1'\nmemory='64Mi'\ncpu='50m'\n[env]\nMODE='prod'\n",
+        );
+        write_file(
+            dir.path(),
+            "native.toml",
+            "[app.worker]\nexec='/usr/bin/true'\n[job.migrate]\nexec='/usr/bin/true'\n",
+        );
+        let result = compile(dir.path()).unwrap();
+        let app = &result.config.app["worker"];
+        let job = &result.config.job["migrate"];
+        assert!(app.image.is_none());
+        assert!(job.image.is_none());
+        assert_eq!(
+            app.memory.as_ref().map(|r| r.request),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            job.memory.as_ref().map(|r| r.request),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(job.cpu.as_ref().map(|r| r.request), Some(50));
+        assert_eq!(
+            job.env["MODE"],
+            crate::config::EnvValue::Plain("prod".into())
+        );
+        result.config.validate().unwrap();
     }
 }
