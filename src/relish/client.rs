@@ -2305,20 +2305,32 @@ impl BunClient {
             })
     }
 
-    /// Fetch the active public recipient without accessing cluster key files.
+    /// Fetch the active public recipient without accessing cluster key files:
+    /// the cluster's, or `namespace`'s own key (F05 I4).
     pub async fn secret_public_key(
         &self,
+        namespace: Option<&str>,
     ) -> Result<crate::sesame::types::SecretPublicKey, RelishError> {
-        self.get_typed_json("/v1/secret/public-key").await
+        self.get_typed_json(&secret_public_key_path(namespace))
+            .await
     }
 
-    /// Rotate or finalise the secret encryption key.
-    pub async fn secret_rotate(&self, finalize: bool) -> Result<String, RelishError> {
+    /// Rotate or finalise a secret encryption key: the cluster's, or
+    /// `namespace`'s own.
+    pub async fn secret_rotate(
+        &self,
+        finalize: bool,
+        namespace: Option<&str>,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/secret/rotate", self.base_url);
+        let mut body = serde_json::json!({ "finalize": finalize });
+        if let Some(namespace) = namespace {
+            body["namespace"] = serde_json::Value::from(namespace);
+        }
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "finalize": finalize }))
+            .json(&body)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2537,10 +2549,36 @@ impl BunClient {
     }
 }
 
+/// The public-key route, for the cluster or one namespace. The namespace
+/// is encoded, so a name carrying `&` can't add a query parameter.
+fn secret_public_key_path(namespace: Option<&str>) -> String {
+    match namespace {
+        Some(namespace) => {
+            let value: String =
+                url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
+            format!("/v1/secret/public-key?namespace={value}")
+        }
+        None => "/v1/secret/public-key".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn the_public_key_path_names_an_encoded_namespace() {
+        assert_eq!(secret_public_key_path(None), "/v1/secret/public-key");
+        assert_eq!(
+            secret_public_key_path(Some("team-a")),
+            "/v1/secret/public-key?namespace=team-a"
+        );
+        assert_eq!(
+            secret_public_key_path(Some("a&b")),
+            "/v1/secret/public-key?namespace=a%26b"
+        );
+    }
 
     #[test]
     fn explicit_ca_constructor_refuses_invalid_trust_material() {

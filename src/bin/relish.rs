@@ -804,6 +804,10 @@ enum SecretAction {
     Pubkey {
         /// Read the key offline from this `relish init` directory.
         dir: Option<PathBuf>,
+        /// Print this namespace's own key instead, for a namespace that set
+        /// `secret_key = true`.
+        #[arg(long, conflicts_with = "dir")]
+        namespace: Option<String>,
     },
     /// Encrypt a plaintext value for use in app config ENC[AGE:...] fields.
     Encrypt {
@@ -814,10 +818,16 @@ enum SecretAction {
         value: String,
     },
     /// Rotate the secret encryption key (start or finalise).
+    ///
+    /// Rotates the cluster key, or with `--namespace` that namespace's own
+    /// key. Either way it takes an Admin token scoped to the whole cluster.
     Rotate {
         /// Finalise rotation: remove old read-only keypair.
         #[arg(long)]
         finalize: bool,
+        /// Rotate this namespace's own key instead of the cluster key.
+        #[arg(long)]
+        namespace: Option<String>,
     },
 }
 
@@ -1636,9 +1646,14 @@ async fn main() -> ExitCode {
             commands::batch_status(id, wait, timeout).await
         }
         Command::Secret { action } => match &action {
-            SecretAction::Pubkey { dir } => commands::secret_pubkey(dir.as_deref()).await,
+            SecretAction::Pubkey { dir, namespace } => {
+                commands::secret_pubkey(dir.as_deref(), namespace.as_deref()).await
+            }
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
-            SecretAction::Rotate { finalize } => commands::secret_rotate(*finalize).await,
+            SecretAction::Rotate {
+                finalize,
+                namespace,
+            } => commands::secret_rotate(*finalize, namespace.as_deref()).await,
         },
         Command::Token { action } => match &action {
             TokenAction::Create {
@@ -2015,15 +2030,57 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Secret {
-                action: SecretAction::Pubkey { dir: None }
+                action: SecretAction::Pubkey {
+                    dir: None,
+                    namespace: None
+                }
             })
         ));
         let cli = Cli::try_parse_from(["relish", "secret", "pubkey", "cluster"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Secret {
-                action: SecretAction::Pubkey { dir: Some(ref dir) }
+                action: SecretAction::Pubkey { dir: Some(ref dir), namespace: None }
             }) if dir == std::path::Path::new("cluster")
+        ));
+    }
+
+    #[test]
+    fn secret_pubkey_and_rotate_take_a_namespace() {
+        let cli =
+            Cli::try_parse_from(["relish", "secret", "pubkey", "--namespace", "team-a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Pubkey { dir: None, namespace: Some(ref namespace) }
+            }) if namespace == "team-a"
+        ));
+        // The offline bootstrap only holds the cluster key.
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "secret",
+                "pubkey",
+                "cluster",
+                "--namespace",
+                "team-a"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "relish",
+            "secret",
+            "rotate",
+            "--finalize",
+            "--namespace",
+            "team-a",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Rotate { finalize: true, namespace: Some(ref namespace) }
+            }) if namespace == "team-a"
         ));
     }
 

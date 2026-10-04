@@ -6395,6 +6395,7 @@ image = "busybox:latest"
                 gpu: None,
                 max_apps: None,
                 max_replicas: None,
+                secret_key: false,
             },
         );
         let a = AppId::new("greedy", "prod");
@@ -6492,6 +6493,7 @@ image = "busybox:latest"
             gpu: None,
             max_apps: None,
             max_replicas: None,
+            secret_key: false,
         }
     }
 
@@ -6627,6 +6629,7 @@ image = "busybox:latest"
                 gpu: None,
                 max_apps: None,
                 max_replicas: None,
+                secret_key: false,
             },
         );
         let a = AppId::new("modest", "prod");
