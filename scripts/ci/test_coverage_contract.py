@@ -9,6 +9,7 @@ class Coverage(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'child.json'
         self.tools={name:dict(path='/tools/'+name,sha256='a'*64,version=version,version_command=['/tools/'+name,'--version'],exit_code=0) for name,version in [('cargo','cargo 1.98.0'),('rustc','rustc 1.98.0 (synthetic fixture)\ncommit-hash: '+ 'a'*40 +'\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22'),('nextest','cargo-nextest 0.9.145'),('coverage','cargo-llvm-cov 0.9.1')]}
         self.tools['rustc']['version_command'].append('--verbose')
+        self.tools['coverage']['version_command'].insert(1, 'llvm-cov')
         self.env=k.snapshot_environment({'RUSTC_WRAPPER':'/tools/coverage','CARGO_LLVM_COV':'1','__CARGO_LLVM_COV_RUSTC_WRAPPER':'1','__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS':'-C\x1finstrument-coverage\x1f--cfg=coverage','__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES':'reliaburger,bun,relish','LLVM_PROFILE_FILE':'/work/target/llvm-cov-target/reliaburger-%p-%8m.profraw'})
         run=['cargo','nextest','run','--profile','ci','--features=ebpf','--target-dir','/work/target/llvm-cov-target','--run-ignored=default','-E','all() & not binary(oci_crash)','--no-tests=fail','--no-fail-fast','--test-threads=2','--retries=0']
         ctx=dict(commit='a'*40,run_id='100',attempt='1',host='linux')
@@ -106,7 +107,7 @@ class Coverage(unittest.TestCase):
         from types import SimpleNamespace
         commands={}
         for name in self.tools:
-            path=self.path.parent/name;path.write_bytes(('synthetic tool '+name).encode());commands[name]=[str(path),'--version']+(['--verbose'] if name=='rustc' else [])
+            path=self.path.parent/name;path.write_bytes(('synthetic tool '+name).encode());commands[name]=[str(path)]+(['llvm-cov','--version'] if name=='coverage' else ['--version']+(['--verbose'] if name=='rustc' else []))
         calls=[]
         def run(command,**kw):
             calls.append(command);return SimpleNamespace(returncode=0,stdout=self.tools[Path(command[0]).name]['version']+'\n')
@@ -135,5 +136,46 @@ class Coverage(unittest.TestCase):
     def test_report_tool_override_cannot_hide_in_a_self_selected_context(self):
         self.child['run_environment']['LLVM_COV']='/other/llvm-cov';self.child['list_environment']=copy.deepcopy(self.child['run_environment']);self.expected['instrumentation']=copy.deepcopy(self.child['run_environment']);self.write()
         with self.assertRaisesRegex(c.Invalid,'report-tool/bootstrap'):self.check()
+
+    def query_commands(self):
+        commands = {}
+        for name, tool in self.tools.items():
+            path = self.path.parent / name
+            path.write_text('synthetic tool ' + name)
+            commands[name] = [str(path)] + tool['version_command'][1:]
+        return commands
+
+    def test_coverage_version_collector_accepts_required_cargo_subcommand(self):
+        from types import SimpleNamespace
+        commands = self.query_commands()
+        actual = k.capture_tools(commands, lambda command, **kwargs: SimpleNamespace(
+            returncode=0, stdout=self.tools[Path(command[0]).name]['version']))
+        self.assertEqual(actual['coverage']['version_command'][1:], ['llvm-cov', '--version'])
+        k.tool_context(actual, copy.deepcopy(actual))
+
+    def test_coverage_version_collector_refuses_bare_or_unreviewed_query_before_dispatch(self):
+        from types import SimpleNamespace
+        for arguments in (['--version'], ['llvm-cov', '--version', '--verbose'],
+                          ['llvm-cov', 'report', '--version']):
+            commands = self.query_commands()
+            commands['coverage'] = [commands['coverage'][0]] + arguments
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                return SimpleNamespace(returncode=0, stdout='synthetic version')
+
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(c.Invalid, 'unaudited tool version query'):
+                    k.capture_tools(commands, run)
+                self.assertNotIn(commands['coverage'], calls)
+
+    def test_coverage_context_refuses_missing_subcommand_even_with_matching_pinned_version(self):
+        for arguments in (['--version'], ['llvm-cov', 'report', '--version']):
+            tools = copy.deepcopy(self.tools)
+            tools['coverage']['version_command'] = ['/tools/coverage'] + arguments
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(c.Invalid, 'coverage version query'):
+                    k.tool_context(tools, copy.deepcopy(tools))
 
 if __name__=='__main__':unittest.main()

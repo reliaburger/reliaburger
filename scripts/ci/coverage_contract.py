@@ -78,7 +78,14 @@ def capture_tools(commands, run):
         c.argv(command)
         path = Path(command[0])
         c.require(path.is_absolute(), 'resolve genuine tool before installing adapter')
-        allowed = [['--version', '--verbose']] if name == 'rustc' else [['--version'], ['--version', '--verbose']] if name == 'cargo' else [['--version']]
+        if name == 'coverage':
+            allowed = [['llvm-cov', '--version']]
+        elif name == 'rustc':
+            allowed = [['--version', '--verbose']]
+        elif name == 'cargo':
+            allowed = [['--version'], ['--version', '--verbose']]
+        else:
+            allowed = [['--version']]
         c.require(command[1:] in allowed, 'unaudited tool version query')
         result = run(command, capture_output=True, text=True)
         observed[name] = dict(
@@ -113,6 +120,11 @@ def tool_context(observed, expected):
         c.argv(tool['version_command'])
         c.string(tool['version'], 'actual version')
         c.require(tool['version_command'][0] == tool['path'], 'version command used another executable')
+        if name == 'coverage':
+            c.require(
+                tool['version_command'][1:] == ['llvm-cov', '--version'],
+                'unaudited coverage version query',
+            )
     c.require(
         re.match('cargo-llvm-cov 0\\.9\\.1(?:\\s|$)', observed['coverage']['version']) is not None,
         'unaudited cargo-llvm-cov version',

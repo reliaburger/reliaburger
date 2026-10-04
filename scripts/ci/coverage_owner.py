@@ -330,7 +330,8 @@ def execute(root, directory, context, source_files, run=subprocess.run, commands
     if commands is None:
         rust = owner_tools.rust_tools(base, run)
         commands = {
-            name: [rust.get(name) or shutil.which(binary, path=base.get('PATH')), '--version']
+            name: [rust.get(name) or shutil.which(binary, path=base.get('PATH'))]
+            + (['llvm-cov', '--version'] if name == 'coverage' else ['--version'])
             + (['--verbose'] if name in ('rustc', 'cargo') else [])
             for name, binary in [('cargo', 'cargo'), ('rustc', 'rustc'),
                                  ('nextest', 'cargo-nextest'), ('coverage', 'cargo-llvm-cov')]

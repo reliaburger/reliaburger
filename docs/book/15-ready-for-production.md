@@ -5626,3 +5626,9 @@ before its first owner starts. Owners still refuse reuse within the job. The
 privileged storage owner keeps its reports private while running; an always-run
 step returns that completed report directory to the runner before upload. This
 changes file ownership without replacing the producer's exit status.
+
+A Cargo subcommand executable can still require its subcommand token when
+called directly. The coverage owner observes `cargo-llvm-cov llvm-cov --version`,
+then binds that exact query to the pinned tool bytes. Manual-operation fixtures
+also use the same controlled environment for subprocesses and direct Python
+calls, so the host CI marker cannot silently change which refusal they test.

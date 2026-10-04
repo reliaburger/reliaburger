@@ -41,7 +41,7 @@ class Owner(unittest.TestCase):
         self.mode = 'healthy'
         self.child_count = 0
         versions = {
-            'cargo': 'cargo 1.98.0',
+            'cargo': 'cargo 1.98.0 (synthetic)\ncommit-hash: ' + 'a' * 40 + '\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0',
             'rustc': 'rustc 1.98.0 (synthetic)\ncommit-hash: ' + 'a' * 40 + '\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22',
             'nextest': 'cargo-nextest 0.9.145',
             'coverage': 'cargo-llvm-cov 0.9.1',
@@ -50,7 +50,7 @@ class Owner(unittest.TestCase):
         for name in versions:
             p = self.root / name
             p.write_text('synthetic ' + name)
-            self.commands[name] = [str(p), '--version'] + (['--verbose'] if name == 'rustc' else [])
+            self.commands[name] = [str(p)] + (['llvm-cov', '--version'] if name == 'coverage' else ['--version'] + (['--verbose'] if name == 'rustc' else []))
         self.sysroot = self.root / 'sysroot'
         binpath = self.sysroot / 'lib/rustlib/x86_64-unknown-linux-gnu/bin'
         binpath.mkdir(parents=True)
@@ -68,6 +68,8 @@ class Owner(unittest.TestCase):
             out = self.context['commit'] + '\n' if cmd[1] == 'rev-parse' else 'src/meat/cron.rs\n' if '--error-unmatch' in cmd else ''
             return SimpleNamespace(returncode=0, stdout=out)
         name = Path(cmd[0]).name
+        if name == 'coverage' and '--version' in cmd and cmd[1:] != ['llvm-cov', '--version']:
+            return SimpleNamespace(returncode=1, stdout='', stderr="expected subcommand 'llvm-cov'")
         if '--version' in cmd:
             return SimpleNamespace(
                 returncode=0,
@@ -172,6 +174,19 @@ class Owner(unittest.TestCase):
             self.commands,
             self.environment,
         )
+
+    def test_default_owner_observes_coverage_version_with_required_subcommand(self):
+        binaries = {'cargo-nextest': str(self.root / 'nextest'),
+                    'cargo-llvm-cov': str(self.root / 'coverage')}
+        rust = {name: str(self.root / name) for name in ('cargo', 'rustc')}
+        with patch.object(self.o.owner_tools, 'rust_tools', return_value=rust), \
+             patch.object(self.o.shutil, 'which', side_effect=lambda name, **kwargs: binaries[name]):
+            self.o.execute(self.root, self.directory, self.context,
+                           ['src/meat/cron.rs'], self.fake_run, environment=self.environment)
+        queries = [command for command in self.calls
+                   if Path(command[0]).name == 'coverage' and '--version' in command]
+        self.assertEqual(queries, [[str(self.root / 'coverage'), 'llvm-cov', '--version']])
+        self.assertEqual(self.child_count, 1)
 
     def test_pre_execution_owner_handshake_then_one_run_and_all_existing_stages(self):
         expected = self.execute()

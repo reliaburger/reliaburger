@@ -49,6 +49,11 @@ class FrontdoorEnvironment(unittest.TestCase):
         for name in ('PYTHONDONTWRITEBYTECODE', 'PYTHONPYCACHEPREFIX', 'GITHUB_ACTIONS',
                      'EXPECTED_CHECKOUT_COMMIT', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_OUTPUT'):
             self.environment.pop(name, None)
+        # Direct Python calls use the same controlled environment as child entries.
+        # CI-refusal controls add their explicit GitHub state inside each test.
+        self.environment_patch = patch.dict(os.environ, self.environment, clear=True)
+        self.environment_patch.start()
+        self.addCleanup(self.environment_patch.stop)
 
     def tearDown(self):
         self.temporary.cleanup()

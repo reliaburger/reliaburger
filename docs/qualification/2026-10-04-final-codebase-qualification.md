@@ -1,6 +1,8 @@
 # Final review2 codebase qualification, 4 October 2026
 
-**Status: integration qualification in progress.** This record separates local
+**Status: local record at final child creation; committed CI qualification is
+reported on [PR #591](https://github.com/reliaburger/reliaburger/pull/591) and
+[outer PR #556](https://github.com/reliaburger/reliaburger/pull/556).** This record separates local
 source/control evidence from the final committed CI owners. It does not approve
 merging the outer train or publishing a release.
 
@@ -47,7 +49,7 @@ cloud/power-cut qualifications require their declared owners.
 | Shared workload authorization | Four source-policy architecture assertions failed; paired real HTTP authority control already passed the existing implementation | Four architecture controls and all 247 authorization/apply/batch cases passed; original principal and refusal effects observed |
 | Static permission guardian | Existing matrix guardian and actual shared-Deploy control failed after the helper extraction | Six source controls and all 23 adjacent authorization/permission tests passed; exact helper, propagated error and unconditional Deploy required |
 | Optimized cron owner | Real Cargo metadata refused two transitive thiserror versions | Direct root production dependency lookup verified equal actual versions/features; all eleven optimized production-module tests passed |
-| Evidence front doors | Original incomplete/completion, context, source, ownership and whole-command refusal controls retained | 310 Python controls passed in the complete current-source snapshot |
+| Evidence front doors | Original incomplete/completion, context, source, ownership and whole-command refusal controls retained | 314 Python controls passed in the complete corrective-source snapshot |
 
 Compiler/fixture setup failures are retained separately: Mayo read-guard borrow
 correction, capture test-hook Debug derive, authoritative EOF checkpoint fixture
@@ -114,6 +116,20 @@ restores runner ownership of only the completed privileged report directory
 before upload, retaining the original producer outcome. Four tests-first source
 controls and a real stale-directory cleanup fixture qualify that wiring; hosted
 cache restoration and privileged upload remain current-CI obligations.
+
+The first hosted run at `46d5a2bb` ([run 37211223039](https://github.com/reliaburger/reliaburger/actions/runs/37211223039))
+passed Linux lint, minimum-Rust checks and the optimized cron owner, but exposed
+two adapter integration failures. Four manual-operation fixture tests inherited
+`GITHUB_ACTIONS=true`; the fixture now uses its existing controlled environment
+for direct Python calls, preserving the explicit GitHub-refusal test. The full
+310 controls then passed with both ambient GitHub mode and local target override
+present outside the fixture. Linux coverage stopped before execution because
+its version probe omitted the required `llvm-cov` subcommand token. Four new
+interface controls establish the canonical query and reject bare or unreviewed
+queries; all 314 Python controls passed in isolated qualification. The actual combined
+corrective source also passed all 314 in 23.543s with both ambient GitHub mode
+and the local build override present, plus the ignored-owner check. That failed
+run remains retained; the corrected head requires fresh owner qualification.
 
 ## Failure ledger
 
