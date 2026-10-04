@@ -108,3 +108,60 @@ limits are recorded in the
 [qualification report](../qualification/2026-10-04-delegated-jobs/README.md).
 The sustained harness records unique accepted successes alongside a serving app;
 no 24-hour 100m/day result has been established.
+
+
+## Million-job demo in under a minute
+
+The next demo goal is one million distinct accepted task successes within 60
+seconds, requiring more than 16,667/s. The existing mixed-resource container
+recording remains a separate correctness demonstration; it has not met this goal.
+
+Use tiny deterministic work that depends on the task index, with a checksum
+and selected indexed results. A million repetitions inside one submitted job
+would demonstrate that job's inner loop, rather than one million scheduled,
+retried and durably accounted tasks. Start the clock at submission and stop only
+once the council accepts all successes after worker ledger/index durability.
+Report warm-up separately. Keep the burger app serving and report probe latency,
+retries, resource requests, binary build and cluster hardware.
+
+The recommended execution path is a bounded pool of long-lived owned executors
+for compatible namespaces, pinned images, commands and resource profiles. Build
+and initialise the container/security context once, then launch each command
+as a child process inside it. Retain per-index resource admission, exit status,
+timeout, cancellation and retry identity. Reusable slots need proven child-tree
+retirement and clean scratch/environment before another task can use them.
+Their cgroups must enforce the declared limits, and idle executor memory needs
+its own reservation. Uncertain executor ownership keeps resources quarantined;
+restart fences and retires the old executor before replaying uncommitted work.
+Group-commit outcomes and retain the existing accepted-owner/grant protocol.
+
+A separate explicit worker protocol could process multiple tiny tasks inside a
+persistent process. This removes process startup too, but changes isolation:
+a crash can interrupt several tasks, state can leak between tasks, and an
+individual task cannot be safely killed without retiring its worker. Keep this
+opt-in and restrict sharing to a compatible trust/resource profile. It should
+not silently change ordinary command-job semantics.
+
+The Mesos idea to borrow is a reusable executor that manages many tasks, rather
+than equating every task with a new container. Mesos also permits custom
+executors without a one-to-one task/process relationship; its default executor
+has shared-resource and coupled-failure semantics that should not be copied
+into our independent retry contract without an explicit decision. See the
+[framework guide](https://mesos.apache.org/documentation/latest/app-framework-development-guide/)
+and [workload isolation guide](https://mesos.apache.org/documentation/latest/running-workloads/).
+
+First measure bare process launches, then the owned process path, then a warm
+executor through the full API/ledger/council path in release mode. Measure each
+stage before replacing the homepage recording. A bare launcher or in-process
+loop passing 60 seconds is evidence about that primitive, not a Reliaburger
+million-job demo. This executor reuse is planned work, not implemented by the
+current reusable identity slots, which still recreate the runtime per attempt.
+
+
+The first full primitive measurement launched one million tiny child processes
+in 66.360 seconds on the existing 4-vCPU VM, without the orchestrator or durable
+outcomes. A 20,000-process sample's faster 23,110/s rate did not survive the full
+run, which averaged 15,069/s. Budget additional CPU/node capacity and measure the
+full path; changing the existing demo to host processes alone does not prove the
+60-second target. Reproducible evidence is in the
+[qualification record](../qualification/2026-10-04-delegated-jobs/README.md#process-launch-feasibility-for-the-million-job-demo).

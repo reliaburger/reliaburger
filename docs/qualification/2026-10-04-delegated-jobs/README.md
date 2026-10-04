@@ -72,9 +72,9 @@ cases failed as already tracked in #517. After clearing this task's build cache,
 all 18 snapshot-worker cases and the million-record ledger case passed (19/19,
 36.266 seconds). The million-record case took 33.914 seconds with the configured
 1 MiB result-index cache. Formatting and both Clippy configurations passed.
-Earlier transient fixture failures passed unchanged serial retries. A separate
-issue draft is retained locally pending publication approval; existing failures
-are recorded in the [flakes register](../../flakes.md).
+Earlier transient fixture failures passed unchanged serial retries and are
+tracked in [#582](https://github.com/reliaburger/reliaburger/issues/582), with
+[evidence](ci-timeouts.md) and an entry in the [flakes register](../../flakes.md).
 
 The matching cluster gate passed 43/43 in 270.251 seconds. The Linux runtime gate
 passed 147/147 in 564.882 seconds, including real CPU/memory packing beside an
@@ -116,3 +116,38 @@ extrapolate its hardware cost or scale-out efficiency to the daily target. Use
 release binaries and representative workloads for the sustained qualification,
 and optimise measured runtime/control/storage bottlenecks before claiming that
 100m/day is easy or qualified.
+
+
+## Process-launch feasibility for the million-job demo
+
+A standalone C probe on the same 4-vCPU / 8-GiB aarch64 Linux VM used four
+launcher threads. Every spawned process execs the same small compiled binary,
+performs 64 integer mixing rounds dependent on its index and exits. The parent
+waits for all exit statuses. It launched **1,000,000 processes in 66.360 seconds**
+(**15,069/s**) with zero failures. The earlier 20,000-process sample took 0.865
+seconds (**23,110/s**); extrapolating that short sample would have incorrectly
+suggested an under-minute result on this VM.
+
+For comparison, executing the same tiny computation in four persistent threads
+completed 1,000,000 iterations in 0.088 seconds. That measures an in-process loop,
+not independent OS processes, durable task outcomes or the Reliaburger API.
+Neither result is a cluster throughput qualification. Both omit resource
+admission, isolation, ownership persistence, ledger/index writes, accepted
+completion reporting and service probes. The workload is deliberately tiny,
+not the burger demo's multi-megabyte hashing task.
+
+The [source](launch-probe.c) and [bounded results](launch-probe.json) make the
+probe reproducible on Linux:
+
+```sh
+cc -O2 -pthread launch-probe.c -o /tmp/rb-delegated-launch-probe
+/tmp/rb-delegated-launch-probe spawn 1000000 4
+/tmp/rb-delegated-launch-probe pooled 1000000 4
+```
+
+The million-in-under-a-minute demo needs more than 16,667 accepted successes/s,
+plus headroom for the app and control/storage work. A warm owned executor that
+launches children is the proposed command-job path; an explicit persistent
+worker protocol offers further savings with different isolation semantics.
+The [demo plan](../../plans/2026-10-04-plan-delegated-jobs.md#million-job-demo-in-under-a-minute)
+records the end-to-end acceptance gate. Executor reuse remains unimplemented.
