@@ -28,7 +28,7 @@ pub struct SyncOutcome {
     pub diff_summary: Option<DiffSummary>,
     /// Resource changes to write to Raft.
     pub changes: Vec<ResourceChange>,
-    /// Per-file parse errors (non-fatal).
+    /// Configuration tree errors that refused the sync.
     pub file_errors: HashMap<String, String>,
 }
 
@@ -247,72 +247,18 @@ fn admit_script_changes(
 /// is now surfaced as a per-file error naming the collision rather than
 /// silently overwritten.
 fn parse_toml_files(files: &HashMap<String, String>) -> (Config, HashMap<String, String>) {
-    let mut merged = Config::default();
-    let mut errors = HashMap::new();
-
-    // Sort by path so the merge is deterministic across nodes and runs.
-    let mut ordered: Vec<(&String, &String)> = files.iter().collect();
-    ordered.sort_by(|a, b| a.0.cmp(b.0));
-
-    for (path, content) in ordered {
-        let file_config = match Config::parse(content) {
-            Ok(config) => config,
-            Err(e) => {
-                errors.insert(path.clone(), e.to_string());
-                continue;
-            }
-        };
-
-        // A resource named in two files is ambiguous: report it against
-        // this later-sorted file and let the earlier definition stand,
-        // rather than silently letting hash order pick a winner.
-        if let Some(duplicate) = first_duplicate(&merged, &file_config) {
-            errors.insert(
-                path.clone(),
-                format!("duplicate resource {duplicate} already declared in an earlier file"),
-            );
-            continue;
-        }
-
-        merged.app.extend(file_config.app);
-        merged.job.extend(file_config.job);
-        merged.namespace.extend(file_config.namespace);
-        merged.permission.extend(file_config.permission);
-        merged.build.extend(file_config.build);
+    use crate::relish::compile::{DuplicatePolicy, compile_sources};
+    let snapshot = files
+        .iter()
+        .map(|(path, content)| (std::path::PathBuf::from(path), content.clone()))
+        .collect();
+    match compile_sources(&snapshot, DuplicatePolicy::Refuse) {
+        Ok(result) => (result.config, HashMap::new()),
+        Err(error) => (
+            Config::default(),
+            HashMap::from([(error.path.display().to_string(), error.message)]),
+        ),
     }
-
-    (merged, errors)
-}
-
-/// The first resource in `incoming` that `merged` already declares, if
-/// any. Returns a `kind.name` label for the error message.
-fn first_duplicate(merged: &Config, incoming: &Config) -> Option<String> {
-    for name in incoming.app.keys() {
-        if merged.app.contains_key(name) {
-            return Some(format!("app.{name}"));
-        }
-    }
-    for name in incoming.job.keys() {
-        if merged.job.contains_key(name) {
-            return Some(format!("job.{name}"));
-        }
-    }
-    for name in incoming.namespace.keys() {
-        if merged.namespace.contains_key(name) {
-            return Some(format!("namespace.{name}"));
-        }
-    }
-    for name in incoming.permission.keys() {
-        if merged.permission.contains_key(name) {
-            return Some(format!("permission.{name}"));
-        }
-    }
-    for name in incoming.build.keys() {
-        if merged.build.contains_key(name) {
-            return Some(format!("build.{name}"));
-        }
-    }
-    None
 }
 
 /// Compute the back-off delay for consecutive failures.
@@ -356,6 +302,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gitops_verified_commit_uses_the_watched_tree_defaults_and_namespaces() {
+        let repository = SigningRepo::new();
+        let root = repository.work.join("configs");
+        std::fs::create_dir_all(root.join("team")).unwrap();
+        std::fs::write(
+            root.join("_defaults.toml"),
+            "image = 'web:v2'\nmemory = '128Mi'\n[env]\nSOURCE = 'shared'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("team/app.toml"), "[app.web]\nport = 8080\n").unwrap();
+        let expected = crate::relish::compile::compile(&root).unwrap().config.app["web"].clone();
+        for signed in [false, true] {
+            let sha = commit_in(&repository.work, "watched config tree", signed);
+            let mut config = repository.config();
+            config.path = "/configs".into();
+            config.require_signed_commits = signed;
+            let outcome = execute_sync(
+                &repository.repo,
+                &config,
+                &HashMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+                None,
+            );
+            assert!(
+                matches!(outcome.result, SyncResult::Success),
+                "signed={signed}: {:?}",
+                outcome.result
+            );
+            assert_eq!(outcome.commit.as_ref().unwrap().sha, sha);
+            if signed {
+                assert_eq!(
+                    outcome.commit.as_ref().unwrap().signature,
+                    SignatureStatus::Verified
+                );
+            }
+            assert_eq!(outcome.changes.len(), 1);
+            let ResourceChange::Add {
+                resource_id,
+                spec: diff::ChangePayload::App(spec),
+            } = &outcome.changes[0]
+            else {
+                panic!(
+                    "expected exactly the watched app, got {:?}",
+                    outcome.changes
+                );
+            };
+            assert!(resource_id.contains("team"), "{resource_id}");
+            assert_eq!(**spec, expected);
+        }
+    }
+
+    #[test]
+    fn gitops_tree_matches_cli_defaults_and_directory_namespaces() {
+        let files = HashMap::from([
+            (
+                "_defaults.toml".into(),
+                "image = 'web:v1'\nmemory = '128Mi'\n[env]\nPARENT = 'yes'\n".into(),
+            ),
+            (
+                "team/_defaults.toml".into(),
+                "cpu = '250m'\n[env]\nCHILD = 'yes'\n".into(),
+            ),
+            ("team/app.toml".into(), "[app.web]\nport = 8080\n".into()),
+            (
+                "team/deep/app.toml".into(),
+                "[app.worker]\nimage = 'worker:v1'\n".into(),
+            ),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        for (name, content) in &files {
+            let file = directory.path().join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, content).unwrap();
+        }
+        let cli = crate::relish::compile::compile(directory.path())
+            .unwrap()
+            .config;
+        let (git, errors) = parse_toml_files(&files);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(git, cli);
+        assert_eq!(git.app["web"].namespace.as_deref(), Some("team"));
+        assert_eq!(git.app["worker"].namespace.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn gitops_directory_namespace_is_used_without_defaults() {
+        let files = HashMap::from([(
+            "team/app.toml".into(),
+            "[app.web]\nimage = 'web:v1'\n".into(),
+        )]);
+        let (config, errors) = parse_toml_files(&files);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.app["web"].namespace.as_deref(), Some("team"));
+    }
+
+    #[test]
     fn parse_toml_files_success() {
         let mut files = HashMap::new();
         files.insert(
@@ -383,7 +427,10 @@ mod tests {
         files.insert("bad.toml".to_string(), "not valid toml [[[".to_string());
 
         let (config, errors) = parse_toml_files(&files);
-        assert_eq!(config.app.len(), 1, "good file should be parsed");
+        assert!(
+            config.app.is_empty(),
+            "an incomplete snapshot must not escape"
+        );
         assert_eq!(errors.len(), 1, "bad file should produce error");
         assert!(errors.contains_key("bad.toml"));
     }
@@ -404,9 +451,8 @@ mod tests {
         );
 
         let (config, errors) = parse_toml_files(&files);
-        // The alphabetically-earlier file's definition stands.
-        assert_eq!(config.app.len(), 1);
-        assert_eq!(config.app["web"].image.as_deref(), Some("web:v1"));
+        // A duplicate refuses the whole resolved snapshot.
+        assert!(config.app.is_empty());
         // The later file's collision is surfaced, not swallowed.
         assert!(errors.contains_key("b-second.toml"));
         assert!(errors["b-second.toml"].contains("duplicate resource app.web"));

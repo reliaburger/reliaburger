@@ -163,11 +163,12 @@ in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs
 
 Point the config at a repository and the council leader keeps the cluster in
 step with it. It merges the TOML files under `path` (an app declared in two
-files is an error) and validates the result like `relish apply`. Unlike
-`relish compile`, it doesn't derive namespaces from directories or read
-`_defaults.toml`, so set `namespace` in each app. And unlike `apply`, which
-only adds and updates, GitOps reconciles: delete an app from the repository
-and it goes from the cluster.
+files is an error) and validates the result like `relish apply`. Its watched
+tree uses the same inherited `_defaults.toml` values and directory namespaces
+as `relish compile`. The configured `path` is the root: its own name adds no
+namespace, and defaults outside it are not inherited. A workload's explicit
+namespace wins. GitOps reconciles deletions too: delete an app from the
+repository and it goes from the cluster.
 
 ```toml
 [gitops]
