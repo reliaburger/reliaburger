@@ -51,154 +51,210 @@ fn compile_single_file(path: &Path) -> Result<CompileResult, RelishError> {
     })
 }
 
-/// Compile a directory of TOML files.
+/// Read the whole tree before resolving it. Any unreadable input refuses output.
 fn compile_directory(dir: &Path) -> Result<CompileResult, RelishError> {
-    compile_directory_with_defaults(dir, None)
+    let mut files = std::collections::BTreeMap::new();
+    collect_tree(dir, dir, &mut files)?;
+    let mut result = compile_sources(&files, DuplicatePolicy::Warn)
+        .map_err(|error| RelishError::FormatFailed(error.to_string()))?;
+    for path in &mut result.merged_from {
+        *path = dir.join(&*path);
+    }
+    Ok(result)
 }
 
-/// Compile a directory, inheriting defaults from the parent if the
-/// directory doesn't have its own `_defaults.toml`.
-fn compile_directory_with_defaults(
-    dir: &Path,
-    parent_defaults: Option<&WorkloadDefaults>,
-) -> Result<CompileResult, RelishError> {
-    let mut merged = Config::default();
-    let mut merged_from = Vec::new();
-    let mut warnings = Vec::new();
+fn collect_tree(
+    root: &Path,
+    directory: &Path,
+    files: &mut std::collections::BTreeMap<PathBuf, String>,
+) -> Result<(), RelishError> {
+    let mut entries = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    for path in entries {
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))?;
+        if metadata.is_dir() {
+            collect_tree(root, &path, files)?;
+        } else if metadata.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+        {
+            let content = std::fs::read_to_string(&path).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            let relative = path.strip_prefix(root).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            files.insert(relative.to_path_buf(), content);
+        }
+    }
+    Ok(())
+}
 
-    // Resolve inheritance field by field, including nested table keys.
-    let own_defaults = load_defaults(dir)?;
-    let resolved_defaults = own_defaults
+/// How duplicate definitions in one namespace are handled by the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuplicatePolicy {
+    /// The interactive compiler reports deterministic overrides.
+    Warn,
+    /// An unattended reconciler refuses ambiguous desired state.
+    Refuse,
+}
+
+#[derive(Debug)]
+pub(crate) struct TreeError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl std::fmt::Display for TreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.message)
+    }
+}
+
+/// Resolve an immutable snapshot of paths relative to the tree's root.
+/// Both filesystem compilation and verified Git commits use these rules.
+pub(crate) fn compile_sources(
+    files: &std::collections::BTreeMap<PathBuf, String>,
+    duplicates: DuplicatePolicy,
+) -> Result<CompileResult, TreeError> {
+    use std::path::Component;
+    for path in files.keys() {
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(TreeError {
+                path: path.clone(),
+                message: "expected a path relative to the configuration root".into(),
+            });
+        }
+    }
+    let mut result = CompileResult {
+        config: Config::default(),
+        merged_from: Vec::new(),
+        warnings: Vec::new(),
+    };
+    resolve_directory(Path::new(""), files, None, duplicates, &mut result)?;
+    Ok(result)
+}
+
+fn resolve_directory(
+    directory: &Path,
+    files: &std::collections::BTreeMap<PathBuf, String>,
+    parent: Option<&WorkloadDefaults>,
+    duplicates: DuplicatePolicy,
+    result: &mut CompileResult,
+) -> Result<(), TreeError> {
+    let defaults_path = directory.join("_defaults.toml");
+    let own = files
+        .get(&defaults_path)
+        .map(|raw| {
+            toml::from_str::<WorkloadDefaults>(raw).map_err(|error| TreeError {
+                path: defaults_path.clone(),
+                message: error.to_string(),
+            })
+        })
+        .transpose()?;
+    let resolved = own
         .as_ref()
-        .map(|own| own.inherit(parent_defaults))
-        .or_else(|| parent_defaults.cloned());
-    let defaults = resolved_defaults.as_ref();
-
-    // Process all .toml files in this directory (except _defaults.toml)
-    let entries = collect_toml_files(dir)?;
-
-    for entry_path in &entries {
-        let filename = entry_path
+        .map(|own| own.inherit(parent))
+        .or_else(|| parent.cloned());
+    for (path, raw) in files
+        .iter()
+        .filter(|(path, _)| path.parent() == Some(directory))
+    {
+        if path
             .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if filename == "_defaults.toml" {
+            .is_some_and(|name| name == "_defaults.toml")
+        {
             continue;
         }
-
-        match Config::from_file(entry_path) {
-            Ok(mut file_config) => {
-                // Apply defaults: merge default fields into apps/jobs
-                // that don't have them set
-                if let Some(defaults_toml) = defaults {
-                    defaults_toml.apply(&mut file_config);
-                }
-
-                // Derive namespace from subdirectory name relative to root
-                let namespace = derive_namespace(dir, entry_path);
-                if let Some(ref ns) = namespace {
-                    apply_namespace(&mut file_config, ns);
-                }
-
-                for collision in merge_into(&mut merged, file_config)? {
-                    warnings.push(format!("{}: {collision}", entry_path.display()));
-                }
-                merged_from.push(entry_path.clone());
-            }
-            Err(e) => {
-                return Err(RelishError::FormatFailed(format!(
-                    "{}: {e}",
-                    entry_path.display()
-                )));
-            }
+        let mut config = Config::parse(raw).map_err(|error| TreeError {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        if let Some(defaults) = &resolved {
+            defaults.apply(&mut config);
         }
-    }
-
-    // Recurse into subdirectories — directory name becomes the namespace
-    {
-        let read_dir = std::fs::read_dir(dir)?;
-        let mut subdirs = Vec::new();
-        for entry in read_dir {
-            let path = entry?.path();
-            let metadata = std::fs::metadata(&path).map_err(|error| {
-                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+        if let Some(namespace) = directory.file_name() {
+            let namespace = namespace.to_str().ok_or_else(|| TreeError {
+                path: path.clone(),
+                message: "directory namespace must be UTF-8".into(),
             })?;
-            if metadata.is_dir() {
-                subdirs.push(path);
-            }
+            apply_namespace(&mut config, namespace);
         }
-        subdirs.sort();
-
-        for subdir in subdirs {
-            let mut sub_result = compile_directory_with_defaults(&subdir, defaults)?;
-            // Apply the subdirectory name as namespace.
-            if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
-                apply_namespace(&mut sub_result.config, ns);
-            }
-            for collision in merge_into(&mut merged, sub_result.config)? {
-                warnings.push(format!("{}: {collision}", subdir.display()));
-            }
-            merged_from.extend(sub_result.merged_from);
-            warnings.extend(sub_result.warnings);
-        }
-    }
-
-    Ok(CompileResult {
-        config: merged,
-        merged_from,
-        warnings,
-    })
-}
-
-/// Collect all .toml files in a directory (non-recursive, sorted).
-fn collect_toml_files(dir: &Path) -> Result<Vec<PathBuf>, RelishError> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "toml")
+        // Always refuse an identity collision across namespaces first.
+        let duplicate = first_duplicate_resource(&result.config, &config);
+        let mut next = result.config.clone();
+        let warnings = merge_into(&mut next, config).map_err(|error| TreeError {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        if duplicates == DuplicatePolicy::Refuse
+            && let Some(resource) = duplicate
         {
-            let metadata = std::fs::metadata(&path).map_err(|error| {
-                RelishError::FormatFailed(format!("{}: {error}", path.display()))
-            })?;
-            if metadata.is_file() {
-                files.push(path);
+            return Err(TreeError {
+                path: path.clone(),
+                message: format!(
+                    "duplicate resource {resource} already declared in an earlier file"
+                ),
+            });
+        }
+        result.config = next;
+        result.warnings.extend(
+            warnings
+                .into_iter()
+                .map(|warning| format!("{}: {warning}", path.display())),
+        );
+        result.merged_from.push(path.clone());
+    }
+    let mut children = std::collections::BTreeSet::new();
+    for path in files.keys() {
+        if let Ok(relative) = path.strip_prefix(directory) {
+            let mut parts = relative.components();
+            if let (Some(part), Some(_)) = (parts.next(), parts.next()) {
+                children.insert(directory.join(part.as_os_str()));
             }
         }
     }
-    files.sort();
-    Ok(files)
+    for child in children {
+        resolve_directory(&child, files, resolved.as_ref(), duplicates, result)?;
+    }
+    Ok(())
 }
 
-/// Read defaults strictly: errors must not turn a tree into a partial manifest.
-fn load_defaults(dir: &Path) -> Result<Option<WorkloadDefaults>, RelishError> {
-    let path = dir.join("_defaults.toml");
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(RelishError::FormatFailed(format!(
-                "{}: {error}",
-                path.display()
-            )));
+fn first_duplicate_resource(merged: &Config, incoming: &Config) -> Option<String> {
+    for name in incoming.app.keys() {
+        if merged.app.contains_key(name) {
+            return Some(format!("app.{name}"));
         }
-        Ok(_) => {}
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))?;
-    toml::from_str(&content)
-        .map(Some)
-        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))
-}
-
-/// Derive namespace from the path relative to the root directory.
-/// If the file is directly in the root, returns None.
-fn derive_namespace(root: &Path, file: &Path) -> Option<String> {
-    let parent = file.parent()?;
-    if parent == root {
-        return None;
+    for name in incoming.job.keys() {
+        if merged.job.contains_key(name) {
+            return Some(format!("job.{name}"));
+        }
     }
-    parent.file_name()?.to_str().map(String::from)
+    for name in incoming.namespace.keys() {
+        if merged.namespace.contains_key(name) {
+            return Some(format!("namespace.{name}"));
+        }
+    }
+    for name in incoming.permission.keys() {
+        if merged.permission.contains_key(name) {
+            return Some(format!("permission.{name}"));
+        }
+    }
+    for name in incoming.build.keys() {
+        if merged.build.contains_key(name) {
+            return Some(format!("build.{name}"));
+        }
+    }
+    None
 }
 
 /// Apply a namespace to all apps, jobs and builds in a config that don't
