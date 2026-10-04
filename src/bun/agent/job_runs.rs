@@ -35,6 +35,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         next: crate::bun::jobs::JobInventory,
     ) -> Result<(), BunError> {
+        let new_admission = next.jobs.iter().any(|(id, job)| {
+            self.recorded_jobs
+                .get(id)
+                .is_none_or(|previous| previous.generation != job.generation)
+        });
+        if !new_admission || self.job_store_uncertain {
+            return self.publish_job_inventory(next, None).await;
+        }
+        let encoded = self.preflight_job_inventory(next).await?;
+        self.commit_encoded_job_inventory(encoded).await
+    }
+
+    /// Publish an inventory that preflight already validated and encoded,
+    /// without encoding it a second time.
+    pub(super) async fn commit_encoded_job_inventory(
+        &mut self,
+        encoded: crate::bun::jobs::EncodedInventory,
+    ) -> Result<(), BunError> {
+        let (next, bytes) = encoded.into_parts();
+        self.publish_job_inventory(next, Some(bytes)).await
+    }
+
+    /// Fence and publish `next`. Without preflight `bytes` it is encoded
+    /// here, off the loop, inside the publication's bound.
+    async fn publish_job_inventory(
+        &mut self,
+        next: crate::bun::jobs::JobInventory,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<(), BunError> {
         // A no-op retirement of an unrelated app changes no job ownership.
         if next.jobs == self.recorded_jobs && next.retired == self.retired_batch_executions {
             return Ok(());
@@ -44,15 +73,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "a previous write is uncertain; restart Bun to reload it".into(),
             ));
         }
-        let new_admission = next.jobs.iter().any(|(id, job)| {
-            self.recorded_jobs
-                .get(id)
-                .is_none_or(|previous| previous.generation != job.generation)
-        });
-        if new_admission {
-            self.preflight_job_inventory(next.clone()).await?;
-        }
         if let Some(directory) = self.records_dir.clone() {
+            // Every recorded job has passed validation, so its digest is
+            // proven. Taken before the fence below adds unpublished records.
+            let verified = match bytes {
+                Some(_) => BTreeMap::new(),
+                None => self.recorded_jobs.clone(),
+            };
             self.job_store_uncertain = true;
             // New identities are fenced even when publication has an uncertain outcome.
             // A failed retirement move keeps the active owner until recovery.
@@ -64,8 +91,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let records = next.clone();
             #[cfg(test)]
             self.loop_stalls.hold(LoopStall::Persist).await;
+            #[cfg(test)]
+            if bytes.is_none() {
+                self.loop_stalls.hold(LoopStall::JobInventoryEncode).await;
+            }
             let publication = tokio::task::spawn_blocking(move || {
-                crate::bun::jobs::persist_inventory(&directory, records)
+                let bytes = match bytes {
+                    Some(bytes) => bytes,
+                    None => crate::bun::jobs::encode(&records, &verified)?,
+                };
+                crate::bun::jobs::publish(&directory, &bytes)
             });
             // LOOP-INLINE: detached checkpoint IO has a two-second bound and retains the ownership fence on timeout.
             tokio::time::timeout(std::time::Duration::from_secs(2), publication).await
