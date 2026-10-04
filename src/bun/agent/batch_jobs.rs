@@ -127,14 +127,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
+    /// Encode `inventory` once, refusing it before any fence if it would
+    /// leave the checkpoint without room for its records' transitions.
     pub(super) async fn preflight_job_inventory(
         &self,
         inventory: JobInventory,
-    ) -> Result<(), BunError> {
+    ) -> Result<crate::bun::jobs::EncodedInventory, BunError> {
+        #[cfg(test)]
+        self.loop_stalls.hold(LoopStall::JobInventoryEncode).await;
+        // Every recorded job has passed validation, so its digest is proven.
+        let verified = self.recorded_jobs.clone();
         // LOOP-INLINE: off-thread inventory encoding has a two-second bound before any publication.
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || crate::bun::jobs::preflight(&inventory)),
+            tokio::task::spawn_blocking(move || crate::bun::jobs::preflight(inventory, &verified)),
         )
         .await
         .map_err(|_| {
@@ -273,14 +279,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if fresh.job.is_empty() {
             return Ok(terminal);
         }
-        self.preflight_job_inventory(inventory.clone()).await?;
+        let encoded = self.preflight_job_inventory(inventory).await?;
         // LOOP-INLINE: in-memory deployment ownership lock, no IO.
         let operation = self
             .deploy_operations
             .start(&fresh)
             .await
             .map_err(|error| BunError::BatchConflict(error.to_string()))?;
-        if let Err(error) = self.commit_job_inventory(inventory).await {
+        if let Err(error) = self.commit_encoded_job_inventory(encoded).await {
             // LOOP-INLINE: in-memory operation completion, no IO.
             operation
                 .finish(

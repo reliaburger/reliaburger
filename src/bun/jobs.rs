@@ -178,7 +178,31 @@ fn validate_owner(owner: &BatchExecutionOwnership, restart_count: u32) -> std::i
     Ok(())
 }
 
-fn validate(inventory: &JobInventory) -> std::io::Result<()> {
+/// Whether `previous` already proved `job`'s digest. The digest covers the
+/// namespace, the logical label and the spec, so an unchanged triple needs no
+/// second hash.
+fn digest_verified(previous: Option<&RecordedJob>, job: &RecordedJob) -> bool {
+    previous.is_some_and(|previous| {
+        previous.namespace == job.namespace
+            && previous.spec == job.spec
+            && previous
+                .batch_execution
+                .as_ref()
+                .map(|owner| (&owner.logical_name, &owner.spec_digest))
+                == job
+                    .batch_execution
+                    .as_ref()
+                    .map(|owner| (&owner.logical_name, &owner.spec_digest))
+    })
+}
+
+/// Check every record. `verified` holds records that already passed this
+/// check, so an unchanged spec skips its digest: hashing every admitted spec
+/// on every commit made publication cost grow with the whole inventory.
+fn validate(
+    inventory: &JobInventory,
+    verified: &BTreeMap<String, RecordedJob>,
+) -> std::io::Result<()> {
     for (id, job) in &inventory.jobs {
         crate::config::validate_job(&job.name, &job.spec).map_err(std::io::Error::other)?;
         if job.spec.namespace.as_deref().unwrap_or("default") != job.namespace
@@ -201,12 +225,13 @@ fn validate(inventory: &JobInventory) -> std::io::Result<()> {
                     "conflicting owned current exit evidence",
                 ));
             }
-            if owner.spec_digest
-                != crate::meat::batch_execution::spec_digest(
-                    &job.namespace,
-                    &owner.logical_name,
-                    &job.spec,
-                )?
+            if !digest_verified(verified.get(id), job)
+                && owner.spec_digest
+                    != crate::meat::batch_execution::spec_digest(
+                        &job.namespace,
+                        &owner.logical_name,
+                        &job.spec,
+                    )?
             {
                 return Err(std::io::Error::other(
                     "batch specification digest does not match its admitted spec",
@@ -241,8 +266,32 @@ fn validate(inventory: &JobInventory) -> std::io::Result<()> {
     Ok(())
 }
 
-fn encoded(inventory: &JobInventory) -> std::io::Result<Vec<u8>> {
-    validate(inventory)?;
+/// A validated job inventory with the checkpoint bytes it encodes to, so
+/// admission publishes the bytes its preflight already produced.
+pub(super) struct EncodedInventory {
+    inventory: JobInventory,
+    bytes: Vec<u8>,
+}
+
+impl EncodedInventory {
+    /// The checkpoint bytes to publish.
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The inventory and its checkpoint bytes.
+    pub(super) fn into_parts(self) -> (JobInventory, Vec<u8>) {
+        (self.inventory, self.bytes)
+    }
+}
+
+/// Validate and serialise `inventory`. Each call costs time in proportion to
+/// the whole inventory, so a commit makes exactly one.
+pub(super) fn encode(
+    inventory: &JobInventory,
+    verified: &BTreeMap<String, RecordedJob>,
+) -> std::io::Result<Vec<u8>> {
+    validate(inventory, verified)?;
     Ok(serde_json::to_vec(&Checkpoint {
         schema: 3,
         jobs: inventory.jobs.values().cloned().collect(),
@@ -251,20 +300,23 @@ fn encoded(inventory: &JobInventory) -> std::io::Result<Vec<u8>> {
 }
 
 /// Predictable refusal before the uncertain-I/O fence, with active-phase headroom.
-pub(super) fn preflight(inventory: &JobInventory) -> std::io::Result<()> {
-    let bytes = encoded(inventory)?.len();
+pub(super) fn preflight(
+    inventory: JobInventory,
+    verified: &BTreeMap<String, RecordedJob>,
+) -> std::io::Result<EncodedInventory> {
+    let bytes = encode(&inventory, verified)?;
     let headroom = inventory
         .jobs
         .len()
         .checked_mul(ACTIVE_TRANSITION_HEADROOM)
-        .and_then(|reserve| bytes.checked_add(reserve))
+        .and_then(|reserve| bytes.len().checked_add(reserve))
         .ok_or_else(|| std::io::Error::other("job inventory size overflow"))?;
     if headroom > MAX_CHECKPOINT_BYTES {
         return Err(std::io::Error::other(
             "job attempt inventory is full; retained replay proofs cannot be pruned",
         ));
     }
-    Ok(())
+    Ok(EncodedInventory { inventory, bytes })
 }
 
 pub(super) fn load_inventory(directory: &Path) -> std::io::Result<JobInventory> {
@@ -305,12 +357,12 @@ pub(super) fn load_inventory(directory: &Path) -> std::io::Result<JobInventory> 
             ));
         }
     }
-    validate(&inventory)?;
+    validate(&inventory, &BTreeMap::new())?;
     Ok(inventory)
 }
 
-pub(super) fn persist_inventory(directory: &Path, inventory: JobInventory) -> std::io::Result<()> {
-    let bytes = encoded(&inventory)?;
+/// Durably replace the checkpoint with `bytes` from [`encode`].
+pub(super) fn publish(directory: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if bytes.len() > MAX_CHECKPOINT_BYTES {
         return Err(std::io::Error::other("job attempt checkpoint is too large"));
     }
@@ -320,13 +372,18 @@ pub(super) fn persist_inventory(directory: &Path, inventory: JobInventory) -> st
     std::fs::create_dir_all(directory)?;
     crate::sesame::identity::atomic_write_mode(
         &directory.join(CHECKPOINT_FILE),
-        &bytes,
+        bytes,
         Some(0o600),
     )?;
     if let Some(parent) = directory.parent() {
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn persist_inventory(directory: &Path, inventory: JobInventory) -> std::io::Result<()> {
+    publish(directory, &encode(&inventory, &BTreeMap::new())?)
 }
 
 #[cfg(test)]
@@ -604,5 +661,64 @@ mod tests {
         attempt.spec.exec = Some("/bin/true".into());
         assert!(persist(directory.path(), BTreeMap::from([(identity, attempt)])).is_err());
         assert!(!directory.path().join(CHECKPOINT_FILE).exists());
+    }
+
+    fn inventory_of(job: RecordedJob) -> JobInventory {
+        JobInventory {
+            jobs: BTreeMap::from([(identity(&job.namespace, &job.name), job)]),
+            retired: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_record_already_verified_is_not_hashed_again() {
+        // A digest that cannot match proves which records encoding rehashes.
+        let mut job = labelled_job("migration");
+        job.batch_execution.as_mut().unwrap().spec_digest = "0".repeat(64);
+        assert!(
+            encode(&inventory_of(job.clone()), &BTreeMap::new()).is_err(),
+            "an unverified record must have its digest checked"
+        );
+        let verified = inventory_of(job.clone()).jobs;
+        job.observe_phase(JobPhase::Launching);
+        assert!(
+            encode(&inventory_of(job), &verified).is_ok(),
+            "a phase change rehashed a spec that was already verified"
+        );
+    }
+
+    #[test]
+    fn a_changed_spec_or_label_is_verified_again_under_a_verified_identity() {
+        let job = labelled_job("migration");
+        let verified = inventory_of(job.clone()).jobs;
+        let mut respecified = job.clone();
+        respecified.spec.command = Some(vec!["false".into()]);
+        assert!(encode(&inventory_of(respecified), &verified).is_err());
+        let mut relabelled = job;
+        relabelled.batch_execution.as_mut().unwrap().logical_name = "other".into();
+        assert!(encode(&inventory_of(relabelled), &verified).is_err());
+    }
+
+    #[test]
+    fn an_encoded_inventory_publishes_without_encoding_again() {
+        let job = labelled_job("migration");
+        let encoded = preflight(inventory_of(job.clone()), &BTreeMap::new()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        publish(directory.path(), encoded.bytes()).unwrap();
+        assert_eq!(
+            load(directory.path()).unwrap()[&identity(&job.namespace, &job.name)],
+            job
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_an_inventory_without_room_for_its_transitions() {
+        let mut job = labelled_job("migration");
+        job.spec.image = Some(format!("proc-grill:{}", "x".repeat(MAX_CHECKPOINT_BYTES)));
+        let digest =
+            crate::meat::batch_execution::spec_digest(&job.namespace, "migration", &job.spec)
+                .unwrap();
+        job.batch_execution.as_mut().unwrap().spec_digest = digest;
+        assert!(preflight(inventory_of(job), &BTreeMap::new()).is_err());
     }
 }
