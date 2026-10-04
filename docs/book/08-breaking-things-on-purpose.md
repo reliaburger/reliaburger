@@ -1272,6 +1272,29 @@ and leaves room for active attempts to record their outcomes. When retained
 history fills that space, new admission fails clearly. Existing executions
 remain usable, and their durable fences remain intact.
 
+Checking the whole inventory isn't free, though. Every commit validates and
+serialises all of it, and validation re-hashes each batch record's
+specification against its digest. Our first version did that three times to
+admit one execution: the dispatch's preflight, the commit's own preflight, and
+the publication itself. Every later commit (the launch, the exit, the absence
+proof) did it once more. The capacity test fills the checkpoint close to its
+16 MiB limit, and in a debug build one pass took over a second and a half on a
+hosted macOS runner. The admission turn grew past four seconds, and a
+publication eventually missed its two-second bound. The agent did exactly what
+it should with an uncertain write: it kept the fence and refused further work
+until a restart. So the execution never reported, and the test timed out
+waiting for it (#592).
+
+The fix is to stop repeating work. Preflight now returns an
+`EncodedInventory`, the validated inventory together with its bytes, and
+admission publishes those bytes rather than encoding them again. Validation
+also takes the records already in `recorded_jobs`. Every one of them has
+passed validation, so a record whose namespace, label, specification and
+digest are unchanged skips the hash. A changed spec or label under the same
+identity is checked again. A commit now costs one serialisation, not up to
+three validations and serialisations. A regression counts the encodings an
+admission makes: it saw three before the change and sees one now.
+
 Recovery requires an explicit ownership field in every active job record:
 ordinary jobs encode `null`, and batch jobs encode their owner. Omitting the
 field is invalid rather than silently turning a batch execution into an

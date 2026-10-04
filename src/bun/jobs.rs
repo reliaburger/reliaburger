@@ -274,11 +274,6 @@ pub(super) struct EncodedInventory {
 }
 
 impl EncodedInventory {
-    /// The checkpoint bytes to publish.
-    pub(super) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     /// The inventory and its checkpoint bytes.
     pub(super) fn into_parts(self) -> (JobInventory, Vec<u8>) {
         (self.inventory, self.bytes)
@@ -702,9 +697,11 @@ mod tests {
     #[test]
     fn an_encoded_inventory_publishes_without_encoding_again() {
         let job = labelled_job("migration");
-        let encoded = preflight(inventory_of(job.clone()), &BTreeMap::new()).unwrap();
+        let (_, bytes) = preflight(inventory_of(job.clone()), &BTreeMap::new())
+            .unwrap()
+            .into_parts();
         let directory = tempfile::tempdir().unwrap();
-        publish(directory.path(), encoded.bytes()).unwrap();
+        publish(directory.path(), &bytes).unwrap();
         assert_eq!(
             load(directory.path()).unwrap()[&identity(&job.namespace, &job.name)],
             job
