@@ -731,6 +731,10 @@ is the order the lines were read in: neither file stamps its lines, so a
 stdout line and a stderr line written within the same poll can swap places.
 Within one stream, the order is exact.
 
+A process exiting and its pipe readers reaching EOF are separate events. The in-memory runtime now owns both reader tasks and tracks their completion. A final snapshot waits for that completion outside the process-map lock, and a follower scans once more after completion before returning. `Stopping` is not EOF. This prevents a short-lived child from being reported stopped while its final stdout or stderr chunk is still waiting to reach the buffers.
+
+The first observation of actual child exit starts one two-second drain deadline for both pipes. That deadline belongs to the runtime entry, so canceling a logs request cannot cancel it. A descendant that keeps inherited pipe ends open can delay EOF indefinitely; after the bound, the runtime aborts the remaining readers, reports truncation explicitly in its diagnostic output and preserves bytes already captured. An abort requests cancellation; it does not prove the task has stopped. Each reader owns a completion guard whose destructor confirms that no more bytes can be published, and final readers wait for those acknowledgements. Dropping the last in-memory owner also aborts its readers. File-backed production capture keeps its existing file ownership path. Tests gate final chunk publication after confirmed OS exit, then check snapshots, followers, cancelled waiters, owner drop and a descendant holding the pipes open. A separate gate pauses task destruction after the drain deadline: the final snapshot must remain pending until the reader actually acknowledges termination.
+
 That's a fixed-size array, `[CaptureReader; 2]`, built in place with no
 `Vec` and no heap allocation. Our first version built it with `.map` over
 an array of `(stream, extension)` pairs, which read nicely. Then opening a

@@ -57,16 +57,8 @@ where
 }
 
 fn overlapping(left: &Path, right: &Path) -> bool {
-    let left_artifacts = [
-        left.to_path_buf(),
-        left.with_extension("img"),
-        VolumeManager::sidecar_path(left),
-    ];
-    let right_artifacts = [
-        right.to_path_buf(),
-        right.with_extension("img"),
-        VolumeManager::sidecar_path(right),
-    ];
+    let left_artifacts = super::volume_artifact_paths(left);
+    let right_artifacts = super::volume_artifact_paths(right);
     left_artifacts.iter().any(|left| {
         right_artifacts
             .iter()
@@ -243,6 +235,7 @@ pub(super) fn prepare(
     app: &str,
     spec: &crate::config::app::AppSpec,
 ) -> Result<(), VolumeError> {
+    super::validate_managed_volume_layout(&spec.volumes).map_err(refuse)?;
     validate_names(namespace, app)?;
     std::fs::create_dir_all(&manager.volumes_dir)?;
     let root = manager.volumes_dir.canonicalize()?;
@@ -272,7 +265,7 @@ pub(super) fn prepare(
             }
             checked_path(&root, &VolumeManager::sidecar_path(&path))?;
             if owned.backend == VolumeBackend::LoopMount {
-                checked_path(&root, &path.with_extension("img"))?;
+                checked_path(&root, &super::loop_image_path(&path))?;
                 ensure_loop_mount(&path)?;
             }
             continue;
@@ -293,7 +286,7 @@ pub(super) fn prepare(
         }
         for artifact in [
             &path,
-            &path.with_extension("img"),
+            &super::loop_image_path(&path),
             &VolumeManager::sidecar_path(&path),
         ] {
             checked_path(&root, artifact)?;
@@ -348,7 +341,7 @@ pub(super) fn prepare(
                 }
             }
             VolumeBackend::LoopMount => {
-                let image = path.with_extension("img");
+                let image = super::loop_image_path(&path);
                 let size = size.ok_or_else(|| refuse("loop volume has no size"))?;
                 std::fs::create_dir_all(&path)?;
                 let file = std::fs::OpenOptions::new()
@@ -603,7 +596,7 @@ fn ensure_loop_mount(path: &Path) -> Result<(), VolumeError> {
     if !cfg!(target_os = "linux") {
         return Err(refuse("loop-backed test storage requires Linux"));
     }
-    let image = path.with_extension("img");
+    let image = super::loop_image_path(path);
     if !std::fs::symlink_metadata(&image)?.is_file() {
         return Err(refuse("loop image is not a regular file"));
     }
@@ -706,7 +699,7 @@ pub(super) fn retire(
                 ))
             })?;
         let path = owned_roots[0].join(relative_mount(volume.0)?);
-        verify_loop(mount, &path.with_extension("img"))?;
+        verify_loop(mount, &super::loop_image_path(&path))?;
     }
     for (mount_path, owned) in &journal.volumes {
         let path = owned_roots[0].join(relative_mount(mount_path)?);
@@ -718,7 +711,7 @@ pub(super) fn retire(
                     return Err(refuse("test volume remains mounted"));
                 }
             }
-            let image = path.with_extension("img");
+            let image = super::loop_image_path(&path);
             checked_path(&root, &image)?;
             remove_file(&image)?;
         } else if owned.backend == VolumeBackend::BtrfsSubvolume && exists(&path)? {
@@ -972,7 +965,7 @@ mod tests {
         for paths in [
             ["/data", "/data/nested"],
             ["/data", "/data.img"],
-            ["/data.ext", "/data.other"],
+            ["/data.ext", "/data.ext.img"],
         ] {
             let root = tempfile::tempdir().unwrap();
             let manager = VolumeManager::new(root.path());
@@ -985,6 +978,23 @@ mod tests {
                 .retire_test_storage("rbtest-storage", "web")
                 .unwrap();
         }
+    }
+    #[test]
+    fn dotted_owned_volume_names_are_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(root.path());
+        manager
+            .prepare_test_storage(
+                "rbtest-storage",
+                "web",
+                &spec(&["/data.ext", "/data.other"]),
+            )
+            .unwrap();
+        assert!(root.path().join("rbtest-storage/web/data.ext").is_dir());
+        assert!(root.path().join("rbtest-storage/web/data.other").is_dir());
+        manager
+            .retire_test_storage("rbtest-storage", "web")
+            .unwrap();
     }
     #[test]
     fn unexpected_snapshots_keep_ownership_until_operator_repairs_storage() {
