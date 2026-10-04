@@ -167,6 +167,13 @@ async fn current_apps_feeds_the_dry_run_diff() {
     let plan = crate::relish::plan::generate_plan(&same, Some(&current));
     assert_eq!((plan.to_update, plan.unchanged), (0, 1), "{plan:?}");
 
+    let changed = crate::config::Config::parse(
+        "[app.web]\nimage = \"myapp:v1\"\nreplicas = 3\nport = 8081\n",
+    )
+    .unwrap();
+    let plan = crate::relish::plan::generate_plan(&changed, Some(&current));
+    assert_eq!(plan.to_update, 1, "same-image change was missed: {plan:?}");
+
     let bumped = crate::config::Config::parse("[app.web]\nimage = \"myapp:v2\"\n").unwrap();
     let plan = crate::relish::plan::generate_plan(&bumped, Some(&current));
     assert_eq!((plan.to_create, plan.to_update), (0, 1), "{plan:?}");
@@ -7186,4 +7193,80 @@ async fn per_app_process_metric_is_queryable() {
     assert_eq!(parsed.data[0].metric_name, "process_cpu_percent");
 
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
+    use crate::bun::agent::CurrentResourceStatus;
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+    let agent = tokio::spawn(async move {
+        let Some(AgentCommand::CurrentResources { response }) = cmd_rx.recv().await else {
+            panic!("wrong agent request")
+        };
+        response
+            .send(vec![
+                CurrentResourceStatus {
+                    resource: "app.team/web".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: Some("team-spec".into()),
+                },
+                CurrentResourceStatus {
+                    resource: "app.other/web".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: Some("other-spec".into()),
+                },
+                CurrentResourceStatus {
+                    resource: "job.team/migrate".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: None,
+                },
+            ])
+            .unwrap();
+    });
+    let context = crate::sesame::auth::AuthContext {
+        token_name: "team-reader".into(),
+        principal_id: "token:test".into(),
+        role: crate::sesame::types::ApiRole::ReadOnly,
+        scoped_apps: Some(vec!["web".into()]),
+        scoped_namespaces: Some(vec!["team".into()]),
+    };
+    let app = router(
+        cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    )
+    .layer(axum::Extension(context));
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/apps")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows: Vec<CurrentResourceStatus> =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].resource, "app.team/web");
+    assert_eq!(rows[0].fingerprint.as_deref(), Some("team-spec"));
+    agent.await.unwrap();
+}
+
+#[tokio::test]
+async fn dry_run_endpoint_refuses_unavailable_agent_evidence() {
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    drop(cmd_rx);
+    let app = router(
+        cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/apps")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

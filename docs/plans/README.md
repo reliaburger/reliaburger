@@ -11,6 +11,7 @@ the detail is in the GitHub milestones and issues.
 | Plan | What it is | Still open |
 |---|---|---|
 | [Shared configuration tree](2026-10-04-shared-config-tree.md) | Resolve defaults and directory namespaces consistently through CLI and GitOps adapters. | #548 |
+| [Desired-spec previews](2026-10-04-desired-spec-preview.md) | Complete scoped comparison evidence with explicit offline and unknown actions. | #550 |
 | [Autoscale target validation](2026-10-03-autoscale-target-validation.md) | Refuse nonpositive or nonfinite controller targets and measurements. | #554 |
 | [Review 2: audit fixes](2026-10-03-review2-audit-fixes.md) | The approved 28-issue audit, implemented through one merge train with cross-path hardening last. | [#528–#555](https://github.com/reliaburger/reliaburger/milestone/11) |
 | [Registry verification admission](2026-10-03-plan-registry-verification.md) | Share the bounded Sesame verifier across API and OCI registry requests ([#539](https://github.com/reliaburger/reliaburger/issues/539)). | Router regression, implementation and portable CI |
