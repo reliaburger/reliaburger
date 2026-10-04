@@ -54,6 +54,9 @@ pub enum BindError {
         "cannot resolve {image} to a digest: {reason}; pin it as {image}@sha256:… or try again when the registry answers"
     )]
     Unresolved { image: String, reason: String },
+    /// The node's upstream trust rules don't allow the image (F03 U2).
+    #[error(transparent)]
+    NotAllowed(#[from] crate::pickle::trust::UpstreamRefused),
 }
 
 /// Bind `image` to a manifest digest.
@@ -156,18 +159,32 @@ pub struct ImageBinder {
     /// Asks loopback registries (`localhost:5000`) over plain HTTP, the way
     /// the runtime pulls them.
     loopback: Arc<dyn UpstreamRegistry>,
+    /// This node's `[images.trust_policy]`, whose upstream rules an apply
+    /// checks before it asks any registry (F03 U2).
+    policy: Arc<crate::config::node::TrustPolicySection>,
 }
 
 impl ImageBinder {
     /// A binder that asks `remote` about registries elsewhere and
-    /// `loopback` about those on this host.
+    /// `loopback` about those on this host. It allows every upstream image
+    /// until [`Self::with_policy`] says otherwise.
     pub fn new(remote: Arc<dyn UpstreamRegistry>, loopback: Arc<dyn UpstreamRegistry>) -> Self {
-        Self { remote, loopback }
+        Self {
+            remote,
+            loopback,
+            policy: Arc::default(),
+        }
     }
 
     /// A binder that asks `upstream` about every registry.
     pub fn with_upstream(upstream: Arc<dyn UpstreamRegistry>) -> Self {
         Self::new(upstream.clone(), upstream)
+    }
+
+    /// Check upstream images against `policy`'s rules before binding them.
+    pub fn with_policy(mut self, policy: crate::config::node::TrustPolicySection) -> Self {
+        self.policy = Arc::new(policy);
+        self
     }
 
     /// Bind one image reference (see [`bind_image`]).
@@ -233,11 +250,19 @@ impl ImageBinder {
     }
 
     /// Bind each `(workload, image)` slot, resolving each distinct image once.
-    async fn bind_slots<'a>(
+    async fn bind_slots(
         &self,
-        slots: Vec<(String, &'a mut Option<String>)>,
+        slots: Vec<(String, &mut Option<String>)>,
         catalog: &ManifestCatalog,
     ) -> Result<Vec<AppliedBinding>, BindError> {
+        // Every image passes the upstream rules before any registry hears
+        // about any of them. Pickle's own images (not the cache's copies)
+        // answer to `require_signatures` instead.
+        for image in slots.iter().filter_map(|(_, slot)| slot.as_deref()) {
+            if crate::meat::scheduler::lookup_pickle_manifest(image, catalog).is_none() {
+                crate::pickle::trust::check_upstream(&self.policy, image)?;
+            }
+        }
         let mut resolved: HashMap<String, Binding> = HashMap::new();
         let mut applied = Vec::new();
         for (workload, slot) in slots {
@@ -529,6 +554,87 @@ command = ["migrate"]
                 .unwrap()
                 .ends_with(digest(2).as_str())
         );
+    }
+
+    /// An allow-list naming only Docker Hub's official images.
+    fn official_images_only() -> crate::config::node::TrustPolicySection {
+        crate::config::node::TrustPolicySection {
+            upstream: vec![crate::config::node::UpstreamTrustRule {
+                pattern: "docker.io/library/*".to_string(),
+                require_signatures: false,
+            }],
+            upstream_default: crate::config::node::UpstreamDefault { allow: false },
+            ..Default::default()
+        }
+    }
+
+    /// F03 U2: the apply refuses an image the node's upstream rules don't
+    /// allow, names it, and doesn't ask its registry anything.
+    #[tokio::test]
+    async fn an_image_the_upstream_rules_refuse_fails_the_apply_by_name() {
+        let registry = counting(7);
+        let binder =
+            ImageBinder::with_upstream(registry.clone()).with_policy(official_images_only());
+        let mut config = crate::config::Config::parse(
+            "[app.web]\nimage = \"nginx:1.27\"\n[app.miner]\nimage = \"ghcr.io/evil/miner:1\"\n",
+        )
+        .unwrap();
+        let error = binder
+            .bind_config(&mut config, &ManifestCatalog::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BindError::NotAllowed(_)), "{error}");
+        assert!(
+            error.to_string().contains("ghcr.io/evil/miner:1"),
+            "{error}"
+        );
+        // `miner` sorts before `web`, so nothing was resolved at all.
+        assert_eq!(heads(&registry), 0);
+    }
+
+    #[tokio::test]
+    async fn an_image_a_rule_allows_binds_as_usual() {
+        let binder = ImageBinder::with_upstream(counting(7)).with_policy(official_images_only());
+        let mut config =
+            crate::config::Config::parse("[app.web]\nimage = \"nginx:1.27\"\n").unwrap();
+        let bindings = binder
+            .bind_config(&mut config, &ManifestCatalog::default())
+            .await
+            .unwrap();
+        assert_eq!(bindings.len(), 1);
+    }
+
+    /// The rules are for images from outside Pickle; the cluster's own
+    /// images answer to `require_signatures` instead.
+    #[tokio::test]
+    async fn the_upstream_rules_leave_pickle_images_alone() {
+        let catalog = catalog_with(&[("team/web", "v2", 5)]);
+        let binder = ImageBinder::with_upstream(std::sync::Arc::new(Registry(None)))
+            .with_policy(official_images_only());
+        let mut config =
+            crate::config::Config::parse("[app.web]\nimage = \"localhost:5050/team/web:v2\"\n")
+                .unwrap();
+        binder.bind_config(&mut config, &catalog).await.unwrap();
+        // A digest-pinned Pickle reference is Pickle's too.
+        let pinned = format!("localhost:5050/team/web@{}", digest(5).as_str());
+        let mut config =
+            crate::config::Config::parse(&format!("[app.web]\nimage = \"{pinned}\"\n")).unwrap();
+        binder.bind_config(&mut config, &catalog).await.unwrap();
+    }
+
+    /// An image pinned by digest is still checked: pinning doesn't make an
+    /// image trusted.
+    #[tokio::test]
+    async fn a_pinned_upstream_image_is_checked_too() {
+        let binder = ImageBinder::with_upstream(counting(7)).with_policy(official_images_only());
+        let pinned = format!("ghcr.io/evil/miner@{}", digest(3).as_str());
+        let mut config =
+            crate::config::Config::parse(&format!("[app.miner]\nimage = \"{pinned}\"\n")).unwrap();
+        let error = binder
+            .bind_config(&mut config, &ManifestCatalog::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BindError::NotAllowed(_)), "{error}");
     }
 
     /// A registry that never answers.

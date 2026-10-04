@@ -757,11 +757,11 @@ pub struct ExternalRegistrySection {
 
 /// Image trust policy controlling signature requirements.
 ///
-/// When `require_signatures` is `true`, the scheduler refuses to
-/// schedule Pickle-hosted images that have no attached signature, and a
-/// node that can't reach the cluster trust state to verify one refuses the
-/// deploy rather than skipping the check (fail-closed, IMG2). Images from
-/// external registries are not checked.
+/// When `require_signatures` is `true`, Bun refuses to deploy
+/// Pickle-hosted images that have no valid signature, and a node that
+/// can't reach the cluster trust state to verify one refuses the deploy
+/// rather than skipping the check (fail-closed, IMG2). Images from external
+/// registries answer to the `upstream` rules instead (F03 U2).
 ///
 /// There is deliberately no `build_signer` key path to configure: the
 /// build signer is a persistent code-signing identity the council mints
@@ -776,6 +776,89 @@ pub struct TrustPolicySection {
     pub require_signatures: bool,
     /// Base64-encoded ECDSA P-256 public keys trusted for external signing.
     pub keys: Vec<String>,
+    /// Rules for images from outside Pickle (`[[images.trust_policy.upstream]]`).
+    /// The most specific rule matching an image's repository applies.
+    pub upstream: Vec<UpstreamTrustRule>,
+    /// What happens to an upstream image no rule matches.
+    pub upstream_default: UpstreamDefault,
+}
+
+/// One `[[images.trust_policy.upstream]]` rule (F03 U2, #361).
+///
+/// An image matching a rule is allowed, bound to a digest at apply, and
+/// (once cosign verification lands, U3) checked for a signature when the
+/// rule asks for one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTrustRule {
+    /// A repository, `docker.io/library/nginx`, or a prefix ending in `*`,
+    /// `ghcr.io/acme/*`. Docker Hub shorthand is spelled out: `nginx` is
+    /// `docker.io/library/nginx`.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Require a cosign signature. Refused at startup until U3 can check one.
+    #[serde(default)]
+    pub require_signatures: bool,
+}
+
+/// `[images.trust_policy.upstream_default]`: upstream images no rule matches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamDefault {
+    /// Allow them (the default). `false` turns the rules into an allow-list.
+    pub allow: bool,
+}
+
+impl Default for UpstreamDefault {
+    fn default() -> Self {
+        Self { allow: true }
+    }
+}
+
+impl TrustPolicySection {
+    /// Reject upstream rules that could never match, or that ask for checks
+    /// this release can't make, before the node starts on them.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        let mut seen = std::collections::HashSet::new();
+        for rule in &self.upstream {
+            let bad = |reason: &str| super::error::ConfigError::Validation {
+                field: format!("match = {:?}", rule.pattern),
+                context: "images.trust_policy.upstream".to_string(),
+                reason: reason.to_string(),
+            };
+            let literal = rule.pattern.strip_suffix('*').unwrap_or(&rule.pattern);
+            if literal.is_empty() {
+                return Err(bad("must name a registry and repository"));
+            }
+            if literal.contains('*') {
+                return Err(bad("may hold `*` only at its end"));
+            }
+            let Some((host, path)) = literal.split_once('/') else {
+                return Err(bad(
+                    "must start with a registry host, as in docker.io/library/nginx",
+                ));
+            };
+            if !(host.contains('.') || host.contains(':') || host == "localhost") {
+                return Err(bad(
+                    "must start with a registry host, as in docker.io/library/nginx",
+                ));
+            }
+            // A registry port is in the host; a `:` or `@` in the path is a
+            // tag or a digest, and rules match repositories.
+            if path.contains(':') || path.contains('@') {
+                return Err(bad("matches repositories, so it takes no tag or digest"));
+            }
+            if rule.require_signatures {
+                return Err(bad(
+                    "signatures on upstream images can't be checked yet (cosign support is F03 U3, #361); set require_signatures = false",
+                ));
+            }
+            if !seen.insert(rule.pattern.as_str()) {
+                return Err(bad("appears twice"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ImagesSection {
@@ -1381,6 +1464,89 @@ mod tests {
         let nc = NodeConfig::parse("").unwrap();
         assert!(!nc.images.trust_policy.require_signatures);
         assert!(nc.images.trust_policy.keys.is_empty());
+        assert!(nc.images.trust_policy.upstream.is_empty());
+        assert!(nc.images.trust_policy.upstream_default.allow);
+    }
+
+    #[test]
+    fn parse_upstream_trust_rules() {
+        let nc = NodeConfig::parse(
+            r#"
+            [[images.trust_policy.upstream]]
+            match = "docker.io/library/*"
+            require_signatures = false
+
+            [[images.trust_policy.upstream]]
+            match = "ghcr.io/acme/web"
+
+            [images.trust_policy.upstream_default]
+            allow = false
+            "#,
+        )
+        .unwrap();
+        let policy = &nc.images.trust_policy;
+        assert_eq!(policy.upstream.len(), 2);
+        assert_eq!(policy.upstream[0].pattern, "docker.io/library/*");
+        assert!(!policy.upstream_default.allow);
+        policy.validate().unwrap();
+    }
+
+    fn upstream_rule_error(pattern: &str, require_signatures: bool) -> String {
+        let policy = TrustPolicySection {
+            upstream: vec![UpstreamTrustRule {
+                pattern: pattern.to_string(),
+                require_signatures,
+            }],
+            ..Default::default()
+        };
+        policy.validate().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn an_upstream_rule_that_could_never_match_is_refused() {
+        for (pattern, reason) in [
+            ("", "registry and repository"),
+            ("*", "registry and repository"),
+            ("docker.io/*/nginx", "only at its end"),
+            ("nginx", "registry host"),
+            ("library/nginx", "registry host"),
+            ("docker.io/library/nginx:1.27", "no tag or digest"),
+            ("docker.io/library/nginx@sha256:abc", "no tag or digest"),
+        ] {
+            let error = upstream_rule_error(pattern, false);
+            assert!(error.contains(reason), "{pattern:?}: {error}");
+        }
+        for pattern in ["localhost:5000/*", "registry.internal:443/team/app"] {
+            let policy = TrustPolicySection {
+                upstream: vec![UpstreamTrustRule {
+                    pattern: pattern.to_string(),
+                    require_signatures: false,
+                }],
+                ..Default::default()
+            };
+            policy.validate().unwrap();
+        }
+    }
+
+    /// U2 ships before cosign verification (U3): a rule that asks for a
+    /// signature must not start a node that would silently skip the check.
+    #[test]
+    fn an_upstream_rule_requiring_signatures_is_refused_until_cosign_lands() {
+        let error = upstream_rule_error("ghcr.io/acme/*", true);
+        assert!(error.contains("U3"), "{error}");
+    }
+
+    #[test]
+    fn a_duplicate_upstream_rule_is_refused() {
+        let rule = UpstreamTrustRule {
+            pattern: "ghcr.io/acme/*".to_string(),
+            require_signatures: false,
+        };
+        let policy = TrustPolicySection {
+            upstream: vec![rule.clone(), rule],
+            ..Default::default()
+        };
+        assert!(policy.validate().unwrap_err().to_string().contains("twice"));
     }
 
     #[test]

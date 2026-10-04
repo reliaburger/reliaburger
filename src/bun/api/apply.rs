@@ -6,8 +6,10 @@ use crate::pickle::binding::{AppliedBinding, BindError, ImageBinder};
 /// Bind `config`'s images before the request is answered, for the paths
 /// that must know the bound config before their stream starts (a
 /// standalone deploy, a cluster apply with jobs). A refusal is the HTTP
-/// response: 400 for a reference that doesn't parse, 502 when the registry
-/// couldn't name a digest and the cache doesn't hold the tag.
+/// response: 400 for a reference that doesn't parse, 403 for an image the
+/// node's upstream trust rules refuse, 502 when the registry couldn't name a
+/// digest and the cache doesn't hold the tag.
+#[allow(clippy::result_large_err)]
 pub(super) async fn bind_images(
     state: &ApiState,
     binder: &ImageBinder,
@@ -18,6 +20,7 @@ pub(super) async fn bind_images(
         let status = match error {
             BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
             BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
+            BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
         };
         (
             status,
@@ -543,6 +546,7 @@ pub(super) async fn apply_handler(
 /// (openraft does not forward client writes), streaming its SSE
 /// response back verbatim. Jobs in the same config still deploy on the
 /// receiving node after the specs commit.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn cluster_apply(
     state: ApiState,
     council: Arc<crate::council::CouncilNode>,

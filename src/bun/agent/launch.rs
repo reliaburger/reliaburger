@@ -432,6 +432,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// root CA and returns the digest-pinned reference (`repo@sha256:…`) the
     /// deploy must use, so the runtime pulls exactly the verified bytes — a
     /// tag can move between verify and pull (IMG1).
+    ///
+    /// An image from outside Pickle must pass the node's
+    /// `[[images.trust_policy.upstream]]` rules first (F03 U2). That check
+    /// runs where the runtime pulls images and a council holds the catalogue
+    /// that tells Pickle's images from everyone else's. A standalone node
+    /// has no such catalogue here; its apply checked the same rules against
+    /// its own registry, on this node, before the deploy began.
     pub(super) async fn enforce_image_signature(
         &self,
         spec: &AppSpec,
@@ -444,6 +451,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         image: Option<&str>,
     ) -> Result<Option<String>, String> {
+        self.enforce_upstream_rules(image).await?;
         if !self.trust_policy.require_signatures {
             return Ok(None);
         }
@@ -478,6 +486,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             _ => None,
         })
+    }
+
+    /// Refuse an upstream image the node's upstream rules don't allow (see
+    /// [`Self::enforce_image_signature`] for where this applies).
+    async fn enforce_upstream_rules(&self, image: Option<&str>) -> Result<(), String> {
+        // With the default `allow = true` no rule can refuse anything, so
+        // skip the catalogue read.
+        if self.trust_policy.upstream_default.allow {
+            return Ok(());
+        }
+        let Some(image) = image else {
+            return Ok(());
+        };
+        if self.supervisor.grill().runtime_kind() == crate::grill::records::RuntimeKind::Process {
+            return Ok(());
+        }
+        let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+            return Ok(());
+        };
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
+        let catalog = council.manifest_catalog().await;
+        if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_some() {
+            return Ok(());
+        }
+        crate::pickle::trust::check_upstream(&self.trust_policy, image).map_err(|e| e.to_string())
     }
 
     /// Every age identity that could decrypt this namespace's secrets, newest

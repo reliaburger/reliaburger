@@ -2090,6 +2090,7 @@ mod tests {
             &crate::config::node::TrustPolicySection {
                 require_signatures: true,
                 keys: vec![],
+                ..Default::default()
             },
             Some(&signer.root_ca_cert_der),
             None,

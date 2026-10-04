@@ -1124,6 +1124,7 @@ When `require_signatures = true`:
 - **Unsigned images are accepted but undeployable.** Pushes never fail due to missing signatures, which avoids breaking CI pipelines. However, Bun refuses to deploy unsigned images (`enforce_image_signature`, before every deploy); Meat still places them. This creates a clear separation: the registry accepts all valid OCI images; the node that would run one enforces trust policy.
 - **Keyless signing eliminates key management.** Build nodes sign automatically with the cluster's persistent per-namespace build-signer identity (a Workload-CA leaf). No operator-provisioned signing keys to rotate, distribute, or protect.
 - **External signatures use operator keys.** Teams pushing from external CI register their public keys in each node's `[images.trust_policy] keys`. Pickle verifies its own signature format against them, not cosign's.
+- **Upstream images follow node rules.** `[[images.trust_policy.upstream]]` in `node.toml` names the registries and repositories a node runs images from (the most specific `match` wins); `upstream_default.allow = false` refuses the rest, at apply and again in Bun before every deploy (F03 U2, #361). Pickle's own images are judged by signature, not by these rules.
 - **Signature verification is cached.** Once a manifest's signature is verified and recorded in Raft, subsequent scheduling decisions don't re-verify. The signature status is part of the `ManifestMetadata`.
 
 ### 8.3 Pull-Through Cache Credential Handling

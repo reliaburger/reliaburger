@@ -1336,6 +1336,57 @@ One compile error is worth a paragraph, because you'll meet it. `bind_config` fi
 
 Formats moved with it. A node without this code would store and pass around bound references it doesn't expect, so the protocol and state generations went up (`src/compatibility.rs`) and a 0.1.5 cluster refuses this release.
 
+### Saying which registries you trust
+
+Binding fixes *which* bytes run. It says nothing about *whose*. Should a cluster that runs `docker.io/library/*` also run `ghcr.io/someone-you-never-heard-of/miner`? Until now, yes, always. So `node.toml` grew rules for upstream images:
+
+```toml
+[[images.trust_policy.upstream]]
+match = "docker.io/library/*"
+
+[images.trust_policy.upstream_default]
+allow = false
+```
+
+They live in node config for the same reason the signing keys do ("Whose key is it, anyway?"): if an API token could edit the list, a stolen token could add its own registry to it.
+
+Two details of the config types are new Rust. `match` is a keyword, so the field can't be called that; serde's `#[serde(rename = "match")]` keeps the TOML key while the struct says `pattern`. And `upstream_default.allow` must default to `true` (today's behaviour), but `#[derive(Default)]` would give `bool`'s default, `false`. So `UpstreamDefault` writes its own:
+
+```rust
+impl Default for UpstreamDefault {
+    fn default() -> Self {
+        Self { allow: true }
+    }
+}
+```
+
+With `#[serde(default)]` on the struct, a `node.toml` that never mentions the section gets that impl, and so does the parent's derived `Default`. A derive would have quietly flipped every existing cluster to an empty allow-list. (A test, `parse_trust_policy_defaults`, now says `allow` is `true` out loud.)
+
+"The most specific rule wins" is one iterator chain in `pickle::trust::matching_rule`:
+
+```rust
+policy
+    .upstream
+    .iter()
+    .filter_map(|rule| {
+        let specificity = match rule.pattern.strip_suffix('*') {
+            Some(prefix) => repository.starts_with(prefix).then_some((0, prefix.len())),
+            None => (rule.pattern == repository).then_some((1, rule.pattern.len())),
+        }?;
+        Some((specificity, rule))
+    })
+    .max_by_key(|(specificity, _)| *specificity)
+    .map(|(_, rule)| rule)
+```
+
+Tuples compare field by field, left to right, so `(1, _)` (an exact name) beats any `(0, _)` (a prefix), and between two prefixes the longer one wins. `bool::then_some` turns a condition into an `Option`, and the `?` inside the closure skips a rule that doesn't match. In Go you'd write the loop and keep a running best; here `max_by_key` is that loop.
+
+The check runs twice, like the signature check. At apply, `ImageBinder` judges every image before asking any registry about any of them, so a refused apply names the image and costs no network round trip. Then Bun judges again before every deploy (`enforce_upstream_rules`), because a spec can reach a node without passing this apply: one committed before the rules changed, or a node whose `node.toml` is stricter than the leader's. Both checks skip Pickle's own images, which answer to `require_signatures`, and both skip ProcessGrill, where an image is a placeholder.
+
+The refusal is a `thiserror` struct, `UpstreamRefused`, and the binder's error enum wraps it with `#[error(transparent)] NotAllowed(#[from] UpstreamRefused)`. `transparent` reuses the inner message unchanged; `#[from]` writes the `From` impl, so `check_upstream(...)?` inside `bind_slots` converts the error without a `map_err`. The apply route maps it to a 403, beside the 400 for a bad reference and the 502 for an unreachable registry.
+
+A rule can say `require_signatures = true`, and today that stops the node at startup. Checking cosign signatures is the next step (U3). Until it lands, a node that accepted the setting would skip the check it promised, which is the worst kind of security setting: one that's on and does nothing.
+
 ## What we deferred
 
 **TPM sealing** binds the master secret to specific hardware via the TPM chip's Platform Configuration Registers. If someone steals a disk, the master key is useless on different hardware. This is important for production hardening, but requires a TPM 2.0 device and the `tss-esapi` crate (Linux only). We've deferred it to v2.
@@ -1348,6 +1399,7 @@ Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
 - Identity lives in a per-instance directory (tmpfs-backed on Linux root), created before start, removed with the instance, and restored — schedule and all — across agent restarts
 - Images are signed (keyless by the build signer, or with an operator key via `relish sign`) and verified before they deploy
 - Every apply binds image tags to digests, so every node and restart runs the bytes the apply resolved
+- Node-config rules decide which upstream registries a node will run images from, checked at apply and before every deploy
 - SecurityState (CAs, tokens, keypairs, CRL, secret seals) is replicated through Raft
 - The agent provisions identity during deploy and rotates certificates every 30 minutes
 - API tokens are managed via `relish token list/revoke`

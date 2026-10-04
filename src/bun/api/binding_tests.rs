@@ -172,6 +172,60 @@ async fn a_standalone_apply_fails_before_deploying_when_the_registry_is_down() {
     shutdown.cancel();
 }
 
+/// `[images.trust_policy.upstream_default] allow = false` with one rule
+/// for Docker Hub's official images.
+fn allow_list() -> crate::config::node::TrustPolicySection {
+    crate::config::node::TrustPolicySection {
+        upstream: vec![crate::config::node::UpstreamTrustRule {
+            pattern: "docker.io/library/*".to_string(),
+            require_signatures: false,
+        }],
+        upstream_default: crate::config::node::UpstreamDefault { allow: false },
+        ..Default::default()
+    }
+}
+
+/// F03 U2: the leader refuses an image its upstream rules don't allow,
+/// names it, and commits nothing from the apply.
+#[tokio::test]
+async fn a_cluster_apply_refuses_an_image_the_upstream_rules_do_not_allow() {
+    let council = seeded_council("bind-upstream-refused").await;
+    let binder = binder(Some(7)).with_policy(allow_list());
+    let (app, shutdown) = router_with(Some(council.clone()), None, Some(binder));
+
+    let (_, body) = post(
+        app,
+        "/v1/apply",
+        "[app.web]\nimage = \"nginx:1.27\"\n[app.miner]\nimage = \"ghcr.io/evil/miner:1\"\n",
+    )
+    .await;
+
+    assert!(body.contains("\"Error\""), "{body}");
+    assert!(body.contains("ghcr.io/evil/miner:1"), "{body}");
+    assert!(body.contains("not allowed"), "{body}");
+    assert_eq!(desired_image(&council, "web").await, None);
+    assert_eq!(desired_image(&council, "miner").await, None);
+    shutdown.cancel();
+    council.raft().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_standalone_apply_refuses_an_image_the_upstream_rules_do_not_allow() {
+    let binder = binder(Some(7)).with_policy(allow_list());
+    let (app, shutdown) = router_with(None, None, Some(binder));
+
+    let (status, body) = post(
+        app,
+        "/v1/apply",
+        "[app.miner]\nimage = \"ghcr.io/evil/miner:1\"\n",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("ghcr.io/evil/miner:1"), "{body}");
+    shutdown.cancel();
+}
+
 fn completed(id: u64, created_secs: u64, image: &str) -> DeployHistoryEntry {
     let at = SystemTime::UNIX_EPOCH + Duration::from_secs(created_secs);
     let spec: crate::config::app::AppSpec =

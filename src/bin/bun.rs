@@ -2371,6 +2371,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 credentials,
             )),
         )
+        .with_policy(config.images.trust_policy.clone())
     });
 
     // GitOps (L13): if [gitops] is configured on a cluster node, spawn

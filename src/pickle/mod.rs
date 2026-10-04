@@ -19,5 +19,6 @@ pub mod replication;
 pub mod signing;
 mod storage_budget;
 pub mod store;
+pub mod trust;
 pub mod types;
 pub mod upstream;

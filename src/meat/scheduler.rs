@@ -351,8 +351,10 @@ pub(crate) fn canonical_repository(name: &str) -> &str {
 /// <repo>` and are exempt by construction: unsigned upstream content
 /// stays deployable under `require_signatures` (it was never signable
 /// by us). Pinned by `check_image_schedulable_exempts_pull_through_cache`.
-/// TODO(F03, #320): upstream trust policy (digest pinning, cosign).
-fn lookup_pickle_manifest<'a>(
+/// Upstream images are bound to digests at apply and checked against the
+/// node's `[[images.trust_policy.upstream]]` rules (`pickle::trust`).
+/// TODO(#361): cosign signatures on upstream images (F03 U3).
+pub(crate) fn lookup_pickle_manifest<'a>(
     image_ref: &str,
     catalog: &'a crate::pickle::types::ManifestCatalog,
 ) -> Option<&'a crate::pickle::types::ImageManifest> {
@@ -957,6 +959,7 @@ mod tests {
         TrustPolicySection {
             require_signatures: true,
             keys: vec![],
+            ..Default::default()
         }
     }
 

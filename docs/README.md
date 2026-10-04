@@ -947,6 +947,9 @@ standalone) binds each image tag to the digest it names then, storing
 `nginx:1.27@sha256:…`; `relish apply` prints each binding, and history,
 inspect, status and rollback carry the digest. An unreachable registry fails
 the apply unless the pull-through cache holds the tag (F03 U1, #361).
+`[[images.trust_policy.upstream]]` rules in `node.toml` (most specific `match`
+wins) with `upstream_default.allow = false` turn upstream registries into an
+allow-list, checked at apply and in Bun before every deploy (F03 U2).
 Operational constraints:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each
