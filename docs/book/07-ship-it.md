@@ -831,6 +831,16 @@ The test for this drives `apply_changes` against a council that was never made l
 
 The first version of this fix only checked the outer `Err`, and a static review (B15) caught what that misses. `council.write` returns `Result<CouncilResponse, CouncilError>`, and `Err` only means Raft didn't commit the entry. An entry can commit and still be *refused*: the state machine applies it in log order, decides it isn't allowed, and answers `Ok(CouncilResponse::Refused { reason })` with desired state untouched. An app in an `rbtest-*` namespace is one, since only a leased test write may create those. That `Ok` counted as applied, and the commit advanced past a change that never happened. The `match` above names the refusal next to the transport error, so both stop the sync. The pattern `A | B` in one arm matches either shape, and `Ok(_)` after it catches every other response. The test drives `apply_changes` on a real leader with an `rbtest-lease/web` app and expects the refusal to come back as that resource's id.
 
+## Validating with the right namespace context
+
+A permission file can refer to `prod` after an earlier apply created that namespace. The CLI only has the new file, so a validation pass that insists on seeing `[namespace.prod]` there rejects a valid request. Adding the declaration to satisfy the CLI can replace the namespace's existing quota. The server had the right `validate_against` method, but its earlier validation pass rejected the request before that method ran.
+
+We now share the field checks and make the available context explicit. `validate_intrinsic` checks names, resource values, workload specifications, permission actions and build destination syntax. It leaves permission/build namespace existence for live admission. `validate_against` passes the union of inline declarations and committed namespaces to the same checks; offline `validate` uses only inline declarations.
+
+The helper takes `Option<&[String]>`. `None` means the caller has no authoritative namespace catalogue yet; `Some` supplies a borrowed slice, so validation reads the catalogue without owning or copying it. The CLI's apply and deploy paths use the intrinsic pass. A cluster API repeats it, forwards the original credential if needed, and the leader performs the context check before any desired-state write. Standalone admission and offline lint still use full validation.
+
+A build-only apply also reaches the leader for validation, although build execution remains the separate build route. The regressions use the actual HTTP client against a leader and a three-council follower: existing references succeed without replacing the stored quota, and ghost references fail without adding a permission or app. They also check both permission and build manifest loading locally.
+
 ## The namespace bug that got away
 
 We fixed the identity mismatch on the *write* side and celebrated. Then someone deleted an app from git and watched the wrong one disappear.
