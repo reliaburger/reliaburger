@@ -316,6 +316,9 @@ pub enum AgentCommand {
     UpgradeApply {
         directive: crate::upgrade::types::UpgradeDirective,
         response: oneshot::Sender<Result<(), BunError>>,
+        /// Resolves once the answer has reached the caller; the exec waits
+        /// for it (bounded). `None` when no connection carries the answer.
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     },
     /// Node-level upgrade status.
     UpgradeStatus {
@@ -325,6 +328,8 @@ pub enum AgentCommand {
     UpgradeRollback {
         version: Option<crate::upgrade::BinaryVersion>,
         response: oneshot::Sender<Result<(), BunError>>,
+        /// As for [`AgentCommand::UpgradeApply`].
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     },
     /// Post-boot self-verification of a freshly swapped-in version.
     /// Commits on success; flags revert and exits on failure.
@@ -1130,8 +1135,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::UpgradeApply {
                 directive,
                 response,
+                answer_delivered,
             } => {
-                self.begin_upgrade_apply(directive, response);
+                self.begin_upgrade_apply(directive, response, answer_delivered);
             }
             AgentCommand::UpgradeStatus { response } => {
                 let result = match &self.upgrade {
@@ -1140,8 +1146,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 let _ = response.send(result);
             }
-            AgentCommand::UpgradeRollback { version, response } => {
-                self.begin_upgrade_rollback(version, response);
+            AgentCommand::UpgradeRollback {
+                version,
+                response,
+                answer_delivered,
+            } => {
+                self.begin_upgrade_rollback(version, response, answer_delivered);
             }
             AgentCommand::UpgradeVerify {
                 marker,
