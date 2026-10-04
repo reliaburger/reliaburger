@@ -110,58 +110,135 @@ The sustained harness records unique accepted successes alongside a serving app;
 no 24-hour 100m/day result has been established.
 
 
-## Million-job demo in under a minute
+## High-volume container jobs on the landing page
 
-The next demo goal is one million distinct accepted task successes within 60
-seconds, requiring more than 16,667/s. The existing mixed-resource container
-recording remains a separate correctness demonstration; it has not met this goal.
+The demo should establish a built-in high-throughput execution capability and
+measure its overhead, rather than optimise for a particular round task count.
+Useful initial targets are 500,000 distinct accepted successes in 60 seconds
+or one million in 120 seconds: both require about 8,333/s. Choose the volume
+and hardware after measuring the full path. Neither target is an established
+result. A short demo also cannot qualify 100 million successes over 24 hours.
 
-Use tiny deterministic work that depends on the task index, with a checksum
-and selected indexed results. A million repetitions inside one submitted job
-would demonstrate that job's inner loop, rather than one million scheduled,
-retried and durably accounted tasks. Start the clock at submission and stop only
-once the council accepts all successes after worker ledger/index durability.
-Report warm-up separately. Keep the burger app serving and report probe latency,
-retries, resource requests, binary build and cluster hardware.
+Give this feature its own asciinema recording and a prominent section near the
+landing page introduction, before the installation walkthrough. Lead with the
+verified count, real elapsed time, workload and hardware, then show how to
+reproduce it. Keep the existing general tour separate. The current 1,064-task
+recording proves mixed-profile execution beside a serving app; retain its
+honest caption until a high-throughput container run can replace it. Do not
+relabel that recording or accelerate its playback into a throughput claim.
 
-The recommended execution path is a bounded pool of long-lived owned executors
-for compatible namespaces, pinned images, commands and resource profiles. Build
-and initialise the container/security context once, then launch each command
-as a child process inside it. Retain per-index resource admission, exit status,
-timeout, cancellation and retry identity. Reusable slots need proven child-tree
-retirement and clean scratch/environment before another task can use them.
-Their cgroups must enforce the declared limits, and idle executor memory needs
-its own reservation. Uncertain executor ownership keeps resources quarantined;
-restart fences and retires the old executor before replaying uncommitted work.
-Group-commit outcomes and retain the existing accepted-owner/grant protocol.
+### Fair measurements
 
-A separate explicit worker protocol could process multiple tiny tasks inside a
-persistent process. This removes process startup too, but changes isolation:
-a crash can interrupt several tasks, state can leak between tasks, and an
-individual task cannot be safely killed without retiring its worker. Keep this
-opt-in and restrict sharing to a compatible trust/resource profile. It should
-not silently change ordinary command-job semantics.
+Use tiny deterministic work that depends on each task index. Each command must
+actually execute, exit and produce its own durable terminal outcome. A million
+iterations inside one submitted job would measure that job's inner loop. Verify
+unique accepted task identities and inspect selected indexed outcomes; count
+retries separately. Use release builds, pinned images and bounded output.
 
-The Mesos idea to borrow is a reusable executor that manages many tasks, rather
-than equating every task with a new container. Mesos also permits custom
-executors without a one-to-one task/process relationship; its default executor
-has shared-resource and coupled-failure semantics that should not be copied
-into our independent retry contract without an explicit decision. See the
-[framework guide](https://mesos.apache.org/documentation/latest/app-framework-development-guide/)
-and [workload isolation guide](https://mesos.apache.org/documentation/latest/running-workloads/).
+Measure the following stages on the same VM, workload and concurrency:
 
-First measure bare process launches, then the owned process path, then a warm
-executor through the full API/ledger/council path in release mode. Measure each
-stage before replacing the homepage recording. A bare launcher or in-process
-loop passing 60 seconds is evidence about that primitive, not a Reliaburger
-million-job demo. This executor reuse is planned work, not implemented by the
-current reusable identity slots, which still recreate the runtime per attempt.
+| Stage | What it establishes |
+| --- | --- |
+| Bare child processes | Process-launch throughput and the minimum execution cost without container isolation or durable accounting. |
+| Direct container executor | The cost of the same child launches with the proposed container isolation, per-task limits and cleanup, without cluster dispatch. |
+| Direct executor with ledger/index | The extra cost of durable per-task outcomes with the same group-commit and index settings as the complete system. |
+| Full Reliaburger submission | Dispatch, ownership, resource admission and accepted council completions on top of that execution and storage path. |
 
+Use the direct durable executor as the matched baseline for the complete path.
+Report the overall added elapsed time and throughput ratio. Use profiling and
+phase timings before attributing that whole difference specifically to the
+scheduler; resource admission, ownership and completion reporting also cost
+work. The host-process result alone cannot quantify container scheduling
+overhead. Keep the service running and reservations identical for the matched
+runs; repeat full-size runs and report their spread. Do not extrapolate from a
+short launch burst or subtract timings collected on different machines.
+
+Start the full-path clock before submission and stop only once the council
+accepts all successes after worker ledger/index durability. Report image pull,
+executor warm-up and cold-start timing separately, including a cold end-to-end
+run. Publish wall time, build revision, VM resources, concurrency, resource
+requests/limits, retries, peak memory, disk growth and service probe latency.
+The recorded run must correspond to the report. Playback speed or editorial
+cuts must never substitute for the measured elapsed time.
 
 The first full primitive measurement launched one million tiny child processes
 in 66.360 seconds on the existing 4-vCPU VM, without the orchestrator or durable
 outcomes. A 20,000-process sample's faster 23,110/s rate did not survive the full
-run, which averaged 15,069/s. Budget additional CPU/node capacity and measure the
-full path; changing the existing demo to host processes alone does not prove the
-60-second target. Reproducible evidence is in the
+run, which averaged 15,069/s. That makes a longer demo worth investigating,
+without establishing container or orchestrator throughput. Reproducible
+evidence is in the
 [qualification record](../qualification/2026-10-04-delegated-jobs/README.md#process-launch-feasibility-for-the-million-job-demo).
+
+### Execution contract
+
+The recommended path to investigate is a bounded pool of long-lived owned
+container executors, with a separate child process for each command task. This
+must be a built-in batch execution mode, with no separately installed framework,
+user-managed queue or application worker protocol. Compatible executors share
+only a namespace/trust boundary, pinned image, credentials, mounts, security
+settings and resource profile. Chunk size still controls dispatch rather than
+per-task resource admission; mixed requests use distinct compatible profiles
+and are packed against the same application/batch capacity budget.
+
+A task running inside a reusable container and a fresh OCI container per task
+have different isolation contracts. State that distinction in the manifest,
+manual and recording. Preserve the existing fresh-container path for workloads
+requiring it; do not silently substitute shared container isolation. Benchmark
+that path separately with its stronger lifecycle cost. A large count of
+container-backed tasks must not be described as that many fresh containers.
+
+Build and initialise the executor context once, then retain per-index admission,
+exit status, timeout, cancellation and retry identity. Prove child-tree
+retirement and clean scratch/environment before another task uses the slot.
+Enforce supported per-task limits independently; an executor-wide cgroup alone
+cannot provide every child with an independent limit. Refuse incompatible
+specifications rather than silently weakening them. Account for idle executor
+memory. Uncertain executor ownership keeps resources quarantined; restart
+fences and retires the old executor before replaying uncommitted work. Keep the
+existing durable outcomes and accepted-owner/grant protocol.
+
+An explicit persistent worker protocol could remove process startup as well,
+but changes the command contract: crashes can interrupt several tasks, state
+can leak between tasks, and killing one task may require retiring the worker.
+Keep this opt-in and outside the initial process-per-task container demo.
+
+The Mesos idea to borrow is a reusable executor that manages many tasks, rather
+than equating every task with a new container. Mesos also permits custom
+executors without a one-to-one task/process relationship; its shared-resource
+and coupled-failure semantics should not replace our independent retry contract
+without an explicit decision. See the
+[framework guide](https://mesos.apache.org/documentation/latest/app-framework-development-guide/)
+and [workload isolation guide](https://mesos.apache.org/documentation/latest/running-workloads/).
+Executor reuse remains planned work. The current reusable identity slots still
+recreate the runtime per attempt; their measured performance does not establish
+small execution or scheduling overhead.
+
+### Recording and operator tooling
+
+The main recording should show one manifest submission, the baseline result,
+a live accepted-success count, whole-run average rate, recent rate, backlog,
+active tasks, retries and remaining time when the estimate is meaningful.
+Use summaries rather than scrolling task lists. Show the image and execution
+mode, then retrieve one indexed outcome and a bounded failed-results page.
+Publish underlying evidence and a reproducible benchmark command beside the
+recording. Rates must distinguish accepted completions from local execution
+and expose the freshness of chunk-based reports instead of presenting a
+completion burst as a sustained rate.
+
+Keep the initial workload small enough to reveal orchestration overhead.
+Follow with a short mixed-resource example and a separate restart/retry example
+to demonstrate that this capability also handles ordinary heavier work and
+failures. Keep faults outside the headline throughput interval and report them
+separately. The main run should retain service probes and capacity reservations
+so the demo does not depend on starving applications.
+
+The Kubernetes comparison should describe the architectural distinction:
+Reliaburger delegates execution and batches global lifecycle accounting as a
+built-in capability. Kubernetes already has Indexed Jobs and automatic finished
+Job cleanup; native Indexed Jobs still track task completion through Pods.
+Its API server also requests etcd compaction every five minutes by default.
+Avoid suggesting that batch always requires a third-party framework or manual
+compaction, or that Kubernetes cannot run large batches. A numerical performance
+comparison needs a matched Kubernetes benchmark and stated execution semantics.
+See the official [Jobs documentation](https://kubernetes.io/docs/concepts/workloads/controllers/job/)
+and [API server compaction option](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/#options).

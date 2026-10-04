@@ -145,9 +145,10 @@ cc -O2 -pthread launch-probe.c -o /tmp/rb-delegated-launch-probe
 /tmp/rb-delegated-launch-probe pooled 1000000 4
 ```
 
-The million-in-under-a-minute demo needs more than 16,667 accepted successes/s,
-plus headroom for the app and control/storage work. A warm owned executor that
+The revised initial demo targets of 500,000 successes in a minute or one million
+in two minutes require about 8,333 accepted successes/s, plus headroom for the
+app and control/storage work. A warm owned executor that
 launches children is the proposed command-job path; an explicit persistent
 worker protocol offers further savings with different isolation semantics.
-The [demo plan](../../plans/2026-10-04-plan-delegated-jobs.md#million-job-demo-in-under-a-minute)
+The [demo plan](../../plans/2026-10-04-plan-delegated-jobs.md#high-volume-container-jobs-on-the-landing-page)
 records the end-to-end acceptance gate. Executor reuse remains unimplemented.
