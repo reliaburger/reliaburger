@@ -438,7 +438,7 @@ The sync loop:
 1. **Trigger.** Poll timer (default 30s) or webhook
 2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
 3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
-4. **TOML parse.** All `.toml` files under the configured path. Parse errors are per-file, not global
+4. **Configuration tree.** Read the verified commit under the configured watch root. Resolve `_defaults.toml` inheritance and directory namespaces through the same resolver as CLI compilation. A malformed or ambiguous tree refuses the whole sync
 5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
 6. **Selective apply.** Only changed resources written to Raft
 

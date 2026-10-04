@@ -175,6 +175,13 @@ compilation fails rather than dropping one. Apply those manifests separately
 or give their resources distinct names. Duplicate definitions in one namespace
 use the later file in sorted order and produce a warning.
 
+GitOps resolves its watched tree with these same defaults and directory rules.
+The configured watch directory is the root; only directories below it contribute
+namespaces, and defaults outside that root are not inherited. GitOps refuses
+duplicate resource definitions, while `relish compile` warns about overrides
+within one namespace. Parse, read and namespace-identity errors refuse the whole
+tree in both paths.
+
 ## Rolling deploys
 
 Apply a changed app and Bun replaces its instances one at a time, waiting for

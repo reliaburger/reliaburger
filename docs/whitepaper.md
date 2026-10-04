@@ -661,6 +661,8 @@ Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the n
 
 Lettuce is Reliaburger's built-in GitOps engine, replacing ArgoCD and Flux with a sync loop compiled directly into the Bun binary.
 
+CLI compilation and Lettuce share the resolver for inherited `_defaults.toml` values and directory-derived namespaces. Lettuce resolves the configured watch directory from the verified Git commit; defaults outside that directory are not inherited. Malformed input or an unrepresentable namespace collision refuses the whole sync before desired-state changes. GitOps refuses duplicate resource definitions, while CLI compilation reports deterministic overrides within a namespace.
+
 **Configuration:**
 
 ```toml
@@ -875,7 +877,7 @@ Brioche provides a franchise overview page: all peered clusters, their health st
 
 ### 21.4 Cross-Cluster Image Pull and GitOps
 
-Peered clusters can pull images from one another's Pickle registries on demand (lazy, not eagerly replicated) using the existing OCI Distribution API over the trust relationship. For GitOps, Lettuce supports shared repositories with per-cluster directories: a `_defaults.toml` provides shared configuration, and per-cluster directories override as needed. Each cluster's Lettuce independently syncs its own directory.
+Peered clusters can pull images from one another's Pickle registries on demand (lazy, not eagerly replicated) using the existing OCI Distribution API over the trust relationship. For GitOps, Lettuce supports shared repositories with per-cluster watch directories. A `_defaults.toml` inside the watched tree provides shared values, and child directories can override them. Each cluster independently resolves its watched tree; defaults outside its watch root are not inherited.
 
 ### 21.5 Trust Model
 
@@ -1047,7 +1049,7 @@ Three layers of mitigation. First, Reliaburger recommends managed databases for 
 
 ### Q10: Will TOML configuration get unwieldy at 50+ apps?
 
-Reliaburger supports directory-mode configuration where each app lives in its own file, merged at deploy time. A `_defaults.toml` file provides shared values (common env vars, memory limits, deploy strategy) inherited by all apps unless overridden. `relish fmt` formats files; `relish lint` validates configuration and catches common errors. The GitOps engine (Lettuce) works with directory trees natively.
+Reliaburger supports directory-mode configuration where each app lives in its own file, merged at deploy time. A `_defaults.toml` file provides shared values (common env vars, memory limits, deploy strategy) inherited by all apps unless overridden. `relish fmt` formats files; `relish lint` validates configuration and catches common errors. The GitOps engine (Lettuce) uses the same tree resolver for defaults and directory namespaces, with its configured watch directory as the root. It refuses malformed or ambiguous trees before applying changes.
 
 ### Q11: Doesn't the eBPF approach require a modern kernel? What about older systems?
 
