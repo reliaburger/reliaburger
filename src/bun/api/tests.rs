@@ -7196,7 +7196,6 @@ async fn per_app_process_metric_is_queryable() {
 }
 
 #[tokio::test]
-<<<<<<< HEAD
 async fn apply_uses_committed_namespace_context_before_any_resource_write() {
     use crate::council::RaftRequest;
     let council = seeded_council("namespace-context-review2").await;
@@ -7400,7 +7399,9 @@ async fn follower_apply_defers_namespace_existence_to_the_authoritative_leader()
     for node in nodes {
         node.shutdown().await.unwrap();
     }
-=======
+}
+
+#[tokio::test]
 async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
     use crate::bun::agent::CurrentResourceStatus;
     let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
@@ -7474,5 +7475,4 @@ async fn dry_run_endpoint_refuses_unavailable_agent_evidence() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
->>>>>>> origin/release-0-1-5-review2
 }

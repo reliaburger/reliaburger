@@ -2669,7 +2669,6 @@ mod tests {
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn manifest_loading_defers_namespace_existence_to_live_admission() {
         for manifest in [
             "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
@@ -2693,7 +2692,26 @@ mod tests {
         assert!(
             loaded.is_ok(),
             "an existing live build namespace was rejected locally: {loaded:?}"
-=======
+        );
+    }
+
+    #[tokio::test]
+    async fn intrinsic_manifest_validation_still_refuses_invalid_fields() {
+        for manifest in [
+            "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
+            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
+            "[app.web]\nnamespace = 'existing'\n",
+        ] {
+            let file = write_temp_config(manifest);
+            assert!(
+                load_manifest(&source(file.path())).await.is_err(),
+                "accepted {manifest}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn apply_dry_run_refuses_a_failed_live_comparison() {
         let app = axum::Router::new()
             .route(
@@ -2721,30 +2739,10 @@ mod tests {
         assert!(
             result.is_err(),
             "a failed live comparison became an offline create plan"
->>>>>>> origin/release-0-1-5-review2
         );
     }
 
     #[tokio::test]
-<<<<<<< HEAD
-    async fn intrinsic_manifest_validation_still_refuses_invalid_fields() {
-        for manifest in [
-            "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
-            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
-            "[app.web]\nnamespace = 'existing'\n",
-        ] {
-            let file = write_temp_config(manifest);
-            assert!(
-                load_manifest(&source(file.path())).await.is_err(),
-                "accepted {manifest}"
-            );
-        }
-    }
-
-    #[tokio::test]
-=======
->>>>>>> origin/release-0-1-5-review2
     async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token");
