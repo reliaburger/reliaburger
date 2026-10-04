@@ -87,3 +87,32 @@ Two doctests, 52 CI-script tests, the ignored-test owner checker, generated CLI
 command check, Go workload tests and executable tour command check passed. The
 final homepage/manual command gate passed 14/14 cases.
 No 24-hour 100m/day qualification has been run; that claim remains unqualified.
+
+
+## Live homepage demonstration
+
+The actual homepage Dockerfile was built through the public CLI and Pickle,
+then applied with two burger replicas and one podinfo backend. On a 4 vCPU /
+8 GiB aarch64 Linux VM, rootful runc and eBPF, the warm-image development debug
+run accepted all **1,064 successes**, with **16 retries**, zero terminal failures
+and zero not-run tasks. All **547 service probes** returned 200 during execution;
+the slowest took **0.621 seconds**. Submission to final indexed query
+was **746.855 seconds**, approximately **1.425 accepted successes/s** over
+that interval. This includes runtime and query work, rather than quoting the
+final chunk's one-second rate burst.
+
+Peak observed agent RSS was **784.8 MiB**. The completed run retained **256
+executor identities**, **31,728 ledger bytes** and
+**3,178,496 index bytes**. The failed-only page was empty and direct index 42
+returned success. These are short-run observations, not a memory/storage plateau
+or sustained capacity claim. The results are in [the bounded report](demo-report.json).
+The [homepage recording](../../website/assets/jobs.cast) cuts idle gaps to two
+seconds and states the actual elapsed time. Its binaries were built from the
+implementation working tree; the package version still identifies 0.1.4 until
+the maintainer's release process advances it.
+
+Container lifecycle and debug-build costs dominate this demonstration. Do not
+extrapolate its hardware cost or scale-out efficiency to the daily target. Use
+release binaries and representative workloads for the sustained qualification,
+and optimise measured runtime/control/storage bottlenecks before claiming that
+100m/day is easy or qualified.

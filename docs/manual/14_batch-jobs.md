@@ -93,10 +93,12 @@ error; rebuilding it is worker recovery, rather than an unbounded page read.
 Use the child array ID for results and logs. Each profile index has a 1 MiB
 cache budget; more detail traffic may require additional disk reads.
 
-Detail remains on the worker disk. It is kept for up to one hour **after
-completion**, and at most the newest 20 terminal submissions are retained.
-For a mixed manifest, the clock starts when its last profile finishes; profiles
-are retained and pruned together. Later submissions prune older detail; permanent worker or disk loss can lose
+Detail remains on the worker disk. Later submissions prune detail older than
+one hour **after completion** and keep the newest 20 terminal submissions.
+This is pruning on registration, rather than a background expiry timer; detail
+can remain readable longer while no new work is submitted. For a mixed manifest,
+the clock starts when its last profile finishes; profiles are pruned together.
+Permanent worker or disk loss can lose
 individual results even when accepted aggregate counts remain replicated.
 Export needed results before retention expires. Cancelling counts never-started and interrupted
 tasks as not run, separately from terminal failures and drains active runtime owners before releasing

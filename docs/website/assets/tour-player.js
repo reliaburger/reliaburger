@@ -42,6 +42,7 @@
     var player = null;
     var speed = 1;
     var started = false;
+    var hasPlayed = false;
 
     // The player takes its speed when it's created, so a new speed means a new
     // player that picks up where the old one was.
@@ -70,7 +71,7 @@
       });
       if (!player) return;
       var observed = player;
-      Promise.resolve(observed.getCurrentTime()).then(function (at) {
+      Promise.resolve(hasPlayed ? observed.getCurrentTime() : 0).then(function (at) {
         if (player === observed) create(at > 0 ? at : 0, observed.isPlaying());
       });
     }
@@ -86,6 +87,11 @@
         started = false;
       });
     }
+
+    // Rendering the poster also seeks the player. Only user interaction
+    // makes that position worth preserving across a speed change.
+    screen.addEventListener("pointerdown", function () { hasPlayed = true; });
+    screen.addEventListener("keydown", function () { hasPlayed = true; });
 
     speeds.addEventListener("click", function (event) {
       var button = event.target.closest("button[data-speed]");

@@ -101,7 +101,9 @@ utilisation costs. Production definitions require a council; volatile standalone
 state is confined to the test harness. An abandoned execution quarantines its
 request until recovery instead of releasing uncertain capacity.
 
-Portable, cluster and real Linux runtime gates have run. Results and measured
+Portable, cluster and real Linux runtime gates have run. The actual Linux
+homepage workload passed with all 1,064 successes while its service kept serving;
+the separate recording discloses its measured elapsed time. Results and measured
 limits are recorded in the
 [qualification report](../qualification/2026-10-04-delegated-jobs/README.md).
 The sustained harness records unique accepted successes alongside a serving app;
