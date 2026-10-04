@@ -12,6 +12,7 @@ Rows up to 29 September 2026 come from the pre-0.1.0 checklist
 | Test | First seen | Cause | Status |
 |---|---|---|---|
 | `grill::process::tests::graceful_restart_does_not_reingest_a_retired_instances_capture_file` (`process.rs:1568`, "follow ended early") | 4 Oct (PR #574 exact `0f4ef1ee`, portable Linux run `37169716926`, job `111340034174`; `/tmp/runtime-530-gh-linux-failed.log`; 5,478 passed and this one failed) | Not yet established by this run: the fixture uses file-backed capture, and the log does not identify which follow invocation closed. Source review found an empty file read followed by stopped observation can finish without a final file rescan; its deterministic regression and repair are being qualified separately | Open ([#555](https://github.com/reliaburger/reliaburger/issues/555)): retain the original failure; no retry. The memory-reader repair in [#564](https://github.com/reliaburger/reliaburger/pull/564) is not claimed to resolve this file-backed observation |
+| `managed_status::managed_status_fails_for_missing_stopped_and_unreachable_nodes` (`tests/suite/managed_status.rs:53`) | 4 Oct (two-worker full `make ci`, profile `ci`, for #550; `/tmp/reliaburger-review2-23-ci.log`; 5,399 passed / one failed) | Not established: the subprocess exceeded its outer 15-second deadline. The unchanged case passed one diagnostic run in 11.938 s (`/tmp/reliaburger-review2-23-status-diagnostic.log`); the original test did not retain which of the three node-state subprocesses timed out | Open ([#555](https://github.com/reliaburger/reliaburger/issues/555)): retain per-state subprocess readiness and bounded phase diagnostics before changing any deadline. No retries or exclusions were used in the full run; this diagnostic pass is not a successful full-suite result |
 | `grill::process::tests::logs_include_stderr` (empty final snapshot) | 3 Oct (PR #564 portable Linux, run `37160692780`, job `111313662823`; `/tmp/reliaburger-review2-17-remote-linux.log`) | Product: child exit was observed before detached stdout/stderr readers published their final chunks. Deterministic gated final-snapshot and follower regressions both failed against the old implementation (`/tmp/reliaburger-review2-17-capture-baseline.log`) | Repair in [#564](https://github.com/reliaburger/reliaburger/pull/564): owned reader completion and a bounded drain after actual child exit. A termination-ack gate also failed with synthetic completion at abort issuance (`/tmp/reliaburger-review2-17-capture-termination-baseline.log`); completion now comes only from actual task termination. All 36 ProcessGrill cases and full zero-retry local `make ci` passed (`/tmp/reliaburger-review2-17-capture-fixed-focused.log`, `/tmp/reliaburger-review2-17-capture-fixed-ci.log`). Remote qualification pending; [#555](https://github.com/reliaburger/reliaburger/issues/555) retains lifecycle coverage and the final qualification record |
 | `relish::quickstart::lifecycle::tests::{stopping_a_second_node_needs_yes_because_quorum_goes_with_it, stopping_node_one_needs_yes_because_it_carries_the_host_forwards, stopping_one_node_stops_only_that_vm, stopping_the_whole_cluster_needs_no_confirmation}` | 3 Oct (local two-worker `make ci` for #544; `/tmp/reliaburger-review2-17-ci.log`; all exceeded the fake Lima five-second command deadline) | Not yet known: these four fixtures join the two lifecycle deadline failures recorded for #537. The full run also repeated both 200 ms runner readiness failures; no focused rerun of these four was performed | Open ([#555](https://github.com/reliaburger/reliaburger/issues/555)): fix fake-child readiness and retain subprocess diagnostics; no retries or exclusions were used |
 | `relish::quickstart::runner::tests::a_vm_that_boots_is_left_alone` and `a_vm_that_never_prints_to_its_console_is_restarted_once` (`runner.rs:1051,964`) | 3 Oct (local two-worker full `make ci` for #537; `/tmp/reliaburger-review2-10-ci-final.log`; both also failed in focused `/tmp/reliaburger-review2-10-focused.log`) | Harness: `fake_lima` has a 200 ms startup window before `start_watched` kills and restarts its shell; the assertions observed neither the original command nor its console marker. The focused failures have not yet passed a rerun | Repair integrated from [#557](https://github.com/reliaburger/reliaburger/pull/557); [#555](https://github.com/reliaburger/reliaburger/issues/555) owns final train qualification. These earlier failures are retained as evidence and are not claimed as successful reruns |
@@ -128,3 +129,26 @@ a subsequent connection. The handler records any expired old-identity request
 even if its response is dropped. A negative control keeps the connection alive
 and proves that the same fixture rejects continued use of the old identity.
 Certificate verification and production clocks stay unchanged.
+
+### 2026-10-04: CLI subprocess fixtures during namespace validation (#551, #555)
+
+The complete local `make ci` run for #551 selected 5,421 portable tests with
+profile `ci`, two workers and zero retries. It passed 5,419, failed
+`grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli` after
+2.208 seconds because its shell PID marker was absent, and timed out
+`documentation_first_run::post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed`
+at 60.008 seconds with only the test-start message. Neither fixture was changed
+by #551. The original failure log and JUnit report are retained at
+`/tmp/reliaburger-review2-24-ci.log` and
+`/tmp/reliaburger-review2-24-evidence/full/junit.xml`.
+
+Each passed one exact diagnostic run: Apple cleanup in 2.079 seconds and
+join-token enrolment in 25.840 seconds. These are diagnostics, not a replacement
+for the failed complete run; the cause remains unknown. Their logs are
+`/tmp/reliaburger-review2-24-diagnostic.log` and
+`/tmp/reliaburger-review2-24-enrol-diagnostic.log`. The first diagnostic selected
+only the Apple library test; the enrolment case was explicitly selected from its
+standalone `documentation_first_run` binary in the second command. #555 must
+retain the deadlines, record subprocess readiness and phase evidence without
+credentials, and require exact binary/test inventory so a successful partial
+selector cannot be reported as proving another case.

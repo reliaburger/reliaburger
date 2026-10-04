@@ -42,7 +42,7 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
         eprint!("{report}");
         eprintln!();
     }
-    loaded.config.validate()?;
+    loaded.config.validate_intrinsic()?;
     Ok(loaded.config)
 }
 
@@ -86,7 +86,7 @@ async fn apply_with_client(
         // updates and unchanged resources render as such instead of every
         // resource claiming to be a create. No agent → the all-create plan.
         let current = match client.health().await {
-            Ok(()) => client.current_resources().await.ok(),
+            Ok(()) => Some(client.current_resources().await?),
             Err(_) => None,
         };
         let plan = generate_plan(&config, current.as_deref());
@@ -1157,7 +1157,7 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
 /// otherwise an unreachable agent is an error (X5).
 pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
-    config.validate()?;
+    config.validate_intrinsic()?;
 
     let client = BunClient::default_local();
 
@@ -1165,7 +1165,7 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
         // Same live diff as `apply --dry-run`: a reachable agent supplies
         // current state so the plan shows updates, not universal creates.
         let current = match client.health().await {
-            Ok(()) => client.current_resources().await.ok(),
+            Ok(()) => Some(client.current_resources().await?),
             Err(_) => None,
         };
         let plan = generate_plan(&config, current.as_deref());
@@ -2666,6 +2666,80 @@ mod tests {
         assert_eq!(format_memory(1536), "1.5 KiB");
         assert_eq!(format_memory(24_117_248), "23.0 MiB");
         assert_eq!(format_memory(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[tokio::test]
+    async fn manifest_loading_defers_namespace_existence_to_live_admission() {
+        for manifest in [
+            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+        ] {
+            let file = write_temp_config(manifest);
+            let loaded = load_manifest(&source(file.path())).await;
+            assert!(
+                loaded.is_ok(),
+                "a live-context reference was rejected locally: {loaded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_loading_defers_build_namespace_existence_to_live_admission() {
+        let file = write_temp_config(
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+        );
+        let loaded = load_manifest(&source(file.path())).await;
+        assert!(
+            loaded.is_ok(),
+            "an existing live build namespace was rejected locally: {loaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intrinsic_manifest_validation_still_refuses_invalid_fields() {
+        for manifest in [
+            "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
+            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
+            "[app.web]\nnamespace = 'existing'\n",
+        ] {
+            let file = write_temp_config(manifest);
+            assert!(
+                load_manifest(&source(file.path())).await.is_err(),
+                "accepted {manifest}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_dry_run_refuses_a_failed_live_comparison() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+            )
+            .route(
+                "/v1/apps",
+                axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        client
+            .health()
+            .await
+            .expect("fixture must be a live bun response");
+        let file = write_temp_config("[app.web]\nimage = 'web:v1'\n");
+        let result =
+            apply_with_client(&source(file.path()), OutputFormat::Json, true, &client).await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "a failed live comparison became an offline create plan"
+        );
     }
 
     #[tokio::test]
