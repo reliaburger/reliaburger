@@ -382,6 +382,9 @@ enum LoopStall {
     /// A pre-start's DNS lookups for an egress allowlist. Whoever prepares
     /// the start does them now, off the loop (#419).
     EgressDns,
+    /// Validating and serialising the whole job inventory, off the loop
+    /// but awaited by it.
+    JobInventoryEncode,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`

@@ -2074,10 +2074,21 @@ async fn a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retri
             break;
         }
         assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        let started = std::time::Instant::now();
         let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
             .await
-            .unwrap()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{execution} sent no report within 10 s after {accepted} accepted \
+                     executions; a checkpoint publication past its bound leaves the outcome \
+                     uncertain (see Bun's stderr above)"
+                )
+            })
             .unwrap();
+        eprintln!(
+            "batch-checkpoint fixture {execution} reported in {:?}",
+            started.elapsed()
+        );
         assert_eq!(report["job_name"], execution);
         assert_eq!(
             report["status"], "completed",
@@ -2129,7 +2140,11 @@ async fn a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retri
         );
         let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
             .await
-            .unwrap()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the replayed first execution sent no report within 10 s (recovered: {recover})"
+                )
+            })
             .unwrap();
         assert_eq!(report["job_name"], "batch-checkpoint-0");
         assert_eq!(report["status"], "completed");

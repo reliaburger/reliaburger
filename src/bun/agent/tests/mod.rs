@@ -12822,6 +12822,45 @@ async fn recovered_owned_runc_exit_keeps_retained_object_fenced() {
 }
 
 #[tokio::test]
+async fn admitting_a_batch_execution_encodes_the_job_inventory_once() {
+    // Each encoding validates and serialises the whole inventory, so with a
+    // nearly full checkpoint every extra pass cost seconds in a debug build
+    // and pushed publication past its bound (#592).
+    let records = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    let name = "batch-encoded-once";
+    let config = Config::parse(&format!(
+        "[job.{name}]\nimage='myapp:v1'\ncommand=['true']\n"
+    ))
+    .unwrap();
+    let labels = BTreeMap::from([(
+        name.to_string(),
+        crate::bun::batch::BatchExecutionLabel {
+            name: "migration".into(),
+            namespace: "default".into(),
+        },
+    )]);
+    let (events, _received) = mpsc::channel(64);
+    let before = agent.loop_stalls.reached(LoopStall::JobInventoryEncode);
+    agent
+        .begin_owned_batch(7, config, labels, events)
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::JobInventoryEncode) - before,
+        1,
+        "admission encoded the job inventory more than once"
+    );
+    assert!(
+        crate::bun::jobs::load(records.path())
+            .unwrap()
+            .contains_key("default__batch-encoded-once-0"),
+        "the admitted execution was not published"
+    );
+}
+
+#[tokio::test]
 async fn prerequisite_failure_is_durably_settled_before_the_gate_reports_failure() {
     let records = tempfile::tempdir().unwrap();
     let (mut agent, _, _, grill) = test_agent_with_grill();
