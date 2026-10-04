@@ -632,7 +632,31 @@ impl ImageStore {
                 }
                 Ok(())
             };
-            if blob_path.exists() {
+            let store = self.blob_store.get().cloned().unwrap_or_else(|| {
+                std::sync::Arc::new(crate::pickle::store::BlobStore::new(
+                    self.store_root.clone(),
+                ))
+            });
+            let expected = crate::pickle::types::Digest::new(digest).map_err(|error| {
+                ImageError::LayerPull {
+                    digest: digest.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let cached_store = store.clone();
+            let cached_digest = expected.clone();
+            let cached =
+                tokio::task::spawn_blocking(move || cached_store.revalidate_blob(&cached_digest))
+                    .await
+                    .map_err(|error| ImageError::LayerPull {
+                        digest: digest.clone(),
+                        reason: error.to_string(),
+                    })?
+                    .map_err(|error| ImageError::LayerPull {
+                        digest: digest.clone(),
+                        reason: error.to_string(),
+                    })?;
+            if cached {
                 verify_size(tokio::fs::metadata(&blob_path).await?.len())?;
                 continue;
             }
@@ -664,23 +688,9 @@ impl ImageStore {
 
             // Write atomically (temp + rename) so a crash mid-write can't leave
             // a truncated blob at the final path that a later pull treats as a
-            // valid cache hit (M3) — the `exists()` check above never
-            // re-verifies a cached file. The digest was verified above, so a
-            // completed rename only ever publishes a good blob.
-            // Sync the payload and its containing directory before reuse.
-            // TODO(#555): sync newly created ancestors before claiming full
-            // directory-entry durability across power loss.
-            let store = self.blob_store.get().cloned().unwrap_or_else(|| {
-                std::sync::Arc::new(crate::pickle::store::BlobStore::new(
-                    self.store_root.clone(),
-                ))
-            });
-            let expected = crate::pickle::types::Digest::new(digest).map_err(|error| {
-                ImageError::LayerPull {
-                    digest: digest.clone(),
-                    reason: error.to_string(),
-                }
-            })?;
+            // valid cache hit (M3). Warm and cold paths both verify the
+            // digest through the shared store before use. Publication syncs
+            // the payload and each required ancestor directory entry.
             tokio::task::spawn_blocking(move || store.write_blob(&blob_data, &expected))
                 .await
                 .map_err(|e| ImageError::UnpackFailed {
@@ -1958,6 +1968,67 @@ mod tests {
         layer.size = u64::MAX;
         assert!(upstream.fetch_blob(&reference, &layer).await.is_err());
         assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn same_sized_corrupt_cached_layer_is_refetched_before_unpack() {
+        let fixture = start_registry_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let first = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.manifest_path(&reference)).unwrap())
+                .unwrap();
+        let digest = manifest["layers"][0]["digest"].as_str().unwrap();
+        let path = store.blob_path(digest);
+        let verified = std::fs::read(&path).unwrap();
+        // Ordinary disk corruption: preserve the advertised size, retain no
+        // valid compressed bytes. A fresh rootfs must recover from the source.
+        std::fs::write(&path, vec![0u8; verified.len()]).unwrap();
+        // Discard both generation and completion marker to require a fresh unpack.
+        std::fs::remove_file(first.rootfs.with_extension("complete")).unwrap();
+        std::fs::remove_dir_all(first.rootfs).unwrap();
+        // Reopen with a cap exactly equal to the already cached layer. The
+        // corrupt file must return its reservation through the shared store
+        // before refetch; keeping stale accounting would refuse publication.
+        let registry = std::sync::Arc::new(crate::pickle::store::BlobStore::new(directory.path()));
+        registry
+            .configure_storage_limit(verified.len() as u64)
+            .await
+            .unwrap();
+        let reopened = ImageStore::new(directory.path().to_path_buf());
+        reopened.set_blob_store(registry.clone()).unwrap();
+        let recovered = reopened
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .expect("warm-cache corruption should be discarded and refetched");
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(path).unwrap(), verified);
+        assert_eq!(
+            std::fs::read(recovered.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert!(
+            matches!(
+                registry.write_blob(b"x", &crate::pickle::store::compute_sha256(b"x")),
+                Err(crate::pickle::types::PickleError::StorageQuotaExceeded)
+            ),
+            "verified replacement remains charged"
+        );
+        std::fs::remove_file(recovered.rootfs.with_extension("complete")).unwrap();
+        std::fs::remove_dir_all(recovered.rootfs).unwrap();
+        let healthy = reopened.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            fixture.layer_requests.load(Ordering::SeqCst),
+            2,
+            "healthy warm cache still avoids a layer download"
+        );
+        assert_eq!(
+            std::fs::read(healthy.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
     }
 
     #[tokio::test]

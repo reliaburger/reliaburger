@@ -1022,25 +1022,14 @@ pub async fn batch_submit_handler(
     }
     let permissions = super::api::permission_map(&state).await;
     for job in &jobs {
-        if let Err(response) =
-            crate::sesame::auth::authorize_scoped(auth.as_deref(), &job.name, job.namespace())
-        {
+        if let Err(response) = crate::sesame::auth::authorize_workload(
+            auth.as_deref(),
+            &job.name,
+            job.namespace(),
+            job.spec.exec.is_some() || job.spec.script.is_some(),
+            &permissions,
+        ) {
             return response;
-        }
-        let actions = [crate::config::PermissionAction::Deploy].into_iter().chain(
-            (job.spec.exec.is_some() || job.spec.script.is_some())
-                .then_some(crate::config::PermissionAction::HostExec),
-        );
-        for action in actions {
-            if let Err(response) = crate::sesame::auth::authorize_permission(
-                auth.as_deref(),
-                action,
-                &job.name,
-                job.namespace(),
-                &permissions,
-            ) {
-                return response;
-            }
         }
     }
     // Preserve the caller on the second hop so the leader repeats admission

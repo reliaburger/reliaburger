@@ -1,6 +1,8 @@
 """The CI workflow keeps evidence for every suite, and its triggers and gates say what they do."""
 from pathlib import Path
 import re
+import shlex
+import tempfile
 import subprocess
 import unittest
 
@@ -66,34 +68,205 @@ class EvidenceTests(unittest.TestCase):
     def setUp(self):
         self.jobs = jobs((WORKFLOWS / "ci.yml").read_text())
 
+    EXPECTED_OWNERS = {
+        'portable-linux': ('portable', 'linux'),
+        'portable-darwin': ('macos', 'darwin'),
+        'optimized-cron': ('contract-boundaries', 'linux'),
+        'rootless-linux': ('linux', 'linux'),
+        'linux-root-storage': ('linux', 'linux'),
+        'oci-interruptions': ('linux', 'linux'),
+        'cluster-tests': ('cluster', 'linux'),
+        'slow-tests': ('acceptance', 'linux'),
+        'upgrade-node': ('acceptance', 'linux'),
+        'upgrade-cluster': ('acceptance', 'linux'),
+        'standard-clients': ('acceptance', 'linux'),
+    }
+
+    def assert_owner_artifacts(self, workflow_jobs):
+        """Every fixed owner keeps completion and JUnit under its own identity."""
+        for gate, (job_name, host) in self.EXPECTED_OWNERS.items():
+            job = workflow_jobs[job_name]
+            blocks = steps(job)
+            producers = [index for index, step in enumerate(blocks)
+                         if ('workflow_adapter.py produce' in step and '--gate ' + gate + ' ' in step)
+                         or (gate == 'oci-interruptions'
+                             and 'run: scripts/release/qualify-oci-interruptions.sh' in step)]
+            self.assertEqual(len(producers), 1, gate)
+            index = producers[0]
+            producer = blocks[index]
+            identity = gate.replace('-', '_')
+            self.assertIn('id: ' + identity, producer)
+            self.assertIn(identity + '_sha256: ${{ steps.' + identity
+                          + '.outputs.' + identity + '_sha256 }}', job)
+            if gate != 'oci-interruptions':
+                for argument in ('--host ' + host, '--commit "$EXPECTED_CHECKOUT_COMMIT"',
+                                 '--run-id "$GITHUB_RUN_ID"', '--attempt "$GITHUB_RUN_ATTEMPT"',
+                                 '--github-output "$GITHUB_OUTPUT"'):
+                    self.assertIn(argument, producer)
+            retains = [step for step in blocks[index + 1:]
+                       if 'actions/upload-artifact@' in step
+                       and 'name: contract-' + host + '-' + gate + '\n' in step]
+            self.assertEqual(len(retains), 1, gate)
+            retain = retains[0]
+            self.assertIn('if: always()', retain)
+            self.assertIn('path: target/contracts/' + host + '/' + gate, retain)
+            self.assertIn('retention-days: 14', retain)
+            self.assertIn('if-no-files-found: error', retain)
+        # Original test owners must be intercepted rather than executed again.
+        for job in workflow_jobs.values():
+            for step in steps(job):
+                self.assertEqual(set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST, set())
+
+    def assert_cached_owners_clear_restored_envelopes(self, workflow_jobs):
+        """Clear cached generated directories once before any fresh producer."""
+        matched = set()
+        for name, job in workflow_jobs.items():
+            blocks = steps(job)
+            caches = [index for index, step in enumerate(blocks)
+                      if 'uses: Swatinem/rust-cache@' in step]
+            producers = [index for index, step in enumerate(blocks)
+                         if 'workflow_adapter.py produce' in step
+                         or 'run: scripts/release/qualify-oci-interruptions.sh' in step]
+            if not caches or not producers:
+                continue
+            matched.add(name)
+            cleanup = [index for index, step in enumerate(blocks)
+                       if 'name: Clear restored execution envelopes' in step]
+            self.assertEqual(len(cleanup), 1, name)
+            index = cleanup[0]
+            self.assertGreater(index, max(caches), name)
+            self.assertLess(index, min(producers), name)
+            self.assertNotIn('if:', blocks[index], name)
+            commands = re.findall(r'^        run: (.+)$', blocks[index], re.M)
+            self.assertEqual(commands, ['rm -rf -- target/contracts'], name)
+        self.assertEqual(matched, {'portable', 'linux', 'macos'})
+
+    def test_cached_evidence_owners_clear_only_restored_envelopes_before_production(self):
+        self.assert_cached_owners_clear_restored_envelopes(self.jobs)
+        # rust-cache removes nonartifact files but retains generic directories.
+        # Execute the actual workflow's bounded cleanup against that shape.
+        block = next(step for step in steps(self.jobs['portable'])
+                     if 'name: Clear restored execution envelopes' in step)
+        command = re.search(r'^        run: (.+)$', block, re.M).group(1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = root / 'target/contracts/linux/portable-linux'
+            stale.mkdir(parents=True)
+            artifact = root / 'target/debug/deps/keep-artifact'
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text('compiled dependency')
+            subprocess.run(shlex.split(command), cwd=root, check=True)
+            self.assertFalse((root / 'target/contracts').exists())
+            self.assertEqual(artifact.read_text(), 'compiled dependency')
+            stale.mkdir(parents=True)
+            # Within-job duplicate owner admission remains exclusive: there
+            # is no cleanup between producers, nor adopted old completion.
+            with self.assertRaises(FileExistsError):
+                stale.mkdir(parents=True, exist_ok=False)
+
+    def test_missing_early_late_duplicate_conditional_or_broad_cache_cleanup_is_detected(self):
+        self.assert_cached_owners_clear_restored_envelopes(self.jobs)
+        original = self.jobs['portable']
+        blocks = steps(original)
+        cleanup = next(step for step in blocks
+                       if 'name: Clear restored execution envelopes' in step)
+        cache = next(step for step in blocks if 'uses: Swatinem/rust-cache@' in step)
+        producer = next(step for step in blocks if 'workflow_adapter.py produce' in step)
+        removed = original.replace(cleanup, '')
+        changes = [
+            removed,
+            removed.replace(cache, cleanup + '\n' + cache),
+            removed.replace(producer, producer + '\n' + cleanup),
+            original.replace(cleanup, cleanup + '\n' + cleanup),
+            original.replace('run: rm -rf -- target/contracts', 'run: rm -rf -- target'),
+            original.replace('run: rm -rf -- target/contracts',
+                             'if: steps.cache.outputs.cache-hit == \'true\'\n        run: rm -rf -- target/contracts'),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_cached_owners_clear_restored_envelopes(dict(self.jobs, portable=changed))
+
+    def assert_root_storage_evidence_restored_for_upload(self, workflow_jobs):
+        """Privileged producer stays private; its completed receipts are readable."""
+        blocks = steps(workflow_jobs['linux'])
+        producers = [index for index, step in enumerate(blocks)
+                     if 'workflow_adapter.py produce' in step
+                     and '--gate linux-root-storage ' in step]
+        self.assertEqual(len(producers), 1)
+        self.assertIn('sudo -E env PATH=', blocks[producers[0]])
+        restores = [index for index, step in enumerate(blocks)
+                    if 'name: Restore root-storage evidence ownership' in step]
+        self.assertEqual(len(restores), 1)
+        index = restores[0]
+        uploads = [number for number, step in enumerate(blocks)
+                   if 'name: contract-linux-linux-root-storage\n' in step]
+        self.assertEqual(len(uploads), 1)
+        self.assertGreater(index, producers[0])
+        self.assertLess(index, uploads[0])
+        self.assertIn('if: always()', blocks[index])
+        expected = ('        run: |\n'
+                    '          if [ -d target/contracts/linux/linux-root-storage ]; then\n'
+                    '            sudo chown -R "$(id -u):$(id -g)" -- target/contracts/linux/linux-root-storage\n'
+                    '          fi')
+        self.assertIn(expected, blocks[index])
+        self.assertNotIn('continue-on-error', blocks[producers[0]])
+        # The OCI producer/build/receipt parent runs as the runner; sudo is
+        # inside only the actual Rust namespace wrapper. Do not broaden chown.
+        for name, job in workflow_jobs.items():
+            restores = [step for step in steps(job)
+                        if 'name: Restore root-storage evidence ownership' in step]
+            self.assertEqual(len(restores), 1 if name == 'linux' else 0)
+
+    def test_privileged_private_evidence_is_restored_before_always_upload(self):
+        self.assert_root_storage_evidence_restored_for_upload(self.jobs)
+        owner = (REPO / 'scripts/ci/make_owner.py').read_text()
+        self.assertIn('directory.mkdir(mode=0o700, parents=True, exist_ok=False)', owner)
+
+    def test_missing_early_late_conditional_or_broad_root_evidence_restore_is_detected(self):
+        self.assert_root_storage_evidence_restored_for_upload(self.jobs)
+        original = self.jobs['linux']
+        blocks = steps(original)
+        restore = next(step for step in blocks
+                       if 'name: Restore root-storage evidence ownership' in step)
+        producer = next(step for step in blocks
+                        if 'workflow_adapter.py produce' in step
+                        and '--gate linux-root-storage ' in step)
+        upload = next(step for step in blocks
+                      if 'name: contract-linux-linux-root-storage\n' in step)
+        removed = original.replace(restore, '')
+        changes = [
+            removed,
+            removed.replace(producer, restore + '\n' + producer),
+            removed.replace(upload, upload + '\n' + restore),
+            original.replace(restore, restore.replace('if: always()', 'if: success()')),
+            original.replace(restore, restore.replace(' -- target/contracts/linux/linux-root-storage',
+                                                       ' -- target/contracts')),
+            original.replace(restore, restore + '\n' + restore),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_root_storage_evidence_restored_for_upload(dict(self.jobs, linux=changed))
+
     def test_every_suite_keeps_its_own_junit_report(self):
-        suites = 0
-        for name, job in self.jobs.items():
-            job_steps = steps(job)
-            for index, step in enumerate(job_steps):
-                if "keep-junit.sh" in step:
-                    continue
-                for target in set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST:
-                    suites += 1
-                    with self.subTest(job=name, suite=target):
-                        keeps = [later for later in job_steps[index + 1:]
-                                 if f"scripts/ci/keep-junit.sh {target} " in later]
-                        self.assertTrue(keeps, f"{name}: nothing keeps make {target}'s report")
-                        self.assertRegex(keeps[0], r"if: \$\{\{ !cancelled\(\) \}\}|if: always\(\)")
-        self.assertGreaterEqual(suites, 8)
+        self.assert_owner_artifacts(self.jobs)
 
     def test_every_job_that_keeps_reports_uploads_them_even_on_failure(self):
-        for name, job in self.jobs.items():
-            if "scripts/ci/keep-junit.sh" not in job:
-                continue
-            with self.subTest(job=name):
-                uploads = [step for step in steps(job)
-                           if "actions/upload-artifact@" in step and "target/junit" in step]
-                self.assertEqual(len(uploads), 1, name)
-                self.assertIn("if: always()", uploads[0])
-                self.assertIn(f"name: junit-{name}", uploads[0])
-                self.assertIn("retention-days: 14", uploads[0])
-                self.assertIn("if-no-files-found: error", uploads[0])
+        retains = [step for job in self.jobs.values() for step in steps(job)
+                   if 'actions/upload-artifact@' in step and 'name: contract-' in step]
+        self.assertEqual(len(retains), len(self.EXPECTED_OWNERS))
+        for retain in retains:
+            self.assertIn('if: always()', retain)
+            self.assertIn('retention-days: 14', retain)
+            self.assertIn('if-no-files-found: error', retain)
+
+    def test_missing_failed_or_misnamed_owner_upload_is_detected(self):
+        original = self.jobs['portable']
+        for changed in (original.replace('if: always()', 'if: success()'),
+                        original.replace('name: contract-linux-portable-linux', 'name: wrong-owner'),
+                        original.replace('portable_linux_sha256: ${{ steps.portable_linux.outputs.portable_linux_sha256 }}',
+                                         'portable_linux_sha256: late-unchecked-metadata')):
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_owner_artifacts(dict(self.jobs, portable=changed))
 
     def test_the_old_shared_report_path_is_not_uploaded(self):
         for name, job in self.jobs.items():
@@ -104,9 +277,19 @@ class EvidenceTests(unittest.TestCase):
         evidence = self.jobs["ignored-evidence"]
         for job in ["linux", "cluster", "acceptance"]:
             self.assertIn(job, re.search(r"needs: \[([^\]]*)\]", evidence).group(1))
-        self.assertIn("pattern: junit-*", evidence)
-        self.assertIn("name: oci-interruption-evidence", evidence)
-        self.assertIn("scripts/ci/ignored_owners.py evidence", evidence)
+        for job in ('portable', 'macos', 'contract-boundaries', 'build-tests', 'changes'):
+            self.assertIn(job, re.search(r"needs: \[([^\]]*)\]", evidence).group(1))
+        self.assertIn("pattern: contract-*", evidence)
+        self.assertIn("merge-multiple: false", evidence)
+        self.assertIn("workflow_adapter.py aggregate", evidence)
+        for argument in ('--manifest tests/contracts/manifest.json',
+                         '--ignored-bindings tests/contracts/ignored-bindings.json',
+                         '--needs target/workflow-needs.json', '--commit "$EXPECTED_CHECKOUT_COMMIT"',
+                         '--run-id "$GITHUB_RUN_ID"', '--attempt "$GITHUB_RUN_ATTEMPT"'):
+            self.assertIn(argument, evidence)
+        self.assertIn("${{ toJSON(needs) }}", evidence)
+        self.assertIn("always()", evidence)
+        self.assertNotIn("scripts/ci/ignored_owners.py evidence", evidence)
 
     def test_ci_runs_the_policy_checks_on_every_pull_request(self):
         policy = self.jobs["ci-policy"]
@@ -116,7 +299,9 @@ class EvidenceTests(unittest.TestCase):
 
     def test_the_crane_client_has_a_provisioned_job(self):
         acceptance = self.jobs["acceptance"]
-        self.assertIn("make test-standard-clients", acceptance)
+        self.assertIn("--gate standard-clients --host linux", acceptance)
+        self.assertLess(acceptance.index('name: Install crane'),
+                        acceptance.index('--gate standard-clients --host linux'))
         install = next(step for step in steps(acceptance) if "go-containerregistry" in step)
         self.assertIn("sha256sum --check", install)
 

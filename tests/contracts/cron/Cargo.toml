@@ -1,0 +1,22 @@
+# Optimized boundary tests compile the actual production cron module.
+[package]
+name = "reliaburger_cron_contracts"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+# Independent tiny qualification crate, not the main DataFusion dependency graph.
+[workspace]
+
+# Exact main Cargo.lock versions + resolved feature union from default main graph.
+[dependencies]
+time = { version = "=0.3.47", default-features = false, features = ["alloc", "default", "formatting", "local-offset", "macros", "parsing", "std"] }
+thiserror = { version = "=2.0.18", default-features = false, features = ["default", "std"] }
+
+[profile.release]
+strip = true
+codegen-units = 1

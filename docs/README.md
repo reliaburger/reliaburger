@@ -1383,7 +1383,15 @@ machines.
 - `scripts/release/qualify-oci-interruptions.sh` needs a Linux host with Runc,
   static BusyBox, `ip`, `nft`, a C compiler and sudo. It kills Bun and cancels
   callers at each Runc lifecycle boundary, inside private network and mount
-  namespaces, and keeps logs and test-binary checksums.
+  namespaces, and keeps logs and test-binary checksums. The ordinary command
+  observes the operator and creates a fresh `manual:<uuid>` session bound to
+  the current checkout. Supply `--manual-session manual:RELEASE_REVIEW --owner
+  OPERATOR` to record explicit identity. Receipts and the complete driver log
+  live in a fresh directory under `target/contracts/manual-oci/`. Manual
+  receipts never satisfy GitHub CI aggregation. With `GITHUB_ACTIONS=true`,
+  the command requires trusted current checkout/run/attempt/output inputs
+  and refuses manual options. The same build and isolated groups run once in
+  both modes; compiler overrides require a separate audit.
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
   after the new kernel boot, including address retention until explicit

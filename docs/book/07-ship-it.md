@@ -1242,6 +1242,24 @@ pub(super) enum JobPhase {
 
 `relish apply` refuses to start a job whose previous outcome is unknown, and says why: `previous outcome is unknown; use apply --rerun-jobs for an explicit rerun`. `--rerun-jobs` is the human saying "I've checked, run it again". The API accepts it only from a user with the Deployer role, and only for a file containing nothing but non-scheduled jobs. GitOps and the reconciler never set it. Cron jobs are the one exception: once bun has confirmed the old run's container is gone, the next scheduled occurrence runs normally. That's a new occurrence, not a replay of the uncertain one. Chapter 8 covers the retry budget and the crash tests behind this.
 
+### One workload grant rule at both submission routes
+
+An apply manifest and a batch request resolve their workload names and
+namespaces differently, but they must ask the same authority question before
+writing or dispatching. Both now call `sesame::auth::authorize_workload` after
+intrinsic validation and lease checks. The helper borrows the caller and
+permission map: it creates no new principal or grants. Scope, deployment and
+host execution checks keep their existing order and refusal responses.
+
+A follower still forwards the original bearer. The leader repeats the shared
+rule against its authoritative grants before admitting the batch. The paired
+HTTP control uses that same scoped credential for direct leader apply and
+follower batch. Image workloads need deployment permission; explicit binaries
+and scripts also need host-exec. Refused pairs must add no desired writes or
+workload commands, and allowed pairs must reach their actual route admission.
+The command acknowledgements in this authority fixture do not claim a real
+process exit or container lifecycle.
+
 ## Stop means stop, delete means delete
 
 For most of the project `relish stop web` in a cluster did two things: it deleted `web` from desired state through Raft, and it stopped the leader's own replica on the spot. Both sound reasonable. Together they made a trap. The leader's placement reconciler still had `web` recorded as converged, so when the V02 soak ran `relish stop` and then applied the same file a few seconds later, the reconciler saw the same specification come back and skipped it. The app stayed down. And there was no way at all to remove an app, short of GitOps.

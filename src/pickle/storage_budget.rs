@@ -13,6 +13,21 @@ pub(super) const MAX_STORAGE_FILES: usize = 65_536;
 #[derive(Debug, Default)]
 pub(super) struct StorageBudget {
     state: Mutex<BudgetState>,
+    #[cfg(test)]
+    directory_sync_hook: Mutex<Option<DirectorySyncHook>>,
+}
+
+#[cfg(test)]
+type DirectorySyncCallback = dyn Fn(&Path) -> std::io::Result<()> + Send + Sync;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct DirectorySyncHook(std::sync::Arc<DirectorySyncCallback>);
+#[cfg(test)]
+impl std::fmt::Debug for DirectorySyncHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DirectorySyncHook(..)")
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +110,103 @@ fn scan(directory: &Path, files: &mut HashMap<PathBuf, u64>) -> std::io::Result<
     Ok(())
 }
 impl StorageBudget {
+    /// Test-local instrumentation of the existing real directory syncs.
+    /// It does not add the missing ancestor sync operations under test.
+    #[cfg(test)]
+    pub(super) fn set_directory_sync_hook(&self, hook: std::sync::Arc<DirectorySyncCallback>) {
+        *self
+            .directory_sync_hook
+            .lock()
+            .expect("test sync hook poisoned") = Some(DirectorySyncHook(hook));
+    }
+    fn sync_open_directory(&self, path: &Path, directory: &std::fs::File) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let hook = self
+                .directory_sync_hook
+                .lock()
+                .map_err(|_| std::io::Error::other("test sync hook poisoned"))?
+                .as_ref()
+                .map(|hook| hook.0.clone());
+            if let Some(hook) = hook {
+                return hook(path);
+            }
+        }
+        #[cfg(not(test))]
+        let _ = path;
+        directory.sync_all()
+    }
+    pub(super) fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        let directory = std::fs::File::open(path)?;
+        self.sync_open_directory(path, &directory)
+    }
+    /// Confirm every directory entry needed to reach a published payload.
+    /// Retry parent syncs even for visible directories: an earlier mkdir may
+    /// have succeeded before its parent sync failed. Existing configured path
+    /// aliases keep the same metadata-following semantics as create_dir_all.
+    fn ensure_payload_directory(&self, root: &Path, directory: &Path) -> std::io::Result<()> {
+        let relative = directory
+            .strip_prefix(root)
+            .map_err(|_| std::io::Error::other("payload directory is outside image store"))?;
+        let mut missing = Vec::new();
+        let mut ancestor = if root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            root
+        };
+        while !Self::directory_exists(ancestor)? {
+            missing.push(ancestor.to_owned());
+            ancestor = match ancestor.parent() {
+                Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+                Some(parent) => parent,
+                None => {
+                    return Err(std::io::Error::other(
+                        "image store has no existing ancestor",
+                    ));
+                }
+            };
+        }
+        self.ensure_directory_entry(ancestor)?;
+        for created in missing.into_iter().rev() {
+            self.ensure_directory_entry(&created)?;
+        }
+        let mut current = root.to_owned();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(std::io::Error::other("invalid payload directory component"));
+            };
+            current.push(name);
+            self.ensure_directory_entry(&current)?;
+        }
+        Ok(())
+    }
+    fn directory_exists(path: &Path) -> std::io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => Ok(true),
+            Ok(_) => Err(std::io::Error::other("image directory is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    fn ensure_directory_entry(&self, path: &Path) -> std::io::Result<()> {
+        if !Self::directory_exists(path)? {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && Self::directory_exists(path)? => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(parent) = path.parent() {
+            self.sync_directory(if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            })?;
+        }
+        Ok(())
+    }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, BudgetState>, PickleError> {
         self.state
             .lock()
@@ -134,13 +246,14 @@ impl StorageBudget {
     /// Reusing verified bytes acknowledges a durable blob too. A previous
     /// rename may have returned a directory-sync error, so retry the syncs
     /// before acknowledging reuse. Uncertain reservations remain charged.
-    pub(super) fn sync_verified(&self, path: &Path) -> Result<(), PickleError> {
+    pub(super) fn sync_verified(&self, root: &Path, path: &Path) -> Result<(), PickleError> {
         let _state = self.lock()?;
         std::fs::File::open(path)?.sync_all()?;
         let parent = path
             .parent()
             .ok_or_else(|| std::io::Error::other("payload parent missing"))?;
-        std::fs::File::open(parent)?.sync_all()?;
+        self.ensure_payload_directory(root, parent)?;
+        self.sync_directory(parent)?;
         Ok(())
     }
 
@@ -161,6 +274,7 @@ impl StorageBudget {
     /// confirmed file and containing-directory sync releases the old charge.
     pub(super) fn write_file(
         &self,
+        root: &Path,
         path: &Path,
         data: &[u8],
         mode: Option<u32>,
@@ -174,7 +288,7 @@ impl StorageBudget {
         use std::io::Write as _;
         let mut published = false;
         let result = (|| -> std::io::Result<()> {
-            std::fs::create_dir_all(parent)?;
+            self.ensure_payload_directory(root, parent)?;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -190,7 +304,7 @@ impl StorageBudget {
             drop(file);
             std::fs::rename(&temporary, path)?;
             published = true;
-            std::fs::File::open(parent)?.sync_all()
+            self.sync_directory(parent)
         })();
         if result.is_ok() {
             state.transfer(&temporary, path);
@@ -202,7 +316,10 @@ impl StorageBudget {
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
             // If rename succeeded but sync failed, retain the temporary charge
             // until restart. If cleanup is durable, release its actual prefix.
-            if !published && confirmed && std::fs::File::open(parent)?.sync_all().is_ok() {
+            if !published && confirmed && {
+                let directory = std::fs::File::open(parent)?;
+                self.sync_open_directory(parent, &directory).is_ok()
+            } {
                 state.forget(&temporary);
             }
         }
@@ -229,22 +346,28 @@ impl StorageBudget {
     }
     /// A verified upload already owns its reservation. Transfer it only after
     /// the file and both containing directories acknowledge the rename.
-    /// TODO(#555): also sync parent entries of newly created ancestors.
-    pub(super) fn publish(&self, source: &Path, destination: &Path) -> Result<(), PickleError> {
+    /// The complete ancestor chain is confirmed before publishing, including
+    /// visible directories left by a previously failed parent sync.
+    pub(super) fn publish(
+        &self,
+        root: &Path,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), PickleError> {
         let mut state = self.lock()?;
         let bytes = size(source)?.ok_or_else(|| std::io::Error::other("upload payload missing"))?;
         state.charge(source, bytes)?;
         let parent = destination
             .parent()
             .ok_or_else(|| std::io::Error::other("blob parent missing"))?;
-        std::fs::create_dir_all(parent)?;
+        self.ensure_payload_directory(root, parent)?;
         std::fs::File::open(source)?.sync_all()?;
         std::fs::rename(source, destination)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        self.sync_directory(parent)?;
         if let Some(source_parent) = source.parent()
             && source_parent != parent
         {
-            std::fs::File::open(source_parent)?.sync_all()?;
+            self.sync_directory(source_parent)?;
         }
         state.transfer(source, destination);
         Ok(())
@@ -260,7 +383,7 @@ impl StorageBudget {
         }
         if let Some(parent) = path.parent() {
             match std::fs::File::open(parent) {
-                Ok(directory) => directory.sync_all()?,
+                Ok(directory) => self.sync_open_directory(parent, &directory)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
