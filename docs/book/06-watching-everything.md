@@ -294,6 +294,10 @@ Second, the client filters too, for `-f` and for `--json-field`, which the serve
 
 Both the flushed Parquet files and the unflushed in-memory buffer are included in every DataFusion query. Same trick we use for metrics. There's no blind spot — you see logs from 30 seconds ago in the same SQL query as logs from last week. No merging, no separate code paths, no seams.
 
+A failed flush used to drain the only in-memory copy before it wrote Parquet. An unwritable directory or a failed ingest-checkpoint rename then lost captured rows while their live offsets still claimed they had been read. The store now owns one pending batch until both its Parquet file and capture checkpoint are durable. Retrying reserves the same filename, serialises writers for that batch and finishes it before advancing a newer checkpoint. An async caller can be cancelled while its blocking writer runs; that writer retains its I/O guard, and the store retains the rows for the next attempt.
+
+Queries keep their own copy of the pending batch and exclude its immutable sequence range from the disk relation. A rename during the disk scan therefore cannot add a second copy. New rows are allocated and inserted together under the store's write lock, so they always lie above that reserved range. Failed directory writes, failed checkpoint writes and an explicitly paused, cancelled writer are tested through reads, later appends, retries and reopening the capture checkpoint. A process crash between publishing Parquet and saving the checkpoint can still replay a batch on restart: the in-memory owner disappears with the process. That restart boundary, and the Parquet helper's discarded directory-sync error, need separate recovery qualification.
+
 ## The dashboard
 
 Brioche is a single HTML page. No React, no Vue, no webpack. The server renders the HTML with current data, embeds a 2KB CSS stylesheet, and sends it. The browser refreshes every 5 seconds via a `<meta http-equiv="refresh">` tag.
@@ -730,6 +734,8 @@ in both modes and checks each line's stream. Across the two streams the order
 is the order the lines were read in: neither file stamps its lines, so a
 stdout line and a stderr line written within the same poll can swap places.
 Within one stream, the order is exact.
+
+A file follower can also reach EOF before the process has exited: the child may write its last bytes between the empty read and the next state check. After confirming that the child stopped, the follower scans both files once more before declaring EOF. It preserves the existing resume offsets, so that final scan adds only unseen bytes. Two tests hold the follower at the earlier empty read, release the real child to write stdout and stderr and exit, then check the final lines and their byte positions, including a resumed capture.
 
 A process exiting and its pipe readers reaching EOF are separate events. The in-memory runtime now owns both reader tasks and tracks their completion. A final snapshot waits for that completion outside the process-map lock, and a follower scans once more after completion before returning. `Stopping` is not EOF. This prevents a short-lived child from being reported stopped while its final stdout or stderr chunk is still waiting to reach the buffers.
 
