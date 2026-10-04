@@ -24,6 +24,40 @@ failure groups. Task detail is bounded, filtered and addressable. Metrics labels
 must not grow with task IDs. Reports and queries have bounded memory, deadlines
 and work independent of the full historical task count.
 
+## Next prerequisite: one job execution pipeline
+
+A single independent job is a task array with count one. Route ordinary jobs,
+arrays and mixed-profile submissions through the same cluster placement,
+resource admission, runtime ownership, cancellation, attempt accounting and
+durable result machinery. The current PR still separates ordinary node-local
+jobs (including cron) from delegated arrays. Unifying them is the next
+structural change, before adding reusable executors or model workers.
+
+Separate a reusable job definition, a run of that definition, its indexed tasks
+and their attempts. A definition may have one task or many. Cron is a trigger
+that creates a new run, rather than a property of an individual task template;
+schedules should work for either count. Keep schedule occurrence identity and
+run creation durable and idempotent across leader changes. Specify overlap,
+missed-occurrence and catch-up policies explicitly.
+
+Deployment hooks use the same run machinery, with the deployment awaiting the
+required run outcome before starting its dependent application. Preserve current
+script/secret authorisation, output and dependency behaviour, and conservative
+handling of unknown outcomes, rather than routing existing jobs to a narrower
+array template and silently changing their contract. Make ambiguous-outcome
+retry policy explicit for every run. Resolve durable standalone behaviour as
+part of the unification rather than substituting the volatile array test harness.
+
+Container isolation and eventual persistent-worker execution are backend choices
+independent of task count and trigger. Optimise singleton dispatch latency and
+bulk transport within the common lifecycle. Default CLI task count to one; bulk
+submission should add count/profiles rather than select a separate job engine.
+Distributed training later adds coordinated group admission/recovery within the
+common run model; it does not make its cooperating ranks independent retries.
+Test ordinary jobs, one-element arrays, cron firings and deployment hooks against
+the same ownership, resource, retry and result invariants before retiring the
+old execution path. Update CLI, API, dashboard, manual and book together.
+
 ## Capacity planning
 
 Size the cluster from the workload, rather than its task count. At 1,157.407
@@ -358,8 +392,9 @@ and tokens/s, device utilisation, out-of-memory failures and checkpoint/group
 status. Keep IDs out of metric labels; detailed request and experiment views
 remain indexed and bounded. These are proposed additions, not current metrics.
 
-Implement in this order: reusable command executors and their matched benchmark;
-resident CPU model workers with a supported adapter; whole-device GPU placement
+After unifying the job pipeline, implement reusable command executors and their
+matched benchmark; resident CPU model workers with a supported adapter;
+whole-device GPU placement
 and isolation; then GPU inference and independent training experiments. Add
 distributed training group semantics and checkpoint-aware fairness as explicit
 subsequent work. This sequence keeps the initial feature useful while avoiding
