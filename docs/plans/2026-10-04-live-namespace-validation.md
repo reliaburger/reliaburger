@@ -14,3 +14,9 @@ The failed run is retained, with both exact diagnostic passes recorded in
 `docs/flakes.md` under #555. The remaining gates passed: 42 real cluster cases,
 two doctests, all 52 CI script tests and ignored-owner validation. Full local
 `make ci` is not claimed green; exact-head remote release CI remains required.
+
+Normal integration with the dry-run child retained both regression sets.
+The refreshed source passed formatting, both Clippy matrices and all 145
+combined validation/CLI/HTTP/preview regressions with zero retries. Publication
+is held for the independently reproduced #532 file capture repair so the same
+known Linux failure does not trigger another avoidable CI run.
