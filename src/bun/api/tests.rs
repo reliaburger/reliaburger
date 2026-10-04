@@ -6840,6 +6840,14 @@ async fn static_assets_and_health_stay_public() {
 /// given secret. Returns the app plus the receiver, so a test observes a
 /// triggered sync by a real message on the channel rather than a sleep.
 fn webhook_setup(secret: &str, rate_limit: u32) -> (Router, mpsc::Receiver<()>, CancellationToken) {
+    webhook_setup_for_council(secret, rate_limit, None)
+}
+
+fn webhook_setup_for_council(
+    secret: &str,
+    rate_limit: u32,
+    council: Option<Arc<crate::council::CouncilNode>>,
+) -> (Router, mpsc::Receiver<()>, CancellationToken) {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let shutdown = CancellationToken::new();
     let grill = MockGrill::new();
@@ -6860,7 +6868,7 @@ fn webhook_setup(secret: &str, rate_limit: u32) -> (Router, mpsc::Receiver<()>, 
         None,
         None,
         None,
-        None,
+        council,
         None,
         None,
         None,
@@ -8471,4 +8479,522 @@ async fn write_admission_fixture(
         _ => {}
     }
     council.write(request).await
+}
+
+#[tokio::test]
+async fn cluster_webhook_202_waits_for_replicated_trigger_admission() {
+    let council = seeded_council("webhook-durable-admission").await;
+    let (app, _receiver, shutdown) =
+        webhook_setup_for_council("hooksecret", 10, Some(council.clone()));
+    let body = br#"{"after":"abc123"}"#;
+    let status = post_webhook(
+        &app,
+        body,
+        &[
+            ("x-hub-signature-256", github_signature("hooksecret", body)),
+            ("x-github-delivery", "durable-admission".into()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let state = council.desired_state().await;
+    let sync = state
+        .gitops_sync_state
+        .expect("202 must record a durable pending trigger");
+    let sync = serde_json::to_value(sync).unwrap();
+    assert_eq!(sync["requested_generation"], 1);
+    assert_eq!(sync["completed_generation"], 0);
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_webhook_without_a_leader_is_never_accepted_and_remains_retryable() {
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    let council = Arc::new(
+        crate::council::CouncilNode::new(
+            1,
+            crate::council::types::CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, InMemoryRaftRouter::new()),
+            crate::council::log_store::MemLogStore::new(),
+            crate::council::state_machine::CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let (app, mut receiver, shutdown) =
+        webhook_setup_for_council("hooksecret", 10, Some(council.clone()));
+    let body = br#"{"after":"abc123"}"#;
+    let headers = [
+        ("x-hub-signature-256", github_signature("hooksecret", body)),
+        ("x-github-delivery", "retry-after-no-leader".into()),
+    ];
+    assert_eq!(
+        post_webhook(&app, body, &headers).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(receiver.try_recv().is_err());
+    council
+        .initialize(std::collections::BTreeMap::from([(
+            1,
+            crate::council::types::CouncilNodeInfo {
+                addr: "127.0.0.1:9444".parse().unwrap(),
+                name: "node-1".into(),
+            },
+        )]))
+        .await
+        .unwrap();
+    let mut metrics = council.metrics();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if council.is_leader().await {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        post_webhook(&app, body, &headers).await,
+        StatusCode::ACCEPTED
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_trigger() {
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+    let transport = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    let mut listeners = Vec::new();
+    let mut members = std::collections::BTreeMap::new();
+    let mut directory = crate::mustard::directory::NodeDirectory::default();
+    for id in 1u64..=3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = format!("node-{id}");
+        directory.endpoints.insert(
+            crate::meat::NodeId::new(&name),
+            crate::mustard::directory::NodeEndpoints {
+                api_address: address,
+                reporting_address: address,
+            },
+        );
+        members.insert(
+            id,
+            CouncilNodeInfo {
+                addr: address,
+                name,
+            },
+        );
+        let node = Arc::new(
+            crate::council::CouncilNode::new(
+                id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(id, transport.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        transport.register(id, node.raft().clone()).await;
+        nodes.push(node);
+        listeners.push(listener);
+    }
+    nodes[0].initialize(members).await.unwrap();
+    let mut metrics = nodes[0].metrics();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if nodes[0].is_leader().await {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    for node in nodes.iter().skip(1) {
+        let mut replicated = node.metrics();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if node.current_leader().await == Some(1) {
+                    break;
+                }
+                replicated.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let (_directory_tx, directory_rx) = tokio::sync::watch::channel(directory);
+    let mut routers = Vec::new();
+    let mut receivers = Vec::new();
+    let mut shutdowns = Vec::new();
+    let mut servers = Vec::new();
+    for (node, listener) in nodes.iter().zip(listeners) {
+        let (router, receiver, shutdown) =
+            webhook_setup_for_council("hooksecret", 10, Some(node.clone()));
+        let router = router.layer(axum::Extension(LeaderDirectory(directory_rx.clone())));
+        let serving = router.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, serving).await.unwrap()
+        }));
+        routers.push(router);
+        receivers.push(receiver);
+        shutdowns.push(shutdown);
+    }
+    let body = br#"{"after":"abc123","exact":"raw body must reach the leader"}"#;
+    let headers = [
+        ("x-hub-signature-256", github_signature("hooksecret", body)),
+        ("x-github-delivery", "handover-admission".into()),
+    ];
+    assert_eq!(
+        post_webhook(&routers[2], body, &headers).await,
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), receivers[0].recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        receivers[2].try_recv().is_err(),
+        "a follower must not consume the accepted trigger locally"
+    );
+    let admitted =
+        serde_json::to_value(nodes[0].desired_state().await.gitops_sync_state.unwrap()).unwrap();
+    assert_eq!(admitted["requested_generation"], 1);
+    assert_eq!(admitted["completed_generation"], 0);
+    // The exact nudge has been received, but no sync has run. Stop its leader
+    // through an explicit gate and prove its successor still owns that work.
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let released = stop.clone();
+    let old = nodes[0].clone();
+    let handover = tokio::spawn(async move {
+        released.notified().await;
+        old.shutdown().await.unwrap();
+    });
+    stop.notify_one();
+    handover.await.unwrap();
+    servers[0].abort();
+    let mut following = nodes[1].metrics();
+    let leader_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(id) = nodes[1].current_leader().await
+                && id != 1
+            {
+                break id;
+            }
+            following.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let index = leader_id as usize - 1;
+    assert!(nodes[index].is_leader().await);
+    let pending = serde_json::to_value(
+        nodes[index]
+            .desired_state()
+            .await
+            .gitops_sync_state
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pending["requested_generation"], 1);
+    assert_eq!(pending["completed_generation"], 0);
+    // A successor with a fresh local validator still rejects the committed receipt.
+    let (fresh_validator_router, _fresh_receiver, fresh_shutdown) =
+        webhook_setup_for_council("hooksecret", 10, Some(nodes[index].clone()));
+    assert_eq!(
+        post_webhook(&fresh_validator_router, body, &headers).await,
+        StatusCode::UNAUTHORIZED
+    );
+    fresh_shutdown.cancel();
+    for shutdown in shutdowns {
+        shutdown.cancel();
+    }
+    for server in servers {
+        server.abort();
+    }
+    for node in nodes.iter().skip(1) {
+        node.shutdown().await.unwrap();
+    }
+}
+
+fn webhook_boundary_setup(
+    secret: &str,
+    rate_limit: u32,
+    council: Option<Arc<crate::council::CouncilNode>>,
+    membership: Option<Arc<tokio::sync::RwLock<Vec<NodeMembershipInfo>>>>,
+) -> (
+    Router,
+    mpsc::Receiver<()>,
+    CancellationToken,
+    Arc<tokio::sync::Mutex<crate::lettuce::webhook::WebhookValidator>>,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let shutdown = CancellationToken::new();
+    let grill = MockGrill::new();
+    let port_allocator = PortAllocator::new(30000, 31000);
+    let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+    tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let (webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let validator = Arc::new(tokio::sync::Mutex::new(
+        crate::lettuce::webhook::WebhookValidator::new(secret, rate_limit),
+    ));
+    let app = router_with_upgrade(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        council,
+        None,
+        None,
+        None,
+        membership,
+        Some(webhook_tx),
+        Some(validator.clone()),
+        9117,
+        None,
+        None,
+        None,
+        "default".to_string(),
+        None,
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        crate::bun::capabilities::StaticCapabilities::default(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+    );
+    // Own canceled-request cleanup in this fixture. On an intended old-source
+    // timeout, this layer drops the real handler before either held lock opens.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        shutdown.clone(),
+        async |State(stop): State<CancellationToken>,
+               request: axum::extract::Request,
+               next: axum::middleware::Next| {
+            tokio::select! {
+                _ = stop.cancelled() => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                response = next.run(request) => response,
+            }
+        },
+    ));
+    (app, webhook_rx, shutdown, validator)
+}
+
+async fn boundary_post_webhook(
+    address: std::net::SocketAddr,
+    delivery: &str,
+) -> Result<StatusCode, String> {
+    let body = br#"{"after":"abc123"}"#;
+    let request = reqwest::Client::new()
+        .post(format!("http://{address}/v1/gitops/webhook"))
+        .header("x-hub-signature-256", github_signature("hooksecret", body))
+        .header("x-github-delivery", delivery)
+        .body(body.to_vec());
+    // This six-second observation bound does not change the five-second
+    // production policy. Old handlers that never return fail this assertion.
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        response.bytes().await.map_err(|error| error.to_string())?;
+        Ok::<_, String>(status)
+    })
+    .await
+    .map_err(|_| "webhook did not return within its admission budget".to_owned())??;
+    if started.elapsed() > std::time::Duration::from_millis(5500) {
+        return Err("webhook exceeded five seconds plus bounded HTTP observation overhead".into());
+    }
+    Ok(response)
+}
+
+#[tokio::test]
+async fn whole_webhook_budget_bounds_a_held_validator_and_exact_id_remains_retryable() {
+    let council = seeded_council("webhook-held-validator-boundary").await;
+    let (app, mut receiver, shutdown, validator) =
+        webhook_boundary_setup("hooksecret", 1, Some(council.clone()), None);
+    let held = validator.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let result = boundary_post_webhook(address, "held-validator-exact-id").await;
+    let admission_absent = council.desired_state().await.gitops_sync_state.is_none();
+    let wake_absent = receiver.try_recv().is_err();
+    if !matches!(result, Ok(StatusCode::SERVICE_UNAVAILABLE)) {
+        // Drop the blocked HTTP handler before unlocking, so an intended red
+        // cannot accidentally create a late trigger during fixture cleanup.
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+        drop(held);
+        server.abort();
+        let _ = server.await;
+        panic!(
+            "whole validator wait must return 503: {result:?}; no admission={admission_absent}, no wake={wake_absent}"
+        );
+    }
+    assert!(
+        admission_absent && wake_absent,
+        "timed-out validator wait admitted work"
+    );
+    drop(held);
+    let retry = boundary_post_webhook(address, "held-validator-exact-id").await;
+    let state = council.desired_state().await;
+    let wake = receiver.try_recv().is_ok();
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    assert_eq!(retry.unwrap(), StatusCode::ACCEPTED);
+    let sync = state.gitops_sync_state.unwrap();
+    assert_eq!(
+        (sync.requested_generation, sync.completed_generation),
+        (1, 0)
+    );
+    assert!(wake, "healthy retry must wake its admitted leader");
+}
+
+#[tokio::test]
+async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reservations() {
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+    let transport = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    let mut listeners = Vec::new();
+    let mut members = std::collections::BTreeMap::new();
+    let mut membership = Vec::new();
+    for id in 1u64..=3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = format!("boundary-node-{id}");
+        members.insert(
+            id,
+            CouncilNodeInfo {
+                addr: address,
+                name: name.clone(),
+            },
+        );
+        membership.push(NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new(&name),
+            address,
+            api_advertised: true,
+        });
+        let node = Arc::new(
+            crate::council::CouncilNode::new(
+                id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(id, transport.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        transport.register(id, node.raft().clone()).await;
+        nodes.push(node);
+        listeners.push(listener);
+    }
+    nodes[0].initialize(members).await.unwrap();
+    for node in &nodes {
+        let mut metrics = node.metrics();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while node.current_leader().await != Some(1) {
+                metrics.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let membership = Arc::new(tokio::sync::RwLock::new(membership));
+    let held = membership.write().await;
+    let mut receivers = Vec::new();
+    let mut stops = Vec::new();
+    let mut servers = Vec::new();
+    let mut addresses = Vec::new();
+    for (node, listener) in nodes.iter().zip(listeners) {
+        addresses.push(listener.local_addr().unwrap());
+        let (app, receiver, shutdown, _) = webhook_boundary_setup(
+            "hooksecret",
+            1,
+            Some(node.clone()),
+            Some(membership.clone()),
+        );
+        // No LeaderDirectory layer: this exercises the actual locked metadata
+        // fallback used when gossip has no advertised directory entry.
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        receivers.push(receiver);
+        stops.push(shutdown);
+    }
+    let result = boundary_post_webhook(addresses[2], "held-metadata-exact-id").await;
+    let mut admission_absent = true;
+    for node in &nodes {
+        admission_absent &= node.desired_state().await.gitops_sync_state.is_none();
+    }
+    let wake_absent = receivers
+        .iter_mut()
+        .all(|receiver| receiver.try_recv().is_err());
+    if !matches!(result, Ok(StatusCode::SERVICE_UNAVAILABLE)) {
+        for stop in &stops {
+            stop.cancel();
+        }
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        drop(held);
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
+        panic!(
+            "whole metadata wait must return 503: {result:?}; no admission={admission_absent}, no wake={wake_absent}"
+        );
+    }
+    assert!(
+        admission_absent && wake_absent,
+        "timed-out metadata lookup admitted work"
+    );
+    drop(held);
+    let retry = boundary_post_webhook(addresses[2], "held-metadata-exact-id").await;
+    let state = nodes[0].desired_state().await;
+    let leader_wake = receivers[0].try_recv().is_ok();
+    let follower_wake = receivers[2].try_recv().is_ok();
+    for stop in &stops {
+        stop.cancel();
+    }
+    for node in &nodes {
+        node.shutdown().await.unwrap();
+    }
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+    assert_eq!(retry.unwrap(), StatusCode::ACCEPTED);
+    let sync = state.gitops_sync_state.unwrap();
+    assert_eq!(
+        (sync.requested_generation, sync.completed_generation),
+        (1, 0)
+    );
+    assert!(
+        leader_wake && !follower_wake,
+        "only the admitted leader consumes the wakeup"
+    );
 }

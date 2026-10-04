@@ -11,6 +11,7 @@ Rows up to 29 September 2026 come from the pre-0.1.0 checklist
 
 | Test | First seen | Cause | Status |
 |---|---|---|---|
+| `batch::a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retries` | 4 Oct (PR #589 exact `ae98d1de`, portable macOS run `37200082437`; 5,649 passed / one 60.009s timeout) | Complete hosted-runner cause unknown. Source review found repeated whole-inventory checkpoint publication across serial real executions; the unchanged isolated diagnostic passed in 38.508s | Open ([#555](https://github.com/reliaburger/reliaburger/issues/555)): fixture requests now approach, but remain below, the production 2 MiB body bound and reach the same 16 MiB checkpoint capacity with fewer executions. All existing completion, refusal, retry and recovery assertions and timeouts remain. The fixed isolated case passed in 24.613s; full batch family passed 95/95 in 70.022s. Preserve the original CI failure and separate receipts in `/private/tmp/reliaburger-review2-589-checkpoint-fixture-evidence/`; current complete qualification remains required |
 | `loop_harness::status_answers_while_a_consumer_sync_journals_to_a_slow_disk` ("status took Some(1.393926834s) while a changed view journalled to a slow disk") | 4 Oct (`portable macOS` on PR #556, run 37188135780) | Harness, the #508 class: by design a status can wait two turns of one 400 ms slowed journal write each, which leaves about 200 ms of the 1 s budget for the host's real fsync (`F_FULLFSYNC` on macOS), and on a loaded hosted runner that took about 570 ms | Fixed ([#585](https://github.com/reliaburger/reliaburger/issues/585)): the scenario counts persists per turn instead of timing the status. It fails if any turn journals more than one write or status goes unanswered. It passes 30/30 in a loop and `loop_harness` 5/5; running two sync steps in one turn fails it at once, with a worst turn of 840 ms that the old wall-clock verdict would have passed |
 | `cluster_failover::eight_plus_node_cluster_reconciles_and_reports_through_leader_failover` | 4 Oct (#543 independent parent cluster qualification, 42 selected cases; `/tmp/reliaburger-review2-543-parent-cluster.log`) | Cause unknown: reporting TCP bind on `127.0.0.1:19542` returned `Address already in use` at `tests/support/cluster.rs:370`. A cross-suite fixed-port overlap is plausible from source, but runtime ownership was not captured and that cause is not proved | Open ([#555](https://github.com/reliaburger/reliaburger/issues/555)): unchanged-source, properly gated isolated diagnostic passed in 43.780s. Retain the failed full receipt and diagnostic JUnit/receipts in `/tmp/reliaburger-review2-543-parent-cluster-evidence/`. The initial missing-gate diagnostic was setup-only. Two other failures in that full run were proven old unguarded-placement fixtures and are separate from this flake; no full-cluster pass is claimed for that run |
 | `grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli` | 4 Oct (#535 final integrated `make ci`, profile `ci`, two workers; `/tmp/runtime-535-ci6.log`) | Cause unknown: unchanged Apple fixture timed out before its shell PID file existed (`apple.rs:673`,2.147s). No Apple source changes, retry or diagnostic pass is claimed | Open ([#555](https://github.com/reliaburger/reliaburger/issues/555)): all 5,550 selected tests executed without retries or exclusions; 5,549 passed, this one failed. Both Clippy matrices and formatting passed. Final #535 policy/owner-follow/local controls passed 16/16; this is not a full-CI pass |
@@ -166,3 +167,57 @@ selector cannot be reported as proving another case.
 The corrected local portable run on the inherited #535 source selected 5,598 cases with profile `ci` and zero retries. It passed 5,597 and failed `grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli` after 2.198 seconds: the shell PID marker was missing at `src/grill/apple.rs:673`. This fixture and its production deadlines were unchanged. The complete log is `/tmp/reliaburger-review2-534-inherited535-ci2.log`; its JUnit is `/tmp/reliaburger-review2-534-inherited535-evidence/corrected-full-ci-junit.xml`.
 
 One exact library diagnostic passed in 2.052 seconds, retained separately in `/tmp/reliaburger-review2-534-apple-diagnostic.log` and `/tmp/reliaburger-review2-534-inherited535-evidence/apple-diagnostic-junit.xml`. The cause remains unknown. This pass does not replace the failed complete run. [#555](https://github.com/reliaburger/reliaburger/issues/555) owns the explicit subprocess observation and bounded fixture changes; retries, production deadlines and the coverage floor remain unchanged.
+
+### 4 October 2026: repeated Apple PID-marker failure during #553 qualification
+
+The complete local `make ci` run for #553 selected 5,484 portable tests with
+profile `ci`, two workers and zero retries. It passed 5,483 and failed
+`grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli` after
+2.160 seconds: reading the fixture's shell PID marker returned `NotFound` at
+`src/grill/apple.rs:673`. The unchanged fixture then passed its one exact
+diagnostic in 2.047 seconds. The full-run failure remains a failure; the
+diagnostic does not establish its cause. The missing marker is observed,
+while the cause is unknown. #555 owns the planned actual-spawn PID observer
+and readiness evidence, preserving the existing command deadlines.
+
+The complete run and diagnostic are retained at
+`/tmp/reliaburger-review2-26-ci-currenta41-fixed-lints.log` and
+`/tmp/reliaburger-review2-26-apple-diagnostic.log`. The commands were
+`make ci NEXTEST_PROFILE=ci 'NEXTEST=cargo nextest run --profile ci --no-tests=fail --test-threads 2'`
+and `cargo nextest run --profile ci --no-tests=fail --test-threads 2 --lib -E 'test(=grill::apple::tests::stalled_inspection_times_out_and_reaps_the_cli)'`.
+Both used the same source and owned target directory; no retry, exclusion,
+fixture change or deadline increase was applied.
+
+### 4 October 2026: first-run startup and enrolment during actual #553 qualification
+
+The actual inherited webhook branch's full `make ci` selected 5,650 tests
+with profile `ci`, two test workers and zero retries. It passed 5,648, failed
+`secure_cluster_first_run_initialises_authenticates_and_deploys` after
+30.142 seconds and timed out
+`post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed` after
+60.005 seconds. The startup failure was at `tests/support/bun_process.rs:177`:
+Bun's own listener announcement had not been observed and the captured
+diagnostic was empty. Port zero is intentional in this fixture. The enrolment
+timeout has no established phase. Neither observation establishes the cause.
+
+One unchanged diagnostic selected exactly those two cases with the same
+profile, deadlines, two workers and zero retries. Startup passed in 20.923
+seconds and enrolment in 23.496 seconds. Their causes remain unknown; those
+passes do not replace the failed complete run. [#555](https://github.com/reliaburger/reliaburger/issues/555)
+owns bounded subprocess/phase diagnostics. No fixture, production deadline,
+retry or exclusion was changed for #553.
+
+Full-run log, JUnit, source manifest, failure details and receipt were saved
+before the diagnostic in
+`/tmp/reliaburger-review2-26-actual-branch-evidence/full-ci/`. The diagnostic
+log, JUnit and receipt remain separate in
+`/tmp/reliaburger-review2-26-actual-branch-evidence/one-unchanged-diagnostic/`.
+The complete invocation was
+`make ci NEXTEST_PROFILE=ci 'NEXTEST=cargo nextest run --profile ci --no-tests=fail --test-threads 2'`;
+the diagnostic was
+`cargo nextest run --profile ci --no-tests=fail --test-threads 2 --test documentation_first_run -E 'test(=secure_cluster_first_run_initialises_authenticates_and_deploys) | test(=post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed)'`.
+Both used `CARGO_TARGET_DIR=/tmp/reliaburger-review2-network-target`,
+`CARGO_BUILD_JOBS=2` and offline Cargo. Formatting and both Clippy
+configurations passed before the full run. Since Make stopped at the failed
+test target, doctests 2/2, CI scripts 52/52, ignored-owner checks and final
+formatting were run separately and passed.

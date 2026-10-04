@@ -269,6 +269,11 @@ impl CouncilNode {
         }
     }
 
+    /// Observe committed requested and completed GitOps trigger generations.
+    pub fn gitops_trigger_updates(&self) -> watch::Receiver<(u64, u64)> {
+        self.state_machine.gitops_trigger_updates()
+    }
+
     /// Read the current desired state from the state machine.
     pub async fn desired_state(&self) -> DesiredState {
         self.state_machine.desired_state().await
