@@ -80,6 +80,9 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
+mod batch_jobs;
+mod cluster_jobs;
+pub use cluster_jobs::{ClusterJobReceipt, ClusterJobSettlement};
 mod commands;
 mod consumer;
 mod council_requests;
@@ -96,6 +99,10 @@ mod identity;
 mod identity_signing;
 mod job_runs;
 mod launch;
+#[cfg(test)]
+pub(crate) use cluster_jobs::ClusterJobExecution;
+#[cfg(test)]
+pub(crate) use launch::PrerequisiteFailure;
 mod launch_evidence;
 mod logs;
 mod networking;
@@ -117,7 +124,7 @@ mod trace;
 mod volumes;
 
 use app_stop::{PendingStops, StopPurpose};
-pub use commands::{AgentCommand, ApplyEvent, FaultClearance};
+pub use commands::{AgentCommand, ApplyEvent, FaultClearance, LogExecutionSelection};
 pub use consumer::ConsumerUpdate;
 use deploy_ops::{DeployOp, DeployOps, PreparedInstance, RollingInstance};
 use deploy_worker::DeployWorker;
@@ -385,6 +392,17 @@ struct LoopStalls {
     delays: std::sync::Mutex<std::collections::HashMap<LoopStall, std::time::Duration>>,
     /// How many times each stall's await has been reached, slow or not.
     reached: std::sync::Mutex<std::collections::HashMap<LoopStall, usize>>,
+    /// The same counts for the loop's turn in progress, and the most any
+    /// one turn has reached.
+    per_turn: std::sync::Mutex<StallsPerTurn>,
+}
+
+/// [`LoopStalls`]'s counts for a single turn.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct StallsPerTurn {
+    this_turn: std::collections::HashMap<LoopStall, usize>,
+    most: std::collections::HashMap<LoopStall, usize>,
 }
 
 #[cfg(test)]
@@ -404,10 +422,42 @@ impl LoopStalls {
             .unwrap_or(0)
     }
 
+    /// The most times `stall`'s await has been reached in one loop turn.
+    fn most_in_a_turn(&self, stall: LoopStall) -> usize {
+        self.per_turn
+            .lock()
+            .ok()
+            .and_then(|per_turn| per_turn.most.get(&stall).copied())
+            .unwrap_or(0)
+    }
+
+    /// Start counting a new loop turn.
+    fn begin_turn(&self) {
+        if let Ok(mut per_turn) = self.per_turn.lock() {
+            per_turn.this_turn.clear();
+        }
+    }
+
+    /// Forget the turns counted so far, as the turn meter's reset does.
+    fn reset_most_in_a_turn(&self) {
+        if let Ok(mut per_turn) = self.per_turn.lock() {
+            per_turn.most.clear();
+        }
+    }
+
     /// Wait out `stall`'s delay, if the test set one; `true` when it did.
     async fn hold(&self, stall: LoopStall) -> bool {
         if let Ok(mut reached) = self.reached.lock() {
             *reached.entry(stall).or_default() += 1;
+        }
+        if let Ok(mut per_turn) = self.per_turn.lock() {
+            let this_turn = {
+                let count = per_turn.this_turn.entry(stall).or_default();
+                *count += 1;
+                *count
+            };
+            let most = per_turn.most.entry(stall).or_default();
+            *most = (*most).max(this_turn);
         }
         let delay = self
             .delays
@@ -626,6 +676,7 @@ pub struct BunAgent<G: Grill> {
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
     recorded_jobs: BTreeMap<String, super::jobs::RecordedJob>,
+    retired_batch_executions: BTreeMap<String, super::jobs::RetiredBatchExecution>,
     job_store_uncertain: bool,
     /// Self-upgrade manager. `None` when upgrades are not configured
     /// (upgrade commands then answer with an error).
@@ -830,6 +881,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
             recorded_jobs: BTreeMap::new(),
+            retired_batch_executions: BTreeMap::new(),
             job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -982,6 +1034,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
             recorded_jobs: BTreeMap::new(),
+            retired_batch_executions: BTreeMap::new(),
             job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1262,7 +1315,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let grill = self.supervisor.grill().clone();
         let id = instance_id.clone();
-        let app = app_name.to_string();
+        let app = self.logical_execution_name(instance_id, app_name);
         let namespace = namespace.to_string();
 
         let (line_tx, mut line_rx) = mpsc::channel::<crate::ketchup::types::CapturedLine>(256);
@@ -1455,6 +1508,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         detail: Option<&'static str>,
     ) -> super::loop_meter::Turn {
         self.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+        #[cfg(test)]
+        self.loop_stalls.begin_turn();
         self.loop_meter.begin(branch, detail)
     }
 

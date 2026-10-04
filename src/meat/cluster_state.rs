@@ -81,6 +81,7 @@ impl SchedulerNodeState {
 #[derive(Clone)]
 pub struct ClusterStateCache {
     nodes: HashMap<NodeId, SchedulerNodeState>,
+    accounted_instances: HashMap<(NodeId, AppId, u32), Resources>,
 }
 
 impl ClusterStateCache {
@@ -88,12 +89,52 @@ impl ClusterStateCache {
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
+            accounted_instances: HashMap::new(),
         }
     }
 
     /// Add or replace a node's state.
     pub fn set_node(&mut self, state: SchedulerNodeState) {
         self.nodes.insert(state.node_id.clone(), state);
+    }
+
+    /// Record exact report requests already included in the node's allocated total.
+    pub fn record_reported_instance(
+        &mut self,
+        node: &NodeId,
+        app: &AppId,
+        ordinal: u32,
+        requests: Resources,
+    ) {
+        let accounted = self
+            .accounted_instances
+            .entry((node.clone(), app.clone(), ordinal))
+            .or_default();
+        *accounted = accounted.saturating_add(&requests);
+    }
+
+    /// Add only the unreported part of a committed instance's request.
+    /// Metadata survives cloning and readiness changes during a planning pass.
+    pub fn reserve_committed_instance(
+        &mut self,
+        node_id: &NodeId,
+        app_id: &AppId,
+        ordinal: u32,
+        request: Resources,
+    ) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        let key = (node_id.clone(), app_id.clone(), ordinal);
+        let previous = self.accounted_instances.get(&key).copied();
+        let accounted = previous.unwrap_or_default();
+        let missing = request.saturating_sub(&accounted);
+        node.allocated = node.allocated.saturating_add(&missing);
+        if previous.is_none() {
+            *node.app_replicas.entry(app_id.clone()).or_default() += 1;
+        }
+        self.accounted_instances
+            .insert(key, accounted.saturating_add(&missing));
     }
 
     /// Get a node's state.

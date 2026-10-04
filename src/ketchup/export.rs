@@ -161,6 +161,24 @@ fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
     Ok(url)
 }
 
+/// The `flock` on a source's `_export_checkpoint.lock`, released when dropped.
+///
+/// A `flock` belongs to the open file description, not to the descriptor, and
+/// a child process that another thread is spawning holds a copy of every
+/// descriptor until its `exec` closes it. Closing ours alone could leave the
+/// lock held by that copy for a moment, so the next export straight after
+/// was refused as busy (#519). Unlocking explicitly releases it for every
+/// copy at once.
+struct ExportLock(std::fs::File);
+
+impl Drop for ExportLock {
+    fn drop(&mut self) {
+        // Nothing useful can be done with a failed unlock: closing the
+        // descriptor straight after still releases the lock eventually.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Export local Parquet log files to an object store.
 ///
 /// Ships any `.parquet` files in `source_dir` whose durable id isn't yet in
@@ -186,12 +204,13 @@ pub async fn export_logs(
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let lock = options.open(directory.join("_export_checkpoint.lock"))?;
-        match lock.try_lock() {
+        let file = options.open(directory.join("_export_checkpoint.lock"))?;
+        match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Err(KetchupError::ExportBusy),
             Err(std::fs::TryLockError::Error(error)) => return Err(KetchupError::Io(error)),
         }
+        let lock = ExportLock(file);
         let path = directory.join(CHECKPOINT_FILENAME);
         let current = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
@@ -525,6 +544,53 @@ mod tests {
             "{result:?}"
         );
         assert!(exported_files(dest.path()).is_empty());
+    }
+
+    /// A child that another thread is forking holds a copy of every open
+    /// descriptor until its `exec`, the checkpoint lock's included. A
+    /// finished export must still release the lock at once, or the next
+    /// export straight after is refused as busy (#519).
+    #[tokio::test]
+    async fn exports_follow_each_other_while_other_threads_spawn_processes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let spawning = Arc::clone(&spawning);
+                std::thread::spawn(move || {
+                    while spawning.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let mut checkpoint = ExportCheckpoint::default();
+        let mut busy = 0;
+        for _ in 0..300 {
+            let result = export_logs(
+                source.path(),
+                dest.path().to_str().unwrap(),
+                "node-1",
+                &mut checkpoint,
+            )
+            .await;
+            if matches!(result, Err(KetchupError::ExportBusy)) {
+                busy += 1;
+            }
+        }
+        spawning.store(false, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(busy, 0, "exports refused by a lock nobody holds");
     }
 
     #[tokio::test]

@@ -3,8 +3,10 @@
 /// Handles multi-node workload placement decisions. The scheduler runs
 /// on the leader node and uses a four-phase pipeline (Filter → Score →
 /// Select → Commit) to place replicas across the cluster.
+pub mod admission;
 pub mod autoscaler;
 pub mod batch;
+pub(crate) mod batch_execution;
 pub mod batch_tracker;
 pub mod cluster_state;
 pub mod cron;

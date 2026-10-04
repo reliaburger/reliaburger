@@ -371,3 +371,23 @@ fn apply_refuses_plain_http_manifest_urls() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn directory_compile_refuses_partial_output_when_an_input_is_invalid() {
+    for invalid_file in ["bad.toml", "_defaults.toml"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("good.toml"),
+            "[app.web]\nimage = \"web:1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(invalid_file), "this is not valid TOML [[[").unwrap();
+        let output = run(&["compile", dir.path().to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "partial manifest escaped on stdout"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(invalid_file));
+    }
+}

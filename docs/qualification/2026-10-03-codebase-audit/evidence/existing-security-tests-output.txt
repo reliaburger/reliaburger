@@ -1,0 +1,39 @@
+$ target/debug/deps/reliaburger-d12fb7dd1b9fd42f pickle::api::tests::namespace_scoped_reader_pulls_only_its_namespace --exact
+
+running 1 test
+test pickle::api::tests::namespace_scoped_reader_pulls_only_its_namespace ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4704 filtered out; finished in 1.06s
+
+
+$ target/debug/deps/reliaburger-d12fb7dd1b9fd42f pickle::api::tests::chunked_upload_over_repository_quota_is_refused --exact
+
+running 1 test
+test pickle::api::tests::chunked_upload_over_repository_quota_is_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4704 filtered out; finished in 0.09s
+
+
+$ target/debug/deps/reliaburger-d12fb7dd1b9fd42f pickle::signing::tests::verify_keyless_rejects_an_expired_chain --exact
+
+running 1 test
+test pickle::signing::tests::verify_keyless_rejects_an_expired_chain ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4704 filtered out; finished in 0.04s
+
+
+$ target/debug/deps/reliaburger-d12fb7dd1b9fd42f bun::build_runner::tests::two_builds_reuse_one_signing_identity --exact
+
+running 1 test
+test bun::build_runner::tests::two_builds_reuse_one_signing_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4704 filtered out; finished in 0.10s
+
+
+$ target/debug/deps/reliaburger-d12fb7dd1b9fd42f bun::build_runner::tests::build_sign_then_deploy_verify_round_trips --exact
+
+running 1 test
+test bun::build_runner::tests::build_sign_then_deploy_verify_round_trips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4704 filtered out; finished in 0.10s
+

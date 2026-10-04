@@ -14,9 +14,21 @@ use super::*;
 /// back as one of these ops. Each carries a `oneshot` the loop replies on, so
 /// the task drives the sequence while the loop applies it.
 pub(super) enum DeployOp {
+    PreparedBatchJob {
+        name: String,
+        namespace: String,
+        generation: u64,
+        spec: Box<JobSpec>,
+        reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
+    },
     /// A prerequisite's observed success must be durable before its dependent app runs.
+    EnforceImageReference {
+        image: Option<String>,
+        reply: oneshot::Sender<Result<Option<String>, String>>,
+    },
     ConfirmJobSuccess {
         instance_id: InstanceId,
+        code: i32,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// A bounded probe completes off-loop; only the agent mutates health state.
@@ -285,6 +297,7 @@ impl DeployOp {
     pub(super) fn name(&self) -> &'static str {
         match self {
             DeployOp::ConfirmJobSuccess { .. } => "confirm_job_success",
+            DeployOp::EnforceImageReference { .. } => "enforce_image_reference",
             DeployOp::HealthProbeResult { .. } => "health_probe_result",
             DeployOp::EnforceImageSignature { .. } => "enforce_image_signature",
             DeployOp::StoreDeployedSpec { .. } => "store_deployed_spec",
@@ -293,6 +306,7 @@ impl DeployOp {
             DeployOp::AddAppReplicas { .. } => "add_app_replicas",
             DeployOp::NextDeployGen { .. } => "next_deploy_gen",
             DeployOp::SupervisorDeployApp { .. } => "supervisor_deploy_app",
+            DeployOp::PreparedBatchJob { .. } => "prepared_batch_job",
             DeployOp::SupervisorDeployJob { .. } => "supervisor_deploy_job",
             DeployOp::RegisterServiceApp { .. } => "register_service_app",
             DeployOp::RestoreStoppedRouting { .. } => "restore_stopped_routing",
@@ -552,17 +566,62 @@ impl DeployOps {
         .await
     }
 
+    pub(super) async fn enforce_image_reference(
+        &self,
+        image: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        self.call(
+            |reply| DeployOp::EnforceImageReference {
+                image: image.map(str::to_owned),
+                reply,
+            },
+            Err("agent shutting down during prerequisite trust admission".into()),
+        )
+        .await
+    }
+
     pub(super) async fn confirm_job_success(
         &self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
+        self.confirm_job_exit(instance_id, 0).await
+    }
+
+    pub(super) async fn confirm_job_exit(
+        &self,
+        instance_id: &InstanceId,
+        code: i32,
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::ConfirmJobSuccess {
                 instance_id: instance_id.clone(),
+                code,
                 reply,
             },
             Err(BunError::JobState(
-                "agent unavailable before job success was persisted".into(),
+                "agent unavailable before job exit was persisted".into(),
+            )),
+        )
+        .await
+    }
+
+    pub(super) async fn prepared_batch_job(
+        &self,
+        name: &str,
+        namespace: &str,
+        generation: u64,
+        spec: &JobSpec,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        self.call(
+            |reply| DeployOp::PreparedBatchJob {
+                name: name.into(),
+                namespace: namespace.into(),
+                generation,
+                spec: Box::new(spec.clone()),
+                reply,
+            },
+            Err(BunError::JobState(
+                "agent unavailable before the prepared generation was claimed".into(),
             )),
         )
         .await
@@ -1203,11 +1262,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 let _ = reply.send(result);
             }
-            DeployOp::ConfirmJobSuccess { instance_id, reply } => {
+            DeployOp::EnforceImageReference { image, reply } => {
+                let _ = reply.send(
+                    self.enforce_image_reference_signature(image.as_deref())
+                        .await,
+                );
+            }
+            DeployOp::ConfirmJobSuccess {
+                instance_id,
+                code,
+                reply,
+            } => {
                 let result = self
                     .record_observed_job_exit(
                         &instance_id,
-                        crate::bun::jobs::JobPhase::Exited { code: 0 },
+                        crate::bun::jobs::JobPhase::Exited { code },
                     )
                     .await;
                 if result.is_ok()
@@ -1221,6 +1290,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         instance.state = ContainerState::Stopped;
                     }
                 }
+                let _ = reply.send(result);
+            }
+            DeployOp::PreparedBatchJob {
+                name,
+                namespace,
+                generation,
+                spec,
+                reply,
+            } => {
+                let id = crate::grill::InstanceIdentity::new(&namespace, &name, 0).instance_id();
+                let result =
+                    self.recorded_jobs
+                        .get(&id.0)
+                        .filter(|job| {
+                            job.generation == generation
+                                && job.restart_count == 0
+                                && job.phase == crate::bun::jobs::JobPhase::Preparing
+                                && job.batch_execution.is_some()
+                                && job.spec == *spec
+                        })
+                        .filter(|_| {
+                            !self.job_store_uncertain
+                                && self.supervisor.get_instance(&id).is_some_and(|instance| {
+                                    instance.state == ContainerState::Pending
+                                })
+                        })
+                        .map(|_| vec![id.clone()])
+                        .ok_or_else(|| {
+                            BunError::JobState(
+                                "prepared batch generation no longer owns this launch".into(),
+                            )
+                        });
                 let _ = reply.send(result);
             }
             DeployOp::SupervisorDeployJob {

@@ -47,6 +47,22 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+## Storage ceiling
+
+`[images] max_storage` bounds each node's compressed CAS blob, temporary upload
+and repository authority receipt payload bytes. The store also allows at most
+65,536 payload files, including empty uploads and receipts. Registry pushes, peer replication,
+upstream cache fills and runtime image pulls share this ceiling. An upload chunk
+that would exceed it is refused before writing, with HTTP 413 from the registry. Completed uploads remain charged
+without a manifest; deleting confirmed payloads returns their space to the budget.
+The accounting is rebuilt from disk at startup.
+
+Unpacked root filesystems, catalogue files and filesystem overhead need
+additional disk capacity. This cap measures payload bytes, not filesystem
+block allocation. Reusing an existing verified blob does not charge its bytes
+twice, but uploading another physical copy needs room for that temporary copy
+until completion.
+
 ## Building images
 
 `relish build` builds images from your config straight into Pickle:
@@ -275,7 +291,9 @@ which destinations hold each one.
 
 Archives are streamed to a spool file in `<volumes>/.snapshot-spool` and
 uploaded in 8 MiB parts, so a large volume doesn't need its size in memory.
-The spool never takes the volumes filesystem below 5% free. Objects land under
+The spool always leaves 5% of the volumes filesystem free, or 10 GiB on a
+filesystem larger than 200 GiB; an archive that would cut into that reserve
+fails and is retried on the next sweep. Objects land under
 `<prefix>/<namespace>/<app>/<node>/<volume>/`: the archive is
 `archives/sha256-<digest>.tar.gz`, and a JSON manifest in `manifests/` names
 the snapshot, its volume, node and creation time. Two nodes running the same

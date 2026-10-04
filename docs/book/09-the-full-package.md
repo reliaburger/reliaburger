@@ -115,6 +115,13 @@ fn compute_desired(current: u32, metric: f64, config: &AutoscaleConfig) -> u32 {
 
 ### Hysteresis and cooldown
 
+The target must be positive and finite. Parsing a Rust `f64` accepts `NaN`
+and infinity as well as ordinary numbers, so parsing alone isn't validation.
+We reject those values, zero and negative targets before apply. A finite
+target above 100% remains useful: requests aren't limits, and a replica may
+legitimately use more than it requested. If a collected sample isn't finite,
+the controller leaves the replica count alone for that evaluation.
+
 Without hysteresis, the autoscaler oscillates. CPU drops to 60% (below the 70% target), it scales down, load per instance jumps back to 90%, it scales up, and you're stuck in a loop.
 
 The fix: a scale-down threshold. The default is 0.8, meaning the metric must drop below `target * 0.8 = 56%` before scaling down. At 60%? No change. At 50%? Scale down. The gap between the scale-up trigger (> 70%) and the scale-down trigger (< 56%) prevents oscillation.
@@ -431,7 +438,7 @@ The sync loop:
 1. **Trigger.** Poll timer (default 30s) or webhook
 2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
 3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
-4. **TOML parse.** All `.toml` files under the configured path. Parse errors are per-file, not global
+4. **Configuration tree.** Read the verified commit under the configured watch root. Resolve `_defaults.toml` inheritance and directory namespaces through the same resolver as CLI compilation. A malformed or ambiguous tree refuses the whole sync
 5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
 6. **Selective apply.** Only changed resources written to Raft
 
@@ -545,7 +552,7 @@ Changing what you persist changes what your equality checks mean. If some code c
 
 All of the above — `execute_sync`, the diff engine, signature verification, the webhook validator — was a library nobody ran. The July 2026 review found `execute_sync` had no caller, `/v1/gitops/webhook` returned 503 unconditionally (`gitops_webhook_tx` was hardcoded `None`), and the `[gitops]` config section was parsed and never read. A GitOps engine that never touches git.
 
-The runner (`spawn_gitops_sync`) is the missing piece: a leader-only task that clones the configured repo, then on each poll tick or webhook nudge reads the current apps and last-applied sha from Raft, runs `execute_sync` in `spawn_blocking` (git shells out; never on the async runtime), and applies the resulting changes — `Add`/`Update` become `AppSpec` writes to Raft, `Remove` becomes `AppDelete`. Exactly the desired-state writes a manual `relish apply` makes, which means the scheduler and reconcilers from Chapter 2 pick them up for free. Git becomes just another writer of desired state. The webhook endpoint now has a channel to nudge, so a `git push` hook triggers a sync in milliseconds instead of waiting for the poll.
+The runner (`spawn_gitops_sync`) is the missing piece: a leader-only task that clones the configured repo, then on each poll tick or webhook nudge reads the current apps and last-applied sha from Raft, runs `execute_sync` in `spawn_blocking` (git shells out; never on the async runtime), and applies the resulting changes — `Add`/`Update` become `AppSpec` writes to Raft, `Remove` becomes `AppDelete`. These cover apps, namespaces and permissions; a tree containing jobs is refused before writes. These are the supported desired-state writes a manual `relish apply` makes, which means the scheduler and reconcilers from Chapter 2 pick them up for free. Git becomes just another writer of desired state. The webhook endpoint now has a channel to nudge, so a `git push` hook triggers a sync in milliseconds instead of waiting for the poll.
 
 Wiring it flushed out a bug that only a real repo could surface. `execute_sync` starts by fetching, and treats "fetch found no new commit" as "nothing to do". But the *first* sync after cloning has nothing new to fetch — the clone already contains the commit — yet the desired state has never been applied. The result: a freshly-configured GitOps repo synced *nothing* until someone pushed a second commit. The fix distinguishes "no new commit since last fetch" from "current HEAD not yet applied": when the repo's HEAD differs from the last-*applied* sha, sync it regardless of whether the fetch pulled anything. The unit tests never caught this because they drove `execute_sync` with a mock repo whose `fetch` returned a commit on demand; only a real bare clone, where the first fetch is genuinely a no-op, exposed it.
 
@@ -946,6 +953,17 @@ for every copy at once, including the one in a half-spawned child. The
 relish CLI never reopens an operation in the same process, so users never saw
 this, but the fix makes "dropping releases the lock" true without a caveat.
 
+We fixed that lock and missed its neighbours. Five days later the same
+refusal turned up in three more places that take an `flock` and let a plain
+`File` close it: the local context's `context.lock` (#500), Pickle's upload
+directory owner (#497, in Chapter 5) and the log export checkpoint (#519, in
+Chapter 6). Each now holds the file in a small type whose `Drop` unlocks
+first: `ContextLock`, `UploadDirectoryOwner` and `ExportLock`. Each got the
+same test as the operation lock: a hundred or more lock-and-drop rounds beside
+two threads spawning `true`. Before the fix the upload owner's version was refused
+75 times out of 100. The lesson is a boring one. When you fix a class of bug,
+grep for the class, not just the line in the stack trace.
+
 ### Download before you trust, verify before you replace
 
 The installer needs a guest image and prebuilt binaries. A partial download
@@ -1257,6 +1275,16 @@ pretend daemon when nothing is `Running`, and whose `start` fails if the
 daemon it came up with has gone. The stops take 0, 0.3 and 0.6 seconds, so
 without the gate VM 1's start fails every time with the error from the Mac.
 With the gate, all three end up `Running`.
+
+These watchdog tests then turned flaky on their own (#517). Alone they
+passed; two in one test process failed nine runs in ten. The culprit was
+macOS, not our code: it checks a new executable file the first time anything
+runs it, the check costs over 100 ms, and two first runs of different new
+files wait for each other. Each test wrote a fresh fake `limactl` and started
+it under a 200 ms watchdog, so the second one routinely missed its deadline
+before its script printed a byte. The fix runs each fake once, right after
+writing it and before the clock starts. A file that has been checked starts
+in a few milliseconds from then on.
 
 ### Bake the image, don't install at boot
 
@@ -1626,3 +1654,11 @@ Here's what a real run found that thousands of unit and integration tests hadn't
 Every one of those has its own test now. The deeper lesson is about where the bugs were: not in any one component, but between them. The lock was correct, and so was the agent loop. So were the ledger and the catalogue, each on its own terms. Only a whole cluster, with real images, real timings and a leader that dies, puts them in the same room.
 
 Two things still weren't pretty. While a node is down, nothing can release an address it might still route to, so a survivor that gains a replica keeps retrying its rolling replacement until the node returns (traffic is fine; the survivor already runs the new replicas). And a replica-count change was still a rolling redeploy on that node rather than "start one more". The 0.1.1 recording showed where that leads: node-1 rolled twice, node-2's healthy frontend was moved as well, and `relish inspect` listed five stopped leftovers. In 0.1.2 the agent starts only the added replicas, a suspect node keeps its placements, and the replacement goes to the survivor with the fewest replicas (Chapter 2, "Losing a node shouldn't move the survivors").
+
+### Refusing jobs before their dependent apps
+
+A migration declared with `run_before = ['app.web']` must run before the app is deployed. Lettuce used to parse the job, omit it from its desired-state diff, and report success after publishing the app. The missing piece is a durable identity connecting a Git revision to a job run, plus dispatch and recovery. Until those exist, the safe supported behaviour is an explicit refusal.
+
+After validating the full configuration, `execute_sync` checks `git_config.job.is_empty()`. Any job, including a cron registration or a job-only tree, returns `SyncResult::Failure` before diffing or producing writes. Its error names the jobs and points to `relish apply` or `relish batch`. Apply the migration and dependent app together through the manual path so that `run_before` keeps its meaning.
+
+The runner already records a failure without advancing `last_applied_commit`. The regression first syncs a real Git repository into a single-node Raft council, then commits an app revision, migration, namespace and permission together. It checks the failed history entry and the unchanged app, namespace, permission and applied SHA. Signed commits and repeated reconciliation are covered separately: trusted authorship does not make an unsupported job executable.
