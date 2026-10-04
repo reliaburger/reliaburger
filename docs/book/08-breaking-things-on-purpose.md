@@ -1123,6 +1123,8 @@ The complexity is O(nodes × profiles + total_jobs). If you have 100 nodes and a
 
 The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
 
+Each job name must be unique within its batch, including jobs in different namespaces. Dispatch builds a map keyed by that name, and completion reports identify jobs by name too. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.
+
 ```rust
 pub struct BatchSummary {
     pub batch_id: u64,

@@ -367,6 +367,13 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         }
     }
 
+    crate::grill::volume::validate_managed_volume_layout(&app.volumes).map_err(|reason| {
+        ConfigError::InvalidVolume {
+            name: name.to_string(),
+            reason,
+        }
+    })?;
+
     // Deploy block: `max_surge = 0` with `max_unavailable = 0` leaves a rolling
     // deploy no legal move in either direction, so reject it here rather than
     // let the rollout wedge (M7).
@@ -1386,6 +1393,50 @@ mod tests {
     }
 
     #[test]
+    fn managed_volume_artifact_overlaps_are_rejected() {
+        for paths in [
+            ["/data", "/data/child"],
+            ["/data", "/data.img"],
+            ["/data", "/data.volume.json"],
+            ["/data", "/data.volume.json.tmp"],
+            ["/data", "/data.restore-staged"],
+            ["/data", "/data.restore-old"],
+            ["/data", "/data.restore.json"],
+            ["/data", "/data"],
+            ["/", "/data"],
+        ] {
+            let mut app = minimal_app();
+            app.volumes = paths
+                .map(|path| crate::config::types::VolumeSpec {
+                    path: PathBuf::from(path),
+                    source: None,
+                    size: Some("16Mi".into()),
+                })
+                .to_vec();
+            assert!(
+                matches!(
+                    config_with_app("db", app).validate(),
+                    Err(ConfigError::InvalidVolume { .. })
+                ),
+                "accepted {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_managed_volume_paths_remain_distinct() {
+        let mut app = minimal_app();
+        app.volumes = ["/data.a", "/data.b"]
+            .map(|path| crate::config::types::VolumeSpec {
+                path: PathBuf::from(path),
+                source: None,
+                size: Some("16Mi".into()),
+            })
+            .to_vec();
+        config_with_app("db", app).validate().unwrap();
+    }
+
+    #[test]
     fn validate_volume_relative_mount_path_rejected() {
         let mut app = minimal_app();
         app.volumes.push(crate::config::types::VolumeSpec {
@@ -1511,6 +1562,24 @@ mod tests {
         let app: AppSpec = toml::from_str(r#"script = "echo hello""#).unwrap();
         let config = config_with_app("test", app);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn autoscale_admission_refuses_nonpositive_and_nonfinite_targets() {
+        for target in ["0%", "-20%", "NaN", "NaN%", "inf", "inf%", "-inf"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            assert!(config.validate().is_err(), "accepted target {target}");
+        }
+        for target in ["70%", "0.7", "150%"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            config.validate().unwrap();
+        }
     }
 
     #[test]
