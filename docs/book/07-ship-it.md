@@ -1521,3 +1521,24 @@ A repository containing `_defaults.toml` used to compile through the CLI and fai
 Both paths inherit typed defaults and use the nearest directory name when a workload omits its namespace. The watch root itself contributes no namespace. The resolver returns `Result<CompileResult, TreeError>`: `?` propagates a malformed file or identity collision before a caller can use partial desired state. GitOps refuses duplicate definitions, while CLI compilation retains its warning for deterministic overrides within one namespace. Neither can represent two resources of the same kind and bare name in different namespaces.
 
 The regression compares physical CLI compilation with a real Git sync under a watched subdirectory, first unsigned and then with a trusted SSH commit signature. It checks the resulting app specification and resource identity. Other cases cover nested defaults, directory-only namespaces, duplicate definitions and malformed trees. These exercise the adapters and the sync diff as well as the resolver.
+### Comparing a complete deployment specification
+
+A dry run used to compare only image strings. Keeping an image unchanged while
+changing replicas, a port, environment variables or resource limits therefore
+printed an unchanged workload. The preview now fingerprints the complete
+serialized desired specification. Namespace is part of the resource identity:
+`app.team/web` and `app.other/web` have separate evidence. Replica ordinals are
+placement details, so they do not alter an app's desired-spec fingerprint.
+
+The API returns this evidence for apps, jobs, namespace quotas and permissions.
+Council state supplies the authoritative app, namespace and permission specs;
+local job checkpoints supply job specs. The endpoint filters the result through
+the caller's app and namespace scope. If different executions of one logical
+job have different specifications, their combined evidence is unknown.
+
+An absent fingerprint cannot prove equality. The plan prints `?` and serializes
+`unknown` for incomplete evidence, while a known image change still proves an
+update. An offline preview states that its creates assume no live comparison.
+A failed live lookup returns an error instead of manufacturing an empty cluster.
+Tests exercise the client-to-router-to-agent path and same-image changes, along
+with quotas, permissions, namespace separation and incomplete evidence.
