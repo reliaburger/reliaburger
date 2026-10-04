@@ -930,6 +930,79 @@ Is a record proof that the node *installed* its new leaf? No. A renewal whose an
 
 The tests in `ca_rotation.rs` pin each rule: the generation goes from 0 to 1, a retried begin is a no-op, a stacked rotation is refused and leaves the state untouched while another role rotates freely, a CA from a different root is refused, and finalise is refused while `node-b` still holds its old leaf, then passes once its renewal is allocated. `ca_rotation_through_the_log_waits_for_every_node_leaf` in the state machine drives the same story through real log entries.
 
+## Rotating a CA, part two: trusting both
+
+The council could now hold two Node CAs. Every node still trusted exactly one. The mTLS listener built its `RootCertStore` from `identity.node_ca_der` at startup, the client verifier pinned that same certificate, and `LiveNodeIdentity::replace` refused any renewal whose CA differed from the one it started with. Begin a rotation, renew one node onto the new CA, and that node would be locked out of its own cluster.
+
+So the trust became a list:
+
+```rust
+pub struct TrustSet {
+    pub node_cas: Vec<Vec<u8>>,
+    pub roots: Vec<Vec<u8>>,
+}
+```
+
+`TrustSet::from_state` builds it from `trusted_cas`, and `NodeIdentity` carries one (it's persisted in `node.bundle.json`, now schema 3). The identity still has its own `node_ca_der`, the issuer it presents in its chain, and `validate_identity` refuses an identity whose own issuer and root aren't in its set. A node that distrusts its own chain is a node nobody can talk to.
+
+Every node-identity check now goes through one function:
+
+```rust
+pub fn validate_node_leaf(&self, leaf: &[u8]) -> Result<TrustedChain<'_>, CertError>
+```
+
+It tries each Node CA (signature and issuer name), then each root for that CA, and returns the pair that vouched. `TrustedChain<'_>` holds two `&[u8]` slices borrowed from the set, and the `'_` is a lifetime: it tells the compiler the result can't outlive the `TrustSet` it points into. No copying, and no way to keep a dangling reference to a trust set that's been replaced. When nothing vouches, it returns the most specific error it saw, because "expired" is a lot more useful at 3am than "untrusted".
+
+### A trust set that changes under a running listener
+
+The CRL already had this problem and a solution: a shared handle every handshake re-reads. Trust follows the same idea, but the handle is the live identity itself:
+
+```rust
+pub enum TrustSource {
+    Fixed(Arc<TrustSet>),
+    Live(LiveNodeIdentity),
+}
+```
+
+A verifier built from a `LiveNodeIdentity` holds the `Live` variant and asks it for the current set on every handshake. On the client side that's easy: `PinnedChainServerVerifier` is our code, so it calls `trust.current()` and then `validate_node_leaf`. The server side used rustls's `WebPkiClientVerifier`, which takes its anchors once, at build time. So `RevocationCheckingClientVerifier` now builds a fresh one per handshake from the current Node CAs and delegates to it. Two anchors is a couple of parsed certificates, and cluster connections are few and long-lived, so we didn't bother caching it. The anchors are still the Node CAs and never the roots, for the reason PKI2 gave: a workload certificate also chains to the root and also carries ClientAuth.
+
+One wrinkle: the trait's `root_hint_subjects` returns `&[DistinguishedName]`, a slice borrowed from `self`. A set built per handshake can't lend a slice that outlives the call, so we send no hints. Our clients hold one node identity each and don't consult them.
+
+Who changes the set? Bun's security refresh, which already copied the CRL every five seconds. It now also calls `LiveNodeIdentity::adopt_council_trust(&state)`, which persists the new set and publishes it to every listener and client built from the identity. The next handshake uses it. No rebuild, no restart.
+
+### Only the council's word counts
+
+`replace` used to refuse any change to the CAs. Now it accepts a different trust set only when it equals the one it's handed as the council's:
+
+```rust
+pub async fn replace(&self, identity: NodeIdentity, council_trust: &TrustSet) -> Result<(), MtlsError>
+```
+
+The renewal worker reads `council_trust` from its own replica of the council state, not from the leader's response. A response that says "also trust this CA" isn't enough by itself; the node's replicated state has to agree. If the replica lags behind the leader, the replacement is refused and the next attempt, five seconds later, goes through. `adopt_trust` refuses a set that drops the node's own issuer too, and the refresh logs that once and keeps the old set.
+
+The cluster root stays fixed across a `replace`. Its fingerprint names the cluster, and changing it is root rotation, which comes later.
+
+### The rest of the verifiers
+
+- **Renewal and the internal routes.** `validate_peer` checks the presented leaf with `TrustSet::from_state`, so a node still holding an old-CA leaf can renew onto the new CA. That's the whole point of the window.
+- **Join.** The join bundle and `GET /v1/cluster/ca` carry every trusted Node CA. A joiner pins all of them for the second leg, because the member it's talking to may not have renewed yet.
+- **Images.** Keyless signature verification takes every trusted root and accepts the first that the chain reaches.
+- **Workloads.** `ca.pem` becomes a bundle: every trusted Workload CA, then the root. A workload rotates its identity every half hour, so within half an hour of a rotation beginning every workload trusts both.
+- **Ingress.** The listener is bound once, with one resolver. A `ReloadableCertResolver` wraps it, and a task watches the active Ingress CA's serial; when it changes, it builds a resolver over the new CA and swaps it in. The swap uses a `std::sync::RwLock`, not tokio's, because rustls calls `resolve` synchronously and the lock is held only long enough to clone an `Arc`.
+
+Can you see the gap in the workload story? The new Workload CA signs from the moment the rotation begins, but a peer only trusts it after its own next rotation, up to thirty minutes later. Nodes have the same gap, measured in seconds (the refresh interval). Closing it means trusting a new CA before anything signs with it, and that belongs to the operator-facing rotation flow, where the council can wait until every node has acknowledged the new set.
+
+### The tests
+
+`tests/suite/ca_trust_rotation.rs` runs real TLS handshakes over an in-memory pipe, through the same live builders Bun uses:
+
+- `nodes_on_the_old_and_new_node_ca_authenticate_each_other_both_ways` puts one node on an old-CA leaf and one on a new-CA leaf, both trusting both CAs, and checks every listener against every client, bound and unbound, in both directions.
+- `a_leaf_from_an_untrusted_node_ca_is_refused_both_ways` tries a leaf from a Node CA the cluster never announced and one from another cluster, as client and as server.
+- `a_new_trust_set_reaches_a_running_node_without_a_restart` builds a listener before the rotation, watches it refuse a renewed peer, installs the council's new set with `adopt_council_trust`, and watches the *same config object* accept it. Then it reloads the identity from disk to check the set survives a restart.
+- `replace_accepts_only_the_councils_trust_set` covers the rule above, including the refusal to drop the node's own issuer.
+
+The ingress swap has its own test in `wrapper::tls`, which handshakes against a listener, swaps the resolver, and sees the next handshake present the new certificate.
+
 ## Certificate revocation
 
 Sometimes you need to revoke a certificate before it expires. A node gets compromised, a workload's key leaks, or you rotate a CA. The Certificate Revocation List (CRL) tracks which serial numbers are no longer trusted.

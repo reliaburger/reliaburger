@@ -25,4 +25,5 @@ pub mod renewal_worker;
 pub mod secret;
 pub mod session;
 pub mod token;
+pub mod trust;
 pub mod types;

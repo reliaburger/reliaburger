@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::ca;
 use super::crypto;
 use super::identity_store::NodeIdentity;
+use super::trust::TrustSet;
 use super::types::{CaRole, JoinToken, SecurityState, SerialNumber};
 
 /// Default lifetime for an operator-minted join token.
@@ -72,6 +73,8 @@ pub struct JoinResult {
     pub root_ca_der: Vec<u8>,
     /// DER-encoded Node CA certificate (for verifying peer nodes).
     pub node_ca_der: Vec<u8>,
+    /// Every Node CA and root the council trusts when it signs (F04 R2).
+    pub trust: TrustSet,
 }
 
 /// The certificate signing request a joiner sends to a cluster member.
@@ -112,6 +115,11 @@ pub struct JoinBundle {
     pub node_ca_b64: String,
     /// Base64 DER root CA certificate.
     pub root_ca_b64: String,
+    /// Base64 DER of every Node CA the council trusts, active first. During a
+    /// CA rotation this includes the retiring one.
+    pub trusted_node_cas_b64: Vec<String>,
+    /// Base64 DER of every root the council trusts.
+    pub trusted_roots_b64: Vec<String>,
 }
 
 /// Errors from the joiner side of the ceremony.
@@ -143,6 +151,18 @@ impl JoinBundle {
             certificate_b64: BASE64.encode(&result.certificate_der),
             node_ca_b64: BASE64.encode(&result.node_ca_der),
             root_ca_b64: BASE64.encode(&result.root_ca_der),
+            trusted_node_cas_b64: result
+                .trust
+                .node_cas
+                .iter()
+                .map(|der| BASE64.encode(der))
+                .collect(),
+            trusted_roots_b64: result
+                .trust
+                .roots
+                .iter()
+                .map(|der| BASE64.encode(der))
+                .collect(),
         }
     }
 
@@ -162,9 +182,26 @@ impl JoinBundle {
         let certificate_der = decode("certificate", &self.certificate_b64)?;
         let node_ca_der = decode("node_ca", &self.node_ca_b64)?;
         let root_ca_der = decode("root_ca", &self.root_ca_b64)?;
+        let decode_all = |field: &str, values: &[String]| {
+            values
+                .iter()
+                .map(|value| decode(field, value))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let trust = TrustSet {
+            node_cas: decode_all("trusted_node_cas", &self.trusted_node_cas_b64)?,
+            roots: decode_all("trusted_roots", &self.trusted_roots_b64)?,
+        };
 
         super::cert::validate_chain(&certificate_der, &node_ca_der, &root_ca_der)
             .map_err(|e| JoinClientError::Malformed(format!("issued leaf does not chain: {e}")))?;
+        // The issuer and root must be in the trust set the bundle carries, or
+        // the identity would distrust its own chain.
+        if !trust.trusts_node_ca(&node_ca_der) || !trust.trusts_root(&root_ca_der) {
+            return Err(JoinClientError::Malformed(
+                "the trust set does not include the issuing CA".into(),
+            ));
+        }
 
         let now = SystemTime::now();
         Ok(NodeIdentity {
@@ -175,6 +212,7 @@ impl JoinBundle {
             ca_generation: self.ca_generation,
             node_ca_der,
             root_ca_der,
+            trust,
             not_before: now,
             not_after: now + Duration::from_secs(365 * 24 * 3600),
         })
@@ -199,24 +237,41 @@ pub struct CaCertificates {
     pub node_ca_b64: String,
     /// Base64 DER Root CA certificate.
     pub root_ca_b64: String,
+    /// Base64 DER of every Node CA the cluster trusts, active first. A member
+    /// still presenting a leaf from a retiring Node CA verifies against it.
+    pub trusted_node_cas_b64: Vec<String>,
 }
 
 impl CaCertificates {
-    /// Decode the Node and Root CA DER bytes.
-    pub fn decode(&self) -> Result<(Vec<u8>, Vec<u8>), JoinClientError> {
+    /// Decode the CAs into the trust set the joiner pins for the second leg:
+    /// every trusted Node CA and the one root whose fingerprint was checked.
+    pub fn decode(&self) -> Result<TrustSet, JoinClientError> {
         self.compatibility.require_current()?;
-        let node_ca = BASE64
-            .decode(&self.node_ca_b64)
-            .map_err(|e| JoinClientError::Malformed(format!("node_ca: {e}")))?;
-        let root_ca = BASE64
-            .decode(&self.root_ca_b64)
-            .map_err(|e| JoinClientError::Malformed(format!("root_ca: {e}")))?;
-        Ok((node_ca, root_ca))
+        let decode = |field: &str, value: &str| {
+            BASE64
+                .decode(value)
+                .map_err(|e| JoinClientError::Malformed(format!("{field}: {e}")))
+        };
+        let node_ca = decode("node_ca", &self.node_ca_b64)?;
+        let root_ca = decode("root_ca", &self.root_ca_b64)?;
+        let mut node_cas = vec![node_ca];
+        for value in &self.trusted_node_cas_b64 {
+            let der = decode("trusted_node_cas", value)?;
+            if !node_cas.contains(&der) {
+                node_cas.push(der);
+            }
+        }
+        Ok(TrustSet {
+            node_cas,
+            roots: vec![root_ca],
+        })
     }
 
     /// The `sha256:` fingerprint of the root CA.
     pub fn root_ca_fingerprint(&self) -> Result<String, JoinClientError> {
-        let (_, root_ca) = self.decode()?;
+        let root_ca = BASE64
+            .decode(&self.root_ca_b64)
+            .map_err(|e| JoinClientError::Malformed(format!("root_ca: {e}")))?;
         Ok(super::identity_store::root_ca_fingerprint(&root_ca))
     }
 }
@@ -402,6 +457,7 @@ pub fn sign_join_csr(
         .active_ca(CaRole::Root)
         .map(|ca| ca.certificate_der.clone())
         .unwrap_or_default();
+    let trust = TrustSet::from_state(state).ok_or(JoinError::NoNodeCa)?;
 
     // Unwrap the Node CA private key.
     let ca_private_key_der = crypto::unwrap_key(wrapping_ikm, &wrapped_key)?;
@@ -437,6 +493,7 @@ pub fn sign_join_csr(
         ca_generation: node_ca_generation,
         root_ca_der,
         node_ca_der,
+        trust,
     })
 }
 
@@ -649,6 +706,31 @@ mod tests {
         assert!(matches!(err, JoinClientError::Malformed(_)));
     }
 
+    /// F04 R2: the joiner's identity carries the council's whole trust set,
+    /// and a bundle whose set leaves out the issuing CA is refused.
+    #[test]
+    fn into_identity_carries_the_trust_set_and_refuses_one_without_the_issuer() {
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
+        assert_eq!(
+            Some(result.trust.clone()),
+            TrustSet::from_state(&state),
+            "the bundle carries what the council trusts"
+        );
+        let identity = JoinBundle::from_result(&result)
+            .into_identity(key.clone())
+            .unwrap();
+        assert_eq!(identity.trust, result.trust);
+
+        let mut bundle = JoinBundle::from_result(&result);
+        bundle.trusted_node_cas_b64.clear();
+        assert!(matches!(
+            bundle.into_identity(key),
+            Err(JoinClientError::Malformed(_))
+        ));
+    }
+
     /// #281: a joiner refusing a member's formats says so first, with both
     /// pairs, rather than blaming the member for a rejection it never sent.
     #[test]
@@ -697,10 +779,11 @@ mod tests {
             compatibility: crate::compatibility::CURRENT,
             node_ca_b64: BASE64.encode(&result.node_ca_der),
             root_ca_b64: BASE64.encode(&result.root_ca_der),
+            trusted_node_cas_b64: vec![BASE64.encode(&result.node_ca_der)],
         };
-        let (node_ca, root_ca) = ca.decode().unwrap();
-        assert_eq!(node_ca, result.node_ca_der);
-        assert_eq!(root_ca, result.root_ca_der);
+        let trust = ca.decode().unwrap();
+        assert_eq!(trust.node_cas, [result.node_ca_der.clone()]);
+        assert_eq!(trust.roots, [result.root_ca_der.clone()]);
         let expected = crate::sesame::identity_store::root_ca_fingerprint(&result.root_ca_der);
         assert_eq!(ca.root_ca_fingerprint().unwrap(), expected);
     }

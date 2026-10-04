@@ -539,6 +539,47 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Copy the CRL and the trust set from the council's state into the
+/// verifiers, the security refresh's job on every tick (F04 R2).
+///
+/// The CRL goes into the shared handle every verifier reads. The trust set
+/// goes into the live identity, which persists it and publishes it to every
+/// listener and client built from it. A failure keeps the old trust set and
+/// is logged once until it changes, not every five seconds.
+async fn refresh_crl_and_trust(
+    council: &reliaburger::council::CouncilNode,
+    crl: Option<&reliaburger::sesame::mtls::CrlHandle>,
+    identity: Option<&reliaburger::sesame::credentials::LiveNodeIdentity>,
+    last_error: &mut Option<String>,
+) {
+    let state = council.security_state().await;
+    if let Some(crl) = crl {
+        crl.update(state.crl.clone());
+    }
+    let Some(identity) = identity else {
+        return;
+    };
+    match identity.adopt_council_trust(&state).await {
+        Ok(true) => {
+            let trust = identity.snapshot();
+            println!(
+                "bun: installed the council's trust set: {} Node CA(s), {} root(s)",
+                trust.trust.node_cas.len(),
+                trust.trust.roots.len()
+            );
+            *last_error = None;
+        }
+        Ok(false) => *last_error = None,
+        Err(error) => {
+            let error = error.to_string();
+            if last_error.as_ref() != Some(&error) {
+                eprintln!("bun: WARNING: keeping the current trust set: {error}");
+                *last_error = Some(error);
+            }
+        }
+    }
+}
+
 /// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
 ///
 /// Returns `None` — falling back to a self-signed `localhost` cert — when the
@@ -584,6 +625,45 @@ async fn build_ingress_cert_resolver(
         Err(e) => {
             eprintln!("bun: WARNING: could not build the ingress cert resolver ({e})");
             None
+        }
+    }
+}
+
+/// Rebuild the ingress resolver when the active Ingress CA changes, so
+/// `tls = "cluster"` routes mint their next leaf from the new CA without a
+/// restart (F04 R2). Checks on the security refresh's five-second cadence.
+async fn reload_ingress_resolver_on_ca_change(
+    council: std::sync::Arc<reliaburger::council::CouncilNode>,
+    routing_table: std::sync::Arc<tokio::sync::RwLock<reliaburger::wrapper::routing::RoutingTable>>,
+    lifetime: std::time::Duration,
+    resolver: std::sync::Arc<reliaburger::wrapper::tls::ReloadableCertResolver>,
+    mut serial: Option<reliaburger::sesame::types::SerialNumber>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let active = council
+            .security_state()
+            .await
+            .active_ca(reliaburger::sesame::types::CaRole::Ingress)
+            .map(|ca| ca.serial);
+        if active == serial {
+            continue;
+        }
+        // Remember the serial whether or not the rebuild works: a failure is
+        // logged by the builder, and retrying every tick would only repeat it.
+        serial = active;
+        if let Some(inner) =
+            build_ingress_cert_resolver(&council, routing_table.clone(), lifetime).await
+        {
+            resolver.replace(inner);
+            println!(
+                "bun: ingress now signs `tls = \"cluster\"` leaves with the rotated Ingress CA"
+            );
         }
     }
 }
@@ -1592,13 +1672,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // saw `None` and skipped the check needed to contain that open router.
     if let Some(council) = &api_council {
         refresh_token_store(&api_token_store, council).await;
-        if let Some(crl) = &crl_refresh {
-            crl.update(council.security_state().await.crl);
-        }
+        let mut trust_error = None;
+        refresh_crl_and_trust(
+            council,
+            crl_refresh.as_ref(),
+            api_identity.as_ref(),
+            &mut trust_error,
+        )
+        .await;
 
         let refresh_store = Arc::clone(&api_token_store);
         let refresh_council = Arc::clone(council);
         let refresh_crl = crl_refresh.clone();
+        let refresh_identity = api_identity.clone();
         reliaburger::bun::readiness::spawn_reconstructible(
             "security-refresh",
             false,
@@ -1614,11 +1700,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 let refresh_store = Arc::clone(&refresh_store);
                 let refresh_council = Arc::clone(&refresh_council);
                 let refresh_crl = refresh_crl.clone();
+                let refresh_identity = refresh_identity.clone();
                 async move {
+                    let mut trust_error = None;
                     refresh_token_store(&refresh_store, &refresh_council).await;
-                    if let Some(crl) = &refresh_crl {
-                        crl.update(refresh_council.security_state().await.crl);
-                    }
+                    refresh_crl_and_trust(
+                        &refresh_council,
+                        refresh_crl.as_ref(),
+                        refresh_identity.as_ref(),
+                        &mut trust_error,
+                    )
+                    .await;
                     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                     ready.ready();
                     loop {
@@ -1627,10 +1719,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             _ = ticker.tick() => {
                                 refresh_token_store(&refresh_store, &refresh_council).await;
                                 // Same tick refreshes the CRL so a revoked peer is
-                                // refused on its next handshake (≤5 s lag).
-                                if let Some(crl) = &refresh_crl {
-                                    crl.update(refresh_council.security_state().await.crl);
-                                }
+                                // refused on its next handshake, and the trust set
+                                // so a rotated CA is accepted on it (≤5 s lag).
+                                refresh_crl_and_trust(
+                                    &refresh_council,
+                                    refresh_crl.as_ref(),
+                                    refresh_identity.as_ref(),
+                                    &mut trust_error,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1785,12 +1882,33 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
                 Some(council) => {
-                    build_ingress_cert_resolver(
-                        council,
-                        routing_table.clone(),
-                        config.security.ingress_leaf_lifetime(),
-                    )
-                    .await
+                    let lifetime = config.security.ingress_leaf_lifetime();
+                    let serial = council
+                        .security_state()
+                        .await
+                        .active_ca(reliaburger::sesame::types::CaRole::Ingress)
+                        .map(|ca| ca.serial);
+                    match build_ingress_cert_resolver(council, routing_table.clone(), lifetime)
+                        .await
+                    {
+                        Some(inner) => {
+                            // The listener keeps this one resolver; an Ingress
+                            // CA rotation swaps what's inside it (F04 R2).
+                            let reloadable = std::sync::Arc::new(
+                                reliaburger::wrapper::tls::ReloadableCertResolver::new(inner),
+                            );
+                            tokio::spawn(reload_ingress_resolver_on_ca_change(
+                                std::sync::Arc::clone(council),
+                                routing_table.clone(),
+                                lifetime,
+                                std::sync::Arc::clone(&reloadable),
+                                serial,
+                                shutdown.clone(),
+                            ));
+                            Some(reloadable)
+                        }
+                        None => None,
+                    }
                 }
                 None => None,
             };
@@ -4042,6 +4160,10 @@ mod tests {
                 private_key_der,
                 serial,
                 ca_generation: 0,
+                trust: reliaburger::sesame::trust::TrustSet::single(
+                    hierarchy.node.ca.certificate_der.clone(),
+                    hierarchy.root.ca.certificate_der.clone(),
+                ),
                 node_ca_der: hierarchy.node.ca.certificate_der.clone(),
                 root_ca_der: hierarchy.root.ca.certificate_der.clone(),
                 not_before: std::time::SystemTime::UNIX_EPOCH,
@@ -4088,8 +4210,7 @@ mod tests {
                 .unwrap(),
             "11"
         );
-        let anonymous =
-            mtls::build_ca_pinned_client(server.node_ca_der, server.root_ca_der).unwrap();
+        let anonymous = mtls::build_ca_pinned_client(server.trust.clone()).unwrap();
         assert_eq!(
             anonymous
                 .get(&url)
@@ -4225,6 +4346,10 @@ mod tests {
                 private_key_der,
                 serial,
                 ca_generation: 0,
+                trust: reliaburger::sesame::trust::TrustSet::single(
+                    hierarchy.node.ca.certificate_der.clone(),
+                    hierarchy.root.ca.certificate_der.clone(),
+                ),
                 node_ca_der: hierarchy.node.ca.certificate_der.clone(),
                 root_ca_der: hierarchy.root.ca.certificate_der.clone(),
                 not_before: std::time::SystemTime::UNIX_EPOCH,

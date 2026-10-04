@@ -22,11 +22,23 @@ fn identity(hierarchy: &ca::CaHierarchy, node: &str, serial: u64) -> NodeIdentit
         private_key_der,
         serial,
         ca_generation: 0,
+        trust: reliaburger::sesame::trust::TrustSet::single(
+            hierarchy.node.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ),
         node_ca_der: hierarchy.node.ca.certificate_der.clone(),
         root_ca_der: hierarchy.root.ca.certificate_der.clone(),
         not_before: SystemTime::UNIX_EPOCH,
         not_after: SystemTime::UNIX_EPOCH,
     }
+}
+
+/// The trust set the council describes for a cluster that isn't rotating.
+fn council_trust(hierarchy: &ca::CaHierarchy) -> reliaburger::sesame::trust::TrustSet {
+    reliaburger::sesame::trust::TrustSet::single(
+        hierarchy.node.ca.certificate_der.clone(),
+        hierarchy.root.ca.certificate_der.clone(),
+    )
 }
 
 fn installed(directory: &std::path::Path, identity: &NodeIdentity) -> LiveNodeIdentity {
@@ -96,8 +108,14 @@ async fn existing_server_and_client_configs_observe_replacement_credentials() {
     }
     let renewed_server = identity(&hierarchy, "server", 20);
     let renewed_client = identity(&hierarchy, "client", 21);
-    server.replace(renewed_server.clone()).await.unwrap();
-    client.replace(renewed_client.clone()).await.unwrap();
+    server
+        .replace(renewed_server.clone(), &renewed_server.trust)
+        .await
+        .unwrap();
+    client
+        .replace(renewed_client.clone(), &renewed_client.trust)
+        .await
+        .unwrap();
     for server_config in &servers {
         for client_config in &clients {
             let (client_leaf, server_leaf) =
@@ -124,10 +142,12 @@ async fn replacement_refuses_changed_identity_trust_anchors_keys_or_stale_serial
         identity(&hierarchy, "node", 9),
         identity(&hierarchy, "node", 10),
     ] {
-        assert!(live.replace(replacement).await.is_err());
+        assert!(live.replace(replacement, &original.trust).await.is_err());
         assert_eq!(live.snapshot().certificate_der, original.certificate_der);
     }
-    live.replace(original.clone()).await.unwrap();
+    live.replace(original.clone(), &original.trust)
+        .await
+        .unwrap();
     assert_eq!(live.snapshot().certificate_der, original.certificate_der);
 }
 
@@ -141,7 +161,11 @@ async fn failed_persistence_never_publishes_replacement_credentials() {
     std::fs::remove_file(&key_path).unwrap();
     std::fs::create_dir(&key_path).unwrap();
     let replacement = identity(&hierarchy, "node", 20);
-    assert!(live.replace(replacement.clone()).await.is_err());
+    assert!(
+        live.replace(replacement.clone(), &original.trust)
+            .await
+            .is_err()
+    );
     assert_eq!(live.snapshot().certificate_der, original.certificate_der);
     assert_eq!(
         reliaburger::sesame::identity_store::load(directory.path())
@@ -151,7 +175,9 @@ async fn failed_persistence_never_publishes_replacement_credentials() {
         original.certificate_der
     );
     std::fs::remove_dir(&key_path).unwrap();
-    live.replace(replacement.clone()).await.unwrap();
+    live.replace(replacement.clone(), &original.trust)
+        .await
+        .unwrap();
     assert_eq!(live.snapshot().certificate_der, replacement.certificate_der);
     assert_eq!(
         reliaburger::sesame::identity_store::load(directory.path())
@@ -250,7 +276,9 @@ async fn concurrent_replacements_cannot_roll_back_the_persisted_or_live_serial()
     let live = installed(directory.path(), &identity(&hierarchy, "node", 10));
     let older = identity(&hierarchy, "node", 20);
     let newer = identity(&hierarchy, "node", 30);
-    let (_older_result, newer_result) = tokio::join!(live.replace(older), live.replace(newer));
+    let council = council_trust(&hierarchy);
+    let (_older_result, newer_result) =
+        tokio::join!(live.replace(older, &council), live.replace(newer, &council));
     newer_result.unwrap();
     assert_eq!(live.snapshot().serial, SerialNumber(30));
     assert_eq!(
@@ -262,7 +290,8 @@ async fn concurrent_replacements_cannot_roll_back_the_persisted_or_live_serial()
     );
     let newer = identity(&hierarchy, "node", 50);
     let older = identity(&hierarchy, "node", 40);
-    let (newer_result, older_result) = tokio::join!(live.replace(newer), live.replace(older));
+    let (newer_result, older_result) =
+        tokio::join!(live.replace(newer, &council), live.replace(older, &council));
     newer_result.unwrap();
     assert!(older_result.is_err());
     assert_eq!(live.snapshot().serial, SerialNumber(50));
@@ -296,11 +325,17 @@ async fn existing_internal_http_client_presents_replacement_and_keeps_service_to
     for serial in [11, 21] {
         if serial == 21 {
             client
-                .replace(identity(&hierarchy, "client", serial))
+                .replace(
+                    identity(&hierarchy, "client", serial),
+                    &council_trust(&hierarchy),
+                )
                 .await
                 .unwrap();
             server
-                .replace(identity(&hierarchy, "server", 20))
+                .replace(
+                    identity(&hierarchy, "server", 20),
+                    &council_trust(&hierarchy),
+                )
                 .await
                 .unwrap();
         }
@@ -365,9 +400,12 @@ async fn diagnostics_reads_the_current_node_leaf_after_replacement() {
     .layer(axum::Extension(live.clone()));
     for serial in [10, 20] {
         if serial == 20 {
-            live.replace(identity(&hierarchy, "node", serial))
-                .await
-                .unwrap();
+            live.replace(
+                identity(&hierarchy, "node", serial),
+                &council_trust(&hierarchy),
+            )
+            .await
+            .unwrap();
         }
         let response = router
             .clone()

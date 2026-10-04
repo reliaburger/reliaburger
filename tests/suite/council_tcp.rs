@@ -60,6 +60,10 @@ impl TlsSetup {
             private_key_der: key_der,
             serial,
             ca_generation: 0,
+            trust: reliaburger::sesame::trust::TrustSet::single(
+                self.hierarchy.node.ca.certificate_der.clone(),
+                self.hierarchy.root.ca.certificate_der.clone(),
+            ),
             node_ca_der: self.hierarchy.node.ca.certificate_der.clone(),
             root_ca_der: self.hierarchy.root.ca.certificate_der.clone(),
             not_before: now,

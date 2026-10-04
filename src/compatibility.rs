@@ -53,9 +53,14 @@ pub struct Compatibility {
 /// Several CAs per role: each CA's `CaState`, the node leaf records
 /// (`SecurityState::node_leaves`) and the `CaRotationBegin` and
 /// `CaRotationFinalize` Raft requests (F04 R1, #362).
+/// Trust bundles: the trusted Node CAs and roots in a join bundle
+/// (`JoinBundle::trusted_node_cas_b64`, `trusted_roots_b64`) and in
+/// `GET /v1/cluster/ca`, the workload CA bundle in a signing answer
+/// (`WorkloadCsrResponse::ca_bundle_der`), and the trust set in a node's
+/// identity snapshot (`node.bundle.json` schema 3) (F04 R2, #362).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 41,
-    state: 58,
+    protocol: 42,
+    state: 59,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

@@ -7,6 +7,7 @@ use rustls::sign::CertifiedKey;
 
 use super::identity_store::{NodeIdentity, validate_identity};
 use super::mtls::MtlsError;
+use super::trust::TrustSet;
 
 #[derive(Clone)]
 struct ValidatedIdentity {
@@ -29,8 +30,9 @@ impl ValidatedIdentity {
 }
 
 /// A validated identity that existing TLS configurations can observe changing.
-/// Replacement keeps the node identifier and trust anchors fixed; CA rotation
-/// is a separate protocol. Debug output never includes credentials.
+/// Replacement keeps the node identifier and cluster root fixed. The trust set
+/// changes only to the one the council's state describes (F04 R2). Debug
+/// output never includes credentials.
 #[derive(Clone)]
 pub struct LiveNodeIdentity {
     current: tokio::sync::watch::Sender<ValidatedIdentity>,
@@ -65,8 +67,18 @@ impl LiveNodeIdentity {
 
     /// Validate and persist a newer identity before publishing it to TLS.
     /// Once persistence starts, the operation owns its work through publication
-    /// even if the caller stops waiting. Exact certificate retries are idempotent.
-    pub async fn replace(&self, identity: NodeIdentity) -> Result<(), MtlsError> {
+    /// even if the caller stops waiting. Exact retries are idempotent.
+    ///
+    /// The replacement may carry a different trust set only when that set is
+    /// `council_trust`, the one the council's state describes. Anything else
+    /// would let a renewal response, or a bug, widen or narrow what this node
+    /// accepts from peers.
+    pub async fn replace(
+        &self,
+        identity: NodeIdentity,
+        council_trust: &TrustSet,
+    ) -> Result<(), MtlsError> {
+        let council_trust = council_trust.clone();
         let guard = Arc::clone(&self.writer).lock_owned().await;
         let current = self.current.clone();
         let directory = Arc::clone(&self.directory);
@@ -76,19 +88,28 @@ impl LiveNodeIdentity {
             let _guard = guard;
             let replacement = ValidatedIdentity::new(identity)?;
             let previous = current.borrow().clone();
+            // The root names the cluster; only a root rotation may change it,
+            // and that isn't supported yet.
             if replacement.identity.node_id != previous.identity.node_id
-                || replacement.identity.node_ca_der != previous.identity.node_ca_der
                 || replacement.identity.root_ca_der != previous.identity.root_ca_der
-                || replacement.identity.ca_generation != previous.identity.ca_generation
+                || replacement.identity.ca_generation < previous.identity.ca_generation
             {
                 return Err(MtlsError::InvalidCert(
-                    "renewal changes the node identity or trust anchors".into(),
+                    "renewal changes the node identity or cluster root".into(),
                 ));
             }
-            if replacement.identity.certificate_der == previous.identity.certificate_der {
+            let trust_changed = replacement.identity.trust != previous.identity.trust;
+            if trust_changed && replacement.identity.trust != council_trust {
+                return Err(MtlsError::InvalidCert(
+                    "the new trust set is not the one the council's state describes".into(),
+                ));
+            }
+            let same_leaf =
+                replacement.identity.certificate_der == previous.identity.certificate_der;
+            if same_leaf && !trust_changed {
                 return Ok(());
             }
-            if replacement.identity.serial.0 <= previous.identity.serial.0 {
+            if !same_leaf && replacement.identity.serial.0 <= previous.identity.serial.0 {
                 return Err(MtlsError::InvalidCert(
                     "renewal serial is not newer than the current identity".into(),
                 ));
@@ -103,6 +124,41 @@ impl LiveNodeIdentity {
         .map_err(|error| {
             MtlsError::ConfigFailed(format!("identity replacement worker failed: {error}"))
         })?
+    }
+}
+
+impl LiveNodeIdentity {
+    /// Install the council's trust set, keeping the current leaf. Returns
+    /// whether anything changed.
+    ///
+    /// Bun's security refresh calls this on every tick, the way it refreshes
+    /// the CRL. Listeners and clients built from this identity read the trust
+    /// set on each handshake, so the next connection uses it. A set that
+    /// doesn't include this node's own issuer is refused: installing it would
+    /// make the node distrust its own chain.
+    pub async fn adopt_trust(&self, council_trust: &TrustSet) -> Result<bool, MtlsError> {
+        let current = self.snapshot();
+        if current.trust == *council_trust {
+            return Ok(false);
+        }
+        let updated = NodeIdentity {
+            trust: council_trust.clone(),
+            ..(*current).clone()
+        };
+        self.replace(updated, council_trust).await?;
+        Ok(true)
+    }
+
+    /// [`Self::adopt_trust`] with the trust set `state` describes. A state
+    /// with no Node CA or root (a council not yet seeded) changes nothing.
+    pub async fn adopt_council_trust(
+        &self,
+        state: &super::types::SecurityState,
+    ) -> Result<bool, MtlsError> {
+        match TrustSet::from_state(state) {
+            Some(trust) => self.adopt_trust(&trust).await,
+            None => Ok(false),
+        }
     }
 }
 
@@ -151,6 +207,10 @@ mod tests {
                 private_key_der,
                 serial,
                 ca_generation: 0,
+                trust: crate::sesame::trust::TrustSet::single(
+                    hierarchy.node.ca.certificate_der.clone(),
+                    hierarchy.root.ca.certificate_der.clone(),
+                ),
                 node_ca_der: hierarchy.node.ca.certificate_der.clone(),
                 root_ca_der: hierarchy.root.ca.certificate_der.clone(),
                 not_before: SystemTime::UNIX_EPOCH,
@@ -174,7 +234,8 @@ mod tests {
         });
         held_rx.await.unwrap();
         let writer = live.clone();
-        let pending = tokio::spawn(async move { writer.replace(replacement).await });
+        let trust = replacement.trust.clone();
+        let pending = tokio::spawn(async move { writer.replace(replacement, &trust).await });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let path = directory.path().to_owned();
