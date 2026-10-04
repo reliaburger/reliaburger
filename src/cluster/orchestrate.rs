@@ -7146,6 +7146,53 @@ mod revalidation_in_place {
     }
 
     #[test]
+    fn ordinary_apps_respect_unreported_batch_reservations_and_exact_namespace_dedup() {
+        for reported_namespace in [None, Some("default"), Some("other")] {
+            let mut desired = DesiredState::default();
+            let app = AppId::new("web", "default");
+            desired
+                .apps
+                .insert(app.clone(), requesting(4000, Replicas::Fixed(1)));
+            let batch: crate::meat::batch_tracker::BatchRecord = serde_json::from_value(serde_json::json!({
+                "submitted_at_epoch_secs": 1,
+                "jobs": [{"name":"logical", "namespace":"default", "execution_name":"opaque-owned",
+                    "spec_digest":"a".repeat(64), "node":"home", "status":"Pending",
+                    "resources":{"cpu_millicores":5000,"memory_bytes":0,"gpus":0}}]
+            })).unwrap();
+            desired.batch_state.register(batch).unwrap();
+            let mut home = node("home", 8000, "east");
+            if let Some(namespace) = reported_namespace {
+                home.allocated = Resources::new(5000, 0, 0);
+                home.app_replicas
+                    .insert(AppId::new("opaque-owned", namespace), 1);
+            }
+            let mut cache = ClusterStateCache::new();
+            cache.set_node(home);
+            let decisions = plan_scheduling_pass(
+                &mut cache,
+                &desired,
+                &HashSet::from([NodeId::new("home")]),
+                &mut QuotaLedger::default(),
+            );
+            assert!(
+                placements_of(&decisions, &app).is_empty(),
+                "namespace={reported_namespace:?}: {decisions:?}"
+            );
+            let allocated = cache
+                .get_node(&NodeId::new("home"))
+                .unwrap()
+                .allocated
+                .cpu_millicores;
+            let expected = if reported_namespace == Some("other") {
+                10000
+            } else {
+                5000
+            };
+            assert_eq!(allocated, expected, "namespace={reported_namespace:?}");
+        }
+    }
+
+    #[test]
     fn a_resource_change_that_still_fits_keeps_the_replica_on_its_node() {
         let app = AppId::new("web", "default");
         let mut desired = DesiredState::default();

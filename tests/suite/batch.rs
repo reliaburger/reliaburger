@@ -585,8 +585,9 @@ fn remote_capacity_options(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simultaneous_batch_admissions_share_durable_capacity_across_api_processes() {
     let council = single_node_leader().await;
-    let first = Harness::start_with(capacity_options(council.clone())).await;
-    let second = Harness::start_with(capacity_options(council.clone())).await;
+    let (address, _dispatches, _worker_tasks) = pending_capacity_worker().await;
+    let first = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
+    let second = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
     let first_jobs = full_node_job("first");
     let second_jobs = full_node_job("second");
     let (a, b) = tokio::join!(
@@ -917,7 +918,8 @@ async fn batch_admission_accounts_for_unreported_app_placements() {
         }))
         .await
         .unwrap();
-    let harness = Harness::start_with(capacity_options(council.clone())).await;
+    let (address, _dispatches, _worker_tasks) = pending_capacity_worker().await;
+    let harness = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
     let response = harness
         .client
         .submit_batch(&full_node_job("migration"))

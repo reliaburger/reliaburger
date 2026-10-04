@@ -5906,6 +5906,32 @@ mod tests {
         assert_eq!(inner.state.apps[&identity], default_spec());
     }
 
+    #[tokio::test]
+    async fn unguarded_app_placement_cannot_race_shared_capacity_admission() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "default");
+        let responses = sm
+            .apply([normal_entry(
+                1,
+                1,
+                RaftRequest::SchedulingDecision(SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: vec![Placement {
+                        node_id: NodeId::new("home"),
+                        resources: Resources::new(8000, 0, 0),
+                        ordinal: 0,
+                    }],
+                }),
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(responses[0], CouncilResponse::Refused { .. }),
+            "{responses:?}"
+        );
+        assert!(!sm.desired_state().await.scheduling.contains_key(&app_id));
+    }
+
     #[test]
     fn committing_batch_ownership_first_atomically_refuses_app_and_leased_app_writes() {
         for leased in [false, true] {
