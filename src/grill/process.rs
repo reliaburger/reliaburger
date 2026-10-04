@@ -33,6 +33,119 @@ use super::records::{self, InstanceRecord};
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
+#[cfg(test)]
+struct CaptureGate {
+    entered: tokio::sync::watch::Sender<usize>,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for CaptureGate {
+    fn default() -> Self {
+        Self {
+            entered: tokio::sync::watch::channel(0).0,
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+struct ReleaseCaptureGate(Arc<CaptureGate>);
+
+#[cfg(test)]
+impl Drop for ReleaseCaptureGate {
+    fn drop(&mut self) {
+        self.0.release.add_permits(2);
+    }
+}
+
+/// Child exit and pipe EOF are separate events. The entry owns both reader
+/// lifetimes, including when every asynchronous logs caller is canceled.
+struct CaptureTasks {
+    instance: InstanceId,
+    done: tokio::sync::watch::Sender<[bool; 2]>,
+    readers: std::sync::Mutex<[Option<tokio::task::AbortHandle>; 2]>,
+    drain_started: std::sync::atomic::AtomicBool,
+    truncated: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    deadline_abort_issued: tokio::sync::Notify,
+}
+
+const CAPTURE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl CaptureTasks {
+    fn new(instance: &InstanceId) -> Arc<Self> {
+        Arc::new(Self {
+            instance: instance.clone(),
+            done: tokio::sync::watch::channel([false; 2]).0,
+            readers: std::sync::Mutex::new([None, None]),
+            drain_started: std::sync::atomic::AtomicBool::new(false),
+            truncated: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            deadline_abort_issued: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn wait(&self) {
+        let mut completion = self.done.subscribe();
+        loop {
+            if *completion.borrow_and_update() == [true; 2] {
+                return;
+            }
+            if completion.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn abort(&self) {
+        for reader in self.readers.lock().unwrap().iter().flatten() {
+            reader.abort();
+        }
+    }
+
+    fn start_drain(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.drain_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let capture = self.clone();
+        let deadline = tokio::time::Instant::now() + CAPTURE_DRAIN_TIMEOUT;
+        tokio::spawn(async move {
+            if tokio::time::timeout_at(deadline, capture.wait())
+                .await
+                .is_err()
+            {
+                capture.truncated.store(true, Ordering::Release);
+                eprintln!(
+                    "process {} log capture: pipe drain exceeded 2s after child exit; truncating inherited pipes and preserving captured bytes",
+                    capture.instance
+                );
+                capture.abort();
+                // Abort issuance is not task termination: a reader already
+                // executing on another worker can still publish its chunk.
+                // Only the owned CaptureCompletion guards acknowledge that
+                // no reader can write any more bytes, even without a waiter.
+                #[cfg(test)]
+                capture.deadline_abort_issued.notify_one();
+            }
+        });
+    }
+}
+
+struct CaptureCompletion {
+    capture: Arc<CaptureTasks>,
+    index: usize,
+}
+
+impl Drop for CaptureCompletion {
+    fn drop(&mut self) {
+        self.capture
+            .done
+            .send_modify(|done| done[self.index] = true);
+    }
+}
+
 /// A child process managed by ProcessGrill.
 struct ProcessEntry {
     spec: OciSpec,
@@ -49,6 +162,7 @@ struct ProcessEntry {
     /// In-memory workloads have no adoption path, so dropping their last
     /// owner must not leave the process tree behind.
     cleanup_on_drop: bool,
+    capture: Option<Arc<CaptureTasks>>,
 }
 
 /// The recorded identity of an adopted process.
@@ -61,6 +175,9 @@ struct AdoptedProcess {
 
 impl Drop for ProcessEntry {
     fn drop(&mut self) {
+        if let Some(capture) = &self.capture {
+            capture.abort();
+        }
         if !self.cleanup_on_drop {
             return;
         }
@@ -118,6 +235,9 @@ fn observe_child_exit(entry: &mut ProcessEntry) -> std::io::Result<()> {
     {
         entry.exit_code = status.code();
         entry.state = ContainerState::Stopped;
+        if let Some(capture) = &entry.capture {
+            capture.start_drain();
+        }
     }
     Ok(())
 }
@@ -162,6 +282,10 @@ pub struct ProcessGrill {
     log_dir: Option<PathBuf>,
     /// Durable owner authority for persistent production workloads.
     control: Option<ProcessControl>,
+    #[cfg(test)]
+    capture_gate: Option<Arc<CaptureGate>>,
+    #[cfg(test)]
+    file_eof_gate: Option<Arc<CaptureGate>>,
 }
 
 impl ProcessGrill {
@@ -171,6 +295,10 @@ impl ProcessGrill {
             processes: Arc::new(Mutex::new(HashMap::new())),
             log_dir: None,
             control: None,
+            #[cfg(test)]
+            capture_gate: None,
+            #[cfg(test)]
+            file_eof_gate: None,
         }
     }
 
@@ -181,6 +309,10 @@ impl ProcessGrill {
             processes: Arc::new(Mutex::new(HashMap::new())),
             log_dir: Some(log_dir),
             control: None,
+            #[cfg(test)]
+            capture_gate: None,
+            #[cfg(test)]
+            file_eof_gate: None,
         }
     }
 
@@ -192,6 +324,10 @@ impl ProcessGrill {
             processes: Arc::new(Mutex::new(HashMap::new())),
             log_dir: Some(log_dir),
             control: Some(control),
+            #[cfg(test)]
+            capture_gate: None,
+            #[cfg(test)]
+            file_eof_gate: None,
         }
     }
 
@@ -238,20 +374,34 @@ impl ProcessGrill {
             .map_err(|error| owner_error(instance, error))?
             .map_err(|error| owner_error(instance, error));
         }
-        let procs = self.processes.lock().await;
-        let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
-            instance: instance.clone(),
-        })?;
-        if let Some(stem) = &entry.log_stem {
-            let path = log_file(stem, if stdout { "stdout" } else { "stderr" });
-            return Ok(std::fs::read(path).unwrap_or_default());
-        }
-        let buf = if stdout {
-            entry.stdout_buf.lock().await
-        } else {
-            entry.stderr_buf.lock().await
+        let (buffer, capture) = {
+            let mut procs = self.processes.lock().await;
+            let entry = procs
+                .get_mut(instance)
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
+            observe_child_exit(entry).map_err(|error| owner_error(instance, error))?;
+            if let Some(stem) = &entry.log_stem {
+                let path = log_file(stem, if stdout { "stdout" } else { "stderr" });
+                return Ok(std::fs::read(path).unwrap_or_default());
+            }
+            let buffer = if stdout {
+                entry.stdout_buf.clone()
+            } else {
+                entry.stderr_buf.clone()
+            };
+            let capture = if entry.state == ContainerState::Stopped {
+                entry.capture.clone()
+            } else {
+                None
+            };
+            (buffer, capture)
         };
-        Ok(buf.clone())
+        if let Some(capture) = capture {
+            capture.wait().await;
+        }
+        Ok(buffer.lock().await.clone())
     }
 }
 
@@ -293,6 +443,7 @@ impl super::Grill for ProcessGrill {
                 log_stem: None,
                 exit_code: None,
                 cleanup_on_drop: self.log_dir.is_none(),
+                capture: None,
             },
         );
         Ok(())
@@ -389,17 +540,40 @@ impl super::Grill for ProcessGrill {
             reason: e.to_string(),
         })?;
 
+        let capture = if self.log_dir.is_none() {
+            Some(CaptureTasks::new(instance))
+        } else {
+            None
+        };
         // Spawn tasks to capture stdout/stderr (in-memory mode only —
         // file-backed mode has no pipes to read).
         let stdout_buf = entry.stdout_buf.clone();
         if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(async move {
+            #[cfg(test)]
+            let gate = self.capture_gate.clone();
+            let capture = capture.as_ref().unwrap().clone();
+            let completion = CaptureCompletion {
+                capture: capture.clone(),
+                index: 0,
+            };
+            let reader_task = tokio::spawn(async move {
+                let _completion = completion;
                 let mut reader = stdout;
+                #[cfg(test)]
+                let mut gated = false;
                 let mut buf = vec![0u8; 4096];
                 loop {
                     match reader.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => {
+                            #[cfg(test)]
+                            if !gated {
+                                gated = true;
+                                if let Some(gate) = &gate {
+                                    gate.entered.send_modify(|count| *count += 1);
+                                    gate.release.acquire().await.unwrap().forget();
+                                }
+                            }
                             let mut out = stdout_buf.lock().await;
                             out.extend_from_slice(&buf[..n]);
                         }
@@ -407,17 +581,36 @@ impl super::Grill for ProcessGrill {
                     }
                 }
             });
+            capture.readers.lock().unwrap()[0] = Some(reader_task.abort_handle());
         }
 
         let stderr_buf = entry.stderr_buf.clone();
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
+            #[cfg(test)]
+            let gate = self.capture_gate.clone();
+            let capture = capture.as_ref().unwrap().clone();
+            let completion = CaptureCompletion {
+                capture: capture.clone(),
+                index: 1,
+            };
+            let reader_task = tokio::spawn(async move {
+                let _completion = completion;
                 let mut reader = stderr;
+                #[cfg(test)]
+                let mut gated = false;
                 let mut buf = vec![0u8; 4096];
                 loop {
                     match reader.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => {
+                            #[cfg(test)]
+                            if !gated {
+                                gated = true;
+                                if let Some(gate) = &gate {
+                                    gate.entered.send_modify(|count| *count += 1);
+                                    gate.release.acquire().await.unwrap().forget();
+                                }
+                            }
                             let mut out = stderr_buf.lock().await;
                             out.extend_from_slice(&buf[..n]);
                         }
@@ -425,8 +618,10 @@ impl super::Grill for ProcessGrill {
                     }
                 }
             });
+            capture.readers.lock().unwrap()[1] = Some(reader_task.abort_handle());
         }
 
+        entry.capture = capture;
         entry.child = Some(child);
         entry.log_stem = log_stem;
         entry.state = ContainerState::Running;
@@ -513,6 +708,9 @@ impl super::Grill for ProcessGrill {
                 .map_err(error)?;
             entry.exit_code = status.code();
             entry.state = ContainerState::Stopped;
+            if let Some(capture) = &entry.capture {
+                capture.start_drain();
+            }
         } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGKILL)
                 .map_err(error)?
@@ -637,6 +835,7 @@ impl super::Grill for ProcessGrill {
                 log_stem: record.log_stem.clone(),
                 exit_code: None,
                 cleanup_on_drop: self.log_dir.is_none(),
+                capture: None,
             },
         );
         Ok(true)
@@ -686,8 +885,12 @@ impl super::Grill for ProcessGrill {
                 _ => None,
             });
         }
-        let procs = self.processes.lock().await;
-        Ok(procs.get(instance).and_then(|entry| entry.exit_code))
+        let mut procs = self.processes.lock().await;
+        let Some(entry) = procs.get_mut(instance) else {
+            return Ok(None);
+        };
+        observe_child_exit(entry).map_err(|error| owner_error(instance, error))?;
+        Ok(entry.exit_code)
     }
 
     /// Both streams, stdout then stderr, as runc answers: the two capture
@@ -763,15 +966,16 @@ impl super::Grill for ProcessGrill {
 
         // Snapshot how this instance's logs are captured: two files, or two
         // in-memory buffers, one per stream.
-        let (buffers, log_stem) = if let Some(control) = &self.control {
+        let (buffers, log_stem, capture) = if let Some(control) = &self.control {
             let empty = || Arc::new(Mutex::new(Vec::new()));
-            ([empty(), empty()], control.log_stem(instance).ok())
+            ([empty(), empty()], control.log_stem(instance).ok(), None)
         } else {
             let procs = self.processes.lock().await;
             match procs.get(instance) {
                 Some(entry) => (
                     [entry.stdout_buf.clone(), entry.stderr_buf.clone()],
                     entry.log_stem.clone(),
+                    entry.capture.clone(),
                 ),
                 None => return,
             }
@@ -800,6 +1004,9 @@ impl super::Grill for ProcessGrill {
             readers.push((reader, buffer));
         }
 
+        let mut drained = false;
+        #[cfg(test)]
+        let mut eof_gated = false;
         loop {
             // New bytes since the last poll, from each file or buffer, at
             // most one bounded chunk per stream at a time: a capture with no
@@ -808,10 +1015,8 @@ impl super::Grill for ProcessGrill {
             let mut no_new_data = true;
             let mut backlog = false;
             for (reader, buffer) in &mut readers {
-                let new_data = if let Some(file) = reader.file() {
-                    crate::grill::capture::read_capture_chunk(file, reader.read_offset())
-                        .await
-                        .unwrap_or_default()
+                let new_data = if reader.file().is_some() {
+                    reader.read_chunk().await.unwrap_or_default()
                 } else {
                     let offset = usize::try_from(reader.read_offset()).unwrap_or(usize::MAX);
                     let buf = buffer.lock().await;
@@ -834,21 +1039,34 @@ impl super::Grill for ProcessGrill {
                 continue;
             }
 
+            #[cfg(test)]
+            if no_new_data
+                && !eof_gated
+                && log_stem.is_some()
+                && let Some(gate) = &self.file_eof_gate
+            {
+                eof_gated = true;
+                gate.entered.send_modify(|count| *count += 1);
+                gate.release.acquire().await.unwrap().forget();
+            }
+
             // Check if the process has exited and no more data is coming
-            let exited = if self.control.is_some() {
-                match self.state(instance).await {
-                    Ok(ContainerState::Stopped) => true,
-                    Err(_) => return,
-                    _ => false,
-                }
-            } else {
-                let procs = self.processes.lock().await;
-                let Some(entry) = procs.get(instance) else {
-                    return;
-                };
-                entry.state == ContainerState::Stopped || entry.state == ContainerState::Stopping
+            let exited = match self.state(instance).await {
+                Ok(ContainerState::Stopped) => true,
+                Err(_) => return,
+                _ => false,
             };
             if exited && no_new_data {
+                if !drained {
+                    if let Some(capture) = &capture {
+                        capture.wait().await;
+                    }
+                    drained = true;
+                    // Re-scan after confirmed exit/completion. Both a file
+                    // writer and an owned pipe reader can publish final bytes
+                    // between the earlier empty read and state observation.
+                    continue;
+                }
                 for (reader, _) in &mut readers {
                     if let Some(line) = reader.finish() {
                         let _ = lines_tx.send(line).await;
@@ -857,7 +1075,10 @@ impl super::Grill for ProcessGrill {
                 return;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::select! {
+                _ = lines_tx.closed() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
         }
     }
 }
@@ -1262,6 +1483,9 @@ mod tests {
             Some(crate::ketchup::types::CapturePosition {
                 file: dir.path().join("test-0.stdout"),
                 end_offset: "ACK 1\n".len() as u64,
+                identity: Some(crate::ketchup::types::CaptureFileIdentity::of(
+                    &std::fs::metadata(dir.path().join("test-0.stdout")).unwrap(),
+                )),
             })
         );
         assert_eq!(after_restart, before_restart);
@@ -1835,5 +2059,483 @@ mod tests {
 
         external.kill().unwrap();
         external.wait().unwrap();
+    }
+    async fn child_after_os_exit_with_gated_capture(
+        observe: bool,
+    ) -> (
+        ProcessGrill,
+        InstanceId,
+        Arc<CaptureGate>,
+        ReleaseCaptureGate,
+    ) {
+        let gate = Arc::new(CaptureGate::default());
+        let mut entered = gate.entered.subscribe();
+        let mut grill = ProcessGrill::new();
+        grill.capture_gate = Some(gate.clone());
+        let release = ReleaseCaptureGate(gate.clone());
+        let id = InstanceId("gated-final-output".into());
+        grill
+            .create(
+                &id,
+                &spec_with_args(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo to-out; echo to-err >&2".into(),
+                ]),
+            )
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while *entered.borrow_and_update() < 2 {
+                entered.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        // Actual OS exit is confirmed while both final chunks remain owned by
+        // their readers, before either can publish its bytes to the buffers.
+        grill
+            .processes
+            .lock()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .child
+            .as_mut()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        if observe {
+            assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        }
+        (grill, id, gate, release)
+    }
+
+    async fn stopped_child_with_gated_capture() -> (
+        ProcessGrill,
+        InstanceId,
+        Arc<CaptureGate>,
+        ReleaseCaptureGate,
+    ) {
+        child_after_os_exit_with_gated_capture(true).await
+    }
+
+    #[tokio::test]
+    async fn final_log_snapshot_waits_for_reader_publication_after_child_exit() {
+        let (grill, id, gate, _release) = stopped_child_with_gated_capture().await;
+        let read = grill.logs(&id);
+        tokio::pin!(read);
+        assert!(
+            futures_util::poll!(read.as_mut()).is_pending(),
+            "Stopped was reported before pipe capture published its final bytes"
+        );
+        gate.release.add_permits(2);
+        let logs = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            logs.contains("to-out") && logs.contains("to-err"),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn following_logs_waits_for_reader_publication_after_child_exit() {
+        let (grill, id, gate, _release) = stopped_child_with_gated_capture().await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let offsets = Default::default();
+        let follow = grill.follow_logs(&id, sender, &offsets);
+        tokio::pin!(follow);
+        assert!(
+            futures_util::poll!(follow.as_mut()).is_pending(),
+            "following ended while final pipe chunks were still reader-owned"
+        );
+        gate.release.add_permits(2);
+        tokio::time::timeout(std::time::Duration::from_secs(5), follow)
+            .await
+            .unwrap();
+        let mut lines = Vec::new();
+        while let Some(line) = receiver.recv().await {
+            lines.push(line.line);
+        }
+        lines.sort();
+        assert_eq!(lines, ["to-err", "to-out"]);
+    }
+    #[tokio::test]
+    async fn canceling_a_final_snapshot_waiter_does_not_cancel_owned_capture() {
+        let (grill, id, gate, _release) = stopped_child_with_gated_capture().await;
+        let capture = grill
+            .processes
+            .lock()
+            .await
+            .get(&id)
+            .unwrap()
+            .capture
+            .clone()
+            .unwrap();
+        let mut read = Box::pin(grill.logs(&id));
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        drop(read);
+        gate.release.add_permits(2);
+        tokio::time::timeout(std::time::Duration::from_secs(5), capture.wait())
+            .await
+            .unwrap();
+        assert!(!capture.truncated.load(std::sync::atomic::Ordering::Acquire));
+        let logs = grill.logs(&id).await.unwrap();
+        assert!(
+            logs.contains("to-out") && logs.contains("to-err"),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_process_owner_aborts_gated_pipe_readers() {
+        let (grill, id, _gate, _release) = stopped_child_with_gated_capture().await;
+        let capture = grill
+            .processes
+            .lock()
+            .await
+            .get(&id)
+            .unwrap()
+            .capture
+            .clone()
+            .unwrap();
+        drop(grill);
+        tokio::time::timeout(std::time::Duration::from_secs(5), capture.wait())
+            .await
+            .unwrap();
+        assert_eq!(*capture.done.borrow(), [true; 2]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn descendant_held_pipes_are_bounded_after_exit_even_without_a_logs_waiter() {
+        struct KillMatching {
+            pid: u32,
+            started_at: u64,
+        }
+        impl Drop for KillMatching {
+            fn drop(&mut self) {
+                if records::process_matches(self.pid, self.started_at) {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(self.pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("descendant.pid");
+        let script = format!(
+            "sleep 30 & echo $! > {}; echo to-out; echo to-err >&2; exit",
+            pid_file.display()
+        );
+        let grill = ProcessGrill::new();
+        let id = InstanceId("inherited-capture-pipes".into());
+        grill
+            .create(&id, &spec_with_args(vec!["sh".into(), "-c".into(), script]))
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        grill
+            .processes
+            .lock()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .child
+            .as_mut()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let pid: u32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _kill = KillMatching {
+            pid,
+            started_at: records::process_start_time(pid).unwrap(),
+        };
+        // exit_code is also an exit observer: no logs waiter is needed to own
+        // or start the deadline. The child is gone, but its descendant still
+        // holds both pipe write ends open.
+        assert_eq!(grill.exit_code(&id).await.unwrap(), Some(0));
+        let capture = grill
+            .processes
+            .lock()
+            .await
+            .get(&id)
+            .unwrap()
+            .capture
+            .clone()
+            .unwrap();
+        assert!(
+            capture
+                .drain_started
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        tokio::time::timeout(
+            CAPTURE_DRAIN_TIMEOUT + std::time::Duration::from_secs(3),
+            capture.wait(),
+        )
+        .await
+        .unwrap();
+        assert!(capture.truncated.load(std::sync::atomic::Ordering::Acquire));
+        let logs = grill.logs(&id).await.unwrap();
+        assert!(
+            logs.contains("to-out") && logs.contains("to-err"),
+            "{logs:?}"
+        );
+    }
+    #[tokio::test]
+    async fn every_child_exit_observer_starts_the_owned_capture_drain() {
+        use std::sync::atomic::Ordering;
+        for observer in 0..4 {
+            let (grill, id, gate, _release) = child_after_os_exit_with_gated_capture(false).await;
+            let capture = grill
+                .processes
+                .lock()
+                .await
+                .get(&id)
+                .unwrap()
+                .capture
+                .clone()
+                .unwrap();
+            assert!(!capture.drain_started.load(Ordering::Acquire));
+            match observer {
+                0 => assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped),
+                1 => grill.stop(&id).await.unwrap(),
+                2 => grill.kill(&id).await.unwrap(),
+                3 => assert_eq!(grill.exit_code(&id).await.unwrap(), Some(0)),
+                _ => unreachable!(),
+            }
+            assert!(capture.drain_started.load(Ordering::Acquire));
+            assert_ne!(*capture.done.borrow(), [true; 2]);
+            gate.release.add_permits(2);
+            tokio::time::timeout(std::time::Duration::from_secs(5), capture.wait())
+                .await
+                .unwrap();
+            assert!(!capture.truncated.load(Ordering::Acquire));
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deadline_abort_waits_for_actual_reader_termination_acknowledgement() {
+        struct DropGate {
+            entered: tokio::sync::Notify,
+            released: std::sync::Mutex<bool>,
+            release: std::sync::Condvar,
+        }
+        struct HoldTermination {
+            gate: Arc<DropGate>,
+            _completion: CaptureCompletion,
+        }
+        impl Drop for HoldTermination {
+            fn drop(&mut self) {
+                self.gate.entered.notify_one();
+                let mut released = self.gate.released.lock().unwrap();
+                while !*released {
+                    released = self.gate.release.wait(released).unwrap();
+                }
+                // CaptureCompletion drops only after this destructor returns.
+            }
+        }
+        struct ReleaseTermination(Arc<DropGate>);
+        impl Drop for ReleaseTermination {
+            fn drop(&mut self) {
+                *self.0.released.lock().unwrap() = true;
+                self.0.release.notify_all();
+            }
+        }
+        let gate = Arc::new(DropGate {
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        let _release_on_failure = ReleaseTermination(gate.clone());
+        let capture = CaptureTasks::new(&InstanceId("termination-ack".into()));
+        let held = HoldTermination {
+            gate: gate.clone(),
+            _completion: CaptureCompletion {
+                capture: capture.clone(),
+                index: 0,
+            },
+        };
+        let first = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        let second_completion = CaptureCompletion {
+            capture: capture.clone(),
+            index: 1,
+        };
+        let second = tokio::spawn(async move {
+            let _completion = second_completion;
+            std::future::pending::<()>().await;
+        });
+        *capture.readers.lock().unwrap() =
+            [Some(first.abort_handle()), Some(second.abort_handle())];
+        capture.start_drain();
+        tokio::time::timeout(
+            CAPTURE_DRAIN_TIMEOUT + std::time::Duration::from_secs(5),
+            async {
+                gate.entered.notified().await;
+                capture.deadline_abort_issued.notified().await;
+            },
+        )
+        .await
+        .unwrap();
+        // Abort has been issued at the deadline, but reader zero is still
+        // terminating. Final snapshots must remain pending until its guard
+        // confirms that it can no longer publish any bytes.
+        let mut wait = Box::pin(capture.wait());
+        assert!(
+            futures_util::poll!(wait.as_mut()).is_pending(),
+            "abort issuance was mistaken for reader termination"
+        );
+        *gate.released.lock().unwrap() = true;
+        gate.release.notify_all();
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap();
+        assert_eq!(*capture.done.borrow(), [true; 2]);
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(second.await.unwrap_err().is_cancelled());
+    }
+
+    async fn assert_file_follow_rescans_after_empty_read_then_child_exit(resuming: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let release_child = directory.path().join("release-child");
+        let id = InstanceId("gated-file-final-output".into());
+        let stem = directory.path().join(&id.0);
+        let stdout = log_file(&stem, "stdout");
+        let stderr = log_file(&stem, "stderr");
+        let prefix = if resuming {
+            b"already-seen\n".as_slice()
+        } else {
+            b"".as_slice()
+        };
+        std::fs::write(&stdout, prefix).unwrap();
+        std::fs::write(&stderr, prefix).unwrap();
+        let gate = Arc::new(CaptureGate::default());
+        let mut entered = gate.entered.subscribe();
+        let _release_on_failure = ReleaseCaptureGate(gate.clone());
+        let mut grill = ProcessGrill::with_log_dir(directory.path().to_path_buf());
+        grill.file_eof_gate = Some(gate.clone());
+        let script = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'final-out\\n'; printf 'final-err\\n' >&2",
+            release_child.display()
+        );
+        grill
+            .create(&id, &spec_with_args(vec!["sh".into(), "-c".into(), script]))
+            .await
+            .unwrap();
+        // This test owns a gated foreground child. Unlike production file
+        // capture, it must be killed if an assertion unwinds before release.
+        grill
+            .processes
+            .lock()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .cleanup_on_drop = true;
+        grill.start(&id).await.unwrap();
+        let mut resume = crate::ketchup::types::CaptureOffsets::default();
+        resume.0.insert(stdout.clone(), prefix.len() as u64);
+        resume.0.insert(stderr.clone(), prefix.len() as u64);
+        // The child is still gated. Bind each checkpointed prefix to the
+        // actual descriptor that supplies its bytes, as the log store does.
+        for file in [&stdout, &stderr] {
+            let mut input = std::fs::File::open(file).unwrap();
+            let mut observed = Vec::new();
+            std::io::Read::read_to_end(&mut input, &mut observed).unwrap();
+            assert_eq!(observed, prefix);
+            resume.1.insert(
+                file.clone(),
+                crate::ketchup::types::CaptureFileIdentity::of(&input.metadata().unwrap()),
+            );
+        }
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let follow = grill.follow_logs(&id, sender, &resume);
+        tokio::pin!(follow);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while *entered.borrow_and_update() == 0 {
+                tokio::select! {
+                    _ = follow.as_mut() => panic!("file follow returned before its empty-scan gate"),
+                    change = entered.changed() => change.unwrap(),
+                }
+            }
+        }).await.unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "fixture emitted before the empty scan"
+        );
+        // The first file reads have already returned EOF. Only now does the
+        // real child publish both final writes and exit; the follower is
+        // still held before its state observation.
+        std::fs::write(&release_child, "release").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            grill
+                .processes
+                .lock()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .child
+                .as_mut()
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), follow.as_mut())
+            .await
+            .unwrap();
+        let mut captured = Vec::new();
+        while let Some(line) = receiver.recv().await {
+            captured.push(line);
+        }
+        assert_eq!(
+            captured.len(),
+            2,
+            "file follower treated its pre-exit EOF as final"
+        );
+        for (line, stream, file, text) in [
+            (
+                &captured[0],
+                crate::ketchup::types::LogStream::Stdout,
+                &stdout,
+                "final-out",
+            ),
+            (
+                &captured[1],
+                crate::ketchup::types::LogStream::Stderr,
+                &stderr,
+                "final-err",
+            ),
+        ] {
+            assert_eq!(line.stream, stream);
+            assert_eq!(line.line, text);
+            let position = line.position.as_ref().unwrap();
+            assert_eq!(&position.file, file);
+            assert_eq!(position.end_offset, prefix.len() as u64 + 10);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_follow_rescans_after_eof_before_actual_child_exit() {
+        assert_file_follow_rescans_after_empty_read_then_child_exit(false).await;
+    }
+
+    #[tokio::test]
+    async fn resumed_file_follow_keeps_offsets_across_eof_before_actual_child_exit() {
+        assert_file_follow_rescans_after_empty_read_then_child_exit(true).await;
     }
 }

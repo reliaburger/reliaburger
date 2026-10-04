@@ -163,11 +163,20 @@ in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs
 
 Point the config at a repository and the council leader keeps the cluster in
 step with it. It merges the TOML files under `path` (an app declared in two
-files is an error) and validates the result like `relish apply`. Unlike
-`relish compile`, it doesn't derive namespaces from directories or read
-`_defaults.toml`, so set `namespace` in each app. And unlike `apply`, which
-only adds and updates, GitOps reconciles: delete an app from the repository
-and it goes from the cluster.
+files is an error) and validates the result like `relish apply`. Its watched
+tree uses the same inherited `_defaults.toml` values and directory namespaces
+as `relish compile`. The configured `path` is the root: its own name adds no
+namespace, and defaults outside it are not inherited. A workload's explicit
+namespace wins. GitOps reconciles deletions too: delete an app from the
+repository and it goes from the cluster.
+
+GitOps reconciles apps, namespaces and permissions. Any `[job.*]` declaration,
+including a cron registration or a `run_before = ["app.web"]` migration, refuses
+the whole commit before desired-state writes. The failed sync names the jobs;
+the applied SHA stays at the previous successful commit. Use `relish apply`
+with the migration and dependent app in the same manifest to execute their
+ordering, or `relish batch` for batch work. Lettuce has no durable job identity
+or dispatch path tied to a Git revision yet.
 
 ```toml
 [gitops]
@@ -206,6 +215,24 @@ endpoint needs no token, only the HMAC signature (`X-Hub-Signature-256`) or
 GitLab's `X-Gitlab-Token`. It refuses replays and is rate-limited
 (`webhook_rate_limit`, 10 a minute by default). A delivery refused for the
 rate limit isn't counted as seen, so the provider's retry gets through.
+
+A follower forwards an authenticated webhook to the leader. A clustered
+`202 Accepted` confirms that the cluster has durably accepted the delivery;
+the sync finishes later and pending work survives a leader change. A push
+arriving during a sync remains pending for a later run. If leadership or
+replication cannot be confirmed, the endpoint returns `503`; retrying the
+original delivery ID is safe. Admission has one five-second budget, including
+waiting for the validator, resolving the leader and forwarding or replicating
+the trigger. Timing out releases the local rate and replay reservation.
+The cluster retains the most recent 1,000
+committed delivery IDs across restarts and leader changes. A delivery still
+in that inventory is refused as a replay; one that was not admitted can be
+tried again. Older delivery IDs can be admitted again after eviction.
+
+Durable webhook admission changes both protocol and state formats. Check
+`bun --compatibility` before upgrading. Before 1.0, recreate the cluster
+with matching new binaries and re-apply the repository; older-format logs
+and snapshots are refused rather than migrated.
 
 ## Backing up the council
 

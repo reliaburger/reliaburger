@@ -23,6 +23,8 @@ pub enum PlanAction {
     /// untouched; `relish stop` removes it.
     NotInConfig,
     Unchanged,
+    /// The live endpoint lacks complete desired-spec evidence.
+    Unknown,
 }
 
 impl fmt::Display for PlanAction {
@@ -32,6 +34,7 @@ impl fmt::Display for PlanAction {
             PlanAction::Update => write!(f, "~"),
             PlanAction::NotInConfig => write!(f, "*"),
             PlanAction::Unchanged => write!(f, " "),
+            PlanAction::Unknown => write!(f, "?"),
         }
     }
 }
@@ -43,6 +46,7 @@ impl Serialize for PlanAction {
             PlanAction::Update => serializer.serialize_str("update"),
             PlanAction::NotInConfig => serializer.serialize_str("not_in_config"),
             PlanAction::Unchanged => serializer.serialize_str("unchanged"),
+            PlanAction::Unknown => serializer.serialize_str("unknown"),
         }
     }
 }
@@ -68,24 +72,30 @@ pub struct ApplyPlan {
     /// informational; apply does not remove them.
     pub not_in_config: usize,
     pub unchanged: usize,
+    /// Resources with incomplete live evidence.
+    pub unknown: usize,
+    /// Whether any live state was available for comparison.
+    pub comparison_available: bool,
 }
 
 /// Snapshot of a currently deployed resource for diffing.
 ///
-/// Fetched from a live agent (`GET /v1/apps`) by the dry-run path. The
-/// `image` field is used to detect updates (image change).
+/// Fetched from `GET /v1/apps`. A complete fingerprint proves equality;
+/// image-only evidence can prove an image change but cannot prove equality.
 #[derive(Debug, Clone)]
 pub struct CurrentResource {
     /// Resource identifier matching the plan format, e.g. "app.web".
     pub resource: String,
     /// Current image, if applicable.
     pub image: Option<String>,
+    /// Complete effective desired-spec fingerprint, when known.
+    pub fingerprint: Option<String>,
 }
 
 /// Generate an apply plan from a parsed config.
 ///
-/// When `current` is `None`, all entries are `Create` (single-node, no prior
-/// state). When `Some`, the plan diffs against the current state.
+/// Without a live comparison, creates are an explicit offline assumption.
+/// Live entries require full specification evidence to report unchanged.
 pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> ApplyPlan {
     let mut entries = Vec::new();
     let mut desired_resources = BTreeSet::new();
@@ -99,7 +109,10 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
 
     // Apps
     for (name, app) in &config.app {
-        let resource_key = format!("app.{name}");
+        let resource_key = crate::config::fingerprint::app_resource_key(
+            name,
+            app.namespace.as_deref().unwrap_or("default"),
+        );
         desired_resources.insert(resource_key.clone());
 
         let mut summary = Vec::new();
@@ -125,13 +138,11 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
 
         let action = match current_map.get(resource_key.as_str()) {
             None => PlanAction::Create,
-            Some(existing) => {
-                if existing.image.as_deref() != app.image.as_deref() {
-                    PlanAction::Update
-                } else {
-                    PlanAction::Unchanged
-                }
-            }
+            Some(existing) => compare_spec(
+                existing,
+                crate::config::fingerprint::app_fingerprint(app),
+                app.image.as_deref(),
+            ),
         };
 
         entries.push(PlanEntry {
@@ -143,7 +154,10 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
 
     // Jobs
     for (name, job) in &config.job {
-        let resource_key = format!("job.{name}");
+        let resource_key = crate::config::fingerprint::job_resource_key(
+            name,
+            job.namespace.as_deref().unwrap_or("default"),
+        );
         desired_resources.insert(resource_key.clone());
 
         let mut summary = Vec::new();
@@ -159,13 +173,11 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
 
         let action = match current_map.get(resource_key.as_str()) {
             None => PlanAction::Create,
-            Some(existing) => {
-                if existing.image.as_deref() != job.image.as_deref() {
-                    PlanAction::Update
-                } else {
-                    PlanAction::Unchanged
-                }
-            }
+            Some(existing) => compare_spec(
+                existing,
+                crate::config::fingerprint::job_fingerprint(job),
+                job.image.as_deref(),
+            ),
         };
 
         entries.push(PlanEntry {
@@ -176,14 +188,17 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
     }
 
     // Namespaces
-    for name in config.namespace.keys() {
+    for (name, spec) in &config.namespace {
         let resource_key = format!("namespace.{name}");
         desired_resources.insert(resource_key.clone());
 
-        let action = if current_map.contains_key(resource_key.as_str()) {
-            PlanAction::Unchanged
-        } else {
-            PlanAction::Create
+        let action = match current_map.get(resource_key.as_str()) {
+            Some(existing) => compare_spec(
+                existing,
+                crate::config::fingerprint::spec_fingerprint(spec),
+                None,
+            ),
+            None => PlanAction::Create,
         };
 
         entries.push(PlanEntry {
@@ -194,14 +209,17 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
     }
 
     // Permissions
-    for name in config.permission.keys() {
+    for (name, spec) in &config.permission {
         let resource_key = format!("permission.{name}");
         desired_resources.insert(resource_key.clone());
 
-        let action = if current_map.contains_key(resource_key.as_str()) {
-            PlanAction::Unchanged
-        } else {
-            PlanAction::Create
+        let action = match current_map.get(resource_key.as_str()) {
+            Some(existing) => compare_spec(
+                existing,
+                crate::config::fingerprint::spec_fingerprint(spec),
+                None,
+            ),
+            None => PlanAction::Create,
         };
 
         entries.push(PlanEntry {
@@ -242,12 +260,33 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         .filter(|e| e.action == PlanAction::Unchanged)
         .count();
 
+    let unknown = entries
+        .iter()
+        .filter(|entry| entry.action == PlanAction::Unknown)
+        .count();
     ApplyPlan {
+        unknown,
+        comparison_available: current.is_some(),
         entries,
         to_create,
         to_update,
         not_in_config,
         unchanged,
+    }
+}
+
+fn compare_spec(
+    current: &CurrentResource,
+    desired: Option<String>,
+    desired_image: Option<&str>,
+) -> PlanAction {
+    match (&current.fingerprint, desired) {
+        (Some(actual), Some(desired)) if *actual == desired => PlanAction::Unchanged,
+        (Some(_), Some(_)) => PlanAction::Update,
+        _ if current.image.is_some() && current.image.as_deref() != desired_image => {
+            PlanAction::Update
+        }
+        _ => PlanAction::Unknown,
     }
 }
 
@@ -257,6 +296,12 @@ impl fmt::Display for ApplyPlan {
             writeln!(f, "Relish apply plan:")?;
             writeln!(f)?;
             write!(f, "Plan: 0 to create, 0 to update, 0 unchanged.")?;
+            if !self.comparison_available {
+                write!(
+                    f,
+                    "\nNo live comparison was available; creates are an offline assumption."
+                )?;
+            }
             return Ok(());
         }
 
@@ -279,6 +324,19 @@ impl fmt::Display for ApplyPlan {
             "Plan: {} to create, {} to update, {} unchanged.",
             self.to_create, self.to_update, self.unchanged
         )?;
+        if self.unknown > 0 {
+            write!(
+                f,
+                "\n{} resource(s) have incomplete desired-spec evidence; change status is unknown.",
+                self.unknown
+            )?;
+        }
+        if !self.comparison_available {
+            write!(
+                f,
+                "\nNo live comparison was available; creates are an offline assumption."
+            )?;
+        }
         if self.not_in_config > 0 {
             write!(
                 f,
@@ -296,6 +354,110 @@ mod tests {
 
     fn parse_config(toml: &str) -> Config {
         Config::parse(toml).unwrap()
+    }
+
+    #[test]
+    fn every_resource_family_compares_complete_specs() {
+        let original = parse_config(
+            r#"
+[app.web]
+image = "web:v1"
+[job.migrate]
+image = "web:v1"
+[namespace.team]
+cpu = "2000m"
+[permission.reader]
+actions = ["logs"]
+apps = ["web"]
+"#,
+        );
+        let current = [
+            CurrentResource {
+                resource: "app.web".into(),
+                image: Some("web:v1".into()),
+                fingerprint: crate::config::fingerprint::app_fingerprint(&original.app["web"]),
+            },
+            CurrentResource {
+                resource: "job.migrate".into(),
+                image: Some("web:v1".into()),
+                fingerprint: crate::config::fingerprint::job_fingerprint(&original.job["migrate"]),
+            },
+            CurrentResource {
+                resource: "namespace.team".into(),
+                image: None,
+                fingerprint: crate::config::fingerprint::spec_fingerprint(
+                    &original.namespace["team"],
+                ),
+            },
+            CurrentResource {
+                resource: "permission.reader".into(),
+                image: None,
+                fingerprint: crate::config::fingerprint::spec_fingerprint(
+                    &original.permission["reader"],
+                ),
+            },
+        ];
+        assert_eq!(generate_plan(&original, Some(&current)).unchanged, 4);
+        let mut changed = original.clone();
+        changed.app.get_mut("web").unwrap().port = Some(8080);
+        changed.job.get_mut("migrate").unwrap().command = Some(vec!["migrate-v2".into()]);
+        changed.namespace.get_mut("team").unwrap().cpu = Some("4000m".into());
+        changed
+            .permission
+            .get_mut("reader")
+            .unwrap()
+            .actions
+            .push("metrics".into());
+        let plan = generate_plan(&changed, Some(&current));
+        assert_eq!(plan.to_update, 4, "{plan:?}");
+        assert_eq!(plan.unchanged, 0);
+    }
+
+    #[test]
+    fn offline_and_partial_evidence_are_explicit_in_text_and_json() {
+        let config = parse_config("[app.web]\nimage = 'web:v1'\n");
+        let offline = generate_plan(&config, None);
+        assert!(!offline.comparison_available);
+        assert!(offline.to_string().contains("offline"));
+        let partial = generate_plan(
+            &config,
+            Some(&[CurrentResource {
+                resource: "app.web".into(),
+                image: Some("web:v1".into()),
+                fingerprint: None,
+            }]),
+        );
+        assert_eq!(partial.unknown, 1);
+        assert_eq!(partial.unchanged, 0);
+        let json = serde_json::to_value(&partial).unwrap();
+        assert_eq!(json["entries"][0]["action"], "unknown");
+        assert!(partial.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn image_only_evidence_cannot_prove_unchanged_workloads() {
+        let config = parse_config(
+            "[app.web]\nimage = \"web:v1\"\nreplicas = 9\nport = 9999\n[app.web.env]\nMODE = \"changed\"\n",
+        );
+        let current = [CurrentResource {
+            resource: "app.web".into(),
+            image: Some("web:v1".into()),
+            fingerprint: None,
+        }];
+        let plan = generate_plan(&config, Some(&current));
+        assert_ne!(plan.entries[0].action, PlanAction::Unchanged);
+    }
+
+    #[test]
+    fn namespaced_workloads_do_not_use_other_namespaces_evidence() {
+        let config = parse_config("[app.web]\nimage = \"web:v1\"\nnamespace = \"prod\"\n");
+        let current = [CurrentResource {
+            resource: "app.web".into(),
+            image: Some("web:v1".into()),
+            fingerprint: None,
+        }];
+        let plan = generate_plan(&config, Some(&current));
+        assert_ne!(plan.entries[0].action, PlanAction::Unchanged);
     }
 
     #[test]
@@ -593,6 +755,7 @@ mod tests {
         let current = vec![CurrentResource {
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
+            fingerprint: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         assert_eq!(plan.entries[0].action, PlanAction::Update);
@@ -611,6 +774,7 @@ mod tests {
         let current = vec![CurrentResource {
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
+            fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["web"]),
         }];
         let plan = generate_plan(&config, Some(&current));
         assert_eq!(plan.entries[0].action, PlanAction::Unchanged);
@@ -630,10 +794,12 @@ mod tests {
             CurrentResource {
                 resource: "app.web".to_string(),
                 image: Some("myapp:v1".to_string()),
+                fingerprint: None,
             },
             CurrentResource {
                 resource: "app.old-service".to_string(),
                 image: Some("old:v3".to_string()),
+                fingerprint: None,
             },
         ];
         let plan = generate_plan(&config, Some(&current));
@@ -662,14 +828,17 @@ mod tests {
             CurrentResource {
                 resource: "app.web".to_string(),
                 image: Some("myapp:v1".to_string()),
+                fingerprint: None,
             },
             CurrentResource {
                 resource: "app.api".to_string(),
                 image: Some("api:v1".to_string()),
+                fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["api"]),
             },
             CurrentResource {
                 resource: "app.removed".to_string(),
                 image: Some("old:v1".to_string()),
+                fingerprint: None,
             },
         ];
         let plan = generate_plan(&config, Some(&current));
@@ -691,6 +860,7 @@ mod tests {
         let current = vec![CurrentResource {
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
+            fingerprint: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         let output = plan.to_string();
@@ -703,6 +873,7 @@ mod tests {
         let current = vec![CurrentResource {
             resource: "app.old".to_string(),
             image: Some("old:v1".to_string()),
+            fingerprint: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         let output = plan.to_string();
@@ -726,6 +897,7 @@ mod tests {
         let current = vec![CurrentResource {
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
+            fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["web"]),
         }];
         let plan = generate_plan(&config, Some(&current));
         let output = plan.to_string();

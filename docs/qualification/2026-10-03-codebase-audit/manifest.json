@@ -1,0 +1,226 @@
+[
+  {
+    "slug": "volume-backing-image-collision",
+    "title": "Distinct managed volume paths can share a loop image and reformat each other\u2019s data",
+    "priority": "P1",
+    "verification": "Validation/path reproduced; Linux formatting path verified",
+    "id": "01",
+    "filename": "01-volume-backing-image-collision.md"
+  },
+  {
+    "slug": "build-signature-one-hour-expiry",
+    "title": "Build signer expiry breaks later builds and redeployment of cluster-signed images after one hour",
+    "priority": "P1",
+    "verification": "Full source path; existing clock-injected expiry test",
+    "id": "02",
+    "filename": "02-build-signature-one-hour-expiry.md"
+  },
+  {
+    "slug": "batch-workload-authorization",
+    "title": "Batch submission bypasses token workload scope and Deploy/HostExec grants",
+    "priority": "P1",
+    "verification": "Authenticated router dispatch reproduced",
+    "id": "03",
+    "filename": "03-batch-workload-authorization.md"
+  },
+  {
+    "slug": "manifest-descriptor-authorization",
+    "title": "Manifest publication bypasses repository isolation for globally stored blob references",
+    "priority": "P1",
+    "verification": "Full authorization and publication source path",
+    "id": "04",
+    "filename": "04-manifest-descriptor-authorization.md"
+  },
+  {
+    "slug": "log-flush-data-loss",
+    "title": "Failed Ketchup flush discards rows and advances replay checkpoints past lost data",
+    "priority": "P1",
+    "verification": "Failed flush, replay refusal and restart loss reproduced",
+    "id": "05",
+    "filename": "05-log-flush-data-loss.md"
+  },
+  {
+    "slug": "metrics-object-key-collision",
+    "title": "Metrics writers sharing an object-store prefix overwrite each other\u2019s Parquet chunks",
+    "priority": "P1",
+    "verification": "Two production stores using file:// reproduced",
+    "id": "06",
+    "filename": "06-metrics-object-key-collision.md"
+  },
+  {
+    "slug": "cluster-migration-gate",
+    "title": "Cluster apply commits dependent app revisions before run_before migrations complete",
+    "priority": "P1",
+    "verification": "Cluster and agent production paths verified; no live council run",
+    "id": "07",
+    "filename": "07-cluster-migration-gate.md"
+  },
+  {
+    "slug": "batch-stale-run-completion",
+    "title": "A previous job\u2019s terminal status can falsely complete a new batch before launch",
+    "priority": "P1",
+    "verification": "Real router and delayed fake agent acknowledgement reproduced",
+    "id": "08",
+    "filename": "08-batch-stale-run-completion.md"
+  },
+  {
+    "slug": "ingress-health-rebuild",
+    "title": "Ingress table rebuilds resurrect failed backends and continued probes never exclude them",
+    "priority": "P1",
+    "verification": "Production probe loop and table rebuild reproduced",
+    "id": "09",
+    "filename": "09-ingress-health-rebuild.md"
+  },
+  {
+    "slug": "ingress-backend-redirects",
+    "title": "Ingress follows backend redirects and loses the original status, Location and cookies",
+    "priority": "P1",
+    "verification": "Real production proxy with loopback backend reproduced",
+    "id": "10",
+    "filename": "10-ingress-backend-redirects.md"
+  },
+  {
+    "slug": "consumer-backend-capacity",
+    "title": "One service with more than 32 cluster backends blocks publication of the whole consumer view",
+    "priority": "P1",
+    "verification": "33-endpoint map failure reproduced; production publication traced",
+    "id": "11",
+    "filename": "11-consumer-backend-capacity.md"
+  },
+  {
+    "slug": "registry-blocking-token-verification",
+    "title": "Registry token verification bypasses bounded Argon2 admission and blocks Tokio workers",
+    "priority": "P1",
+    "verification": "Complete synchronous verification call path",
+    "id": "12",
+    "filename": "12-registry-blocking-token-verification.md"
+  },
+  {
+    "slug": "registry-physical-storage-quota",
+    "title": "images.max_storage does not bound bare blobs or temporary uploads on disk",
+    "priority": "P1",
+    "verification": "Quota accounting and all normal upload paths verified",
+    "id": "13",
+    "filename": "13-registry-physical-storage-quota.md"
+  },
+  {
+    "slug": "cron-step-overflow",
+    "title": "Large cron steps panic in debug and schedule every minute in release",
+    "priority": "P2",
+    "verification": "Current library/debug and exact-source/release reproduced",
+    "id": "14",
+    "filename": "14-cron-step-overflow.md"
+  },
+  {
+    "slug": "batch-duplicate-identities",
+    "title": "Duplicate batch job names silently drop work and leave completion tracking stuck",
+    "priority": "P2",
+    "verification": "Real router dispatch and tracker state reproduced",
+    "id": "15",
+    "filename": "15-batch-duplicate-identities.md"
+  },
+  {
+    "slug": "batch-capacity-admission",
+    "title": "Cluster batches use stale or unlimited fallback capacity and do not retain admission reservations",
+    "priority": "P2",
+    "verification": "Capacity translation, fallback and durable tracker source path",
+    "id": "16",
+    "filename": "16-batch-capacity-admission.md"
+  },
+  {
+    "slug": "ingress-stream-timeout",
+    "title": "Ingress aborts healthy SSE and download streams after 30 seconds",
+    "priority": "P2",
+    "verification": "Active 40-second backend stream aborted at 30 seconds",
+    "id": "17",
+    "filename": "17-ingress-stream-timeout.md"
+  },
+  {
+    "slug": "external-dns-tcp",
+    "title": "External DNS queries fail over TCP, including retries after truncated UDP answers",
+    "priority": "P2",
+    "verification": "Real UDP/TCP responder and mock upstream reproduced",
+    "id": "18",
+    "filename": "18-external-dns-tcp.md"
+  },
+  {
+    "slug": "compile-namespace-collision",
+    "title": "Directory compile silently drops same-named workloads from distinct namespaces",
+    "priority": "P1",
+    "verification": "Two-file directory compilation reproduced",
+    "id": "19",
+    "filename": "19-compile-namespace-collision.md"
+  },
+  {
+    "slug": "compile-ignored-defaults",
+    "title": "_defaults.toml silently ignores shared environment, memory and deployment settings",
+    "priority": "P2",
+    "verification": "Documented defaults fixture compiled; fields absent",
+    "id": "20",
+    "filename": "20-compile-ignored-defaults.md"
+  },
+  {
+    "slug": "gitops-directory-semantics",
+    "title": "GitOps rejects _defaults.toml and ignores directory-derived namespaces",
+    "priority": "P2",
+    "verification": "Production execute_sync on local Git repository reproduced",
+    "id": "21",
+    "filename": "21-gitops-directory-semantics.md"
+  },
+  {
+    "slug": "gitops-silently-ignored-jobs",
+    "title": "GitOps reports successful sync while dropping jobs and migration prerequisites",
+    "priority": "P1",
+    "verification": "Production execute_sync with app and migration job reproduced",
+    "id": "22",
+    "filename": "22-gitops-silently-ignored-jobs.md"
+  },
+  {
+    "slug": "dry-run-incomplete-diff",
+    "title": "apply --dry-run calls materially changed workloads unchanged when the image is unchanged",
+    "priority": "P2",
+    "verification": "Plan generated with changed replicas, port and env reproduced",
+    "id": "23",
+    "filename": "23-dry-run-incomplete-diff.md"
+  },
+  {
+    "slug": "cli-existing-namespace-validation",
+    "title": "CLI rejects permission and build manifests that refer to an already-created cluster namespace",
+    "priority": "P2",
+    "verification": "Same config refused locally and accepted by validate_against reproduced",
+    "id": "24",
+    "filename": "24-cli-existing-namespace-validation.md"
+  },
+  {
+    "slug": "compile-partial-success",
+    "title": "Directory compile exits successfully and emits an incomplete manifest after workload parse failures",
+    "priority": "P2",
+    "verification": "Good plus malformed file returns successful partial config",
+    "id": "25",
+    "filename": "25-compile-partial-success.md"
+  },
+  {
+    "slug": "follower-webhook-lost-trigger",
+    "title": "GitOps webhook returns 202 on followers but discards the trigger before leader sync",
+    "priority": "P2",
+    "verification": "API queue, per-node startup and leader-gated runner traced",
+    "id": "26",
+    "filename": "26-follower-webhook-lost-trigger.md"
+  },
+  {
+    "slug": "autoscale-invalid-targets",
+    "title": "Autoscaling accepts nonpositive and nonfinite targets, disabling or corrupting scaling decisions",
+    "priority": "P2",
+    "verification": "Current Config validation accepts all four invalid values",
+    "id": "27",
+    "filename": "27-autoscale-invalid-targets.md"
+  },
+  {
+    "slug": "cross-path-contracts-and-lifecycle-hardening",
+    "title": "Unify behavioral contracts across entry points and add lifecycle regression coverage",
+    "priority": "P2",
+    "verification": "Cross-cutting follow-up plan based on verified drafts 01\u201327",
+    "id": "28",
+    "filename": "28-cross-path-contracts-and-lifecycle-hardening.md"
+  }
+]

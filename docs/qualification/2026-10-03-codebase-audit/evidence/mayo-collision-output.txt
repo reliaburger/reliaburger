@@ -1,0 +1,5 @@
+Parent rerun of /tmp/reliaburger-mayo-collision-repro, 3 October 2026.
+
+after node a flush [(100, "cpu", "{\"node\":\"a\"}", 11.0)]
+after node b flush [(100, "cpu", "{\"node\":\"b\"}", 22.0)]
+remote files=["metrics_000000.parquet"]

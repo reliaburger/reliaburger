@@ -1,0 +1,903 @@
+{
+  "review_date": "2026-10-03",
+  "issues_reviewed": 112,
+  "comments_reviewed": 32,
+  "issues": [
+    {
+      "number": 510,
+      "title": "The leader resigns for disk pressure when unexported logs exceed max_storage_mb, though the disk is mostly free",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/510",
+      "comments_reviewed": 0,
+      "body_sha256": "7252dd83d1a17d78ec0ce435949a02198b9cd5be23f60fd96673df1300dd3b1c"
+    },
+    {
+      "number": 509,
+      "title": "A pooled peer connection keeps presenting an expired leaf after renewal, so Pickle replication gets 403 and clients get 503",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/509",
+      "comments_reviewed": 0,
+      "body_sha256": "4ed553d89423eda91699184db68d3aaa6d0b92c26f03c1addf326329ec8edb32"
+    },
+    {
+      "number": 508,
+      "title": "status_answers_while_every_persist_waits_on_a_slow_disk: restart_step turn of 1109 ms on portable macOS",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/508",
+      "comments_reviewed": 0,
+      "body_sha256": "6f57630b839ca1774673d357d08c810e31fcd3d2f26eb83a528d21be11bf9364"
+    },
+    {
+      "number": 507,
+      "title": "Let's make the getting started awesome",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/507",
+      "comments_reviewed": 0,
+      "body_sha256": "74083a1d49f8072dd35dcda96be8d9c2b264d627100615ebc5a9e58e7e208617"
+    },
+    {
+      "number": 505,
+      "title": "sync_cluster_consumer turns run 0.3\u20131.2 s on the agent loop and fail the soak's 1 s turn budget",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/505",
+      "comments_reviewed": 0,
+      "body_sha256": "05eacbada6d6d7f9ff4dc2e45860c33ec79c46661ee49b48569808f0e7702b89"
+    },
+    {
+      "number": 500,
+      "title": "Flake: relish::local_context lock tests fail in a full parallel cargo test run",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/500",
+      "comments_reviewed": 0,
+      "body_sha256": "3082a03badc82308a9ccb51b0a3605dcbe1fb1bc35d67b35ccec689003033604"
+    },
+    {
+      "number": 497,
+      "title": "Flake: pickle::store upload_directory_owner_excludes_competitors_and_reclaims_on_replacement",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/497",
+      "comments_reviewed": 0,
+      "body_sha256": "2bed579f50067288ffef80c3bb5da7a271a535d00c0077ad1e4cc0d1904e0dee"
+    },
+    {
+      "number": 482,
+      "title": "Snapshot commands act on the receiving node's copy of the volume, not the app's node",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/482",
+      "comments_reviewed": 0,
+      "body_sha256": "6615e2fe652889ffad61b87e3bd8c108bc8df50f1d64d3f49763b3f66c8e66c7"
+    },
+    {
+      "number": 481,
+      "title": "Stopping a node's last local replica withdraws the whole service VIP, so local clients get EPERM",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/481",
+      "comments_reviewed": 0,
+      "body_sha256": "cdad8624d4eafdabb04118dc394bd74d718b83a514a2a26deab0bf0ef8da959f"
+    },
+    {
+      "number": 480,
+      "title": "A voter whose disk fills stops applying Raft for good, and wtf still reports a healthy council",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/480",
+      "comments_reviewed": 0,
+      "body_sha256": "170d0ada2acd27aaa23f38e23c132de1f1a8cfc0817d9b684daffb7336acf7de"
+    },
+    {
+      "number": 479,
+      "title": "Council recover without --from refuses on clusters below 10,000 Raft entries",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/479",
+      "comments_reviewed": 0,
+      "body_sha256": "a06d32ca7414a93340549a5632c08c9808b26b93ca65071dba09f9c1afbf70d4"
+    },
+    {
+      "number": 478,
+      "title": "A council recovered from an older backup never runs workloads: nodes refuse its regressed catalogue generation",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/478",
+      "comments_reviewed": 0,
+      "body_sha256": "e56a54d6765dd8512012075d57494a333284e8cf6b067316f23b1ba2f47a86f9"
+    },
+    {
+      "number": 477,
+      "title": "Council recover overwrites the restored security state, losing every API token",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/477",
+      "comments_reviewed": 0,
+      "body_sha256": "537d66ce4fcc2a995dfd386c64276814498f94ee8d95951e936c86b5ad47588e"
+    },
+    {
+      "number": 476,
+      "title": "A retired runc intent keeps decrypted secrets until the instance id starts again",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/476",
+      "comments_reviewed": 0,
+      "body_sha256": "cac6a3c462a37e38e93386ec5364e69855d13f0eb28dfdb968c5480440f4303c"
+    },
+    {
+      "number": 461,
+      "title": "Flake: gitops stuck-fetch test reads the pid file before the shell writes it",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/461",
+      "comments_reviewed": 0,
+      "body_sha256": "34c2f987669c4ebcbbb0f6c4168c972ad2539c595c82e4123dba2f5d31bdd5af"
+    },
+    {
+      "number": 456,
+      "title": "Flake: oci_crash::normal_rootless_bun_recovers_owned_forward_and_discovery, runtime_unknown never clears",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/456",
+      "comments_reviewed": 0,
+      "body_sha256": "9635dfe5e8fe296a51f42c3ebf8a6061fde35e67b2c03c1ca8ca2a11ab60eda4"
+    },
+    {
+      "number": 450,
+      "title": "Flake: podinfo_demo_feels_network_faults_between_frontend_and_redis sees cache round trips succeed through a partition",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/450",
+      "comments_reviewed": 0,
+      "body_sha256": "7f25929c06c916d0ea1b0522a700f2299cea828cb73a884608d7429885b0a47c"
+    },
+    {
+      "number": 448,
+      "title": "Flake: exec_request_is_sent_again_until_the_owner_listens misses the retry window under coverage load",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/448",
+      "comments_reviewed": 0,
+      "body_sha256": "f220e3155e34741f8c9b56ad2e1b302145ab6e14b085da94c94ef74139ed97be"
+    },
+    {
+      "number": 436,
+      "title": "Non-council worker returns empty desired state as successful cluster diagnostics",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/436",
+      "comments_reviewed": 0,
+      "body_sha256": "e5c58093ce4fbaf446d98cbec0f3a3713c7152f43d2a0ae831f5709a6d2b0f2e"
+    },
+    {
+      "number": 435,
+      "title": "Cluster stop reports completion before any worker confirms stopping",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/435",
+      "comments_reviewed": 0,
+      "body_sha256": "a6ee7ad93dad2733bf6d6d874649b9af54bdf06da3c87db4951d5d5bed76c818"
+    },
+    {
+      "number": 434,
+      "title": "Spec changes bypass resource and hard-label placement checks",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/434",
+      "comments_reviewed": 0,
+      "body_sha256": "d16e9a9bae279f7361366d4c94c01309f7a2ff6e00154cc3d811b427a48c8053"
+    },
+    {
+      "number": 433,
+      "title": "A daemon can lose its placement because its own running copy consumes capacity",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/433",
+      "comments_reviewed": 0,
+      "body_sha256": "c506fca4c16988b4b4193937d1fadfd8b391f47c50cad2a82488a40edd63a50a"
+    },
+    {
+      "number": 432,
+      "title": "Pending placements lose capacity reservations between scheduler ticks",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/432",
+      "comments_reviewed": 0,
+      "body_sha256": "4a068d1dc043612fb6585b2fdbd2e6f17ac6f7336aa227d1953adbe40d25c32e"
+    },
+    {
+      "number": 431,
+      "title": "Stale healthy endpoints survive report expiry indefinitely",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/431",
+      "comments_reviewed": 0,
+      "body_sha256": "eda634277f159ce4d237b679c894018c71e16db3c38a5b8c80ce0a2dcd1cc864"
+    },
+    {
+      "number": 430,
+      "title": "Recovery deletes old state before securing the replacement and bypasses open-file locks",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/430",
+      "comments_reviewed": 0,
+      "body_sha256": "0fb79d6df6665d3bc4696914a3d4557e5b0b168d009a00c37bd0c782b0f7b559"
+    },
+    {
+      "number": 429,
+      "title": "A recovered survivor with seed addresses never bootstraps",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/429",
+      "comments_reviewed": 0,
+      "body_sha256": "65f0082121c6ea69f423d8f6d8f54afb94372b21058755418d1b5bb4ec576027"
+    },
+    {
+      "number": 428,
+      "title": "Fresh or re-enrolled nodes cannot join a recovered council",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/428",
+      "comments_reviewed": 0,
+      "body_sha256": "5534deb0914eb8f689141c3da176a76b4b951054b92f7f29113a56658e13f1ef"
+    },
+    {
+      "number": 427,
+      "title": "Snapshot transfer advertises entries absent from its payload",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/427",
+      "comments_reviewed": 0,
+      "body_sha256": "1a7f53ec153bc3515dd9e1742a16a7353c03e89431115d3586156a97c404a438"
+    },
+    {
+      "number": 426,
+      "title": "Council snapshot install skips entries: get_current_snapshot labels stored snapshot with the live log position",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/426",
+      "comments_reviewed": 0,
+      "body_sha256": "8a06d41fc1aafe8acbd1cc8b3f0b02b696f5f315c6d3ecb44cf88a4816891fbb"
+    },
+    {
+      "number": 424,
+      "title": "Split brain after council recover: returning old voters re-form a quorum on the old epoch",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/424",
+      "comments_reviewed": 0,
+      "body_sha256": "8358b59e219c0602ca2be062fb5d38210ec8c0935dfa8538dc14529083e58ea2"
+    },
+    {
+      "number": 423,
+      "title": "Restarting bun moves a managed-volume app onto an empty volume",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/423",
+      "comments_reviewed": 0,
+      "body_sha256": "d4473899ceafc69d3c9d7b49729f3349a9936cf4b92790c409cd6c891f34c866"
+    },
+    {
+      "number": 422,
+      "title": "Split a startup retirement's completing turn so slow disks stay under the 1 s budget",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/422",
+      "comments_reviewed": 0,
+      "body_sha256": "f0fafc6562447148e2f960c81159c097b9b6d752e80c5542ed90f50a48acdccd"
+    },
+    {
+      "number": 419,
+      "title": "Move the two remaining fixed-timeout awaits off the agent loop (publication inventory, egress pre-start DNS)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/419",
+      "comments_reviewed": 0,
+      "body_sha256": "15f0cc770b45cb198d21998161b6f51793a1c71f746d8eaa730079e1ea38323f"
+    },
+    {
+      "number": 418,
+      "title": "Health tick ran 1 s after a whole-cluster restart: startup retirement waited on an unreachable leader",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/418",
+      "comments_reviewed": 0,
+      "body_sha256": "6f5e3c414f376cdc54b5c7f11a9d1b10b78f245a0240bbcb6380b0c4c8754cb2"
+    },
+    {
+      "number": 407,
+      "title": "Appliance W7: docs, retiring preview tools, Ubuntu 26.04 quickstart guest, and the Wyse exit test",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/407",
+      "comments_reviewed": 1,
+      "body_sha256": "db7124adce6682b5546bc8d633b7fe19f643cc6087a030cb42eec3cdcc9ca411"
+    },
+    {
+      "number": 406,
+      "title": "Appliance W6: OS updates run by bun (relish os)",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/406",
+      "comments_reviewed": 1,
+      "body_sha256": "01e182eaa475628d8b7c0fdea80d66942b16a2a09778acbb1955fcb1ac5c2531"
+    },
+    {
+      "number": 405,
+      "title": "Appliance W5: claim machines over the LAN",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/405",
+      "comments_reviewed": 1,
+      "body_sha256": "d90b4870602de7557e43ed79a759d4e140871f6f5e394d22413e3ce5deede4e8"
+    },
+    {
+      "number": 404,
+      "title": "Appliance W4: relish netboot",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/404",
+      "comments_reviewed": 1,
+      "body_sha256": "a859155671f0f340095a394d130d6254af943c9537fe49b6d2998415dd672374"
+    },
+    {
+      "number": 403,
+      "title": "Appliance W3: relish cluster create --bare-metal and relish image download/write/seed",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/403",
+      "comments_reviewed": 1,
+      "body_sha256": "01e5fbf62276455ff7a3f390418252c2743807a09ca9145a433bd282d164e3b4"
+    },
+    {
+      "number": 402,
+      "title": "Appliance W2: seed mode in bun (bun --appliance) and security gaps G1\u2013G4, G6",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/402",
+      "comments_reviewed": 0,
+      "body_sha256": "3d310a95fb529d14e3361f16bb21a3af7136cd27c767a64df4a2b97505bae2f8"
+    },
+    {
+      "number": 401,
+      "title": "Appliance W1: weekly signed OS builds and the OS channel",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/401",
+      "comments_reviewed": 0,
+      "body_sha256": "082d37856e35d39b57d7827e3726db411d1e8b5cb9c2f94f44e9cce07e5f95b1"
+    },
+    {
+      "number": 398,
+      "title": "Instance ordinals are per node, so every node's first replica is app-0",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/398",
+      "comments_reviewed": 0,
+      "body_sha256": "ff3bd27a47b56c7d8ac67c4daac7e038b1d4b08eb81459676fde01c804e7839a"
+    },
+    {
+      "number": 395,
+      "title": "Installer is silent for minutes while it downloads",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/395",
+      "comments_reviewed": 0,
+      "body_sha256": "5fc962f3e92ad0be82659db0857b23da2f6f2db3eecdcf2a751414632c5931e6"
+    },
+    {
+      "number": 393,
+      "title": "Execution fence's network-reference read can still fail on the turn budget",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/393",
+      "comments_reviewed": 0,
+      "body_sha256": "9fae9a537f3ab9c770af55708ba6f33c3fc0e84b8b16a7fccc50eb6cd67acfd0"
+    },
+    {
+      "number": 392,
+      "title": "F07 part 2: stderr capture, richer log filters, a merged live event stream, rollback over merged history",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/392",
+      "comments_reviewed": 1,
+      "body_sha256": "ff0e1fd5cb19cf7da622287bbd711ac4fa6c45fe9f9ab98194814563f7cc59a6"
+    },
+    {
+      "number": 389,
+      "title": "Process owner errors turn into a silent \"no exit code\"",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/389",
+      "comments_reviewed": 0,
+      "body_sha256": "9d93d718cbfa407f3a359ca2a6eb607e9ac770a79eec4247bb17030aa7943348"
+    },
+    {
+      "number": 387,
+      "title": "Flake: oci_crash stop fails with 'the runtime did not answer for the network reference within the turn'",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/387",
+      "comments_reviewed": 0,
+      "body_sha256": "da3def10c0b78e85cdfaf28216f45fdd34255f0c9f6300b88a47012208541cd9"
+    },
+    {
+      "number": 386,
+      "title": "Flake: bun::agent lease tests fail with \"preparing to preparing\" under load",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/386",
+      "comments_reviewed": 0,
+      "body_sha256": "808ca8d803e679983909049121bda4a766203ba4812e7c6be58563bf778b9681"
+    },
+    {
+      "number": 377,
+      "title": "Streamed metrics queries: Mayo and rollups stop loading every Parquet file",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/377",
+      "comments_reviewed": 0,
+      "body_sha256": "c0a052153f217038dc41f18a1c5978358d46c46d040283b6446c807e9fe81e01"
+    },
+    {
+      "number": 375,
+      "title": "CLI polish: relish images column width, and wtf listing [builds] twice",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/375",
+      "comments_reviewed": 0,
+      "body_sha256": "0d52e735d9311684541c31103eeece187fea2ba95c29b88c1adf81dd15192980"
+    },
+    {
+      "number": 373,
+      "title": "Self-upgrade cluster suite: docs disagree on how many council voters it forms",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/373",
+      "comments_reviewed": 0,
+      "body_sha256": "88bc84a8135a5e072cb63b0e310ea420645fa33a740f315eebcdf8679ee1c85e"
+    },
+    {
+      "number": 371,
+      "title": "A two-voter council accepts a rolling upgrade it can never finish",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/371",
+      "comments_reviewed": 0,
+      "body_sha256": "e903bff81be1d70e587020f7ad9a7ab071173b8cfa3e4d70d95548473d1205cf"
+    },
+    {
+      "number": 369,
+      "title": "F08: Complete WebSocket ingress parity and certificate automation (ACME)",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/369",
+      "comments_reviewed": 0,
+      "body_sha256": "b861e2392e96e82b6145f2cee4b3cfbbfc1d9857dda8ab7e460903c9b70dfb1a"
+    },
+    {
+      "number": 368,
+      "title": "F11: Finish supported Kubernetes translations",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/368",
+      "comments_reviewed": 0,
+      "body_sha256": "65c3fb9d385aea5c9c3919952b448a5921c0cea9ce81a6c2b767be0f1fd2785e"
+    },
+    {
+      "number": 367,
+      "title": "F10: Explicit managed-volume retirement and runtime parity. Direct Apple Container is disabled:",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/367",
+      "comments_reviewed": 0,
+      "body_sha256": "a27a5c35702a94ee0897e9cd2357acacd4da4a0a77bf5d70453fb12165eb6bf6"
+    },
+    {
+      "number": 366,
+      "title": "F09: Packet-level faults: delay is done",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/366",
+      "comments_reviewed": 0,
+      "body_sha256": "1637a4f869e2449bd47e25770fcc7944789878632188f90988274308d6ff5b62"
+    },
+    {
+      "number": 365,
+      "title": "F07: Finish cross-node views and log-stream capabilities",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/365",
+      "comments_reviewed": 1,
+      "body_sha256": "e72a0eafce7c8c98c625279d107cd0b33f526dd56c0f544f037cf45e01362117"
+    },
+    {
+      "number": 364,
+      "title": "F06: Complete the metrics/query and reporting architecture, including event production and vers",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/364",
+      "comments_reviewed": 1,
+      "body_sha256": "90879d45c3a29bc83bdfd38a02bda4a6af79375ef690339394be2b3bbf336395"
+    },
+    {
+      "number": 363,
+      "title": "F05: Complete namespace-scoped identity and token lifecycle",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/363",
+      "comments_reviewed": 2,
+      "body_sha256": "c378cb9a9212b917463196606d8da3d2bcb995d1f15d79c2b1fabe2776bb9beb"
+    },
+    {
+      "number": 362,
+      "title": "F04: Add supported CA recovery and rotation operations",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/362",
+      "comments_reviewed": 2,
+      "body_sha256": "8f945b71294872761052680ba8bffbb20c3260e9c859917dffc29c10654ad7f3"
+    },
+    {
+      "number": 361,
+      "title": "F03: Finish upstream image trust",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/361",
+      "comments_reviewed": 2,
+      "body_sha256": "2219794362f3c561cc378d809db86f4d2fcf255949560bff01c0d62d36f0cb21"
+    },
+    {
+      "number": 360,
+      "title": "F02: Complete rootless and process-workload isolation. Rootless Runc clusters are refused at st",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/360",
+      "comments_reviewed": 0,
+      "body_sha256": "852e7b7e38615488ce8ed14e512c5027a36c8afd7ff8762df2b017692e5c0320"
+    },
+    {
+      "number": 359,
+      "title": "F01: Propagate GPU capacity and cached-image placement evidence",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/359",
+      "comments_reviewed": 0,
+      "body_sha256": "a50544e4574791e3785529e888ed6aa2abd6653a7dd2e9ed42a16205afd7da7c"
+    },
+    {
+      "number": 358,
+      "title": "Flake: normal_rootless_bun_recovers_owned_forward_and_discovery sees no pid after an upgrade walk",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/358",
+      "comments_reviewed": 2,
+      "body_sha256": "c2d422b3bc6cf6c2b0a076e1c1a19ea6b5bc67719706af4a929be1a383f3dd90"
+    },
+    {
+      "number": 353,
+      "title": "Pull-through cache stores only the first puller's platform for a multi-platform upstream image",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/353",
+      "comments_reviewed": 0,
+      "body_sha256": "9d3b5ea5938d9456e240f109e864476fdc04f83934fa4da3d9b0492106d3f527"
+    },
+    {
+      "number": 351,
+      "title": "Agent loop: meter, starvation harness and no long inline awaits",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/351",
+      "comments_reviewed": 1,
+      "body_sha256": "17a8601c4fb5596dc584e2c7632bf0c90a83b744ce9cb97e1d485ac2fe69730f"
+    },
+    {
+      "number": 346,
+      "title": "After a node dies, the scheduler packs all replicas onto one survivor and stops a healthy replica",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/346",
+      "comments_reviewed": 0,
+      "body_sha256": "496c4dc15c754a4ee131c637d659a96a1fe40e4daec6204280ebbe428311b09b"
+    },
+    {
+      "number": 342,
+      "title": "Node-kill cluster test sends its fault before the council membership settles",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/342",
+      "comments_reviewed": 0,
+      "body_sha256": "120b70e18811fcf9d5823bddcefd92b21d16d14509ad89f2ab088e09c0da74f1"
+    },
+    {
+      "number": 340,
+      "title": "Snapshot operation answers before releasing its volume reservation, so an immediate follow-up gets a spurious 409",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/340",
+      "comments_reviewed": 0,
+      "body_sha256": "2bf9a0f95b4b19f243d696daa605d84c2d2c1fdf8b4c70ade9f801782d14483d"
+    },
+    {
+      "number": 339,
+      "title": "Upgrades: refuse an incompatible release before starting a run, and name the version in quickstart refusals",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/339",
+      "comments_reviewed": 1,
+      "body_sha256": "14e47b9906ba901bc1a562453b535f8ff003bafa3b40966efdf2fc53637282c6"
+    },
+    {
+      "number": 335,
+      "title": "Flake: lost_exec_owner_keeps_application_retirement_unconfirmed unwraps ESRCH in cleanup",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/335",
+      "comments_reviewed": 0,
+      "body_sha256": "070bff961e63660c4fb4f7948a313e87ce5e902f2f978347a54b6668fa8c93ca"
+    },
+    {
+      "number": 334,
+      "title": "Should entry-node fault pre-checks read the leader's gossip view? (C6.4)",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/334",
+      "comments_reviewed": 0,
+      "body_sha256": "96ac432896abaa177fdea539999de9fe9c9fe993719b1de514d385379dc70edf"
+    },
+    {
+      "number": 333,
+      "title": "Quickstart setup: restarting all three silent VMs at once failed on Lima's user-v2 socket",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/333",
+      "comments_reviewed": 0,
+      "body_sha256": "adb75a87ccefa9835fc4a83fdadd8d9c169a0987db8217a56929aba8d9eecdc1"
+    },
+    {
+      "number": 331,
+      "title": "A build on a follower can't be signed: the build signer and AttachSignature need the leader",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/331",
+      "comments_reviewed": 0,
+      "body_sha256": "f6f6f858b0ae1ce5b3569c6a81d14693fc36a0aa93a4a011ac242daf6fd488cb"
+    },
+    {
+      "number": 326,
+      "title": "Show a durable \"blocked by quota\" status for apps the scheduler won't place",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/326",
+      "comments_reviewed": 0,
+      "body_sha256": "218f60a8f7cb5633049ce279d4e79b5deb58f0f6673cb80313d554536f03e022"
+    },
+    {
+      "number": 322,
+      "title": "Wrapper returns 502 when a pooled keep-alive connection was already closed by the backend",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/322",
+      "comments_reviewed": 0,
+      "body_sha256": "2a5035c1f1efd0bf67ef6d35cccf64393a98a85ca46e77759df9ea211debca50"
+    },
+    {
+      "number": 320,
+      "title": "Known capability gaps after 0.1.0 (F01\u2013F12)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/320",
+      "comments_reviewed": 2,
+      "body_sha256": "c6f2e3e4eccfc875729e54d788dd9a47e43b3cd2c43d14ddf17f6b2fcfa503b9"
+    },
+    {
+      "number": 319,
+      "title": "H05: split large modules along existing ownership boundaries",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/319",
+      "comments_reviewed": 0,
+      "body_sha256": "63c9e26bc3617c02d0e148bed60c35b5229b2fb4618e9aee08bda3dfb8a223d7"
+    },
+    {
+      "number": 318,
+      "title": "Flaky: process_recovery::workload_retirement_waits_for_exec_processes (\"parent did not retire\")",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/318",
+      "comments_reviewed": 0,
+      "body_sha256": "0bb3b28a02b0d09cbcbdc9921c5467aa4b06a6fff126032a2efb59674bde7dd3"
+    },
+    {
+      "number": 317,
+      "title": "Re-record the homepage tour against the published release",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/317",
+      "comments_reviewed": 2,
+      "body_sha256": "fe2d81d73e18ef7b801b1b2c94a332d43e103d646065e4a6eefb63ca36a9cfa5"
+    },
+    {
+      "number": 315,
+      "title": "Website: a full CLI walkthrough and a searchable command reference",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/315",
+      "comments_reviewed": 0,
+      "body_sha256": "adf6073a0f816aa914dd244c831c41afed0f4be760e1e8d6f1a11ac84ce9f458"
+    },
+    {
+      "number": 314,
+      "title": "relish build uploads to localhost:5050 on a quickstart laptop, where nothing listens",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/314",
+      "comments_reviewed": 0,
+      "body_sha256": "094311b2197fd572c482ffc654469556f503da804c67b8f8e67dd4c7717d4d37"
+    },
+    {
+      "number": 311,
+      "title": "Book v2: a distilled rewrite of \"Building Reliaburger\", alongside v1",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/311",
+      "comments_reviewed": 2,
+      "body_sha256": "a42793fed9e7c538c66737a87272c6c82da829364ab7b4c6545de7f245e27ad9"
+    },
+    {
+      "number": 310,
+      "title": "Mayo memory grows over a long soak",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/310",
+      "comments_reviewed": 0,
+      "body_sha256": "c486f0be6c1615c9aa76227855806b8964adb9215ee603e3ee05cae977e5d744"
+    },
+    {
+      "number": 309,
+      "title": "\"local service requires its committed cluster allocation\" on the first deploy after a starved one",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/309",
+      "comments_reviewed": 0,
+      "body_sha256": "18174bfc4466872c800d2bb11015c2a54f7fe6a2c2f87935ec723961a45ed1b4"
+    },
+    {
+      "number": 308,
+      "title": "Log forwarders restart from the start of the capture file instead of the ingest checkpoint",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/308",
+      "comments_reviewed": 0,
+      "body_sha256": "34055c171f1852638c10d5e757ff9c7e43bb6e9e6748a16bb54981d84be6efd9"
+    },
+    {
+      "number": 307,
+      "title": "Redeploying a running app ignores a changed ingress host",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/307",
+      "comments_reviewed": 0,
+      "body_sha256": "d8a6a7ca2597ad488788d4dd6c987b19e8338be02aa91791728bc988b101d088"
+    },
+    {
+      "number": 305,
+      "title": "GitOps doesn't repair manual drift until a new commit arrives (B16)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/305",
+      "comments_reviewed": 0,
+      "body_sha256": "a96b4bc0b38fd6c0a8fcd675bd574dfcb7f15aa5ac9417692f233f6d1d3df8a7"
+    },
+    {
+      "number": 304,
+      "title": "Keep JUnit evidence for every CI suite and name ci-full honestly (T06, T07)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/304",
+      "comments_reviewed": 0,
+      "body_sha256": "d6c0e79546db5ead0c6386c07efbbb5b05170bfe36901e5533049dea95a8cd03"
+    },
+    {
+      "number": 303,
+      "title": "Give every ignored test an owner and test CI job selection (T04, T05)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/303",
+      "comments_reviewed": 0,
+      "body_sha256": "a52e2bde58fad4506b2f51bc1d163c0af5ade47e07dbfaa79f3f908c729606ff"
+    },
+    {
+      "number": 302,
+      "title": "loop_summary.py prints FAIL but exits 0, and counts skipped or missing lanes as passes (T03)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/302",
+      "comments_reviewed": 0,
+      "body_sha256": "9f9c2deb6878108c47bd33798993bef50f429e93744d9c505d1794e653f07b87"
+    },
+    {
+      "number": 301,
+      "title": "Tests that can't fail: cgroup v2 detection and the node-pressure early return (T01, T02)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/301",
+      "comments_reviewed": 0,
+      "body_sha256": "b018f54a6f7471acc80d7103bc508c11ee1f51318c2b7e6de921fb217c3cb3bf"
+    },
+    {
+      "number": 300,
+      "title": "Whitepaper and design docs still contradict the 0.1.0 contract (static review \u00a72)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/300",
+      "comments_reviewed": 0,
+      "body_sha256": "38825d510495c0eb72b9711c960be1fff6a09c116c9380aa094e43515a5c3db1"
+    },
+    {
+      "number": 299,
+      "title": "Autoscaler accepts min = 0 but can never scale up from zero; no memory acceptance test (B08 remainder)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/299",
+      "comments_reviewed": 0,
+      "body_sha256": "c0d444108d979b28bbc455c012bd927f45c2e7f4f004519acf281710a830b100"
+    },
+    {
+      "number": 298,
+      "title": "[permission] logs/metrics/secret/admin actions aren't enforced on read routes (B18)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/298",
+      "comments_reviewed": 0,
+      "body_sha256": "3cf79d4d1a31785204749a588dfed4045d3e806b1991b2a838ae65d6b7ff6a93"
+    },
+    {
+      "number": 297,
+      "title": "GitOps webhook: a rate-limited delivery is refused as a replay when retried (B10)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/297",
+      "comments_reviewed": 0,
+      "body_sha256": "a0eafdf1929cf22c922257212275e2e05868a9ab927608782c2a3132ec125dc6"
+    },
+    {
+      "number": 296,
+      "title": "GitOps git subprocesses have no deadline or cancellation (B19)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/296",
+      "comments_reviewed": 0,
+      "body_sha256": "fa30ceacf265e6e2834873a5aaad21af2b07f063e87763d91c8ddc7d7786b609"
+    },
+    {
+      "number": 295,
+      "title": "GitOps: editing a multiline script skips mandatory signing (B13)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/295",
+      "comments_reviewed": 0,
+      "body_sha256": "f77f9620919984242fd70175a70f77bbb6ebdf6b917afc69eccc4dae0205693c"
+    },
+    {
+      "number": 294,
+      "title": "Snapshot volume slug collides (/a/b vs /a-b) and listing hides unreadable metadata",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/294",
+      "comments_reviewed": 0,
+      "body_sha256": "7668517b088889678416e49c182a96e7249c0f6ab64ac9eb4b77fc6a1ae58f2d"
+    },
+    {
+      "number": 293,
+      "title": "Snapshot upload buffers the whole archive in memory and has no deadline (B07)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/293",
+      "comments_reviewed": 0,
+      "body_sha256": "1275f219b3032c7a4722176dff96a35df4324a5a0f036a840596d2e3193ee5dd"
+    },
+    {
+      "number": 292,
+      "title": "Snapshot export: unique archive identity, destination-aware receipts, no pruning before upload (B05, B06)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/292",
+      "comments_reviewed": 0,
+      "body_sha256": "4e1ec42125dded1871aaee8a7af86ed0fa18b399c75d5df91deabbb6e447cb49"
+    },
+    {
+      "number": 291,
+      "title": "Snapshot restore: own the volume while restoring and survive a crash mid-swap (B03, B04)",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/291",
+      "comments_reviewed": 0,
+      "body_sha256": "3aa5714bd31d4d1777d3665848100314c7ca56b3af68d073653dcc1bf8f064a1"
+    },
+    {
+      "number": 288,
+      "title": "V04: cold installs on Intel macOS, Linux x86_64 and Linux arm64",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/288",
+      "comments_reviewed": 0,
+      "body_sha256": "3a707252305bc299d817e94a008f224a343f5161d93a49d519425cf40b0ace75"
+    },
+    {
+      "number": 287,
+      "title": "V02 leftovers: snapshot uploader under power cuts, v02-loops bounds",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/287",
+      "comments_reviewed": 0,
+      "body_sha256": "a659a6b38735599c7bf57a36359002012b785a31e4141111a2c3813298bdc94e"
+    },
+    {
+      "number": 286,
+      "title": "V01: run the full live catalogue on three independent runc nodes",
+      "state": "OPEN",
+      "url": "https://github.com/reliaburger/reliaburger/issues/286",
+      "comments_reviewed": 0,
+      "body_sha256": "53cccbae895700f3c37e892c4c439a3fa6bc2712c68a6411f6d84b60510db272"
+    },
+    {
+      "number": 285,
+      "title": "Register and fix two flakes seen on #277's CI",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/285",
+      "comments_reviewed": 0,
+      "body_sha256": "fb5ecc7a5d684d118ba966456c391e2a5ff96c8a82645cc4918ae1f8f2ea5e51"
+    },
+    {
+      "number": 284,
+      "title": "relish wtf: report bun versions and flag version skew",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/284",
+      "comments_reviewed": 0,
+      "body_sha256": "2a2703be5a046647eaa306deaa2e2d5f4daf130ed63fd2f347d83e4fcc056a88"
+    },
+    {
+      "number": 283,
+      "title": "relish inspect should show every instance across the cluster, with its node",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/283",
+      "comments_reviewed": 0,
+      "body_sha256": "aa459e95d94b17366e6efc9ec36baac28fd81b814babbb0cfdb9c3f4996e66c5"
+    },
+    {
+      "number": 282,
+      "title": "Cross-node log warnings drop the reason a node didn't answer",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/282",
+      "comments_reviewed": 0,
+      "body_sha256": "c8308bd9d4135b0c9040b37e2ed59581f6ec56233230f4f437b2e08c7f6ff69e"
+    },
+    {
+      "number": 281,
+      "title": "State-format refusal should name the versions and the fix",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/281",
+      "comments_reviewed": 0,
+      "body_sha256": "f73759a0c55501bfd9ff58a2f1bcf604cfb63701b585bcf5aad914565cde2642"
+    },
+    {
+      "number": 280,
+      "title": "UI polish: landing-page copy buttons and section links, readable dark-theme charts, human-readable units",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/280",
+      "comments_reviewed": 0,
+      "body_sha256": "b3c5aac95985e5c3d50e32bb65b6244a9f88b804596c392616067ef8e023859c"
+    },
+    {
+      "number": 241,
+      "title": "Cannot recover app state after stopping bun in one of the nodes",
+      "state": "CLOSED",
+      "url": "https://github.com/reliaburger/reliaburger/issues/241",
+      "comments_reviewed": 8,
+      "body_sha256": "955e793ea2848013dcd27444f7fe077d6a3e7cb989a2881233a799ee818d779c"
+    }
+  ]
+}

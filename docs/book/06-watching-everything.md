@@ -52,6 +52,43 @@ object_store_url = "s3://my-bucket/reliaburger-metrics"
 
 Same code, same queries, same dashboard. The only difference is where the bytes go. Your metrics survive node failures because they're in S3, not on a local disk that just caught fire.
 
+Remote metric chunks use random 128-bit names and create-only PUTs. Two nodes starting with the same empty bucket cannot choose `metrics_000000.parquet` and silently overwrite each other. Even a name collision refuses the second write and leaves its samples available for retry.
+
+Bun opens a node-owned prefix beneath that bucket. For an enrolled node, the owner combines the cluster root CA fingerprint with the node ID in its certificate; renewing a leaf certificate under the same root and node ID keeps the same archive. A different root CA or a newly enrolled node identity gets a different prefix; the archive-wide reader can still inspect the earlier prefix. Plaintext nodes keep an opaque owner in `metrics-archive-owner` under the configured `[storage] data` directory. Back up that file: restoring only a remote bucket cannot identify which plaintext node's history to reopen. A human label or local directory path never chooses the prefix. Remote archive startup refuses an unwritable configured data directory or corrupt owner. Set `[storage] data` to a writable directory owned by that node, or restore its owner file from backup. Falling back to the common per-user state directory could give two nodes the same archive owner, so remote plaintext archives never use that fallback. Ordinary local metrics keep their existing fallback behaviour.
+
+Each production node queries its own prefix, so cluster fan-out and rollups count each archive once. Remote retention still belongs to the bucket lifecycle policy; the existing remote prune path remains a no-op. `MayoStore::open` remains an archive-wide API for explicit offline queries; `open_for_node` is the production scope. This changes the durable ownership contract even though the Parquet columns stay the same, so it increments the state generation. Startup, joins and upgrades refuse the earlier generation; recreate the cluster with fresh node state rather than rolling across that boundary. The earlier shared prefix cannot prove which node owns each chunk, so we preserve it separately instead of guessing an owner or migrating it into a scoped archive.
+
+### A flush needs an owner until acknowledgement
+
+A remote PUT can store the object and then lose its reply. If the task that
+awaited it disappears, did the samples disappear too? The request can't answer
+that question. The store has to keep the batch.
+
+The pending flush holds immutable encoded Parquet bytes, a publication identity
+and a writer guard. Cancelling an async caller drops its handle, while a blocking
+writer can still finish using another handle. An `Arc` is Rust's shared ownership
+pointer: cloning it gives another owner of the same value, and the value lives
+until the last owner drops it. Here that lifetime protects rows and the write
+operation rather than just saving an allocation.
+
+Retries use the retained publication. If the chosen object key already belongs
+to a different publisher, even one with identical samples, the store chooses a
+new key instead of overwriting it. Query exclusion verifies the retained batch's
+publication identity and encoded bytes; matching timestamps and values alone
+can't establish ownership. A query keeps the pending rows while it examines the
+archive, so cancellation, uncertain replies and listing races must still expose
+one copy. New samples can join the buffer without becoming part of that frozen
+batch. Retention must not discard the unresolved publication as old history.
+
+For local writes, a visible directory name isn't a durable acknowledgement.
+The writer confirms owned directory entries before creating descendants and
+publishing the file, then confirms the published file's entry. A fresh store
+must revisit an entry left visible by an uncertain earlier writer. This work is
+bounded to the configured archive and its owned creation chain, not every
+existing ancestor on the machine. The controlled fault tests check the order
+and retained ownership. They don't simulate a broken disk or prove physical
+power-loss survival; those results need the separate qualification record.
+
 ## Collecting metrics
 
 The `sysinfo` crate gives us cross-platform system metrics without writing platform-specific code. On both Linux and macOS, we collect:
@@ -294,6 +331,33 @@ Second, the client filters too, for `-f` and for `--json-field`, which the serve
 
 Both the flushed Parquet files and the unflushed in-memory buffer are included in every DataFusion query. Same trick we use for metrics. There's no blind spot — you see logs from 30 seconds ago in the same SQL query as logs from last week. No merging, no separate code paths, no seams.
 
+A failed flush used to drain the only in-memory copy before it wrote Parquet. An unwritable directory or a failed ingest-checkpoint rename then lost captured rows while their live offsets still claimed they had been read. The store now owns one pending batch until both its Parquet file and capture checkpoint are durable. Retrying reserves the same filename, serialises writers for that batch and finishes it before advancing a newer checkpoint. An async caller can be cancelled while its blocking writer runs; that writer retains its I/O guard, and the store retains the rows for the next attempt.
+
+Queries keep their own copy of the pending batch and exclude its immutable
+sequence range from the disk relation. A rename during the disk scan therefore
+cannot add a second copy. New rows are allocated and inserted together under the
+store's write lock, so they always lie above that reserved range. Cancellation
+and checkpoint faults must leave those retained rows queryable until retry
+finishes the acknowledgement.
+
+The restart boundary needs evidence in the published file too. The Parquet
+footer carries the batch's frozen capture checkpoint; the JSON sidecar carries
+the same identity and offsets. Reopening can recover the published checkpoint
+when a process stopped between Parquet publication and the sidecar update.
+That closes a different gap from keeping an `Arc` alive: no in-memory pointer
+survives process loss.
+
+Capture identity comes from the same opened file that supplied the bytes and
+travels with its position into both checkpoint representations. Re-statting a
+pathname later can bind an old offset to a replacement file and skip its new
+prefix. The controls replace that path after the old line was read, then require
+the replacement to start at zero. They also hold directory confirmation and
+checkpoint publication separately. These are the specified append-only capture
+and restart guarantees; they don't make arbitrary file rotation or unflushed
+memory durable. The [qualification record template](../qualification/2026-10-04-final-codebase-qualification.template.md)
+keeps the actual execution and physical interruption results pending until the
+matching gates run.
+
 ## The dashboard
 
 Brioche is a single HTML page. No React, no Vue, no webpack. The server renders the HTML with current data, embeds a 2KB CSS stylesheet, and sends it. The browser refreshes every 5 seconds via a `<meta http-equiv="refresh">` tag.
@@ -412,7 +476,7 @@ if !self.seen_windows.insert(key) {
 
 **Per-app metrics that were never collected.** Production only collected node-level metrics (CPU, memory for the whole box). The autoscaler and the per-app dashboards had nothing to read. The collector already knew how to scrape a single process; it just wasn't being called. The collection loop now asks the agent for its running instances and collects per-process CPU and memory for each one, labelled `namespace/app`. (Even then the autoscaler kept asking for a series called `cpu` that nobody records. Chapter 9 tells that story. The per-process memory series is what memory autoscaling reads; Chapter 9 also shows it driving a real scale-up on runc.)
 
-**A flush that froze every query.** The flush wrote Parquet while holding the store's write lock, and Arrow's writer is synchronous. So for the duration of the write, every query waited. Worse, blocking I/O on an async task stalls the whole tokio runtime. We split the flush in two: drain the buffer under a brief lock, then write outside it, on the blocking pool:
+**A flush that froze every query.** The flush wrote Parquet while holding the store's write lock, and Arrow's writer is synchronous. So for the duration of the write, every query waited. Worse, blocking I/O on an async task stalls the whole tokio runtime. The first repair split the flush in two: prepare the batch under a brief lock, then write outside it, on the blocking pool:
 
 ```rust
 let pending = { store.write().await.take_flush_batch()? };  // brief lock
@@ -421,7 +485,10 @@ if let Some(p) = pending {
 }
 ```
 
-While the write is in flight, queries hold a read lock and proceed. And a corrupt or truncated Parquet file (a flush killed mid-write) no longer poisons the directory: we read each file on its own and skip the bad one with a log, so one botched flush doesn't fail every unrelated read.
+The current ownership contract also keeps that prepared batch in the store until
+acknowledgement completes. Moving the write outside the lock mustn't move the
+only copy outside the store. While the write is in flight, queries hold a read
+lock and proceed. And a corrupt or truncated Parquet file (a flush killed mid-write) no longer poisons the directory: we read each file on its own and skip the bad one with a log, so one botched flush doesn't fail every unrelated read.
 
 **Reads that grew with uptime.** After 0.1.0 a long soak showed Bun's memory climbing for hours without ever tripping the leak check. Nothing leaked. A test binary with its own counting allocator (a `#[global_allocator]` that forwards to `System` and adds up the bytes, so it counts the heap we ask for rather than what the allocator keeps mapped) showed each alert evaluation and rollup giving back every byte it took. What grew was the *peak*: about 1.5 MiB more per hour of history, because a query for the last two minutes still loaded every Parquet file in the directory before filtering. With seven days of retention that's a week of growth. A read with a lower bound now skips any file whose newest sample, read from the footer statistics, is older than the bound:
 
@@ -731,6 +798,12 @@ is the order the lines were read in: neither file stamps its lines, so a
 stdout line and a stderr line written within the same poll can swap places.
 Within one stream, the order is exact.
 
+A file follower can also reach EOF before the process has exited: the child may write its last bytes between the empty read and the next state check. After confirming that the child stopped, the follower scans both files once more before declaring EOF. It preserves the existing resume offsets, so that final scan adds only unseen bytes. Two tests hold the follower at the earlier empty read, release the real child to write stdout and stderr and exit, then check the final lines and their byte positions, including a resumed capture.
+
+A process exiting and its pipe readers reaching EOF are separate events. The in-memory runtime now owns both reader tasks and tracks their completion. A final snapshot waits for that completion outside the process-map lock, and a follower scans once more after completion before returning. `Stopping` is not EOF. This prevents a short-lived child from being reported stopped while its final stdout or stderr chunk is still waiting to reach the buffers.
+
+The first observation of actual child exit starts one two-second drain deadline for both pipes. That deadline belongs to the runtime entry, so canceling a logs request cannot cancel it. A descendant that keeps inherited pipe ends open can delay EOF indefinitely; after the bound, the runtime aborts the remaining readers, reports truncation explicitly in its diagnostic output and preserves bytes already captured. An abort requests cancellation; it does not prove the task has stopped. Each reader owns a completion guard whose destructor confirms that no more bytes can be published, and final readers wait for those acknowledgements. Dropping the last in-memory owner also aborts its readers. File-backed production capture keeps its existing file ownership path. Tests gate final chunk publication after confirmed OS exit, then check snapshots, followers, cancelled waiters, owner drop and a descendant holding the pipes open. A separate gate pauses task destruction after the drain deadline: the final snapshot must remain pending until the reader actually acknowledges termination.
+
 That's a fixed-size array, `[CaptureReader; 2]`, built in place with no
 `Vec` and no heap allocation. Our first version built it with `.map` over
 an array of `(stream, extension)` pairs, which read nicely. Then opening a
@@ -739,34 +812,43 @@ to `map` can't `.await`. Rust has no async `map` on arrays (the closure
 would return a future, and you'd get an array of unstarted futures back), so
 we wrote the two elements out.
 
-The store then does the bookkeeping. It keeps the highest offset it has
-ingested per capture file and refuses anything at or below it:
+The store then does the bookkeeping. The reader observes device and inode
+through the same opened file descriptor that supplies the bytes. Each emitted
+capture position carries that identity. A pathname can be replaced between
+reading a line and saving its checkpoint; asking the pathname for its identity
+later would attach the old offset to the replacement and skip its first lines.
 
-```rust
-if let Some(position) = &record.position {
-    let seen = self.ingested.offsets.get(&position.file).copied();
-    if seen.is_some_and(|offset| position.end_offset <= offset) {
-        return false;
-    }
-    self.ingested.offsets.insert(position.file.clone(), position.end_offset);
-}
-```
+`CaptureReader::read_chunk` keeps its work local through every `.await`. Only
+a completed read updates the reader's identity and partial-line state. Cancelling
+a read therefore leaves the previous state available for a retry. A replacement
+is read from byte zero and never completes a partial line left by the old file.
+Resume offsets also carry identity, which is checked again against the opened
+file. This closes replacement between loading the checkpoint and starting the
+forwarder. Both the process runtime and Runc use that reader path.
 
-`Option::is_some_and` is "there's a value and this predicate holds for it",
-which reads better than `matches!(seen, Some(offset) if ...)`. On every flush
-the store writes those offsets, plus the last sequence, to
-`ingest-checkpoint.json`, always *after* the Parquet file. Which
-order you pick decides what a crash between the two writes costs. Checkpoint
-first, and a crash loses the batch: the offsets say the lines are stored, and
-they aren't. Parquet first, and a crash stores one batch twice. We take the
-duplicate. The same reasoning covers a power cut: lines still in the buffer
-never reached a checkpoint, so the replay after the reboot stores them, once,
-and skips everything older.
+The store skips a capture position only when its identity matches the stored
+identity and its offset is at or below the stored offset. A caller without a
+verified identity can still supply a queryable line; it cannot advance a durable
+capture checkpoint.
 
-Keying on the file path works because each runc generation writes its own
-capture files, and the process runtime only ever appends. A restarted
-instance is a new file and starts from its first line; an adopted one picks
-up where the store left off. The Apple runtime is the exception: `container
+On each flush the store freezes the offsets, identities and last sequence in
+its pending batch. It saves that checkpoint in the Parquet footer alongside the
+rows, then publishes the file and replaces `ingest-checkpoint.json`. If the
+second replace fails, a restarted store reads the latest footer checkpoint.
+There is no separate transaction to complete before recognising those stored
+rows. Files written by earlier versions without this metadata remain readable;
+they rely on their original JSON checkpoint.
+
+The writer syncs the Parquet file, each newly created containing directory
+entry and the publication directory before acknowledging success. Directory-sync errors stay
+visible and leave the batch owned for retry. Controlled operation failures and restart fixtures exercise this ordering; it does not substitute for
+qualification on a disposable host that actually loses power.
+
+The file identity and offset govern adoption. A capture opened with the
+checkpointed identity resumes past the stored lines; a replacement starts at
+byte zero, even when it has the same pathname and is longer than the old file.
+Each Runc generation has its own capture files, and the process runtime appends
+to the capture owned by that execution. The Apple runtime is the exception: `container
 logs --follow` hands us lines with no offsets, so an adopted Apple container
 is still ingested again after a restart. It's a laptop runtime and the
 comment in `apple.rs` says so.
@@ -779,11 +861,13 @@ incrementing one counter now look like two clients.
 
 What about the Parquet files a node wrote before `sequence` existed? Our
 first cut made the column nullable so they'd still read, with `NULLS FIRST`
-to sort them before everything new. Then we deleted it. Before 0.1.0 we
-don't carry old formats forward; we bump the generation and start a fresh
-cluster (Chapter 14 has the policy). The logs table is durable state and
+to sort them before everything new. Then we deleted it. At that point, before 0.1.0, we did not carry old formats
+forward; we bumped the generation and started a fresh
+cluster. That was the pre-release sequence introduction, not the current
+post-release migration policy; Chapter 14 describes the release format bumps.
+The logs table is durable state and
 the `/v1/logs/entries` answer is a node-to-node wire format, so both moved:
-protocol 24 to 25, state 40 to 41. A node upgraded in place now refuses to
+protocol 24 to 25, state 40 to 41. With that change, an incompatible node refused to
 start at its state stamp instead of quietly half-reading old log files, and
 `sequence` is a required column. Only `instance` stays nullable, because
 the node's own startup lines don't come from any instance.

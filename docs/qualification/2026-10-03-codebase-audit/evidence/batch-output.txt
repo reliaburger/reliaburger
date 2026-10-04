@@ -1,0 +1,11 @@
+Parent rerun of /tmp/reliaburger-runtime-repros/batch, 3 October 2026.
+The fake agent acknowledged commands/status; it did not execute any scripts.
+
+response 202 Accepted: {"batch_id":1,"assigned":1,"unschedulable":[]}
+AGENT GOT jobs ["forbidden"]
+response 202 Accepted: {"batch_id":2,"assigned":2,"unschedulable":[]}
+AGENT GOT jobs ["duplicate"]
+response 202 Accepted: {"batch_id":3,"assigned":1,"unschedulable":[]}
+AGENT GOT jobs ["duplicate"]
+batch2 before new deploy completed: {"batch_id":2,"total":2,"pending":1,"completed":1,"failed":0,"unschedulable":0,"done":false,"elapsed_secs":0}
+batch3 before new deploy completed: {"batch_id":3,"total":1,"pending":0,"completed":1,"failed":0,"unschedulable":0,"done":true,"elapsed_secs":0}

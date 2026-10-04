@@ -592,17 +592,14 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(instance_ids)
     }
 
-    /// Deploy a job, creating a single workload instance in Pending state.
-    ///
-    /// Jobs are run-to-completion tasks: no port allocation, no health
-    /// checks, and a finite restart budget (3 retries by default).
-    pub async fn deploy_job(
-        &mut self,
+    /// Check every predictable job admission rule without creating an instance.
+    /// Owned batch groups use this same gate before publishing any checkpoint.
+    pub(crate) fn admit_job(
+        &self,
         job_name: &str,
         namespace: &str,
         spec: &JobSpec,
-        now: Instant,
-    ) -> Result<Vec<InstanceId>, BunError> {
+    ) -> Result<(), BunError> {
         self.admit_workload_kind(
             job_name,
             namespace,
@@ -615,6 +612,23 @@ impl<G: Grill> WorkloadSupervisor<G> {
 
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
         self.admit_instance_identity(&instance_id, job_name, namespace)?;
+
+        Ok(())
+    }
+
+    /// Deploy a job, creating a single workload instance in Pending state.
+    ///
+    /// Jobs are run-to-completion tasks: no port allocation, no health
+    /// checks, and a finite restart budget (3 retries by default).
+    pub async fn deploy_job(
+        &mut self,
+        job_name: &str,
+        namespace: &str,
+        spec: &JobSpec,
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        self.admit_job(job_name, namespace, spec)?;
+        let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
 
         let instance = WorkloadInstance {
             id: instance_id.clone(),

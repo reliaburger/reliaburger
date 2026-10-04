@@ -102,6 +102,24 @@ fn spawn_agent(
                 AgentCommand::Status { response } => {
                     let _ = response.send(statuses.clone());
                 }
+                AgentCommand::ResolveExecutionLogs {
+                    app_name,
+                    namespace,
+                    instance,
+                    response,
+                } => {
+                    let _ = response.send(Ok(crate::bun::agent::LogExecutionSelection {
+                        logical_name: app_name.clone(),
+                        instances: statuses
+                            .iter()
+                            .filter(|status| {
+                                status.app_name == app_name && status.namespace == namespace
+                            })
+                            .map(|status| status.id.clone())
+                            .collect(),
+                        selected_instance: instance,
+                    }));
+                }
                 AgentCommand::JobStatus { response } => {
                     let _ = response.send(jobs.clone());
                 }

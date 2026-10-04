@@ -1085,7 +1085,22 @@ stop, and each due minute is claimed on disk before launch. If Bun dies in
 between, that occurrence is skipped, not replayed. We'd rather miss a backup
 than run a migration twice.
 
+A cron step can be larger than the field it advances. `59/255` still means
+minute 59, once an hour. The parser walks a bounded inclusive range with
+`step_by`, which stops at its upper bound. Adding the step to a `u8` by hand
+used to overflow: debug builds panicked, and release builds wrapped the same
+expression into every minute. The regression checks single values, ranges
+and wildcards with the largest accepted step. Configuration admission parses
+the expression too, so a malformed schedule fails before it reaches the
+agent's command loop.
+
 ## Batch scheduling
+
+Submitting a batch can start a host process just as applying a job can. We check the caller's token role and app/namespace scope, the namespace's `deploy` grant, and `host-exec` for an explicit binary or script before registering or dispatching any job. Followers make the same check and forward the caller's credential, so the leader rechecks its current permission map. Using the cluster service token for that hop would turn a restricted user into a system principal.
+
+We validate the complete job group through `Config::validate_against`, passing the committed namespace context. A missing runtime or conflicting `image`, `exec` and `script` fields fail before any registration. The authenticated internal runner uses the same preflight, so a service credential cannot bypass specification or lease validation.
+
+Batch dispatch doesn't carry server-owned test-lease ownership. We refuse test namespaces, lease headers and test-owned image repositories through this route. Those jobs must use the lease-aware apply path, which records their ownership before runtime mutation. Our tests pin scope refusal, deploy and host-execution grants, and rejection of unowned test storage references.
 
 The Meat scheduler's Filter→Score→Select→Commit pipeline evaluates every node for every placement. That's the right trade-off for long-running apps where quality of placement matters — you want the best node, not just any node. But for batch jobs (short-lived, many identical instances), you need throughput.
 
@@ -1112,7 +1127,172 @@ For each profile group, the scheduler sorts nodes by available capacity (most ro
 
 The complexity is O(nodes × profiles + total_jobs). If you have 100 nodes and all jobs are identical (1 profile), it's O(100 + 100,000) — essentially linear in the number of jobs. Even with 100 different profiles, it's O(10,000 + 100,000). The per-job pipeline would be O(100 × 100,000) — ten million evaluations.
 
+Suppose the reports say a node has eight free CPUs. One batch requests all
+eight, and a second batch arrives before the next report. Both fit the same
+report. A lock in the leader process won't fix this across a leader change,
+and the ordinary app scheduler has to respect the first batch too.
+
+We therefore commit each batch's resource reservation before dispatch. Both
+schedulers start with the worker reports, then add committed app placements
+and batch reservations that those reports haven't represented yet. We match
+evidence by node, namespace, execution name and ordinal. A report for ordinal
+one can't discharge a reservation for ordinal zero. If the placement requests
+500m but its exact report shows only 250m, we add the missing 250m before
+planning more work. The cache retains this accounting when Rust clones it for
+a tentative plan or changes a node's readiness. It also retains reservations
+made earlier in the same pass. The resource quantities are requests, the same
+quantities the ordinary scheduler uses.
+
+The commit carries the Raft log position from the snapshot used to plan it.
+The state machine compares that position with its previous applied entry
+before changing either placements or batches. If another admission got there
+first, the candidate is refused and the leader plans again. This is a
+compare-and-swap operation: Rust's `Option<LogId>` represents either the exact
+position we read or the absence of any applied entry. After a bounded number
+of competing writes, submission returns a retryable error. The entire placement
+pass is one guarded transaction: an invalid later decision can't leave earlier
+apps committed. The old unguarded placement request is refused.
+
+Clustered admission requires a live report publisher, the current Raft term,
+and an unexpired local receive deadline for each candidate. The watch snapshot
+carries that term and each report's `tokio::time::Instant` deadline. `Instant`
+measures elapsed time on this process, so a sender's future wall clock can't
+keep an old report fresh. Checking the deadline at consumption also closes the
+gap before the aggregator's next publication. These checks stay on the leader;
+Raft application never depends on a replica's clock. Missing evidence doesn't
+turn a cluster into an unlimited standalone node.
+
+Batch planning and registration have a five-second overall deadline and at
+most eight attempts after competing writes. If the acknowledgement is lost,
+submission returns 503 without dispatching. A late committed allocation stays
+reserved because timing out the caller doesn't prove Raft refused the write.
+The ordinary scheduler bounds its whole-pass proposal too and replans from
+committed state on the next tick.
+
+Durable retirement excludes a worker even while gossip and reports still call
+it alive. The planner filters it, and Raft refuses a registration assigned to
+it before changing counters, ownership history or reservations. A delayed
+first dispatch also checks retirement against its live allocation. An already
+owned exact retry retains its original attempt; this check adds no stop API.
+
+A timeout tells us that we couldn't establish the outcome. It doesn't tell us
+that the process exited. An unknown dispatch or runtime outcome therefore
+keeps its durable reservation and remains nonterminal, including after leader
+handover. Dropping a watcher or exhausting dispatch retries doesn't release
+capacity either. A callback needs exit evidence for the exact execution before
+it can make the job terminal. Only a positively observed exit or explicit
+fenced retirement releases the reservation.
+Our regression tests submit through two independent API processes with one
+shared council, keep reports behind committed app placements, and lose a
+runner beyond the observation deadline. Each case checks the public outcome
+and the replicated state.
+
 The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
+
+Each job name must be unique within its batch, including jobs in different namespaces. Submission builds a map keyed by that label before assigning execution identities. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.
+
+Suppose yesterday's batch had a job called `migration`, and today's batch uses the same name. Yesterday's stopped process still appears in status, but it says nothing about today's outcome. We give each submitted job a fresh opaque random runtime name, persist that execution name with its batch record, and dispatch and poll using it. Submitted names remain useful labels. The submit response's `executions` map gives you the runtime name to use for logs or status queries. A leader restart reads the same identities from Raft; it doesn't invent replacements.
+
+The worker also records that the execution belongs to a batch. A delayed dispatch with the same execution name, specification and logical label reuses that attempt and its result, even after successful completion or a worker restart. Changing either the specification or label for an existing execution is a conflict. We don't infer ownership from a name prefix, and a public manifest can't set the internal ownership marker or take over that execution through a job rerun.
+
+Batch jobs run once. A `schedule` belongs in ordinary apply, and `run_before`
+requires an app in the same apply. We refuse both fields on batch submission
+before registering ownership instead of accepting work that this worker skips.
+Automatic retries remain part of that one execution: the retry counter advances,
+and the checkpoint clears the previous exit before a new attempt starts. A
+nonzero exit during retry backoff doesn't finish the batch. The replay regression
+blocks the second attempt after the first failed, then confirms that the final
+exit zero survives recovery without another launch.
+
+A runtime status read can notice an exit before the agent checkpoints it. Owned
+batch status waits for that durable, current-attempt observation before exposing
+completion, so a callback cannot get ahead of recovery evidence. Process exit
+and object retirement are separate: an OCI container object can remain after
+its process exited. A confirmed current exit completes the execution; moving
+its record into compact retired proof still requires positive runtime/resource
+absence. Recovery cannot treat a retained stopped OCI object as absent:
+its full owned record stays until inspection positively establishes absence.
+These retained objects therefore consume more of the finite node inventory.
+A stopped object without exit evidence remains unknown.
+
+Before returning 202, the agent preflights the complete dispatched group and
+publishes its ownership in one atomic checkpoint. Preflight shares the
+supervisor's full job admission gate: host execution and script policy,
+unsupported resource limits and instance identity checks all happen before
+publication. One invalid member leaves the entire group unadmitted, so a
+corrected request can still run the healthy job. Each worker receives the
+exact prepared generation. Checkpoint IO runs off the async runtime with a
+bounded wait; a failed or uncertain publication returns 503 and keeps the
+identities fenced. Removing a filesystem obstruction doesn't authorise an
+extra launch on retry. An uncertain original attempt remains visibly unknown.
+A lost HTTP acknowledgement is different: publication may already be in flight,
+and the original owned attempt may subsequently run. The 503 makes that
+uncertainty explicit; identical dispatch retries still refer to the same attempt.
+Only new ownership metadata queries use an overall five-second deadline,
+including queueing and all alias-resolution phases; timing out those read-only
+queries admits no work.
+
+Following a selected batch execution also checks its live committed allocation
+under that same metadata deadline, after the original logical Scope and Logs
+grants. SSE and WebSocket streams contact that worker using the existing
+trusted service transport. An ordinary app placement with the same label gives
+no routing authority. A missing, unadvertised or pruned allocation returns an
+explicit refusal before opening the stream; retained replay ownership alone
+cannot identify a worker. A logical batch follow needs an explicit instance.
+Stored log queries retain their logical labels after progress pruning, and a
+worker's local capture can still be selected directly. Both SSE and WebSocket
+honour local=true by bypassing cluster fan-out, so a same-label remote app
+cannot replace the selected local execution.
+
+The council keeps a compact ownership index after it prunes a terminal batch's
+progress record. The index binds each namespace and execution name to its batch
+and logical label, together with a digest of the original specification. A new
+runner must match that digest and its live committed allocation before creating
+anything. The retained index alone cannot authorise a first launch after
+progress pruning. An app write cannot acquire an indexed identity, even on a
+worker that never ran that batch. Registration and app writes enforce the same
+rule atomically in Raft, so their ordering decides ownership. The index has
+a 131,072-entry limit and an independent 32 MiB encoded-byte limit. When full, it
+refuses new batches before dispatch;
+existing attempts can still record outcomes. We keep the replay fences rather
+than pruning names into availability again. Eventually, repeated admissions
+fill that finite history. Further admissions then require a fresh cluster. The
+100,000-job example above describes allocation complexity across enough nodes;
+it does not promise unlimited retained execution history.
+
+Retiring a batch execution moves its replay proof into a compact inventory in
+the same atomic checkpoint. Active records keep their complete specifications;
+retired proofs retain the batch, label, specification digest, generation and
+original exit evidence without keeping the full specification. Unknown exit
+remains unknown after retirement. A delayed service request
+still refers to that original attempt after retirement and recovery; it cannot
+turn a removed runtime into permission to launch again. The checkpoint has a
+16 MiB limit, so admission checks the whole proposed inventory before writing
+and leaves room for active attempts to record their outcomes. When retained
+history fills that space, new admission fails clearly. Existing executions
+remain usable, and their durable fences remain intact.
+
+Recovery requires an explicit ownership field in every active job record:
+ordinary jobs encode `null`, and batch jobs encode their owner. Omitting the
+field is invalid rather than silently turning a batch execution into an
+ordinary job and losing its replay fence or scoped label.
+
+Completion callbacks carry execution names too. A report for an earlier run cannot complete a later run just because you reused a label. Our regression holds the new deploy's acknowledgement while the agent reports a successful old `migration`: the new batch must remain pending. Different batches can therefore run jobs with the same submitted name without replacing one another's runtime.
+
+You still want a token scoped to `migration` to see those runs. The internal
+dispatch includes a map from every execution name to its original label and
+namespace. We check the complete map at the service-authenticated boundary,
+then pass it through a typed agent command. The public configuration can't
+provide aliases. The worker records the label before launching the runtime,
+and checkpoint recovery validates it before adopting that execution.
+
+The supervisor keeps the opaque execution name for runtime ownership. Status
+presents the logical label and keeps the existing instance ID for identifying
+the actual run. Raw log authorisation resolves that ID using the runner's
+durable job record, so it also works on a worker without the leader's batch
+tracker. Forwarded log rows use the logical label with the same namespace and
+opaque instance ID. You can therefore query all `migration` logs within your
+scope, or select one execution without accidentally authorising another job.
 
 ```rust
 pub struct BatchSummary {
@@ -1390,4 +1570,3 @@ relish test --chaos --yes                    # the guarded catalogue (real clust
 cargo test --lib council::node                # partition recovery
 relish dev test onion                         # eBPF fault enforcement (Lima)
 ```
-

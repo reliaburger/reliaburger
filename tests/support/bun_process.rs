@@ -15,6 +15,88 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// Keep a readable Bun log unchanged, or expose only the failed read's kind.
+/// Error text and paths can contain sensitive fixture data and are omitted.
+fn bun_log_diagnostic(log_path: &Path) -> String {
+    match std::fs::read_to_string(log_path) {
+        Ok(log) => log,
+        Err(error) => format!("bun log-read-error kind={:?}", error.kind()),
+    }
+}
+
+thread_local! {
+    static TRACE_FIRST_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable phase-only diagnostics on this first-run test thread. No argv, token
+/// value, subprocess output or security-file contents are logged by the tracer.
+pub fn enable_phase_diagnostics() {
+    TRACE_FIRST_RUN.with(|enabled| enabled.set(true));
+}
+
+pub struct FixturePhase {
+    name: &'static str,
+    started: Instant,
+    enabled: bool,
+}
+
+impl Drop for FixturePhase {
+    fn drop(&mut self) {
+        if self.enabled {
+            eprintln!(
+                "first-run phase={} end elapsed={:?} panicking={}",
+                self.name,
+                self.started.elapsed(),
+                std::thread::panicking()
+            );
+        }
+    }
+}
+
+pub fn fixture_phase(name: &'static str) -> FixturePhase {
+    let enabled = TRACE_FIRST_RUN.with(std::cell::Cell::get);
+    if enabled {
+        eprintln!("first-run phase={name} begin");
+    }
+    FixturePhase {
+        name,
+        started: Instant::now(),
+        enabled,
+    }
+}
+
+fn safe_relish_phase(args: &[&str]) -> &'static str {
+    // Only fixed semantic labels leave this function. Never interpolate args.
+    if args.first() == Some(&"init") {
+        return "cluster-init-command";
+    }
+    if args.first() == Some(&"join") {
+        return "join-command";
+    }
+    if args.windows(2).any(|pair| pair == ["join-token", "create"]) {
+        return "join-token-mint-command";
+    }
+    if args.windows(2).any(|pair| pair == ["token", "create"]) {
+        return "bearer-mint-command";
+    }
+    if args.windows(2).any(|pair| pair == ["token", "list"]) {
+        return "token-replication-probe-command";
+    }
+    if args.contains(&"nodes") {
+        return "membership-nodes-command";
+    }
+    if args.contains(&"council") {
+        return "membership-council-command";
+    }
+    if args.contains(&"status") {
+        return "status-command";
+    }
+    if args.contains(&"apply") {
+        return "apply-command";
+    }
+    "relish-command"
+}
+
 /// How long a helper waits for Bun or Relish before failing the test.
 pub const WAIT: Duration = Duration::from_secs(30);
 
@@ -38,6 +120,7 @@ impl BunProcess {
         log_path: PathBuf,
         runtime: &str,
     ) -> Self {
+        let _phase = fixture_phase("bun-child-spawn");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
         command
@@ -61,7 +144,7 @@ impl BunProcess {
     /// Panic with Bun's log if the process has already exited.
     pub fn assert_running(&mut self) {
         if let Some(status) = self.child.try_wait().unwrap() {
-            let log = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+            let log = bun_log_diagnostic(&self.log_path);
             panic!("bun exited before the first-run command ({status}):\n{log}");
         }
     }
@@ -153,7 +236,7 @@ pub fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
     let deadline = Instant::now() + WAIT;
     loop {
         if let Some(status) = bun.child.try_wait().unwrap() {
-            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            let log = bun_log_diagnostic(&bun.log_path);
             if log.contains("Address already in use") {
                 return BunStart::PortRace;
             }
@@ -161,8 +244,7 @@ pub fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
         }
         // A connection to a reserved address may reach the process that stole
         // it. Only this child's own announcement proves its binds succeeded.
-        let bound_address = std::fs::read_to_string(&bun.log_path)
-            .unwrap_or_default()
+        let bound_address = bun_log_diagnostic(&bun.log_path)
             .lines()
             .find_map(|line| line.strip_prefix("bun: API server listening on "))
             .and_then(|bound| bound.parse::<SocketAddr>().ok())
@@ -173,7 +255,7 @@ pub fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
             return BunStart::Ready(address);
         }
         if Instant::now() >= deadline {
-            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            let log = bun_log_diagnostic(&bun.log_path);
             panic!("bun never listened on {address}:\n{log}");
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -205,6 +287,7 @@ pub fn spawn_bun_with_runtime_port_retry<F>(
 where
     F: FnMut() -> (PathBuf, SocketAddr, PathBuf),
 {
+    let _phase = fixture_phase("bun-listener-readiness");
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
         let (config, address, log_path) = build();
@@ -212,7 +295,7 @@ where
         match wait_for_bind(&mut bun, address) {
             BunStart::Ready(address) => return (bun, address),
             BunStart::PortRace => {
-                let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+                let log = bun_log_diagnostic(&bun.log_path);
                 assert!(
                     attempt < ATTEMPTS,
                     "bun lost the reserved-port race {ATTEMPTS} times in a row:\n{log}"
@@ -273,6 +356,7 @@ registry_port = 0
 /// Run the compiled `relish` with no endpoint, token or CA inherited from
 /// the environment.
 pub fn run_relish(args: &[&str]) -> Output {
+    let _phase = fixture_phase(safe_relish_phase(args));
     Command::new(env!("CARGO_BIN_EXE_relish"))
         .args(args)
         .env_remove("RELIABURGER_ENDPOINT")
@@ -294,6 +378,7 @@ pub fn assert_success(output: &Output, context: &str) {
 
 /// Retry a Relish command until it succeeds, failing if Bun exits first.
 pub fn wait_for_relish(bun: &mut BunProcess, args: &[&str]) -> Output {
+    let _phase = fixture_phase("relish-endpoint-readiness");
     let deadline = Instant::now() + WAIT;
     loop {
         bun.assert_running();
@@ -302,7 +387,7 @@ pub fn wait_for_relish(bun: &mut BunProcess, args: &[&str]) -> Output {
             return output;
         }
         if Instant::now() >= deadline {
-            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            let log = bun_log_diagnostic(&bun.log_path);
             panic!(
                 "relish never reached bun\nstdout={}\nstderr={}\nbun log={log}",
                 String::from_utf8_lossy(&output.stdout),
@@ -324,7 +409,7 @@ pub fn wait_for_relish_output(bun: &mut BunProcess, args: &[&str], expected: &st
             return output;
         }
         if Instant::now() >= deadline {
-            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            let log = bun_log_diagnostic(&bun.log_path);
             panic!(
                 "relish output never contained {expected:?}\nstdout={}\nstderr={}\nbun log={log}",
                 String::from_utf8_lossy(&output.stdout),

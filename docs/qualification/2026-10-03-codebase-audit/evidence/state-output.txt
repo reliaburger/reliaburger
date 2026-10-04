@@ -1,0 +1,9 @@
+Parent rerun of /tmp/reliaburger-state-repro, 3 October 2026.
+
+probe before rebuild: routable=0
+probe after rebuild and more failures: routable=1
+failed flush result=Err(Io(Os { code: 17, kind: AlreadyExists, message: "File exists" })) buffered=0
+replay lost row after failed flush accepted=false
+reopened log checkpoint offset=Some(10)
+rows after recovery=[Object {"line": String("kept")}]
+33 cluster backends: merged=33 validation=Some(InvalidSnapshot { service: "default__crowded", reason: "backend capacity exceeded" })
