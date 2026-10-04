@@ -40,7 +40,9 @@ pub const DEFAULT_UPLOAD_TTL: Duration = Duration::from_secs(3600);
 pub struct QuotaConfig {
     /// Maximum stored bytes for any single repository. `0` = unlimited.
     pub per_repository_bytes: u64,
-    /// Maximum stored bytes across the whole registry. `0` = unlimited.
+    /// Node-local CAS, upload temporary and repository receipt payload cap.
+    /// The HTTP API enforces this through the shared BlobStore budget.
+    /// `0` = unlimited bytes; the store still bounds payload-file counts.
     pub total_bytes: u64,
 }
 
