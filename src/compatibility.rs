@@ -43,9 +43,10 @@ pub struct Compatibility {
 /// repository upload receipts, keyed by repository and exact lease generation
 /// before scoped publication can reuse shared CAS content (#531).
 /// Complete desired-spec fingerprints and namespace-qualified preview keys (#550).
+/// Node-owned remote metrics prefixes and persisted plaintext archive ownership (#533).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 36,
-    state: 51,
+    state: 52,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

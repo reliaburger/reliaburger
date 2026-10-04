@@ -89,6 +89,36 @@ means no sample yet. A node that doesn't answer becomes a
 relish top                       # every node's workloads, with CPU and memory
 ```
 
+### Remote metrics archives
+
+To keep metrics beyond the node's local disk, set its bucket prefix:
+
+```toml
+[metrics]
+object_store_url = "s3://bucket/reliaburger-metrics"
+```
+
+Each node writes immutable chunks beneath its own archive prefix, and cluster
+queries read each node's history once. Remote retention uses the bucket's
+lifecycle policy; Bun does not prune those remote chunks.
+
+An enrolled node's archive owner combines its root CA and certificate node ID.
+Renewing its leaf certificate with that same identity keeps the archive;
+changing the root CA or node identity starts a separate one. A plaintext node
+persists `metrics-archive-owner` under the configured `[storage] data` directory.
+Back up that file with the node state if you need to reopen its remote history
+after losing the local disk. Human labels do not select archive ownership.
+
+Remote plaintext startup refuses an unwritable configured data directory or a
+corrupt owner file. Give that node a writable `[storage] data` directory, or
+restore its original owner file from backup. A shared user-directory fallback
+cannot safely identify distinct nodes.
+
+The archive ownership change increments the state generation. Existing nodes
+refuse that boundary during an upgrade, so recreate the cluster with fresh
+state. Keep earlier shared-prefix archives separately: their chunks do not
+prove node ownership, and no automatic migration assigns them to a node.
+
 ### Your app's own metrics
 
 An app that serves Prometheus text declares it, and each node scrapes its own

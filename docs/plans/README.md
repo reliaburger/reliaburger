@@ -10,6 +10,8 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [GitOps job refusal](2026-10-04-gitops-job-refusal.md) | Refuse unsupported jobs before publishing their dependent apps or advancing the applied revision. | #549 |
+| [Shared configuration tree](2026-10-04-shared-config-tree.md) | Resolve defaults and directory namespaces consistently through CLI and GitOps adapters. | #548 |
 | [Desired-spec previews](2026-10-04-desired-spec-preview.md) | Complete scoped comparison evidence with explicit offline and unknown actions. | #550 |
 | [Autoscale target validation](2026-10-03-autoscale-target-validation.md) | Refuse nonpositive or nonfinite controller targets and measurements. | #554 |
 | [Physical image storage quota](2026-10-03-plan-physical-image-quota.md) | Bound committed blobs and concurrent temporary payloads across all image writers ([#540](https://github.com/reliaburger/reliaburger/issues/540)). | Regressions, shared budget, production wiring and CI |
@@ -17,6 +19,7 @@ the detail is in the GitHub milestones and issues.
 | [Registry verification admission](2026-10-03-plan-registry-verification.md) | Share the bounded Sesame verifier across API and OCI registry requests ([#539](https://github.com/reliaburger/reliaburger/issues/539)). | Router regression, implementation and portable CI |
 | [Blob repository authority](2026-10-03-plan-blob-repository-authority.md) | Require destination upload or catalogue evidence for shared CAS bytes ([#531](https://github.com/reliaburger/reliaburger/issues/531)). | Regressions, durable receipts, lifecycle and CI |
 | [Build signing lifetime](2026-10-03-plan-build-signing-lifetime.md) | Separate artefact authority from runtime mTLS and refresh the cached signer ([#529](https://github.com/reliaburger/reliaburger/issues/529)). | Regression, implementation and validation |
+| [Live namespace validation](2026-10-04-live-namespace-validation.md) | Keep intrinsic field checks local and resolve permission/build namespace existence on the leader. | #551 |
 | [Managed volume image identities](2026-10-03-managed-volume-image-identities.md) | Preserve full volume filenames and refuse overlapping storage artifacts. | #528 |
 | [Batch duplicate identities](2026-10-03-batch-duplicate-identities.md) | Refuse ambiguous duplicate labels before any batch dispatch. | #542 |
 | [V02: sustained qualification](2026-09-25-v02-sustained.md) | The design, invariants and pass/fail thresholds of the sustained soak. `scripts/release/qualify-sustained.sh`, `sustained_check.py` and the [release runbook](../releasing.md) run every release against it. | Snapshot uploader under power cuts and the `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)) |
