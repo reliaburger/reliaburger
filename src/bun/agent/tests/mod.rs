@@ -3221,6 +3221,29 @@ async fn deploy_creates_managed_volume_directories() {
     let _ = handle.await;
 }
 
+/// The agent rechecks the full layout before creating the first directory.
+#[tokio::test]
+async fn overlapping_volume_layout_is_refused_before_any_directory_is_provisioned() {
+    let volumes = tempfile::tempdir().unwrap();
+    let (mut agent, tx, shutdown) = test_agent();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let handle = tokio::spawn(async move { agent.run().await });
+    let config = Config::parse(
+        "[app.web]\nimage='myapp:v1'\n[[app.web.volumes]]\npath='/data'\n[[app.web.volumes]]\npath='/data.img'\n",
+    ).unwrap();
+    // Direct agent dispatch deliberately bypasses HTTP configuration admission.
+    let events = send_deploy(&tx, config).await;
+    shutdown.cancel();
+    handle.await.unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, ApplyEvent::Error { message } if message.contains("overlap"))
+        ),
+        "{events:?}"
+    );
+    assert!(!volumes.path().join("default/web").exists());
+}
+
 /// Host-path volumes are the operator's responsibility — deploys
 /// must not create anything under the managed volumes directory.
 #[tokio::test]
