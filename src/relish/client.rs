@@ -1124,6 +1124,7 @@ impl BunClient {
             .map(|row| crate::relish::plan::CurrentResource {
                 resource: row.resource,
                 image: row.image,
+                fingerprint: row.fingerprint,
             })
             .collect())
     }

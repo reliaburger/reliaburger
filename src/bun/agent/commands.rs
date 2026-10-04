@@ -544,19 +544,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let mut resources: Vec<CurrentResourceStatus> = self
                     .deployed_specs
                     .iter()
-                    .map(|((app, _namespace), spec)| CurrentResourceStatus {
-                        resource: format!("app.{app}"),
+                    .map(|((app, namespace), spec)| CurrentResourceStatus {
+                        resource: crate::config::fingerprint::app_resource_key(app, namespace),
                         image: spec.image.clone(),
+                        fingerprint: crate::config::fingerprint::app_fingerprint_in(
+                            spec, namespace,
+                        ),
                     })
                     .collect();
                 for job in self.get_job_status() {
                     resources.push(CurrentResourceStatus {
-                        resource: format!("job.{}", job.name),
+                        resource: crate::config::fingerprint::job_resource_key(
+                            &job.name,
+                            &job.namespace,
+                        ),
                         image: Some(job.image),
+                        fingerprint: self.recorded_jobs.get(&job.instance_id).and_then(|record| {
+                            crate::config::fingerprint::job_fingerprint(&record.spec)
+                        }),
                     });
                 }
                 resources.sort_by(|a, b| a.resource.cmp(&b.resource));
-                resources.dedup_by(|a, b| a.resource == b.resource);
+                resources.dedup_by(|a, b| {
+                    if a.resource != b.resource {
+                        return false;
+                    }
+                    if a.fingerprint != b.fingerprint || a.image != b.image {
+                        // Different executions of one logical job cannot prove
+                        // a single current specification.
+                        b.fingerprint = None;
+                        b.image = None;
+                    }
+                    true
+                });
                 let _ = response.send(resources);
             }
             AgentCommand::JobStatus { response } => {
