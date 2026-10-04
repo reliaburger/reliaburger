@@ -13,7 +13,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::service_id::ServiceId;
-use super::types::{BackendInstance, MAX_BACKENDS, OnionError, ServiceEntry};
+#[cfg(test)]
+use super::types::MAX_BACKENDS;
+use super::types::{BackendInstance, OnionError, ServiceEntry};
 use super::vip::{VirtualIP, name_to_id};
 
 /// The service map: qualified service identities to their service entries.
@@ -68,9 +70,6 @@ impl ServiceMap {
             }
             if map.entries.contains_key(&key) || map.allocated_vips.contains(&entry.vip) {
                 return Err(invalid("duplicate service or virtual IP owner"));
-            }
-            if entry.backends.len() > MAX_BACKENDS {
-                return Err(invalid("backend capacity exceeded"));
             }
             let mut backend_ids = HashSet::new();
             for backend in &entry.backends {
@@ -184,11 +183,6 @@ impl ServiceMap {
         {
             *existing = backend;
             return Ok(());
-        }
-        if entry.backends.len() >= MAX_BACKENDS {
-            return Err(OnionError::TooManyBackends {
-                app_name: id.qualified(),
-            });
         }
         entry.backends.push(backend);
         Ok(())
@@ -645,14 +639,11 @@ mod tests {
         assert_eq!(entry.backends[0].node_ip, Ipv4Addr::new(10, 0, 3, 3));
         assert_eq!(entry.backends[0].host_port, 31000);
         assert!(!entry.backends[0].healthy);
-        let original = serde_json::to_value(entry).unwrap();
-        assert!(matches!(
-            map.add_backend(&service, test_backend("overflow", [10, 0, 4, 4], 32000)),
-            Err(OnionError::TooManyBackends { .. })
-        ));
+        map.add_backend(&service, test_backend("overflow", [10, 0, 4, 4], 32000))
+            .unwrap();
         assert_eq!(
-            serde_json::to_value(map.resolve(&service).unwrap()).unwrap(),
-            original
+            map.resolve(&service).unwrap().backends.len(),
+            MAX_BACKENDS + 1
         );
     }
 
@@ -768,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn too_many_backends_errors() {
+    fn the_full_catalogue_can_exceed_kernel_backend_pool_capacity() {
         let mut map = ServiceMap::new();
         map.register(&sid("default", "redis"), 6379, None).unwrap();
 
@@ -784,13 +775,18 @@ mod tests {
             .unwrap();
         }
 
-        let err = map
-            .add_backend(
-                &sid("default", "redis"),
-                test_backend("redis-extra", [10, 0, 2, 100], 31000),
-            )
-            .unwrap_err();
-        assert!(matches!(err, OnionError::TooManyBackends { .. }));
+        map.add_backend(
+            &sid("default", "redis"),
+            test_backend("redis-extra", [10, 0, 2, 100], 31000),
+        )
+        .unwrap();
+        assert_eq!(
+            map.resolve(&sid("default", "redis"))
+                .unwrap()
+                .backends
+                .len(),
+            MAX_BACKENDS + 1
+        );
     }
 
     #[test]
@@ -1046,5 +1042,56 @@ mod tests {
 
         let entry = merged.resolve(&sid("default", "web")).unwrap();
         assert_eq!(entry.backends.len(), 1, "shared backend was duplicated");
+    }
+    #[test]
+    fn thirty_three_local_replicas_survive_snapshot_validation() {
+        let id = sid("default", "crowded");
+        let mut map = ServiceMap::new();
+        map.register(&id, 8080, None).unwrap();
+        for index in 0..33 {
+            map.add_backend(
+                &id,
+                test_backend(
+                    &format!("crowded-{index}"),
+                    [10, 0, 2, index + 2],
+                    30000 + index as u16,
+                ),
+            )
+            .unwrap();
+        }
+        let entries: Vec<_> = map.resolve_all().into_iter().cloned().collect();
+        let restored = ServiceMap::from_snapshot(&entries).unwrap();
+        assert_eq!(restored.resolve(&id).unwrap().backends.len(), 33);
+    }
+
+    #[test]
+    fn thirty_three_remote_replicas_do_not_poison_an_unrelated_service_snapshot() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        let id = sid("default", "crowded");
+        let catalog = EndpointCatalog::rebuild([(
+            id.clone(),
+            8080,
+            (0..33)
+                .map(|index| CatalogBackend {
+                    execution: None,
+                    node_id: format!("node-{index}"),
+                    node_ip: Ipv4Addr::new(10, 0, 2, index + 2),
+                    host_port: 30000 + index as u16,
+                    healthy: true,
+                })
+                .collect(),
+        )])
+        .unwrap();
+        let mut local = ServiceMap::new();
+        let other = sid("default", "other");
+        local.register(&other, 9090, None).unwrap();
+        local
+            .add_backend(&other, test_backend("other-0", [10, 0, 3, 1], 31000))
+            .unwrap();
+        let merged = local.with_cluster_catalog(&catalog);
+        let entries: Vec<_> = merged.resolve_all().into_iter().cloned().collect();
+        let restored = ServiceMap::from_snapshot(&entries).unwrap();
+        assert_eq!(restored.resolve(&id).unwrap().backends.len(), 33);
+        assert_eq!(restored.resolve(&other).unwrap().backends.len(), 1);
     }
 }

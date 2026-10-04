@@ -389,7 +389,7 @@ The eBPF programs don't call back to Bun. They read from kernel-resident hash ma
 
 **`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string, value is a 4-byte IPv4 address in network byte order. It's a leftover from the abandoned in-kernel DNS design (see "Why userspace DNS" below) — the userspace responder resolves names straight from the `ServiceMap` instead, so this map isn't on the resolution path today.
 
-**`backend_map`**: Maps `(VIP, port)` pairs to backend arrays. Each entry holds up to 32 backends with their real IPs, ports, and health flags, plus a round-robin counter. When the connect hook intercepts a VIP connection, it looks up this map and picks a healthy backend.
+**`backend_map`**: Maps `(VIP, port)` pairs to backend arrays. Each entry holds up to 32 backends with their real IPs, ports, and health flags, plus a round-robin counter. When the connect hook intercepts a VIP connection, it looks up this map and picks a healthy backend. The userspace catalogue keeps every replica, including a thirty-third backend; DNS, ingress and unrelated services can still install the complete snapshot. For a service above the kernel array's capacity, each consumer chooses a deterministic pool of at most 32. Healthy local backends come first, then healthy remote backends, with a stable score from the consumer's node ID distributing remote choices across nodes. A client on one node reaches that node's selected pool; it is not promised access to all replicas through that one kernel array. Reordering the catalogue cannot change the selected pool.
 
 **`firewall_map`**: Maps `(source_cgroup_id, destination_app_id)` to allow/deny. This is how we enforce namespace isolation and per-app firewall rules at the connection level.
 
