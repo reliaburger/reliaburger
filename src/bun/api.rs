@@ -908,7 +908,7 @@ async fn enforce_cluster_permission(
 
 /// The replicated `[permission]` map, keyed by token name. Empty without a
 /// council (single-node mode, where permissions can't be configured).
-async fn permission_map(
+pub(crate) async fn permission_map(
     state: &ApiState,
 ) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
     match &state.council {
@@ -1128,7 +1128,7 @@ async fn known_node_api_url(
 
 /// Preserve the end user's credential so the target node repeats every
 /// authentication and server-policy check.
-fn copy_forwarded_auth(
+pub(crate) fn copy_forwarded_auth(
     mut request: reqwest::RequestBuilder,
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {

@@ -145,6 +145,58 @@ pub fn resolve_job_namespaces(
     Ok(jobs)
 }
 
+/// Admit the complete group before either tracker registration or agent dispatch.
+async fn validate_batch_jobs(
+    state: &ApiState,
+    jobs: &[BatchJobSubmission],
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    if jobs.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "batch has no jobs".into()));
+    }
+    if headers.contains_key("x-reliaburger-test-lease") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "batch jobs do not support test leases".into(),
+        ));
+    }
+    // Batch dispatch has no application-lease ownership registration. A
+    // service credential cannot turn a reserved namespace/image into ordinary work.
+    if jobs
+        .iter()
+        .any(|job| crate::testkit::lease::valid_test_namespace(job.namespace()))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "batch jobs cannot use test lease namespaces without lease ownership".into(),
+        ));
+    }
+    crate::testkit::lease::authorise_image_references(
+        jobs.iter().filter_map(|job| job.spec.image.as_deref()),
+        None,
+    )
+    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    let config = Config {
+        job: jobs
+            .iter()
+            .map(|job| (job.name.clone(), job.spec.clone()))
+            .collect(),
+        ..Config::default()
+    };
+    let known_namespaces = match &state.council {
+        Some(council) => council
+            .desired_state()
+            .await
+            .namespaces
+            .into_keys()
+            .collect(),
+        None => Vec::new(),
+    };
+    config
+        .validate_against(&known_namespaces)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // Capacity
 // ---------------------------------------------------------------------------
@@ -699,6 +751,7 @@ async fn fetch_remote_outcome(
 pub async fn batch_submit_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
     // Submitting work is a Deployer action (AUTH2 — it used to take no auth).
@@ -707,14 +760,6 @@ pub async fn batch_submit_handler(
     {
         return resp;
     }
-    // Followers forward the raw body to the leader (the tracker and
-    // the aggregated capacity view live there).
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
-        return forward_to_leader(&state, council, "/v1/batch", body).await;
-    }
-
     let request: BatchSubmitRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -743,6 +788,39 @@ pub async fn batch_submit_handler(
                 .into_response();
         }
     };
+    if let Err((status, error)) = validate_batch_jobs(&state, &jobs, &headers).await {
+        return (status, Json(serde_json::json!({"error": error}))).into_response();
+    }
+    let permissions = super::api::permission_map(&state).await;
+    for job in &jobs {
+        if let Err(response) =
+            crate::sesame::auth::authorize_scoped(auth.as_deref(), &job.name, job.namespace())
+        {
+            return response;
+        }
+        let actions = [crate::config::PermissionAction::Deploy].into_iter().chain(
+            (job.spec.exec.is_some() || job.spec.script.is_some())
+                .then_some(crate::config::PermissionAction::HostExec),
+        );
+        for action in actions {
+            if let Err(response) = crate::sesame::auth::authorize_permission(
+                auth.as_deref(),
+                action,
+                &job.name,
+                job.namespace(),
+                &permissions,
+            ) {
+                return response;
+            }
+        }
+    }
+    // Preserve the caller on the second hop so the leader repeats admission
+    // against its authoritative grants, without granting system authority.
+    if let Some(council) = &state.council
+        && !council.is_leader().await
+    {
+        return forward_to_leader(&state, council, "/v1/batch", body, &headers).await;
+    }
     // Stable input order: together with the scheduler's ordered
     // profile groups this pins the assignment plan (the old
     // allocation-order finding).
@@ -916,6 +994,7 @@ pub async fn batch_submit_handler(
 pub async fn batch_run_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    headers: axum::http::HeaderMap,
     Json(run): Json<BatchRunRequest>,
 ) -> Response {
     // Node-to-node only: reject anything that isn't the system principal
@@ -959,6 +1038,9 @@ pub async fn batch_run_handler(
                 .into_response();
         }
     };
+    if let Err((status, error)) = validate_batch_jobs(&state, &jobs, &headers).await {
+        return (status, Json(serde_json::json!({"error": error}))).into_response();
+    }
     tokio::spawn(run_jobs_and_watch(
         state.cmd_tx.clone(),
         run.batch_id,
@@ -1061,6 +1143,7 @@ async fn forward_to_leader(
     council: &crate::council::CouncilNode,
     path: &str,
     body: String,
+    headers: &axum::http::HeaderMap,
 ) -> Response {
     let Some(leader_url) = super::api::leader_api_url(state, council).await else {
         return (
@@ -1069,15 +1152,13 @@ async fn forward_to_leader(
         )
             .into_response();
     };
-    let mut request = state
+    let request = state
         .cluster_http
         .client()
         .post(format!("{leader_url}{path}"))
         .header("content-type", "application/json")
         .body(body);
-    if let Some(token) = &state.service_token {
-        request = request.bearer_auth(token);
-    }
+    let request = super::api::copy_forwarded_auth(request, headers);
     proxy_response(request.send().await).await
 }
 
@@ -1232,6 +1313,63 @@ mod tests {
         )])
         .unwrap_err();
         assert!(err.contains("two namespaces"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn internal_batch_dispatch_validates_specs_and_refuses_unowned_test_resources() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let router = crate::bun::api::router(
+            tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+        )
+        .layer(axum::Extension(crate::sesame::auth::system_context()));
+        let cases = [
+            ("default", serde_json::json!({}), StatusCode::BAD_REQUEST),
+            (
+                "default",
+                serde_json::json!({"image": "busybox", "exec": "true"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "default",
+                serde_json::json!({"exec": "true", "script": "true"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "rbtest-batch",
+                serde_json::json!({"image": "busybox"}),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "default",
+                serde_json::json!({"image": "localhost:5050/rbtest-image/work:test"}),
+                StatusCode::CONFLICT,
+            ),
+        ];
+        for (namespace, spec, expected) in cases {
+            let request = Request::post("/v1/batch/run")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"batch_id": 1, "jobs": [
+                        {"name": "migration", "namespace": namespace, "spec": spec}
+                    ]})
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "namespace={namespace}, spec={spec}"
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[test]
