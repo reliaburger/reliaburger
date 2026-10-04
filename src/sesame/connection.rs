@@ -116,6 +116,30 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for LifetimeLimitedIo<S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsTransport;
 
+/// Request extension that resolves once the connection carrying the request
+/// has finished: every answer on it written and flushed, and the socket
+/// closed.
+///
+/// [`serve_http_connection`] attaches it to every request. A handler whose
+/// answer must reach the client before the process execs (a self-upgrade)
+/// answers with `Connection: close` and hands this to whoever execs, so
+/// the exec waits for the answer instead of guessing how long it takes.
+#[derive(Debug, Clone)]
+pub struct ConnectionClosed(tokio_util::sync::CancellationToken);
+
+impl ConnectionClosed {
+    /// One that resolves when `token` is cancelled, for callers (and tests)
+    /// that stand in for a connection.
+    pub fn from_token(token: tokio_util::sync::CancellationToken) -> Self {
+        Self(token)
+    }
+
+    /// Wait until the connection has closed.
+    pub async fn wait(&self) {
+        self.0.cancelled().await
+    }
+}
+
 /// Deadlines every HTTP listener in Bun applies to the connections it accepts.
 ///
 /// Hyper and axum switch none of these on by default: an idle keep-alive
@@ -320,6 +344,10 @@ pub async fn serve_http_connection<I>(
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let closed = tokio_util::sync::CancellationToken::new();
+    // Cancelled however this function returns, after the connection is done.
+    let _closed_on_return = closed.clone().drop_guard();
+    let router = router.layer(axum::Extension(ConnectionClosed(closed)));
     let io = StallGuardedIo::new(io, timeouts.request_head, timeouts.write_stall);
     let hyper_service = hyper_util::service::TowerToHyperService::new(router);
     let builder = http_builder(&timeouts);
@@ -489,6 +517,58 @@ mod tests {
         mtls, renewal::TlsPeerCertificate, types::SerialNumber,
     };
     use std::time::SystemTime;
+
+    /// Bun execs straight after it answers an upgrade, and exec closes every
+    /// socket, so the answer has to be on the wire first (#526). The
+    /// extension resolves only once Hyper has written a closing answer in
+    /// full and ended the connection.
+    #[tokio::test]
+    async fn connection_closed_waits_until_a_closing_answer_is_written() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                move |axum::Extension(closed): axum::Extension<ConnectionClosed>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let _ = seen_tx.send(closed);
+                        (
+                            [(axum::http::header::CONNECTION, "close")],
+                            "x".repeat(4096),
+                        )
+                    }
+                },
+            ),
+        );
+        // A small pipe: the answer can't all be written until the client reads.
+        let (client, server) = tokio::io::duplex(64);
+        tokio::spawn(serve_http_connection(
+            server,
+            router,
+            ConnectionTimeouts::PRODUCTION,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let (mut read, mut write) = tokio::io::split(client);
+        write
+            .write_all(b"POST / HTTP/1.1\r\nhost: bun\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let closed = seen.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), closed.wait())
+                .await
+                .is_err(),
+            "resolved while the answer was still unread"
+        );
+        let mut answer = Vec::new();
+        read.read_to_end(&mut answer).await.unwrap();
+        assert!(answer.ends_with("x".repeat(4096).as_bytes()));
+        tokio::time::timeout(Duration::from_secs(5), closed.wait())
+            .await
+            .expect("still open after the whole answer was read");
+    }
 
     /// A node identity for `node` whose leaf lives for `lifetime`.
     fn node_identity(
