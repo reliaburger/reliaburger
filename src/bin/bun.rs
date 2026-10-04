@@ -979,6 +979,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
+    // Under ProcessGrill an app's `image` is a placeholder nobody pulls, so
+    // there's nothing to bind to a digest at apply (F03 U1, decision 5).
+    let runtime_pulls_images = !matches!(runtime, AnyGrill::Process(_));
     let runtime_version = runtime_version(runtime_kind).await;
     let host_kernel = host_kernel().await;
     // Image-store handle for installing the cluster P2P image source
@@ -2350,6 +2353,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Cloned for the GC task (asks the agent for actively deployed images).
     let gc_cmd_tx = cmd_tx.clone();
 
+    // F03 U1: an apply this node leads binds each image tag to the digest it
+    // names now, so every node, restart and replacement pulls the same
+    // bytes. Only when this node's own runtime pulls images; a cluster runs
+    // one runtime kind, so the leader's speaks for every node. Loopback
+    // registries are asked over plain HTTP, the way the runtime pulls them.
+    let image_binder = runtime_pulls_images.then(|| {
+        let credentials = reliaburger::pickle::upstream::resolve_credentials(
+            &config.images.external_registries,
+            |name| std::env::var(name).ok(),
+        );
+        reliaburger::pickle::binding::ImageBinder::new(
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::new(
+                credentials.clone(),
+            )),
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::insecure_http(
+                credentials,
+            )),
+        )
+    });
+
     // GitOps (L13): if [gitops] is configured on a cluster node, spawn
     // the leader-only sync loop and hand the API a webhook sender that
     // nudges it. The webhook endpoint returns 503 without this.
@@ -2374,6 +2397,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 webhook_rx,
                 config.storage.data.clone(),
                 shutdown.clone(),
+                image_binder.clone(),
             );
             println!("bun: gitops sync loop started");
             Some(webhook_tx)
@@ -2622,6 +2646,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match capacity_admission {
         Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
+    };
+    let app = match image_binder {
+        Some(binder) => app.layer(axum::Extension(binder)),
         None => app,
     };
     let app = match api_known_members {

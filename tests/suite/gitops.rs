@@ -142,6 +142,7 @@ async fn sync_loop_applies_repo_apps_to_raft() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     // The app from git should appear in Raft desired state.
@@ -191,6 +192,7 @@ async fn webhook_triggers_immediate_sync() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     // The runner always applies the first commit before waiting for a timer or
@@ -288,6 +290,7 @@ async fn sync_loop_applies_every_supported_declarative_kind() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let council_check = Arc::clone(&council);
@@ -356,7 +359,7 @@ async fn apply_changes_stops_and_reports_on_write_failure() {
         spec: ChangePayload::App(Box::new(spec)),
     }];
 
-    let result = apply_changes(&node, &changes).await;
+    let result = apply_changes(&node, &changes, None).await;
     assert!(
         matches!(result, Err(ref id) if id == "app.default/web"),
         "a failed write must be reported, not swallowed: {result:?}"
@@ -390,10 +393,114 @@ async fn apply_changes_reports_a_refused_write_as_a_failure() {
         spec: ChangePayload::App(Box::new(spec)),
     }];
 
-    let result = apply_changes(&council, &changes).await;
+    let result = apply_changes(&council, &changes, None).await;
     assert!(
         matches!(result, Err(ref id) if id == "app.rbtest-lease/web"),
         "a refused write must be reported as unapplied: {result:?}"
+    );
+    assert!(council.desired_state().await.apps.is_empty());
+    council.shutdown().await.ok();
+}
+
+/// An upstream registry that names one digest for every tag, or is down.
+struct FixedRegistry(Option<reliaburger::pickle::types::Digest>);
+
+impl reliaburger::pickle::upstream::UpstreamRegistry for FixedRegistry {
+    fn head_manifest_digest<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<'a, reliaburger::pickle::types::Digest> {
+        let answer = self.0.clone().ok_or_else(|| {
+            reliaburger::pickle::types::PickleError::ReplicationFailed("connection refused".into())
+        });
+        Box::pin(async move { answer })
+    }
+
+    fn fetch_manifest<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<
+        'a,
+        reliaburger::pickle::upstream::UpstreamManifest,
+    > {
+        unimplemented!("binding only asks for the digest")
+    }
+
+    fn fetch_root<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<
+        'a,
+        reliaburger::pickle::upstream::UpstreamRoot,
+    > {
+        unimplemented!("binding only asks for the digest")
+    }
+
+    fn fetch_blob<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+        _layer: &'a reliaburger::pickle::types::LayerDescriptor,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<'a, Vec<u8>> {
+        unimplemented!("binding only asks for the digest")
+    }
+}
+
+fn web_change(image: &str) -> reliaburger::lettuce::diff::ResourceChange {
+    let spec = reliaburger::config::Config::parse(&format!("[app.web]\nimage = \"{image}\"\n"))
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    reliaburger::lettuce::diff::ResourceChange::Add {
+        resource_id: "app.default/web".to_string(),
+        spec: reliaburger::lettuce::diff::ChangePayload::App(Box::new(spec)),
+    }
+}
+
+/// F03 U1: GitOps writes the same bound reference a manual apply does.
+#[tokio::test]
+async fn apply_changes_binds_an_apps_image_to_a_digest() {
+    use reliaburger::pickle::binding::ImageBinder;
+
+    let council = single_node_leader().await;
+    let digest =
+        reliaburger::pickle::types::Digest::new(&format!("sha256:{}", "7".repeat(64))).unwrap();
+    let binder = ImageBinder::with_upstream(Arc::new(FixedRegistry(Some(digest.clone()))));
+
+    let result = reliaburger::lettuce::runner::apply_changes(
+        &council,
+        &[web_change("nginx:1.27")],
+        Some(&binder),
+    )
+    .await;
+
+    assert_eq!(result.unwrap(), 1);
+    let image = council.desired_state().await.apps[&AppId::new("web", "default")]
+        .image
+        .clone();
+    assert_eq!(image, Some(format!("nginx:1.27@{}", digest.as_str())));
+    council.shutdown().await.ok();
+}
+
+/// With the registry down and nothing cached, the change fails and names
+/// the image, so the commit isn't advanced and the next poll retries.
+#[tokio::test]
+async fn apply_changes_fails_a_change_whose_image_cannot_be_bound() {
+    use reliaburger::pickle::binding::ImageBinder;
+
+    let council = single_node_leader().await;
+    let binder = ImageBinder::with_upstream(Arc::new(FixedRegistry(None)));
+
+    let result = reliaburger::lettuce::runner::apply_changes(
+        &council,
+        &[web_change("nginx:1.27")],
+        Some(&binder),
+    )
+    .await;
+
+    assert!(
+        matches!(&result, Err(message) if message.starts_with("app.default/web") && message.contains("nginx:1.27")),
+        "{result:?}"
     );
     assert!(council.desired_state().await.apps.is_empty());
     council.shutdown().await.ok();
@@ -452,6 +559,7 @@ async fn sync_deletes_the_namespaced_app_not_the_default_one() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let council_check = Arc::clone(&council);
@@ -497,6 +605,7 @@ async fn a_failed_sync_is_recorded_in_sync_state() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let council_check = Arc::clone(&council);
@@ -561,6 +670,7 @@ async fn an_unchanged_commit_still_repairs_manual_drift() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let web = AppId::new("web", "default");
@@ -693,6 +803,7 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let stuck = wait_for(Duration::from_secs(15), || {
@@ -768,6 +879,7 @@ async fn job_refusal_keeps_the_last_applied_commit_and_all_desired_resources() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
     let check = Arc::clone(&council);
     assert!(

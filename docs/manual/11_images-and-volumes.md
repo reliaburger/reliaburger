@@ -47,6 +47,45 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+## Tags bind to digests at apply
+
+A tag moves. `nginx:1.27` today needn't be `nginx:1.27` next week, so the
+node that handles your apply (the leader, on a cluster) asks which manifest
+the tag names right now and stores both:
+
+```text
+$ relish apply web.toml
+  web: nginx:1.27 → sha256:3f2a1b9c04d7... (from the registry)
+  app web: committed to the cluster
+```
+
+The app's image is now `nginx:1.27@sha256:3f2a…`. The digest decides what
+every pull fetches, so every node, every restart and every replacement runs
+the same bytes, and you still read the tag. Because a pinned pull may use a
+mirror, `mirrors` now covers every image you apply.
+
+- **Apply again to move.** Applying the same file re-resolves the tag, which
+  is how you pick up a new `nginx:1.27` on purpose. The binding line shows it.
+- **Already pinned?** An image you write as `name@sha256:…` or
+  `name:tag@sha256:…` is stored as written.
+- **Registry down?** The apply fails with the registry's error and stores
+  nothing, unless the pull-through cache holds the tag: then the apply binds
+  the cached copy and says so (`from the pull-through cache; the registry did
+  not answer`). The registry gets 20 seconds to answer.
+- **Pickle images** bind to the digest the cluster's registry holds for the
+  tag, without asking anyone else.
+- **Where you see it:** `relish history` and `relish inspect` show the bound
+  reference, as does each instance's image in `relish status`. `relish rollback`
+  restores the bound reference of the version before, so it runs the bytes
+  that ran then, even if the tag has moved since.
+- **GitOps** binds the same way when it writes an app. Git keeps the tag, and
+  a bound image isn't drift; the tag re-resolves when the app changes in Git.
+
+Binding happens only where the leader's own runtime pulls images (runc, or
+Apple containers on a Mac). Under the process runtime an app's `image` is a
+placeholder nobody pulls, so it's stored as written. A cluster runs one
+runtime kind, so the leader's speaks for every node.
+
 ## Storage ceiling
 
 `[images] max_storage` bounds each node's compressed CAS blob, temporary upload

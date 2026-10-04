@@ -229,8 +229,11 @@ keys = []                 # extra trusted ECDSA P-256 public keys, base64
 ```
 
 Images that `relish build` pushes are signed by the cluster's build signer,
-which the policy trusts without a key. Images from external registries and the
-pull-through cache aren't checked, so pin those by digest.
+which the policy trusts without a key. Signatures on images from external
+registries and the pull-through cache aren't checked yet, but every apply binds
+their tags to digests
+([Tags bind to digests at apply](11_images-and-volumes.md#tags-bind-to-digests-at-apply)),
+so what you applied is what runs on every node.
 
 For images you build elsewhere and push to the registry, sign them with your
 own key. Make one, and put the public key it prints in every node's `keys`:

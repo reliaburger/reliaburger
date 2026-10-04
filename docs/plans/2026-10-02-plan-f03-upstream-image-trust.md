@@ -102,6 +102,7 @@ U1 first (about a week): it fixes the drift on its own and everything else build
 
 - The reference parser reads `repo:tag@sha256:…`, and the trust-policy lookup drops the tag before its digest lookup. Without that second fix, an unsigned Pickle image written as `app:v1@sha256:…` would have counted as external and skipped `require_signatures` once the pull worked.
 - `pickle::binding::bind_image` resolves a tag from the catalogue, upstream, or the cached copy, with unit tests. It isn't wired into apply until questions 1, 2 and 5 are settled.
+- **U1 wired (0.1.6).** `ImageBinder` binds every app, init-container and job image in `POST /v1/apply` on the leader (inside the SSE stream, so a slow registry doesn't time out a follower's forward), in the GitOps runner, and in a standalone node's apply and rollback. Bun attaches it only when its runtime pulls images. The upstream `HEAD` gets 20 s before the cache fallback. Instead of moving the digest out of `ImageReference::tag`, the reference keeps the tag a bound reference carries (`bound_tag`), and a fresh pull-through fill records the image under it, so the cache fallback still works once every pull is by digest. GitOps reads a bound image back as Git's tag when diffing, so binding isn't drift. Protocol 41, state 58. Not done: an agent-level test that a restart after the tag moves runs the old digest (restarts re-create from the stored OCI spec, whose root is the bound reference).
 
 ## Decisions (maintainer, 2 October 2026)
 

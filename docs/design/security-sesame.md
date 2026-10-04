@@ -1094,6 +1094,13 @@ The manifest carries a single signature slot, so a later `relish sign`
 replaces an earlier signature (including a build signer's). Signatures bind
 digests, never tags: re-pushing a tag leaves the new digest unsigned.
 
+The signature format is Pickle's own (P-256 over the digest string), not
+cosign's. Images from outside Pickle carry no signature Pickle checks yet,
+but every apply binds their tags to digests (`nginx:1.27@sha256:…`), so the
+bytes that run are the bytes the apply resolved (F03 U1, #361). Rules for
+those upstream images stay in `node.toml` for the same reason the keys do:
+nothing an API token can change should decide what the cluster trusts.
+
 ---
 
 ## 6. Configuration

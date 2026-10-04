@@ -22,7 +22,13 @@ use super::oci_pull::retry_registry_read;
 pub struct ImageReference {
     pub registry: String,
     pub repository: String,
+    /// What a pull asks for: the tag, or the digest when there is one.
     pub tag: String,
+    /// The tag a reference bound at apply still carries for people
+    /// (`nginx:1.27@sha256:…` keeps `1.27`). The pull ignores it; the
+    /// pull-through cache records the image under it, so a later apply can
+    /// bind the tag from the cache while upstream is down.
+    pub bound_tag: Option<String>,
 }
 
 /// Errors from image operations.
@@ -72,7 +78,7 @@ impl ImageReference {
         }
 
         // Split off the tag (last `:` that isn't part of a port number)
-        let (name_part, tag) = split_name_tag(s);
+        let (name_part, tag, bound_tag) = split_name_tag(s);
 
         // Determine if the first component is a registry (contains `.` or `:`)
         let parts: Vec<&str> = name_part.splitn(2, '/').collect();
@@ -95,6 +101,7 @@ impl ImageReference {
             registry,
             repository,
             tag,
+            bound_tag,
         })
     }
 
@@ -119,21 +126,22 @@ impl ImageReference {
     }
 }
 
-/// Split an image name into (name, tag). Defaults tag to "latest".
+/// Split an image name into (name, tag, bound tag). Defaults tag to
+/// "latest".
 ///
 /// A digest-pinned reference (`name@sha256:…`) carries the digest in
 /// the tag position — content addressing makes a tag redundant, and
 /// downstream code recognises the `sha256:` prefix.
-fn split_name_tag(s: &str) -> (&str, String) {
+fn split_name_tag(s: &str) -> (&str, String, Option<String>) {
     // A digest wins over a tag. A reference bound at apply carries both
-    // (`nginx:1.27@sha256:…`): the tag is for people, so drop it here.
+    // (`nginx:1.27@sha256:…`): the tag is for people, so it's kept aside.
     if let Some((name, digest)) = s.split_once('@') {
-        let (name, _tag) = split_tag(name);
-        return (name, digest.to_string());
+        let (name, tag) = split_tag(name);
+        return (name, digest.to_string(), tag.map(str::to_string));
     }
     match split_tag(s) {
-        (name, Some(tag)) => (name, tag.to_string()),
-        (name, None) => (name, "latest".to_string()),
+        (name, Some(tag)) => (name, tag.to_string(), None),
+        (name, None) => (name, "latest".to_string(), None),
     }
 }
 
@@ -215,6 +223,7 @@ impl ImageMirrors {
             registry: mirror.clone(),
             repository: image.repository.clone(),
             tag: image.tag.clone(),
+            bound_tag: image.bound_tag.clone(),
         })
     }
 
@@ -1154,6 +1163,18 @@ mod tests {
             assert_eq!(r.tag, digest, "{input}");
             assert!(r.to_oci_reference().is_ok(), "{input}");
         }
+    }
+
+    /// The tag a bound reference carries is kept beside the digest, so the
+    /// pull-through cache can remember it; a plain pin or tag has none.
+    #[test]
+    fn a_bound_reference_keeps_its_tag_aside() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let bound = ImageReference::parse(&format!("localhost:5000/app:v1@{digest}")).unwrap();
+        assert_eq!(bound.bound_tag.as_deref(), Some("v1"));
+        let pinned = ImageReference::parse(&format!("localhost:5000/app@{digest}")).unwrap();
+        assert_eq!(pinned.bound_tag, None);
+        assert_eq!(ImageReference::parse("app:v1").unwrap().bound_tag, None);
     }
 
     /// A port in the registry is not a tag, with or without a digest.

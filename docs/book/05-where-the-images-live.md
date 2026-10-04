@@ -164,6 +164,8 @@ Once an image is in the catalog, a worker that doesn't hold it locally fetches t
 
 The tempting next step is a *pull-through cache*: your apps reference `alpine:latest` or `nginx:1.25`, and the first node to need one transparently pulls it from Docker Hub (via the `oci-distribution` client from Phase 1), stores the layers, and commits the manifest to Raft so the next node gets it from a peer. The plumbing is sketched in `pull.rs`, but wiring it end to end — intercepting the miss, caching upstream, committing to Raft — is deferred to Phase 12. For now, public base images are still pulled from Docker Hub per node; only images you've explicitly pushed to Pickle replicate across the cluster. We'll come back to it in Chapter 12.
 
+(It landed there: the cache stores upstream images under `cache/<host>/<repository>` and serves them from peers. And since 0.1.6 an apply binds every tag to a digest, so the cache and every node agree on which bytes `nginx:1.25` means. Chapter 10's "A tag is a promise nobody keeps" tells that part.)
+
 ## How it compares to Docker Hub
 
 Let's walk through what deploying an image looks like with Docker Hub versus Pickle.
@@ -198,7 +200,7 @@ When your registry is external, your deploy pipeline inherits its uptime. Docker
 
 With Pickle, the cluster *is* the registry. If the cluster is up, the registry is up. There's no separate SLA to track, no status page to monitor, no fallback to configure — for the images you've pushed. Build and push your own apps to Pickle and a Docker Hub outage can't stop you redeploying them; they live on cluster nodes and replicate between peers.
 
-Public base images are the caveat until Phase 12. Today a node still pulls `nginx:1.25` from Docker Hub the first time it needs it. Once the pull-through cache lands, that first pull caches into Pickle and every subsequent deploy on any node comes from a peer — at which point Docker Hub could vanish and your existing deployments wouldn't notice. For now, the honest story is: your own images are outage-proof, public base images aren't yet.
+Public base images are the caveat until Phase 12. Today a node still pulls `nginx:1.25` from Docker Hub the first time it needs it. Once the pull-through cache lands, that first pull caches into Pickle and every subsequent deploy on any node comes from a peer — at which point Docker Hub could vanish and your existing deployments wouldn't notice. For now, the honest story is: your own images are outage-proof, public base images aren't yet. (Phase 12 closed that gap; with the cache on, a public image is outage-proof from its first pull.)
 
 ## Volume size enforcement
 

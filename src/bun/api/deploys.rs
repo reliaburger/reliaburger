@@ -220,9 +220,12 @@ pub(super) async fn deploys_history_handler(
 /// "Previous" means the last-but-one distinct successful deploy: the
 /// most recent completed entry is the *current* version, so rollback
 /// targets the one before it. Re-applies through the same path as
-/// `apply` (Raft in cluster mode, local deploy otherwise).
+/// `apply` (Raft in cluster mode, local deploy otherwise). The recorded
+/// spec carries the digest it ran, so the rollback runs those bytes; only
+/// a record from before binding (a bare tag) is resolved again.
 pub(super) async fn rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
@@ -290,6 +293,7 @@ pub(super) async fn rollback_handler(
     let mut config = Config::default();
     config.app.insert(app.clone(), spec);
     let raw = toml::to_string(&config).unwrap_or_default();
+    let binder = binder.map(|extension| extension.0);
 
     if let Some(council) = &state.council {
         return cluster_apply(
@@ -300,11 +304,26 @@ pub(super) async fn rollback_handler(
             None,
             HeaderMap::new(),
             None,
+            binder,
         )
         .await;
     }
 
-    let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    let bindings = match &binder {
+        Some(binder) => match super::apply::bind_images(&state, binder, &mut config).await {
+            Ok(bindings) => bindings,
+            Err(response) => return response,
+        },
+        None => Vec::new(),
+    };
+    let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32 + bindings.len());
+    for binding in &bindings {
+        let _ = event_tx
+            .send(ApplyEvent::Progress {
+                message: binding.to_string(),
+            })
+            .await;
+    }
     if state
         .cmd_tx
         .send(AgentCommand::Deploy {
