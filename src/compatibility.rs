@@ -42,8 +42,9 @@ pub struct Compatibility {
 /// on `local=true`, carrying scope and last use (F05 I2), and the per-blob
 /// repository upload receipts, keyed by repository and exact lease generation
 /// before scoped publication can reuse shared CAS content (#531).
+/// Complete desired-spec fingerprints and namespace-qualified preview keys (#550).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 35,
+    protocol: 36,
     state: 51,
 };
 
