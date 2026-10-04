@@ -2167,22 +2167,8 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
 /// The agent mints the token, stores its Argon2id hash in Raft, and
 /// returns the plaintext once; this prints it to stdout and never stores
 /// it. Needs a reachable agent and an admin credential.
-pub async fn token_create(
-    name: &str,
-    role_str: &str,
-    apps: Option<&str>,
-    namespaces: Option<&str>,
-    ttl_days: Option<u64>,
-) -> Result<(), RelishError> {
-    token_create_with_client(
-        name,
-        role_str,
-        apps,
-        namespaces,
-        ttl_days,
-        &BunClient::default_local(),
-    )
-    .await
+pub async fn token_create(request: &super::client::TokenRequest) -> Result<(), RelishError> {
+    token_create_with_client(request, &BunClient::default_local()).await
 }
 
 /// Create a token via the agent so it's persisted in Raft. The token is minted
@@ -2190,37 +2176,58 @@ pub async fn token_create(
 /// stdout. An unreachable agent is an error (never a silent exit-0), and the
 /// role is validated server-side.
 async fn token_create_with_client(
-    name: &str,
-    role_str: &str,
-    apps: Option<&str>,
-    namespaces: Option<&str>,
-    ttl_days: Option<u64>,
+    request: &super::client::TokenRequest,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let apps_vec = apps.map(|a| a.split(',').map(|s| s.trim().to_string()).collect());
-    let namespaces_vec = namespaces.map(|n| n.split(',').map(|s| s.trim().to_string()).collect());
+    let issued = client.token_create(request).await?;
 
-    let plaintext = client
-        .token_create(name, role_str, apps_vec, namespaces_vec, ttl_days)
-        .await?;
-
-    eprintln!("Token created: {name}");
-    eprintln!("  Role: {role_str}");
-    if let Some(apps) = apps {
-        eprintln!("  Apps: {apps}");
+    eprintln!("Token created: {}", request.name);
+    eprintln!("  Role: {}", request.role);
+    if let Some(apps) = &request.apps {
+        eprintln!("  Apps: {}", apps.join(","));
     }
-    if let Some(namespaces) = namespaces {
-        eprintln!("  Namespaces: {namespaces}");
+    if let Some(namespaces) = &request.namespaces {
+        eprintln!("  Namespaces: {}", namespaces.join(","));
     }
-    if let Some(days) = ttl_days {
-        eprintln!("  TTL: {days} days");
+    match issued.expires_at {
+        Some(at) => eprintln!("  Expires: {}", format_utc(at)),
+        None => eprintln!("  Expires: never"),
     }
     eprintln!();
-    println!("{plaintext}");
+    println!("{}", issued.token);
 
     Ok(())
 }
 
+/// Give an API token a new secret through the agent.
+///
+/// The new secret is printed to stdout once. The old one keeps working
+/// until the time printed on stderr, so clients can move over first.
+pub async fn token_rotate(name: &str, grace_hours: Option<u64>) -> Result<(), RelishError> {
+    token_rotate_with_client(name, grace_hours, &BunClient::default_local()).await
+}
+
+async fn token_rotate_with_client(
+    name: &str,
+    grace_hours: Option<u64>,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let issued = client.token_rotate(name, grace_hours).await?;
+
+    eprintln!("Token rotated: {name}");
+    match issued.previous_valid_until {
+        Some(at) => eprintln!("  Old secret works until: {}", format_utc(at)),
+        None => eprintln!("  Old secret: stopped working"),
+    }
+    match issued.expires_at {
+        Some(at) => eprintln!("  Expires: {}", format_utc(at)),
+        None => eprintln!("  Expires: never"),
+    }
+    eprintln!();
+    println!("{}", issued.token);
+
+    Ok(())
+}
 /// Print the cluster's age public key, for encrypting `ENC[AGE:...]` values.
 ///
 /// With no directory, asks the configured cluster (`GET
@@ -2295,19 +2302,20 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
 /// List API tokens via the agent, with every node's last use merged in.
 pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
     let listing = BunClient::default_local().token_list().await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     // A member that didn't answer may hold a more recent use; say so on
-    // stderr so `-o json` stays parseable.
+    // stderr so `-o json` stays parseable. Expiry warnings go there too.
     for warning in &listing.warnings {
         eprintln!("warning: last use incomplete: {warning}");
     }
+    for warning in token_expiry_warnings(&listing.tokens, now) {
+        eprintln!("warning: {warning}");
+    }
     match output {
-        OutputFormat::Human => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            print!("{}", render_token_list(&listing.tokens, now));
-        }
+        OutputFormat::Human => print!("{}", render_token_list(&listing.tokens, now)),
         OutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&listing).map_err(RelishError::SerialiseJson)?
@@ -2318,6 +2326,30 @@ pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
         ),
     }
     Ok(())
+}
+
+/// One line per token that has expired, or expires within
+/// [`crate::sesame::token::TOKEN_EXPIRY_WARNING`] of `now`, saying what to do.
+fn token_expiry_warnings(tokens: &[super::client::TokenSummary], now: u64) -> Vec<String> {
+    let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
+    tokens
+        .iter()
+        .filter_map(|token| {
+            let at = token.expires_at.filter(|at| *at <= horizon)?;
+            let name = &token.name;
+            Some(if at <= now {
+                format!(
+                    "token {name} has expired; create a replacement, or rotate it with \
+                     `relish token rotate {name}` before the expiry sweep removes it"
+                )
+            } else {
+                format!(
+                    "token {name} expires in {}; rotate it with `relish token rotate {name}`",
+                    format_duration(at - now)
+                )
+            })
+        })
+        .collect()
 }
 
 /// The `relish token list` table: UTC creation and expiry times, with how
@@ -2899,10 +2931,53 @@ mod tests {
         assert_eq!(render_token_list(&[], 0), "no tokens\n");
     }
 
+    #[test]
+    fn token_list_warns_about_tokens_expiring_within_fourteen_days() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
+        let now = 1_790_337_600;
+        let summary = |name: &str, expires_at: Option<u64>| TokenSummary {
+            name: name.to_string(),
+            role: "deployer".to_string(),
+            scope: TokenScopeSummary::default(),
+            created_at: now - 80 * 86_400,
+            expires_at,
+            last_used: None,
+        };
+        let tokens = [
+            summary("soon", Some(now + 3 * 86_400)),
+            summary("edge", Some(now + 14 * 86_400)),
+            summary("later", Some(now + 15 * 86_400)),
+            summary("forever", None),
+            summary("gone", Some(now - 60)),
+        ];
+        assert_eq!(
+            token_expiry_warnings(&tokens, now),
+            [
+                "token soon expires in 3d; rotate it with `relish token rotate soon`",
+                "token edge expires in 14d; rotate it with `relish token rotate edge`",
+                "token gone has expired; create a replacement, or rotate it with \
+                 `relish token rotate gone` before the expiry sweep removes it",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn token_create_errors_when_agent_unreachable() {
-        let result =
-            token_create_with_client("ci-bot", "deployer", None, None, None, &bogus_client()).await;
+        let request = super::super::client::TokenRequest {
+            name: "ci-bot".to_string(),
+            role: "deployer".to_string(),
+            apps: None,
+            namespaces: None,
+            lifetime: super::super::client::TokenLifetime::Default,
+            inherit_permissions: false,
+        };
+        let result = token_create_with_client(&request, &bogus_client()).await;
+        assert!(result.is_err(), "unreachable agent must be an error");
+    }
+
+    #[tokio::test]
+    async fn token_rotate_errors_when_agent_unreachable() {
+        let result = token_rotate_with_client("ci-bot", None, &bogus_client()).await;
         assert!(result.is_err(), "unreachable agent must be an error");
     }
 

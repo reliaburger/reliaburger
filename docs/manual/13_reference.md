@@ -111,7 +111,7 @@ startup instead of being ignored.
 | `[storage]` | data directories, `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` |
-| `[security]` | master key, bootstrap and identity paths, `require_mtls`, `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below) |
+| `[security]` | master key, bootstrap and identity paths, `require_mtls`, `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
 | `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`) |
 | `[images]` | registry, pull-through cache, mirrors, trust policy, builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart; see `images-and-volumes`) |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |

@@ -2527,6 +2527,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             node_certificate: None,
         },
         test_policy: config.testing.clone(),
+        token_lifetime: config.security.token_lifetime(),
     };
 
     // Enable workload-JWT bearer authentication when the cluster has an OIDC

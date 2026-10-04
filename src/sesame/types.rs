@@ -295,8 +295,45 @@ pub struct ApiToken {
     pub scope: TokenScope,
     /// When the token expires.
     pub expires_at: Option<SystemTime>,
-    /// When the token was created.
+    /// When the token's current secret was issued: at creation, then at
+    /// each `relish token rotate`.
     pub created_at: SystemTime,
+    /// The secret this token had before its last rotation, while it is
+    /// still accepted. `None` when the token was never rotated, or was
+    /// rotated with no grace period.
+    #[serde(default)]
+    pub previous_secret: Option<PreviousSecret>,
+}
+
+/// A rotated-out token secret that keeps working until `valid_until`, so
+/// clients can move to the new secret without an outage (F05 I3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreviousSecret {
+    /// Argon2id hash of the old secret.
+    pub token_hash: Vec<u8>,
+    /// Salt the old secret was hashed with.
+    pub token_salt: Vec<u8>,
+    /// When the old secret stops working.
+    pub valid_until: SystemTime,
+}
+
+/// A new secret for an existing API token, as `RaftRequest::RotateApiToken`
+/// carries it. The leader hashes the secret and reads the clock, so every
+/// replica applies the same values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenRotation {
+    /// The token being rotated.
+    pub name: String,
+    /// Argon2id hash of the new secret.
+    pub token_hash: Vec<u8>,
+    /// Salt the new secret was hashed with.
+    pub token_salt: Vec<u8>,
+    /// When the new secret was issued.
+    pub rotated_at: SystemTime,
+    /// When the new secret expires.
+    pub expires_at: Option<SystemTime>,
+    /// Until when the old secret keeps working; `None` ends it at once.
+    pub previous_valid_until: Option<SystemTime>,
 }
 
 // ---------------------------------------------------------------------------

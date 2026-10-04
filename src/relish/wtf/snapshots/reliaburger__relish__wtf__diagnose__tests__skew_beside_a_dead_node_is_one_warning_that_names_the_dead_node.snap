@@ -19,3 +19,4 @@ OK [faults] no active Smoker faults
 OK [registry] Pickle is reachable and its known layers meet the redundancy target
 OK [replicas] every app runs its desired replicas
 OK [services] all deployed services have a healthy backend
+OK [tokens] no API token expires within 14 days, and no admin token is past 90 days
