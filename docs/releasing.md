@@ -101,8 +101,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 50. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 34, state 49; this binary (reliaburger v0.1.5 (465fdeb)) needs protocol 35, state 50. …
+incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 34, state 49; this binary (reliaburger v0.1.5 (465fdeb)) needs protocol 40, state 57. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -146,7 +146,7 @@ paused run, because no node moved.
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
 `start` fails with both format pairs. A 0.1.4 cluster refuses 0.1.5 like this:
-`refusing to upgrade to v0.1.5: incompatible binary: found protocol 35, state 50; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+`refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -217,15 +217,18 @@ records a run, with
 
 ### Upgrading from 0.1.4
 
-0.1.5 can't roll onto a 0.1.4 cluster. The leader now sweeps expired API
-tokens through a new Raft entry (`SweepExpiredApiTokens`), which 0.1.4 can't
-decode from the log, and each peer answers the token list for itself with
-each token's scope and last use. So the protocol moved from 34 to 35 and the
-state format from 49 to 50. Recreate the cluster the same way as
-[from 0.1.0](#upgrading-from-010): move the data directories aside (or
-`relish local destroy --yes` a laptop cluster), install 0.1.5 and re-apply
-your apps. 0.1.4's leader refuses the upgrade before it records a run, with
-`found protocol 35, state 50; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+0.1.5 can't roll onto a 0.1.4 cluster. The leader sweeps expired API tokens
+through a new Raft entry, and each peer answers the token list for itself
+with scope and last use (F05 I2). The codebase-audit fixes add more to the
+council's log and to what nodes exchange: per-blob upload receipts in
+Pickle, owned metrics and log archive prefixes, batch attempt identities
+and whole-pass admission, run-before migration fences, webhook trigger
+receipts, and complete spec fingerprints for `apply --dry-run`. So the
+protocol moved from 34 to 40 and the state format from 49 to 57. Recreate
+the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data
+directories aside (or `relish local destroy --yes` a laptop cluster), install
+0.1.5 and re-apply your apps. 0.1.4's leader refuses the upgrade before it records a run, with
+`found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
 
 ## Signing identity
 

@@ -94,7 +94,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.5: incompatible binary: found protocol 35, state 50; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49. …
+refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49. …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -131,7 +131,7 @@ it before recording a run, with the message above
 And 0.1.4: protocol 34, state format still 49. A 0.1.3 cluster's leader
 refuses it the same way
 ([upgrading from 0.1.3](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-013)).
-And 0.1.5: protocol 35 and state format 50. A 0.1.4 cluster's leader refuses
+And 0.1.5: protocol 40 and state format 57. A 0.1.4 cluster's leader refuses
 it the same way
 ([upgrading from 0.1.4](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-014)).
 
@@ -150,7 +150,7 @@ line says what it found and what it needs, so even a truncated journal line
 carries it:
 
 ```text
-incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 50. Pre-1.0 builds don't migrate state: …
+incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: …
 ```
 
 A join between mismatched binaries fails the same way, starting

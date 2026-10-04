@@ -187,8 +187,7 @@ migration and no feature gate
 - [ ] **0.1.5: bug fixes, ready for release, qualification to follow**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/11), merge
   train [#484](https://github.com/reliaburger/reliaburger/pull/484)). Every
-  item below has landed on `release-1-1-5`, apart from the two flake PRs
-  still in CI, and the crate says 0.1.5:
+  item below has landed on `release-1-1-5`, and the crate says 0.1.5:
   - [x] token list with scope, expiry and last use, and an hourly sweep of
     expired tokens that never removes the last Admin (F05 I2,
     [#483](https://github.com/reliaburger/reliaburger/pull/483));
@@ -207,19 +206,24 @@ migration and no feature gate
   - [x] the 0.1.4 soak findings: a consumer sync journals one write a turn
     ([#505](https://github.com/reliaburger/reliaburger/issues/505), [#506](https://github.com/reliaburger/reliaburger/pull/506)), and a peer TLS connection retires when its
     client leaf expires ([#509](https://github.com/reliaburger/reliaburger/issues/509), [#518](https://github.com/reliaburger/reliaburger/pull/518));
-  - [ ] flakes: `flock` guards that unlock on drop and a slow-disk scenario
-    that counts persists ([#497](https://github.com/reliaburger/reliaburger/issues/497), [#500](https://github.com/reliaburger/reliaburger/issues/500), [#508](https://github.com/reliaburger/reliaburger/issues/508), [#519](https://github.com/reliaburger/reliaburger/issues/519),
-    [#523](https://github.com/reliaburger/reliaburger/pull/523)), and a snapshot spool quota independent of the host disk
-    ([#524](https://github.com/reliaburger/reliaburger/issues/524), [#525](https://github.com/reliaburger/reliaburger/pull/525)), both still in CI.
+  - [x] the codebase audit's 28 fixes ([#528](https://github.com/reliaburger/reliaburger/issues/528)–[#555](https://github.com/reliaburger/reliaburger/issues/555),
+    [#556](https://github.com/reliaburger/reliaburger/pull/556)): data safety in volumes, logs, metrics and the registry;
+    token scope on batch submission and repository isolation in Pickle;
+    ingress, DNS and service-discovery routing; batch, cron and migration
+    correctness; config compile, `_defaults.toml`, GitOps and `apply
+    --dry-run`; and one behaviour across every entry point;
+  - [x] flakes: `flock` guards that unlock on drop, slow-disk scenarios that
+    count persists, a spool quota independent of the host disk, warmed fake
+    executables and closed scripted connections ([#497](https://github.com/reliaburger/reliaburger/issues/497), [#500](https://github.com/reliaburger/reliaburger/issues/500),
+    [#508](https://github.com/reliaburger/reliaburger/issues/508), [#517](https://github.com/reliaburger/reliaburger/issues/517), [#519](https://github.com/reliaburger/reliaburger/issues/519)–[#521](https://github.com/reliaburger/reliaburger/issues/521), [#524](https://github.com/reliaburger/reliaburger/issues/524), [#585](https://github.com/reliaburger/reliaburger/issues/585), [#523](https://github.com/reliaburger/reliaburger/pull/523),
+    [#525](https://github.com/reliaburger/reliaburger/pull/525), [#557](https://github.com/reliaburger/reliaburger/pull/557), [#586](https://github.com/reliaburger/reliaburger/pull/586)).
 
-  Still open, with no fix yet: the quickstart runner's fake-`limactl` tests
-  failing when they share a process
-  ([#517](https://github.com/reliaburger/reliaburger/issues/517)), and three
-  flakes found while proving the others
-  ([#520](https://github.com/reliaburger/reliaburger/issues/520), [#521](https://github.com/reliaburger/reliaburger/issues/521), [#526](https://github.com/reliaburger/reliaburger/issues/526)); #523 adds them to the
-  [known flakes register](flakes.md). 0.1.5 changes the protocol and state
-  formats (34 and 49 in 0.1.4; 35 and 50 now, for the token sweep), so a
-  0.1.4 cluster can't roll to it: recreate the cluster
+  The self-upgrade fixes for the privileged Linux `oci_crash` flake are in
+  too, but that flake isn't proven gone yet, so
+  [#526](https://github.com/reliaburger/reliaburger/issues/526) stays open. 0.1.5
+  changes the protocol and state formats (34 and 49 in 0.1.4; 40 and 57 now,
+  for the token sweep and the audit fixes), so a 0.1.4 cluster can't roll to
+  it: recreate the cluster
   ([upgrading from 0.1.4](releasing.md#upgrading-from-014)).
 - [ ] **0.1.6: operations security**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/12)). The

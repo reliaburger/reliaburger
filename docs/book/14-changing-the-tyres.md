@@ -591,7 +591,7 @@ A refusal is only as good as its first line. The 0.1.0 version said `invalid or 
 So every refusal now leads with the pair, then the remedy, then a link to the policy:
 
 ```text
-incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 50. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
+incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
 ```
 
 A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
@@ -611,7 +611,7 @@ Two bits of `thiserror` syntax are new here. `{found}` names a field of the vari
 
 `this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.3 (465fdeb)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
 
-The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 34, state 49; this binary (...) needs protocol 35, state 50`.
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 34, state 49; this binary (...) needs protocol 40, state 57`.
 
 The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
 
@@ -1413,7 +1413,7 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 35, state 50; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49` (a 0.1.4 cluster offered 0.1.5), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49` (a 0.1.4 cluster offered 0.1.5), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 
