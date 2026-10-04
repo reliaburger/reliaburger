@@ -10,6 +10,8 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [GitOps job refusal](2026-10-04-gitops-job-refusal.md) | Refuse unsupported jobs before publishing their dependent apps or advancing the applied revision. | #549 |
+| [Shared configuration tree](2026-10-04-shared-config-tree.md) | Resolve defaults and directory namespaces consistently through CLI and GitOps adapters. | #548 |
 | [Desired-spec previews](2026-10-04-desired-spec-preview.md) | Complete scoped comparison evidence with explicit offline and unknown actions. | #550 |
 | [Autoscale target validation](2026-10-03-autoscale-target-validation.md) | Refuse nonpositive or nonfinite controller targets and measurements. | #554 |
 | [Batch execution identities](2026-10-03-batch-execution-identities.md) | Bind batch outcomes, scope and durable retries to one execution per submitted job. | #535 |

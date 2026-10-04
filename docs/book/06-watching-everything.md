@@ -294,6 +294,10 @@ Second, the client filters too, for `-f` and for `--json-field`, which the serve
 
 Both the flushed Parquet files and the unflushed in-memory buffer are included in every DataFusion query. Same trick we use for metrics. There's no blind spot — you see logs from 30 seconds ago in the same SQL query as logs from last week. No merging, no separate code paths, no seams.
 
+A failed flush used to drain the only in-memory copy before it wrote Parquet. An unwritable directory or a failed ingest-checkpoint rename then lost captured rows while their live offsets still claimed they had been read. The store now owns one pending batch until both its Parquet file and capture checkpoint are durable. Retrying reserves the same filename, serialises writers for that batch and finishes it before advancing a newer checkpoint. An async caller can be cancelled while its blocking writer runs; that writer retains its I/O guard, and the store retains the rows for the next attempt.
+
+Queries keep their own copy of the pending batch and exclude its immutable sequence range from the disk relation. A rename during the disk scan therefore cannot add a second copy. New rows are allocated and inserted together under the store's write lock, so they always lie above that reserved range. Failed directory writes, failed checkpoint writes and an explicitly paused, cancelled writer are tested through reads, later appends, retries and reopening the capture checkpoint. A process crash between publishing Parquet and saving the checkpoint can still replay a batch on restart: the in-memory owner disappears with the process. That restart boundary, and the Parquet helper's discarded directory-sync error, need separate recovery qualification.
+
 ## The dashboard
 
 Brioche is a single HTML page. No React, no Vue, no webpack. The server renders the HTML with current data, embeds a 2KB CSS stylesheet, and sends it. The browser refreshes every 5 seconds via a `<meta http-equiv="refresh">` tag.
