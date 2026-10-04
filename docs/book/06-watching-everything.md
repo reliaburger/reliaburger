@@ -52,6 +52,12 @@ object_store_url = "s3://my-bucket/reliaburger-metrics"
 
 Same code, same queries, same dashboard. The only difference is where the bytes go. Your metrics survive node failures because they're in S3, not on a local disk that just caught fire.
 
+Remote metric chunks use random 128-bit names and create-only PUTs. Two nodes starting with the same empty bucket cannot choose `metrics_000000.parquet` and silently overwrite each other. Even a name collision refuses the second write and leaves its samples available for retry.
+
+Bun opens a node-owned prefix beneath that bucket. For an enrolled node, the owner combines the cluster root CA fingerprint with the node ID in its certificate; renewing a leaf certificate under the same root and node ID keeps the same archive. A different root CA or a newly enrolled node identity gets a different prefix; the archive-wide reader can still inspect the earlier prefix. Plaintext nodes keep an opaque owner in `metrics-archive-owner` under the configured `[storage] data` directory. Back up that file: restoring only a remote bucket cannot identify which plaintext node's history to reopen. A human label or local directory path never chooses the prefix. Remote archive startup refuses an unwritable configured data directory or corrupt owner. Set `[storage] data` to a writable directory owned by that node, or restore its owner file from backup. Falling back to the common per-user state directory could give two nodes the same archive owner, so remote plaintext archives never use that fallback. Ordinary local metrics keep their existing fallback behaviour.
+
+Each production node queries its own prefix, so cluster fan-out and rollups count each archive once. Remote retention still belongs to the bucket lifecycle policy; the existing remote prune path remains a no-op. `MayoStore::open` remains an archive-wide API for explicit offline queries; `open_for_node` is the production scope. This changes the durable ownership contract even though the Parquet columns stay the same, so it increments the state generation. Startup, joins and upgrades refuse the earlier generation; recreate the cluster with fresh node state rather than rolling across that boundary. The earlier shared prefix cannot prove which node owns each chunk, so we preserve it separately instead of guessing an owner or migrating it into a scoped archive.
+
 ## Collecting metrics
 
 The `sysinfo` crate gives us cross-platform system metrics without writing platform-specific code. On both Linux and macOS, we collect:
