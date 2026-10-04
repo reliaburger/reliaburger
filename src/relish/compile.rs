@@ -3,10 +3,10 @@
 /// Walks a directory of TOML files, discovers `_defaults.toml` files,
 /// merges defaults into each app/job spec, and returns a single resolved
 /// `Config`. Directory names become namespaces.
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::config::defaults::WorkloadDefaults;
 
 use super::RelishError;
 
@@ -17,7 +17,7 @@ pub struct CompileResult {
     pub config: Config,
     /// Files that were successfully merged.
     pub merged_from: Vec<PathBuf>,
-    /// Warnings (e.g. parse errors in individual files).
+    /// Non-fatal duplicate-definition warnings; incomplete trees are errors.
     pub warnings: Vec<String>,
 }
 
@@ -60,18 +60,19 @@ fn compile_directory(dir: &Path) -> Result<CompileResult, RelishError> {
 /// directory doesn't have its own `_defaults.toml`.
 fn compile_directory_with_defaults(
     dir: &Path,
-    parent_defaults: Option<&BTreeMap<String, toml::Value>>,
+    parent_defaults: Option<&WorkloadDefaults>,
 ) -> Result<CompileResult, RelishError> {
     let mut merged = Config::default();
     let mut merged_from = Vec::new();
     let mut warnings = Vec::new();
 
-    // Load defaults: own file takes priority, fall back to parent's
-    let (own_defaults, defaults_warning) = load_defaults(dir);
-    if let Some(warning) = defaults_warning {
-        warnings.push(warning);
-    }
-    let defaults = own_defaults.as_ref().or(parent_defaults);
+    // Resolve inheritance field by field, including nested table keys.
+    let own_defaults = load_defaults(dir)?;
+    let resolved_defaults = own_defaults
+        .as_ref()
+        .map(|own| own.inherit(parent_defaults))
+        .or_else(|| parent_defaults.cloned());
+    let defaults = resolved_defaults.as_ref();
 
     // Process all .toml files in this directory (except _defaults.toml)
     let entries = collect_toml_files(dir)?;
@@ -90,7 +91,7 @@ fn compile_directory_with_defaults(
                 // Apply defaults: merge default fields into apps/jobs
                 // that don't have them set
                 if let Some(defaults_toml) = defaults {
-                    apply_defaults(&mut file_config, defaults_toml);
+                    defaults_toml.apply(&mut file_config);
                 }
 
                 // Derive namespace from subdirectory name relative to root
@@ -105,38 +106,40 @@ fn compile_directory_with_defaults(
                 merged_from.push(entry_path.clone());
             }
             Err(e) => {
-                warnings.push(format!("{}: {e}", entry_path.display()));
+                return Err(RelishError::FormatFailed(format!(
+                    "{}: {e}",
+                    entry_path.display()
+                )));
             }
         }
     }
 
     // Recurse into subdirectories — directory name becomes the namespace
-    if let Ok(read_dir) = std::fs::read_dir(dir) {
-        let mut subdirs: Vec<PathBuf> = read_dir
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
+    {
+        let read_dir = std::fs::read_dir(dir)?;
+        let mut subdirs = Vec::new();
+        for entry in read_dir {
+            let path = entry?.path();
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            if metadata.is_dir() {
+                subdirs.push(path);
+            }
+        }
         subdirs.sort();
 
         for subdir in subdirs {
-            match compile_directory_with_defaults(&subdir, defaults) {
-                Ok(mut sub_result) => {
-                    // Apply the subdirectory name as namespace
-                    if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
-                        apply_namespace(&mut sub_result.config, ns);
-                    }
-                    for collision in merge_into(&mut merged, sub_result.config)? {
-                        warnings.push(format!("{}: {collision}", subdir.display()));
-                    }
-                    merged_from.extend(sub_result.merged_from);
-                    warnings.extend(sub_result.warnings);
-                }
-                Err(RelishError::Io(_)) => {
-                    // Skip unreadable directories
-                }
-                Err(e) => return Err(e),
+            let mut sub_result = compile_directory_with_defaults(&subdir, defaults)?;
+            // Apply the subdirectory name as namespace.
+            if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
+                apply_namespace(&mut sub_result.config, ns);
             }
+            for collision in merge_into(&mut merged, sub_result.config)? {
+                warnings.push(format!("{}: {collision}", subdir.display()));
+            }
+            merged_from.extend(sub_result.merged_from);
+            warnings.extend(sub_result.warnings);
         }
     }
 
@@ -149,63 +152,43 @@ fn compile_directory_with_defaults(
 
 /// Collect all .toml files in a directory (non-recursive, sorted).
 fn collect_toml_files(dir: &Path) -> Result<Vec<PathBuf>, RelishError> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "toml"))
-        .collect();
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                RelishError::FormatFailed(format!("{}: {error}", path.display()))
+            })?;
+            if metadata.is_file() {
+                files.push(path);
+            }
+        }
+    }
     files.sort();
     Ok(files)
 }
 
-/// Load `_defaults.toml` from a directory, if present.
-///
-/// Returns the defaults and any reason they could not be loaded (O10). The
-/// `.ok()?` this replaced turned an unreadable or malformed defaults file
-/// into "there are no defaults" — so a typo in `_defaults.toml` didn't fail
-/// the compile, it silently dropped the default image from every app in the
-/// directory and let the error surface much later as a missing field.
-fn load_defaults(dir: &Path) -> (Option<BTreeMap<String, toml::Value>>, Option<String>) {
-    let defaults_path = dir.join("_defaults.toml");
-    if !defaults_path.is_file() {
-        return (None, None);
-    }
-    let content = match std::fs::read_to_string(&defaults_path) {
-        Ok(content) => content,
-        Err(e) => {
-            return (
-                None,
-                Some(format!("{}: unreadable: {e}", defaults_path.display())),
-            );
+/// Read defaults strictly: errors must not turn a tree into a partial manifest.
+fn load_defaults(dir: &Path) -> Result<Option<WorkloadDefaults>, RelishError> {
+    let path = dir.join("_defaults.toml");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RelishError::FormatFailed(format!(
+                "{}: {error}",
+                path.display()
+            )));
         }
-    };
-    match toml::from_str(&content) {
-        Ok(parsed) => (Some(parsed), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "{}: invalid TOML, defaults not applied: {e}",
-                defaults_path.display()
-            )),
-        ),
+        Ok(_) => {}
     }
-}
-
-/// Apply defaults to a config. For each app, if a field from defaults
-/// is missing, inject it. Currently supports the `image` default.
-fn apply_defaults(config: &mut Config, defaults: &BTreeMap<String, toml::Value>) {
-    let default_image = defaults
-        .get("image")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    for app in config.app.values_mut() {
-        if app.image.is_none()
-            && let Some(ref img) = default_image
-        {
-            app.image = Some(img.clone());
-        }
-    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))?;
+    toml::from_str(&content)
+        .map(Some)
+        .map_err(|error| RelishError::FormatFailed(format!("{}: {error}", path.display())))
 }
 
 /// Derive namespace from the path relative to the root directory.
@@ -433,23 +416,13 @@ mod tests {
         }
     }
 
-    /// O10: a malformed `_defaults.toml` used to be indistinguishable from
-    /// no defaults at all, so the error surfaced later as a missing field.
     #[test]
-    fn a_malformed_defaults_file_is_reported() {
+    fn malformed_defaults_refuse_the_entire_compile() {
         let dir = TempDir::new().unwrap();
         write_file(dir.path(), "_defaults.toml", "image = \"not closed\n");
         write_file(dir.path(), "a.toml", "[app.web]\nimage = \"x:1\"\n");
-
-        let result = compile(dir.path()).unwrap();
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("_defaults.toml") && w.contains("invalid TOML")),
-            "a malformed defaults file was swallowed: {:?}",
-            result.warnings
-        );
+        let error = compile(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("_defaults.toml"), "{error}");
     }
 
     #[test]
@@ -505,22 +478,38 @@ mod tests {
     }
 
     #[test]
-    fn compile_invalid_file_skipped_with_warning() {
+    fn malformed_workload_files_refuse_the_entire_compile() {
         let dir = TempDir::new().unwrap();
         write_file(dir.path(), "bad.toml", "this is not valid toml [[[");
-        write_file(
-            dir.path(),
-            "good.toml",
-            r#"
-            [app.web]
-            image = "myapp:v1"
-            "#,
-        );
+        write_file(dir.path(), "good.toml", "[app.web]\nimage = \"web:1\"\n");
+        let error = compile(dir.path())
+            .expect_err("partial manifests must not be emitted")
+            .to_string();
+        assert!(error.contains("bad.toml"), "{error}");
+    }
 
-        let result = compile(dir.path()).unwrap();
-        assert_eq!(result.config.app.len(), 1, "valid file should be parsed");
-        assert_eq!(result.warnings.len(), 1, "bad file should produce warning");
-        assert!(result.warnings[0].contains("bad.toml"));
+    #[test]
+    fn invalid_files_in_nested_directories_refuse_the_entire_compile() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("prod")).unwrap();
+        write_file(&dir.path().join("prod"), "bad.toml", "[app.web\n");
+        write_file(dir.path(), "good.toml", "[app.api]\nimage = \"api:1\"\n");
+        assert!(
+            compile(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("bad.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_symlink_input_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("bad.toml"))
+            .unwrap();
+        let error = compile(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("bad.toml"), "{error}");
     }
 
     #[test]
@@ -553,5 +542,152 @@ mod tests {
     fn compile_nonexistent_path_errors() {
         let result = compile(Path::new("/nonexistent/path/nothing.toml"));
         assert!(result.is_err());
+    }
+    #[test]
+    fn typed_defaults_preserve_resources_environment_and_partial_deploy_overrides() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "_defaults.toml",
+            r#"
+image = "web:1"
+memory = "256Mi-512Mi"
+cpu = "100m-500m"
+[env]
+MODE = "prod"
+KEEP = "default"
+[deploy]
+strategy = "rolling"
+max_unavailable = 0
+auto_rollback = true
+"#,
+        );
+        write_file(
+            dir.path(),
+            "web.toml",
+            r#"
+[app.web]
+[app.web.env]
+KEEP = "explicit"
+[app.web.deploy]
+auto_rollback = false
+"#,
+        );
+        let result = compile(dir.path()).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(
+            app.memory.as_ref().map(|r| r.request),
+            Some(256 * 1024 * 1024)
+        );
+        assert_eq!(app.cpu.as_ref().map(|r| r.request), Some(100));
+        assert_eq!(
+            app.env["MODE"],
+            crate::config::EnvValue::Plain("prod".into())
+        );
+        assert_eq!(
+            app.env["KEEP"],
+            crate::config::EnvValue::Plain("explicit".into())
+        );
+        let deploy = app.deploy.as_ref().unwrap();
+        assert_eq!(deploy.max_unavailable, Some(0));
+        assert_eq!(deploy.auto_rollback, Some(false));
+        assert_eq!(deploy.strategy.as_deref(), Some("rolling"));
+        let encoded = toml::to_string(&result.config).unwrap();
+        assert_eq!(
+            crate::config::Config::parse(&encoded).unwrap(),
+            result.config
+        );
+    }
+
+    #[test]
+    fn nested_defaults_merge_parent_tables_and_explicit_scalars_win() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("prod")).unwrap();
+        write_file(
+            dir.path(),
+            "_defaults.toml",
+            "image='parent:1'\nmemory='256Mi'\n[env]\nPARENT='yes'\nVALUE='parent'\n[deploy]\nmax_unavailable=0\nauto_rollback=true\n",
+        );
+        write_file(
+            &dir.path().join("prod"),
+            "_defaults.toml",
+            "cpu='300m'\n[env]\nVALUE='child'\n[deploy]\nauto_rollback=false\n",
+        );
+        write_file(
+            &dir.path().join("prod"),
+            "web.toml",
+            "[app.web]\nimage='explicit:1'\nmemory='128Mi'\n[app.web.deploy]\nmax_surge=0\n",
+        );
+        let result = compile(dir.path()).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.image.as_deref(), Some("explicit:1"));
+        assert_eq!(
+            app.memory.as_ref().map(|r| r.request),
+            Some(128 * 1024 * 1024)
+        );
+        assert_eq!(app.cpu.as_ref().map(|r| r.request), Some(300));
+        assert_eq!(
+            app.env["PARENT"],
+            crate::config::EnvValue::Plain("yes".into())
+        );
+        assert_eq!(
+            app.env["VALUE"],
+            crate::config::EnvValue::Plain("child".into())
+        );
+        let deploy = app.deploy.as_ref().unwrap();
+        assert_eq!(deploy.max_surge, Some(0));
+        assert_eq!(deploy.max_unavailable, Some(0));
+        assert_eq!(deploy.auto_rollback, Some(false));
+    }
+
+    #[test]
+    fn defaults_reject_unknown_keys_and_invalid_values_with_the_path() {
+        for raw in [
+            "memroy='256Mi'",
+            "memory='nonsense'",
+            "cpu='bad'",
+            "[deploy]\nmax_unavailble=0",
+        ] {
+            let dir = TempDir::new().unwrap();
+            write_file(dir.path(), "_defaults.toml", raw);
+            write_file(dir.path(), "web.toml", "[app.web]\nimage='web:1'\n");
+            let error = compile(dir.path())
+                .expect_err("unsupported defaults must not disappear")
+                .to_string();
+            assert!(error.contains("_defaults.toml"), "{error}");
+        }
+    }
+    #[test]
+    fn common_defaults_preserve_explicit_host_execution_for_apps_and_jobs() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "_defaults.toml",
+            "image='container:1'\nmemory='64Mi'\ncpu='50m'\n[env]\nMODE='prod'\n",
+        );
+        write_file(
+            dir.path(),
+            "native.toml",
+            "[app.worker]\nexec='/usr/bin/true'\n[job.migrate]\nexec='/usr/bin/true'\n",
+        );
+        let result = compile(dir.path()).unwrap();
+        let app = &result.config.app["worker"];
+        let job = &result.config.job["migrate"];
+        assert!(app.image.is_none());
+        assert!(job.image.is_none());
+        assert_eq!(
+            app.memory.as_ref().map(|r| r.request),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            job.memory.as_ref().map(|r| r.request),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(job.cpu.as_ref().map(|r| r.request), Some(50));
+        assert_eq!(
+            job.env["MODE"],
+            crate::config::EnvValue::Plain("prod".into())
+        );
+        result.config.validate().unwrap();
     }
 }

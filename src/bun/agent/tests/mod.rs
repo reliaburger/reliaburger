@@ -11,6 +11,7 @@ mod loop_harness;
 mod loop_rule;
 mod published_status;
 mod restart_ownership;
+mod upgrade_answer;
 
 #[test]
 fn trace_targets_are_positional_arguments_not_shell_source() {
