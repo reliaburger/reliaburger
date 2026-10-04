@@ -39,11 +39,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.deployed_specs
             .remove(&(app_name.to_string(), namespace.to_string()));
-        let mut jobs = self.recorded_jobs.clone();
-        jobs.retain(|_, job| job.name != app_name || job.namespace != namespace);
-        if jobs.len() != self.recorded_jobs.len() {
-            self.commit_jobs(jobs).await?;
+        let mut inventory = crate::bun::jobs::JobInventory {
+            jobs: self.recorded_jobs.clone(),
+            retired: self.retired_batch_executions.clone(),
+        };
+        let retiring: Vec<_> = inventory
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.name == app_name && job.namespace == namespace)
+            .map(|(id, job)| (id.clone(), job.clone()))
+            .collect();
+        for (id, job) in retiring {
+            if let Some(owner) = &job.batch_execution {
+                if !job.runtime_absent {
+                    return Err(BunError::JobState(
+                        "batch execution retirement lacks positive runtime absence".into(),
+                    ));
+                }
+                // Only current-attempt terminal evidence becomes a terminal proof.
+                // An interrupted retry or explicit unknown stop remains unknown.
+                let phase = job
+                    .batch_terminal_exit()
+                    .map_or(crate::bun::jobs::JobPhase::Unknown, |code| {
+                        crate::bun::jobs::JobPhase::Exited { code }
+                    });
+                inventory.retired.insert(
+                    id.clone(),
+                    crate::bun::jobs::RetiredBatchExecution {
+                        name: job.name.clone(),
+                        namespace: job.namespace.clone(),
+                        generation: job.generation,
+                        restart_count: job.restart_count,
+                        batch_execution: owner.clone(),
+                        runtime_absent: true,
+                        phase,
+                    },
+                );
+            }
+            inventory.jobs.remove(&id);
         }
+        self.commit_job_inventory(inventory).await?;
         Ok(())
     }
 

@@ -22,6 +22,209 @@ pub(super) struct LogsQuery {
     pub(super) label: Option<bool>,
 }
 
+/// Resolve trusted execution aliases before authorising the requested path.
+// The error is the HTTP response this route must return unchanged.
+#[allow(clippy::result_large_err)]
+pub(super) async fn resolve_log_path(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    instance: Option<&str>,
+) -> Result<crate::bun::agent::LogExecutionSelection, Response> {
+    resolve_log_path_until(
+        state,
+        app,
+        namespace,
+        instance,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+async fn resolve_log_path_until(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    instance: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<crate::bun::agent::LogExecutionSelection, Response> {
+    match tokio::time::timeout_at(
+        deadline,
+        resolve_log_path_inner(state, app, namespace, instance),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(agent_unavailable()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn resolve_log_path_inner(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    instance: Option<&str>,
+) -> Result<crate::bun::agent::LogExecutionSelection, Response> {
+    let resolved = ask_agent_bounded(&state.cmd_tx, |response| {
+        AgentCommand::ResolveExecutionLogs {
+            app_name: app.into(),
+            namespace: namespace.into(),
+            instance: instance.map(str::to_string),
+            response,
+        }
+    })
+    .await?;
+    let mut selection = match resolved {
+        Ok(selection) => selection,
+        Err(error) => {
+            // An explicit selector can refer to an execution on another node.
+            // Only retained committed ownership supplies that missing alias;
+            // a local ordinary owner must never acquire the requested batch label.
+            if let (Some(council), Some(instance)) = (&state.council, instance)
+                && let Some(identity) = crate::grill::InstanceIdentity::parse(instance)
+                && identity.namespace == namespace
+                && identity.instance_id().0 == instance
+            {
+                let desired = council.desired_state().await;
+                if let Some(owner) = desired.batch_state.execution_owners.get(instance)
+                    && (app == identity.app || app == owner.logical_name)
+                {
+                    let local = ask_agent_bounded(&state.cmd_tx, |response| AgentCommand::Status {
+                        response,
+                    })
+                    .await?;
+                    if !local.iter().any(|status| status.id == instance) {
+                        return Ok(crate::bun::agent::LogExecutionSelection {
+                            logical_name: owner.logical_name.clone(),
+                            instances: Vec::new(),
+                            selected_instance: Some(instance.to_string()),
+                        });
+                    }
+                }
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response());
+        }
+    };
+    // The retained cluster index also resolves structured log rows on a node
+    // that does not own the runtime. Never relabel a known local ordinary owner.
+    if let Some(council) = &state.council {
+        let desired = council.desired_state().await;
+        let direct = desired.batch_state.execution_owner(namespace, app);
+        if instance.is_none() && direct.is_some() {
+            let id = crate::grill::InstanceIdentity::new(namespace, app, 0).instance_id();
+            if desired
+                .batch_state
+                .execution_owners
+                .iter()
+                .any(|(other_id, owner)| {
+                    other_id != &id.0
+                        && owner.logical_name == app
+                        && crate::grill::InstanceIdentity::parse(other_id)
+                            .is_some_and(|identity| identity.namespace == namespace)
+                })
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "ambiguous execution and logical label; select an explicit instance",
+                )
+                    .into_response());
+            }
+            if selection.instances.is_empty()
+                && let Some(owner) = direct
+            {
+                selection.logical_name = owner.logical_name.clone();
+                selection.selected_instance = Some(id.0);
+            }
+        }
+    }
+    Ok(selection)
+}
+
+/// A selected batch stream belongs to its committed allocation, never an app
+/// placement with the same logical label. Retained replay ownership alone has
+/// no routing authority after tracker pruning.
+#[allow(clippy::result_large_err)]
+async fn owned_follow_node(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    instance: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<crate::meat::NodeId>, Response> {
+    let Some(council) = &state.council else {
+        return Ok(None);
+    };
+    tokio::time::timeout_at(deadline, async {
+        let desired = council.desired_state().await;
+        let Some(instance) = instance else {
+            if desired
+                .batch_state
+                .execution_owners
+                .iter()
+                .any(|(id, owner)| {
+                    owner.logical_name == app
+                        && crate::grill::InstanceIdentity::parse(id)
+                            .is_some_and(|identity| identity.namespace == namespace)
+                })
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "batch follow requires an explicit execution instance",
+                )
+                    .into_response());
+            }
+            return Ok(None);
+        };
+        let Some(owner) = desired.batch_state.execution_owners.get(instance) else {
+            return Ok(None);
+        };
+        let identity = crate::grill::InstanceIdentity::parse(instance)
+            .filter(|identity| {
+                identity.namespace == namespace
+                    && identity.instance_id().0 == instance
+                    && identity.ordinal == 0
+            })
+            .ok_or_else(agent_unavailable)?;
+        if owner.logical_name != app {
+            return Err(agent_unavailable());
+        }
+        let mut allocations = desired
+            .batch_state
+            .batches
+            .iter()
+            .filter(|(id, _)| *id == owner.batch_id)
+            .flat_map(|(_, batch)| &batch.jobs)
+            .filter(|job| job.execution_name == identity.app && job.namespace == namespace);
+        let allocation = allocations.next().ok_or_else(agent_unavailable)?;
+        if allocations.next().is_some()
+            || allocation.name != app
+            || allocation.spec_digest != owner.spec_digest
+        {
+            return Err(agent_unavailable());
+        }
+        let node = allocation.node.clone().ok_or_else(agent_unavailable)?;
+        let self_name = state.node_name.as_deref().ok_or_else(agent_unavailable)?;
+        if self_name != node.0 {
+            let membership = state.membership.as_ref().ok_or_else(agent_unavailable)?;
+            let members = membership.read().await;
+            let mut matching = members.iter().filter(|member| member.node_id == node);
+            let member = matching.next().ok_or_else(agent_unavailable)?;
+            if !member.api_advertised || matching.next().is_some() {
+                return Err(agent_unavailable());
+            }
+        }
+        Ok(Some(node))
+    })
+    .await
+    .unwrap_or_else(|_| Err(agent_unavailable()))
+}
+
 /// Get logs for an app.
 ///
 /// Supports `?tail=N` to return only the last N lines, and
@@ -30,8 +233,27 @@ pub(super) async fn logs_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
-    Query(query): Query<LogsQuery>,
+    Query(mut query): Query<LogsQuery>,
 ) -> Response {
+    if let Err(response) = log_metadata_preflight(auth.as_deref(), &namespace, &query) {
+        return response;
+    }
+    let metadata_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let selection = match resolve_log_path_until(
+        &state,
+        &app,
+        &namespace,
+        query.instance.as_deref(),
+        metadata_deadline,
+    )
+    .await
+    {
+        Ok(selection) => selection,
+        Err(response) => return response,
+    };
+    let app = selection.logical_name.clone();
+    query.instance = selection.selected_instance.clone();
+
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
@@ -56,8 +278,24 @@ pub(super) async fn logs_handler(
     }
 
     if follow {
-        // A cluster member follows every node that runs the app; the
-        // per-node streams it opens come back here with `local=true`.
+        let owned_node = if query.local.unwrap_or(false) {
+            None
+        } else {
+            match owned_follow_node(
+                &state,
+                &app,
+                &namespace,
+                query.instance.as_deref(),
+                metadata_deadline,
+            )
+            .await
+            {
+                Ok(node) => node,
+                Err(response) => return response,
+            }
+        };
+        // Ordinary apps follow placements; selected batch executions follow
+        // only their proven allocation. Peer streams return with `local=true`.
         if !query.local.unwrap_or(false)
             && let Some(frames) = spawn_cluster_log_follow(
                 &state,
@@ -65,6 +303,7 @@ pub(super) async fn logs_handler(
                 &namespace,
                 query.tail,
                 query.instance.clone(),
+                owned_node,
             )
         {
             let stream = ReceiverStream::new(frames)
@@ -96,9 +335,16 @@ pub(super) async fn logs_handler(
         return Sse::new(stream).into_response();
     }
 
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::Logs {
-        app_name: app,
-        namespace,
+    if selection.instances.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no local capture for this workload"})),
+        )
+            .into_response();
+    }
+
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::LogCaptures {
+        instances: selection.instances,
         tail: query.tail,
         response,
     })
@@ -159,6 +405,7 @@ pub(super) fn spawn_cluster_log_follow(
     namespace: &str,
     tail: Option<usize>,
     instance: Option<String>,
+    owned_node: Option<crate::meat::NodeId>,
 ) -> Option<mpsc::Receiver<LogFrame>> {
     let (Some(council), Some(membership), Some(self_name)) =
         (&state.council, &state.membership, &state.node_name)
@@ -175,6 +422,7 @@ pub(super) fn spawn_cluster_log_follow(
         namespace.to_string(),
         tail,
         instance,
+        owned_node,
         frames_tx,
     ));
     Some(frames_rx)
@@ -204,8 +452,9 @@ pub(super) struct LogSourceEnded {
 
 /// Merge the log streams of every node that runs an app into `events`.
 ///
-/// Every [`LOG_FOLLOW_REFRESH`] it re-reads the app's placements and the live
-/// membership: it opens a stream to each placed node it isn't following yet
+/// Every [`LOG_FOLLOW_REFRESH`] it re-reads ordinary app placements and live
+/// membership. A selected batch uses its proven allocation instead of app
+/// placements. It opens a stream to each selected node it isn't following yet
 /// and drops the streams of nodes that left. A node that goes away produces a
 /// [`LogFrame::Warning`] and the follow carries on with the rest. It returns
 /// when the client disconnects.
@@ -219,6 +468,7 @@ pub(super) async fn follow_cluster_logs(
     namespace: String,
     tail: Option<usize>,
     instance: Option<String>,
+    owned_node: Option<crate::meat::NodeId>,
     events: mpsc::Sender<LogFrame>,
 ) {
     let app_id = crate::meat::types::AppId::new(&app, &namespace);
@@ -232,13 +482,18 @@ pub(super) async fn follow_cluster_logs(
         std::collections::HashMap::new();
     let (ended_tx, mut ended_rx) = mpsc::channel::<LogSourceEnded>(16);
     loop {
-        let placed: std::collections::BTreeSet<crate::meat::NodeId> = council
-            .desired_state()
-            .await
-            .scheduling
-            .get(&app_id)
-            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
-            .unwrap_or_default();
+        let placed: std::collections::BTreeSet<crate::meat::NodeId> =
+            if let Some(node) = &owned_node {
+                std::collections::BTreeSet::from([node.clone()])
+            } else {
+                council
+                    .desired_state()
+                    .await
+                    .scheduling
+                    .get(&app_id)
+                    .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+                    .unwrap_or_default()
+            };
         let members = membership.read().await.clone();
 
         // A node we followed that dropped out of the live membership gets
@@ -438,9 +693,29 @@ pub(super) async fn ws_logs_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
-    Query(query): Query<LogsQuery>,
+    Query(mut query): Query<LogsQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    query.follow = Some(true);
+    if let Err(response) = log_metadata_preflight(auth.as_deref(), &namespace, &query) {
+        return response;
+    }
+    let metadata_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let selection = match resolve_log_path_until(
+        &state,
+        &app,
+        &namespace,
+        query.instance.as_deref(),
+        metadata_deadline,
+    )
+    .await
+    {
+        Ok(selection) => selection,
+        Err(response) => return response,
+    };
+    let app = selection.logical_name.clone();
+    query.instance = selection.selected_instance.clone();
+
     // Scope is checked *before* the upgrade: once the socket is live there
     // is no response left to refuse with.
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
@@ -457,13 +732,35 @@ pub(super) async fn ws_logs_handler(
     {
         return resp;
     }
-    let frames = match spawn_cluster_log_follow(
-        &state,
-        &app,
-        &namespace,
-        query.tail,
-        query.instance.clone(),
-    ) {
+    let owned_node = if query.local.unwrap_or(false) {
+        None
+    } else {
+        match owned_follow_node(
+            &state,
+            &app,
+            &namespace,
+            query.instance.as_deref(),
+            metadata_deadline,
+        )
+        .await
+        {
+            Ok(node) => node,
+            Err(response) => return response,
+        }
+    };
+    let cluster_frames = if query.local.unwrap_or(false) {
+        None
+    } else {
+        spawn_cluster_log_follow(
+            &state,
+            &app,
+            &namespace,
+            query.tail,
+            query.instance.clone(),
+            owned_node,
+        )
+    };
+    let frames = match cluster_frames {
         Some(frames) => frames,
         None => match follow_local_logs(
             &state,
@@ -520,8 +817,19 @@ pub(super) async fn logs_entries_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
-    Query(query): Query<LogsQuery>,
+    Query(mut query): Query<LogsQuery>,
 ) -> Response {
+    if let Err(response) = log_metadata_preflight(auth.as_deref(), &namespace, &query) {
+        return response;
+    }
+    let selection =
+        match resolve_log_path(&state, &app, &namespace, query.instance.as_deref()).await {
+            Ok(selection) => selection,
+            Err(response) => return response,
+        };
+    let app = selection.logical_name.clone();
+    query.instance = selection.selected_instance.clone();
+
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
@@ -549,6 +857,42 @@ pub(super) async fn logs_entries_handler(
         Ok(entries) => Json(entries).into_response(),
         Err(e) => log_query_error(e),
     }
+}
+
+/// Reject input and namespace denials without asking the agent for aliases.
+/// Logical app authorisation follows trusted resolution, because an opaque
+/// execution selector may be accessible under its original submitted label.
+#[allow(clippy::result_large_err)]
+fn log_metadata_preflight(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    namespace: &str,
+    query: &LogsQuery,
+) -> Result<(), Response> {
+    if let Some(auth) = auth
+        && auth.token_name != crate::sesame::auth::SYSTEM_PRINCIPAL
+        && auth
+            .scoped_namespaces
+            .as_ref()
+            .is_some_and(|allowed| !allowed.iter().any(|value| value == namespace))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "token scope does not allow this namespace",
+        )
+            .into_response());
+    }
+    if let Some(grep) = &query.grep {
+        crate::ketchup::log_store::validate_grep(grep).map_err(log_query_error)?;
+    }
+    parse_stream(query.stream.as_deref()).map_err(log_query_error)?;
+    if query.follow.unwrap_or(false) && query.stream.is_some() {
+        return Err(log_query_error(
+            crate::ketchup::types::KetchupError::QueryRejected {
+                reason: "stream can't be combined with follow".into(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// The store filter a request's query parameters ask for, or why they don't
@@ -604,8 +948,19 @@ pub(super) async fn logs_cross_node_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
-    Query(query): Query<LogsQuery>,
+    Query(mut query): Query<LogsQuery>,
 ) -> Response {
+    if let Err(response) = log_metadata_preflight(auth.as_deref(), &namespace, &query) {
+        return response;
+    }
+    let selection =
+        match resolve_log_path(&state, &app, &namespace, query.instance.as_deref()).await {
+            Ok(selection) => selection,
+            Err(response) => return response,
+        };
+    let app = selection.logical_name.clone();
+    query.instance = selection.selected_instance.clone();
+
     use crate::meat::types::AppId;
 
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {

@@ -171,7 +171,9 @@ pub enum RaftRequest {
     BatchJobUpdate {
         batch_id: u64,
         job_name: String,
+        namespace: String,
         status: crate::meat::batch_tracker::JobStatus,
+        exit_code: Option<i32>,
     },
     /// Register a build, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.

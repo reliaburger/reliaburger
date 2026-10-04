@@ -403,7 +403,13 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     Ok(())
 }
 
-fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
+pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
+    validate_label(name, "job", "name")?;
+    validate_label(
+        job.namespace.as_deref().unwrap_or("default"),
+        name,
+        "namespace",
+    )?;
     if let Some(expression) = &job.schedule {
         crate::meat::cron::CronSchedule::parse(expression).map_err(|error| {
             ConfigError::Validation {

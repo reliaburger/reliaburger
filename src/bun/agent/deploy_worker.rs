@@ -14,6 +14,7 @@ use super::*;
 /// supervisor / service-map / networking state.
 pub(super) struct DeployWorker<G: Grill> {
     pub(super) rerun_unknown_jobs: bool,
+    pub(super) prepared_batch_jobs: Option<BTreeMap<String, u64>>,
     pub(super) grill: G,
     pub(super) ops: DeployOps,
     /// Shared drain tracker, so the worker can drain-and-stop a retiring
@@ -459,11 +460,24 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
 
-            let ids = match self
-                .ops
-                .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
-                .await
-            {
+            let admission = match &self.prepared_batch_jobs {
+                Some(prepared) => match prepared.get(job_name) {
+                    Some(generation) => {
+                        self.ops
+                            .prepared_batch_job(job_name, namespace, *generation, spec)
+                            .await
+                    }
+                    None => Err(BunError::BatchConflict(
+                        "worker lacks the exact prepared generation".into(),
+                    )),
+                },
+                None => {
+                    self.ops
+                        .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
+                        .await
+                }
+            };
+            let ids = match admission {
                 Ok(ids) => ids,
                 Err(e) => {
                     let _ = events

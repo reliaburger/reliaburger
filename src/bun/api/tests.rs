@@ -3813,7 +3813,24 @@ async fn workload_admission_fixture(
     mpsc::Receiver<AgentCommand>,
 ) {
     let council = seeded_council(tag).await;
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, mut incoming) = mpsc::channel(16);
+    let (mutations, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        while let Some(command) = incoming.recv().await {
+            match command {
+                AgentCommand::BatchOwnedExecutions { response, .. } => {
+                    // This fixture owns no runtime. Answer only the read-only
+                    // query; preserve original write/launch assertions below.
+                    let _ = response.send(Default::default());
+                }
+                mutation => {
+                    if mutations.send(mutation).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
     let app = router(
         tx,
         None,
@@ -3999,8 +4016,8 @@ async fn job_apply_checks_namespace_and_app_scope_before_enqueuing_work() {
         StatusCode::OK
     );
     assert!(matches!(
-        commands.try_recv(),
-        Ok(AgentCommand::Deploy { .. })
+        commands.recv().await,
+        Some(AgentCommand::Deploy { .. })
     ));
     council.shutdown().await.unwrap();
 }
@@ -4093,8 +4110,8 @@ async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and
                 );
                 if expected == StatusCode::OK {
                     assert!(matches!(
-                        commands.try_recv(),
-                        Ok(AgentCommand::Deploy { .. })
+                        commands.recv().await,
+                        Some(AgentCommand::Deploy { .. })
                     ));
                 } else {
                     assert!(matches!(
@@ -7473,6 +7490,190 @@ async fn dry_run_endpoint_refuses_unavailable_agent_evidence() {
                 .unwrap(),
         )
         .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_log_metadata_refuses_a_stalled_agent_within_a_bounded_wait() {
+    let (tx, mut held_commands) = mpsc::channel(16);
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    let mut request = axum::http::Request::get("/v1/logs/migration/default")
+        .body(Body::empty())
+        .unwrap();
+    let mut reader = deployer_context();
+    reader.role = crate::sesame::types::ApiRole::ReadOnly;
+    reader.scoped_apps = Some(vec!["migration".into()]);
+    reader.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(reader);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        held_commands.try_recv(),
+        Ok(AgentCommand::ResolveExecutionLogs { .. })
+    ));
+    assert!(
+        held_commands.try_recv().is_err(),
+        "a timed-out lookup enqueued work"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_apply_metadata_refuses_a_stalled_agent_before_work() {
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    let mut request = axum::http::Request::post("/v1/apply")
+        .body(Body::from("[job.migration]\nimage='test:v1'\n"))
+        .unwrap();
+    let mut deployer = deployer_context();
+    deployer.scoped_apps = Some(vec!["migration".into()]);
+    deployer.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(deployer);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned apply metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(AgentCommand::BatchOwnedExecutions { .. })
+    ));
+    assert!(
+        commands.try_recv().is_err(),
+        "timed-out admission enqueued a deploy or run"
+    );
+}
+
+#[tokio::test]
+async fn owned_internal_run_metadata_refuses_a_stalled_agent_before_writes_or_launch() {
+    let council = seeded_council("owned-metadata-bound").await;
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let mut request = axum::http::Request::post("/v1/batch/run")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "batch_id": 1, "jobs": [{"name": "batch-bound", "spec": {"image": "test:v1"}}],
+                "execution_labels": {"batch-bound": {"name": "migration", "namespace": "default"}}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let mut system = deployer_context();
+    system.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+    system.principal_id = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+    system.role = crate::sesame::types::ApiRole::Admin;
+    request.extensions_mut().insert(system);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned internal metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(AgentCommand::BatchOwnedExecutions { .. })
+    ));
+    assert!(
+        commands.try_recv().is_err(),
+        "timed-out admission enqueued a worker"
+    );
+    let desired = council.desired_state().await;
+    assert!(desired.apps.is_empty());
+    assert!(desired.batch_state.batches.is_empty());
+    assert!(desired.batch_state.execution_owners.is_empty());
+    assert_eq!(desired.batch_state.next_batch_id, 1);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn owned_remote_log_metadata_bounds_the_local_collision_check() {
+    let council = seeded_council("owned-remote-metadata-bound").await;
+    let batch = serde_json::from_value(serde_json::json!({
+        "jobs": [{"name": "migration", "execution_name": "batch-remote-bound", "namespace": "default", "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+        "submitted_at_epoch_secs": 1
+    })).unwrap();
+    council
+        .write(crate::council::RaftRequest::BatchRegister { batch })
+        .await
+        .unwrap();
+    let before = council.desired_state().await;
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let mut request = axum::http::Request::get(
+        "/v1/logs/entries/batch-remote-bound/default?instance=default__batch-remote-bound-0",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let mut reader = deployer_context();
+    reader.role = crate::sesame::types::ApiRole::ReadOnly;
+    reader.scoped_apps = Some(vec!["migration".into()]);
+    reader.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(reader);
+    let (result, (_held_response, mut commands)) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request)),
+        async {
+            let Some(AgentCommand::ResolveExecutionLogs { response, .. }) = commands.recv().await
+            else {
+                panic!("first metadata phase must resolve the explicit selector");
+            };
+            response
+                .send(Err(crate::bun::BunError::BatchConflict(
+                    "no local owner".into(),
+                )))
+                .unwrap();
+            let Some(AgentCommand::Status { response }) = commands.recv().await else {
+                panic!("remote ownership needs a local ordinary collision check");
+            };
+            (response, commands)
+        }
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "metadata lookup enqueued work"
+    );
+    let after = council.desired_state().await;
+    assert_eq!(after.apps, before.apps);
+    assert_eq!(after.batch_state, before.batch_state);
+    council.shutdown().await.unwrap();
+    let response = result
+        .expect("remote collision metadata did not end within the overall deadline")
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

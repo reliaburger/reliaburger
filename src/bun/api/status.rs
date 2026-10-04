@@ -618,6 +618,12 @@ pub(super) async fn status_app_handler(
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    let selection = match super::logs::resolve_log_path(&state, &app, &namespace, None).await {
+        Ok(selection) => selection,
+        Err(response) => return response,
+    };
+    let app = selection.logical_name;
+
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
@@ -625,7 +631,14 @@ pub(super) async fn status_app_handler(
         Ok(statuses) => {
             let filtered: Vec<&InstanceStatus> = statuses
                 .iter()
-                .filter(|s| s.app_name == app && s.namespace == namespace)
+                .filter(|s| {
+                    s.app_name == app
+                        && s.namespace == namespace
+                        && selection
+                            .selected_instance
+                            .as_ref()
+                            .is_none_or(|id| &s.id == id)
+                })
                 .collect();
             if filtered.is_empty() {
                 (
