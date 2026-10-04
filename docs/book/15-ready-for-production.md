@@ -4623,6 +4623,15 @@ looser. Put three persists into the record write and the new verdict fails
 straight away, while the old one would have passed: every turn came in under
 500 ms.
 
+The consumer-sync scenario from #505 had the same stopwatch, and the next
+day it failed the same way (#585): a status took 1.39 s behind a changed
+view on a hosted macOS runner. A status may wait two turns, each holding one
+400 ms slowed journal write, so the host's real fsyncs had about 200 ms of
+the budget left, and they took about 570 ms. It now counts too: status must
+answer, and no turn may journal more than one write. Run two sync steps in
+one turn and it fails straight away, with a worst turn of 840 ms that the
+stopwatch would have passed.
+
 #### A test that raced the clock
 
 One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`
