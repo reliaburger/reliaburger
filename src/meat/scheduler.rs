@@ -244,10 +244,7 @@ impl Scheduler {
     /// Uses the `request` (minimum) values from cpu/memory ranges.
     /// Falls back to zero if not specified.
     fn extract_resources(&self, spec: &AppSpec) -> Resources {
-        let cpu = spec.cpu.as_ref().map(|r| r.request).unwrap_or(0);
-        let memory = spec.memory.as_ref().map(|r| r.request).unwrap_or(0);
-        let gpus = spec.gpu.unwrap_or(0);
-        Resources::new(cpu, memory, gpus)
+        crate::meat::admission::app_requests(spec)
     }
 
     /// Parse placement labels from the spec.

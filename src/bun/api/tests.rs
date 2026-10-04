@@ -2574,7 +2574,7 @@ async fn cluster_lease_delete_waits_for_system_retirement_acknowledgements() {
         }),
     ] {
         assert!(!matches!(
-            council.write(request).await.unwrap(),
+            write_admission_fixture(&council, request).await.unwrap(),
             CouncilResponse::Refused { .. }
         ));
     }
@@ -7611,13 +7611,18 @@ async fn owned_internal_run_metadata_refuses_a_stalled_agent_before_writes_or_la
 async fn owned_remote_log_metadata_bounds_the_local_collision_check() {
     let council = seeded_council("owned-remote-metadata-bound").await;
     let batch = serde_json::from_value(serde_json::json!({
-        "jobs": [{"name": "migration", "execution_name": "batch-remote-bound", "namespace": "default", "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+        "jobs": [{"name": "migration", "execution_name": "batch-remote-bound", "namespace": "default", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
         "submitted_at_epoch_secs": 1
     })).unwrap();
-    council
-        .write(crate::council::RaftRequest::BatchRegister { batch })
-        .await
-        .unwrap();
+    write_admission_fixture(
+        &council,
+        crate::council::RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch,
+        },
+    )
+    .await
+    .unwrap();
     let before = council.desired_state().await;
     let (tx, mut commands) = mpsc::channel(16);
     let app = router(
@@ -7676,4 +7681,24 @@ async fn owned_remote_log_metadata_bounds_the_local_collision_check() {
         .expect("remote collision metadata did not end within the overall deadline")
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+async fn write_admission_fixture(
+    council: &crate::council::CouncilNode,
+    mut request: crate::council::RaftRequest,
+) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
+    let previous = council.desired_state().await.last_applied_log;
+    match &mut request {
+        crate::council::RaftRequest::BatchRegister {
+            expected_log_id, ..
+        } => *expected_log_id = previous,
+        crate::council::RaftRequest::SchedulingDecision(decision) => {
+            request = crate::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
+            }
+        }
+        _ => {}
+    }
+    council.write(request).await
 }

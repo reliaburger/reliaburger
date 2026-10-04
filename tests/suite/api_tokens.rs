@@ -19,6 +19,10 @@ use std::{
 use tower::ServiceExt;
 
 async fn api() -> (Arc<CouncilNode>, Router) {
+    api_with_capacity(false).await
+}
+
+async fn api_with_capacity(capacity: bool) -> (Arc<CouncilNode>, Router) {
     let network = InMemoryRaftRouter::new();
     let council = Arc::new(
         CouncilNode::new(
@@ -44,7 +48,7 @@ async fn api() -> (Arc<CouncilNode>, Router) {
     })
     .await
     .unwrap();
-    let router = router_for_council(council.clone(), None, None);
+    let router = router_for_council(council.clone(), None, None, capacity);
     (council, router)
 }
 
@@ -52,9 +56,53 @@ fn router_for_council(
     council: Arc<CouncilNode>,
     membership: Option<Arc<tokio::sync::RwLock<Vec<reliaburger::bun::api::NodeMembershipInfo>>>>,
     service_token: Option<String>,
+    capacity: bool,
 ) -> Router {
+    let (capacity_publisher, aggregated_rx) = if capacity {
+        let node = reliaburger::meat::NodeId::new("local");
+        let mut state = reliaburger::reporting::aggregator::AggregatedState {
+            leadership_epoch: Some(council.current_term()),
+            ..Default::default()
+        };
+        state.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        );
+        state.reports.insert(
+            node.clone(),
+            reliaburger::reporting::types::StateReport {
+                node_id: node,
+                timestamp: SystemTime::UNIX_EPOCH,
+                running_apps: vec![],
+                cached_specs: vec![],
+                resource_usage: reliaburger::reporting::types::ResourceUsage {
+                    cpu_total_millicores: 8000,
+                    memory_total_mb: 16384,
+                    ..Default::default()
+                },
+                event_log: vec![],
+                has_buildah: false,
+            },
+        );
+        let (publisher, receiver) = tokio::sync::watch::channel(state);
+        (Some(publisher), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let membership = if capacity {
+        Some(Arc::new(tokio::sync::RwLock::new(vec![
+            reliaburger::bun::api::NodeMembershipInfo {
+                node_id: reliaburger::meat::NodeId::new("local"),
+                address: "127.0.0.1:1".parse().unwrap(),
+                api_advertised: true,
+            },
+        ])))
+    } else {
+        membership
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
+        let _capacity_publisher = capacity_publisher;
         while let Some(command) = rx.recv().await {
             match command {
                 reliaburger::bun::agent::AgentCommand::RunJobsWithLabels {
@@ -90,9 +138,9 @@ fn router_for_council(
         0,
         None,
         None,
-        None,
+        aggregated_rx,
         "test".into(),
-        None,
+        capacity.then(|| "local".into()),
         reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
         reliaburger::cluster::ClusterHttp::plaintext(),
         5050,
@@ -218,7 +266,7 @@ async fn batch_submission_checks_every_job_against_token_scope_before_dispatch()
 
 #[tokio::test]
 async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
-    let (council, router) = api().await;
+    let (council, router) = api_with_capacity(true).await;
     for (actions, spec) in [
         (
             vec!["logs"],
@@ -411,6 +459,7 @@ async fn follower_batch_submission_preserves_the_callers_credential_for_leader_a
         nodes[1].clone(),
         Some(membership),
         Some("cluster-service-credential".into()),
+        false,
     );
     let mut request = Request::post("/v1/batch")
         .header("content-type", "application/json")

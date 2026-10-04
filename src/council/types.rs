@@ -164,6 +164,8 @@ pub enum RaftRequest {
     /// Register a batch, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.
     BatchRegister {
+        /// Revision used to plan this complete allocation.
+        expected_log_id: Option<openraft::LogId<u64>>,
         batch: crate::meat::batch_tracker::BatchRecord,
     },
     /// Record a job's state transition within a tracked batch. An
@@ -338,6 +340,11 @@ pub enum RaftRequest {
     /// remove from `now_unix_ms` alone, so every replica removes the same
     /// tokens. It never removes the last Admin and never empties the store.
     SweepExpiredApiTokens { now_unix_ms: u64 },
+    /// Commit one complete placement pass against its original admission revision.
+    SchedulingDecisions {
+        expected_log_id: Option<openraft::LogId<u64>>,
+        decisions: Vec<SchedulingDecision>,
+    },
 }
 
 // ---------------------------------------------------------------------------

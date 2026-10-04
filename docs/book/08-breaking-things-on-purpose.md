@@ -1127,6 +1127,66 @@ For each profile group, the scheduler sorts nodes by available capacity (most ro
 
 The complexity is O(nodes × profiles + total_jobs). If you have 100 nodes and all jobs are identical (1 profile), it's O(100 + 100,000) — essentially linear in the number of jobs. Even with 100 different profiles, it's O(10,000 + 100,000). The per-job pipeline would be O(100 × 100,000) — ten million evaluations.
 
+Suppose the reports say a node has eight free CPUs. One batch requests all
+eight, and a second batch arrives before the next report. Both fit the same
+report. A lock in the leader process won't fix this across a leader change,
+and the ordinary app scheduler has to respect the first batch too.
+
+We therefore commit each batch's resource reservation before dispatch. Both
+schedulers start with the worker reports, then add committed app placements
+and batch reservations that those reports haven't represented yet. We match
+evidence by node, namespace, execution name and ordinal. A report for ordinal
+one can't discharge a reservation for ordinal zero. If the placement requests
+500m but its exact report shows only 250m, we add the missing 250m before
+planning more work. The cache retains this accounting when Rust clones it for
+a tentative plan or changes a node's readiness. It also retains reservations
+made earlier in the same pass. The resource quantities are requests, the same
+quantities the ordinary scheduler uses.
+
+The commit carries the Raft log position from the snapshot used to plan it.
+The state machine compares that position with its previous applied entry
+before changing either placements or batches. If another admission got there
+first, the candidate is refused and the leader plans again. This is a
+compare-and-swap operation: Rust's `Option<LogId>` represents either the exact
+position we read or the absence of any applied entry. After a bounded number
+of competing writes, submission returns a retryable error. The entire placement
+pass is one guarded transaction: an invalid later decision can't leave earlier
+apps committed. The old unguarded placement request is refused.
+
+Clustered admission requires a live report publisher, the current Raft term,
+and an unexpired local receive deadline for each candidate. The watch snapshot
+carries that term and each report's `tokio::time::Instant` deadline. `Instant`
+measures elapsed time on this process, so a sender's future wall clock can't
+keep an old report fresh. Checking the deadline at consumption also closes the
+gap before the aggregator's next publication. These checks stay on the leader;
+Raft application never depends on a replica's clock. Missing evidence doesn't
+turn a cluster into an unlimited standalone node.
+
+Batch planning and registration have a five-second overall deadline and at
+most eight attempts after competing writes. If the acknowledgement is lost,
+submission returns 503 without dispatching. A late committed allocation stays
+reserved because timing out the caller doesn't prove Raft refused the write.
+The ordinary scheduler bounds its whole-pass proposal too and replans from
+committed state on the next tick.
+
+Durable retirement excludes a worker even while gossip and reports still call
+it alive. The planner filters it, and Raft refuses a registration assigned to
+it before changing counters, ownership history or reservations. A delayed
+first dispatch also checks retirement against its live allocation. An already
+owned exact retry retains its original attempt; this check adds no stop API.
+
+A timeout tells us that we couldn't establish the outcome. It doesn't tell us
+that the process exited. An unknown dispatch or runtime outcome therefore
+keeps its durable reservation and remains nonterminal, including after leader
+handover. Dropping a watcher or exhausting dispatch retries doesn't release
+capacity either. A callback needs exit evidence for the exact execution before
+it can make the job terminal. Only a positively observed exit or explicit
+fenced retirement releases the reservation.
+Our regression tests submit through two independent API processes with one
+shared council, keep reports behind committed app placements, and lose a
+runner beyond the observation deadline. Each case checks the public outcome
+and the replicated state.
+
 The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
 
 Each job name must be unique within its batch, including jobs in different namespaces. Submission builds a map keyed by that label before assigning execution identities. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.

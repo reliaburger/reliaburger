@@ -233,6 +233,9 @@ pub fn capacities_from_reports(
 ) -> Vec<NodeCapacity> {
     let mut capacities = Vec::new();
     for member in members {
+        if !aggregated.report_is_fresh(&member.node_id) {
+            continue;
+        }
         let Some(report) = aggregated.reports.get(&member.node_id) else {
             continue;
         };
@@ -303,7 +306,11 @@ fn map_report_error(error: ReportError) -> BatchRejection {
 /// Register a batch record durably: through Raft when a council
 /// exists (the id comes from the replicated counter, JOB4), through
 /// the in-memory tracker standalone.
-pub(crate) async fn register_batch(state: &ApiState, record: BatchRecord) -> Result<u64, String> {
+pub(crate) async fn register_batch(
+    state: &ApiState,
+    record: BatchRecord,
+    expected_log_id: Option<openraft::LogId<u64>>,
+) -> Result<u64, String> {
     match &state.council {
         Some(council) => {
             let desired = council.desired_state().await;
@@ -317,12 +324,16 @@ pub(crate) async fn register_batch(state: &ApiState, record: BatchRecord) -> Res
                 return Err("execution identity already belongs to an app".into());
             }
             match council
-                .write(crate::council::types::RaftRequest::BatchRegister { batch: record })
+                .write(crate::council::types::RaftRequest::BatchRegister {
+                    expected_log_id,
+                    batch: record,
+                })
                 .await
             {
                 Ok(crate::council::types::CouncilResponse::BatchRegistered { batch_id }) => {
                     Ok(batch_id)
                 }
+                Ok(crate::council::types::CouncilResponse::Refused { reason }) => Err(reason),
                 Ok(other) => Err(format!("unexpected raft response: {other:?}")),
                 Err(e) => Err(format!("raft register failed: {e}")),
             }
@@ -827,6 +838,144 @@ async fn fetch_remote_outcome(
 // Handlers
 // ---------------------------------------------------------------------------
 
+async fn plan_batch_admission(
+    state: &ApiState,
+    jobs: &[BatchJobSubmission],
+    executions: &BTreeMap<String, String>,
+    self_name: &str,
+) -> Result<(u64, crate::meat::batch::BatchAllocation), Box<Response>> {
+    let batch_jobs: Vec<BatchJob> = jobs
+        .iter()
+        .map(|job| BatchJob {
+            name: job.name.clone(),
+            resources: crate::meat::admission::job_requests(&job.spec),
+        })
+        .collect();
+    for _ in 0..8 {
+        let desired = match &state.council {
+            Some(council) => Some(council.desired_state().await),
+            None => None,
+        };
+        let expected_log_id = desired.as_ref().and_then(|state| state.last_applied_log);
+        let mut capacities = if desired.is_some() {
+            let (Some(aggregated_rx), Some(membership)) = (&state.aggregated_rx, &state.membership)
+            else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cluster batch capacity reports are unavailable",
+                )
+                    .into_response()
+                    .into());
+            };
+            if aggregated_rx.has_changed().is_err() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cluster capacity publisher is unavailable",
+                )
+                    .into_response()
+                    .into());
+            }
+            let members = membership.read().await.clone();
+            let aggregated = aggregated_rx.borrow().clone();
+            if state
+                .council
+                .as_ref()
+                .is_none_or(|council| aggregated.leadership_epoch != Some(council.current_term()))
+            {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cluster capacity snapshot belongs to another leadership epoch",
+                )
+                    .into_response()
+                    .into());
+            }
+            let mut capacities = capacities_from_reports(&members, &aggregated);
+            if let Some(desired) = &desired {
+                capacities.retain(|capacity| {
+                    !desired
+                        .security_state
+                        .crl
+                        .retired_nodes
+                        .contains_key(&capacity.node_id.0)
+                });
+            }
+            if capacities.is_empty() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cluster batch capacity reports are not fresh",
+                )
+                    .into_response()
+                    .into());
+            }
+            if let Some(desired) = &desired {
+                for capacity in &mut capacities {
+                    if let Some(report) = aggregated.reports.get(&capacity.node_id) {
+                        capacity.allocated = capacity.allocated.saturating_add(
+                            &crate::meat::admission::unreported_commitments(
+                                desired,
+                                &capacity.node_id,
+                                report,
+                            ),
+                        );
+                    }
+                }
+            }
+            capacities
+        } else {
+            local_only_capacity(self_name)
+        };
+        let allocation = schedule_batch(&batch_jobs, &mut capacities);
+        let mut job_records = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let node = allocation
+                .assignments
+                .iter()
+                .find(|(name, _)| name == &job.name)
+                .map(|(_, node)| node.clone());
+            let digest = match crate::meat::batch_execution::spec_digest(
+                job.namespace(),
+                &job.name,
+                &job.spec,
+            ) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    return Err((StatusCode::BAD_REQUEST, error.to_string())
+                        .into_response()
+                        .into());
+                }
+            };
+            job_records.push(BatchJobRecord {
+                resources: crate::meat::admission::job_requests(&job.spec),
+                name: job.name.clone(),
+                execution_name: executions[&job.name].clone(),
+                spec_digest: digest,
+                namespace: job.namespace().to_string(),
+                status: if node.is_some() {
+                    JobStatus::Pending
+                } else {
+                    JobStatus::Unschedulable
+                },
+                node,
+            });
+        }
+        let record = BatchRecord {
+            jobs: job_records,
+            submitted_at_epoch_secs: epoch_now_secs(),
+        };
+        match register_batch(state, record, expected_log_id).await {
+            Ok(batch_id) => return Ok((batch_id, allocation)),
+            Err(error) if error == "admission revision changed" => continue,
+            Err(error) => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":format!("cluster batch tracker unavailable: {error}")}))).into_response().into()),
+        }
+    }
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "cluster batch admission remained busy",
+    )
+        .into_response()
+        .into())
+}
+
 /// `POST /v1/batch` — leader-forwarded submission.
 pub async fn batch_submit_handler(
     State(state): State<ApiState>,
@@ -911,36 +1060,6 @@ pub async fn batch_submit_handler(
         .clone()
         .unwrap_or_else(|| "local".to_string());
 
-    // Capacity: the aggregated reports when clustered, self otherwise.
-    let mut capacities = match (&state.aggregated_rx, &state.membership) {
-        (Some(aggregated_rx), Some(membership)) => {
-            let members = membership.read().await.clone();
-            let capacities = capacities_from_reports(&members, &aggregated_rx.borrow());
-            if capacities.is_empty() {
-                local_only_capacity(&self_name)
-            } else {
-                capacities
-            }
-        }
-        _ => local_only_capacity(&self_name),
-    };
-
-    let batch_jobs: Vec<BatchJob> = jobs
-        .iter()
-        .map(|job| BatchJob {
-            name: job.name.clone(),
-            resources: Resources::new(
-                job.spec.cpu.as_ref().map(|r| r.request).unwrap_or(0),
-                job.spec.memory.as_ref().map(|r| r.request).unwrap_or(0),
-                0,
-            ),
-        })
-        .collect();
-
-    let allocation = schedule_batch(&batch_jobs, &mut capacities);
-
-    // The durable record includes unschedulable jobs (JOB3): they are
-    // part of the batch's story, not an omission.
     let executions: BTreeMap<String, String> = jobs
         .iter()
         .map(|job| {
@@ -950,49 +1069,14 @@ pub async fn batch_submit_handler(
             )
         })
         .collect();
-    let mut job_records = Vec::with_capacity(jobs.len());
-    for job in &jobs {
-        let node = allocation
-            .assignments
-            .iter()
-            .find(|(name, _)| name == &job.name)
-            .map(|(_, node)| node.clone());
-        let digest = match crate::meat::batch_execution::spec_digest(
-            job.namespace(),
-            &job.name,
-            &job.spec,
-        ) {
-            Ok(digest) => digest,
-            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-        };
-        job_records.push(BatchJobRecord {
-            name: job.name.clone(),
-            execution_name: executions[&job.name].clone(),
-            spec_digest: digest,
-            namespace: job.namespace().to_string(),
-            status: if node.is_some() {
-                JobStatus::Pending
-            } else {
-                JobStatus::Unschedulable
-            },
-            node,
-        });
-    }
-    let record = BatchRecord {
-        jobs: job_records,
-        submitted_at_epoch_secs: epoch_now_secs(),
-    };
-    let batch_id = match register_batch(&state, record).await {
-        Ok(batch_id) => batch_id,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": format!("cluster batch tracker unavailable: {e}")
-                })),
-            )
-                .into_response();
-        }
+    // Replan after a conflicting committed entry, with a finite retry budget.
+    // Dispatch starts only after the original snapshot wins the shared CAS.
+    let (batch_id, allocation) = match tokio::time::timeout(
+        std::time::Duration::from_secs(5), plan_batch_admission(&state, &jobs, &executions, &self_name),
+    ).await {
+        Ok(Ok(admission)) => admission,
+        Ok(Err(response)) => return *response,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "cluster batch admission timed out; outcome unknown; any late allocation stays reserved").into_response(),
     };
 
     // Group assignments by node and dispatch. A BTreeMap so dispatch
@@ -1209,6 +1293,7 @@ pub async fn batch_run_handler(
                         && recorded.name == label.name
                         && recorded.spec_digest == digest
                         && !recorded.status.is_terminal()
+                        && recorded.node.as_ref().is_some_and(|node| !desired.security_state.crl.retired_nodes.contains_key(&node.0))
                         && recorded
                             .node
                             .as_ref()
@@ -1676,6 +1761,199 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_stalled_actual_council_admission_returns_unknown_without_dispatch() {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::{CouncilConfig, CouncilNode, CouncilNodeInfo};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+        let network = InMemoryRaftRouter::new();
+        let council = Arc::new(
+            CouncilNode::new(
+                1,
+                CouncilConfig {
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 150,
+                    election_timeout_max_ms: 400,
+                    snapshot_threshold: 100,
+                    max_in_snapshot_log_to_keep: 50,
+                },
+                InMemoryRaftNetworkFactory::new(1, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(1, council.raft().clone()).await;
+        council
+            .initialize(BTreeMap::from([(
+                1,
+                CouncilNodeInfo::new("127.0.0.1:9100".parse().unwrap(), "leader"),
+            )]))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !council.is_leader().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let node = crate::meat::NodeId::new("worker");
+        let mut aggregated = AggregatedState {
+            leadership_epoch: Some(council.current_term()),
+            ..Default::default()
+        };
+        aggregated.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        aggregated.reports.insert(
+            node.clone(),
+            report_with_usage(
+                &node,
+                crate::reporting::types::ResourceUsage {
+                    cpu_total_millicores: 8000,
+                    memory_total_mb: 16384,
+                    ..Default::default()
+                },
+            ),
+        );
+        let (_publisher, reports) = tokio::sync::watch::channel(aggregated);
+        let (commands, mut launches) = tokio::sync::mpsc::channel(16);
+        let router = crate::bun::api::router_with_upgrade(
+            commands,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council.clone()),
+            None,
+            Some("service-token".into()),
+            None,
+            Some(Arc::new(tokio::sync::RwLock::new(vec![
+                NodeMembershipInfo {
+                    node_id: node,
+                    address: "127.0.0.1:9101".parse().unwrap(),
+                    api_advertised: true,
+                },
+            ]))),
+            None,
+            None,
+            9117,
+            None,
+            None,
+            Some(reports),
+            "default".into(),
+            Some("leader".into()),
+            crate::bun::build_runner::BuildSettings::with_timeout(900),
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            crate::bun::capabilities::StaticCapabilities::default(),
+            crate::bun::readiness::ReadinessTracker::new(),
+            None,
+            None,
+            None,
+        )
+        .layer(axum::Extension(crate::sesame::auth::system_context()));
+        council.hang_writes();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(7), router.oneshot(
+            axum::http::Request::post("/v1/batch").header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"jobs":[{"name":"held","spec":{"image":"proc-grill:ignored","command":["true"]}}]}"#)).unwrap()
+        )).await;
+        let records = council.desired_state().await.batch_state.batches.len();
+        council.shutdown().await.unwrap();
+        assert!(
+            launches.try_recv().is_err(),
+            "a timed-out admission dispatched worker commands"
+        );
+        assert_eq!(records, 0);
+        assert_eq!(
+            response
+                .expect("the actual Council hang escaped the admission deadline")
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_report_published_before_its_receive_deadline_expires_between_ticks() {
+        use crate::reporting::transport::{InMemoryReportingNetwork, ReportingTransport};
+        let network = InMemoryReportingNetwork::new();
+        let address = "127.0.0.1:9120".parse().unwrap();
+        let transport = network.register(address).await;
+        let worker = network.register("127.0.0.1:9121".parse().unwrap()).await;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut aggregator, snapshot) = crate::reporting::aggregator::ReportAggregator::new(
+            transport,
+            crate::config::node::ReportingTreeSection {
+                stale_report_timeout_secs: 30,
+                ..Default::default()
+            },
+            shutdown.clone(),
+            None,
+            None,
+            None,
+        );
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let mut run = Box::pin(aggregator.run());
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(run.as_mut().poll(&mut context), Poll::Pending));
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        assert!(matches!(run.as_mut().poll(&mut context), Poll::Pending));
+        let node = crate::meat::NodeId::new("worker");
+        worker
+            .send(
+                address,
+                &crate::reporting::types::ReportingMessage::Report(report_with_usage(
+                    &node,
+                    crate::reporting::types::ResourceUsage {
+                        cpu_total_millicores: 8000,
+                        memory_total_mb: 16384,
+                        ..Default::default()
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(run.as_mut().poll(&mut context), Poll::Pending));
+        assert!(snapshot.borrow().reports.contains_key(&node));
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        assert!(matches!(run.as_mut().poll(&mut context), Poll::Pending));
+        assert!(snapshot.borrow().stale_nodes.is_empty());
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let cached = snapshot.borrow().clone();
+        assert_eq!(cached.reports.len(), 1);
+        assert!(
+            cached.stale_nodes.is_empty(),
+            "periodic publication must not have marked this control stale yet"
+        );
+        let capacities = capacities_from_reports(
+            &[NodeMembershipInfo {
+                node_id: node,
+                address,
+                api_advertised: true,
+            }],
+            &cached,
+        );
+        shutdown.cancel();
+        assert!(matches!(run.as_mut().poll(&mut context), Poll::Ready(())));
+        assert!(
+            capacities.is_empty(),
+            "a cached snapshot outlived its receive-time deadline"
+        );
+    }
+
     #[test]
     fn capacities_map_commitments_not_usage() {
         let node = crate::meat::NodeId("worker-1".to_string());
@@ -1688,6 +1966,10 @@ mod tests {
         };
 
         let mut aggregated = AggregatedState::default();
+        aggregated.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
         aggregated
             .reports
             .insert(node.clone(), report_with_usage(&node, usage));
@@ -1708,6 +1990,10 @@ mod tests {
     fn capacities_skip_pre_capacity_nodes() {
         let node = crate::meat::NodeId("fresh".to_string());
         let mut aggregated = AggregatedState::default();
+        aggregated.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
         aggregated
             .reports
             .insert(node.clone(), report_with_usage(&node, Default::default()));
@@ -1715,6 +2001,34 @@ mod tests {
         let members = vec![NodeMembershipInfo {
             node_id: node,
             address: std::net::SocketAddr::from(([10, 0, 0, 2], 9117)),
+            api_advertised: true,
+        }];
+        assert!(capacities_from_reports(&members, &aggregated).is_empty());
+    }
+
+    #[test]
+    fn stale_reports_never_offer_batch_capacity() {
+        let node = crate::meat::NodeId("stale".into());
+        let mut aggregated = AggregatedState::default();
+        aggregated.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        aggregated.reports.insert(
+            node.clone(),
+            report_with_usage(
+                &node,
+                crate::reporting::types::ResourceUsage {
+                    cpu_total_millicores: 8000,
+                    memory_total_mb: 16384,
+                    ..Default::default()
+                },
+            ),
+        );
+        aggregated.stale_nodes.push(node.clone());
+        let members = vec![NodeMembershipInfo {
+            node_id: node,
+            address: "127.0.0.1:9117".parse().unwrap(),
             api_advertised: true,
         }];
         assert!(capacities_from_reports(&members, &aggregated).is_empty());
@@ -1758,6 +2072,7 @@ mod tests {
             job_outcome(&[status("stopped", None)], "j", "default"),
             None
         );
+        assert_eq!(job_outcome(&[status("failed", None)], "j", "default"), None);
         assert_eq!(
             job_outcome(&[status("failed", Some(1))], "j", "default"),
             Some(1)
