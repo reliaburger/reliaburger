@@ -2081,11 +2081,16 @@ async fn a_probe_that_lands_after_a_kill_keeps_the_restarted_instance_probed() {
 }
 
 #[tokio::test]
-async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
+async fn deployment_publishes_thirty_three_backends_and_retains_runtime_owners() {
     let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
     let mut config = basic_config();
-    config.app.get_mut("web").unwrap().replicas =
-        crate::config::Replicas::Fixed(crate::onion::types::MAX_BACKENDS as u32 + 1);
+    let app = config.app.get_mut("web").unwrap();
+    let replicas = crate::onion::types::MAX_BACKENDS + 1;
+    app.replicas = crate::config::Replicas::Fixed(replicas as u32);
+    app.ingress = Some(toml::from_str("host = 'large.web.test'\ntls = 'disabled'").unwrap());
+    let view = agent.service_map_watch();
+    let routes = agent.routing_table_handle();
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
     let events = drain_deploy(&mut agent, config).await;
     let owners: std::collections::HashSet<_> = agent
         .supervisor
@@ -2098,18 +2103,40 @@ async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
         .into_iter()
         .filter(|(call, id)| call == "create" && !owners.contains(id))
         .collect();
+    let published = view
+        .borrow()
+        .resolve(&service)
+        .map(|entry| entry.backends.len());
+    let routed = routes
+        .read()
+        .await
+        .lookup("large.web.test", "/")
+        .map(|route| route.backends.len());
     agent.retire_workload("web", "default").await.unwrap();
     assert!(
         unowned.is_empty(),
         "created runtimes lost their cleanup owner: {unowned:?}"
     );
+    assert_eq!(expect_complete(&events).0, replicas);
+    assert_eq!(owners.len(), replicas);
+    assert_eq!(published, Some(replicas), "DNS must see the full catalogue");
+    assert_eq!(
+        routed,
+        Some(replicas),
+        "Wrapper must see the full catalogue"
+    );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, ApplyEvent::Complete { .. })),
-        "deployment completed despite refusing an endpoint: {events:?}"
+            .any(|event| matches!(event, ApplyEvent::Error { .. }))
     );
-    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("cannot publish backend"))));
+    assert!(view.borrow().resolve(&service).is_none());
+    assert!(routes.read().await.lookup("large.web.test", "/").is_none());
+    assert!(
+        owners
+            .iter()
+            .all(|id| agent.supervisor.get_instance(id).is_none())
+    );
 }
 
 #[tokio::test]

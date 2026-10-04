@@ -84,7 +84,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(entry) = services.resolve(id).cloned() else {
             return Ok(());
         };
-        let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
+        let bpf = crate::onion::ebpf::maps::BpfServiceMap::for_consumer(
+            self.cluster
+                .as_ref()
+                .map_or("", |cluster| cluster.local_node_id.0.as_str()),
+        );
         let mut ebpf = handle.lock().await;
         bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
             .map_err(|error| BunError::BackendPublication {
@@ -560,7 +564,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         if let Some(handle) = self.onion_ebpf.as_ref() {
             let mut ebpf = handle.lock().await;
-            let map = crate::onion::ebpf::maps::BpfServiceMap::new();
+            let map = crate::onion::ebpf::maps::BpfServiceMap::for_consumer(
+                self.cluster
+                    .as_ref()
+                    .map_or("", |cluster| cluster.local_node_id.0.as_str()),
+            );
             let failure =
                 |error: crate::onion::ebpf::maps::BpfMapError| BunError::BackendRetirement {
                     service: service.clone(),
