@@ -83,6 +83,8 @@ pub enum ReportError {
 /// state machine, so every field is data, not process handles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchJobRecord {
+    /// Accepted requests held until positively terminal, even before a report.
+    pub resources: crate::meat::Resources,
     /// One opaque runtime identity, distinct from the submitted logical label.
     pub execution_name: String,
     /// Canonical evidence binding the original submitted specification.
@@ -456,6 +458,7 @@ mod tests {
             jobs: jobs
                 .iter()
                 .map(|(name, node, status)| BatchJobRecord {
+                    resources: crate::meat::Resources::default(),
                     name: name.to_string(),
                     execution_name: name.to_string(),
                     spec_digest: "a".repeat(64),

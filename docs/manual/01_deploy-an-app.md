@@ -281,6 +281,19 @@ entries or 32 MiB, and each runner's checkpoint to 16 MiB. Full history refuses
 new admissions while preserving existing runs and their replay fences. Further
 admissions then require a fresh cluster.
 
+Clustered batches require fresh capacity reports received in the current
+leadership term from a live report publisher. Batch reservations and committed
+app placements share one capacity budget, including work not yet reported by a
+worker. Missing or expired reports return 503 rather than assuming spare
+capacity. Durably retired workers cannot receive new assignments or delayed
+first launches.
+
+Planning and registration are bounded to five seconds. A registration timeout
+returns 503 without dispatching; a late committed reservation remains held.
+Unknown dispatch or runtime outcomes also retain capacity until positive exit
+evidence or explicit fenced retirement. Repeated public submissions receive
+new execution identities; a 503 does not prove an earlier reservation vanished.
+
 A batch admission response of 503 can mean its acknowledgement was lost after
 publication started. That original owned attempt may still run. Retrying the
 same internal dispatch preserves the attempt and cannot launch a second one.

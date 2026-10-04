@@ -267,7 +267,9 @@ signatures if you ask it to.
 
 Batch jobs retain distinct execution identities and their original scoped
 labels across retries and recovery. Finite durable history keeps replay fences;
-see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md).
+see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and batches share
+committed capacity reservations across leader changes. Clustered admission
+requires current, unexpired reports and refuses new work on retired nodes.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary

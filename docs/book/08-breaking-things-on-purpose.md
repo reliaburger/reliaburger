@@ -1135,9 +1135,13 @@ and the ordinary app scheduler has to respect the first batch too.
 We therefore commit each batch's resource reservation before dispatch. Both
 schedulers start with the worker reports, then add committed app placements
 and batch reservations that those reports haven't represented yet. We match
-batch evidence by namespace and execution identity, so another execution of
-the same logical job doesn't consume its reservation. The resource quantities
-are requests, the same quantities the ordinary scheduler uses.
+evidence by node, namespace, execution name and ordinal. A report for ordinal
+one can't discharge a reservation for ordinal zero. If the placement requests
+500m but its exact report shows only 250m, we add the missing 250m before
+planning more work. The cache retains this accounting when Rust clones it for
+a tentative plan or changes a node's readiness. It also retains reservations
+made earlier in the same pass. The resource quantities are requests, the same
+quantities the ordinary scheduler uses.
 
 The commit carries the Raft log position from the snapshot used to plan it.
 The state machine compares that position with its previous applied entry
@@ -1145,9 +1149,31 @@ before changing either placements or batches. If another admission got there
 first, the candidate is refused and the leader plans again. This is a
 compare-and-swap operation: Rust's `Option<LogId>` represents either the exact
 position we read or the absence of any applied entry. After a bounded number
-of competing writes, submission returns a retryable error. Clustered batch
-submission also needs fresh capacity reports; missing reports don't turn a
-cluster into an unlimited standalone node.
+of competing writes, submission returns a retryable error. The entire placement
+pass is one guarded transaction: an invalid later decision can't leave earlier
+apps committed. The old unguarded placement request is refused.
+
+Clustered admission requires a live report publisher, the current Raft term,
+and an unexpired local receive deadline for each candidate. The watch snapshot
+carries that term and each report's `tokio::time::Instant` deadline. `Instant`
+measures elapsed time on this process, so a sender's future wall clock can't
+keep an old report fresh. Checking the deadline at consumption also closes the
+gap before the aggregator's next publication. These checks stay on the leader;
+Raft application never depends on a replica's clock. Missing evidence doesn't
+turn a cluster into an unlimited standalone node.
+
+Batch planning and registration have a five-second overall deadline and at
+most eight attempts after competing writes. If the acknowledgement is lost,
+submission returns 503 without dispatching. A late committed allocation stays
+reserved because timing out the caller doesn't prove Raft refused the write.
+The ordinary scheduler bounds its whole-pass proposal too and replans from
+committed state on the next tick.
+
+Durable retirement excludes a worker even while gossip and reports still call
+it alive. The planner filters it, and Raft refuses a registration assigned to
+it before changing counters, ownership history or reservations. A delayed
+first dispatch also checks retirement against its live allocation. An already
+owned exact retry retains its original attempt; this check adds no stop API.
 
 A timeout tells us that we couldn't establish the outcome. It doesn't tell us
 that the process exited. An unknown dispatch or runtime outcome therefore

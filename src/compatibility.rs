@@ -46,9 +46,10 @@ pub struct Compatibility {
 /// Node-owned remote metrics prefixes and persisted plaintext archive ownership (#533).
 /// Batch execution identities, current-attempt reports and trusted label maps (#535).
 /// Durable owned attempts, compact retired proofs and retained execution ownership (#535).
+/// Shared batch requests and whole-pass placement admission revisions (#543).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 37,
-    state: 53,
+    protocol: 38,
+    state: 54,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

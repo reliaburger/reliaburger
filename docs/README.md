@@ -136,6 +136,14 @@ Full history refuses new admission while preserving existing executions. Further
 admission then requires a fresh cluster. See [batch execution ownership](book/08-breaking-things-on-purpose.md)
 for acknowledgement uncertainty, retry and retirement semantics.
 
+Apps and batches share committed capacity reservations across leader changes.
+Clustered batch admission requires a live capacity publisher, reports from the
+current Raft term and unexpired local receive deadlines. Missing evidence returns
+503. Planning and registration have a five-second budget; a late committed
+reservation stays held and that timed-out request dispatches no work. Unknown
+runtime outcomes retain capacity. Durably retired nodes are excluded even while
+gossip still advertises them as alive.
+
 ### Registry behaviour
 
 - A manifest push persists its catalogue before acknowledging. 201 means the

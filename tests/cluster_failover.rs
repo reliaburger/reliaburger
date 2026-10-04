@@ -534,6 +534,13 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
             }],
         }),
     ] {
+        let request = match request {
+            RaftRequest::SchedulingDecision(decision) => RaftRequest::SchedulingDecisions {
+                expected_log_id: nodes[0].council.desired_state().await.last_applied_log,
+                decisions: vec![decision],
+            },
+            request => request,
+        };
         assert!(!matches!(
             nodes[0].council.write(request).await.unwrap(),
             reliaburger::council::CouncilResponse::Refused { .. }
@@ -714,6 +721,13 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
             }],
         }),
     ] {
+        let request = match request {
+            RaftRequest::SchedulingDecision(decision) => RaftRequest::SchedulingDecisions {
+                expected_log_id: nodes[0].council.desired_state().await.last_applied_log,
+                decisions: vec![decision],
+            },
+            request => request,
+        };
         assert!(!matches!(
             nodes[0].council.write(request).await.unwrap(),
             reliaburger::council::CouncilResponse::Refused { .. }

@@ -82,3 +82,98 @@ not entered this branch yet.
 The first baseline compile stopped on a test fixture using insert on the
 aggregator's Vec stale_nodes (/tmp/runtime-543-baseline.log). No behavioral red
 is counted. Changed only fixture insertion to push and retained the attempt.
+
+## Qualification receipts
+
+Inherited actual integrated train ef1a378a (protocol 37/state 53); this change
+uses protocol 38/state 54. The whole-pass placement variant is appended to the
+wire enum. Existing unguarded placement requests are refused in production.
+Each app/batch request uses the same request-or-zero defaults; jobs request no
+GPUs because JobSpec has no GPU field. Atomic application compares the previous
+entry, while last_applied_log still records the current entry for term guards.
+
+Baseline receipts remain in /private/tmp/runtime-543-*.log. The first two
+attempts were Vec fixture compile errors, not behavioural failures. Baseline3
+had seven genuine failures and two invalid ProcessGrill resource fixtures;
+corrected authenticated remote-runner baseline4 had four genuine failures.
+The actual two-Council old-term snapshot control failed with 202 instead of
+503 (epoch-baseline). Closed publisher and receive-deadline-between-ticks
+controls both failed (freshness-baseline); the latter now manually polls the
+paused aggregator future instead of spawning it. Actual Council hang_writes
+exceeded the outer seven-second HTTP deadline (write-deadline-baseline), before
+the five-second overall admission budget was implemented.
+
+The footprint baseline first had missing fixture imports (not a red), then
+ran eight controls: six genuine failures for app/batch partial request and
+ordinal mismatch, current-revision retired-node Raft registration, and retired
+node raw HTTP admission; two exact-complete reports passed. The delayed service
+dispatch baseline initially held a metrics borrow across a Raft write and was
+interrupted as a setup hang. After copying the membership log ID before await,
+it genuinely failed: an exact first dispatch returned 202 after durable worker
+retirement. No namespace existence restriction was introduced: valid app/job
+namespace labels remain accepted without a namespace declaration.
+
+Focused3 ran 173 tests: 171 passed and two positive fixtures lacked the new
+report provenance. Corrected only the manual daemon report identity and the
+allowed permission fixture's current-term report, receive deadline and owned
+publisher. All denied permission assertions remain unchanged. Focused4 passed
+all 173 tests in 80.683 seconds. Earlier focused1 and focused2 setup failures
+are retained; no introduced failure is described as a flake.
+
+Full portable CI and required real cluster qualification follow. Unknown
+outcomes remain held across watcher loss, dispatch exhaustion and leadership
+handover. Retirement guards prevent NEW assignment/first launch only; already
+owned exact retries remain idempotent, with no new physical stop/cancel API.
+
+The first full CI stopped in Clippy before portable tests: large error values
+in the extracted helper/test adapter, default-field fixture assignment, two
+redundant fixture bindings and a needless borrow. Boxed the two errors and
+corrected those fixture expressions without changing admission behaviour.
+Receipt: /private/tmp/runtime-543-ci1.log.
+
+CI2 still stopped before portable tests: removing redundant report shadowing
+also removed the needed mutability in two fixtures. Corrected those bindings;
+Clippy also found the equivalent default assignment and needless borrows in
+the portable harness. Receipt: /private/tmp/runtime-543-ci2.log.
+
+CI3 passed both Clippy matrices, then ran all 5,578 portable tests: 5,575 passed
+and three older positive fixtures lacked explicit report provenance. The manual
+daemon now records its actual original ordinal and 600m request, the stale-node
+fixture provides a current received report/deadline for its positive planned
+member, and the catalogue-repair fixture supplies the actual Council term to
+its owned watch snapshot. Original self-eviction, stale-member and catalogue
+repair assertions remain intact; no missing/stale negative is weakened. The
+full failed receipt is retained in /private/tmp/runtime-543-ci3.log. These are
+introduced fixture errors, not flakes. Remaining gates did not run after the
+portable failure. Expanded focus includes every orchestrator audit case.
+
+Expanded focused5 passed all 271 tests in 107.798 seconds, including every
+orchestrator case and the actual catalogue-repair control. Production is frozen
+for independent parent real-cluster qualification; remaining plan/body changes
+will record receipts only. Full CI runs again on the corrected fixture inputs.
+
+CI4 passed formatting, both Clippy matrices, all 5,578 portable tests
+(599.647 seconds, 75 gate-owned skips), two doctests, all 52 CI-script tests
+and ignored-owner checks. This receipt precedes the gated fixture correction
+below; it does not claim final-source cluster qualification.
+
+Independent parent cluster qualification bound 960 files to the frozen source
+snapshot and ran all 42 cases: 39 passed, three failed in 229.905 seconds. Two
+leased-placement setup loops still sent the deliberately refused legacy request;
+they now construct current-revision SchedulingDecisions without changing any
+lease-retirement, decommission or handover assertions. The unrelated reporting
+TCP bind19542 failure passed a correctly gated isolated unchanged-source diagnostic
+in 43.780 seconds. Its cause remains unknown; the plausible fixed-port overlap
+is inference only and is recorded separately in docs/flakes.md under #555.
+Parent evidence: /tmp/reliaburger-review2-543-parent-cluster-evidence/.
+No production source changed after the passing portable run. Final gated
+qualification and static checks now cover the corrected setup requests.
+
+Final current-source cluster qualification passed all 42 cases in 351.978
+seconds, with no retries or exclusions. Both final Clippy matrices passed
+(2.87/1.11 seconds), formatting and diff checks passed. Preserved final JUnit
+and receipt under /private/tmp/runtime-543-evidence/. SHA256 comparison of every
+src file against the parent frozen snapshot found zero production differences.
+The passing portable CI4 predates only the two corrected gated setups and later
+qualification prose; final static and full cluster checks cover those changes.
+The earlier independent 39/42 result and unknown bind diagnostic remain intact.

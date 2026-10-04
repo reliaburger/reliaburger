@@ -959,6 +959,13 @@ fn apply_request(&mut self, request: &RaftRequest) {
 }
 ```
 
+This early version committed one placement at a time. The current scheduler
+commits a complete `SchedulingDecisions` pass with the log revision it used to
+plan. Raft refuses stale plans and publishes the whole validated pass atomically,
+so app placements and batch reservations share a capacity budget. The original
+unguarded variant is refused; [batch scheduling](08-breaking-things-on-purpose.md#batch-scheduling)
+explains the admission boundary.
+
 Exhaustive `match` — add a new variant and the compiler forces you to handle it everywhere. Compare that to a `switch` in Go, where a forgotten `case` silently falls through to nothing.
 
 ### Snapshots and the JSON key problem

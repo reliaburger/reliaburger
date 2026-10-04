@@ -44,6 +44,7 @@ struct HarnessOptions {
     /// Nodes to report capacity for (name → the aggregated view).
     capacity_nodes: Vec<String>,
     stale_capacity_nodes: Vec<String>,
+    close_capacity_channel: bool,
     aggregated_override:
         Option<tokio::sync::watch::Receiver<reliaburger::reporting::aggregator::AggregatedState>>,
     /// Trusted authentication context injected by this test server's boundary.
@@ -59,6 +60,8 @@ struct Harness {
     port: u16,
     cmd_tx: mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
     _tasks: TestTasks,
+    _capacity_publisher:
+        Option<tokio::sync::watch::Sender<reliaburger::reporting::aggregator::AggregatedState>>,
 }
 
 impl Harness {
@@ -93,9 +96,19 @@ impl Harness {
         });
 
         let aggregated = {
-            let mut state = reliaburger::reporting::aggregator::AggregatedState::default();
+            let mut state = reliaburger::reporting::aggregator::AggregatedState {
+                leadership_epoch: options
+                    .council
+                    .as_ref()
+                    .map(|council| council.current_term()),
+                ..Default::default()
+            };
             for name in &options.capacity_nodes {
                 let node = reliaburger::meat::NodeId(name.clone());
+                state.receive_deadlines.insert(
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                );
                 state.reports.insert(
                     node.clone(),
                     reliaburger::reporting::types::StateReport {
@@ -200,6 +213,7 @@ impl Harness {
             port,
             cmd_tx,
             _tasks: TestTasks::new(shutdown, vec![agent_task, server_task]),
+            _capacity_publisher: (!options.close_capacity_channel).then_some(_aggregated_tx),
         }
     }
 
@@ -308,7 +322,7 @@ async fn assert_pruned_execution_cannot_be_claimed_elsewhere(mode: &str, kind: &
     let first = Harness::start_with(HarnessOptions {
         council: Some(nodes[0].clone()),
         node_name: Some("first-worker".into()),
-        ..Default::default()
+        ..local_capacity_options(nodes[0].clone(), "first-worker")
     })
     .await;
     let response = first
@@ -339,7 +353,7 @@ async fn assert_pruned_execution_cannot_be_claimed_elsewhere(mode: &str, kind: &
         "jobs": [{
             "name": "prune-marker",
             "execution_name": "prune-marker-execution",
-            "spec_digest": "a".repeat(64),
+            "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64),
             "namespace": "default",
             "node": null,
             "status": "Unschedulable"
@@ -347,10 +361,15 @@ async fn assert_pruned_execution_cannot_be_claimed_elsewhere(mode: &str, kind: &
         "submitted_at_epoch_secs": submitted_at + TERMINAL_RETENTION_SECS + 1
     }))
     .unwrap();
-    nodes[0]
-        .write(RaftRequest::BatchRegister { batch: marker })
-        .await
-        .unwrap();
+    write_admission_fixture(
+        &nodes[0],
+        RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch: marker,
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         nodes[0]
             .desired_state()
@@ -492,6 +511,62 @@ async fn cluster_batches_without_fresh_capacity_refuse_before_registration() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_worker_in_a_fresh_api_roster_never_receives_new_batch_work() {
+    let council = single_node_leader().await;
+    let membership_log_id = *council.metrics().borrow().membership_config.log_id();
+    let response = council
+        .write(reliaburger::council::RaftRequest::DecommissionNode {
+            node_id: "retired-worker".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 1,
+            membership_log_id,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            response,
+            reliaburger::council::CouncilResponse::NodeDecommissioned { .. }
+        ),
+        "{response:?}"
+    );
+    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
+    let mut options = remote_capacity_options(council.clone(), address);
+    options.membership.as_mut().unwrap()[0].node_id =
+        reliaburger::meat::NodeId::new("retired-worker");
+    options.capacity_nodes = vec!["retired-worker".into()];
+    let harness = Harness::start_with(options).await;
+    let response = reqwest::Client::new().post(format!("{}/v1/batch",harness.base_url))
+        .json(&serde_json::json!({"jobs":[{"name":"retired-target","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
+        .send().await.unwrap();
+    let status = response.status();
+    let records = council.desired_state().await.batch_state.batches.len();
+    drop(harness);
+    council.shutdown().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(records, 0);
+    assert!(dispatches.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_capacity_watch_never_admits_from_its_retained_report() {
+    let council = single_node_leader().await;
+    let mut options = capacity_options(council.clone());
+    options.close_capacity_channel = true;
+    let harness = Harness::start_with(options).await;
+    let response = reqwest::Client::new().post(format!("{}/v1/batch", harness.base_url))
+        .json(&serde_json::json!({"jobs":[{"name":"closed-publisher","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
+        .send().await.unwrap();
+    let status = response.status();
+    let records = council.desired_state().await.batch_state.batches.len();
+    drop(harness);
+    council.shutdown().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(records, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_batches_with_stale_capacity_refuse_before_registration() {
     let council = single_node_leader().await;
     let mut options = capacity_options(council.clone());
@@ -531,6 +606,14 @@ fn capacity_options(council: Arc<CouncilNode>) -> HarnessOptions {
         capacity_nodes: vec!["node-1".into()],
         ..Default::default()
     }
+}
+
+fn local_capacity_options(council: Arc<CouncilNode>, name: &str) -> HarnessOptions {
+    let mut options = capacity_options(council);
+    options.node_name = Some(name.into());
+    options.membership.as_mut().unwrap()[0].node_id = reliaburger::meat::NodeId::new(name);
+    options.capacity_nodes = vec![name.into()];
+    options
 }
 
 async fn pending_capacity_worker() -> (
@@ -1014,17 +1097,19 @@ async fn batch_admission_accounts_for_unreported_app_placements() {
         })
         .await
         .unwrap();
-    council
-        .write(RaftRequest::SchedulingDecision(SchedulingDecision {
+    write_admission_fixture(
+        &council,
+        RaftRequest::SchedulingDecision(SchedulingDecision {
             app_id,
             placements: vec![Placement {
                 node_id: NodeId::new("node-1"),
                 resources: Resources::new(8000, 0, 0),
                 ordinal: 0,
             }],
-        }))
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .unwrap();
     let (address, _dispatches, _worker_tasks) = pending_capacity_worker().await;
     let harness = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
     let response = harness
@@ -1046,6 +1131,7 @@ async fn an_expired_batch_with_an_unknown_runner_remains_nonterminal() {
     let record = BatchRecord {
         submitted_at_epoch_secs: 0,
         jobs: vec![BatchJobRecord {
+            resources: reliaburger::meat::Resources::default(),
             name: "uncertain".into(),
             execution_name: "uncertain-execution".into(),
             spec_digest: "a".repeat(64),
@@ -1054,10 +1140,15 @@ async fn an_expired_batch_with_an_unknown_runner_remains_nonterminal() {
             status: JobStatus::Pending,
         }],
     };
-    council
-        .write(reliaburger::council::types::RaftRequest::BatchRegister { batch: record })
-        .await
-        .unwrap();
+    write_admission_fixture(
+        &council,
+        reliaburger::council::types::RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch: record,
+        },
+    )
+    .await
+    .unwrap();
     let harness = Harness::start_with(capacity_options(council.clone())).await;
     harness.client.batch_status(1).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1696,14 +1787,19 @@ async fn assert_clustered_runner_cannot_create_from_stale_or_foreign_ownership(m
         "jobs": [{
             "name": execution, "execution_name": execution, "namespace": "default",
             "node": if mode == "wrong-node" { "other-worker" } else { "worker" }, "status": "Pending",
-            "spec_digest": digest
+            "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": digest
         }],
         "submitted_at_epoch_secs": 1_000_000
     })).unwrap();
-    council
-        .write(RaftRequest::BatchRegister { batch: record })
-        .await
-        .unwrap();
+    write_admission_fixture(
+        &council,
+        RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch: record,
+        },
+    )
+    .await
+    .unwrap();
     if mode == "pruned" {
         council
             .write(RaftRequest::BatchJobUpdate {
@@ -1718,17 +1814,42 @@ async fn assert_clustered_runner_cannot_create_from_stale_or_foreign_ownership(m
         let marker: BatchRecord = serde_json::from_value(serde_json::json!({
             "jobs": [{
                 "name": "prune-marker", "execution_name": "prune-marker-execution",
-                "spec_digest": "a".repeat(64),
+                "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64),
                 "namespace": "default", "node": null, "status": "Unschedulable"
             }],
             "submitted_at_epoch_secs": 1_000_000 + TERMINAL_RETENTION_SECS + 1
         }))
         .unwrap();
-        council
-            .write(RaftRequest::BatchRegister { batch: marker })
+        write_admission_fixture(
+            &council,
+            RaftRequest::BatchRegister {
+                expected_log_id: None,
+                batch: marker,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(council.desired_state().await.batch_state.get(1).is_none());
+    }
+    if mode == "retired" {
+        let membership_log_id = *council.metrics().borrow().membership_config.log_id();
+        let response = council
+            .write(RaftRequest::DecommissionNode {
+                node_id: "worker".into(),
+                retired_by: "operator".into(),
+                reason: "retired after allocation".into(),
+                retired_at_unix_ms: 1,
+                membership_log_id,
+            })
             .await
             .unwrap();
-        assert!(council.desired_state().await.batch_state.get(1).is_none());
+        assert!(
+            matches!(
+                response,
+                reliaburger::council::CouncilResponse::NodeDecommissioned { .. }
+            ),
+            "{response:?}"
+        );
     }
     if mode == "altered-spec" {
         spec.command = Some(vec![
@@ -1805,6 +1926,11 @@ async fn a_live_batch_assigned_to_another_worker_cannot_authorise_local_creation
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_batchs_original_spec_cannot_change_before_the_first_runner_admission() {
     assert_clustered_runner_cannot_create_from_stale_or_foreign_ownership("altered-spec").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_first_batch_dispatch_cannot_launch_after_durable_node_retirement() {
+    assert_clustered_runner_cannot_create_from_stale_or_foreign_ownership("retired").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2267,13 +2393,18 @@ async fn committed_remote_ownership_cannot_relabel_a_local_ordinary_log_selector
         .0;
     ordinary.client.apply(&Config::parse(&format!("[job.{execution}]\nnamespace='team'\nimage='proc-grill:image-ignored'\ncommand=['sh','-c','echo ordinary-private-sentinel; sleep 10']")).unwrap()).await.unwrap();
     let record: BatchRecord = serde_json::from_value(serde_json::json!({
-        "jobs": [{"name": "migration", "execution_name": execution, "namespace": "team", "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+        "jobs": [{"name": "migration", "execution_name": execution, "namespace": "team", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
         "submitted_at_epoch_secs": epoch_now_secs()
     })).unwrap();
-    council
-        .write(reliaburger::council::types::RaftRequest::BatchRegister { batch: record })
-        .await
-        .unwrap();
+    write_admission_fixture(
+        &council,
+        reliaburger::council::types::RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch: record,
+        },
+    )
+    .await
+    .unwrap();
     let http = reqwest::Client::new();
     for prefix in ["logs", "logs/entries"] {
         let response = http
@@ -2337,13 +2468,18 @@ async fn a_remote_log_selector_uses_committed_ownership_and_original_scope() {
         ),
     ] {
         let record: BatchRecord = serde_json::from_value(serde_json::json!({
-            "jobs": [{"name": label, "execution_name": execution, "namespace": "team", "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+            "jobs": [{"name": label, "execution_name": execution, "namespace": "team", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
             "submitted_at_epoch_secs": epoch_now_secs()
         })).unwrap();
-        council
-            .write(RaftRequest::BatchRegister { batch: record })
-            .await
-            .unwrap();
+        write_admission_fixture(
+            &council,
+            RaftRequest::BatchRegister {
+                expected_log_id: None,
+                batch: record,
+            },
+        )
+        .await
+        .unwrap();
         store.write().await.ingest(&LogRecord {
             app: label.into(),
             namespace: "team".into(),
@@ -3136,7 +3272,7 @@ async fn batch_ids_stay_monotonic_across_an_api_restart() {
     let first = Harness::start_with(HarnessOptions {
         council: Some(Arc::clone(&council)),
         node_name: Some("leader".to_string()),
-        ..Default::default()
+        ..local_capacity_options(council.clone(), "leader")
     })
     .await;
     let jobs = jobs_from(
@@ -3154,7 +3290,7 @@ async fn batch_ids_stay_monotonic_across_an_api_restart() {
     let second = Harness::start_with(HarnessOptions {
         council: Some(Arc::clone(&council)),
         node_name: Some("leader".to_string()),
-        ..Default::default()
+        ..local_capacity_options(council.clone(), "leader")
     })
     .await;
     // The old batch is still readable after the "restart"…
@@ -3269,6 +3405,7 @@ async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
     // The "old leader" registered this batch and dispatched, then died.
     let record = BatchRecord {
         jobs: vec![BatchJobRecord {
+            resources: reliaburger::meat::Resources::default(),
             name: "orphan".to_string(),
             execution_name: "orphan".to_string(),
             spec_digest: "a".repeat(64),
@@ -3278,10 +3415,15 @@ async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
         }],
         submitted_at_epoch_secs: epoch_now_secs(),
     };
-    let response = council
-        .write(reliaburger::council::types::RaftRequest::BatchRegister { batch: record })
-        .await
-        .unwrap();
+    let response = write_admission_fixture(
+        &council,
+        reliaburger::council::types::RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch: record,
+        },
+    )
+    .await
+    .unwrap();
     let batch_id = match response {
         reliaburger::council::types::CouncilResponse::BatchRegistered { batch_id } => batch_id,
         other => panic!("unexpected response: {other:?}"),
@@ -3421,13 +3563,18 @@ async fn assert_batch_follow_selects_committed_owner(
         .instance_id()
         .0;
     let record: BatchRecord = serde_json::from_value(serde_json::json!({
-        "jobs": [{"name": "migration", "execution_name": execution, "namespace": "team", "spec_digest": if local_capture { digest } else { "a".repeat(64) }, "node": if local_capture { "reader-node" } else { "batch-worker" }, "status": "Pending"}],
+        "jobs": [{"name": "migration", "execution_name": execution, "namespace": "team", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": if local_capture { digest } else { "a".repeat(64) }, "node": if local_capture { "reader-node" } else { "batch-worker" }, "status": "Pending"}],
         "submitted_at_epoch_secs": if unavailable == Some("pruned") { 0 } else { epoch_now_secs() }
     })).unwrap();
-    council
-        .write(RaftRequest::BatchRegister { batch: record })
-        .await
-        .unwrap();
+    write_admission_fixture(
+        &council,
+        RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch: record,
+        },
+    )
+    .await
+    .unwrap();
     if unavailable == Some("pruned") {
         council
             .write(RaftRequest::BatchJobUpdate {
@@ -3439,15 +3586,18 @@ async fn assert_batch_follow_selects_committed_owner(
             })
             .await
             .unwrap();
-        council
-            .write(RaftRequest::BatchRegister {
+        write_admission_fixture(
+            &council,
+            RaftRequest::BatchRegister {
+                expected_log_id: None,
                 batch: BatchRecord {
                     jobs: Vec::new(),
                     submitted_at_epoch_secs: epoch_now_secs(),
                 },
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             !council
                 .desired_state()
@@ -3469,17 +3619,19 @@ async fn assert_batch_follow_selects_committed_owner(
             })
             .await
             .unwrap();
-        council
-            .write(RaftRequest::SchedulingDecision(SchedulingDecision {
+        write_admission_fixture(
+            &council,
+            RaftRequest::SchedulingDecision(SchedulingDecision {
                 app_id: AppId::new("migration", "team"),
                 placements: vec![Placement {
                     node_id: NodeId("ordinary-worker".into()),
                     resources: Resources::new(0, 0, 0),
                     ordinal: 0,
                 }],
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
     }
     let desired = council.desired_state().await;
     assert!(
@@ -3780,4 +3932,24 @@ async fn batch_websocket_follow_local_empty_never_uses_app_placements() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_websocket_follow_local_capture_never_uses_app_placements() {
     assert_batch_follow_selects_committed_owner(true, true, Some("local-capture")).await;
+}
+
+async fn write_admission_fixture(
+    council: &reliaburger::council::CouncilNode,
+    mut request: reliaburger::council::RaftRequest,
+) -> Result<reliaburger::council::CouncilResponse, reliaburger::council::CouncilError> {
+    let previous = council.desired_state().await.last_applied_log;
+    match &mut request {
+        reliaburger::council::RaftRequest::BatchRegister {
+            expected_log_id, ..
+        } => *expected_log_id = previous,
+        reliaburger::council::RaftRequest::SchedulingDecision(decision) => {
+            request = reliaburger::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
+            }
+        }
+        _ => {}
+    }
+    council.write(request).await
 }
