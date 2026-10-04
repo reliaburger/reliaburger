@@ -1565,6 +1565,24 @@ mod tests {
     }
 
     #[test]
+    fn autoscale_admission_refuses_nonpositive_and_nonfinite_targets() {
+        for target in ["0%", "-20%", "NaN", "NaN%", "inf", "inf%", "-inf"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            assert!(config.validate().is_err(), "accepted target {target}");
+        }
+        for target in ["70%", "0.7", "150%"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn invalid_cron_schedule_is_rejected_during_config_validation() {
         for expression in ["61 * * * *", "*/0 * * * *", "not a schedule"] {
             let raw = format!("[job.tick]\nimage=\"busybox\"\nschedule={expression:?}\n");
