@@ -525,7 +525,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if job.phase != crate::bun::jobs::JobPhase::Unknown {
                     job.phase = crate::bun::jobs::JobPhase::Stopped;
                 }
-                job.runtime_absent = true;
+                // Confirmed process exit does not establish OCI object absence.
+                job.runtime_absent = job.batch_execution.is_none()
+                    || job.runtime == crate::grill::records::RuntimeKind::Process;
             }
         }
         if owns_job {

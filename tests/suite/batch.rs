@@ -638,7 +638,13 @@ async fn owned_batch_retry_keeps_current_attempt_outcome_through_recovery() {
         .send()
         .await
         .unwrap();
-    assert_eq!(recovered.status(), reqwest::StatusCode::ACCEPTED);
+    let recovered_status = recovered.status();
+    let recovered_body = recovered.text().await.unwrap();
+    assert_eq!(
+        recovered_status,
+        reqwest::StatusCode::ACCEPTED,
+        "{recovered_body}"
+    );
     let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
         .await
         .unwrap()
@@ -1079,6 +1085,8 @@ async fn assert_clustered_runner_cannot_create_from_stale_or_foreign_ownership(m
             .write(RaftRequest::BatchJobUpdate {
                 batch_id: 1,
                 job_name: execution.into(),
+                namespace: "default".into(),
+                exit_code: Some(0),
                 status: JobStatus::Completed,
             })
             .await
@@ -1446,6 +1454,112 @@ async fn an_uncertain_batch_checkpoint_refuses_dispatch_and_keeps_retries_fenced
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn predictable_host_policy_refusal_keeps_the_whole_batch_unadmitted() {
+    let mut invalid =
+        Config::parse("[job.invalid]\nnamespace='team'\nexec='/bin/echo'\ncommand=['rejected']\n")
+            .unwrap();
+    predictable_policy_refusal_keeps_batch_unadmitted(invalid.job.remove("invalid").unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn predictable_process_limits_refusal_keeps_the_whole_batch_unadmitted() {
+    let mut invalid = Config::parse("[job.invalid]\nnamespace='team'\nimage='proc-grill:image-ignored'\ncommand=['true']\ncpu='100m'\n").unwrap();
+    predictable_policy_refusal_keeps_batch_unadmitted(invalid.job.remove("invalid").unwrap()).await;
+}
+
+async fn predictable_policy_refusal_keeps_batch_unadmitted(
+    invalid: reliaburger::config::job::JobSpec,
+) {
+    let scratch = tempfile::tempdir().unwrap();
+    let records = scratch.path().join("records");
+    let launches = scratch.path().join("launches");
+    let runner = Harness::start_with(HarnessOptions {
+        records_dir: Some(records.clone()),
+        ..Default::default()
+    })
+    .await;
+    let healthy = "batch-policy-healthy";
+    let rejected = "batch-policy-invalid";
+    let spec = serde_json::json!({
+        "image":"proc-grill:image-ignored", "namespace":"team",
+        "command":["sh", "-c", "printf healthy >> \"$1\"", "sh", launches]
+    });
+    let request = serde_json::json!({
+        "batch_id":991,
+        "jobs":[
+            {"name":healthy,"namespace":"team","spec":spec},
+            {"name":rejected,"namespace":"team","spec":invalid}
+        ],
+        "execution_labels":{
+            (healthy):{"name":"healthy","namespace":"team"},
+            (rejected):{"name":"invalid","namespace":"team"}
+        }
+    });
+    let http = reqwest::Client::new();
+    let refused = http
+        .post(format!("{}/v1/batch/run", runner.base_url))
+        .bearer_auth(TEST_SERVICE_TOKEN)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = refused.status();
+    let error = refused.text().await.unwrap();
+    let checkpoint_exists = records.join("job-attempts.checkpoint").exists();
+    let jobs: Vec<serde_json::Value> = http
+        .get(format!("{}/v1/jobs", runner.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let instances: Vec<serde_json::Value> = http
+        .get(format!("{}/v1/status", runner.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let launched_before_retry = launches.exists();
+    let corrected = http
+        .post(format!("{}/v1/batch/run", runner.base_url))
+        .bearer_auth(TEST_SERVICE_TOKEN)
+        .json(&serde_json::json!({
+            "batch_id":991,
+            "jobs":[{"name":healthy,"namespace":"team","spec":spec}],
+            "execution_labels":{(healthy):{"name":"healthy","namespace":"team"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    let corrected_status = corrected.status();
+    let corrected_error = corrected.text().await.unwrap();
+    if corrected_status == reqwest::StatusCode::ACCEPTED {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !launches.exists() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    drop(runner);
+    assert!(!status.is_success(), "node policy was bypassed: {error}");
+    assert!(
+        !checkpoint_exists && jobs.is_empty() && instances.is_empty() && !launched_before_retry,
+        "predictable refusal admitted ownership/runtime evidence: checkpoint={checkpoint_exists}, jobs={jobs:?}, instances={instances:?}, launched={launched_before_retry}; {error}"
+    );
+    assert_eq!(
+        corrected_status,
+        reqwest::StatusCode::ACCEPTED,
+        "a healthy corrected request was permanently fenced: {corrected_error}"
+    );
+    assert_eq!(std::fs::read_to_string(launches).unwrap(), "healthy");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_log_rows_preserve_logical_scope_and_distinct_execution_ids() {
     let scratch = tempfile::tempdir().unwrap();
     let store = Arc::new(RwLock::new(reliaburger::ketchup::log_store::LogStore::new(
@@ -1512,6 +1626,167 @@ async fn batch_log_rows_preserve_logical_scope_and_distinct_execution_ids() {
     assert_eq!(entries.len(), 2);
     assert_ne!(entries[0].instance, entries[1].instance);
     assert!(entries.iter().all(|entry| entry.line == "logical-sentinel"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_remote_ownership_cannot_relabel_a_local_ordinary_log_selector() {
+    let council = single_node_leader().await;
+    let ordinary = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        node_name: Some("local-worker".into()),
+        ..Default::default()
+    })
+    .await;
+    let execution = "ordinary-execution";
+    let id = reliaburger::grill::InstanceIdentity::new("team", execution, 0)
+        .instance_id()
+        .0;
+    ordinary.client.apply(&Config::parse(&format!("[job.{execution}]\nnamespace='team'\nimage='proc-grill:image-ignored'\ncommand=['sh','-c','echo ordinary-private-sentinel; sleep 10']")).unwrap()).await.unwrap();
+    let record: BatchRecord = serde_json::from_value(serde_json::json!({
+        "jobs": [{"name": "migration", "execution_name": execution, "namespace": "team", "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+        "submitted_at_epoch_secs": epoch_now_secs()
+    })).unwrap();
+    council
+        .write(reliaburger::council::types::RaftRequest::BatchRegister { batch: record })
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    for prefix in ["logs", "logs/entries"] {
+        let response = http
+            .get(format!("{}/v1/{prefix}/migration/team", ordinary.base_url))
+            .query(&[("instance", &id)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            !response
+                .text()
+                .await
+                .unwrap()
+                .contains("ordinary-private-sentinel")
+        );
+    }
+    let logs = http
+        .get(format!("{}/v1/logs/{execution}/team", ordinary.base_url))
+        .query(&[("instance", &id)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        logs.status(),
+        reqwest::StatusCode::OK,
+        "the ordinary owner must remain available under its own label"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_log_selector_uses_committed_ownership_and_original_scope() {
+    use reliaburger::council::types::RaftRequest;
+    use reliaburger::grill::InstanceIdentity;
+    use reliaburger::ketchup::types::{LogRecord, LogStream};
+    let council = single_node_leader().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Arc::new(RwLock::new(reliaburger::ketchup::log_store::LogStore::new(
+        scratch.path().to_path_buf(),
+    )));
+    let old_execution = "batch-remote-old";
+    let new_execution = "batch-remote-new";
+    let old_id = InstanceIdentity::new("team", old_execution, 0)
+        .instance_id()
+        .0;
+    let new_id = InstanceIdentity::new("team", new_execution, 0)
+        .instance_id()
+        .0;
+    for (label, execution, id, line) in [
+        (
+            "migration",
+            old_execution,
+            old_id.as_str(),
+            "old-execution-sentinel",
+        ),
+        (
+            old_execution,
+            new_execution,
+            new_id.as_str(),
+            "new-execution-sentinel",
+        ),
+    ] {
+        let record: BatchRecord = serde_json::from_value(serde_json::json!({
+            "jobs": [{"name": label, "execution_name": execution, "namespace": "team", "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+            "submitted_at_epoch_secs": epoch_now_secs()
+        })).unwrap();
+        council
+            .write(RaftRequest::BatchRegister { batch: record })
+            .await
+            .unwrap();
+        store.write().await.ingest(&LogRecord {
+            app: label.into(),
+            namespace: "team".into(),
+            instance: id.into(),
+            stream: LogStream::Stdout,
+            line: line.into(),
+            position: None,
+        });
+    }
+    let http = reqwest::Client::new();
+    for reader_label in ["migration", old_execution] {
+        // This council node holds no runtime, active job or retired node proof.
+        let reader = Harness::start_with(HarnessOptions {
+            council: Some(council.clone()),
+            node_name: Some("leader".into()),
+            log_store: Some(store.clone()),
+            auth_context: Some(reliaburger::sesame::auth::AuthContext {
+                token_name: "reader".into(),
+                principal_id: "reader-credential".into(),
+                role: reliaburger::sesame::types::ApiRole::ReadOnly,
+                scoped_apps: Some(vec![reader_label.into()]),
+                scoped_namespaces: Some(vec!["team".into()]),
+            }),
+            ..Default::default()
+        })
+        .await;
+        let path = format!("{}/v1/logs/entries/{old_execution}/team", reader.base_url);
+        let ambiguous = http.get(&path).send().await.unwrap();
+        assert_eq!(ambiguous.status(), reqwest::StatusCode::BAD_REQUEST);
+        for (label, id, sentinel) in [
+            ("migration", old_id.as_str(), "old-execution-sentinel"),
+            (old_execution, new_id.as_str(), "new-execution-sentinel"),
+        ] {
+            let response = http
+                .get(&path)
+                .query(&[("instance", id)])
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            if label == reader_label {
+                assert_eq!(status, reqwest::StatusCode::OK, "{reader_label}: {body}");
+                let entries: Vec<reliaburger::ketchup::types::LogEntry> =
+                    serde_json::from_str(&body).unwrap();
+                assert_eq!(entries.len(), 1, "{body}");
+                assert_eq!(entries[0].instance.as_deref(), Some(id));
+                assert_eq!(entries[0].line, sentinel);
+            } else {
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::FORBIDDEN,
+                    "{reader_label}: {body}"
+                );
+                assert!(!body.contains(sentinel));
+            }
+        }
+        for id in ["team__batch-never-owned-0", "other__batch-remote-old-0"] {
+            let unknown = http
+                .get(&path)
+                .query(&[("instance", id)])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1744,6 +2019,13 @@ async fn a_previous_named_run_cannot_complete_a_new_batch_before_dispatch_acknow
         while let Some(command) = rx.recv().await {
             match command {
                 AgentCommand::Deploy { events, .. } => held_events.push(events),
+                AgentCommand::RunJobsWithLabels {
+                    events, response, ..
+                } => {
+                    // Acknowledge owned admission while holding launch evidence.
+                    held_events.push(events);
+                    let _ = response.send(Ok(BTreeMap::new()));
+                }
                 AgentCommand::Status { response } => {
                     let _ = response.send(vec![InstanceStatus {
                         id: "previous-run".into(),
@@ -2035,6 +2317,7 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
     let run = serde_json::json!({
         "batch_id": 424242,
         "callback_base_url": submitter.base_url,
+        "execution_labels": {"remote-1": {"name": "remote-1", "namespace": "default"}},
         "jobs": [{
             "name": "remote-1",
             "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "remote"] },
@@ -2072,7 +2355,7 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
     let report = http
         .post(format!("{}/v1/batch/424242/report", submitter.base_url))
         .bearer_auth(TEST_SERVICE_TOKEN)
-        .json(&serde_json::json!({ "job_name": "remote-1", "status": "completed" }))
+        .json(&serde_json::json!({ "job_name": "remote-1", "namespace": "default", "status": "completed", "exit_code": 0 }))
         .send()
         .await
         .unwrap();
@@ -2095,6 +2378,7 @@ async fn batch_reports_are_validated_and_idempotent() {
     );
     let response = harness.client.submit_batch(&jobs).await.unwrap();
     let batch_id = response["batch_id"].as_u64().unwrap();
+    let execution = response["executions"]["steady"].as_str().unwrap();
     harness.wait_done(batch_id, 30).await;
 
     let http = reqwest::Client::new();
@@ -2104,7 +2388,7 @@ async fn batch_reports_are_validated_and_idempotent() {
     let forged = http
         .post(&report_url)
         .bearer_auth(TEST_SERVICE_TOKEN)
-        .json(&serde_json::json!({ "job_name": "steady", "status": "meltdown" }))
+        .json(&serde_json::json!({ "job_name": execution, "namespace": "default", "status": "meltdown", "exit_code": null }))
         .send()
         .await
         .unwrap();
@@ -2114,7 +2398,7 @@ async fn batch_reports_are_validated_and_idempotent() {
     let duplicate = http
         .post(&report_url)
         .bearer_auth(TEST_SERVICE_TOKEN)
-        .json(&serde_json::json!({ "job_name": "steady", "status": "completed" }))
+        .json(&serde_json::json!({ "job_name": execution, "namespace": "default", "status": "completed", "exit_code": 0 }))
         .send()
         .await
         .unwrap();
@@ -2128,7 +2412,7 @@ async fn batch_reports_are_validated_and_idempotent() {
     let conflict = http
         .post(&report_url)
         .bearer_auth(TEST_SERVICE_TOKEN)
-        .json(&serde_json::json!({ "job_name": "steady", "status": "failed" }))
+        .json(&serde_json::json!({ "job_name": execution, "namespace": "default", "status": "failed", "exit_code": 1 }))
         .send()
         .await
         .unwrap();
@@ -2138,7 +2422,7 @@ async fn batch_reports_are_validated_and_idempotent() {
     let unknown = http
         .post(&report_url)
         .bearer_auth(TEST_SERVICE_TOKEN)
-        .json(&serde_json::json!({ "job_name": "impostor", "status": "completed" }))
+        .json(&serde_json::json!({ "job_name": "impostor", "namespace": "default", "status": "completed", "exit_code": 0 }))
         .send()
         .await
         .unwrap();
@@ -2154,6 +2438,7 @@ async fn batch_internal_endpoints_require_the_system_principal() {
     let http = reqwest::Client::new();
     let run = serde_json::json!({
         "batch_id": 1,
+        "execution_labels": {"x": {"name": "x", "namespace": "default"}},
         "jobs": [{
             "name": "x",
             "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "x"] },
@@ -2182,7 +2467,7 @@ async fn batch_internal_endpoints_require_the_system_principal() {
     // The report endpoint is equally guarded.
     let report = http
         .post(format!("{}/v1/batch/1/report", runner.base_url))
-        .json(&serde_json::json!({ "job_name": "x", "status": "completed" }))
+        .json(&serde_json::json!({ "job_name": "x", "namespace": "default", "status": "completed", "exit_code": 0 }))
         .send()
         .await
         .unwrap();
@@ -2361,6 +2646,8 @@ async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
     let record = BatchRecord {
         jobs: vec![BatchJobRecord {
             name: "orphan".to_string(),
+            execution_name: "orphan".to_string(),
+            spec_digest: "a".repeat(64),
             namespace: "default".to_string(),
             node: Some(reliaburger::meat::NodeId("runner".to_string())),
             status: JobStatus::Pending,
@@ -2382,6 +2669,7 @@ async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
     let run = serde_json::json!({
         "batch_id": batch_id,
         "callback_base_url": null,
+        "execution_labels": {"orphan": {"name": "orphan", "namespace": "default"}},
         "jobs": [{
             "name": "orphan",
             "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "orphan"] },
@@ -2412,4 +2700,460 @@ async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
     .await;
     let summary = new_leader.wait_done(batch_id, 60).await;
     assert_eq!(summary["completed"].as_u64(), Some(1), "{summary}");
+}
+
+// Batch allocations bypass app placements. Follow routes must select the
+// committed execution owner and retain the original logical scope boundary.
+
+async fn batch_follow_peer(
+    sentinel: &'static str,
+    selected: String,
+) -> (
+    std::net::SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    TestTasks,
+) {
+    use axum::extract::{Path, Query};
+    use axum::http::HeaderMap;
+    use axum::response::sse::{Event, Sse};
+    use futures_util::StreamExt as _;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let peer = axum::Router::new().route(
+        "/v1/logs/{app}/{namespace}",
+        axum::routing::get(
+            move |Path((app, namespace)): Path<(String, String)>,
+                  Query(query): Query<BTreeMap<String, String>>,
+                  headers: HeaderMap| {
+                let calls = observed.clone();
+                let selected = selected.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!((app.as_str(), namespace.as_str()), ("migration", "team"));
+                    assert_eq!(query.get("follow").map(String::as_str), Some("true"));
+                    assert_eq!(query.get("local").map(String::as_str), Some("true"));
+                    assert_eq!(query.get("label").map(String::as_str), Some("true"));
+                    assert_eq!(query.get("instance"), Some(&selected));
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some(format!("Bearer {TEST_SERVICE_TOKEN}").as_str()),
+                    );
+                    let events = futures_util::stream::once(async move {
+                        Ok::<_, std::convert::Infallible>(Event::default().data(sentinel))
+                    })
+                    .chain(futures_util::stream::pending());
+                    Sse::new(events)
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let stopped = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, peer)
+            .with_graceful_shutdown(async move { stopped.cancelled().await })
+            .await
+            .unwrap();
+    });
+    (address, calls, TestTasks::new(shutdown, vec![server]))
+}
+
+fn batch_follow_reader_scope(app: &str) -> reliaburger::sesame::auth::AuthContext {
+    reliaburger::sesame::auth::AuthContext {
+        token_name: "reader".into(),
+        principal_id: "reader-credential".into(),
+        role: reliaburger::sesame::types::ApiRole::ReadOnly,
+        scoped_apps: Some(vec![app.into()]),
+        scoped_namespaces: Some(vec!["team".into()]),
+    }
+}
+
+async fn assert_batch_follow_selects_committed_owner(
+    websocket: bool,
+    same_label_app: bool,
+    unavailable: Option<&str>,
+) {
+    use futures_util::StreamExt as _;
+    use reliaburger::council::types::RaftRequest;
+    use reliaburger::meat::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let local = matches!(unavailable, Some("local-empty" | "local-capture"));
+    let local_capture = unavailable == Some("local-capture");
+    let local_spec = Config::parse("[job.migration]\nimage='proc-grill:image-ignored'\nnamespace='team'\ncommand=['echo','worker-local-capture-sentinel']\n")
+        .unwrap().job.remove("migration").unwrap();
+    use sha2::{Digest, Sha256};
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&("team", "migration", &local_spec)).unwrap())
+    );
+    let council = single_node_leader().await;
+    let execution = "batch-remote-follow";
+    let selected = reliaburger::grill::InstanceIdentity::new("team", execution, 0)
+        .instance_id()
+        .0;
+    let record: BatchRecord = serde_json::from_value(serde_json::json!({
+        "jobs": [{"name": "migration", "execution_name": execution, "namespace": "team", "spec_digest": if local_capture { digest } else { "a".repeat(64) }, "node": if local_capture { "reader-node" } else { "batch-worker" }, "status": "Pending"}],
+        "submitted_at_epoch_secs": if unavailable == Some("pruned") { 0 } else { epoch_now_secs() }
+    })).unwrap();
+    council
+        .write(RaftRequest::BatchRegister { batch: record })
+        .await
+        .unwrap();
+    if unavailable == Some("pruned") {
+        council
+            .write(RaftRequest::BatchJobUpdate {
+                batch_id: 1,
+                job_name: execution.into(),
+                namespace: "team".into(),
+                status: JobStatus::Completed,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        council
+            .write(RaftRequest::BatchRegister {
+                batch: BatchRecord {
+                    jobs: Vec::new(),
+                    submitted_at_epoch_secs: epoch_now_secs(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(
+            !council
+                .desired_state()
+                .await
+                .batch_state
+                .batches
+                .iter()
+                .any(|(id, _)| *id == 1)
+        );
+    }
+    if same_label_app {
+        let mut ordinary =
+            Config::parse("[app.migration]\nimage='proc-grill:image-ignored'\nnamespace='team'\n")
+                .unwrap();
+        council
+            .write(RaftRequest::AppSpec {
+                app_id: AppId::new("migration", "team"),
+                spec: Box::new(ordinary.app.remove("migration").unwrap()),
+            })
+            .await
+            .unwrap();
+        council
+            .write(RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: AppId::new("migration", "team"),
+                placements: vec![Placement {
+                    node_id: NodeId("ordinary-worker".into()),
+                    resources: Resources::new(0, 0, 0),
+                    ordinal: 0,
+                }],
+            }))
+            .await
+            .unwrap();
+    }
+    let desired = council.desired_state().await;
+    assert!(
+        !desired
+            .scheduling
+            .contains_key(&AppId::new(execution, "team"))
+    );
+    assert_eq!(
+        desired
+            .scheduling
+            .contains_key(&AppId::new("migration", "team")),
+        same_label_app,
+    );
+    assert_eq!(
+        desired
+            .batch_state
+            .execution_owner("team", execution)
+            .unwrap()
+            .logical_name,
+        "migration",
+    );
+    let (batch_address, batch_calls, _batch_server) =
+        batch_follow_peer("committed-batch-owner-sentinel", selected.clone()).await;
+    let (ordinary_address, ordinary_calls, _ordinary_server) =
+        batch_follow_peer("unrelated-app-placement-sentinel", selected.clone()).await;
+    let mut membership = vec![
+        NodeMembershipInfo {
+            node_id: NodeId("batch-worker".into()),
+            address: batch_address,
+            api_advertised: true,
+        },
+        NodeMembershipInfo {
+            node_id: NodeId("ordinary-worker".into()),
+            address: ordinary_address,
+            api_advertised: true,
+        },
+    ];
+    if unavailable == Some("missing") {
+        membership.retain(|member| member.node_id.0 != "batch-worker");
+    } else if unavailable == Some("unadvertised") {
+        membership[0].api_advertised = false;
+    }
+    let reader = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        node_name: Some("reader-node".into()),
+        membership: Some(membership.clone()),
+        auth_context: Some(batch_follow_reader_scope("migration")),
+        ..Default::default()
+    })
+    .await;
+    let denied = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        node_name: Some("denied-reader-node".into()),
+        membership: Some(membership),
+        auth_context: Some(batch_follow_reader_scope("not-migration")),
+        ..Default::default()
+    })
+    .await;
+    let http = reqwest::Client::new();
+    if local_capture {
+        let run = http
+            .post(format!("{}/v1/batch/run", reader.base_url))
+            .bearer_auth(TEST_SERVICE_TOKEN)
+            .json(&serde_json::json!({
+                "batch_id": 1,
+                "jobs": [{"name": execution, "namespace": "team", "spec": local_spec}],
+                "execution_labels": {(execution): {"name": "migration", "namespace": "team"}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = run.status();
+        let error = run.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{error}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let logs = http
+                    .get(format!("{}/v1/logs/{execution}/team", reader.base_url))
+                    .query(&[("instance", selected.as_str())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                if logs.contains("worker-local-capture-sentinel") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("local batch capture did not become ready");
+    }
+    if websocket {
+        let denied_url = format!(
+            "{}/v1/ws/logs/{execution}/team?instance={selected}&local={local}&tail=10",
+            denied.base_url.replace("http://", "ws://"),
+        );
+        match tokio_tungstenite::connect_async(denied_url).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 403);
+            }
+            other => panic!("an unrelated logical scope acquired a batch follow: {other:?}"),
+        }
+        let url = format!(
+            "{}/v1/ws/logs/{execution}/team?instance={selected}&local={local}&tail=10",
+            reader.base_url.replace("http://", "ws://"),
+        );
+        if unavailable.is_some() && !local {
+            match tokio_tungstenite::connect_async(url).await {
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                    assert_eq!(response.status().as_u16(), 503)
+                }
+                other => panic!("unavailable batch allocation acquired a WebSocket: {other:?}"),
+            }
+            assert_eq!(batch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(ordinary_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            drop(denied);
+            drop(reader);
+            council.shutdown().await.unwrap();
+            return;
+        }
+        let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("selected worker never supplied or closed its WebSocket");
+        if unavailable == Some("local-empty") {
+            assert!(
+                !matches!(next, Some(Ok(WsMessage::Text(_)))),
+                "local-only follow acquired a remote line: {next:?}"
+            );
+            assert_eq!(batch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(ordinary_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            drop(denied);
+            drop(reader);
+            council.shutdown().await.unwrap();
+            return;
+        }
+        let frame = next.unwrap().unwrap();
+        let WsMessage::Text(text) = frame else {
+            panic!("expected a batch-owner text frame");
+        };
+        assert_eq!(
+            serde_json::from_str::<reliaburger::ketchup::follow::LogFrame>(&text).unwrap(),
+            reliaburger::ketchup::follow::LogFrame::Line(
+                if local_capture {
+                    "worker-local-capture-sentinel"
+                } else {
+                    "committed-batch-owner-sentinel"
+                }
+                .into()
+            ),
+            "a same-label app placement was treated as a batch execution owner",
+        );
+        socket.close(None).await.unwrap();
+    } else {
+        let denied_response = http
+            .get(format!("{}/v1/logs/{execution}/team", denied.base_url))
+            .query(&[
+                ("follow", "true"),
+                ("instance", selected.as_str()),
+                ("local", if local { "true" } else { "false" }),
+                ("tail", "10"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied_response.status(), reqwest::StatusCode::FORBIDDEN);
+        let response = http
+            .get(format!("{}/v1/logs/{execution}/team", reader.base_url))
+            .query(&[
+                ("follow", "true"),
+                ("instance", selected.as_str()),
+                ("local", if local { "true" } else { "false" }),
+                ("tail", "10"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        if unavailable.is_some() && !local {
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(batch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(ordinary_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            drop(denied);
+            drop(reader);
+            council.shutdown().await.unwrap();
+            return;
+        }
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let mut body = response.bytes_stream();
+        let next = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("selected worker never supplied or closed its SSE stream");
+        if unavailable == Some("local-empty") {
+            assert!(
+                next.is_none(),
+                "local-only follow acquired remote SSE data: {next:?}"
+            );
+            assert_eq!(batch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(ordinary_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            drop(denied);
+            drop(reader);
+            council.shutdown().await.unwrap();
+            return;
+        }
+        let chunk = next.unwrap().unwrap();
+        let text = std::str::from_utf8(&chunk).unwrap();
+        assert!(
+            text.contains(if local_capture {
+                "worker-local-capture-sentinel"
+            } else {
+                "committed-batch-owner-sentinel"
+            }),
+            "{text}"
+        );
+        assert!(!text.contains("unrelated-app-placement-sentinel"), "{text}");
+    }
+    assert_eq!(
+        batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+        if local { 0 } else { 1 }
+    );
+    assert_eq!(
+        ordinary_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "unrelated same-label app placement was contacted for the batch selector",
+    );
+    drop(denied);
+    drop(reader);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sse_follow_uses_committed_remote_owner_without_app_placement() {
+    assert_batch_follow_selects_committed_owner(false, false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sse_follow_does_not_substitute_same_label_app_placement() {
+    assert_batch_follow_selects_committed_owner(false, true, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_websocket_follow_uses_committed_remote_owner_without_app_placement() {
+    assert_batch_follow_selects_committed_owner(true, false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_websocket_follow_does_not_substitute_same_label_app_placement() {
+    assert_batch_follow_selects_committed_owner(true, true, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sse_follow_refuses_missing_allocation() {
+    assert_batch_follow_selects_committed_owner(false, true, Some("missing")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sse_follow_refuses_unadvertised_allocation() {
+    assert_batch_follow_selects_committed_owner(false, true, Some("unadvertised")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sse_follow_refuses_pruned_allocation() {
+    assert_batch_follow_selects_committed_owner(false, true, Some("pruned")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_websocket_follow_refuses_missing_allocation() {
+    assert_batch_follow_selects_committed_owner(true, true, Some("missing")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_websocket_follow_refuses_unadvertised_allocation() {
+    assert_batch_follow_selects_committed_owner(true, true, Some("unadvertised")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_websocket_follow_refuses_pruned_allocation() {
+    assert_batch_follow_selects_committed_owner(true, true, Some("pruned")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sse_follow_local_empty_never_uses_app_placements() {
+    assert_batch_follow_selects_committed_owner(false, true, Some("local-empty")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sse_follow_local_capture_never_uses_app_placements() {
+    assert_batch_follow_selects_committed_owner(false, true, Some("local-capture")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_websocket_follow_local_empty_never_uses_app_placements() {
+    assert_batch_follow_selects_committed_owner(true, true, Some("local-empty")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_websocket_follow_local_capture_never_uses_app_placements() {
+    assert_batch_follow_selects_committed_owner(true, true, Some("local-capture")).await;
 }

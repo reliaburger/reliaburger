@@ -107,6 +107,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(ids)
     }
 
+    pub(super) fn spawn_selected_logs_read(
+        &self,
+        instances: Vec<InstanceId>,
+        tail: Option<usize>,
+        response: oneshot::Sender<Result<String, BunError>>,
+    ) {
+        let grill = self.supervisor.grill().clone();
+        tokio::spawn(async move {
+            let logs = read_captures(&grill, &instances).await;
+            let logs = match tail {
+                Some(n) => tail_lines(&logs, n),
+                None => logs,
+            };
+            let _ = response.send(Ok(logs));
+        });
+    }
+
     /// Answer a `Logs` command from a task: every instance's capture, cut to
     /// the last `tail` lines when asked.
     pub(super) fn spawn_logs_read(
@@ -146,12 +163,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         label: Option<String>,
         lines: mpsc::Sender<String>,
     ) {
-        let Ok(mut instance_ids) = self.app_instance_ids(app_name, namespace) else {
+        let Ok(selection) = self.resolve_execution_logs(app_name, namespace, instance.as_deref())
+        else {
             return;
         };
-        if let Some(instance) = &instance {
-            instance_ids.retain(|id| &id.0 == instance);
-        }
+        let instance_ids = selection.instances.into_iter().map(InstanceId).collect();
         tokio::spawn(send_tail_then_follow(
             self.supervisor.grill().clone(),
             instance_ids,

@@ -2408,6 +2408,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rerun_unknown_jobs: bool,
     ) {
         let worker = DeployWorker {
+            prepared_batch_jobs: None,
             rerun_unknown_jobs,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
@@ -12713,4 +12714,109 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
     );
     shutdown.cancel();
     task.await.unwrap();
+}
+
+async fn recovered_owned_exit_preserves_retirement_provenance(
+    runtime: crate::grill::records::RuntimeKind,
+) {
+    use crate::bun::jobs::{BatchExecutionOwnership, JobInventory, JobPhase, RecordedJob};
+    let records = tempfile::tempdir().unwrap();
+    let volumes = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(runtime);
+    let id = InstanceId("default__batch-retained-object-0".into());
+    let name = "batch-retained-object";
+    let spec = Config::parse(&format!("[job.{name}]\nimage='myapp:v1'\n"))
+        .unwrap()
+        .job
+        .remove(name)
+        .unwrap();
+    let job = RecordedJob {
+        name: name.into(),
+        namespace: "default".into(),
+        batch_execution: Some(BatchExecutionOwnership {
+            batch_id: 42,
+            logical_name: "migration".into(),
+            spec_digest: crate::meat::batch_execution::spec_digest("default", "migration", &spec)
+                .unwrap(),
+            observed_exit_code: Some(0),
+            observed_restart_count: Some(0),
+        }),
+        spec,
+        runtime,
+        generation: 1,
+        restart_count: 0,
+        phase: JobPhase::Exited { code: 0 },
+        runtime_absent: false,
+    };
+    crate::bun::jobs::persist_inventory(
+        records.path(),
+        JobInventory {
+            jobs: BTreeMap::from([(id.0.clone(), job)]),
+            retired: BTreeMap::new(),
+        },
+    )
+    .unwrap();
+    let mut record = adoption_record(&id.0, name, false);
+    record.is_job = true;
+    record.app_spec = None;
+    record.runtime = runtime;
+    record.runc_container_id =
+        (runtime == crate::grill::records::RuntimeKind::Runc).then(|| id.0.clone());
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_adopt_result(&id, false);
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+    assert_eq!(agent.recorded_jobs[&id.0].batch_terminal_exit(), Some(0));
+    // A confirmed process stop must retain the same object-absence distinction.
+    agent
+        .finish_app_stop(
+            name,
+            "default",
+            app_stop::AppStop {
+                instances: vec![id.clone()],
+                owns_job: true,
+                taken_restarts: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let compact = agent.release_retired_workload(name, "default").await;
+    if runtime == crate::grill::records::RuntimeKind::Process {
+        compact.unwrap();
+        assert_eq!(
+            agent.retired_batch_executions[&id.0].terminal_exit(),
+            Some(0)
+        );
+    } else {
+        assert!(
+            compact.is_err(),
+            "a retained stopped OCI object was compacted as absent"
+        );
+        assert!(
+            !agent.recorded_jobs[&id.0].runtime_absent,
+            "process exit became object-absence provenance"
+        );
+        assert!(agent.retired_batch_executions.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recovered_owned_process_exit_allows_positive_compact_retirement() {
+    recovered_owned_exit_preserves_retirement_provenance(
+        crate::grill::records::RuntimeKind::Process,
+    )
+    .await;
+}
+#[tokio::test]
+async fn recovered_owned_apple_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Apple)
+        .await;
+}
+#[tokio::test]
+async fn recovered_owned_runc_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Runc)
+        .await;
 }

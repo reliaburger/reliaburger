@@ -53,7 +53,26 @@ fn router_for_council(
     membership: Option<Arc<tokio::sync::RwLock<Vec<reliaburger::bun::api::NodeMembershipInfo>>>>,
     service_token: Option<String>,
 ) -> Router {
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            match command {
+                reliaburger::bun::agent::AgentCommand::RunJobsWithLabels {
+                    config,
+                    execution_labels,
+                    response,
+                    ..
+                } => {
+                    assert_eq!(config.job.len(), execution_labels.len());
+                    let _ = response.send(Ok(BTreeMap::new()));
+                }
+                reliaburger::bun::agent::AgentCommand::Status { response } => {
+                    let _ = response.send(Vec::new());
+                }
+                _ => {}
+            }
+        }
+    });
     reliaburger::bun::api::router_with_upgrade(
         tx,
         None,

@@ -10,6 +10,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         config
             .validate_workload_names()
             .map_err(|error| error.to_string())?;
+        for (name, namespace) in config
+            .app
+            .iter()
+            .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default")))
+            .chain(
+                config
+                    .job
+                    .iter()
+                    .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default"))),
+            )
+        {
+            let id = crate::grill::InstanceIdentity::new(namespace, name, 0).instance_id();
+            if self
+                .recorded_jobs
+                .get(&id.0)
+                .is_some_and(|job| job.batch_execution.is_some())
+                || self.retired_batch_executions.contains_key(&id.0)
+            {
+                return Err(format!(
+                    "workload {namespace}/{name} belongs to a batch execution"
+                ));
+            }
+        }
         for (name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
             if self
@@ -163,6 +186,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let observed_operation = operation.clone();
         let worker = DeployWorker {
             rerun_unknown_jobs,
+            prepared_batch_jobs: None,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
                 tx: self.deploy_ops_tx.clone(),

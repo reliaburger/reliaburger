@@ -302,6 +302,16 @@ impl StateMachineInner {
                 }
             }
             RaftRequest::AppSpec { app_id, spec } => {
+                if self
+                    .state
+                    .batch_state
+                    .execution_owner(&app_id.namespace, &app_id.name)
+                    .is_some()
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "identity belongs to a batch execution".into(),
+                    });
+                }
                 if crate::testkit::lease::valid_test_namespace(&app_id.namespace) {
                     return Some(CouncilResponse::Refused {
                         reason: "test lease namespace requires a leased app write".to_string(),
@@ -917,24 +927,39 @@ impl StateMachineInner {
                 }
             }
             RaftRequest::BatchRegister { batch } => {
-                // The durable counter is the id authority (JOB4): a
-                // restarted leader continues from the replicated value
-                // instead of reusing ids from 1. Registration also prunes
-                // stale terminal batches, keyed on the *request's* clock
-                // so every replica prunes identically.
-                let batch_id = self.state.batch_state.register(batch.clone());
-                return Some(CouncilResponse::BatchRegistered { batch_id });
+                if batch.jobs.iter().any(|job| {
+                    self.state
+                        .apps
+                        .contains_key(&crate::meat::types::AppId::new(
+                            &job.execution_name,
+                            &job.namespace,
+                        ))
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "execution identity already belongs to an app".into(),
+                    });
+                }
+                return Some(match self.state.batch_state.register(batch.clone()) {
+                    Ok(batch_id) => CouncilResponse::BatchRegistered { batch_id },
+                    Err(reason) => CouncilResponse::Refused { reason },
+                });
             }
             RaftRequest::BatchJobUpdate {
                 batch_id,
                 job_name,
+                namespace,
                 status,
+                exit_code,
             } => {
                 // Transition validation lives here, at the single point
                 // every replica passes through: forged states, unknown
                 // jobs and conflicting terminal reports are refused;
                 // duplicate terminal reports apply as no-ops (JOB3).
-                if let Err(e) = self.state.batch_state.report(*batch_id, job_name, *status) {
+                if let Err(e) = self
+                    .state
+                    .batch_state
+                    .report(*batch_id, job_name, namespace, *status, *exit_code)
+                {
                     return Some(CouncilResponse::Refused {
                         reason: e.to_string(),
                     });
@@ -1289,6 +1314,16 @@ impl StateMachineInner {
                 app_id,
                 spec,
             } => {
+                if self
+                    .state
+                    .batch_state
+                    .execution_owner(&app_id.namespace, &app_id.name)
+                    .is_some()
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "identity belongs to a batch execution".into(),
+                    });
+                }
                 let Some(lease) = self.state.test_leases.get(lease_id) else {
                     return Some(CouncilResponse::Refused {
                         reason: "lease not found".to_string(),
@@ -5823,6 +5858,8 @@ mod tests {
         crate::meat::batch_tracker::BatchRecord {
             jobs: vec![crate::meat::batch_tracker::BatchJobRecord {
                 name: job.to_string(),
+                execution_name: job.to_string(),
+                spec_digest: "a".repeat(64),
                 namespace: "default".to_string(),
                 node: Some(crate::meat::types::NodeId::new(node)),
                 status: crate::meat::batch_tracker::JobStatus::Pending,
@@ -6000,6 +6037,8 @@ mod tests {
                 .apply_request(&RaftRequest::BatchJobUpdate {
                     batch_id: 1,
                     job_name: "execution-00000000".into(),
+                    namespace: "default".into(),
+                    exit_code: Some(0),
                     status: crate::meat::batch_tracker::JobStatus::Completed,
                 })
                 .is_none()
@@ -6162,6 +6201,8 @@ mod tests {
                 RaftRequest::BatchJobUpdate {
                     batch_id: 1,
                     job_name: "j1".to_string(),
+                    namespace: "default".into(),
+                    exit_code: Some(0),
                     status: crate::meat::batch_tracker::JobStatus::Completed,
                 },
             )])
@@ -6177,6 +6218,8 @@ mod tests {
                 RaftRequest::BatchJobUpdate {
                     batch_id: 1,
                     job_name: "j1".to_string(),
+                    namespace: "default".into(),
+                    exit_code: Some(1),
                     status: crate::meat::batch_tracker::JobStatus::Failed,
                 },
             )])
@@ -6192,6 +6235,8 @@ mod tests {
                 RaftRequest::BatchJobUpdate {
                     batch_id: 99,
                     job_name: "j1".to_string(),
+                    namespace: "default".into(),
+                    exit_code: Some(0),
                     status: crate::meat::batch_tracker::JobStatus::Completed,
                 },
             )])

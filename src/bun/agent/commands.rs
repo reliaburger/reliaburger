@@ -37,8 +37,40 @@ pub struct FaultClearance {
     pub reservation: Option<u64>,
 }
 
+/// Trusted local resolution used before public status/log authorisation.
+#[derive(Debug)]
+pub struct LogExecutionSelection {
+    pub logical_name: String,
+    pub instances: Vec<String>,
+    pub selected_instance: Option<String>,
+}
+
 /// Commands sent to the agent over the command channel.
 pub enum AgentCommand {
+    ResolveExecutionLogs {
+        app_name: String,
+        namespace: String,
+        instance: Option<String>,
+        response: oneshot::Sender<Result<LogExecutionSelection, BunError>>,
+    },
+    LogCaptures {
+        instances: Vec<String>,
+        tail: Option<usize>,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Internal authenticated dispatch; admission must be durable before acknowledgement.
+    RunJobsWithLabels {
+        batch_id: u64,
+        config: Config,
+        execution_labels: BTreeMap<String, crate::bun::batch::BatchExecutionLabel>,
+        events: mpsc::Sender<ApplyEvent>,
+        response: oneshot::Sender<Result<BTreeMap<String, i32>, BunError>>,
+    },
+    /// Query explicit local ownership before enforcing first-launch allocation.
+    BatchOwnedExecutions {
+        identities: Vec<(String, String)>,
+        response: oneshot::Sender<std::collections::BTreeSet<String>>,
+    },
     /// Deploy workloads from a parsed Config.
     ///
     /// Progress events are streamed over the `events` channel so the
@@ -344,6 +376,10 @@ impl AgentCommand {
     /// The variant's name, for the loop meter's slow-turn log.
     pub(super) fn name(&self) -> &'static str {
         match self {
+            AgentCommand::RunJobsWithLabels { .. } => "run_jobs_with_labels",
+            AgentCommand::BatchOwnedExecutions { .. } => "batch_owned_executions",
+            AgentCommand::ResolveExecutionLogs { .. } => "resolve_execution_logs",
+            AgentCommand::LogCaptures { .. } => "log_captures",
             AgentCommand::Deploy { .. } => "deploy",
             AgentCommand::RerunJobs { .. } => "rerun_jobs",
             AgentCommand::Stop { .. } => "stop",
@@ -419,6 +455,47 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Handle a single command.
     pub(super) async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
+            AgentCommand::ResolveExecutionLogs {
+                app_name,
+                namespace,
+                instance,
+                response,
+            } => {
+                let _ = response.send(self.resolve_execution_logs(
+                    &app_name,
+                    &namespace,
+                    instance.as_deref(),
+                ));
+            }
+            AgentCommand::LogCaptures {
+                instances,
+                tail,
+                response,
+            } => {
+                self.spawn_selected_logs_read(
+                    instances.into_iter().map(InstanceId).collect(),
+                    tail,
+                    response,
+                );
+            }
+            AgentCommand::RunJobsWithLabels {
+                batch_id,
+                config,
+                execution_labels,
+                events,
+                response,
+            } => {
+                let result = self
+                    .begin_owned_batch(batch_id, config, execution_labels, events)
+                    .await;
+                let _ = response.send(result);
+            }
+            AgentCommand::BatchOwnedExecutions {
+                identities,
+                response,
+            } => {
+                let _ = response.send(self.batch_owned_identities(&identities));
+            }
             AgentCommand::Deploy { config, events } => {
                 self.begin_deploy(config, events, true, false).await;
             }

@@ -476,8 +476,23 @@ fn spawn_status_agent(mut commands: mpsc::Receiver<AgentCommand>, stop: Cancella
                     None => return,
                 },
             };
-            if let AgentCommand::Status { response } = command {
-                let _ = response.send(vec![instance(TARGET_APP), instance(OTHER_APP)]);
+            match command {
+                AgentCommand::Status { response } => {
+                    let _ = response.send(vec![instance(TARGET_APP), instance(OTHER_APP)]);
+                }
+                AgentCommand::ResolveExecutionLogs {
+                    app_name,
+                    instance,
+                    response,
+                    ..
+                } => {
+                    let _ = response.send(Ok(crate::bun::agent::LogExecutionSelection {
+                        logical_name: app_name,
+                        instances: Vec::new(),
+                        selected_instance: instance,
+                    }));
+                }
+                _ => {}
             }
         }
     });
