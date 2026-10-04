@@ -3923,6 +3923,53 @@ mod tests {
             .map(|value| value.to_str().unwrap().to_string())
     }
 
+    #[tokio::test]
+    async fn registry_reads_and_writes_share_the_api_verification_admission() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        for authorization in [format!("Bearer {deployer}"), basic("ci", &deployer)] {
+            for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
+                let permits = crate::sesame::auth::hold_all_verify_permits().await;
+                let request =
+                    app.clone()
+                        .oneshot(client_request(method, uri, Some(&authorization), true));
+                tokio::pin!(request);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(20), &mut request)
+                        .await
+                        .is_err(),
+                    "{method} registry verification bypassed the shared admission"
+                );
+                drop(permits);
+                let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                    .await
+                    .expect("registry verification should resume after admission opens")
+                    .unwrap();
+                assert!(response.status().is_success());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_registry_credentials_do_not_wait_for_verification_admission() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let _permits = crate::sesame::auth::hold_all_verify_permits().await;
+        for authorization in ["Bearer invalid".to_string(), basic("ci", "invalid")] {
+            for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    app.clone()
+                        .oneshot(client_request(method, uri, Some(&authorization), true)),
+                )
+                .await
+                .expect("malformed credentials should be refused before hashing")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+
     /// `docker login` probes `GET /v2/` with the stored credential; a
     /// Deployer token as the Basic password must answer 200.
     #[tokio::test]
