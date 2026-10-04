@@ -7516,7 +7516,10 @@ mod tests {
                     1,
                     2,
                     RaftRequest::TaskArray(Box::new(
-                        crate::meat::task_array_store::TaskArrayWrite::Cancel { batch_id: 9 },
+                        crate::meat::task_array_store::TaskArrayWrite::Cancel {
+                            now_epoch_secs: 0,
+                            batch_id: 9,
+                        },
                     )),
                 ),
             ])
@@ -7540,6 +7543,7 @@ mod tests {
                 1,
                 2,
                 RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+                    now_epoch_secs: 0,
                     batch_id: 1,
                     results: Vec::new(),
                     grants: vec![(

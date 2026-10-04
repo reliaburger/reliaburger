@@ -153,6 +153,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/node/{name}", AnyToken),
     route(Get, "/ui/gitops", AnyToken),
     route(Get, "/ui/fragment/apps", AnyToken),
+    route(Get, "/ui/fragment/batches", AnyToken),
     route(Get, "/ui/fragment/nodes", AnyToken),
     gated(Get, "/ui/fragment/alerts", AnyToken, Cluster(METRICS)),
     route(
@@ -287,6 +288,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Task arrays. `sync` and the `local` reads are the leader's calls to
     // nodes; results and logs are also held to the array's scope.
     route(Post, "/v1/batch/array", Deployer),
+    route(Post, "/v1/batch/manifest", Deployer),
+    route(Get, "/v1/batch/summaries", AnyToken),
     route(Post, "/v1/batch/array/sync", System),
     route(Get, "/v1/batch/array/{id}/local/results", System),
     route(Get, "/v1/batch/array/{id}/local/tasks/{index}/logs", System),

@@ -645,7 +645,7 @@ Everything in the batch path so far treats a job as a *thing*: a spec in the req
 
 Kubernetes has the same problem in a different shape. An Indexed Job creates one Pod per index, and each Pod is several etcd writes over its life (create, bind, status updates, finalizer removal, deletion). The upstream scalability envelope stops at 150,000 Pods per cluster, so a million tasks run in waves. The usual escape hatch is a work queue: a few long-lived workers draining Redis. That scales beautifully, and the orchestrator no longer knows your tasks exist. Retries, logs and results become your code.
 
-We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost that doesn't grow with the task count. This section first builds the pieces as libraries, tested hard and measured in one process, and then wires them into Raft, the API and `relish`. Wiring changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 needs a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/2026-09-28-plan-million-jobs.md` has the details).
+We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost proportional to chunks rather than individual tasks. This section first builds the pieces as libraries, tested hard and measured in one process, and then wires them into Raft, the API and `relish`. Wiring changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 needs a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/2026-09-28-plan-million-jobs.md` has the details).
 
 ### Template plus count, ranges instead of records
 
@@ -679,13 +679,13 @@ The interesting rule is who's allowed to retire a chunk. Suppose node n3 goes qu
 
 Granting is a separate pure function, `plan_grants`, which tops each node up to about two rounds of its slots, emptiest node first, lowest chunk ids first. Fast nodes drain their chunks sooner and get more, so there's no up-front split to get wrong. The design doc's original sketch partitioned the count across nodes by capacity once, up front, which guarantees a straggler tail whenever one node turns out slower than predicted.
 
-The test that matters most here is another property test: a random mix of plans, completions, node losses and cancels, after each of which every chunk must be in exactly one of queued, held or done, and every task counted exactly once. Then there's a plain unit test that runs a whole million-task array with 1% of indices failing for good on three nodes. The leader's state at the end is well under the 256 KiB budget, and the number of rounds depends on the number of chunks, not tasks.
+The test that matters most here is another property test: a random mix of plans, completions, node losses and cancels, after each of which every chunk must be in exactly one of queued, held or done, and every task counted exactly once. Then there's a plain unit test that runs a whole million-task array with 1% of indices failing for good on three nodes. The leader's state at the end is well under the 256 KiB budget, and the number of rounds depends on the number of chunks. At a fixed chunk size this still grows with task count; the gain is amortisation, not constant cost.
 
 ### The node: slots, not chunks
 
 On the node, a `TaskPool` runs tasks through a `tokio::sync::Semaphore` whose permits are the node's slots. Every chunk the node holds draws from the same permits, so the tail of one chunk overlaps the head of the next instead of leaving slots idle. Each task is a tokio task in a `JoinSet` holding an *owned* permit, the same RAII trick Chapter 4 used for connections: dropping the permit frees the slot, so there's no release call to forget on an error path.
 
-Running an attempt is behind a trait with two real implementations, which is our rule for when a trait is allowed to exist. `ProcessRunner` spawns the binary directly (no shell, no owner helper, stdin closed) and keeps a bounded head and tail of its output. `FakeRunner` computes the outcome from the invocation, and it's what makes a million-task test run in half a minute. It takes the outcome as a closure:
+Running an attempt is behind a trait with two real implementations, which is our rule for when a trait is allowed to exist. Production `OwnedRunner` uses the node's durable runtime ownership and cached images. It holds the resource reservation through cancellation and uncertain retirement; a kill acknowledgement is not proof of exit. `ProcessRunner` remains a direct-process test and benchmark backend with bounded capture. `FakeRunner` computes the outcome from the invocation, and it's what makes a million-task test run in half a minute. It takes the outcome as a closure:
 
 ```rust
 pub fn new(
@@ -700,7 +700,7 @@ Waiting for a permit races against cancellation with `tokio::select!`, and here 
 
 ### Durable enough, cheaply
 
-A node running thousands of tasks a second can't fsync thousands of times a second. The ledger writes each finished task as a 14-byte record (index, attempts, outcome, exit code, run time) into an append-only file, in blocks with a CRC32 each, and a background writer *group-commits*: it fsyncs once per 100 ms or 4,096 records, whichever comes first, and only then tells each waiting chunk its records are durable. Only then does the chunk get reported to the leader.
+A node running thousands of tasks a second can't fsync thousands of times a second. The ledger writes each finished task as a 22-byte record (index, attempts, outcome, exit code, run time and 64-bit grant generation) into an append-only file, in blocks with a CRC32 each, and a background writer *group-commits*: it fsyncs once per 100 ms or 4,096 records, whichever comes first, and only then tells each waiting chunk its records are durable. Only then does the chunk get reported to the leader.
 
 On restart, `replay` reads the file back. Decoding uses `as_chunks`:
 
@@ -708,9 +708,9 @@ On restart, `replay` reads the file back. Decoding uses `as_chunks`:
 let (raw_records, _) = body.as_chunks::<RECORD_BYTES>();
 ```
 
-The `::<RECORD_BYTES>` is a *turbofish*, the syntax for passing a generic parameter explicitly. Here the parameter is a number, not a type (a *const generic*), and the result is a slice of fixed-size arrays, `&[[u8; 14]]`, plus whatever bytes were left over. The decoder then takes `&[u8; RECORD_BYTES]`, so indexing into a record can never go out of bounds, and the compiler knows it.
+The `::<RECORD_BYTES>` is a *turbofish*, the syntax for passing a generic parameter explicitly. Here the parameter is a number, not a type (a *const generic*), and the result is a slice of fixed-size arrays, `&[[u8; 22]]`, plus whatever bytes were left over. The decoder then takes `&[u8; RECORD_BYTES]`, so indexing into a record can never go out of bounds, and the compiler knows it.
 
-A block cut short by a crash at the very end of the file is ignored: nobody was told those records were durable. Damage anywhere earlier is an error, not a skip, because skipping would silently re-run or lose finished tasks. Anything in a held chunk without a terminal record runs again. That's at-least-once execution, and it's a deliberate trade for tasks this short.
+A block cut short by a crash at the very end is truncated before new records are appended: nobody was told those records were durable. Damage anywhere earlier is an error, not a skip, because skipping would silently re-run or lose finished tasks. Anything in a held chunk without a terminal record runs again. That's at-least-once execution, and it's a deliberate trade for tasks this short.
 
 ### Putting it together, in one process
 
@@ -725,7 +725,7 @@ Those 422 ticks become Raft entries once the pieces are wired, so the shape of t
 TaskArray(Box<crate::meat::task_array_store::TaskArrayWrite>),
 ```
 
-`TaskArrayWrite` is its own enum with four variants (`Register`, `Sync`, `Cancel`, `Requeue`), and the rules for applying each one live beside the data in `meat::task_array_store`, where they're plain functions with plain unit tests. The state machine's part is six lines. Why the `Box`? A Rust enum is as large as its largest variant, because every value has to fit in the same slot. A `Sync` carries two vectors and a `Register` carries a whole `JobSpec`, and without the box every `RaftRequest` in the log (including the humble `Noop`) would pay for that space. `Box<T>` puts the payload on the heap and leaves a pointer behind. It's the same reason the other big variants in that enum are boxed.
+`TaskArrayWrite` is its own enum with registration, sync, cancellation and requeue variants, plus atomic mixed-manifest registration and cancellation, and the rules for applying each one live beside the data in `meat::task_array_store`, where they're plain functions with plain unit tests. The state machine's part is six lines. Why the `Box`? A Rust enum is as large as its largest variant, because every value has to fit in the same slot. A `Sync` carries two vectors and a `Register` carries a whole `JobSpec`, and without the box every `RaftRequest` in the log (including the humble `Noop`) would pay for that space. `Box<T>` puts the payload on the heap and leaves a pointer behind. It's the same reason the other big variants in that enum are boxed.
 
 Arrays take their ids from the same counter as ordinary batches, so `relish batch-status 12` names one thing. The apply function borrows the counter as a closure:
 
@@ -733,17 +733,17 @@ Arrays take their ids from the same counter as ordinary batches, so `relish batc
 pub fn apply(
     &mut self,
     write: &TaskArrayWrite,
-    allocate_id: impl FnOnce() -> u64,
+    allocate_id: impl FnMut() -> u64,
 ) -> Result<TaskArrayApplied, TaskArrayStoreError>
 ```
 
-`FnOnce` is the loosest of Rust's three closure traits: the closure may be called at most once, and it's allowed to consume what it captured. That's exactly the promise we want to make. The id is taken only after every check has passed, so a refused registration never burns an id, and the call site says `|| batch_state.allocate_id()` without `TaskArrays` knowing anything about batches. In Go you'd pass a `func() uint64` and hope nobody calls it twice; here the type says so.
+`FnMut` permits several calls: a mixed manifest takes one parent ID and one ID per resource profile. Validation happens before any allocation, so an invalid profile rejects the whole submission without consuming IDs. The call site still says `|| batch_state.allocate_id()` without `TaskArrays` knowing about the counter.
 
 The leader runs one loop, on every node, which does nothing unless the node leads. Once a second it reads the replicated arrays and sends each node its share: the chunks it holds, each with its grant attempt. The node's answer is its free slots and the chunks it has finished. For each running array the leader then writes a single `Sync` entry holding both the finished chunks and the next grants. To plan grants that account for the chunks being retired in the same entry, the leader clones the state, applies the results to the clone and plans against that. A node that finished a chunk gets its replacement in the same entry, and `apply` re-checks everything anyway. A holder that hasn't answered for 30 seconds gets a `Requeue`, and the fence from earlier makes its late reports harmless.
 
-The node is deliberately forgetful. It doesn't store its grants: every sync tells it what it holds, and it starts what it isn't running, cancels what it no longer holds, and keeps reporting a finished chunk until the leader stops listing it. That makes a restarted leader and a restarted node the same case as a normal tick. There was one trap. Finished results sat in a map keyed by chunk id, with the attempt stored beside the result. If the leader takes a chunk back and later re-grants it to the same node at the next attempt, the old run (cancelled, but still finishing) could land after the new one and overwrite it, and the chunk would never be reported again. Keying the map by `(chunk, attempt)` makes that impossible, rather than unlikely.
+The node persists the highest recovery/term/index control version and the highest grant generation per chunk. It reconstructs work from the next valid snapshot: every sync tells it what it holds, and it starts what it isn't running, cancels what it no longer holds, and keeps reporting a finished chunk until the leader stops listing it. That makes a restarted leader and a restarted node the same case as a normal tick. There was one trap. Finished results sat in a map keyed by chunk id, with the attempt stored beside the result. If the leader takes a chunk back and later re-grants it to the same node at the next attempt, the old run (cancelled, but still finishing) could land after the new one and overwrite it, and the chunk would never be reported again. Keying the map by `(chunk, attempt)` makes that impossible, rather than unlikely.
 
-Two smaller Rust points came out of the node. The first is that `TaskRunner` can't be used as a trait object. Its method returns `impl Future`, a type each implementation picks for itself, and `dyn TaskRunner` would need one type known up front. So the node holds an enum, `NodeRunner::Process` or `NodeRunner::Fake`, whose own `run` matches and forwards. With two implementations that's three lines, and the API state can hold one concrete node type. The second is that Clippy rejected our first version of "open the array if we haven't yet", a `contains_key` followed by `insert`, because it looks the key up twice. The `Entry` API does it once:
+Two smaller Rust points came out of the node. The first is that `TaskRunner` can't be used as a trait object. Its method returns `impl Future`, a type each implementation picks for itself, and `dyn TaskRunner` would need one type known up front. So the node holds an enum, `NodeRunner::Owned`, `NodeRunner::Process` or `NodeRunner::Fake`, whose own `run` matches and forwards. With two implementations that's three lines, and the API state can hold one concrete node type. The second is that Clippy rejected our first version of "open the array if we haven't yet", a `contains_key` followed by `insert`, because it looks the key up twice. The `Entry` API does it once:
 
 ```rust
 let run = match arrays.entry(assignment.batch_id) {
@@ -759,7 +759,49 @@ let run = match arrays.entry(assignment.batch_id) {
 
 On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 100,000 fake tasks through a real single-node council: the whole array cost 51 Raft entries.
 
-What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. No mount isolation for tasks yet, so nodes with it on sit arrays out rather than quietly running them unisolated. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
+What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
+
+### Packing profiles and querying outcomes
+
+A shared `ExecutionBudget` accounts for app commitments and actual running attempts in CPU and memory. App creation, rolling replacements and adoption use the same ledger as batch work. Recovery restores ownership even if the node's capacity has shrunk; it stops new admission rather than erasing a surviving app. Waiting batch attempts enter a FIFO resource queue. This prevents continual overtaking by smaller requests, but can leave free capacity idle behind a large request. There is no tenant DRF or app pre-emption; new deployments still need rollout headroom.
+
+A manifest groups up to sixteen homogeneous resource profiles. Stable parent/profile/index identities avoid serialising a million specs. Workers reserve each attempt, not its queued chunk, release requests during retry backoff, and reuse a bounded pool of owned runtime identities per namespace. Each image attempt has a fresh runtime generation, a read-only root and temporary scratch space. Cached images reduce transfer and unpacking cost; runc still launches a container per attempt, so startup cost remains part of the throughput budget.
+
+Terminal outcomes stream into the ledger while a chunk runs. The acknowledgement waits for the checksummed block, fsync and derived redb index transaction. A failed write stops local work and reports a refusal. The leader's accepted owner/generation ranges select results, including failures beyond the capped summary list. The index keeps the newest grant for each task even when an older execution finishes later. Output is keyed by grant too. New worker and array directories are synced in
+their parent before a grant can execute, because syncing a file alone does not
+make its directory entry durable. Streaming recovery retains one checksummed
+block and only records from held chunks; it does not build a sparse set of every
+historical index. The explicit `replay` API still collects records for tests and
+small callers.
+
+A disaster-recovery epoch can rewind the council snapshot while worker grant fences remain newer. Comparing just term and index would either hang that work or mix histories. The node instead persists a recovery refusal before cancelling old attempts, preserves their directories and requires fresh worker data after re-enrolment. Ordinary leader elections keep the same epoch and still resume durable outcomes. An empty leader snapshot still syncs once with each worker; it cannot assume no work exists locally. The recovery test finishes generation five, rolls control back to generation one in a new epoch, restarts the worker and verifies that neither execution nor deletion can cross that refusal. External effects still need a business key that survives a cluster rebuild.
+
+The derived index uses a 1 MiB cache per profile, rather than redb's 1 GiB default. A node can retain many profiles, so leaving the database default would make job-history queries compete with application memory. The million-record ledger case also exercises index rebuild and lookup with that small cache.
+
+The default view is a summary, not a task list. Watch, JSON status and the dashboard show counts and rates. Histograms merge before p50/p95/p99 are read; those are bucket upper bounds for final attempts, not end-to-end latency. Detail pages inspect at most 4,096 indexes, return at most 1,000 rows and contact at most eight workers, with a cursor even for an empty failure page. Retention starts at terminal acceptance and groups a parent with its profiles. Worker loss can lose detail without changing replicated accepted counts.
+
+The manual's burger manifest runs 1,000 small and 64 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. This demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md) records that gate.
+
+
+Control reports carry exact failed counts and a capped preview of 256 index
+ranges per chunk. The full result index remains authoritative beyond that
+preview. Streaming capture moves to the writer when a task finishes, rather
+than keeping another copy until the chunk ends. Otherwise sparse failures in
+a large chunk would make the executor retain hundreds of megabytes of output
+that it had already persisted.
+
+Owned runtime reuse also has to preserve the source's namespace. A runtime
+process alone does not carry the agent's firewall binding. Delegated executors
+now live under `/reliaburger/<namespace>/<executor>/<slot>`. The node publishes
+the namespace ancestor before starting a descendant, and the eBPF connect hook
+uses it when there is no exact app binding. Exact app bindings keep precedence.
+The executor caches at most 256 ancestors and evicts only one with no surviving
+attempts. It journals cache ownership before publication, and startup retires
+old runtime owners before clearing those recorded, same-boot bindings. A live
+source check refuses start or stops the original owner when enforcement is lost.
+The real-runc namespace regression connects successfully inside its namespace,
+refuses a cross-namespace service, removes the live binding during execution,
+and checks that the process tree has retired before recovery clears the journal.
 
 ## Lessons from the phase
 

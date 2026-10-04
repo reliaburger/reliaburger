@@ -1039,11 +1039,57 @@ They would be, without constraints. The constraint that ships today is a policy 
 
 Durability is eventual, not guaranteed at push time. A push commits the image locally and returns immediately with an `oci-replication: pending` header, so the client never mistakes acceptance for full redundancy. A leader-only heal loop (running roughly every 60 seconds) then replicates layers towards a redundancy target of 2 total copies by default: the node that received the push plus one peer. There is no synchronous mode and no `push_sync` config key. This keeps push latency low and independent of cluster size, at the cost of a short window after a push where the image exists on only one node. In clusters too small to reach the target, the heal loop records that full redundancy can't be met rather than silently claiming success.
 
+### Resource-aware delegated execution
+
+A thousand queued jobs don't need a thousand simultaneous allocations. Suppose
+an otherwise available node has eight cores and 16 GiB of memory. It can run
+32 tasks requesting 250 millicores and 256 MiB each, four tasks requesting two
+cores and 4 GiB each, or a mixture. Existing applications and system reservations
+come out of that capacity first. A task count alone cannot describe this budget.
+
+The delegated pipeline separates resource allocation from task selection, an
+idea also used by Mesos's two-level scheduling. Meat selects eligible nodes and
+records bounded chunk grants in Raft. Bun accounts for application commitments,
+packs individual tasks within its shared node budget and reuses execution
+machinery and cached artifacts. A chunk is a queue of work;
+its size amortises dispatch and bookkeeping, not the resource footprint of
+concurrent execution. Arrays encode repeated templates compactly. Mixed-profile
+manifests preserve individual identities while grouping compatible work.
+
+Workers record terminal outcomes as tasks finish, using bounded group commit,
+and resend completion batches until the leader accepts them. Grant generations
+and reconciliation fence stale requests and resolve uncertain ownership after
+failover. Restoring older council state can rewind grant identities; workers
+with existing array data persist a refusal until re-enrolled with fresh data,
+preserving old results for investigation. At-least-once execution requires
+business idempotency keys that survive cluster recovery. Detailed outcome
+availability and retention are explicit; a missing worker isn't a zero count.
+
+At this volume, the default operator view is a workload summary: unique success
+and terminal-failure rates, retries, backlog and submission age, final-attempt
+duration distributions, resource requests and refusal reasons.
+Individual tasks remain addressable for diagnosis, with bounded detail queries
+and exports. Histograms merge before percentiles are calculated, and metric
+labels never use individual task IDs. Local FIFO admission prevents small tasks
+continually overtaking a large waiting request, at the cost of idle capacity
+behind that request. Namespace app quotas currently govern ordinary placement,
+not delegated array resource usage. Tenant allocation, DRF and service pre-emption
+remain future work;
+new app deployments still require free capacity and rollout headroom.
+
+**Implementation status:** this is the architecture implemented in
+[#266](https://github.com/reliaburger/reliaburger/pull/266), following the
+[resource-aware jobs plan](plans/2026-10-04-plan-delegated-jobs.md). The daily
+throughput target remains unqualified until real workloads sustain at least
+1,158 unique successful completions per second with headroom, concurrent apps,
+failure recovery and bounded memory and storage. A short simulated burst doesn't
+establish that result.
+
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
-Not yet, and nobody has measured it. 100M jobs a day is a design target (§2). In 0.1.0 the batch allocator exists, but the delegated pipeline below isn't wired end to end, so on-demand and cron jobs go through the ordinary per-job path. Task arrays, which keep a large batch as compact state in Raft and expand it on each node, are the headline of 0.2.0 ([roadmap](roadmap.md#releases-after-010)). Here's the design they build on.
+100M jobs a day remains an unqualified design target (§2). The 0.2.0 development implementation keeps arrays compact in Raft and expands them on workers. On-demand and cron jobs still use the ordinary per-job path; high-volume callers use arrays or mixed-profile manifests.
 
-The leader doesn't schedule individual jobs. For batch workloads, Meat allocates job batches to nodes: "Node 7, here are your next 200 jobs." Nodes execute their assigned jobs and report completions asynchronously via the hierarchical reporting tree. The Raft log records only batch-level decisions, not individual job lifecycle events. The leader's hot path focuses on Apps (which change infrequently) and batch-level allocation decisions. The Meat scheduler runs on a dedicated async task with its own CPU budget, isolated from API serving, Brioche UI, and metrics queries.
+The leader grants chunks: "Node 7, here are your next 200 indexes." Workers execute within their shared CPU/memory budget. A leader-driven HTTP sync accepts durable aggregate completions and retransmits grants; per-task ledgers and indexes stay on workers. This removes global placement and Raft writes per task. Runtime startup, resource demand, storage, result retention and application service quality still determine whether a particular cluster can sustain the daily target. The [qualification report](qualification/2026-10-04-delegated-jobs/README.md) records the evidence and the remaining sustained gate.
 
 ### Q9: Local-only volumes with no distributed storage. How do teams not lose data?
 

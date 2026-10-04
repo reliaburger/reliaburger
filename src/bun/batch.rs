@@ -1387,6 +1387,7 @@ pub async fn batch_report_handler(
 pub async fn batch_status_handler(
     State(state): State<ApiState>,
     AxumPath(batch_id): AxumPath<u64>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
     if let Some(council) = &state.council
         && !council.is_leader().await
@@ -1408,10 +1409,42 @@ pub async fn batch_status_handler(
             // Task arrays share the id space; the summary says `"kind": "array"`.
             let arrays = super::task_array_leader::read_task_arrays(&state).await;
             if let Some(record) = arrays.get(batch_id) {
+                if let Err(response) = crate::sesame::auth::authorize_scoped(
+                    auth.as_deref(),
+                    &record.name,
+                    &record.namespace,
+                ) {
+                    return response;
+                }
                 let nodes = state.task_arrays.node_views(batch_id).await;
-                return Json(super::task_array_api::array_summary(
-                    batch_id, record, &nodes,
-                ))
+                let progress = record.state.summary();
+                let mut summary = super::task_array_api::array_summary(batch_id, record, &nodes);
+                summary["rates"] = serde_json::to_value(
+                    state
+                        .task_arrays
+                        .rates(batch_id, (progress.succeeded, progress.failed))
+                        .await,
+                )
+                .expect("finite rates");
+                return Json(summary).into_response();
+            }
+            if let Some(manifest) = arrays.manifest(batch_id) {
+                if let Err(response) = crate::sesame::auth::authorize_scoped(
+                    auth.as_deref(),
+                    &manifest.name,
+                    &manifest.namespace,
+                ) {
+                    return response;
+                }
+                return Json(
+                    super::task_array_api::manifest_summary(
+                        batch_id,
+                        manifest,
+                        &arrays,
+                        &state.task_arrays,
+                    )
+                    .await,
+                )
                 .into_response();
             }
             (

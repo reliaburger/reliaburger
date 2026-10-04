@@ -101,10 +101,12 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
-  - `relish batch cancel <ID>`: Stop a task array: tasks that haven't started never will, running ones get SIGTERM, then SIGKILL after 10 seconds
-  - `relish batch results <ID>`: Show each task's outcome, read from the nodes' ledgers
+  - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
+  - `relish batch watch <ID>`: Watch rates, bounded profile summaries and duration distributions
+  - `relish batch cancel <ID>`: Cancel an array or mixed manifest and retire its active attempts
+  - `relish batch results <ID>`: Read a bounded indexed page of accepted task outcomes
   - `relish batch logs --index <INDEX> <ID>`: Print a failed task's output (the first and last 2 KiB)
-- `relish run --batch <NAME> --count <COUNT> --exec <EXEC> [ARGS]...`: Run a task array: one host binary, many indexed tasks
+- `relish run --batch <NAME> --count <COUNT> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
 - `relish batch-status <ID>`: Show the progress of a submitted batch
 
 **Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
@@ -273,8 +275,10 @@ it would take out every replica or put the council's quorum at risk.
 
 **Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
 blue-green switches, autoscaling on metrics, jobs, cron and batch. Task arrays
-(`relish run --batch`) run one binary a hundred thousand times, each task its
-own retried process, for a Raft entry a second. Point the cluster at a Git
+(`relish run --batch`, 0.2.0 development preview) keep repeated image or host
+tasks compact, pack CPU and memory beside apps, and report grouped outcomes
+through Raft. Mixed-profile manifests, rates and indexed detail are described
+in [the batch manual](docs/manual/14_batch-jobs.md). Point the cluster at a Git
 repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.
 

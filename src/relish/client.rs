@@ -2516,6 +2516,21 @@ impl BunClient {
     }
 
     /// Cancel a task array (`POST /v1/batch/{id}/cancel`).
+    /// Admit all manifest profiles through one durable request.
+    pub async fn submit_task_manifest(
+        &self,
+        request: &crate::bun::task_array_api::TaskManifestRequest,
+    ) -> Result<serde_json::Value, RelishError> {
+        let response = self
+            .http()?
+            .post(format!("{}/v1/batch/manifest", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
     pub async fn cancel_batch(&self, batch_id: u64) -> Result<(), RelishError> {
         let url = format!("{}/v1/batch/{batch_id}/cancel", self.base_url);
         let response = self
@@ -2539,9 +2554,24 @@ impl BunClient {
         failed_only: bool,
         limit: usize,
     ) -> Result<crate::bun::task_array_api::TaskResults, RelishError> {
+        self.batch_results_page(batch_id, failed_only, limit, None, None)
+            .await
+    }
+
+    /// Read a bounded cursor page, or address one stable task index.
+    pub async fn batch_results_page(
+        &self,
+        batch_id: u64,
+        failed_only: bool,
+        limit: usize,
+        after: Option<u32>,
+        index: Option<u32>,
+    ) -> Result<crate::bun::task_array_api::TaskResults, RelishError> {
         let url = format!(
-            "{}/v1/batch/{batch_id}/results?failed={failed_only}&limit={limit}",
-            self.base_url
+            "{}/v1/batch/{batch_id}/results?failed={failed_only}&limit={limit}{}{}",
+            self.base_url,
+            after.map_or(String::new(), |a| format!("&after={a}")),
+            index.map_or(String::new(), |i| format!("&index={i}"))
         );
         let response = self
             .http()?

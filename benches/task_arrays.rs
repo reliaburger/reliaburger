@@ -80,9 +80,11 @@ fn simulate_leader(nodes: usize) -> TaskArrayState {
                 }
                 let tasks = range.end() - range.start() + 1;
                 let result = ChunkResult {
+                    duration_counts: [0; 16],
                     chunk: ChunkId(chunk),
                     attempt: state.attempt_of(ChunkId(chunk)),
                     succeeded: tasks - failed.len() as u32,
+                    failed_count: failed.len() as u32,
                     failed_indices: failed,
                     not_run: 0,
                     retried: 0,
@@ -118,6 +120,7 @@ fn bench_leader(c: &mut Criterion) {
 
 fn chunk_work(count: u32, chunk: u32, program: &str, args: &[&str]) -> ChunkWork {
     ChunkWork {
+        template: None,
         batch_id: 1,
         spec: TaskArraySpec {
             chunk_size: count,

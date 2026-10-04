@@ -3,8 +3,8 @@
 //!
 //! Everything here is a pure, deterministic state machine. It's shaped to
 //! live inside the Raft `DesiredState` (every operation takes its inputs
-//! as arguments and never reads a clock), but nothing wires it there yet:
-//! that waits for the compatibility gate in the million-jobs plan.
+//! as arguments and never reads a clock). The replicated task-array store
+//! applies these operations in committed log order.
 //!
 //! The state never holds a record per task. Chunks move between three
 //! [`IndexRangeSet`]s (queued, granted per node, done), and a finished
@@ -23,6 +23,8 @@ use super::types::NodeId;
 /// only in the nodes' ledgers. 10,000 sparse failures is about 160 KiB of
 /// JSON.
 pub const MAX_FAILED_RANGES: usize = 10_000;
+/// Bound sparse failures in each worker control report.
+pub const MAX_CHUNK_FAILED_RANGES: usize = 256;
 
 /// Fewest chunks the grant policy keeps queued on a node, so a node that
 /// finishes one chunk always has the next one ready.
@@ -65,13 +67,17 @@ impl TaskArrayStatus {
 /// chunk is accounted for exactly once: succeeded, failed or not run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkResult {
+    /// Mergeable final-attempt duration buckets: 1,2,4,...,16384 ms,+Inf.
+    pub duration_counts: [u64; 16],
     /// The chunk.
     pub chunk: ChunkId,
     /// The grant attempt the node was running; fences stale reports.
-    pub attempt: u8,
+    pub attempt: u64,
     /// Tasks that exited 0.
     pub succeeded: u32,
-    /// Indices that failed on every attempt.
+    /// Total failures, including those omitted from the bounded preview.
+    pub failed_count: u32,
+    /// A bounded preview of indices that failed on every attempt.
     pub failed_indices: IndexRangeSet,
     /// Tasks never started because the array stopped.
     pub not_run: u32,
@@ -102,8 +108,8 @@ pub enum TaskArrayError {
     )]
     StaleAttempt {
         chunk: u32,
-        reported: u8,
-        current: u8,
+        reported: u64,
+        current: u64,
     },
     #[error("chunk {chunk} has {expected} tasks but the report accounts for {reported}")]
     CountMismatch {
@@ -113,6 +119,8 @@ pub enum TaskArrayError {
     },
     #[error("chunk {chunk} report names failed indices outside the chunk")]
     IndexOutsideChunk { chunk: u32 },
+    #[error("chunk {chunk} report exceeds the failed-index preview bound")]
+    FailurePreviewTooLarge { chunk: u32 },
     #[error("the array has stopped; no more chunks can be granted")]
     Stopped,
 }
@@ -152,9 +160,11 @@ pub struct TaskArrayState {
     /// Chunk ids each node holds.
     grants: BTreeMap<NodeId, IndexRangeSet>,
     /// Grant attempt per chunk, stored only once it's above 1.
-    attempts: BTreeMap<u32, u8>,
+    attempts: BTreeMap<u32, u64>,
     /// Chunk ids retired.
     done: IndexRangeSet,
+    /// Accepted terminal grant per chunk; cancelled unstarted chunks have none.
+    accepted: BTreeMap<NodeId, BTreeMap<u64, IndexRangeSet>>,
     /// Indices that failed for good, up to [`MAX_FAILED_RANGES`] ranges.
     failed_indices: IndexRangeSet,
     /// Failed indices not stored because the range cap was reached.
@@ -164,6 +174,7 @@ pub struct TaskArrayState {
     not_run: u64,
     retried: u64,
     stopped: Option<StopReason>,
+    duration_counts: [u64; 16],
 }
 
 impl TaskArrayState {
@@ -181,6 +192,7 @@ impl TaskArrayState {
             grants: BTreeMap::new(),
             attempts: BTreeMap::new(),
             done: IndexRangeSet::new(),
+            accepted: BTreeMap::new(),
             failed_indices: IndexRangeSet::new(),
             failed_overflow: 0,
             succeeded: 0,
@@ -188,6 +200,7 @@ impl TaskArrayState {
             not_run: 0,
             retried: 0,
             stopped: None,
+            duration_counts: [0; 16],
         })
     }
 
@@ -199,6 +212,21 @@ impl TaskArrayState {
     /// Chunks retired.
     pub fn done(&self) -> &IndexRangeSet {
         &self.done
+    }
+
+    /// Grant whose terminal report was accepted for this chunk.
+    pub fn accepted_grant(&self, chunk: ChunkId) -> Option<(NodeId, u64)> {
+        self.accepted.iter().find_map(|(node, generations)| {
+            generations
+                .iter()
+                .find(|(_, chunks)| chunks.contains(chunk.0))
+                .map(|(grant, _)| (node.clone(), *grant))
+        })
+    }
+
+    /// Mergeable terminal-attempt duration distribution for accepted chunks.
+    pub fn duration_counts(&self) -> &[u64; 16] {
+        &self.duration_counts
     }
 
     /// Chunks `node` holds, if any.
@@ -222,7 +250,7 @@ impl TaskArrayState {
     }
 
     /// The grant attempt a chunk is on: 1 until a node loss re-queues it.
-    pub fn attempt_of(&self, chunk: ChunkId) -> u8 {
+    pub fn attempt_of(&self, chunk: ChunkId) -> u64 {
         self.attempts.get(&chunk.0).copied().unwrap_or(1)
     }
 
@@ -293,10 +321,13 @@ impl TaskArrayState {
                 current,
             });
         }
+        if result.failed_indices.range_count() > MAX_CHUNK_FAILED_RANGES {
+            return Err(TaskArrayError::FailurePreviewTooLarge { chunk });
+        }
         let expected = u64::from(range.end() - range.start()) + 1;
-        let failed = result.failed_indices.len();
+        let failed = u64::from(result.failed_count);
         let reported = u64::from(result.succeeded) + failed + u64::from(result.not_run);
-        if reported != expected {
+        if reported != expected || result.failed_indices.len() > failed {
             return Err(TaskArrayError::CountMismatch {
                 chunk,
                 expected,
@@ -314,11 +345,21 @@ impl TaskArrayState {
         self.release(node, chunk);
         self.attempts.remove(&chunk);
         self.done.insert(chunk);
+        self.accepted
+            .entry(node.clone())
+            .or_default()
+            .entry(result.attempt)
+            .or_default()
+            .insert(chunk);
+        for (total, count) in self.duration_counts.iter_mut().zip(result.duration_counts) {
+            *total += count;
+        }
         self.succeeded += u64::from(result.succeeded);
         self.failed += failed;
         self.not_run += u64::from(result.not_run);
         self.retried += u64::from(result.retried);
         self.record_failures(&result.failed_indices);
+        self.failed_overflow += failed - result.failed_indices.len();
         if let Some(limit) = self.spec.max_failed_indexes
             && self.failed > u64::from(limit)
         {
@@ -686,9 +727,11 @@ mod tests {
                     }
                     let tasks = range.end() - range.start() + 1;
                     let result = ChunkResult {
+                        duration_counts: [0; 16],
                         chunk: ChunkId(chunk),
                         attempt: 1,
                         succeeded: tasks - failed.len() as u32,
+                        failed_count: failed.len() as u32,
                         failed_indices: failed,
                         not_run: 0,
                         retried: 0,
@@ -730,9 +773,11 @@ mod tests {
     fn all_ok(state: &TaskArrayState, chunk: u32) -> ChunkResult {
         let range = state.spec.chunk_range(ChunkId(chunk)).unwrap();
         ChunkResult {
+            duration_counts: [0; 16],
             chunk: ChunkId(chunk),
             attempt: state.attempt_of(ChunkId(chunk)),
             succeeded: range.end() - range.start() + 1,
+            failed_count: 0,
             failed_indices: IndexRangeSet::new(),
             not_run: 0,
             retried: 0,
@@ -785,6 +830,7 @@ mod tests {
         state.grant(&node("n1"), &chunks(0..=2)).unwrap();
         let mut result = all_ok(&state, 2);
         result.succeeded = 498;
+        result.failed_count = 2;
         result.failed_indices = IndexRangeSet::from_range(2042..=2043);
         result.retried = 7;
         assert_eq!(
@@ -844,6 +890,7 @@ mod tests {
                 reported: 99
             })
         );
+        result.failed_count = 1;
         result.failed_indices = IndexRangeSet::from_range(100..=100);
         assert_eq!(
             state.complete(&node("n1"), &result),
@@ -930,6 +977,7 @@ mod tests {
         state.grant(&node("n1"), &chunks(0..=0)).unwrap();
         let mut result = all_ok(&state, 0);
         result.succeeded = 98;
+        result.failed_count = 2;
         result.failed_indices = IndexRangeSet::from_range(10..=11);
         state.complete(&node("n1"), &result).unwrap();
         assert_eq!(state.stop_reason(), Some(StopReason::TooManyFailures));
@@ -945,6 +993,7 @@ mod tests {
         state.complete(&node("n1"), &ok).unwrap();
         let mut one_failed = all_ok(&state, 1);
         one_failed.succeeded = 99;
+        one_failed.failed_count = 1;
         one_failed.failed_indices = IndexRangeSet::from_range(142..=142);
         state.complete(&node("n1"), &one_failed).unwrap();
         assert_eq!(state.status(), TaskArrayStatus::CompletedWithFailures);
@@ -960,21 +1009,27 @@ mod tests {
     #[test]
     fn failed_indices_past_the_range_cap_are_counted_not_stored() {
         let count = (MAX_FAILED_RANGES as u32 + 10) * 2;
-        let mut state = TaskArrayState::new(spec(count, count), 1).unwrap();
-        state.grant(&node("n1"), &chunks(0..=0)).unwrap();
-        let mut failures = IndexRangeSet::new();
-        for i in (0..count).step_by(2) {
-            failures.insert(i);
+        let mut state = TaskArrayState::new(spec(count, 512), 1).unwrap();
+        for chunk in 0..state.spec.chunk_count() {
+            state.grant(&node("n1"), &chunks(chunk..=chunk)).unwrap();
+            let range = state.spec.chunk_range(ChunkId(chunk)).unwrap();
+            let tasks = range.end() - range.start() + 1;
+            let mut failures = IndexRangeSet::new();
+            for i in range.step_by(2) {
+                failures.insert(i);
+            }
+            let result = ChunkResult {
+                duration_counts: [0; 16],
+                chunk: ChunkId(chunk),
+                attempt: 1,
+                succeeded: tasks - failures.len() as u32,
+                failed_count: failures.len() as u32,
+                failed_indices: failures,
+                not_run: 0,
+                retried: 0,
+            };
+            state.complete(&node("n1"), &result).unwrap();
         }
-        let result = ChunkResult {
-            chunk: ChunkId(0),
-            attempt: 1,
-            succeeded: count / 2,
-            failed_indices: failures,
-            not_run: 0,
-            retried: 0,
-        };
-        state.complete(&node("n1"), &result).unwrap();
         assert_eq!(state.failed_indices().range_count(), MAX_FAILED_RANGES);
         assert_eq!(state.failed_overflow, 10);
         assert_eq!(state.summary().failed, u64::from(count / 2));

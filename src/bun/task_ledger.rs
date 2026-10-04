@@ -18,7 +18,7 @@
 //! ```text
 //! file   = MAGIC (8 bytes) block*
 //! block  = record_count: u32, crc32(records): u32, record * record_count
-//! record = index: u32, attempts: u8, outcome: u8, exit_code: i32, run_ms: u32
+//! record = index: u32, attempts: u8, outcome: u8, exit_code: i32, run_ms: u32, grant_attempt: u64
 //! ```
 //!
 //! `exit_code` holds `i32::MIN` for "no exit status"; that sentinel never
@@ -36,10 +36,10 @@ use crate::meat::index_set::IndexRangeSet;
 use crate::meat::task_array::{ChunkId, TaskArraySpec};
 
 /// Identifies the file format.
-pub const MAGIC: &[u8; 8] = b"RBTASKL1";
+pub const MAGIC: &[u8; 8] = b"RBTASKL2";
 
 /// Bytes per record.
-pub const RECORD_BYTES: usize = 14;
+pub const RECORD_BYTES: usize = 22;
 
 /// Bytes of block header.
 const BLOCK_HEADER_BYTES: usize = 8;
@@ -91,12 +91,12 @@ impl GroupCommit {
 }
 
 /// An open ledger file, appended to in blocks.
-#[derive(Debug)]
 pub struct Ledger {
     file: File,
     pending: Vec<u8>,
     pending_records: u32,
     syncs: u64,
+    index: std::sync::Arc<super::task_result_index::TaskResultIndex>,
 }
 
 impl Ledger {
@@ -113,15 +113,17 @@ impl Ledger {
             file.write_all(MAGIC)?;
             file.sync_all()?;
         } else {
-            let mut magic = [0u8; 8];
-            let mut reader = File::open(path)?;
-            if length < 8 || reader.read_exact(&mut magic).is_err() || &magic != MAGIC {
-                return Err(LedgerError::BadMagic {
-                    path: path.to_path_buf(),
-                });
+            let recovered = scan(path, |_| Ok(()))?;
+            if recovered.torn_tail {
+                file.set_len(recovered.valid_bytes)?;
+                file.sync_all()?;
             }
         }
+        let index =
+            super::task_result_index::TaskResultIndex::open(&path.with_extension("index.redb"))?;
+        index.rebuild(path)?;
         Ok(Self {
+            index,
             file,
             pending: Vec::new(),
             pending_records: 0,
@@ -154,10 +156,16 @@ impl Ledger {
         block.extend_from_slice(&self.pending);
         self.file.write_all(&block)?;
         self.file.sync_data()?;
+        self.index.append(&self.pending)?;
         self.syncs += 1;
         self.pending.clear();
         self.pending_records = 0;
         Ok(())
+    }
+
+    /// Shared reader for derived indexed detail.
+    pub fn index(&self) -> std::sync::Arc<super::task_result_index::TaskResultIndex> {
+        self.index.clone()
     }
 
     /// How many fsyncs this ledger has done.
@@ -166,7 +174,7 @@ impl Ledger {
     }
 }
 
-fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
+pub(crate) fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
     let outcome: u8 = match record.outcome {
         TaskFinal::Succeeded => 1,
         TaskFinal::Failed => 2,
@@ -177,9 +185,10 @@ fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
     out.push(outcome);
     out.extend_from_slice(&record.exit_code.unwrap_or(NO_EXIT_CODE).to_le_bytes());
     out.extend_from_slice(&record.run_ms.to_le_bytes());
+    out.extend_from_slice(&record.grant_attempt.to_le_bytes());
 }
 
-fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskRecord, LedgerError> {
+pub(crate) fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskRecord, LedgerError> {
     let u32_at =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
     let outcome = match bytes[5] {
@@ -195,6 +204,7 @@ fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskRecord, LedgerE
     };
     let exit_code = u32_at(6) as i32;
     Ok(TaskRecord {
+        grant_attempt: u64::from_le_bytes(bytes[14..22].try_into().expect("record width")),
         index: u32_at(0),
         attempts: bytes[4],
         outcome,
@@ -214,6 +224,8 @@ pub struct ReplayedLedger {
     pub finished: IndexRangeSet,
     /// Whether a torn final block was ignored.
     pub torn_tail: bool,
+    /// Length through the last complete, checksummed block.
+    pub valid_bytes: u64,
 }
 
 impl ReplayedLedger {
@@ -235,53 +247,75 @@ impl ReplayedLedger {
 /// anywhere else is an error rather than a silent skip, because skipping
 /// would re-run or lose finished tasks without saying so. Blocking I/O.
 pub fn replay(path: &Path) -> Result<ReplayedLedger, LedgerError> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
+    let mut records = Vec::new();
+    let mut finished = IndexRangeSet::new();
+    let mut replayed = scan(path, |record| {
+        if record.outcome != TaskFinal::NotRun {
+            finished.insert(record.index);
+        }
+        records.push(record);
+        Ok(())
+    })?;
+    replayed.records = records;
+    replayed.finished = finished;
+    Ok(replayed)
+}
+
+/// Stream validated blocks with memory bounded by one group-commit block.
+/// Visitors see only records covered by a complete checksum. The returned
+/// metadata has no collected records or finished indexes; use `replay` to
+/// deliberately collect history, or select only currently held chunks here.
+pub fn scan(
+    path: &Path,
+    mut visit: impl FnMut(TaskRecord) -> Result<(), LedgerError>,
+) -> Result<ReplayedLedger, LedgerError> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut magic = [0; 8];
+    if file.read_exact(&mut magic).is_err() || &magic != MAGIC {
         return Err(LedgerError::BadMagic {
-            path: path.to_path_buf(),
+            path: path.to_owned(),
         });
     }
-    let mut replayed = ReplayedLedger::default();
-    let mut at = MAGIC.len();
-    while at < bytes.len() {
-        let offset = at as u64;
-        let Some(header) = bytes.get(at..at + BLOCK_HEADER_BYTES) else {
+    let mut replayed = ReplayedLedger {
+        valid_bytes: 8,
+        ..Default::default()
+    };
+    let mut at = 8u64;
+    while at < length {
+        let mut header = [0; BLOCK_HEADER_BYTES];
+        if file.read_exact(&mut header).is_err() {
             replayed.torn_tail = true;
             break;
-        };
-        let count = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        if count == 0 || count > MAX_BLOCK_RECORDS {
-            return torn_or_corrupt(&mut replayed, at, bytes.len(), offset);
         }
-        let body_start = at + BLOCK_HEADER_BYTES;
-        let body_end = body_start + count as usize * RECORD_BYTES;
-        let Some(body) = bytes.get(body_start..body_end) else {
+        let count = u32::from_le_bytes(header[..4].try_into().expect("header count"));
+        let checksum = u32::from_le_bytes(header[4..].try_into().expect("header checksum"));
+        if count == 0 || count > MAX_BLOCK_RECORDS {
+            return torn_or_corrupt(&mut replayed, at as usize, length as usize, at);
+        }
+        let end = at + BLOCK_HEADER_BYTES as u64 + u64::from(count) * RECORD_BYTES as u64;
+        if end > length {
             replayed.torn_tail = true;
             break;
-        };
-        if crc32fast::hash(body) != crc {
-            // A full-length block with a bad checksum is torn only if
-            // nothing follows it.
-            if body_end == bytes.len() {
+        }
+        let mut bytes = vec![0; count as usize * RECORD_BYTES];
+        file.read_exact(&mut bytes)?;
+        if crc32fast::hash(&bytes) != checksum {
+            if end == length {
                 replayed.torn_tail = true;
                 break;
             }
-            return Err(LedgerError::Corrupt { offset });
+            return Err(LedgerError::Corrupt { offset: at });
         }
-        let (raw_records, _) = body.as_chunks::<RECORD_BYTES>();
-        for (position, raw) in raw_records.iter().enumerate() {
-            let record_offset = (body_start + position * RECORD_BYTES) as u64;
-            let record = decode(raw, record_offset)?;
-            match record.outcome {
-                TaskFinal::Succeeded | TaskFinal::Failed => {
-                    replayed.finished.insert(record.index);
-                }
-                TaskFinal::NotRun => {}
-            }
-            replayed.records.push(record);
+        for (position, raw) in bytes.as_chunks::<RECORD_BYTES>().0.iter().enumerate() {
+            let record = decode(
+                raw,
+                at + BLOCK_HEADER_BYTES as u64 + (position * RECORD_BYTES) as u64,
+            )?;
+            visit(record)?;
         }
-        at = body_end;
+        at = end;
+        replayed.valid_bytes = at;
     }
     Ok(replayed)
 }
@@ -382,8 +416,8 @@ async fn run_writer(
 }
 
 /// Flush off the async runtime, then answer everyone waiting. A write
-/// error is reported to the waiters and the ledger carries on; losing the
-/// ledger itself (the blocking task panicked) stops the writer, and every
+/// error stops the writer: a partial write cannot safely be followed by
+/// another append. Losing the ledger itself also stops it, and every
 /// later append then fails with [`LedgerError::WriterStopped`].
 async fn commit(
     mut ledger: Ledger,
@@ -406,6 +440,7 @@ async fn commit(
     for waiter in waiting.drain(..) {
         let _ = waiter.send(result.clone());
     }
+    result.map_err(|reason| LedgerError::Io(std::io::Error::other(reason)))?;
     Ok(ledger)
 }
 
@@ -415,6 +450,7 @@ mod tests {
 
     fn record(index: u32, outcome: TaskFinal) -> TaskRecord {
         TaskRecord {
+            grant_attempt: 1,
             index,
             attempts: 1,
             outcome,
@@ -430,6 +466,34 @@ mod tests {
 
     fn path_in(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("ledger")
+    }
+
+    #[tokio::test]
+    async fn failed_flush_stops_the_writer_and_never_acknowledges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        drop(Ledger::open(&path).unwrap());
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger.file = File::open(&path).unwrap(); // Explicitly read-only, including as root.
+        let (handle, writer) = spawn_writer(
+            ledger,
+            GroupCommit {
+                interval: Duration::from_millis(1),
+                max_records: 1,
+            },
+        );
+        assert!(
+            handle
+                .append(vec![record(0, TaskFinal::Succeeded)])
+                .await
+                .is_err()
+        );
+        assert!(writer.await.unwrap().is_err());
+        assert!(matches!(
+            handle.append(vec![record(1, TaskFinal::Succeeded)]).await,
+            Err(LedgerError::WriterStopped)
+        ));
+        assert!(replay(&path).unwrap().records.is_empty());
     }
 
     #[test]
@@ -497,6 +561,32 @@ mod tests {
         let mut ledger = Ledger::open(&path_in(&dir)).unwrap();
         ledger.flush().unwrap();
         assert_eq!(ledger.syncs(), 0);
+    }
+
+    #[test]
+    fn streaming_scan_does_not_retain_sparse_historical_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(&path_in(&dir)).unwrap();
+        let records: Vec<_> = (0..1024)
+            .map(|index| record(index * 2, TaskFinal::Succeeded))
+            .collect();
+        ledger.append(&records);
+        ledger.flush().unwrap();
+        let mut visited = 0;
+        let scanned = scan(&path_in(&dir), |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, 1024);
+        assert!(
+            scanned.finished.is_empty(),
+            "streaming scan retained historical indexes"
+        );
+        assert!(scanned.records.is_empty());
+        let collected = replay(&path_in(&dir)).unwrap();
+        assert_eq!(collected.finished.range_count(), 1024);
+        assert_eq!(collected.records, records);
     }
 
     #[test]
@@ -588,6 +678,7 @@ mod tests {
             let shifted: Vec<TaskRecord> = batch
                 .iter()
                 .map(|r| TaskRecord {
+                    grant_attempt: 1,
                     index: r.index + block * 4096,
                     ..r.clone()
                 })
@@ -596,7 +687,16 @@ mod tests {
             ledger.flush().unwrap();
         }
         let bytes = std::fs::metadata(path_in(&dir)).unwrap().len();
-        assert!(bytes <= 16 * 1024 * 1024, "{bytes} bytes");
+        assert!(bytes <= 24 * 1024 * 1024, "{bytes} ledger bytes");
+        let indexed = std::fs::metadata(path_in(&dir).with_extension("index.redb"))
+            .unwrap()
+            .len();
+        eprintln!("million task outcomes: ledger={bytes} bytes, index={indexed} bytes");
+        assert!(
+            bytes + indexed <= 128 * 1024 * 1024,
+            "{} total bytes",
+            bytes + indexed
+        );
         let replayed = replay(&path_in(&dir)).unwrap();
         assert_eq!(replayed.records.len(), 245 * 4096);
         assert_eq!(replayed.finished.range_count(), 1);

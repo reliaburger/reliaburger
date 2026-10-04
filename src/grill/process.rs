@@ -1102,6 +1102,7 @@ mod tests {
                 readonly: false,
             },
             process: OciProcess {
+                rlimits: Vec::new(),
                 args,
                 env: vec!["TEST_VAR=hello".to_string()],
                 cwd: "/".to_string(),

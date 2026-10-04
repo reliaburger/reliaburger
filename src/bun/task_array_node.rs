@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::task_executor::{
@@ -40,7 +40,10 @@ use crate::meat::task_array_state::ChunkResult;
 pub const TASK_ARRAYS_DIR: &str = "task-arrays";
 
 /// Most result rows one request returns.
-pub const MAX_RESULT_ROWS: usize = 1_000_000;
+pub const MAX_RESULT_ROWS: usize = 1000;
+
+/// Tasks examined by a detail page, even when its failure filter returns no rows.
+pub const RESULT_PAGE_SPAN: u32 = 4096;
 
 /// One chunk the leader says this node holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,12 +51,16 @@ pub struct HeldChunk {
     /// The chunk.
     pub chunk: ChunkId,
     /// Its grant attempt; a result is only good for this attempt.
-    pub attempt: u8,
+    pub attempt: u64,
 }
 
 /// What the leader tells a node about one running array.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArrayAssignment {
+    /// Owned container template; host assignments retain the allowlist gate.
+    pub template: Option<Box<crate::config::job::JobSpec>>,
+    /// Per-task resource request; a queued chunk does not reserve this multiplied by its size.
+    pub resources: crate::meat::Resources,
     /// The array's batch id.
     pub batch_id: u64,
     /// Count and policy.
@@ -70,9 +77,22 @@ pub struct ArrayAssignment {
     pub stopping: bool,
 }
 
+/// Orders cluster recovery, leadership and committed assignment revisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ControlVersion {
+    /// Disaster recovery epoch.
+    pub epoch: u64,
+    /// Raft leadership term.
+    pub term: u64,
+    /// Applied log index of the assignment snapshot.
+    pub index: u64,
+}
+
 /// The leader's sync call to one node.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSyncRequest {
+    /// Persistent fence for delayed control messages.
+    pub version: ControlVersion,
     /// Every array the cluster still keeps. A node deletes the files of
     /// any array not listed here.
     pub known: Vec<u64>,
@@ -123,12 +143,17 @@ pub struct NodeSyncResponse {
 /// One task's durable outcome, as `relish batch results` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskResultRow {
+    /// Grant that produced this outcome.
+    pub grant_attempt: u64,
     /// The task's index.
     pub index: u32,
     /// Attempts made.
     pub attempts: u8,
     /// Whether it succeeded.
     pub succeeded: bool,
+    /// Cancelled execution with no accepted success or terminal failure.
+    #[serde(default)]
+    pub not_run: bool,
     /// The last attempt's exit code (negative for a signal), if it had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -156,6 +181,8 @@ pub enum TaskArrayNodeError {
 /// An enum rather than a generic parameter so the API state can hold one
 /// concrete node type whichever runner it was built with.
 pub enum NodeRunner {
+    /// Execute containers with the node's configured owned runtime.
+    Owned(Box<super::task_runtime::OwnedRunner<crate::grill::AnyGrill>>),
     /// Spawn host processes.
     Process(ProcessRunner),
     /// Compute outcomes without processes (tests and benchmarks).
@@ -170,6 +197,7 @@ impl TaskRunner for NodeRunner {
         cancel: &CancellationToken,
     ) -> Attempt {
         match self {
+            Self::Owned(runner) => runner.run(task, timeout, cancel).await,
             Self::Process(runner) => runner.run(task, timeout, cancel).await,
             Self::Fake(runner) => runner.run(task, timeout, cancel).await,
         }
@@ -183,7 +211,7 @@ pub struct TaskArrayNodeConfig {
     /// The node's host-binary policy; a task array's binary must be on
     /// its allowlist.
     pub policy: ProcessWorkloadsConfig,
-    /// Slots per array when the array doesn't cap it (the CPU count).
+    /// Safety cap per node and array, further bounded by the shared budget.
     pub default_concurrency: u32,
     /// Retry backoff base and cap.
     pub backoff: (Duration, Duration),
@@ -194,12 +222,14 @@ pub struct TaskArrayNodeConfig {
 impl TaskArrayNodeConfig {
     /// The production settings under `data_dir`.
     pub fn for_data_dir(data_dir: &Path, policy: ProcessWorkloadsConfig) -> Self {
-        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        // A CPU fraction can admit several attempts per core. The shared
+        // resource budget, plus this explicit safety cap, bounds execution.
+        let safety_cap = 256usize;
         let defaults = PoolConfig::with_concurrency(1);
         Self {
             root: data_dir.join(TASK_ARRAYS_DIR),
             policy,
-            default_concurrency: u32::try_from(cpus).unwrap_or(u32::MAX),
+            default_concurrency: u32::try_from(safety_cap).unwrap_or(u32::MAX),
             backoff: (defaults.backoff_base, defaults.backoff_cap),
             group_commit: GroupCommit::default(),
         }
@@ -212,12 +242,20 @@ struct ArrayRun {
     ledger: LedgerHandle,
     cancel: CancellationToken,
     /// Chunks started, by chunk id: the attempt and its cancel token.
-    chunks: HashMap<u32, (u8, CancellationToken)>,
+    chunks: HashMap<u32, (u64, CancellationToken)>,
     /// Results of finished chunks, by chunk id and attempt.
-    finished: Arc<Mutex<HashMap<(u32, u8), ChunkResult>>>,
+    finished: Arc<Mutex<HashMap<(u32, u64), ChunkResult>>>,
     /// Records read back from an earlier run's ledger, by chunk, used
     /// once when that chunk starts again.
     resumed: HashMap<u32, Vec<TaskRecord>>,
+    highest: BTreeMap<u32, u64>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+enum ControlCheck {
+    Accepted,
+    Stale,
+    RecoveryRequired,
 }
 
 /// The node's task-array executor.
@@ -225,16 +263,34 @@ pub struct TaskArrayNode {
     config: TaskArrayNodeConfig,
     runner: Arc<NodeRunner>,
     arrays: Mutex<HashMap<u64, ArrayRun>>,
+    slots: Arc<Semaphore>,
+    budget: Arc<super::execution_budget::ExecutionBudget>,
+    indexes: Mutex<HashMap<u64, Arc<super::task_result_index::TaskResultIndex>>>,
 }
 
 impl TaskArrayNode {
     /// An executor running attempts through `runner`.
     pub fn new(config: TaskArrayNodeConfig, runner: NodeRunner) -> Self {
+        let slots = Arc::new(Semaphore::new(config.default_concurrency.max(1) as usize));
+        let budget = super::execution_budget::ExecutionBudget::new(crate::meat::Resources::new(
+            u64::from(config.default_concurrency.max(1)) * 1000,
+            u64::MAX,
+            0,
+        ));
         Self {
             config,
+            slots,
+            budget,
+            indexes: Mutex::new(HashMap::new()),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Use the exact admission ledger the node's supervisor uses for apps.
+    pub fn with_budget(mut self, budget: Arc<super::execution_budget::ExecutionBudget>) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Where this node keeps one array's files.
@@ -247,6 +303,82 @@ impl TaskArrayNode {
     /// and the reason.
     pub async fn sync(&self, request: &NodeSyncRequest) -> NodeSyncResponse {
         let mut arrays = self.arrays.lock().await;
+        let path = self.config.root.join("control.json");
+        let version = request.version;
+        let checked = tokio::task::spawn_blocking(move || {
+            let directory = path.parent().expect("control has parent");
+            std::fs::create_dir_all(directory)?;
+            // The directory entry itself must survive before a fence can.
+            let parent = directory
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+            let previous: ControlVersion = match std::fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ControlVersion::default()
+                }
+                Err(error) => return Err(error),
+            };
+            if version.epoch < previous.epoch
+                || (version.epoch == previous.epoch
+                    && (version.term < previous.term || version.index < previous.index))
+            {
+                return Ok(ControlCheck::Stale);
+            }
+            let recovery = directory.join("recovery-required.json");
+            match std::fs::read(&recovery) {
+                Ok(_) => return Ok(ControlCheck::RecoveryRequired),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if version.epoch > previous.epoch {
+                let has_old_arrays =
+                    std::fs::read_dir(directory)?.try_fold(false, |found, entry| {
+                        let entry = entry?;
+                        Ok::<_, std::io::Error>(
+                            found
+                                || (entry.file_type()?.is_dir()
+                                    && entry
+                                        .file_name()
+                                        .to_str()
+                                        .is_some_and(|name| name.parse::<u64>().is_ok())),
+                        )
+                    })?;
+                if has_old_arrays {
+                    // Persist the refusal before cancellation. A restart or a later
+                    // snapshot forgetting these arrays must never clear their fences.
+                    persist_json(&recovery, &(previous, version))?;
+                    return Ok(ControlCheck::RecoveryRequired);
+                }
+            }
+            if version > previous {
+                persist_json(&path, &version)?;
+            }
+            Ok::<_, std::io::Error>(ControlCheck::Accepted)
+        })
+        .await;
+        if !matches!(checked, Ok(Ok(ControlCheck::Accepted))) {
+            let recovery_required = matches!(checked, Ok(Ok(ControlCheck::RecoveryRequired)));
+            if recovery_required {
+                for run in arrays.values() {
+                    run.cancel.cancel();
+                }
+            }
+            let reason = if recovery_required {
+                "recovery epoch changed with existing array data; archive old data and re-enrol this worker with fresh data"
+            } else {
+                "stale control version or unavailable persistent fence"
+            };
+            return NodeSyncResponse {
+                arrays: request
+                    .arrays
+                    .iter()
+                    .map(|a| refused(a.batch_id, reason.into()))
+                    .collect(),
+            };
+        }
         let running: Vec<u64> = request.arrays.iter().map(|a| a.batch_id).collect();
         let finished_ids: Vec<u64> = arrays
             .keys()
@@ -256,7 +388,11 @@ impl TaskArrayNode {
         for id in finished_ids {
             // Finished or forgotten: stop anything still going. The
             // directory stays while the cluster lists the array.
-            if let Some(run) = arrays.remove(&id) {
+            if request.known.contains(&id) {
+                if let Some(run) = arrays.get(&id) {
+                    run.cancel.cancel();
+                }
+            } else if let Some(run) = arrays.remove(&id) {
                 run.cancel.cancel();
             }
         }
@@ -292,6 +428,44 @@ impl TaskArrayNode {
 
     /// Whether this node may run the array's binary at all.
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
+        if assignment.resources.cpu_millicores == 0
+            || assignment.resources.memory_bytes == 0
+            || assignment.resources.gpus != 0
+        {
+            return Err(
+                "tasks require positive CPU and memory requests; GPU task execution is unavailable"
+                    .into(),
+            );
+        }
+        if !self.budget.capacity().fits(&assignment.resources) {
+            return Err("task requests exceed this node's allocatable resources".into());
+        }
+        if assignment
+            .template
+            .as_ref()
+            .is_some_and(|t| t.image.is_some())
+        {
+            return match self.runner.as_ref() {
+                NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
+                NodeRunner::Fake(_) => Ok(()),
+                _ => Err("container tasks require the rootful owned Linux runtime".into()),
+            };
+        }
+        if let NodeRunner::Owned(runner) = self.runner.as_ref() {
+            if !runner.supports_host() {
+                return Err("host arrays require the owned process runtime; use image tasks on Linux container nodes".into());
+            }
+            if assignment
+                .template
+                .as_ref()
+                .is_some_and(|t| t.cpu.is_some() || t.memory.is_some())
+            {
+                return Err(
+                    "the host process runtime cannot enforce CPU or memory limits; use image tasks"
+                        .into(),
+                );
+            }
+        }
         if !self.config.policy.is_binary_allowed(&assignment.program) {
             return Err(format!(
                 "{} isn't in this node's [process_workloads] allowed_binaries",
@@ -311,17 +485,40 @@ impl TaskArrayNode {
     async fn open(&self, assignment: &ArrayAssignment) -> Result<ArrayRun, TaskArrayNodeError> {
         let directory = self.array_dir(assignment.batch_id);
         let spec = assignment.spec.clone();
-        let (ledger, resumed) = tokio::task::spawn_blocking(move || {
+        let held: std::collections::BTreeSet<_> =
+            assignment.held.iter().map(|h| h.chunk.0).collect();
+        let (ledger, resumed, highest) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(directory.join("output"))?;
+            std::fs::File::open(directory.parent().expect("array has parent"))?.sync_all()?;
             let path = directory.join("ledger");
             let resumed = if path.exists() {
-                group_by_chunk(&spec, task_ledger::replay(&path)?.records)
+                let mut records = Vec::new();
+                task_ledger::scan(&path, |record| {
+                    if spec
+                        .chunk_of(record.index)
+                        .is_some_and(|c| held.contains(&c.0))
+                    {
+                        records.push(record);
+                    }
+                    Ok(())
+                })?;
+                group_by_chunk(&spec, records)
             } else {
                 HashMap::new()
             };
-            Ok::<_, TaskArrayNodeError>((Ledger::open(&path)?, resumed))
+            let fence = directory.join("grants.json");
+            let highest = match std::fs::read(&fence) {
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(error) => return Err(error.into()),
+            };
+            Ok::<_, TaskArrayNodeError>((Ledger::open(&path)?, resumed, highest))
         })
         .await??;
+        self.indexes
+            .lock()
+            .await
+            .insert(assignment.batch_id, ledger.index());
         let (handle, _writer) = task_ledger::spawn_writer(ledger, self.config.group_commit);
         let config = PoolConfig {
             concurrency: self.concurrency(&assignment.spec),
@@ -329,25 +526,59 @@ impl TaskArrayNode {
             backoff_cap: self.config.backoff.1,
         };
         Ok(ArrayRun {
-            pool: Arc::new(TaskPool::new(Arc::clone(&self.runner), config)),
+            pool: Arc::new(
+                TaskPool::with_node_slots(
+                    Arc::clone(&self.runner),
+                    config,
+                    Arc::clone(&self.slots),
+                )
+                .with_budget(Arc::clone(&self.budget), assignment.resources),
+            ),
             ledger: handle,
             cancel: CancellationToken::new(),
             chunks: HashMap::new(),
             finished: Arc::new(Mutex::new(HashMap::new())),
             resumed,
+            highest,
+            failure: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Bring one array in line with the leader's view of it.
     async fn reconcile(&self, run: &mut ArrayRun, assignment: &ArrayAssignment) -> ArrayProgress {
+        if let Some(reason) = run.failure.lock().await.clone() {
+            return refused(assignment.batch_id, reason);
+        }
         if assignment.stopping {
             run.cancel.cancel();
         }
-        let held: BTreeMap<u32, u8> = assignment
+        let mut held: BTreeMap<u32, u64> = assignment
             .held
             .iter()
             .map(|h| (h.chunk.0, h.attempt))
             .collect();
+        let mut changed = false;
+        for (&chunk, attempt) in &mut held {
+            let highest = run.highest.entry(chunk).or_insert(0);
+            if *attempt > *highest {
+                *highest = *attempt;
+                changed = true;
+            } else {
+                *attempt = *highest;
+            }
+        }
+        if changed {
+            let path = self.array_dir(assignment.batch_id).join("grants.json");
+            let highest = run.highest.clone();
+            let persisted =
+                tokio::task::spawn_blocking(move || persist_json(&path, &highest)).await;
+            if !matches!(persisted, Ok(Ok(()))) {
+                let reason = "cannot persist the grant fence".to_string();
+                *run.failure.lock().await = Some(reason.clone());
+                run.cancel.cancel();
+                return refused(assignment.batch_id, reason);
+            }
+        }
 
         // Stop chunks the leader took back (or re-granted at a new attempt).
         run.chunks.retain(|chunk, (attempt, cancel)| {
@@ -374,6 +605,7 @@ impl TaskArrayNode {
             let cancel = run.cancel.child_token();
             run.chunks.insert(chunk, (attempt, cancel.clone()));
             let work = ChunkWork {
+                template: assignment.template.clone(),
                 batch_id: assignment.batch_id,
                 spec: assignment.spec.clone(),
                 chunk: ChunkId(chunk),
@@ -382,11 +614,19 @@ impl TaskArrayNode {
                 args: assignment.args.clone(),
                 env: assignment.env.clone(),
             };
-            let resumed = run.resumed.remove(&chunk).unwrap_or_default();
+            let resumed = run
+                .resumed
+                .remove(&chunk)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.grant_attempt == attempt)
+                .collect();
             tokio::spawn(run_chunk(
                 Arc::clone(&run.pool),
                 run.ledger.clone(),
                 Arc::clone(&run.finished),
+                Arc::clone(&run.failure),
+                run.cancel.clone(),
                 self.array_dir(assignment.batch_id).join("output"),
                 work,
                 resumed,
@@ -397,7 +637,17 @@ impl TaskArrayNode {
         let counters = run.pool.counters();
         ArrayProgress {
             batch_id: assignment.batch_id,
-            slots: self.concurrency(&assignment.spec),
+            slots: {
+                let available = self.budget.available();
+                let fits = (available.cpu_millicores / assignment.resources.cpu_millicores)
+                    .min(available.memory_bytes / assignment.resources.memory_bytes);
+                self.concurrency(&assignment.spec)
+                    .min(u32::try_from(fits).unwrap_or(u32::MAX))
+                    .saturating_add(
+                        u32::try_from(counters.running.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
+                    )
+                    .min(self.concurrency(&assignment.spec))
+            },
             refused: None,
             finished,
             counters: NodeArrayCounters {
@@ -412,6 +662,7 @@ impl TaskArrayNode {
 
     /// Delete the directories of arrays the cluster no longer lists.
     async fn delete_unknown(&self, known: &[u64]) {
+        self.indexes.lock().await.retain(|id, _| known.contains(id));
         let root = self.config.root.clone();
         let known = known.to_vec();
         let result = tokio::task::spawn_blocking(move || {
@@ -452,27 +703,59 @@ impl TaskArrayNode {
         failed_only: bool,
         limit: usize,
     ) -> Result<Vec<TaskResultRow>, TaskArrayNodeError> {
-        let path = self.array_dir(batch_id).join("ledger");
-        // One past the cap, so the leader can tell a capped answer apart.
+        self.results_page(batch_id, failed_only, limit, 0, u32::MAX)
+            .await
+    }
+
+    /// Read one bounded, indexed range. Readers share the writer's database.
+    pub async fn results_page(
+        &self,
+        batch_id: u64,
+        failed_only: bool,
+        limit: usize,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<TaskResultRow>, TaskArrayNodeError> {
+        let mut indexes = self.indexes.lock().await;
+        let index = match indexes.entry(batch_id) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let path = self.array_dir(batch_id).join("ledger");
+                if !path.exists() {
+                    return Err(TaskArrayNodeError::UnknownArray { batch_id });
+                }
+                let index_path = path.with_extension("index.redb");
+                if !index_path.exists() {
+                    return Err(std::io::Error::other(
+                        "result index unavailable; recover the worker ledger before reading detail",
+                    )
+                    .into());
+                }
+                let index = tokio::task::spawn_blocking(move || {
+                    let index = super::task_result_index::TaskResultIndex::open(
+                        &path.with_extension("index.redb"),
+                    )?;
+                    // Accepted outcomes already required this index's durable
+                    // commit. Recovery rebuilds active writers; a read never
+                    // scans the historical ledger merely to open a valid index.
+                    Ok::<_, LedgerError>(index)
+                })
+                .await??;
+                entry.insert(index).clone()
+            }
+        };
+        drop(indexes);
         let limit = limit.min(MAX_RESULT_ROWS + 1);
         tokio::task::spawn_blocking(move || {
-            if !path.exists() {
-                return Err(TaskArrayNodeError::UnknownArray { batch_id });
-            }
-            let mut last: BTreeMap<u32, TaskRecord> = BTreeMap::new();
-            for record in task_ledger::replay(&path)?.records {
-                if record.outcome != TaskFinal::NotRun {
-                    last.insert(record.index, record);
-                }
-            }
-            Ok(last
-                .into_values()
-                .filter(|record| !failed_only || record.outcome == TaskFinal::Failed)
-                .take(limit)
+            let records = index.page(start, end, failed_only, limit)?;
+            Ok(records
+                .into_iter()
                 .map(|record| TaskResultRow {
+                    grant_attempt: record.grant_attempt,
                     index: record.index,
                     attempts: record.attempts,
                     succeeded: record.outcome == TaskFinal::Succeeded,
+                    not_run: record.outcome == TaskFinal::NotRun,
                     exit_code: record.exit_code,
                     run_ms: record.run_ms,
                 })
@@ -488,8 +771,28 @@ impl TaskArrayNode {
         batch_id: u64,
         index: u32,
     ) -> Result<Vec<u8>, TaskArrayNodeError> {
+        let row = self
+            .results_page(batch_id, false, 1, index, index.saturating_add(1))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(TaskArrayNodeError::NoOutput { index })?;
+        if row.succeeded || row.not_run {
+            return Err(TaskArrayNodeError::NoOutput { index });
+        }
+        self.task_output_grant(batch_id, index, row.grant_attempt)
+            .await
+    }
+
+    /// Output from exactly the winning grant, never an older task execution.
+    pub async fn task_output_grant(
+        &self,
+        batch_id: u64,
+        index: u32,
+        grant: u64,
+    ) -> Result<Vec<u8>, TaskArrayNodeError> {
         let directory = self.array_dir(batch_id);
-        let path = directory.join("output").join(index.to_string());
+        let path = directory.join("output").join(format!("{index}-{grant}"));
         match tokio::fs::read(&path).await {
             Ok(bytes) => Ok(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -502,6 +805,16 @@ impl TaskArrayNode {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn persist_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(&serde_json::to_vec(value)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    std::fs::File::open(path.parent().expect("fence has parent"))?.sync_all()
 }
 
 fn refused(batch_id: u64, reason: String) -> ArrayProgress {
@@ -533,40 +846,80 @@ fn group_by_chunk(spec: &TaskArraySpec, records: Vec<TaskRecord>) -> HashMap<u32
 
 /// Run one chunk, make its records durable, keep failed tasks' output,
 /// then publish the result for the next sync.
+#[allow(clippy::too_many_arguments)]
 async fn run_chunk(
     pool: Arc<TaskPool<NodeRunner>>,
     ledger: LedgerHandle,
-    finished: Arc<Mutex<HashMap<(u32, u8), ChunkResult>>>,
+    finished: Arc<Mutex<HashMap<(u32, u64), ChunkResult>>>,
+    failure: Arc<Mutex<Option<String>>>,
+    array_cancel: CancellationToken,
     output_dir: PathBuf,
     work: ChunkWork,
     resumed: Vec<TaskRecord>,
     cancel: CancellationToken,
 ) {
-    let outcome = pool.resume_chunk(&work, resumed, &cancel).await;
-    let outputs: Vec<(u32, CapturedOutput)> = outcome
-        .records
-        .iter()
-        .filter_map(|record| record.output.clone().map(|output| (record.index, output)))
-        .collect();
-    if !outputs.is_empty() {
-        let written =
-            tokio::task::spawn_blocking(move || write_outputs(&output_dir, &outputs)).await;
-        if !matches!(written, Ok(Ok(()))) {
-            eprintln!(
-                "bun: task array {}: couldn't keep failed tasks' output",
-                work.batch_id
-            );
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<TaskRecord>(1024);
+    let stream_work = async {
+        let result = async {
+            let mut persisted = crate::meat::index_set::IndexRangeSet::new();
+            while let Some(record) = receiver.recv().await {
+                let mut records = vec![record];
+                while records.len() < 4096 {
+                    match receiver.try_recv() {
+                        Ok(record) => records.push(record),
+                        Err(_) => break,
+                    }
+                }
+                let outputs: Vec<_> = records
+                    .iter()
+                    .filter_map(|r| r.output.clone().map(|o| (r.index, r.grant_attempt, o)))
+                    .collect();
+                if !outputs.is_empty() {
+                    let directory = output_dir.clone();
+                    tokio::task::spawn_blocking(move || write_outputs(&directory, &outputs))
+                        .await??;
+                }
+                for record in &records {
+                    persisted.insert(record.index);
+                }
+                ledger.append(records).await?;
+            }
+            Ok::<_, TaskArrayNodeError>(persisted)
         }
+        .await;
+        if let Err(error) = &result {
+            *failure.lock().await = Some(format!("task durability unavailable: {error}"));
+            array_cancel.cancel();
+        }
+        result
+    };
+    let (outcome, persisted) = tokio::join!(
+        pool.resume_chunk_streaming(&work, resumed, &cancel, Some(sender)),
+        stream_work
+    );
+    let durable = async {
+        let persisted = persisted?;
+        // Tasks cancelled before spawning have no stream record.
+        let remaining: Vec<_> = outcome
+            .records
+            .iter()
+            .filter(|r| !persisted.contains(r.index))
+            .cloned()
+            .collect();
+        if !remaining.is_empty() {
+            ledger.append(remaining).await?;
+        }
+        Ok::<_, TaskArrayNodeError>(())
     }
-    // The leader learns of the chunk only once its records are durable,
-    // so `relish batch results` never misses a retired chunk. If the disk
-    // fails the result still goes back: the leader's counts don't depend
-    // on this node's ledger.
-    if let Err(error) = ledger.append(outcome.records).await {
+    .await;
+    if let Err(error) = durable {
+        *failure.lock().await = Some(format!("task durability unavailable: {error}"));
+        array_cancel.cancel();
         eprintln!(
-            "bun: task array {}: ledger write failed: {error}",
+            "bun: task array {}: cannot acknowledge chunk: {error}",
             work.batch_id
         );
+        return;
     }
     // Keyed by attempt too: a taken-back run finishing late mustn't
     // overwrite the result of the chunk's newer grant on this node.
@@ -576,8 +929,8 @@ async fn run_chunk(
         .insert((work.chunk.0, work.grant_attempt), outcome.result);
 }
 
-fn write_outputs(directory: &Path, outputs: &[(u32, CapturedOutput)]) -> std::io::Result<()> {
-    for (index, output) in outputs {
+fn write_outputs(directory: &Path, outputs: &[(u32, u64, CapturedOutput)]) -> std::io::Result<()> {
+    for (index, grant, output) in outputs {
         let mut bytes = output.head.clone();
         if !output.tail.is_empty() {
             let kept = (output.head.len() + output.tail.len()) as u64;
@@ -588,9 +941,12 @@ fn write_outputs(directory: &Path, outputs: &[(u32, CapturedOutput)]) -> std::io
             }
             bytes.extend_from_slice(&output.tail);
         }
-        std::fs::write(directory.join(index.to_string()), bytes)?;
+        use std::io::Write;
+        let mut file = std::fs::File::create(directory.join(format!("{index}-{grant}")))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
     }
-    Ok(())
+    std::fs::File::open(directory)?.sync_all()
 }
 
 #[cfg(test)]
@@ -629,9 +985,11 @@ mod tests {
         )
     }
 
-    fn assignment(batch_id: u64, count: u32, held: &[(u32, u8)]) -> ArrayAssignment {
+    fn assignment(batch_id: u64, count: u32, held: &[(u32, u64)]) -> ArrayAssignment {
         ArrayAssignment {
+            template: None,
             batch_id,
+            resources: crate::meat::Resources::new(1000, 64 << 20, 0),
             spec: TaskArraySpec {
                 chunk_size: 10,
                 ..TaskArraySpec::with_count(count)
@@ -652,6 +1010,7 @@ mod tests {
 
     fn request(arrays: Vec<ArrayAssignment>) -> NodeSyncRequest {
         NodeSyncRequest {
+            version: ControlVersion::default(),
             known: arrays.iter().map(|a| a.batch_id).collect(),
             arrays,
         }
@@ -679,6 +1038,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_epoch_refuses_old_ledgers_persistently_without_deleting_them() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let mut old = request(vec![assignment(1, 10, &[(0, 5)])]);
+        old.version = ControlVersion {
+            epoch: 0,
+            term: 7,
+            index: 99,
+        };
+        sync_until_finished(&node, &old, 1).await;
+        // The derived index can update shutdown metadata; compare authoritative files.
+        let files: BTreeMap<_, _> = std::fs::read_dir(node.array_dir(1))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("ledger" | "grants.json")
+                )
+            })
+            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+            .collect();
+        let mut restored = request(vec![assignment(1, 10, &[(0, 1)])]);
+        restored.version = ControlVersion {
+            epoch: 1,
+            term: 1,
+            index: 1,
+        };
+        let response = node.sync(&restored).await.arrays.remove(0);
+        assert!(response.refused.unwrap().contains("recovery epoch"));
+        assert!(response.finished.is_empty());
+        drop(node);
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        // Even a later control snapshot forgetting the old submission must not erase its evidence.
+        restarted
+            .sync(&NodeSyncRequest {
+                version: restored.version,
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            restarted.sync(&restored).await.arrays[0]
+                .refused
+                .as_ref()
+                .unwrap()
+                .contains("recovery epoch")
+        );
+        for (path, bytes) in files {
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "{} changed",
+                path.display()
+            );
+        }
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_node = fake_node(fresh.path(), FakeRunner::always_succeeds());
+        assert_eq!(
+            sync_until_finished(&fresh_node, &restored, 1)
+                .await
+                .finished[0]
+                .attempt,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_grant_fence_keeps_refusing_after_the_disk_is_repaired() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        node.sync(&request(vec![assignment(1, 10, &[])])).await;
+        let fence = node.array_dir(1).join("grants.json");
+        std::fs::create_dir(&fence).unwrap();
+        let grant = request(vec![assignment(1, 10, &[(0, 1)])]);
+        let first = node.sync(&grant).await.arrays.remove(0);
+        assert!(first.refused.unwrap().contains("grant fence"));
+        std::fs::remove_dir(&fence).unwrap();
+        let later = node.sync(&grant).await.arrays.remove(0);
+        assert!(later.refused.unwrap().contains("grant fence"));
+        assert!(later.finished.is_empty());
+        assert_eq!(later.counters.attempts_started, 0);
+    }
+
+    #[tokio::test]
     async fn held_chunks_run_and_are_reported_at_their_attempt() {
         let root = tempfile::tempdir().unwrap();
         let node = fake_node(root.path(), FakeRunner::always_succeeds());
@@ -686,7 +1129,7 @@ mod tests {
         let progress = sync_until_finished(&node, &sync, 2).await;
         assert_eq!(progress.slots, 8);
         assert_eq!(progress.refused, None);
-        let finished: Vec<(u32, u8, u32)> = progress
+        let finished: Vec<(u32, u64, u32)> = progress
             .finished
             .iter()
             .map(|r| (r.chunk.0, r.attempt, r.succeeded))
@@ -807,6 +1250,7 @@ mod tests {
 
         // Finished: no longer assigned, but still known.
         node.sync(&NodeSyncRequest {
+            version: ControlVersion::default(),
             known: vec![1],
             arrays: Vec::new(),
         })

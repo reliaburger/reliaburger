@@ -3,8 +3,10 @@
 Reviewed on 3 October 2026, rebased onto main `41dfc9ba35d377a36359cd86a7b76382301cfc1e`.
 The original PR head was `160bd16f7ea4e402fc5e775cd442cefe3780285c`.
 Compatibility is now protocol 35 / state 50 (main was 34 / 49).
-This review changes integration and records evidence; it does not implement the
-architectural corrections below.
+This archived review describes rebased head `9d975d9e828e36a61983bf44ca9292ae76428a8a`.
+Run its defect probes only against that head. The subsequent authorised
+implementation is tracked in the [4 October plan](../../plans/2026-10-04-plan-delegated-jobs.md);
+its recovery tests assert the corrected behaviour, rather than these defects.
 
 ## Recommendation
 

@@ -1302,6 +1302,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // used to carry zeroes).
     let (capacity_cpu, capacity_memory) = node_capacity(&config);
     agent.set_node_capacity(capacity_cpu, capacity_memory);
+    let execution_budget = agent.execution_budget();
 
     // Thread the `[process_workloads]` policy into the supervisor (D17/H8).
     // Without this the supervisor keeps its deny-by-default constructor
@@ -1853,6 +1854,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Adopt workloads that survived a previous bun process (restart or
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
     agent.adopt_recorded_instances().await?;
+    let task_runner = agent.delegated_task_runner(&data_base)?;
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    let task_runner = if let Some(kernel) = agent.delegated_namespace_kernel() {
+        task_runner.with_namespace_policy(
+            reliaburger::bun::task_namespace::TaskNamespacePolicy::recover(kernel, &data_base)
+                .await?,
+        )
+    } else {
+        task_runner
+    };
     let deploy_history = agent.deploy_history_handle();
 
     // Onion DNS: start the .internal responder when [dns] enables it,
@@ -2783,8 +2794,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases.clone()),
         jwt_verifier,
         Some(status_reader),
-        // Task arrays run host processes, gated by the same allowlist as
-        // process workloads, with a ledger under the data directory.
+        // Delegated tasks share the agent runtime and resource commitments;
+        // detailed outcomes remain in durable worker ledgers.
         Some(Arc::new(
             reliaburger::bun::task_array_leader::TaskArrayService::new(Some(Arc::new(
                 reliaburger::bun::task_array_node::TaskArrayNode::new(
@@ -2792,11 +2803,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         &data_base,
                         config.process_workloads.clone(),
                     ),
-                    reliaburger::bun::task_array_node::NodeRunner::Process(
-                        reliaburger::bun::task_executor::ProcessRunner::default(),
-                    ),
-                ),
-            ))),
+                    reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
+                )
+                .with_budget(execution_budget),
+            )))
+            .with_trust_policy(config.images.trust_policy.clone()),
         )),
     );
     let app = match &registry_forwarder {

@@ -11,8 +11,8 @@
 //! [`SILENCE_TIMEOUT`] gets a `Requeue`, which hands its chunks to others
 //! at the next attempt, so a late report from it is fenced off.
 //!
-//! The same loop runs standalone (no council): the arrays then live in
-//! memory and the only node is this one.
+//! Tests can run the same loop with volatile standalone state. Production
+//! admission requires a council for durable definitions and identities.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -66,9 +66,13 @@ pub struct NodeView {
 /// Task-array settings, the node executor and the leader's in-memory
 /// view, shared by the API handlers and the leader loop.
 pub struct TaskArrayService {
+    /// Image signature policy applied before admission and dispatch.
+    pub trust_policy: crate::config::node::TrustPolicySection,
     /// This node's executor; `None` means this node can't run tasks
     /// (it still coordinates when it leads).
     pub node: Option<Arc<TaskArrayNode>>,
+    /// Production definitions require replicated storage, never volatile IDs.
+    require_council: bool,
     /// Time between syncs.
     pub sync_interval: Duration,
     /// Silence before a node's chunks are taken back.
@@ -77,27 +81,58 @@ pub struct TaskArrayService {
     local: Mutex<TaskArrays>,
     /// What each node last said about each array, by batch id.
     views: Mutex<HashMap<u64, BTreeMap<NodeId, NodeView>>>,
+    rates: Mutex<HashMap<u64, super::task_rates::RateSample>>,
 }
 
 impl TaskArrayService {
     /// A service with the production timings.
     pub fn new(node: Option<Arc<TaskArrayNode>>) -> Self {
-        Self::with_timings(node, SYNC_INTERVAL, SILENCE_TIMEOUT)
+        let mut service = Self::with_timings(node, SYNC_INTERVAL, SILENCE_TIMEOUT);
+        service.require_council = true;
+        service
     }
 
-    /// A service with explicit timings (tests use short ones).
+    /// Apply the configured image policy to batch admission too.
+    pub fn with_trust_policy(mut self, policy: crate::config::node::TrustPolicySection) -> Self {
+        self.trust_policy = policy;
+        self
+    }
+
+    /// Test harness service with explicit timings and volatile standalone state.
+    /// Production uses `new`, which requires a council for durable definitions.
     pub fn with_timings(
         node: Option<Arc<TaskArrayNode>>,
         sync_interval: Duration,
         silence_timeout: Duration,
     ) -> Self {
         Self {
+            trust_policy: Default::default(),
+            require_council: false,
             node,
             sync_interval,
             silence_timeout,
             local: Mutex::new(TaskArrays::default()),
             views: Mutex::new(HashMap::new()),
+            rates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Rate of unique accepted results; first or stale samples are unknown.
+    pub async fn rates(&self, batch_id: u64, counts: (u64, u64)) -> super::task_rates::TaskRates {
+        let now = Instant::now();
+        let epoch_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.rates
+            .lock()
+            .await
+            .entry(batch_id)
+            .or_insert_with(|| super::task_rates::RateSample::new(counts, now, epoch_ms))
+            .update(counts, now, epoch_ms)
     }
 
     /// What each node last said about `batch_id`.
@@ -126,9 +161,25 @@ pub enum TaskArrayWriteError {
 /// Returns the new id for a registration.
 pub(crate) async fn write_task_array(
     state: &ApiState,
-    write: TaskArrayWrite,
+    mut write: TaskArrayWrite,
 ) -> Result<Option<u64>, TaskArrayWriteError> {
+    match &mut write {
+        TaskArrayWrite::Sync { now_epoch_secs, .. }
+        | TaskArrayWrite::Cancel { now_epoch_secs, .. }
+        | TaskArrayWrite::Requeue { now_epoch_secs, .. }
+        | TaskArrayWrite::CancelManifest { now_epoch_secs, .. }
+            if *now_epoch_secs == 0 =>
+        {
+            *now_epoch_secs = crate::meat::batch_tracker::epoch_now_secs();
+        }
+        _ => {}
+    }
     let Some(council) = &state.council else {
+        if state.task_arrays.require_council {
+            return Err(TaskArrayWriteError::Unavailable(
+                "delegated arrays require a council for durable definitions and identities".into(),
+            ));
+        }
         let mut tracker = state.batch_tracker.lock().await;
         let mut arrays = state.task_arrays.local.lock().await;
         return match arrays.apply(&write, || tracker.allocate_id()) {
@@ -176,8 +227,16 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
                 .collect()
         })
         .unwrap_or_default();
+    let mut template = record.template.clone();
+    template.namespace = Some(record.namespace.clone());
     ArrayAssignment {
+        template: Some(Box::new(template)),
         batch_id,
+        resources: crate::meat::Resources::new(
+            record.template.cpu.map_or(1000, |r| r.request),
+            record.template.memory.map_or(64 << 20, |r| r.request),
+            0,
+        ),
         spec: state.spec.clone(),
         program: record.template.exec.clone().unwrap_or_default(),
         args: record.template.command.clone().unwrap_or_default(),
@@ -200,6 +259,7 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
 /// every array the cluster still keeps.
 pub fn sync_request_for(arrays: &TaskArrays, node: &NodeId) -> NodeSyncRequest {
     NodeSyncRequest {
+        version: Default::default(),
         known: arrays.ids(),
         arrays: arrays
             .active()
@@ -241,6 +301,7 @@ pub fn plan_sync(
         return None;
     }
     Some(TaskArrayWrite::Sync {
+        now_epoch_secs: 0,
         batch_id,
         results,
         grants,
@@ -351,21 +412,35 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         memory.last_heard.clear();
         memory.last_known.clear();
         memory.failing.clear();
+        state.task_arrays.rates.lock().await.clear();
         return;
     }
     let now = Instant::now();
     let since = *memory.since.get_or_insert(now);
-    let arrays = read_task_arrays(state).await;
-    let known = arrays.ids();
-    if known.is_empty() {
-        // Nothing to run and nothing any node could still hold: arrays
-        // are only pruned when a new one registers.
+    let (arrays, version) = match &state.council {
+        Some(council) => {
+            let desired = council.desired_state().await;
+            let version = super::task_array_node::ControlVersion {
+                epoch: desired.recovery_epoch,
+                term: council.current_term(),
+                index: desired.last_applied_log.map_or(0, |id| id.index),
+            };
+            (desired.task_arrays, version)
+        }
+        None => (read_task_arrays(state).await, Default::default()),
+    };
+    if !is_leading(state).await {
         return;
     }
+    let known = arrays.ids();
+    // Even an empty restored snapshot must reach workers: they can hold
+    // pre-recovery attempts or directories unknown to this council history.
+    // last_known below suppresses repeats only after a successful sync.
 
     let mut calls = tokio::task::JoinSet::new();
     for (node, url) in sync_targets(state).await {
-        let request = sync_request_for(&arrays, &node);
+        let mut request = sync_request_for(&arrays, &node);
+        request.version = version;
         if request.arrays.is_empty() && memory.last_known.get(&node) == Some(&known) {
             continue;
         }
@@ -418,7 +493,11 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             eprintln!(
                 "bun: task array {batch_id}: {node} can't finish its chunks; requeueing them"
             );
-            let write = TaskArrayWrite::Requeue { batch_id, node };
+            let write = TaskArrayWrite::Requeue {
+                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                batch_id,
+                node,
+            };
             if let Err(error) = write_task_array(state, write).await {
                 eprintln!("bun: task array {batch_id}: requeue failed: {error}");
             }
@@ -438,6 +517,19 @@ async fn remember_views(
     answers: &[(NodeId, NodeSyncResponse)],
     arrays: &TaskArrays,
 ) {
+    state
+        .task_arrays
+        .rates
+        .lock()
+        .await
+        .retain(|id, _| arrays.get(*id).is_some() || arrays.manifest(*id).is_some());
+    for (id, record) in arrays.iter() {
+        let summary = record.state.summary();
+        state
+            .task_arrays
+            .rates(id, (summary.succeeded, summary.failed))
+            .await;
+    }
     let mut views = state.task_arrays.views.lock().await;
     views.retain(|batch_id, _| arrays.get(*batch_id).is_some());
     for (node, response) in answers {
@@ -500,6 +592,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("PLAIN".to_string(), EnvValue::Plain("yes".to_string()));
         TaskArrayRecord {
+            terminal_at_epoch_secs: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: JobSpec {
@@ -539,11 +632,13 @@ mod tests {
         }
     }
 
-    fn done(chunk: u32, attempt: u8, succeeded: u32) -> ChunkResult {
+    fn done(chunk: u32, attempt: u64, succeeded: u32) -> ChunkResult {
         ChunkResult {
+            duration_counts: [0; 16],
             chunk: ChunkId(chunk),
             attempt,
             succeeded,
+            failed_count: 0,
             failed_indices: IndexRangeSet::new(),
             not_run: 0,
             retried: 0,
@@ -593,7 +688,13 @@ mod tests {
         arrays.apply(&register(5), || 1).unwrap();
         arrays.apply(&register(5), || 2).unwrap();
         arrays
-            .apply(&TaskArrayWrite::Cancel { batch_id: 1 }, || 0)
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    now_epoch_secs: 0,
+                    batch_id: 1,
+                },
+                || 0,
+            )
             .unwrap();
         let request = sync_request_for(&arrays, &node("a"));
         assert_eq!(request.known, vec![1, 2]);
@@ -616,7 +717,10 @@ mod tests {
         )
         .unwrap();
         let TaskArrayWrite::Sync {
-            results, grants, ..
+            now_epoch_secs: 0,
+            results,
+            grants,
+            ..
         } = write
         else {
             panic!("expected a sync");
@@ -637,6 +741,7 @@ mod tests {
         assert_eq!(
             write,
             TaskArrayWrite::Sync {
+                now_epoch_secs: 0,
                 batch_id: 1,
                 results: vec![(node("a"), done(0, 1, 10))],
                 grants: vec![(node("a"), IndexRangeSet::from_range(2..=2))],

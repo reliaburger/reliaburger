@@ -2,11 +2,13 @@
 
 Status: in progress on `feat/million-jobs`, for **0.2.0** ("A million jobs").
 Task arrays are wired into Raft, the API and `relish` (M5). The wiring bumped
-the compatibility generations to protocol 35 and state 50, so 0.2.0 needs a
+the compatibility generations to protocol 36 and state 51, so 0.2.0 needs a
 fresh cluster: the maintainer decided on 28 September 2026 that there's no
 backwards compatibility before 1.0.0 (see [Compatibility](#compatibility)).
 
-This file is the single source of truth. It supersedes
+The October [resource-aware plan](2026-10-04-plan-delegated-jobs.md) now owns
+implementation and qualification. This file retains the September design and
+library history. It originally superseded
 [`2026-09-25-plan-task-arrays.md`](2026-09-25-plan-task-arrays.md) (merged in
 from `plans/million-jobs` unchanged), whose findings it keeps and whose
 100,000-job tour step becomes the fallback headline below.
@@ -18,7 +20,9 @@ from `plans/million-jobs` unchanged), whose findings it keeps and whose
 **3 October review:** keep the array/chunk concept, but resource accounting,
 durable outcomes and stale-grant fencing need correction before finishing the
 feature. Five defects reproduced; see the [review and qualification evidence](../qualification/2026-10-03-task-array-review/README.md).
-The next implementation step awaits the maintainer's decision after this review.
+The maintainer authorised implementation on 4 October. The
+[resource-aware delegated jobs plan](2026-10-04-plan-delegated-jobs.md) now owns
+implementation and qualification; the library history below is retained.
 
 - **Branch:** `feat/million-jobs`, rebased onto `main` at `41dfc9ba` on
   3 October 2026 (the original base was `087d882f`). Draft PR #266, "Million jobs:
@@ -59,7 +63,7 @@ The next implementation step awaits the maintainer's decision after this review.
     nodes, follower killed mid-run) in `make test-cluster`.
   - Docs: manual `01_deploy-an-app.md` "Task arrays"; book Chapter 12
     "Wiring it in"; `docs/roadmap.md`; README; `docs/testing.md`.
-- **Next, in order:**
+- **September next steps (superseded by the October plan):**
   1. Before the rebase, CI on PR #266 was green with `full-ci` (run
      36486408185, commit `348db40f`: lint, portable Linux and macOS, privileged Linux, minimum
      Rust, benchmarks, acceptance, and the multi-node cluster job, which

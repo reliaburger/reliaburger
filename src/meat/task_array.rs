@@ -8,8 +8,8 @@
 //!
 //! Indices are grouped into fixed-size *chunks*. The chunk, not the task,
 //! is what the leader allocates to nodes and records in Raft, so the
-//! control plane's cost grows with `count / chunk_size`, never with
-//! `count`. See `docs/plans/2026-09-28-plan-million-jobs.md`.
+//! control plane's cost grows with `count / chunk_size`; at a fixed
+//! chunk size it still grows with the task count. See `docs/plans/2026-09-28-plan-million-jobs.md`.
 
 use std::ops::RangeInclusive;
 
@@ -51,8 +51,8 @@ pub const INDEX_PLACEHOLDER: &str = "{index}";
 pub struct ChunkId(pub u32);
 
 /// Count and policy for a task array. Travels beside the job template
-/// rather than inside it, because [`JobSpec`] refuses unknown fields and
-/// older nodes must keep parsing it.
+/// rather than inside it, keeping ordinary job configuration separate from
+/// delegated execution policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskArraySpec {
     /// Number of tasks; indices run from 0 to `count - 1`.
@@ -71,7 +71,7 @@ pub struct TaskArraySpec {
     #[serde(default = "default_task_timeout_secs")]
     pub task_timeout_secs: u32,
     /// Most tasks of this array one node runs at once. `None` lets each
-    /// node use its CPU count.
+    /// node use its configured safety cap, further bounded by resource requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_node_concurrency: Option<u32>,
 }
@@ -109,7 +109,9 @@ pub enum TaskArraySpecError {
     TimeoutOutOfRange { seconds: u32 },
     #[error("per-node concurrency must be at least 1")]
     ZeroConcurrency,
-    #[error("a task array template needs `exec` (a host binary); {found} isn't supported yet")]
+    #[error(
+        "a task array template needs exactly one of `image` or `exec`; {found} isn't supported"
+    )]
     UnsupportedTemplate { found: &'static str },
     #[error("a task array template can't have {field}")]
     TemplateField { field: &'static str },
@@ -190,19 +192,39 @@ impl TaskArraySpec {
     }
 }
 
-/// Check that a job template can be run as a task array. Version 1 runs
-/// host binaries only: images and inline scripts come later, and cron
-/// schedules and `run_before` ordering make no sense per task.
+/// Check a homogeneous image or host template. Cron schedules, inline scripts
+/// and dependency hooks do not describe individual delegated tasks.
 pub fn validate_template(template: &JobSpec) -> Result<(), TaskArraySpecError> {
-    if template.image.is_some() {
-        return Err(TaskArraySpecError::UnsupportedTemplate { found: "an image" });
+    // At most 64 active profiles are copied into a node sync. Bound each
+    // template so argv/environment cannot turn that into an unbounded RPC.
+    if serde_json::to_vec(template).map_or(true, |bytes| bytes.len() > 16 * 1024) {
+        return Err(TaskArraySpecError::TemplateField {
+            field: "a template larger than 16 KiB",
+        });
+    }
+    if template.image.is_some() && template.exec.is_some() {
+        return Err(TaskArraySpecError::UnsupportedTemplate {
+            found: "both image and exec",
+        });
     }
     if template.script.is_some() {
         return Err(TaskArraySpecError::UnsupportedTemplate { found: "a script" });
     }
-    if template.exec.is_none() {
+    if template.exec.is_none() && template.image.is_none() {
         return Err(TaskArraySpecError::UnsupportedTemplate {
-            found: "a template without exec",
+            found: "a template without image or exec",
+        });
+    }
+    if template.cpu.is_some_and(|r| r.request == 0)
+        || template.memory.is_some_and(|r| r.request == 0)
+    {
+        return Err(TaskArraySpecError::TemplateField {
+            field: "a zero CPU or memory request",
+        });
+    }
+    if template.env.values().any(|value| value.is_encrypted()) {
+        return Err(TaskArraySpecError::TemplateField {
+            field: "encrypted environment values",
         });
     }
     if template.schedule.is_some() {
@@ -433,16 +455,15 @@ mod tests {
     }
 
     #[test]
-    fn templates_must_be_plain_exec_jobs() {
+    fn templates_accept_images_and_exec_but_refuse_dependencies() {
         assert_eq!(validate_template(&exec_template(&["{index}"])), Ok(()));
 
         let mut image = exec_template(&[]);
         image.exec = None;
         image.image = Some("alpine:3".to_string());
-        assert!(matches!(
-            validate_template(&image),
-            Err(TaskArraySpecError::UnsupportedTemplate { .. })
-        ));
+        assert_eq!(validate_template(&image), Ok(()));
+        image.exec = Some("/bin/true".into());
+        assert!(validate_template(&image).is_err());
 
         let mut scheduled = exec_template(&[]);
         scheduled.schedule = Some("* * * * *".to_string());

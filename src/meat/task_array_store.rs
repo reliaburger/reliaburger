@@ -45,11 +45,39 @@ pub struct TaskArrayRecord {
     pub template: JobSpec,
     /// Chunks, grants and counts.
     pub state: TaskArrayState,
+    /// Timestamp of the accepted terminal transition, supplied by the leader.
+    pub terminal_at_epoch_secs: Option<u64>,
+}
+
+/// One homogeneous resource profile in a mixed submission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestCohort {
+    pub name: String,
+    #[serde(flatten)]
+    pub spec: TaskArraySpec,
+    pub template: JobSpec,
+}
+/// Durable mapping from a manifest's profile names to stable array identities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskManifest {
+    pub name: String,
+    pub namespace: String,
+    pub cohorts: Vec<(String, u64)>,
+    pub submitted_at_epoch_secs: u64,
 }
 
 /// A change to the set of task arrays. Carried by one Raft entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TaskArrayWrite {
+    /// Atomically register every profile before any work is dispatched.
+    RegisterManifest {
+        name: String,
+        namespace: String,
+        cohorts: Vec<ManifestCohort>,
+        submitted_at_epoch_secs: u64,
+    },
+    /// Cancel every profile through one replicated operation.
+    CancelManifest { batch_id: u64, now_epoch_secs: u64 },
     /// Submit a new array. The id comes from the cluster's batch counter,
     /// so array and ordinary batch ids never collide.
     Register {
@@ -62,6 +90,7 @@ pub enum TaskArrayWrite {
     },
     /// Record finished chunks, then hand out new ones.
     Sync {
+        now_epoch_secs: u64,
         batch_id: u64,
         /// Chunks nodes finished, each fenced by its grant attempt.
         results: Vec<(NodeId, ChunkResult)>,
@@ -70,9 +99,13 @@ pub enum TaskArrayWrite {
         grants: Vec<(NodeId, IndexRangeSet)>,
     },
     /// Stop an array: nothing new starts, running chunks drain.
-    Cancel { batch_id: u64 },
+    Cancel { batch_id: u64, now_epoch_secs: u64 },
     /// A node went quiet: take its chunks back at the next attempt.
-    Requeue { batch_id: u64, node: NodeId },
+    Requeue {
+        batch_id: u64,
+        node: NodeId,
+        now_epoch_secs: u64,
+    },
 }
 
 /// What an applied write did.
@@ -98,6 +131,8 @@ pub enum TaskArrayApplied {
 /// Why a write was refused as a whole.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TaskArrayStoreError {
+    #[error("invalid task manifest: {0}")]
+    Manifest(String),
     #[error("task array {batch_id} not found")]
     UnknownArray { batch_id: u64 },
     #[error("invalid task array: {0}")]
@@ -112,6 +147,7 @@ pub enum TaskArrayStoreError {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskArrays {
     arrays: BTreeMap<u64, TaskArrayRecord>,
+    manifests: BTreeMap<u64, TaskManifest>,
 }
 
 impl TaskArrays {
@@ -120,9 +156,94 @@ impl TaskArrays {
     pub fn apply(
         &mut self,
         write: &TaskArrayWrite,
-        allocate_id: impl FnOnce() -> u64,
+        mut allocate_id: impl FnMut() -> u64,
     ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
         match write {
+            TaskArrayWrite::RegisterManifest {
+                name,
+                namespace,
+                cohorts,
+                submitted_at_epoch_secs,
+            } => {
+                if !crate::config::valid_workload_label(name)
+                    || !crate::config::valid_workload_label(namespace)
+                    || cohorts.is_empty()
+                    || cohorts.len() > 16
+                {
+                    return Err(TaskArrayStoreError::Manifest(
+                        "give DNS-label name/namespace and 1–16 resource profiles".into(),
+                    ));
+                }
+                let mut names = std::collections::BTreeSet::new();
+                let mut total = 0u64;
+                for cohort in cohorts {
+                    if !crate::config::valid_workload_label(&cohort.name)
+                        || !names.insert(&cohort.name)
+                    {
+                        return Err(TaskArrayStoreError::Manifest(
+                            "profile names must be nonempty and unique".into(),
+                        ));
+                    }
+                    cohort.spec.validate()?;
+                    validate_template(&cohort.template)?;
+                    total += u64::from(cohort.spec.count);
+                }
+                if total > u64::from(super::task_array::MAX_TASK_COUNT) {
+                    return Err(TaskArrayStoreError::Manifest(
+                        "manifest exceeds the task-count bound".into(),
+                    ));
+                }
+                if self.active().count() + cohorts.len() > MAX_ACTIVE_ARRAYS {
+                    return Err(TaskArrayStoreError::TooManyActive {
+                        active: self.active().count(),
+                    });
+                }
+                self.prune(*submitted_at_epoch_secs);
+                let batch_id = allocate_id();
+                let mut identities = Vec::new();
+                for cohort in cohorts {
+                    let id = allocate_id();
+                    let state = TaskArrayState::new(cohort.spec.clone(), *submitted_at_epoch_secs)?;
+                    self.arrays.insert(
+                        id,
+                        TaskArrayRecord {
+                            name: name.clone(),
+                            namespace: namespace.clone(),
+                            template: cohort.template.clone(),
+                            state,
+                            terminal_at_epoch_secs: None,
+                        },
+                    );
+                    identities.push((cohort.name.clone(), id));
+                }
+                self.manifests.insert(
+                    batch_id,
+                    TaskManifest {
+                        name: name.clone(),
+                        namespace: namespace.clone(),
+                        cohorts: identities,
+                        submitted_at_epoch_secs: *submitted_at_epoch_secs,
+                    },
+                );
+                Ok(TaskArrayApplied::Registered { batch_id })
+            }
+            TaskArrayWrite::CancelManifest {
+                batch_id,
+                now_epoch_secs,
+            } => {
+                let manifest = self
+                    .manifests
+                    .get(batch_id)
+                    .ok_or(TaskArrayStoreError::UnknownArray {
+                        batch_id: *batch_id,
+                    })?
+                    .clone();
+                for (_, id) in manifest.cohorts {
+                    self.record_mut(id)?.state.cancel();
+                    self.mark_terminal(id, *now_epoch_secs)?;
+                }
+                Ok(TaskArrayApplied::Cancelled)
+            }
             TaskArrayWrite::Register {
                 name,
                 namespace,
@@ -130,7 +251,9 @@ impl TaskArrays {
                 spec,
                 submitted_at_epoch_secs,
             } => {
-                if name.trim().is_empty() {
+                if !crate::config::valid_workload_label(name)
+                    || !crate::config::valid_workload_label(namespace)
+                {
                     return Err(TaskArrayStoreError::EmptyName);
                 }
                 validate_template(template)?;
@@ -144,6 +267,7 @@ impl TaskArrays {
                 self.arrays.insert(
                     batch_id,
                     TaskArrayRecord {
+                        terminal_at_epoch_secs: None,
                         name: name.clone(),
                         namespace: namespace.clone(),
                         template: (**template).clone(),
@@ -153,6 +277,7 @@ impl TaskArrays {
                 Ok(TaskArrayApplied::Registered { batch_id })
             }
             TaskArrayWrite::Sync {
+                now_epoch_secs,
                 batch_id,
                 results,
                 grants,
@@ -171,6 +296,7 @@ impl TaskArrays {
                         Err(_) => applied.3 += 1,
                     }
                 }
+                self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Synced {
                     results_applied: applied.0,
                     results_refused: applied.1,
@@ -178,15 +304,32 @@ impl TaskArrays {
                     grants_refused: applied.3,
                 })
             }
-            TaskArrayWrite::Cancel { batch_id } => {
+            TaskArrayWrite::Cancel {
+                batch_id,
+                now_epoch_secs,
+            } => {
                 self.record_mut(*batch_id)?.state.cancel();
+                self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Cancelled)
             }
-            TaskArrayWrite::Requeue { batch_id, node } => {
+            TaskArrayWrite::Requeue {
+                batch_id,
+                node,
+                now_epoch_secs,
+            } => {
                 let chunks = self.record_mut(*batch_id)?.state.requeue_node(node);
+                self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Requeued { chunks })
             }
         }
+    }
+
+    fn mark_terminal(&mut self, id: u64, now: u64) -> Result<(), TaskArrayStoreError> {
+        let record = self.record_mut(id)?;
+        if record.state.status().is_terminal() && record.terminal_at_epoch_secs.is_none() {
+            record.terminal_at_epoch_secs = Some(now.max(record.state.submitted_at_epoch_secs));
+        }
+        Ok(())
     }
 
     fn record_mut(&mut self, batch_id: u64) -> Result<&mut TaskArrayRecord, TaskArrayStoreError> {
@@ -199,21 +342,65 @@ impl TaskArrays {
     /// [`MAX_TERMINAL_ARRAYS`] of the rest (newest ids win). `now` comes
     /// from the write, so every replica prunes the same arrays.
     fn prune(&mut self, now_epoch_secs: u64) {
-        self.arrays.retain(|_, record| {
-            !(record.state.status().is_terminal()
-                && now_epoch_secs.saturating_sub(record.state.submitted_at_epoch_secs)
-                    > TERMINAL_RETENTION_SECS)
-        });
-        let terminal: Vec<u64> = self
-            .arrays
-            .iter()
-            .filter(|(_, record)| record.state.status().is_terminal())
-            .map(|(id, _)| *id)
+        let children: std::collections::BTreeSet<u64> = self
+            .manifests
+            .values()
+            .flat_map(|m| m.cohorts.iter().map(|(_, id)| *id))
             .collect();
-        let excess = terminal.len().saturating_sub(MAX_TERMINAL_ARRAYS);
-        for id in terminal.into_iter().take(excess) {
-            self.arrays.remove(&id);
+        // A parent and all its profiles are one retention unit. Its clock
+        // starts when the last profile finishes, not at submission.
+        let mut terminal: Vec<(u64, u64, bool)> = self
+            .manifests
+            .iter()
+            .filter_map(|(id, m)| {
+                let completed: Option<Vec<u64>> = m
+                    .cohorts
+                    .iter()
+                    .map(|(_, child)| self.arrays.get(child)?.terminal_at_epoch_secs)
+                    .collect();
+                completed.map(|times| (times.into_iter().max().unwrap_or(0), *id, true))
+            })
+            .chain(self.arrays.iter().filter_map(|(id, r)| {
+                if children.contains(id) {
+                    return None;
+                }
+                r.terminal_at_epoch_secs.map(|time| (time, *id, false))
+            }))
+            .collect();
+        terminal.sort_unstable();
+        let retained = terminal
+            .iter()
+            .filter(|(time, _, _)| now_epoch_secs.saturating_sub(*time) <= TERMINAL_RETENTION_SECS)
+            .count();
+        let mut excess = retained.saturating_sub(MAX_TERMINAL_ARRAYS);
+        for (time, id, parent) in terminal {
+            let expired = now_epoch_secs.saturating_sub(time) > TERMINAL_RETENTION_SECS;
+            if !expired && excess == 0 {
+                continue;
+            }
+            if !expired {
+                excess -= 1;
+            }
+            if parent {
+                if let Some(manifest) = self.manifests.remove(&id) {
+                    for (_, child) in manifest.cohorts {
+                        self.arrays.remove(&child);
+                    }
+                }
+            } else {
+                self.arrays.remove(&id);
+            }
         }
+    }
+
+    /// Retained parent summaries, without enumerating any task.
+    pub fn manifests(&self) -> impl Iterator<Item = (u64, &TaskManifest)> {
+        self.manifests.iter().map(|(id, manifest)| (*id, manifest))
+    }
+
+    /// Look up a mixed-profile submission.
+    pub fn manifest(&self, batch_id: u64) -> Option<&TaskManifest> {
+        self.manifests.get(&batch_id)
     }
 
     /// Look up an array.
@@ -296,11 +483,13 @@ mod tests {
         }
     }
 
-    fn finished(chunk: u32, attempt: u8, succeeded: u32) -> ChunkResult {
+    fn finished(chunk: u32, attempt: u64, succeeded: u32) -> ChunkResult {
         ChunkResult {
+            duration_counts: [0; 16],
             chunk: ChunkId(chunk),
             attempt,
             succeeded,
+            failed_count: 0,
             failed_indices: IndexRangeSet::new(),
             not_run: 0,
             retried: 0,
@@ -313,6 +502,7 @@ mod tests {
         grants: Vec<(NodeId, IndexRangeSet)>,
     ) -> TaskArrayWrite {
         TaskArrayWrite::Sync {
+            now_epoch_secs: 0,
             batch_id,
             results,
             grants,
@@ -344,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn register_refuses_an_image_template() {
+    fn register_accepts_an_image_template() {
         let mut arrays = TaskArrays::default();
         let mut image = template();
         image.exec = None;
@@ -356,12 +546,14 @@ mod tests {
             spec: TaskArraySpec::with_count(3),
             submitted_at_epoch_secs: 1,
         };
-        assert!(matches!(
-            arrays.apply(&write, || 1),
-            Err(TaskArrayStoreError::Invalid(
-                TaskArraySpecError::UnsupportedTemplate { .. }
-            ))
-        ));
+        assert_eq!(
+            arrays.apply(&write, || 1).unwrap(),
+            TaskArrayApplied::Registered { batch_id: 1 }
+        );
+        assert_eq!(
+            arrays.get(1).unwrap().template.image.as_deref(),
+            Some("alpine:3")
+        );
     }
 
     #[test]
@@ -400,7 +592,13 @@ mod tests {
         let mut arrays = TaskArrays::default();
         let old = registered(&mut arrays, &register(4, 4, 100), 1);
         arrays
-            .apply(&TaskArrayWrite::Cancel { batch_id: old }, || 0)
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    now_epoch_secs: 0,
+                    batch_id: old,
+                },
+                || 0,
+            )
             .unwrap();
         assert!(arrays.get(old).unwrap().state.status().is_terminal());
 
@@ -425,7 +623,13 @@ mod tests {
         for id in 1..=(MAX_TERMINAL_ARRAYS as u64 + 5) {
             registered(&mut arrays, &register(4, 4, 1), id);
             arrays
-                .apply(&TaskArrayWrite::Cancel { batch_id: id }, || 0)
+                .apply(
+                    &TaskArrayWrite::Cancel {
+                        now_epoch_secs: 0,
+                        batch_id: id,
+                    },
+                    || 0,
+                )
                 .unwrap();
         }
         registered(&mut arrays, &register(4, 4, 1), 1000);
@@ -494,6 +698,7 @@ mod tests {
         arrays
             .apply(
                 &TaskArrayWrite::Requeue {
+                    now_epoch_secs: 0,
                     batch_id: id,
                     node: node("a"),
                 },
@@ -534,8 +739,12 @@ mod tests {
         let mut arrays = TaskArrays::default();
         for write in [
             sync(9, vec![], vec![]),
-            TaskArrayWrite::Cancel { batch_id: 9 },
+            TaskArrayWrite::Cancel {
+                now_epoch_secs: 0,
+                batch_id: 9,
+            },
             TaskArrayWrite::Requeue {
+                now_epoch_secs: 0,
                 batch_id: 9,
                 node: node("a"),
             },
@@ -562,7 +771,13 @@ mod tests {
             )
             .unwrap();
         arrays
-            .apply(&TaskArrayWrite::Cancel { batch_id: id }, || 0)
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    now_epoch_secs: 0,
+                    batch_id: id,
+                },
+                || 0,
+            )
             .unwrap();
         let state = &arrays.get(id).unwrap().state;
         assert_eq!(state.status(), TaskArrayStatus::Stopping);
@@ -571,6 +786,7 @@ mod tests {
         let applied = arrays
             .apply(
                 &TaskArrayWrite::Requeue {
+                    now_epoch_secs: 0,
                     batch_id: id,
                     node: node("a"),
                 },
@@ -599,5 +815,88 @@ mod tests {
         let json = serde_json::to_string(&arrays).unwrap();
         let back: TaskArrays = serde_json::from_str(&json).unwrap();
         assert_eq!(back, arrays);
+    }
+    #[test]
+    fn manifest_retention_starts_at_last_completion_and_keeps_profiles_together() {
+        let mut arrays = TaskArrays::default();
+        let mut next = 1;
+        let cohort = |name: &str| ManifestCohort {
+            name: name.into(),
+            spec: TaskArraySpec {
+                chunk_size: 1,
+                ..TaskArraySpec::with_count(1)
+            },
+            template: *template(),
+        };
+        arrays
+            .apply(
+                &TaskArrayWrite::RegisterManifest {
+                    name: "mixed".into(),
+                    namespace: "default".into(),
+                    cohorts: vec![cohort("small"), cohort("large")],
+                    submitted_at_epoch_secs: 0,
+                },
+                || {
+                    let id = next;
+                    next += 1;
+                    id
+                },
+            )
+            .unwrap();
+        let n = NodeId::new("n1");
+        arrays
+            .apply(
+                &sync(
+                    2,
+                    vec![],
+                    vec![(n.clone(), IndexRangeSet::from_range(0..=0))],
+                ),
+                || panic!("sync allocated ID"),
+            )
+            .unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::Sync {
+                    batch_id: 2,
+                    now_epoch_secs: 100,
+                    results: vec![(n.clone(), finished(0, 1, 1))],
+                    grants: vec![],
+                },
+                || unreachable!(),
+            )
+            .unwrap();
+        registered(&mut arrays, &register(1, 1, 4200), 10);
+        assert!(
+            arrays.get(2).is_some(),
+            "early profile pruned while parent was active"
+        );
+        arrays
+            .apply(
+                &sync(
+                    3,
+                    vec![],
+                    vec![(n.clone(), IndexRangeSet::from_range(0..=0))],
+                ),
+                || unreachable!(),
+            )
+            .unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::Sync {
+                    batch_id: 3,
+                    now_epoch_secs: 5000,
+                    results: vec![(n, finished(0, 1, 1))],
+                    grants: vec![],
+                },
+                || unreachable!(),
+            )
+            .unwrap();
+        registered(&mut arrays, &register(1, 1, 8500), 11);
+        assert!(arrays.manifest(1).is_some());
+        assert!(arrays.get(2).is_some());
+        registered(&mut arrays, &register(1, 1, 8601), 12);
+        assert!(arrays.manifest(1).is_none());
+        assert!(arrays.get(2).is_none());
+        assert!(arrays.get(3).is_none());
     }
 }

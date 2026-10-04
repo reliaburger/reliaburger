@@ -128,8 +128,9 @@ use test_leases::{
 };
 use ui::{
     app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
-    fragment_apps_handler, fragment_instances_handler, fragment_nodes_handler, gitops_handler,
-    login_handler, node_detail_handler, ui_logout_handler, ui_session_handler,
+    fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
+    fragment_nodes_handler, gitops_handler, login_handler, node_detail_handler, ui_logout_handler,
+    ui_session_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -612,6 +613,7 @@ pub fn router_with_upgrade(
         .route("/ui/node/{name}", get(node_detail_handler))
         .route("/ui/gitops", get(gitops_handler))
         .route("/ui/fragment/apps", get(fragment_apps_handler))
+        .route("/ui/fragment/batches", get(fragment_batches_handler))
         .route("/ui/fragment/nodes", get(fragment_nodes_handler))
         .route("/ui/fragment/alerts", get(fragment_alerts_handler))
         .route(
@@ -762,12 +764,20 @@ pub fn router_with_upgrade(
         .route("/v1/test/leases/retired", post(test_lease_retired_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(super::batch::batch_submit_handler))
+        .route(
+            "/v1/batch/summaries",
+            get(super::task_array_api::summaries_handler),
+        )
         .route("/v1/batch/run", post(super::batch::batch_run_handler))
         .route(
             "/v1/batch/{id}/report",
             post(super::batch::batch_report_handler),
         )
         .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
+        .route(
+            "/v1/batch/manifest",
+            post(super::task_array_api::manifest_handler),
+        )
         .route(
             "/v1/batch/array",
             post(super::task_array_api::submit_handler),

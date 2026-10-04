@@ -17,6 +17,7 @@ pub mod discovery_owners;
 pub mod disk_pressure;
 mod egress_owners;
 pub mod events;
+pub mod execution_budget;
 pub mod gpu;
 pub mod health;
 pub(crate) mod jobs;
@@ -33,6 +34,11 @@ pub mod task_array_leader;
 pub mod task_array_node;
 pub mod task_executor;
 pub mod task_ledger;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub mod task_namespace;
+pub mod task_rates;
+pub mod task_result_index;
+pub mod task_runtime;
 pub mod testapp;
 pub mod token_sweep;
 pub mod top;
@@ -56,6 +62,13 @@ pub enum BunError {
     /// Predictable admission limit; existing executions remain available.
     #[error("batch execution capacity is unavailable: {0}")]
     BatchCapacity(String),
+
+    /// Admission could not reserve all requested resource dimensions.
+    #[error("node capacity cannot admit {requested}; available {available}")]
+    Capacity {
+        requested: crate::meat::Resources,
+        available: crate::meat::Resources,
+    },
     /// Durable job execution evidence cannot be established.
     #[error("job state is unavailable: {0}")]
     JobState(String),

@@ -38,8 +38,10 @@ pub const OUTPUT_KEEP_BYTES: usize = 2048;
 pub const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 /// One attempt of one task, fully resolved: what to run and as whom.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskInvocation {
+    /// Container template, when execution uses an owned runtime.
+    pub template: Option<Box<crate::config::job::JobSpec>>,
     /// The task's index.
     pub index: u32,
     /// Attempt number, starting at 1.
@@ -96,7 +98,7 @@ pub struct CapturedOutput {
 }
 
 impl CapturedOutput {
-    fn push(&mut self, bytes: &[u8]) {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
         self.total_bytes += bytes.len() as u64;
         let room = OUTPUT_KEEP_BYTES.saturating_sub(self.head.len());
         let (into_head, rest) = bytes.split_at(room.min(bytes.len()));
@@ -339,6 +341,8 @@ impl TaskRunner for FakeRunner {
 /// What the pool needs to run one chunk.
 #[derive(Debug, Clone)]
 pub struct ChunkWork {
+    /// Container template carried with the committed assignment.
+    pub template: Option<Box<crate::config::job::JobSpec>>,
     /// The array's batch id (goes into each task's environment).
     pub batch_id: u64,
     /// Count and policy.
@@ -346,7 +350,7 @@ pub struct ChunkWork {
     /// Which chunk.
     pub chunk: ChunkId,
     /// The leader's grant attempt, echoed back in the result.
-    pub grant_attempt: u8,
+    pub grant_attempt: u64,
     /// Host binary to run.
     pub program: PathBuf,
     /// Argument template, with `{index}` placeholders.
@@ -369,6 +373,8 @@ pub enum TaskFinal {
 /// The durable outcome of one task, as the ledger stores it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
+    /// Durable leader grant generation; distinct from per-task retry count.
+    pub grant_attempt: u64,
     /// The task's index.
     pub index: u32,
     /// Attempts made (0 if the task never started).
@@ -450,19 +456,45 @@ pub struct TaskPool<R: TaskRunner> {
     runner: Arc<R>,
     config: PoolConfig,
     slots: Arc<Semaphore>,
+    node_slots: Arc<Semaphore>,
     counters: Arc<PoolCounters>,
+    budget: Option<Arc<super::execution_budget::ExecutionBudget>>,
+    resources: crate::meat::Resources,
 }
 
 impl<R: TaskRunner> TaskPool<R> {
     /// A pool running attempts through `runner`.
     pub fn new(runner: Arc<R>, config: PoolConfig) -> Self {
+        Self::with_node_slots(
+            runner,
+            config,
+            Arc::new(Semaphore::new(config.concurrency.max(1) as usize)),
+        )
+    }
+
+    /// An array pool sharing the node's admission limit with other arrays.
+    pub fn with_node_slots(runner: Arc<R>, config: PoolConfig, node_slots: Arc<Semaphore>) -> Self {
         let permits = config.concurrency.max(1) as usize;
         Self {
             runner,
             config,
             slots: Arc::new(Semaphore::new(permits)),
+            node_slots,
             counters: Arc::new(PoolCounters::default()),
+            budget: None,
+            resources: crate::meat::Resources::default(),
         }
+    }
+
+    /// Account each running attempt against the shared application/task budget.
+    pub fn with_budget(
+        mut self,
+        budget: Arc<super::execution_budget::ExecutionBudget>,
+        resources: crate::meat::Resources,
+    ) -> Self {
+        self.budget = Some(budget);
+        self.resources = resources;
+        self
     }
 
     /// The live counters.
@@ -488,6 +520,20 @@ impl<R: TaskRunner> TaskPool<R> {
         finished: Vec<TaskRecord>,
         cancel: &CancellationToken,
     ) -> ChunkOutcome {
+        self.resume_chunk_streaming(work, finished, cancel, None)
+            .await
+    }
+
+    /// Send each outcome as it finishes, allowing group commit during execution.
+    /// The bounded channel applies backpressure if the disk cannot keep up.
+    pub async fn resume_chunk_streaming(
+        &self,
+        work: &ChunkWork,
+        finished: Vec<TaskRecord>,
+        cancel: &CancellationToken,
+        outcomes: Option<tokio::sync::mpsc::Sender<TaskRecord>>,
+    ) -> ChunkOutcome {
+        let pending = Arc::new(Semaphore::new(1024));
         let mut done = IndexRangeSet::new();
         for record in &finished {
             done.insert(record.index);
@@ -510,18 +556,46 @@ impl<R: TaskRunner> TaskPool<R> {
                 permit = Arc::clone(&self.slots).acquire_owned() => permit.ok(),
             };
             let Some(permit) = permit else {
-                records.push(not_run(index));
+                records.push(TaskRecord {
+                    grant_attempt: work.grant_attempt,
+                    ..not_run(index)
+                });
                 continue;
             };
+            let pending_permit = Arc::clone(&pending)
+                .acquire_owned()
+                .await
+                .expect("pending semaphore stays open");
             let task = TaskAttempts {
                 runner: Arc::clone(&self.runner),
                 config: self.config,
                 slots: Arc::clone(&self.slots),
+                node_slots: Arc::clone(&self.node_slots),
                 counters: Arc::clone(&self.counters),
+                budget: self.budget.clone(),
+                resources: self.resources,
                 work: Arc::clone(&work),
                 cancel: cancel.clone(),
             };
-            running.spawn(task.run(index, permit));
+            let outcomes = outcomes.clone();
+            let task_grant = work.grant_attempt;
+            running.spawn(async move {
+                let mut record = task.run(index, permit).await;
+                record.grant_attempt = task_grant;
+                if let Some(sender) = outcomes {
+                    // The writer owns capture from here. Keeping a second copy
+                    // until a large chunk ends would multiply failure memory.
+                    let output = record.output.take();
+                    let _ = sender
+                        .send(TaskRecord {
+                            output,
+                            ..record.clone()
+                        })
+                        .await;
+                }
+                drop(pending_permit);
+                record
+            });
             while let Some(done) = running.try_join_next() {
                 records.extend(done.ok());
             }
@@ -543,6 +617,7 @@ impl<R: TaskRunner> TaskPool<R> {
 
 fn not_run(index: u32) -> TaskRecord {
     TaskRecord {
+        grant_attempt: 1,
         index,
         attempts: 0,
         outcome: TaskFinal::NotRun,
@@ -554,9 +629,11 @@ fn not_run(index: u32) -> TaskRecord {
 
 fn summarise<'a>(work: &ChunkWork, records: impl Iterator<Item = &'a TaskRecord>) -> ChunkResult {
     let mut result = ChunkResult {
+        duration_counts: [0; 16],
         chunk: work.chunk,
         attempt: work.grant_attempt,
         succeeded: 0,
+        failed_count: 0,
         failed_indices: IndexRangeSet::new(),
         not_run: 0,
         retried: 0,
@@ -565,9 +642,19 @@ fn summarise<'a>(work: &ChunkWork, records: impl Iterator<Item = &'a TaskRecord>
         match record.outcome {
             TaskFinal::Succeeded => result.succeeded += 1,
             TaskFinal::Failed => {
-                result.failed_indices.insert(record.index);
+                result.failed_count += 1;
+                if result.failed_indices.range_count()
+                    < crate::meat::task_array_state::MAX_CHUNK_FAILED_RANGES
+                {
+                    result.failed_indices.insert(record.index);
+                }
             }
             TaskFinal::NotRun => result.not_run += 1,
+        }
+        if record.outcome != TaskFinal::NotRun {
+            let bucket =
+                (32 - record.run_ms.max(1).saturating_sub(1).leading_zeros()).min(15) as usize;
+            result.duration_counts[bucket] += 1;
         }
         result.retried += u32::from(record.attempts.saturating_sub(1));
     }
@@ -579,7 +666,10 @@ struct TaskAttempts<R: TaskRunner> {
     runner: Arc<R>,
     config: PoolConfig,
     slots: Arc<Semaphore>,
+    node_slots: Arc<Semaphore>,
     counters: Arc<PoolCounters>,
+    budget: Option<Arc<super::execution_budget::ExecutionBudget>>,
+    resources: crate::meat::Resources,
     work: Arc<ChunkWork>,
     cancel: CancellationToken,
 }
@@ -610,6 +700,29 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 }
                 self.counters.retried.fetch_add(1, Ordering::Relaxed);
             }
+            let node_permit = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => None,
+                permit = Arc::clone(&self.node_slots).acquire_owned() => permit.ok(),
+            };
+            let Some(node_permit) = node_permit else {
+                return TaskRecord {
+                    attempts: attempt - 1,
+                    ..not_run(index)
+                };
+            };
+            let mut resource_lease = match &self.budget {
+                Some(budget) => match budget.acquire(self.resources, &self.cancel).await {
+                    Some(lease) => Some(lease.quarantine_on_drop()),
+                    None => {
+                        return TaskRecord {
+                            attempts: attempt - 1,
+                            ..not_run(index)
+                        };
+                    }
+                },
+                None => None,
+            };
             let invocation = self.invocation(index, attempt);
             self.counters
                 .attempts_started
@@ -619,7 +732,12 @@ impl<R: TaskRunner> TaskAttempts<R> {
             let result = self.runner.run(&invocation, timeout, &self.cancel).await;
             let run_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
             self.counters.running.fetch_sub(1, Ordering::Relaxed);
+            if let Some(lease) = resource_lease.as_mut() {
+                lease.confirm_retired();
+            }
             drop(permit.take());
+            drop(node_permit);
+            drop(resource_lease);
 
             let exit_code = match result.outcome {
                 AttemptOutcome::Exited { code } => Some(code),
@@ -627,6 +745,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 _ => None,
             };
             let record = TaskRecord {
+                grant_attempt: 1,
                 index,
                 attempts: attempt,
                 outcome: TaskFinal::Failed,
@@ -666,6 +785,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 .map(|(key, value)| (key.to_string(), value)),
         );
         TaskInvocation {
+            template: work.template.clone(),
             index,
             attempt,
             program: work.program.clone(),
@@ -681,6 +801,7 @@ mod tests {
 
     fn work(count: u32, chunk_size: u32, chunk: u32) -> ChunkWork {
         ChunkWork {
+            template: None,
             batch_id: 7,
             spec: TaskArraySpec {
                 chunk_size,
@@ -704,6 +825,7 @@ mod tests {
 
     fn invocation(program: &str, args: &[&str]) -> TaskInvocation {
         TaskInvocation {
+            template: None,
             index: 3,
             attempt: 1,
             program: PathBuf::from(program),
@@ -811,6 +933,88 @@ mod tests {
         assert!(!attempt.outcome.is_retryable());
     }
 
+    #[tokio::test]
+    async fn streaming_failures_transfer_output_without_retaining_it_for_the_whole_chunk() {
+        struct LoudRunner;
+        impl TaskRunner for LoudRunner {
+            async fn run(&self, _: &TaskInvocation, _: Duration, _: &CancellationToken) -> Attempt {
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 1 },
+                    output: CapturedOutput {
+                        head: vec![b'x'; OUTPUT_KEEP_BYTES],
+                        tail: vec![b'y'; OUTPUT_KEEP_BYTES],
+                        total_bytes: (OUTPUT_KEEP_BYTES * 2) as u64,
+                    },
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(LoudRunner), fast(4));
+        let mut work = work(64, 64, 0);
+        work.spec.max_attempts = 1;
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let consume = async {
+            let mut count = 0;
+            while let Some(record) = rx.recv().await {
+                let record: TaskRecord = record;
+                assert_eq!(record.output.unwrap().head.len(), OUTPUT_KEEP_BYTES);
+                count += 1;
+            }
+            count
+        };
+        let (outcome, count) = tokio::join!(
+            pool.resume_chunk_streaming(&work, vec![], &cancel, Some(tx)),
+            consume
+        );
+        assert_eq!(count, 64);
+        assert_eq!(outcome.result.failed_count, 64);
+        assert!(outcome.records.iter().all(|record| record.output.is_none()));
+    }
+
+    #[test]
+    fn sparse_failures_keep_exact_counts_with_a_bounded_control_preview() {
+        let work = ChunkWork {
+            batch_id: 1,
+            template: None,
+            spec: TaskArraySpec {
+                chunk_size: 65_536,
+                ..TaskArraySpec::with_count(65_536)
+            },
+            chunk: ChunkId(0),
+            grant_attempt: 1,
+            program: "/unused".into(),
+            args: vec![],
+            env: vec![],
+        };
+        let records: Vec<_> = (0..65_536)
+            .map(|index| TaskRecord {
+                grant_attempt: 1,
+                index,
+                attempts: 1,
+                outcome: if index % 2 == 0 {
+                    TaskFinal::Failed
+                } else {
+                    TaskFinal::Succeeded
+                },
+                exit_code: Some((index % 2 == 0) as i32),
+                run_ms: 1,
+                output: None,
+            })
+            .collect();
+        let result = summarise(&work, records.iter());
+        assert_eq!(result.failed_count, 32_768);
+        assert_eq!(result.failed_indices.range_count(), 256);
+        assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
+        let mut state = crate::meat::task_array_state::TaskArrayState::new(work.spec, 0).unwrap();
+        let node = crate::meat::NodeId("worker".into());
+        state
+            .grant(&node, &IndexRangeSet::from_range(0..=0))
+            .unwrap();
+        state.complete(&node, &result).unwrap();
+        assert_eq!(state.summary().failed, 32_768);
+        assert_eq!(state.failed_overflow, 32_512);
+    }
+
     #[test]
     fn captured_output_keeps_a_bounded_head_and_tail() {
         let mut output = CapturedOutput::default();
@@ -889,6 +1093,7 @@ mod tests {
         let runner = Arc::new(FakeRunner::always_succeeds());
         let pool = TaskPool::new(Arc::clone(&runner), fast(4));
         let earlier = |index, outcome| TaskRecord {
+            grant_attempt: 1,
             index,
             attempts: 1,
             outcome,

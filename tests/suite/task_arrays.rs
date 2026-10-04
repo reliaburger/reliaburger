@@ -98,6 +98,21 @@ async fn single_node_leader() -> Arc<CouncilNode> {
 
 impl Harness {
     async fn start(options: Options) -> Self {
+        Self::start_with_tokens(options, None).await
+    }
+
+    async fn start_with_tokens(
+        options: Options,
+        tokens: Option<reliaburger::sesame::auth::TokenStore>,
+    ) -> Self {
+        Self::start_with_worker_files(options, tokens, |_| {}).await
+    }
+
+    async fn start_with_worker_files(
+        options: Options,
+        tokens: Option<reliaburger::sesame::auth::TokenStore>,
+        prepare: impl FnOnce(&std::path::Path),
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         // No agent: task arrays don't go through it. Holding the receiver
@@ -113,6 +128,7 @@ impl Harness {
         });
 
         let data = tempfile::tempdir().unwrap();
+        prepare(data.path());
         let node = TaskArrayNode::new(
             TaskArrayNodeConfig {
                 root: data.path().join("task-arrays"),
@@ -151,7 +167,7 @@ impl Harness {
             None,
             None,
             council.clone(),
-            None,
+            tokens,
             None,
             None,
             None,
@@ -263,6 +279,25 @@ fn shell_array(count: u32, chunk_size: u32, script: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_leader_snapshot_still_reconciles_old_worker_files() {
+    let harness = Harness::start_with_worker_files(Options::processes(false), None, |root| {
+        let orphan = root.join("task-arrays/999");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("ledger"), b"old worker evidence").unwrap();
+    })
+    .await;
+    let orphan = harness._data.path().join("task-arrays/999");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while orphan.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "an empty snapshot never reached the worker"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_array_of_processes_runs_to_completion_standalone() {
     let harness = Harness::start(Options::processes(false)).await;
     let batch_id = harness
@@ -296,7 +331,7 @@ async fn failures_are_counted_and_their_output_kept() {
     let results: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         results["rows"],
-        json!([{ "index": 7, "attempts": 2, "succeeded": false, "exit_code": 1, "run_ms": results["rows"][0]["run_ms"] }])
+        json!([{ "grant_attempt": 1, "index": 7, "attempts": 2, "succeeded": false, "not_run": false, "exit_code": 1, "run_ms": results["rows"][0]["run_ms"] }])
     );
     let (_, body) = harness
         .get(&format!("/v1/batch/{batch_id}/results?limit=5"))
@@ -406,7 +441,7 @@ async fn a_bad_submission_is_refused_with_the_reason() {
     let (status, answer) = harness
         .submit(json!({
             "name": "images",
-            "template": { "image": "alpine:3", "command": ["true"] },
+            "template": { "image": "alpine:3", "exec": SHELL, "command": ["true"] },
             "spec": { "count": 10 },
         }))
         .await;
@@ -445,5 +480,235 @@ async fn a_node_that_may_not_run_the_binary_says_why() {
     assert_eq!(
         summary["queued"], 20,
         "nothing is granted to a node that can't run it"
+    );
+}
+
+/// One Raft submission accepts all profiles; the summary list never expands indexes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_manifest_has_atomic_identity_histograms_and_indexed_pages() {
+    let harness = Harness::start(Options {
+        council: true,
+        runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |task| {
+            AttemptOutcome::Exited {
+                code: i32::from(task.index == 5000),
+            }
+        })),
+        allowed: vec![SHELL],
+        slots: 16,
+    })
+    .await;
+    let cohort = |name: &str, count: u32, cpu: &str, memory: &str| json!({"name":name,"count":count,"chunk_size":256,"max_attempts":1,"template":{"image":"fixture:v1","command":["worker","{index}"],"cpu":cpu,"memory":memory}});
+    let response = harness.http.post(format!("{}/v1/batch/manifest",harness.base_url)).json(&json!({"name":"mixed","namespace":"tenant-a","cohort":[cohort("small",6000,"100m","32Mi"),cohort("large",16,"1000m","64Mi")]})).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    let summary = harness.wait_done(id, 60).await;
+    assert_eq!(summary["total"], 6016);
+    assert_eq!(summary["succeeded"], 6015);
+    assert_eq!(summary["failed"], 1);
+    assert_eq!(summary["cohorts"].as_array().unwrap().len(), 2);
+    let counts: u64 = summary["duration_final_attempt_ms"]["counts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(counts, 6016);
+    let child = summary["cohorts"][0]["batch_id"].as_u64().unwrap();
+    let (status, page) = harness
+        .get(&format!("/v1/batch/{child}/results?failed=true&limit=20"))
+        .await;
+    assert_eq!(status, 200);
+    let page: Value = serde_json::from_slice(&page).unwrap();
+    assert!(page["rows"].as_array().unwrap().is_empty());
+    assert_eq!(page["next_after"], 4095);
+    let (_, page) = harness
+        .get(&format!(
+            "/v1/batch/{child}/results?failed=true&limit=20&after=4095"
+        ))
+        .await;
+    let page: Value = serde_json::from_slice(&page).unwrap();
+    assert_eq!(page["rows"][0]["index"], 5000);
+    let (_, page) = harness
+        .get(&format!("/v1/batch/{child}/results?index=5000"))
+        .await;
+    let page: Value = serde_json::from_slice(&page).unwrap();
+    assert_eq!(page["rows"].as_array().unwrap().len(), 1);
+    let (_, listing) = harness.get("/v1/batch/summaries").await;
+    let listing: Value = serde_json::from_slice(&listing).unwrap();
+    assert_eq!(listing["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["batches"][0]["batch_id"], id);
+    let (_, html) = harness.get("/ui/fragment/batches").await;
+    assert!(String::from_utf8(html).unwrap().contains("6015 / 6016"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_profile_refuses_the_whole_manifest_and_parent_cancel_drains_all_profiles() {
+    let harness = Harness::start(Options {
+        council: true,
+        runner: NodeRunner::Fake(FakeRunner::new(Duration::from_millis(100), |_| {
+            AttemptOutcome::Exited { code: 0 }
+        })),
+        allowed: vec![SHELL],
+        slots: 2,
+    })
+    .await;
+    let profile = |name: &str, count: u32| json!({"name":name,"count":count,"chunk_size":10,"template":{"exec":SHELL,"command":["-c","exit 0"]}});
+    let invalid = json!({"name":"mixed","cohort":[profile("small",100),profile("large",0)]});
+    let response = harness
+        .http
+        .post(format!("{}/v1/batch/manifest", harness.base_url))
+        .json(&invalid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(
+        harness
+            .council
+            .as_ref()
+            .unwrap()
+            .desired_state()
+            .await
+            .task_arrays
+            .ids()
+            .is_empty()
+    );
+    let valid = json!({"name":"mixed","cohort":[profile("small",100),profile("large",100)]});
+    let response = harness
+        .http
+        .post(format!("{}/v1/batch/manifest", harness.base_url))
+        .json(&valid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(id, 1, "invalid submission consumed IDs");
+    let response = harness
+        .http
+        .post(format!("{}/v1/batch/{id}/cancel", harness.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let summary = harness.wait_done(id, 30).await;
+    assert_eq!(summary["status"], "Cancelled");
+    assert_eq!(
+        summary["total"].as_u64().unwrap(),
+        summary["succeeded"].as_u64().unwrap()
+            + summary["failed"].as_u64().unwrap()
+            + summary["not_run"].as_u64().unwrap()
+    );
+    for child in summary["cohorts"].as_array().unwrap() {
+        assert_eq!(child["status"], "Cancelled");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_admission_and_summary_views_honour_the_callers_scope() {
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+    let operator = reliaburger::sesame::token::create_token(
+        "operator",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let scoped = reliaburger::sesame::token::create_token(
+        "scoped",
+        ApiRole::Deployer,
+        TokenScope {
+            apps: Some(vec!["allowed".into()]),
+            namespaces: Some(vec!["tenant-a".into()]),
+        },
+        None,
+    )
+    .unwrap();
+    let tokens = reliaburger::sesame::auth::new_token_store();
+    tokens.write().await.extend([operator.token, scoped.token]);
+    let harness = Harness::start_with_tokens(
+        Options {
+            council: true,
+            runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |_| {
+                AttemptOutcome::Exited { code: 0 }
+            })),
+            allowed: vec![SHELL],
+            slots: 2,
+        },
+        Some(tokens),
+    )
+    .await;
+    let request = |name: &str, namespace: &str| json!({"name":name,"namespace":namespace,"cohort":[{"name":"small","count":1,"template":{"exec":SHELL,"command":["-c","true"]}}]});
+    let submit = |name: &str, namespace: &str, token: &str| {
+        harness
+            .http
+            .post(format!("{}/v1/batch/manifest", harness.base_url))
+            .bearer_auth(token)
+            .json(&request(name, namespace))
+    };
+    for (name, namespace) in [("other", "tenant-a"), ("allowed", "tenant-b")] {
+        assert_eq!(
+            submit(name, namespace, &scoped.plaintext)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let allowed = submit("allowed", "tenant-a", &scoped.plaintext)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 202);
+    let allowed_id = allowed.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    let hidden = submit("other", "tenant-b", &operator.plaintext)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), 202);
+    let hidden_id = hidden.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    let visible: Value = harness
+        .http
+        .get(format!("{}/v1/batch/summaries", harness.base_url))
+        .bearer_auth(&scoped.plaintext)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(visible["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(visible["batches"][0]["batch_id"], allowed_id);
+    let html = harness
+        .http
+        .get(format!("{}/ui/fragment/batches", harness.base_url))
+        .bearer_auth(&scoped.plaintext)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("allowed"));
+    assert!(!html.contains("other"));
+    assert_eq!(
+        harness
+            .http
+            .post(format!("{}/v1/batch/{hidden_id}/cancel", harness.base_url))
+            .bearer_auth(&scoped.plaintext)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
     );
 }

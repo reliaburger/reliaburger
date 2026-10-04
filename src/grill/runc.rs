@@ -812,6 +812,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -871,6 +872,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sh".into()],
                 env: vec![],
                 cwd: "/".into(),
@@ -934,6 +936,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -1024,6 +1027,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
@@ -1181,6 +1185,7 @@ mod tests {
                     readonly: false,
                 },
                 process: crate::grill::oci::OciProcess {
+                    rlimits: Vec::new(),
                     args: vec![
                         "/bin/sh".to_string(),
                         "-c".to_string(),
@@ -1344,6 +1349,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -1401,6 +1407,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
@@ -1593,6 +1600,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),

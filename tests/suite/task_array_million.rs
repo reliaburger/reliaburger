@@ -89,6 +89,7 @@ fn dispatch(
 ) {
     for chunk in chunks.iter() {
         let work = ChunkWork {
+            template: None,
             batch_id: 1,
             spec: state.spec.clone(),
             chunk: ChunkId(chunk),

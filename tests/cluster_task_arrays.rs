@@ -285,5 +285,32 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
         .await
         .unwrap();
     assert_eq!(results["rows"], json!([]), "{results}");
+    // Mixed resource profiles follow the same follower-to-leader admission path.
+    let mixed = http.post(format!("http://127.0.0.1:{}/v1/batch/manifest", nodes[follower].api_port))
+        .json(&json!({"name":"mixed-survivor","namespace":"default","cohort":[
+            {"name":"small","count":20,"template":{"exec":BINARY,"command":["{index}"],"cpu":"100m","memory":"32Mi"}},
+            {"name":"large","count":12,"template":{"exec":BINARY,"command":["{index}"],"cpu":"1000m","memory":"64Mi"}}
+        ]})).send().await.unwrap();
+    assert_eq!(mixed.status(), 202);
+    let mixed_id = mixed.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    wait_until(
+        "forwarded manifest finishes",
+        Duration::from_secs(30),
+        async || {
+            status(&http, &nodes[follower], mixed_id)
+                .await
+                .is_some_and(|summary| {
+                    if summary["done"] != true {
+                        return false;
+                    }
+                    assert_eq!(summary["succeeded"], 32);
+                    assert_eq!(summary["cohorts"].as_array().unwrap().len(), 2);
+                    true
+                })
+        },
+    )
+    .await;
     root.cancel();
 }

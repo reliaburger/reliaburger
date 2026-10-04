@@ -2129,7 +2129,12 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
 
 /// Show a batch's progress; with `wait`, poll (bounded by `timeout`)
 /// until the batch reaches a terminal state.
-pub async fn batch_status(batch_id: u64, wait: bool, timeout_secs: u64) -> Result<(), RelishError> {
+pub async fn batch_status(
+    batch_id: u64,
+    wait: bool,
+    timeout_secs: u64,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let summary = if wait {
         wait_for_batch(
@@ -2141,12 +2146,16 @@ pub async fn batch_status(batch_id: u64, wait: bool, timeout_secs: u64) -> Resul
     } else {
         client.batch_status(batch_id).await?
     };
-    print_batch_summary(batch_id, &summary);
+    if matches!(output, OutputFormat::Human) {
+        print_batch_summary(batch_id, &summary);
+    } else {
+        println!("{}", format_output(&summary, output)?);
+    }
     Ok(())
 }
 
 fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
-    if summary["kind"] == "array" {
+    if summary["kind"] == "array" || summary["kind"] == "manifest" {
         print!("{}", format_array_summary(batch_id, summary));
         return;
     }
@@ -2174,12 +2183,15 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
 /// What `relish run --batch` submits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskArrayRun {
+    pub image: Option<String>,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
     /// The array's name.
     pub name: String,
     /// Its namespace.
     pub namespace: String,
     /// Host binary every task runs.
-    pub exec: std::path::PathBuf,
+    pub exec: Option<std::path::PathBuf>,
     /// Argument template with `{index}` placeholders.
     pub args: Vec<String>,
     /// `KEY=VALUE` pairs for every task's environment.
@@ -2193,12 +2205,12 @@ pub struct TaskArrayRun {
 pub fn task_array_request(
     run: TaskArrayRun,
 ) -> Result<crate::bun::task_array_api::TaskArraySubmitRequest, RelishError> {
-    if !run.exec.is_absolute() {
+    if run.exec.as_ref().is_some_and(|path| !path.is_absolute()) {
         return Err(RelishError::InvalidFlag {
             flag: "exec".to_string(),
             reason: format!(
                 "{} isn't an absolute path; nodes allow binaries by absolute path",
-                run.exec.display()
+                run.exec.as_ref().expect("checked").display()
             ),
         });
     }
@@ -2219,19 +2231,172 @@ pub fn task_array_request(
         name: run.name,
         namespace: Some(run.namespace),
         template: crate::config::job::JobSpec {
-            image: None,
+            image: run.image,
             command: Some(run.args),
             schedule: None,
             run_before: Vec::new(),
-            memory: None,
-            cpu: None,
+            memory: run
+                .memory
+                .as_deref()
+                .map(crate::config::types::ResourceRange::parse_memory)
+                .transpose()?,
+            cpu: run
+                .cpu
+                .as_deref()
+                .map(crate::config::types::ResourceRange::parse_cpu)
+                .transpose()?,
             env,
             namespace: None,
-            exec: Some(run.exec),
+            exec: run.exec,
             script: None,
         },
         spec: run.spec,
     })
+}
+
+/// Submit all resource profiles atomically from a compact TOML manifest.
+pub async fn submit_task_manifest(
+    path: &std::path::Path,
+    output: OutputFormat,
+    dry_run: bool,
+) -> Result<(), RelishError> {
+    let source = std::fs::read_to_string(path)?;
+    let request: crate::bun::task_array_api::TaskManifestRequest = toml::from_str(&source)
+        .map_err(|e| RelishError::InvalidFlag {
+            flag: "manifest".into(),
+            reason: e.to_string(),
+        })?;
+    let mut trial = crate::meat::task_array_store::TaskArrays::default();
+    let mut next = 0;
+    trial
+        .apply(
+            &crate::meat::task_array_store::TaskArrayWrite::RegisterManifest {
+                name: request.name.clone(),
+                namespace: request.namespace.clone(),
+                cohorts: request.cohort.clone(),
+                submitted_at_epoch_secs: 0,
+            },
+            || {
+                next += 1;
+                next
+            },
+        )
+        .map_err(|error| RelishError::InvalidFlag {
+            flag: "manifest".into(),
+            reason: error.to_string(),
+        })?;
+    if dry_run {
+        let tasks: u64 = request.cohort.iter().map(|c| u64::from(c.spec.count)).sum();
+        println!(
+            "valid manifest: {} profiles, {} tasks",
+            request.cohort.len(),
+            tasks
+        );
+        return Ok(());
+    }
+    let response = BunClient::default_local()
+        .submit_task_manifest(&request)
+        .await?;
+    if matches!(output, OutputFormat::Human) {
+        println!(
+            "manifest {} submitted; watch with: relish batch watch {}",
+            response["batch_id"], response["batch_id"]
+        );
+    } else {
+        println!("{}", format_output(&response, output)?);
+    }
+    Ok(())
+}
+
+/// Observe bounded summaries once a second; never enumerate the task list.
+pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let summary = client.batch_status(batch_id).await?;
+        println!("{}", format_batch_watch(&summary));
+        if summary["done"].as_bool() == Some(true) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RelishError::RequestTimeout);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// A rate is unique accepted successes, while durations describe the final
+/// attempt. Quantiles merge bucket counts and report bucket upper bounds.
+pub fn format_batch_watch(summary: &serde_json::Value) -> String {
+    let rate = summary["rates"]["successes_per_second"]
+        .as_f64()
+        .map_or("unknown".to_string(), |r| format!("{r:.1}/s"));
+    let mut output = format!(
+        "batch {}: {} / {} succeeded, {} failed, {} not run, {} retries; {} | accepted successes {}",
+        summary["batch_id"],
+        summary["succeeded"],
+        summary["total"],
+        summary["failed"],
+        summary["not_run"],
+        summary["retried"],
+        summary["status"].as_str().unwrap_or("unknown"),
+        rate
+    );
+    output.push_str(&format!(
+        " | {} queued, {} held",
+        summary["queued"], summary["held"]
+    ));
+    let failure_rate = summary["rates"]["failures_per_second"]
+        .as_f64()
+        .map_or("unknown".into(), |r| format!("{r:.1}/s"));
+    output.push_str(&format!(" | terminal failures {failure_rate}"));
+    if let Some(counts) = summary["duration_final_attempt_ms"]["counts"].as_array() {
+        let counts: Vec<u64> = counts.iter().map(|c| c.as_u64().unwrap_or(0)).collect();
+        let total: u64 = counts.iter().sum();
+        for (label, percent) in [("p50", 50), ("p95", 95), ("p99", 99)] {
+            let mut cumulative = 0;
+            let bucket = counts.iter().position(|count| {
+                cumulative += count;
+                total > 0 && cumulative >= total.saturating_mul(percent).div_ceil(100)
+            });
+            let value = match bucket {
+                Some(b) if b < 15 => format!("<={}ms", 1u64 << b),
+                Some(_) => ">16384ms".into(),
+                None => "unknown".into(),
+            };
+            output.push_str(&format!(" | final attempt {label} {value}"));
+        }
+    }
+    for cohort in summary["cohorts"].as_array().into_iter().flatten() {
+        output.push_str(&format!(
+            "\n  {}: array {}, {} / {} succeeded; request {}m CPU, {}Mi memory",
+            cohort["profile"].as_str().unwrap_or("?"),
+            cohort["batch_id"],
+            cohort["succeeded"],
+            cohort["total"],
+            cohort["cpu_request_millicores"],
+            cohort["memory_request_bytes"].as_u64().unwrap_or(0) / (1024 * 1024)
+        ));
+    }
+    for profile in
+        std::iter::once(summary).chain(summary["cohorts"].as_array().into_iter().flatten())
+    {
+        for node in profile["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|node| node["refused"].is_string())
+            .take(3)
+        {
+            output.push_str(&format!(
+                "\n  array {} refused on {}: {}",
+                profile["batch_id"],
+                node["node"].as_str().unwrap_or("?"),
+                node["refused"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    output
 }
 
 /// Submit a task array (`relish run --batch`).
@@ -2262,10 +2427,12 @@ pub async fn batch_results(
     batch_id: u64,
     failed_only: bool,
     limit: usize,
+    after: Option<u32>,
+    index: Option<u32>,
     format: OutputFormat,
 ) -> Result<(), RelishError> {
     let results = BunClient::default_local()
-        .batch_results(batch_id, failed_only, limit)
+        .batch_results_page(batch_id, failed_only, limit, after, index)
         .await?;
     match format {
         OutputFormat::Human => print!("{}", format_task_results(&results)),
@@ -2305,14 +2472,27 @@ pub fn format_task_results(results: &crate::bun::task_array_api::TaskResults) ->
         let exit = row
             .exit_code
             .map_or_else(|| "-".to_string(), |code| code.to_string());
-        let outcome = if row.succeeded { "succeeded" } else { "failed" };
+        let outcome = if row.not_run {
+            "not run"
+        } else if row.succeeded {
+            "succeeded"
+        } else {
+            "failed"
+        };
         out.push_str(&format!(
             "{:>10}  {:>8}  {:<9}  {:>6}  {:>9}\n",
             row.index, row.attempts, outcome, exit, row.run_ms
         ));
     }
     if results.truncated {
-        out.push_str("(more rows exist; raise --limit to see them)\n");
+        if let Some(cursor) = results.next_after {
+            out.push_str(&format!(
+                "(next page: relish batch results {} --after {cursor}; repeat your filter)\n",
+                results.batch_id
+            ));
+        } else {
+            out.push_str("(more rows exist in this page)\n");
+        }
     }
     if !results.unreachable.is_empty() {
         let nodes: Vec<&str> = results.unreachable.iter().map(|n| n.0.as_str()).collect();
@@ -3957,9 +4137,12 @@ mod task_array_tests {
 
     fn run() -> TaskArrayRun {
         TaskArrayRun {
+            image: None,
+            cpu: None,
+            memory: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
-            exec: PathBuf::from("/usr/local/bin/rb-task"),
+            exec: Some(PathBuf::from("/usr/local/bin/rb-task")),
             args: vec!["--frame".to_string(), "{index}".to_string()],
             env: vec!["MODE=fast".to_string(), "EMPTY=".to_string()],
             spec: TaskArraySpec::with_count(10),
@@ -3992,7 +4175,7 @@ mod task_array_tests {
     #[test]
     fn a_relative_exec_or_a_bad_env_pair_is_refused_before_sending() {
         let mut relative = run();
-        relative.exec = PathBuf::from("rb-task");
+        relative.exec = Some(PathBuf::from("rb-task"));
         assert!(matches!(
             task_array_request(relative),
             Err(RelishError::InvalidFlag { flag, .. }) if flag == "exec"
@@ -4037,18 +4220,24 @@ mod task_array_tests {
     fn task_results_render_as_a_table_with_caveats() {
         let results = TaskResults {
             batch_id: 3,
+            next_after: None,
+            retention_seconds: 3600,
             rows: vec![
                 TaskResultRow {
+                    grant_attempt: 1,
                     index: 7,
                     attempts: 3,
                     succeeded: false,
+                    not_run: false,
                     exit_code: Some(2),
                     run_ms: 15,
                 },
                 TaskResultRow {
+                    grant_attempt: 1,
                     index: 8,
                     attempts: 1,
                     succeeded: false,
+                    not_run: false,
                     exit_code: None,
                     run_ms: 600000,
                 },
@@ -4061,7 +4250,7 @@ mod task_array_tests {
             "     INDEX  ATTEMPTS  OUTCOME      EXIT     RUN MS\n\
              \x20        7         3  failed          2         15\n\
              \x20        8         1  failed          -     600000\n\
-             (more rows exist; raise --limit to see them)\n\
+             (more rows exist in this page)\n\
              (couldn't reach node-3; their tasks are missing)\n"
         );
     }

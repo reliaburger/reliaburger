@@ -1449,3 +1449,14 @@ They're one part of a release's acceptance, not all of it; the
 [release runbook](releasing.md) lists the gates a candidate has to pass.
 
 Held cluster jobs conservatively reserve their CPU/memory requests on every app or batch placement candidate until positive settlement. This can over-reserve; it does not add initial node-local job capacity admission.
+
+### Delegated jobs (0.2.0 development preview)
+
+[Batch jobs](manual/14_batch-jobs.md) explains compact arrays, atomic mixed-profile
+manifests, app/job resource accounting, watch summaries, indexed detail, retries
+and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
+homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
+a service. Build matching development binaries and use a fresh cluster (protocol
+36 / state 51); the published 0.1.4 recording predates this step. The
+[implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
+and the still-unqualified 100m/day sustained throughput target.

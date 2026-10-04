@@ -72,10 +72,12 @@ pub struct Compatibility {
 /// the `CaRotationPrepare` and `AcknowledgeNodeTrust` Raft requests and the
 /// `POST /v1/cluster/trust-ack` body a node sends the leader (F04 R4, #362).
 /// and task arrays (`RaftRequest::TaskArray`, `DesiredState::task_arrays`
-/// and node ledgers under `task-arrays/`).
+/// and node ledgers under `task-arrays/`), including mixed-profile manifests,
+/// persistent recovery/term/index fences, 64-bit grant generations, accepted
+/// ownership ranges, duration buckets and indexed result pages (47/64).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 46,
-    state: 63,
+    protocol: 47,
+    state: 64,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

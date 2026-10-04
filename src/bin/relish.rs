@@ -370,7 +370,7 @@ enum Command {
         /// Path to a TOML config file with [job.*] sections.
         path: Option<PathBuf>,
     },
-    /// Run a task array: one host binary, many indexed tasks.
+    /// Run a resource-aware task array from an image or allowlisted host binary.
     ///
     /// Every task runs the same binary with `{index}` in its arguments
     /// replaced by its own index, from 0 to COUNT-1, and gets
@@ -391,8 +391,17 @@ enum Command {
         #[arg(long)]
         count: u32,
         /// Host binary every task runs.
+        #[arg(long, required_unless_present = "image", conflicts_with = "image")]
+        exec: Option<PathBuf>,
+        /// OCI image executed by the owned Linux runtime.
+        #[arg(long, required_unless_present = "exec", conflicts_with = "exec")]
+        image: Option<String>,
+        /// CPU request-limit range, such as 250m-500m.
         #[arg(long)]
-        exec: PathBuf,
+        cpu: Option<String>,
+        /// Memory request-limit range, such as 64Mi-128Mi.
+        #[arg(long)]
+        memory: Option<String>,
         /// Tasks per chunk: the unit the cluster hands to nodes.
         #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_CHUNK_SIZE)]
         chunk: u32,
@@ -405,7 +414,7 @@ enum Command {
         /// Per-attempt timeout, in seconds.
         #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_TASK_TIMEOUT_SECS)]
         timeout: u32,
-        /// Most tasks one node runs at once (default: its CPU count).
+        /// Most tasks one node runs at once (default: 256, bounded by requests).
         #[arg(long)]
         concurrency: Option<u32>,
         /// Namespace the array belongs to.
@@ -871,13 +880,25 @@ fn parse_join_token_ttl(value: &str) -> Result<u64, String> {
 
 #[derive(Subcommand)]
 enum BatchAction {
-    /// Stop a task array: tasks that haven't started never will, running
-    /// ones get SIGTERM, then SIGKILL after 10 seconds.
+    /// Submit a compact TOML manifest containing mixed resource profiles.
+    Submit {
+        path: PathBuf,
+        /// Validate the manifest locally without submitting work.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Watch rates, bounded profile summaries and duration distributions.
+    Watch {
+        id: u64,
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+    },
+    /// Cancel an array or mixed manifest and retire its active attempts.
     Cancel {
         /// Batch id from `relish run --batch`.
         id: u64,
     },
-    /// Show each task's outcome, read from the nodes' ledgers.
+    /// Read a bounded indexed page of accepted task outcomes.
     Results {
         /// Batch id from `relish run --batch`.
         id: u64,
@@ -887,6 +908,12 @@ enum BatchAction {
         /// Most rows to show.
         #[arg(long, default_value_t = reliaburger::bun::task_array_api::DEFAULT_RESULT_ROWS)]
         limit: usize,
+        /// Cursor returned by the previous page.
+        #[arg(long)]
+        after: Option<u32>,
+        /// Look up one task directly.
+        #[arg(long, conflicts_with = "after")]
+        index: Option<u32>,
     },
     /// Print a failed task's output (the first and last 2 KiB).
     Logs {
@@ -1844,10 +1871,23 @@ async fn main() -> ExitCode {
             timeout,
         } => commands::build(path, registry_port, timeout).await,
         Command::Batch { action, path } => match (action, path) {
-            (Some(BatchAction::Cancel { id }), _) => commands::batch_cancel(id).await,
-            (Some(BatchAction::Results { id, failed, limit }), _) => {
-                commands::batch_results(id, failed, limit, cli.output).await
+            (Some(BatchAction::Submit { path, dry_run }), _) => {
+                commands::submit_task_manifest(&path, cli.output, dry_run).await
             }
+            (Some(BatchAction::Watch { id, timeout }), _) => {
+                commands::watch_task_batch(id, timeout).await
+            }
+            (Some(BatchAction::Cancel { id }), _) => commands::batch_cancel(id).await,
+            (
+                Some(BatchAction::Results {
+                    id,
+                    failed,
+                    limit,
+                    after,
+                    index,
+                }),
+                _,
+            ) => commands::batch_results(id, failed, limit, after, index, cli.output).await,
             (Some(BatchAction::Logs { id, index }), _) => {
                 commands::batch_task_logs(id, index).await
             }
@@ -1861,6 +1901,9 @@ async fn main() -> ExitCode {
             batch,
             count,
             exec,
+            image,
+            cpu,
+            memory,
             chunk,
             max_attempts,
             max_failed,
@@ -1874,6 +1917,9 @@ async fn main() -> ExitCode {
                 name: batch,
                 namespace,
                 exec,
+                image,
+                cpu,
+                memory,
                 args,
                 env,
                 spec: reliaburger::meat::task_array::TaskArraySpec {
@@ -1888,7 +1934,7 @@ async fn main() -> ExitCode {
             .await
         }
         Command::BatchStatus { id, wait, timeout } => {
-            commands::batch_status(id, wait, timeout).await
+            commands::batch_status(id, wait, timeout, cli.output).await
         }
         Command::Secret { action } => match &action {
             SecretAction::Pubkey { dir, namespace } => {
@@ -3904,7 +3950,10 @@ mod tests {
         let cli = parse(&["relish", "batch", "results", "7", "--failed"]).unwrap();
         match cli.command {
             Command::Batch {
-                action: Some(BatchAction::Results { id, failed, limit }),
+                action:
+                    Some(BatchAction::Results {
+                        id, failed, limit, ..
+                    }),
                 ..
             } => {
                 assert_eq!((id, failed), (7, true));
@@ -3959,10 +4008,11 @@ mod tests {
                 namespace,
                 env,
                 args,
+                ..
             } => {
                 assert_eq!(batch, "render");
                 assert_eq!(count, 1_000_000);
-                assert_eq!(exec, PathBuf::from("/usr/local/bin/rb-task"));
+                assert_eq!(exec, Some(PathBuf::from("/usr/local/bin/rb-task")));
                 assert_eq!(chunk, 1024);
                 assert_eq!(max_attempts, 3);
                 assert_eq!(max_failed, Some(10));

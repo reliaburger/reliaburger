@@ -31,7 +31,7 @@ use crate::meat::task_array::{TaskArraySpec, validate_template};
 use crate::meat::task_array_store::{TaskArrayRecord, TaskArrayWrite};
 
 /// Default rows `GET /v1/batch/{id}/results` returns.
-pub const DEFAULT_RESULT_ROWS: usize = 10_000;
+pub const DEFAULT_RESULT_ROWS: usize = 1000;
 
 /// Most failed-index ranges a summary lists.
 const SUMMARY_FAILED_RANGES: usize = 20;
@@ -70,6 +70,13 @@ pub struct ResultsQuery {
     /// Most rows to return.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Resume strictly after this task index.
+    pub after: Option<u32>,
+    /// Address one task directly.
+    pub index: Option<u32>,
+    /// Internal range endpoints, used by peer fan-out.
+    pub start: Option<u32>,
+    pub end: Option<u32>,
 }
 
 /// `GET /v1/batch/{id}/results` answer.
@@ -81,6 +88,10 @@ pub struct TaskResults {
     pub rows: Vec<TaskResultRow>,
     /// More rows existed than `limit` allowed.
     pub truncated: bool,
+    /// Cursor for the next bounded index window, including empty failure pages.
+    pub next_after: Option<u32>,
+    /// Detail is retained locally, for at most the configured terminal retention.
+    pub retention_seconds: u64,
     /// Nodes that couldn't be asked; their tasks are missing.
     pub unreachable: Vec<NodeId>,
 }
@@ -165,6 +176,9 @@ pub async fn submit_handler(
     if let Some(council) = follower_council(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/array", body).await;
     }
+    if let Err(reason) = pin_template_image(&state, &mut request.template).await {
+        return error(StatusCode::BAD_REQUEST, reason);
+    }
     let count = request.spec.count;
     let chunks = request.spec.chunk_count();
     let write = TaskArrayWrite::Register {
@@ -192,6 +206,112 @@ pub async fn submit_handler(
     }
 }
 
+/// Compact mixed-profile input, also accepted as a TOML file by relish.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskManifestRequest {
+    pub name: String,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    pub cohort: Vec<crate::meat::task_array_store::ManifestCohort>,
+}
+fn default_namespace() -> String {
+    "default".into()
+}
+
+/// `POST /v1/batch/manifest`: one durable admission for heterogeneous work.
+pub async fn manifest_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    body: String,
+) -> Response {
+    let auth = auth.as_deref();
+    if let Err(response) =
+        crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Deployer)
+    {
+        return response;
+    }
+    let mut request: TaskManifestRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => return self::error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    if let Err(response) =
+        crate::sesame::auth::authorize_scoped(auth, &request.name, &request.namespace)
+    {
+        return response;
+    }
+    for cohort in &mut request.cohort {
+        let mut array = TaskArraySubmitRequest {
+            name: request.name.clone(),
+            namespace: Some(request.namespace.clone()),
+            template: cohort.template.clone(),
+            spec: cohort.spec.clone(),
+        };
+        if let Err(reason) = validate_submission(&mut array) {
+            return error(StatusCode::BAD_REQUEST, reason);
+        }
+        cohort.template = array.template;
+    }
+    if let Some(council) = follower_council(&state).await {
+        return forward_to_leader(&state, council, "/v1/batch/manifest", body).await;
+    }
+    for cohort in &mut request.cohort {
+        if let Err(reason) = pin_template_image(&state, &mut cohort.template).await {
+            return error(StatusCode::BAD_REQUEST, reason);
+        }
+    }
+    let write = TaskArrayWrite::RegisterManifest {
+        name: request.name,
+        namespace: request.namespace,
+        cohorts: request.cohort,
+        submitted_at_epoch_secs: epoch_now_secs(),
+    };
+    match write_task_array(&state, write).await {
+        Ok(Some(batch_id)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"batch_id": batch_id})),
+        )
+            .into_response(),
+        Ok(None) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "manifest admission returned no identity",
+        ),
+        Err(error) => write_error(error),
+    }
+}
+
+async fn pin_template_image(
+    state: &ApiState,
+    template: &mut crate::config::job::JobSpec,
+) -> Result<(), String> {
+    if template.image.is_some() && state.task_arrays.trust_policy.require_signatures {
+        let council = state
+            .council
+            .as_ref()
+            .ok_or("signed image admission requires cluster trust state")?;
+        let security = council.security_state().await;
+        let catalog = council.manifest_catalog().await;
+        let root = security
+            .get_ca(crate::sesame::types::CaRole::Root)
+            .map(|ca| ca.certificate_der.as_slice());
+        if let Some(digest) = crate::meat::scheduler::verify_image_signature(
+            template.image.as_deref(),
+            &catalog,
+            &state.task_arrays.trust_policy,
+            root,
+            Some(&security.crl),
+        )
+        .map_err(|e| e.to_string())?
+        {
+            template.image = Some(crate::meat::scheduler::pin_image_reference(
+                template.image.as_deref().expect("image checked"),
+                &digest,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `POST /v1/batch/{id}/cancel`: stop a task array. Tasks that haven't
 /// started never will; running ones get SIGTERM, then SIGKILL.
 pub async fn cancel_handler(
@@ -206,22 +326,38 @@ pub async fn cancel_handler(
         return response;
     }
     let arrays = read_task_arrays(&state).await;
-    let Some(record) = arrays.get(batch_id) else {
+    let (name, namespace, write) = if let Some(record) = arrays.get(batch_id) {
+        (
+            &record.name,
+            &record.namespace,
+            TaskArrayWrite::Cancel {
+                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                batch_id,
+            },
+        )
+    } else if let Some(record) = arrays.manifest(batch_id) {
+        (
+            &record.name,
+            &record.namespace,
+            TaskArrayWrite::CancelManifest {
+                batch_id,
+                now_epoch_secs: epoch_now_secs(),
+            },
+        )
+    } else {
         return error(
             StatusCode::NOT_FOUND,
-            format!("task array {batch_id} not found (only task arrays can be cancelled)"),
+            format!("task submission {batch_id} not found"),
         );
     };
-    if let Err(response) =
-        crate::sesame::auth::authorize_scoped(auth, &record.name, &record.namespace)
-    {
+    if let Err(response) = crate::sesame::auth::authorize_scoped(auth, name, namespace) {
         return response;
     }
     if let Some(council) = follower_council(&state).await {
         let path = format!("/v1/batch/{batch_id}/cancel");
         return forward_to_leader(&state, council, &path, String::new()).await;
     }
-    match write_task_array(&state, TaskArrayWrite::Cancel { batch_id }).await {
+    match write_task_array(&state, write).await {
         Ok(_) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "batch_id": batch_id, "cancelled": true })),
@@ -266,8 +402,69 @@ pub fn array_summary(
         "failed_indices": failed,
         "failed_overflow": state.failed_overflow,
         "submitted_at_epoch_secs": state.submitted_at_epoch_secs,
-        "nodes": nodes,
+        "nodes": nodes.iter().take(64).collect::<Vec<_>>(),
+        "nodes_truncated": nodes.len()>64,
+        "duration_final_attempt_ms": { "bounds": [1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null], "counts": state.duration_counts() },
+        "cpu_request_millicores": record.template.cpu.map_or(1000, |r| r.request),
+        "memory_request_bytes": record.template.memory.map_or(64 << 20, |r| r.request),
+        "age_seconds": epoch_now_secs().saturating_sub(state.submitted_at_epoch_secs),
+        "details_retention_seconds": crate::meat::task_array_store::TERMINAL_RETENTION_SECS,
+        "execution_semantics": "at_least_once",
     })
+}
+
+/// Summary for a mixed manifest. Profile rows remain bounded by admission;
+/// their tasks are represented only by counts and a mergeable histogram.
+pub async fn manifest_summary(
+    batch_id: u64,
+    manifest: &crate::meat::task_array_store::TaskManifest,
+    arrays: &crate::meat::task_array_store::TaskArrays,
+    service: &super::task_array_leader::TaskArrayService,
+) -> serde_json::Value {
+    let mut total = 0;
+    let mut succeeded = 0;
+    let mut failed = 0;
+    let mut not_run = 0;
+    let mut retried = 0;
+    let mut queued = 0;
+    let mut held = 0;
+    let mut done = true;
+    let mut durations = [0u64; 16];
+    let mut cohorts = Vec::new();
+    let mut stopped_failed = false;
+    let mut stopping = false;
+    for (name, id) in &manifest.cohorts {
+        if let Some(record) = arrays.get(*id) {
+            let s = record.state.summary();
+            total += s.total;
+            succeeded += s.succeeded;
+            failed += s.failed;
+            not_run += s.not_run;
+            retried += s.retried;
+            queued += s.queued;
+            held += s.held;
+            done &= s.status.is_terminal();
+            stopped_failed |= matches!(
+                s.status,
+                crate::meat::task_array_state::TaskArrayStatus::Failed
+            );
+            stopping |= matches!(
+                s.status,
+                crate::meat::task_array_state::TaskArrayStatus::Stopping
+            );
+            for (total, count) in durations.iter_mut().zip(record.state.duration_counts()) {
+                *total += count;
+            }
+            let mut cohort = array_summary(*id, record, &service.node_views(*id).await);
+            cohort["profile"] = serde_json::json!(name);
+            cohorts.push(cohort);
+        } else {
+            done = false;
+        }
+    }
+    serde_json::json!({ "batch_id":batch_id,"kind":"manifest","name":manifest.name,"namespace":manifest.namespace,"total":total,"succeeded":succeeded,"failed":failed,"not_run":not_run,"retried":retried,"queued":queued,"held":held,"done":done,
+        "status":if stopping {"Stopping"} else if !done {"Running"} else if stopped_failed {"Failed"} else if not_run>0 {"Cancelled"} else if failed>0 {"CompletedWithFailures"} else {"Succeeded"},
+        "cohorts":cohorts,"duration_final_attempt_ms":{"bounds":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null],"counts":durations},"rates":service.rates(batch_id,(succeeded,failed)).await,"details_retention_seconds":crate::meat::task_array_store::TERMINAL_RETENTION_SECS,"execution_semantics":"at_least_once" })
 }
 
 /// `POST /v1/batch/array/sync`: the leader's once-a-second call.
@@ -311,7 +508,24 @@ pub async fn local_results_handler(
         return error(StatusCode::NOT_FOUND, "this node runs no task arrays");
     };
     let limit = query.limit.unwrap_or(DEFAULT_RESULT_ROWS);
-    match node.results(batch_id, query.failed, limit).await {
+    let start = query
+        .start
+        .or(query.index)
+        .unwrap_or_else(|| query.after.map_or(0, |a| a.saturating_add(1)));
+    let end = query
+        .end
+        .unwrap_or_else(|| {
+            if query.index.is_some() {
+                start.saturating_add(1)
+            } else {
+                start.saturating_add(super::task_array_node::RESULT_PAGE_SPAN)
+            }
+        })
+        .min(start.saturating_add(super::task_array_node::RESULT_PAGE_SPAN));
+    match node
+        .results_page(batch_id, query.failed, limit, start, end)
+        .await
+    {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => node_error(e),
     }
@@ -319,10 +533,16 @@ pub async fn local_results_handler(
 
 /// `GET /v1/batch/array/{id}/local/tasks/{index}/logs`: a failed task's
 /// output, if this node kept it.
+#[derive(Default, Deserialize)]
+pub struct OutputQuery {
+    grant: Option<u64>,
+}
+
 pub async fn local_logs_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     AxumPath((batch_id, index)): AxumPath<(u64, u32)>,
+    Query(query): Query<OutputQuery>,
 ) -> Response {
     if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
         return response;
@@ -330,7 +550,11 @@ pub async fn local_logs_handler(
     let Some(node) = &state.task_arrays.node else {
         return error(StatusCode::NOT_FOUND, "this node runs no task arrays");
     };
-    match node.task_output(batch_id, index).await {
+    let result = match query.grant {
+        Some(grant) => node.task_output_grant(batch_id, index, grant).await,
+        None => node.task_output(batch_id, index).await,
+    };
+    match result {
         Ok(bytes) => bytes.into_response(),
         Err(e) => node_error(e),
     }
@@ -374,19 +598,22 @@ async fn node_results(
     batch_id: u64,
     failed: bool,
     limit: usize,
+    start: u32,
+    end: u32,
 ) -> Result<Option<Vec<TaskResultRow>>, String> {
     let Some(url) = url else {
         let Some(node) = &state.task_arrays.node else {
             return Ok(None);
         };
-        return match node.results(batch_id, failed, limit).await {
+        return match node.results_page(batch_id, failed, limit, start, end).await {
             Ok(rows) => Ok(Some(rows)),
             Err(TaskArrayNodeError::UnknownArray { .. }) => Ok(None),
             Err(e) => Err(e.to_string()),
         };
     };
-    let url =
-        format!("{url}/v1/batch/array/{batch_id}/local/results?failed={failed}&limit={limit}");
+    let url = format!(
+        "{url}/v1/batch/array/{batch_id}/local/results?failed={failed}&limit={limit}&start={start}&end={end}"
+    );
     let response = fetch_from_node(state, &url).await?;
     match response.status().as_u16() {
         404 => Ok(None),
@@ -399,25 +626,59 @@ async fn node_results(
 
 /// Merge rows from several nodes. An index can appear twice when a chunk
 /// ran partly on a node that was then written off; the row that agrees
-/// with the leader's record of failures wins.
+/// with the leader's accepted node and grant generation wins.
 pub fn merge_rows(
     record: &TaskArrayRecord,
-    per_node: Vec<Vec<TaskResultRow>>,
+    per_node: Vec<(NodeId, Vec<TaskResultRow>)>,
     limit: usize,
 ) -> (Vec<TaskResultRow>, bool) {
-    let failures = record.state.failed_indices();
     let mut merged: std::collections::BTreeMap<u32, TaskResultRow> = Default::default();
-    for row in per_node.into_iter().flatten() {
-        let agrees = |row: &TaskResultRow| row.succeeded != failures.contains(row.index);
-        match merged.get(&row.index) {
-            Some(existing) if agrees(existing) || !agrees(&row) => {}
-            _ => {
+    for (node, rows) in per_node {
+        for row in rows {
+            let Some(chunk) = record.state.spec.chunk_of(row.index) else {
+                continue;
+            };
+            if record.state.accepted_grant(chunk) == Some((node.clone(), row.grant_attempt)) {
                 merged.insert(row.index, row);
             }
         }
     }
     let truncated = merged.len() > limit;
     (merged.into_values().take(limit).collect(), truncated)
+}
+
+fn result_window(
+    record: &TaskArrayRecord,
+    query: &ResultsQuery,
+) -> (u32, u32, std::collections::BTreeSet<NodeId>) {
+    let start = query
+        .index
+        .unwrap_or_else(|| query.after.map_or(0, |a| a.saturating_add(1)));
+    let end = if query.index.is_some() {
+        start.saturating_add(1)
+    } else {
+        start.saturating_add(super::task_array_node::RESULT_PAGE_SPAN)
+    }
+    .min(record.state.spec.count);
+    let mut owners = std::collections::BTreeSet::new();
+    let mut end = end;
+    let mut cursor = start;
+    while cursor < end {
+        let Some(chunk) = record.state.spec.chunk_of(cursor) else {
+            break;
+        };
+        if let Some((node, _)) = record.state.accepted_grant(chunk) {
+            if !owners.contains(&node) && owners.len() == 8 {
+                end = cursor;
+                break;
+            }
+            owners.insert(node.clone());
+        }
+        // Walk chunk boundaries, rather than visiting every index in a large chunk.
+        cursor = ((u64::from(chunk.0) + 1) * u64::from(record.state.spec.chunk_size))
+            .min(u64::from(end)) as u32;
+    }
+    (start, end, owners)
 }
 
 /// `GET /v1/batch/{id}/results`: every task's outcome, gathered from the
@@ -428,6 +689,9 @@ pub async fn results_handler(
     AxumPath(batch_id): AxumPath<u64>,
     Query(query): Query<ResultsQuery>,
 ) -> Response {
+    if query.limit == Some(0) {
+        return error(StatusCode::BAD_REQUEST, "result limit must be positive");
+    }
     let limit = query
         .limit
         .unwrap_or(DEFAULT_RESULT_ROWS)
@@ -446,27 +710,76 @@ pub async fn results_handler(
     }
     if let Some(council) = follower_council(&state).await {
         let path = format!(
-            "/v1/batch/{batch_id}/results?failed={}&limit={limit}",
-            query.failed
+            "/v1/batch/{batch_id}/results?failed={}&limit={limit}{}{}",
+            query.failed,
+            query.after.map_or(String::new(), |a| format!("&after={a}")),
+            query.index.map_or(String::new(), |i| format!("&index={i}"))
         );
         return forward_get_to_leader(&state, council, &path).await;
     }
+    let (start, end, owners) = result_window(record, &query);
     let mut per_node = Vec::new();
     let mut unreachable = Vec::new();
+    let mut calls = tokio::task::JoinSet::new();
+    let mut known = std::collections::BTreeSet::new();
     for (node, url) in every_node(&state).await {
+        if !owners.contains(&node) {
+            continue;
+        }
+        known.insert(node.clone());
         // One row more than asked for, so a full answer can say it's truncated.
         let asked = limit.saturating_add(1);
-        match node_results(&state, url.as_deref(), batch_id, query.failed, asked).await {
-            Ok(Some(rows)) => per_node.push(rows),
-            Ok(None) => {}
+        let state = state.clone();
+        let failed = query.failed;
+        calls.spawn(async move {
+            (
+                node,
+                node_results(&state, url.as_deref(), batch_id, failed, asked, start, end).await,
+            )
+        });
+        // Bound simultaneous RPCs and buffered responses even with tiny chunks.
+        if calls.len() >= 8
+            && let Some(Ok((node, result))) = calls.join_next().await
+        {
+            match result {
+                Ok(Some(rows)) => per_node.push((node, rows)),
+                Ok(None) | Err(_) => unreachable.push(node),
+            }
+        }
+    }
+    unreachable.extend(owners.difference(&known).cloned());
+    while let Some(done) = calls.join_next().await {
+        let Ok((node, result)) = done else { continue };
+        match result {
+            Ok(Some(rows)) => per_node.push((node, rows)),
+            Ok(None) => unreachable.push(node),
             Err(reason) => {
                 eprintln!("bun: task array {batch_id}: results from {node}: {reason}");
                 unreachable.push(node);
             }
         }
     }
-    let (rows, truncated) = merge_rows(record, per_node, limit);
+    let scanned_cap = per_node
+        .iter()
+        .filter(|(_, rows)| rows.len() > limit)
+        .filter_map(|(_, rows)| rows.get(limit - 1).map(|r| r.index))
+        .min();
+    let (rows, capped) = merge_rows(record, per_node, limit);
+    let next_after = if query.index.is_some() || end == 0 {
+        None
+    } else if capped {
+        rows.last().map(|r| r.index)
+    } else if let Some(cursor) = scanned_cap {
+        Some(cursor)
+    } else if end < record.state.spec.count {
+        Some(end - 1)
+    } else {
+        None
+    };
+    let truncated = capped || next_after.is_some();
     Json(TaskResults {
+        next_after,
+        retention_seconds: crate::meat::task_array_store::TERMINAL_RETENTION_SECS,
         batch_id,
         rows,
         truncated,
@@ -504,30 +817,94 @@ pub async fn logs_handler(
             format!("task array {batch_id} has no task {index}"),
         );
     }
-    for (_, url) in every_node(&state).await {
-        let output = match url {
-            None => match &state.task_arrays.node {
-                Some(node) => node.task_output(batch_id, index).await.ok(),
-                None => None,
-            },
-            Some(url) => {
-                let url = format!("{url}/v1/batch/array/{batch_id}/local/tasks/{index}/logs");
-                match fetch_from_node(&state, &url).await {
-                    Ok(response) if response.status().is_success() => {
-                        response.bytes().await.ok().map(|bytes| bytes.to_vec())
-                    }
-                    _ => None,
+    let chunk = record.state.spec.chunk_of(index).expect("validated index");
+    let Some((owner, grant)) = record.state.accepted_grant(chunk) else {
+        return error(StatusCode::NOT_FOUND, "task has no accepted outcome yet");
+    };
+    let Some((_, url)) = every_node(&state)
+        .await
+        .into_iter()
+        .find(|(node, _)| node == &owner)
+    else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "accepted task owner is unavailable",
+        );
+    };
+    let output = match url {
+        None => match &state.task_arrays.node {
+            Some(node) => node.task_output_grant(batch_id, index, grant).await.ok(),
+            None => None,
+        },
+        Some(url) => {
+            let url =
+                format!("{url}/v1/batch/array/{batch_id}/local/tasks/{index}/logs?grant={grant}");
+            match fetch_from_node(&state, &url).await {
+                Ok(response) if response.status().is_success() => {
+                    response.bytes().await.ok().map(|bytes| bytes.to_vec())
+                }
+                Ok(response) if response.status() == StatusCode::NOT_FOUND => None,
+                _ => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "accepted task owner's output is unavailable",
+                    );
                 }
             }
-        };
-        if let Some(bytes) = output {
-            return bytes.into_response();
         }
+    };
+    if let Some(bytes) = output {
+        return bytes.into_response();
     }
     error(
         StatusCode::NOT_FOUND,
         format!("no node kept output for task {index}; output is kept only for failed tasks"),
     )
+}
+
+/// Gather bounded parent/profile summaries, excluding a parent's child arrays.
+pub async fn summaries(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> Vec<serde_json::Value> {
+    let arrays = read_task_arrays(state).await;
+    let children: std::collections::BTreeSet<_> = arrays
+        .manifests()
+        .flat_map(|(_, m)| m.cohorts.iter().map(|(_, id)| *id))
+        .collect();
+    let mut rows = Vec::new();
+    for (id, manifest) in arrays.manifests() {
+        if crate::sesame::auth::authorize_scoped(auth, &manifest.name, &manifest.namespace).is_ok()
+        {
+            rows.push(manifest_summary(id, manifest, &arrays, &state.task_arrays).await);
+        }
+    }
+    for (id, record) in arrays.iter() {
+        if children.contains(&id)
+            || crate::sesame::auth::authorize_scoped(auth, &record.name, &record.namespace).is_err()
+        {
+            continue;
+        }
+        let mut row = array_summary(id, record, &state.task_arrays.node_views(id).await);
+        let counts = record.state.summary();
+        row["rates"] = serde_json::json!(
+            state
+                .task_arrays
+                .rates(id, (counts.succeeded, counts.failed))
+                .await
+        );
+        rows.push(row);
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r["batch_id"].as_u64().unwrap_or(0)));
+    rows
+}
+
+/// Aggregate admission-bounded batch list; no per-task objects are returned.
+pub async fn summaries_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    Json(serde_json::json!({ "batches": summaries(&state, auth.as_deref()).await })).into_response()
 }
 
 #[cfg(test)]
@@ -562,6 +939,66 @@ mod tests {
     }
 
     #[test]
+    fn tiny_chunks_page_across_at_most_eight_workers_without_skipping_indexes() {
+        use crate::meat::task_array::ChunkId;
+        use crate::meat::task_array_state::ChunkResult;
+        let mut state = TaskArrayState::new(
+            TaskArraySpec {
+                chunk_size: 1,
+                ..TaskArraySpec::with_count(16)
+            },
+            0,
+        )
+        .unwrap();
+        for chunk in 0..16 {
+            let node = NodeId::new(format!("worker-{chunk}"));
+            state
+                .grant(&node, &IndexRangeSet::from_range(chunk..=chunk))
+                .unwrap();
+            state
+                .complete(
+                    &node,
+                    &ChunkResult {
+                        chunk: ChunkId(chunk),
+                        attempt: 1,
+                        succeeded: 1,
+                        failed_count: 0,
+                        failed_indices: IndexRangeSet::new(),
+                        not_run: 0,
+                        retried: 0,
+                        duration_counts: [0; 16],
+                    },
+                )
+                .unwrap();
+        }
+        let record = TaskArrayRecord {
+            name: "tiny".into(),
+            namespace: "default".into(),
+            template: template(),
+            state,
+            terminal_at_epoch_secs: Some(1),
+        };
+        let (start, end, owners) = result_window(&record, &ResultsQuery::default());
+        assert_eq!((start, end, owners.len()), (0, 8, 8));
+        let (start, end, owners) = result_window(
+            &record,
+            &ResultsQuery {
+                after: Some(7),
+                ..Default::default()
+            },
+        );
+        assert_eq!((start, end, owners.len()), (8, 16, 8));
+        let (start, end, owners) = result_window(
+            &record,
+            &ResultsQuery {
+                index: Some(14),
+                ..Default::default()
+            },
+        );
+        assert_eq!((start, end, owners.len()), (14, 15, 1));
+    }
+
+    #[test]
     fn a_submission_settles_one_namespace() {
         let mut request = submission();
         assert_eq!(validate_submission(&mut request).unwrap(), "default");
@@ -582,7 +1019,7 @@ mod tests {
     fn invalid_submissions_are_refused_with_the_reason() {
         let mut no_exec = submission();
         no_exec.template.exec = None;
-        no_exec.template.image = Some("alpine".to_string());
+        no_exec.template.image = None;
         assert!(
             validate_submission(&mut no_exec)
                 .unwrap_err()
@@ -606,6 +1043,14 @@ mod tests {
             validate_submission(&mut secret)
                 .unwrap_err()
                 .contains("encrypted")
+        );
+
+        let mut oversized = submission();
+        oversized.template.command = Some(vec!["x".repeat(16 * 1024)]);
+        assert!(
+            validate_submission(&mut oversized)
+                .unwrap_err()
+                .contains("16 KiB")
         );
 
         let mut unnamed = submission();
@@ -634,9 +1079,11 @@ mod tests {
             .complete(
                 &node,
                 &crate::meat::task_array_state::ChunkResult {
+                    duration_counts: [0; 16],
                     chunk: crate::meat::task_array::ChunkId(0),
                     attempt: 1,
                     succeeded: 10 - failed.len() as u32,
+                    failed_count: failed_indices.len() as u32,
                     failed_indices,
                     not_run: 0,
                     retried: 0,
@@ -644,6 +1091,7 @@ mod tests {
             )
             .unwrap();
         TaskArrayRecord {
+            terminal_at_epoch_secs: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: template(),
@@ -653,9 +1101,11 @@ mod tests {
 
     fn row(index: u32, succeeded: bool) -> TaskResultRow {
         TaskResultRow {
+            grant_attempt: 1,
             index,
             attempts: 1,
             succeeded,
+            not_run: false,
             exit_code: Some(i32::from(!succeeded)),
             run_ms: 1,
         }
@@ -667,10 +1117,11 @@ mod tests {
         let (rows, truncated) = merge_rows(
             &record,
             vec![
-                vec![row(0, true), row(2, true), row(3, true)],
-                // Index 2 also ran here, and this run is the one the leader
-                // recorded (it failed).
-                vec![row(1, true), row(2, false)],
+                (NodeId::new("old-worker"), vec![row(2, true), row(4, true)]),
+                (
+                    NodeId::new("a"),
+                    vec![row(0, true), row(1, true), row(2, false), row(3, true)],
+                ),
             ],
             10,
         );
@@ -678,7 +1129,11 @@ mod tests {
         assert_eq!(got, vec![(0, true), (1, true), (2, false), (3, true)]);
         assert!(!truncated);
 
-        let (rows, truncated) = merge_rows(&record, vec![vec![row(0, true), row(1, true)]], 1);
+        let (rows, truncated) = merge_rows(
+            &record,
+            vec![(NodeId::new("a"), vec![row(0, true), row(1, true)])],
+            1,
+        );
         assert_eq!(rows.len(), 1);
         assert!(truncated);
     }

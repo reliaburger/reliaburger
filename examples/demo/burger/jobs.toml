@@ -1,0 +1,28 @@
+# Development preview: PR #266 / 0.2.0, on rootful Linux nodes.
+# A chunk queues indexes; CPU and memory requests govern actual concurrency.
+name = "burger-orders"
+namespace = "default"
+
+[[cohort]]
+name = "small"
+count = 1000
+chunk_size = 128
+max_attempts = 3
+task_timeout_secs = 30
+[cohort.template]
+image = "burger:v1"
+command = ["/burger", "batch", "small", "{index}"]
+cpu = "100m-250m"
+memory = "32Mi-64Mi"
+
+[[cohort]]
+name = "large"
+count = 64
+chunk_size = 16
+max_attempts = 3
+task_timeout_secs = 30
+[cohort.template]
+image = "burger:v1"
+command = ["/burger", "batch", "large", "{index}"]
+cpu = "1000m"
+memory = "128Mi"

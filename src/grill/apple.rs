@@ -949,6 +949,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec!["TEST=1".to_string()],
                 cwd: "/".to_string(),
@@ -1019,6 +1020,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "300".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),

@@ -280,8 +280,11 @@ migration and no feature gate
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
-  keep compact state in Raft and expand on each node, and finish a million
-  tasks in minutes on three nodes.
+  keep compact state in Raft and expand on each node. The development draft
+  adds mixed resource profiles, shared app/job admission, durable worker outcomes,
+  summaries and indexed detail ([implementation plan](plans/2026-10-04-plan-delegated-jobs.md)).
+  The million-task release gate and sustained 100m/day claim still require
+  real-runtime qualification ([evidence](qualification/2026-10-04-delegated-jobs/README.md)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
