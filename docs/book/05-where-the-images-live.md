@@ -206,6 +206,10 @@ Phase 1 added volume support with `VolumeSpec.size`, but the size field was igno
 
 On Linux, managed volumes with a size limit get a loop-mounted ext4 filesystem. The node creates a sparse file of the specified size, formats it with ext4, and mounts it. Writes that exceed the quota fail with ENOSPC — the kernel enforces it, not us.
 
+The full volume name matters when we name its image. `/data.a` gets `data.a.img`, and `/data.b` gets `data.b.img`. Replacing the extension would give both volumes `data.img`, so provisioning the second could format the first volume's data. We append the suffix instead, and use the same derivation during remount and retirement.
+
+Before creating any managed volume for an app, we check the whole layout. Mount directories, images, metadata sidecars and temporary snapshot restore paths must neither coincide nor contain one another. `/data` alongside `/data.img` is unsafe too: the second mount directory occupies the first image's name. Configuration admission rejects these layouts, and the agent repeats the check before touching storage. The Linux regression writes separate sentinels to two dotted volumes, unmounts both, then remounts them to check that each still owns its data.
+
 A mount is kernel state, though, and kernel state doesn't survive a reboot. We only mounted the image when the volume was first created. The V02 soak stopped and started the whole cluster, and the writer app came back to an empty `/data`: its image sat unmounted beside a bare directory, the container wrote into that directory on the root filesystem (with no size limit at all), and 36,318 acknowledged lines were hidden rather than lost. Provisioning an existing loop volume now mounts its image again when it isn't mounted. If something already wrote into the bare mountpoint, it refuses and says so, because mounting over those files would hide them just as quietly.
 
 The same soak found a smaller trap in a new loop volume. `mkfs.ext4` leaves `lost+found` behind, so the app never sees an empty directory. The official Redis entrypoint only takes over its data directory when it holds nothing but `*.rdb` files and `appendonlydir`; anything else and it prints a notice, drops to the `redis` user and fails with "Permission denied". Postgres's `initdb` flatly refuses a non-empty directory. We remove `lost+found` right after mounting, so a new volume looks exactly like a Docker volume does. `e2fsck` makes a fresh one if it ever needs it.
@@ -1127,3 +1131,40 @@ cargo test --lib pickle       # the whole registry, in-process
 Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
 
 Phase 5 adds 72 tests, bringing the total to 867.
+
+
+### Sharing the authentication budget
+
+A registry request used to call the synchronous Argon2 verifier directly. The token decisions were correct, but the hash ran on a Tokio worker. Enough concurrent requests could occupy the workers that also run Bun's health checks and scheduling.
+
+Pickle now uses the same asynchronous verifier as the API and browser login. It rejects malformed tokens before hashing, waits for one of four process-wide permits, and runs the expensive verification with `spawn_blocking`. A permit is a borrowed place in that shared budget; holding it inside the blocking closure keeps the place occupied until the hash really finishes, even if the HTTP caller disconnects.
+
+The regression holds every verification permit and sends real registry reads and uploads, with both Bearer and TLS Basic credentials. Each request waits until admission opens, while malformed credentials return 401 immediately. Role and repository scope checks still happen after authentication. A different HTTP port doesn't buy a second CPU budget.
+
+### A shared digest needs repository authority
+
+A content-addressed store shares identical bytes across repositories. That saves
+space, but physical presence cannot establish who may use those bytes. A scoped
+publisher used to be able to name another repository's blob in its own manifest,
+then read the newly referenced content through its ordinary repository grant.
+
+Publication now checks every configuration, layer and index child against the
+destination repository. A current catalogue reference proves authority. A
+completed upload proves it too: after verifying the complete payload's digest,
+the blocking transaction writes a receipt for the repository and its exact lease
+generation before acknowledging success. The receipt filename hashes that
+identity, so repository strings cannot become filesystem paths. Missing or
+unreadable evidence never confers authority.
+
+Scoped blob probes use the same rule. If HEAD reported global presence while
+publication required a destination upload, a normal client would skip the upload
+and fail later. Returning 404 prompts it to send the bytes it owns. Shared storage
+still keeps one final copy, and an existing catalogue reference lets subsequent
+pushes reuse it. Bare blobs from the old format need another upload before scoped
+publication; catalogue references remain valid after restart.
+
+Collecting or rejecting corrupt bytes removes their receipts. Retiring a leased
+repository removes only that generation's evidence, preserving other repositories'
+authority and shared content. The regressions cover foreign configurations,
+layers and index children, successful ordinary pushes, persisted receipts,
+failed digest checks, receipt-write failures and exact-generation retirement.

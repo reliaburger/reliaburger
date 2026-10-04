@@ -115,7 +115,7 @@ later) places the app and clears the reason.
 
 ```sh
 relish apply app.toml            # deploy (or converge) everything in the file
-relish apply app.toml --dry-run  # preview; exits 0 even with no agent
+relish apply app.toml --dry-run  # preview; no-agent output states its offline assumption
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
 relish exec web env              # run a command inside an instance, on whichever node runs it
@@ -124,6 +124,8 @@ relish inspect web               # every instance on every node, desired vs runn
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
+
+`apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 
 In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
@@ -162,7 +164,12 @@ relish apply all.toml
 `compile` walks the directory recursively. Each subdirectory's name becomes
 the namespace of the apps inside it, and a `_defaults.toml` fills in fields its
 apps leave unset. `diff` compares files, not the live cluster; `apply --dry-run`
-shows what would change on the cluster.
+compares complete desired specifications, including replicas, environment,
+resources, namespace quotas and permissions. Namespace-qualified workloads have
+separate identities. Incomplete live evidence is shown as `?` (`unknown` in JSON),
+never as unchanged. With no reachable agent, the output states that creates are
+an offline assumption; JSON includes `comparison_available: false`. If a live
+agent answers but cannot supply the comparison, the command fails.
 
 A compiled manifest currently keys apps, jobs and builds by bare name. If two
 resources of the same kind have the same name in different namespaces,

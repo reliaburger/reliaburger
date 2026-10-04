@@ -39,10 +39,13 @@ pub struct Compatibility {
 /// `identity` event kinds a peer's `/v1/events` answer can carry (F05 I1),
 /// and the API token expiry sweep (`RaftRequest::SweepExpiredApiTokens`,
 /// `CouncilResponse::ApiTokensSwept`) with the token list each peer answers
-/// on `local=true`, carrying scope and last use (F05 I2).
+/// on `local=true`, carrying scope and last use (F05 I2), and the per-blob
+/// repository upload receipts, keyed by repository and exact lease generation
+/// before scoped publication can reuse shared CAS content (#531).
+/// Complete desired-spec fingerprints and namespace-qualified preview keys (#550).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 35,
-    state: 50,
+    protocol: 36,
+    state: 51,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

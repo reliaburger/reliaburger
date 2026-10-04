@@ -10,6 +10,7 @@ pub mod app;
 pub mod build;
 pub(crate) mod defaults;
 pub mod error;
+pub mod fingerprint;
 pub mod job;
 pub mod namespace;
 pub mod node;

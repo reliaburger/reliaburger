@@ -167,6 +167,13 @@ async fn current_apps_feeds_the_dry_run_diff() {
     let plan = crate::relish::plan::generate_plan(&same, Some(&current));
     assert_eq!((plan.to_update, plan.unchanged), (0, 1), "{plan:?}");
 
+    let changed = crate::config::Config::parse(
+        "[app.web]\nimage = \"myapp:v1\"\nreplicas = 3\nport = 8081\n",
+    )
+    .unwrap();
+    let plan = crate::relish::plan::generate_plan(&changed, Some(&current));
+    assert_eq!(plan.to_update, 1, "same-image change was missed: {plan:?}");
+
     let bumped = crate::config::Config::parse("[app.web]\nimage = \"myapp:v2\"\n").unwrap();
     let plan = crate::relish::plan::generate_plan(&bumped, Some(&current));
     assert_eq!((plan.to_create, plan.to_update), (0, 1), "{plan:?}");
@@ -7186,4 +7193,286 @@ async fn per_app_process_metric_is_queryable() {
     assert_eq!(parsed.data[0].metric_name, "process_cpu_percent");
 
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn apply_uses_committed_namespace_context_before_any_resource_write() {
+    use crate::council::RaftRequest;
+    let council = seeded_council("namespace-context-review2").await;
+    let quota = crate::config::Config::parse("[namespace.existing]\ncpu = '2000m'\nmax_apps = 2\n")
+        .unwrap()
+        .namespace
+        .remove("existing")
+        .unwrap();
+    council
+        .write(RaftRequest::NamespaceSpec {
+            name: "existing".into(),
+            spec: Box::new(quota.clone()),
+        })
+        .await
+        .unwrap();
+    let (app, shutdown, token) = router_for_council(council.clone()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::relish::client::BunClient::new_with_token(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        Some(&token),
+    );
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
+    )
+    .unwrap();
+    let result = client.apply(&permission).await;
+    assert!(
+        result.is_ok(),
+        "committed namespace was rejected: {result:?}"
+    );
+    let desired = council.desired_state().await;
+    assert_eq!(desired.namespaces["existing"], quota);
+    assert_eq!(
+        desired.permissions["reader"],
+        permission.permission["reader"]
+    );
+    let ghost = crate::config::Config::parse(
+        "[permission.ghost]\nactions = ['logs']\napps = ['web']\nnamespaces = ['ghost']\n",
+    )
+    .unwrap();
+    assert!(client.apply(&ghost).await.is_err());
+    assert!(
+        !council
+            .desired_state()
+            .await
+            .permissions
+            .contains_key("ghost")
+    );
+    // Apply validates build declarations; execution is the separate build route.
+    let before_builds = council.desired_state().await;
+    for (namespace, expected) in [("existing", true), ("ghost", false)] {
+        let build = crate::config::Config::parse(&format!(
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = '{namespace}'\n"
+        )).unwrap();
+        let result = client.apply(&build).await;
+        assert_eq!(
+            result.is_ok(),
+            expected,
+            "build namespace={namespace}: {result:?}"
+        );
+        let after = council.desired_state().await;
+        assert_eq!(after.namespaces, before_builds.namespaces);
+        assert_eq!(after.permissions, before_builds.permissions);
+        assert_eq!(after.apps, before_builds.apps);
+    }
+    shutdown.cancel();
+    server.await.unwrap();
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn follower_apply_defers_namespace_existence_to_the_authoritative_leader() {
+    use crate::council::RaftRequest;
+    let nodes = council_of(3).await;
+    let leader_id = nodes[0].current_leader().await.unwrap();
+    let leader = nodes[(leader_id - 1) as usize].clone();
+    let follower = nodes
+        .iter()
+        .enumerate()
+        .find(|(index, _)| *index + 1 != leader_id as usize)
+        .unwrap()
+        .1
+        .clone();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while follower.current_leader().await != Some(leader_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("follower must know the elected leader before the HTTP request");
+    let quota = crate::config::Config::parse("[namespace.existing]\ncpu = '2000m'\nmax_apps = 2\n")
+        .unwrap()
+        .namespace
+        .remove("existing")
+        .unwrap();
+    leader
+        .write(RaftRequest::NamespaceSpec {
+            name: "existing".into(),
+            spec: Box::new(quota.clone()),
+        })
+        .await
+        .unwrap();
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let mut servers = Vec::new();
+    let shutdown = CancellationToken::new();
+    let client = crate::relish::client::BunClient::new_with_token(
+        &format!("http://{}", follower_listener.local_addr().unwrap()),
+        Some(&plaintext),
+    );
+    let reached_leader = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (node, listener, is_leader) in [
+        (leader.clone(), leader_listener, true),
+        (follower, follower_listener, false),
+    ] {
+        let (commands, _receiver) = mpsc::channel(4);
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(token.clone());
+        let mut app = router(
+            commands,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(node),
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            leader_port,
+            None,
+        );
+        if is_leader {
+            let reached = reached_leader.clone();
+            app = app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let reached = reached.clone();
+                    async move {
+                        if request.uri().path() == "/v1/apply" {
+                            reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+        }
+        let stop = shutdown.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await
+                .unwrap();
+        }));
+    }
+    let valid = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
+    )
+    .unwrap();
+    let accepted = client.apply(&valid).await;
+    assert!(
+        accepted.is_ok(),
+        "follower rejected a committed namespace: {accepted:?}"
+    );
+    assert_eq!(leader.desired_state().await.namespaces["existing"], quota);
+    assert_eq!(
+        leader.desired_state().await.permissions["reader"],
+        valid.permission["reader"]
+    );
+    let ghost = crate::config::Config::parse(
+        "[permission.ghost]\nactions = ['logs']\napps = ['web']\nnamespaces = ['ghost']\n",
+    )
+    .unwrap();
+    assert!(client.apply(&ghost).await.is_err());
+    assert!(
+        !leader
+            .desired_state()
+            .await
+            .permissions
+            .contains_key("ghost")
+    );
+    assert_eq!(
+        reached_leader.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both existence decisions must reach the leader"
+    );
+    shutdown.cancel();
+    for server in servers {
+        server.await.unwrap();
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
+    use crate::bun::agent::CurrentResourceStatus;
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+    let agent = tokio::spawn(async move {
+        let Some(AgentCommand::CurrentResources { response }) = cmd_rx.recv().await else {
+            panic!("wrong agent request")
+        };
+        response
+            .send(vec![
+                CurrentResourceStatus {
+                    resource: "app.team/web".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: Some("team-spec".into()),
+                },
+                CurrentResourceStatus {
+                    resource: "app.other/web".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: Some("other-spec".into()),
+                },
+                CurrentResourceStatus {
+                    resource: "job.team/migrate".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: None,
+                },
+            ])
+            .unwrap();
+    });
+    let context = crate::sesame::auth::AuthContext {
+        token_name: "team-reader".into(),
+        principal_id: "token:test".into(),
+        role: crate::sesame::types::ApiRole::ReadOnly,
+        scoped_apps: Some(vec!["web".into()]),
+        scoped_namespaces: Some(vec!["team".into()]),
+    };
+    let app = router(
+        cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    )
+    .layer(axum::Extension(context));
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/apps")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows: Vec<CurrentResourceStatus> =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].resource, "app.team/web");
+    assert_eq!(rows[0].fingerprint.as_deref(), Some("team-spec"));
+    agent.await.unwrap();
+}
+
+#[tokio::test]
+async fn dry_run_endpoint_refuses_unavailable_agent_evidence() {
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    drop(cmd_rx);
+    let app = router(
+        cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/apps")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

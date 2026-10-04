@@ -37,28 +37,13 @@ impl Config {
     ///
     /// Returns the first error found. Call after `from_str` or `from_file`.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_workload_names()?;
-        for (name, app) in &self.app {
-            validate_app(name, app)?;
-        }
-        for (name, job) in &self.job {
-            validate_job(name, job)?;
-        }
-        for (name, ns) in &self.namespace {
-            validate_namespace(name, ns)?;
-        }
-        // Permissions and builds may reference namespaces declared in the
-        // same file. Apply passes the already-committed desired-state
-        // namespaces through `validate_against`; a bare `validate` only
-        // knows about namespaces in this config.
-        let declared: Vec<String> = self.namespace.keys().cloned().collect();
-        for (name, perm) in &self.permission {
-            validate_permission(name, perm, &declared)?;
-        }
-        for (name, build) in &self.build {
-            validate_build(name, build, &declared)?;
-        }
-        Ok(())
+        self.validate_against(&[])
+    }
+
+    /// Check all local semantics before a request reaches live admission.
+    /// Namespace existence is resolved from authoritative cluster state later.
+    pub fn validate_intrinsic(&self) -> Result<(), ConfigError> {
+        self.validate_with_namespace_context(None)
     }
 
     /// Validate identity labels and refuse app/job runtime identity collisions.
@@ -95,6 +80,15 @@ impl Config {
     /// desired state) as also declared. Permissions and builds may target
     /// a namespace created by an earlier apply, not just one in this file.
     pub fn validate_against(&self, known_namespaces: &[String]) -> Result<(), ConfigError> {
+        let mut declared: Vec<String> = self.namespace.keys().cloned().collect();
+        declared.extend(known_namespaces.iter().cloned());
+        self.validate_with_namespace_context(Some(&declared))
+    }
+
+    fn validate_with_namespace_context(
+        &self,
+        namespaces: Option<&[String]>,
+    ) -> Result<(), ConfigError> {
         self.validate_workload_names()?;
         for (name, app) in &self.app {
             validate_app(name, app)?;
@@ -105,13 +99,11 @@ impl Config {
         for (name, ns) in &self.namespace {
             validate_namespace(name, ns)?;
         }
-        let mut declared: Vec<String> = self.namespace.keys().cloned().collect();
-        declared.extend(known_namespaces.iter().cloned());
-        for (name, perm) in &self.permission {
-            validate_permission(name, perm, &declared)?;
+        for (name, permission) in &self.permission {
+            validate_permission(name, permission, namespaces)?;
         }
         for (name, build) in &self.build {
-            validate_build(name, build, &declared)?;
+            validate_build(name, build, namespaces)?;
         }
         Ok(())
     }
@@ -168,7 +160,7 @@ fn validate_namespace(name: &str, ns: &super::namespace::NamespaceSpec) -> Resul
 fn validate_permission(
     name: &str,
     perm: &super::permission::PermissionSpec,
-    known_namespaces: &[String],
+    known_namespaces: Option<&[String]>,
 ) -> Result<(), ConfigError> {
     for action in &perm.actions {
         if !KNOWN_PERMISSION_ACTIONS.contains(&action.as_str()) {
@@ -186,7 +178,10 @@ fn validate_permission(
     // and hides a typo. `default` always exists implicitly.
     if let Some(namespaces) = &perm.namespaces {
         for ns in namespaces {
-            if ns != "default" && !known_namespaces.iter().any(|n| n == ns) {
+            validate_label(ns, name, "namespaces")?;
+            if ns != "default"
+                && known_namespaces.is_some_and(|known| !known.iter().any(|n| n == ns))
+            {
                 return Err(ConfigError::Validation {
                     field: "namespaces".to_string(),
                     context: format!("permission {name:?}"),
@@ -201,14 +196,17 @@ fn validate_permission(
 fn validate_build(
     name: &str,
     build: &super::build::BuildSpec,
-    known_namespaces: &[String],
+    known_namespaces: Option<&[String]>,
 ) -> Result<(), ConfigError> {
     // Destination syntax and context existence.
     super::build::validate_build_namespace(name, build)?;
     // A build's namespace must exist. `default` is implicit.
+    if let Some(ns) = &build.namespace {
+        validate_label(ns, name, "namespace")?;
+    }
     if let Some(ns) = &build.namespace
         && ns != "default"
-        && !known_namespaces.iter().any(|n| n == ns)
+        && known_namespaces.is_some_and(|known| !known.iter().any(|n| n == ns))
     {
         return Err(ConfigError::Validation {
             field: "namespace".to_string(),
@@ -366,6 +364,13 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             });
         }
     }
+
+    crate::grill::volume::validate_managed_volume_layout(&app.volumes).map_err(|reason| {
+        ConfigError::InvalidVolume {
+            name: name.to_string(),
+            reason,
+        }
+    })?;
 
     // Deploy block: `max_surge = 0` with `max_unavailable = 0` leaves a rolling
     // deploy no legal move in either direction, so reject it here rather than
@@ -1386,6 +1391,50 @@ mod tests {
     }
 
     #[test]
+    fn managed_volume_artifact_overlaps_are_rejected() {
+        for paths in [
+            ["/data", "/data/child"],
+            ["/data", "/data.img"],
+            ["/data", "/data.volume.json"],
+            ["/data", "/data.volume.json.tmp"],
+            ["/data", "/data.restore-staged"],
+            ["/data", "/data.restore-old"],
+            ["/data", "/data.restore.json"],
+            ["/data", "/data"],
+            ["/", "/data"],
+        ] {
+            let mut app = minimal_app();
+            app.volumes = paths
+                .map(|path| crate::config::types::VolumeSpec {
+                    path: PathBuf::from(path),
+                    source: None,
+                    size: Some("16Mi".into()),
+                })
+                .to_vec();
+            assert!(
+                matches!(
+                    config_with_app("db", app).validate(),
+                    Err(ConfigError::InvalidVolume { .. })
+                ),
+                "accepted {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_managed_volume_paths_remain_distinct() {
+        let mut app = minimal_app();
+        app.volumes = ["/data.a", "/data.b"]
+            .map(|path| crate::config::types::VolumeSpec {
+                path: PathBuf::from(path),
+                source: None,
+                size: Some("16Mi".into()),
+            })
+            .to_vec();
+        config_with_app("db", app).validate().unwrap();
+    }
+
+    #[test]
     fn validate_volume_relative_mount_path_rejected() {
         let mut app = minimal_app();
         app.volumes.push(crate::config::types::VolumeSpec {
@@ -1511,6 +1560,24 @@ mod tests {
         let app: AppSpec = toml::from_str(r#"script = "echo hello""#).unwrap();
         let config = config_with_app("test", app);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn autoscale_admission_refuses_nonpositive_and_nonfinite_targets() {
+        for target in ["0%", "-20%", "NaN", "NaN%", "inf", "inf%", "-inf"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            assert!(config.validate().is_err(), "accepted target {target}");
+        }
+        for target in ["70%", "0.7", "150%"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage='busybox'\ncpu='100m'\n[app.web.autoscale]\nmetric='cpu'\ntarget='{target}'\nmin=1\nmax=5\n"
+            ))
+            .unwrap();
+            config.validate().unwrap();
+        }
     }
 
     #[test]
