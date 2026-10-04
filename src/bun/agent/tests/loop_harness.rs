@@ -1094,8 +1094,13 @@ async fn sync_consumer(
 /// before installing it, then marks it active, then forgets the views it
 /// replaced: three fsync'd writes in one turn, and five when the first
 /// answer after a recovery withdraws everything first. At the soak's
-/// 400 ms a write, either sync must still keep every turn, and a status
-/// queued behind it, inside the budget.
+/// 400 ms a write, either sync must journal at most one write in any turn,
+/// and a status queued behind it must still be answered.
+///
+/// The verdict counts writes per turn instead of timing the status. A
+/// status may wait two turns of one slowed write each, which leaves about
+/// 200 ms of the budget for the host's real fsyncs, and on a loaded hosted
+/// macOS runner `F_FULLFSYNC` took about 570 ms (#585), the #508 class.
 #[tokio::test]
 async fn status_answers_while_a_consumer_sync_journals_to_a_slow_disk() {
     let (agent, _root, catalog, ingress) = recovered_consumer().await;
@@ -1110,8 +1115,8 @@ async fn status_answers_while_a_consumer_sync_journals_to_a_slow_disk() {
         let reply = sync_consumer(&running.tx, generation, catalog, ingress.clone()).await;
         let mid_sync = running.status_latency().await;
         assert!(
-            mid_sync.is_some_and(|latency| latency < TURN_BUDGET),
-            "status took {mid_sync:?} while {view} journalled to a slow disk"
+            mid_sync.is_some(),
+            "status went unanswered while {view} journalled to a slow disk"
         );
         let update = tokio::time::timeout(std::time::Duration::from_secs(10), reply)
             .await
@@ -1121,9 +1126,20 @@ async fn status_answers_while_a_consumer_sync_journals_to_a_slow_disk() {
         assert!(update.published, "{view} was not published");
         assert!(lease.is_valid(), "{view} did not renew the view lease");
     }
-    running
-        .assert_responsive("consumer syncs journalled their views to a slow disk")
-        .await;
+    let after_syncs = running.status_latency().await;
+    let most_in_a_turn = running.stalls.most_in_a_turn(LoopStall::Persist);
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(
+        after_syncs.is_some(),
+        "status went unanswered after the consumer syncs"
+    );
+    assert!(
+        most_in_a_turn <= 1,
+        "one turn journalled {most_in_a_turn} writes to a slow disk (the worst turn \
+         was {worst:?}); a consumer sync step may journal one"
+    );
 }
 
 /// Counting the writes makes the split independent of the disk: whatever a
