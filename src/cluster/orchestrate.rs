@@ -7578,3 +7578,118 @@ mod revalidation_in_place {
         assert_eq!(home.allocated.cpu_millicores, 900);
     }
 }
+
+// Append to src/cluster/orchestrate.rs after integrating root534 + actual543.
+#[cfg(test)]
+mod audit_prerequisite_capacity {
+    use super::*;
+    use crate::council::prerequisites::PrerequisiteClaim;
+    use crate::meat::types::AppId;
+
+    fn approved() -> Config {
+        Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nimage='migration:v1'\ncpu='5'\nrun_before=['app.web']\n[job.notify]\nimage='notify:v1'\ncpu='3'\n").unwrap()
+    }
+    fn candidates() -> ClusterStateCache {
+        let mut cache = ClusterStateCache::new();
+        for name in ["a", "b"] {
+            cache.set_node(SchedulerNodeState {
+                node_id: NodeId::new(name),
+                allocatable: Resources::new(8000, 16 * 1024 * 1024 * 1024, 0),
+                allocated: Resources::default(),
+                labels: Default::default(),
+                ready: true,
+                capabilities: Default::default(),
+                app_replicas: Default::default(),
+                uptime_secs: 100,
+                cached_images: Default::default(),
+            });
+        }
+        cache
+    }
+    fn probe(cpu: u64) -> (AppId, AppSpec) {
+        let id = AppId::new("capacity-probe", "another-namespace");
+        let mut spec: AppSpec = toml::from_str("image='probe:v1'").unwrap();
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu,
+            limit: cpu,
+        });
+        (id, spec)
+    }
+    fn run(desired: &crate::council::types::DesiredState, cpu: u64) -> (ClusterStateCache, bool) {
+        let mut desired = desired.clone();
+        let (id, spec) = probe(cpu);
+        desired.apps.insert(id.clone(), spec);
+        let mut cache = candidates();
+        let decisions = plan_scheduling_pass(
+            &mut cache,
+            &desired,
+            &HashSet::from([NodeId::new("a"), NodeId::new("b")]),
+            &mut crate::meat::quota::QuotaLedger::default(),
+        );
+        let placed = decisions
+            .iter()
+            .any(|decision| decision.app_id == id && !decision.placements.is_empty());
+        (cache, placed)
+    }
+    #[test]
+    fn ordinary_placement_subtracts_precommit_jobs_from_every_candidate_before_reports_arrive() {
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.prerequisite_claims.insert(
+            "1234567890abcdef1234567890abcdef".into(),
+            PrerequisiteClaim {
+                term: 1,
+                recovery_epoch: 0,
+                apps_committed: false,
+                config: approved(),
+            },
+        );
+        let (cache, placed) = run(&desired, 4000);
+        assert!(
+            !placed,
+            "planner spent capacity held by an unreported migration/ordinary job"
+        );
+        for node in ["a", "b"] {
+            let state = cache.get_node(&NodeId::new(node)).unwrap();
+            assert_eq!(state.allocated.cpu_millicores, 8000, "{node}");
+            assert_eq!(
+                state.replicas_of(&AppId::new("migrate", "default")),
+                0,
+                "a reservation invented a report replica"
+            );
+        }
+        desired
+            .prerequisite_claims
+            .values_mut()
+            .next()
+            .unwrap()
+            .term = 99;
+        let (_, placed) = run(&desired, 4000);
+        assert!(!placed, "a different owner term is not proof of settlement");
+    }
+    #[test]
+    fn ordinary_placement_releases_migration_after_commit_but_keeps_the_ordinary_tail() {
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.prerequisite_claims.insert(
+            "1234567890abcdef1234567890abcdef".into(),
+            PrerequisiteClaim {
+                term: 1,
+                recovery_epoch: 0,
+                apps_committed: true,
+                config: approved(),
+            },
+        );
+        let (_, placed) = run(&desired, 6000);
+        assert!(!placed, "ordinary tail's 3000m reservation disappeared");
+        let (_, placed) = run(&desired, 4000);
+        assert!(
+            placed,
+            "completed migration's 5000m reservation survived commit"
+        );
+        desired.prerequisite_claims.clear();
+        let (_, placed) = run(&desired, 8000);
+        assert!(
+            placed,
+            "positively released ownership still blocked placement"
+        );
+    }
+}

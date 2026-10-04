@@ -76,6 +76,29 @@ impl Config {
         Ok(())
     }
 
+    /// A prerequisite must gate an app in this same submission and namespace.
+    fn validate_prerequisites(&self) -> Result<(), ConfigError> {
+        for (name, job) in &self.job {
+            for target in &job.run_before {
+                let app = target
+                    .strip_prefix("app.")
+                    .and_then(|name| self.app.get(name));
+                if job.schedule.is_some()
+                    || !app.is_some_and(|app| {
+                        app.namespace.as_deref().unwrap_or("default")
+                            == job.namespace.as_deref().unwrap_or("default")
+                    })
+                {
+                    return Err(ConfigError::Validation {
+                        field: "run_before".into(), context: name.clone(),
+                        reason: "prerequisites must name app.<name> in the same apply and namespace, and cannot have a schedule".into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate this config, treating `known_namespaces` (from committed
     /// desired state) as also declared. Permissions and builds may target
     /// a namespace created by an earlier apply, not just one in this file.
@@ -96,6 +119,7 @@ impl Config {
         for (name, job) in &self.job {
             validate_job(name, job)?;
         }
+        self.validate_prerequisites()?;
         for (name, ns) in &self.namespace {
             validate_namespace(name, ns)?;
         }
@@ -1775,5 +1799,23 @@ mod tests {
         )
         .unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn prerequisites_require_an_app_in_the_same_apply_and_namespace() {
+        for body in [
+            "[job.migrate]\nimage='migrate'\nrun_before=['app.absent']\n",
+            "[app.web]\nimage='web'\nnamespace='production'\n[job.migrate]\nimage='migrate'\nnamespace='other'\nrun_before=['app.web']\n",
+            "[app.web]\nimage='web'\n[job.migrate]\nimage='migrate'\nrun_before=['job.web']\n",
+        ] {
+            let error = Config::parse(body).unwrap().validate().expect_err(body);
+            assert!(error.to_string().contains("run_before"), "{error}");
+        }
+    }
+
+    #[test]
+    fn same_namespace_prerequisites_are_valid() {
+        Config::parse("[app.web]\nimage='web'\nnamespace='production'\n[job.migrate]\nimage='migrate'\nnamespace='production'\nrun_before=['app.web']\n")
+            .unwrap().validate().unwrap();
     }
 }

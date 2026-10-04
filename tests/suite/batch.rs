@@ -3934,6 +3934,722 @@ async fn batch_websocket_follow_local_capture_never_uses_app_placements() {
     assert_batch_follow_selects_committed_owner(true, true, Some("local-capture")).await;
 }
 
+async fn assert_cluster_prerequisite_gate(exit_code: i32, overlap: bool) {
+    let council = single_node_leader().await;
+    let old = Config::parse("[app.api]\nimage='old'\n")
+        .unwrap()
+        .app
+        .remove("api")
+        .unwrap();
+    council
+        .write(reliaburger::council::types::RaftRequest::AppSpec {
+            app_id: reliaburger::meat::AppId::new("api", "default"),
+            spec: Box::new(old),
+        })
+        .await
+        .unwrap();
+    let harness = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        ..Default::default()
+    })
+    .await;
+    let scratch = tempfile::tempdir().unwrap();
+    let started = scratch.path().join("started");
+    let release = scratch.path().join("release");
+    let command = format!(
+        "touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; exit {exit_code}",
+        started.display(),
+        release.display()
+    );
+    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n").unwrap();
+    config.job.get_mut("migrate").unwrap().command = Some(vec!["sh".into(), "-c".into(), command]);
+    let client = harness.client.clone();
+    let apply = tokio::spawn(async move { client.apply(&config).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let while_blocked = council.desired_state().await.apps
+        [&reliaburger::meat::AppId::new("api", "default")]
+        .image
+        .clone();
+    let overlapping_result = if overlap {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                harness
+                    .client
+                    .apply(&Config::parse("[app.api]\nimage='competing'\n").unwrap()),
+            )
+            .await
+            .expect("an overlapping apply must be refused while the migration owns its app"),
+        )
+    } else {
+        None
+    };
+    std::fs::write(&release, b"release").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), apply)
+        .await
+        .unwrap()
+        .unwrap();
+    if let Some(overlapping_result) = overlapping_result {
+        assert!(
+            overlapping_result.is_err(),
+            "overlapping cluster apply bypassed migration ownership: {overlapping_result:?}"
+        );
+    }
+    assert_eq!(
+        while_blocked.as_deref(),
+        Some("old"),
+        "new app became schedulable while the migration was blocked"
+    );
+    let after = council.desired_state().await.apps
+        [&reliaburger::meat::AppId::new("api", "default")]
+        .image
+        .clone();
+    if exit_code == 0 {
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(after.as_deref(), Some("new"));
+    } else {
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(after.as_deref(), Some("old"));
+    }
+    drop(harness);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_apply_waits_for_prerequisite_success_before_committing_an_app_revision() {
+    assert_cluster_prerequisite_gate(0, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_apply_refuses_a_failed_prerequisite_without_committing_an_app_revision() {
+    assert_cluster_prerequisite_gate(1, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_cluster_prerequisite_owns_its_app_until_desired_writes_finish() {
+    assert_cluster_prerequisite_gate(0, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_forwarding_cannot_bypass_a_failed_cluster_prerequisite() {
+    let network = InMemoryRaftRouter::new();
+    let mut councils = Vec::new();
+    for id in [1, 2] {
+        let node = Arc::new(
+            CouncilNode::new(
+                id,
+                fast_config(),
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, node.raft().clone()).await;
+        councils.push(node);
+    }
+    councils[0]
+        .initialize(BTreeMap::from([(
+            1,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !councils[0].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    councils[0]
+        .add_learner(
+            2,
+            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-2"),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while councils[1].current_leader().await != Some(1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let app_id = reliaburger::meat::AppId::new("api", "default");
+    councils[0]
+        .write(reliaburger::council::types::RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: Box::new(
+                Config::parse("[app.api]\nimage='old'\n")
+                    .unwrap()
+                    .app
+                    .remove("api")
+                    .unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    let leader = Harness::start_with(HarnessOptions {
+        council: Some(councils[0].clone()),
+        node_name: Some("node-1".into()),
+        ..Default::default()
+    })
+    .await;
+    let follower = Harness::start_with(HarnessOptions {
+        council: Some(councils[1].clone()),
+        node_name: Some("node-2".into()),
+        membership: Some(vec![NodeMembershipInfo {
+            node_id: reliaburger::meat::NodeId::new("node-1"),
+            address: format!("127.0.0.1:{}", leader.port).parse().unwrap(),
+            api_advertised: true,
+        }]),
+        ..Default::default()
+    })
+    .await;
+    let scratch = tempfile::tempdir().unwrap();
+    let started = scratch.path().join("started");
+    let release = scratch.path().join("release");
+    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n").unwrap();
+    config.job.get_mut("migrate").unwrap().command = Some(vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; exit 1",
+            started.display(),
+            release.display()
+        ),
+    ]);
+    let client = follower.client.clone();
+    let apply = tokio::spawn(async move { client.apply(&config).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let blocked_image = councils[0].desired_state().await.apps[&app_id]
+        .image
+        .clone();
+    std::fs::write(release, b"release").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), apply)
+        .await
+        .unwrap()
+        .unwrap();
+    let final_image = councils[0].desired_state().await.apps[&app_id]
+        .image
+        .clone();
+    drop(follower);
+    drop(leader);
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
+    assert_eq!(blocked_image.as_deref(), Some("old"));
+    assert!(
+        result.is_err(),
+        "a forwarded failed migration was accepted: {result:?}"
+    );
+    assert_eq!(final_image.as_deref(), Some("old"));
+}
+
+async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
+    use reliaburger::council::types::RaftRequest;
+    use reliaburger::meat::AppId;
+
+    let network = InMemoryRaftRouter::new();
+    let mut councils = Vec::new();
+    for id in [1, 2] {
+        let node = Arc::new(
+            CouncilNode::new(
+                id,
+                fast_config(),
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, node.raft().clone()).await;
+        councils.push(node);
+    }
+    councils[0]
+        .initialize(BTreeMap::from([(
+            1,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !councils[0].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    councils[0]
+        .add_learner(
+            2,
+            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-2"),
+        )
+        .await
+        .unwrap();
+    let app_id = AppId::new("api", "default");
+    councils[0]
+        .write(RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: Box::new(
+                Config::parse("[app.api]\nimage='old'\n")
+                    .unwrap()
+                    .app
+                    .remove("api")
+                    .unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    let old_leader = Harness::start_with(HarnessOptions {
+        council: Some(councils[0].clone()),
+        node_name: Some("node-1".into()),
+        ..Default::default()
+    })
+    .await;
+    let scratch = tempfile::tempdir().unwrap();
+    let started = scratch.path().join("started");
+    let attempts = scratch.path().join("attempts");
+    let release = scratch.path().join("release");
+    let replacement = scratch.path().join("replacement");
+    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n").unwrap();
+    config.job.get_mut("migrate").unwrap().command = Some(vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "printf 'attempt\\n' >> '{}'; touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; exit 0",
+            attempts.display(),
+            started.display(),
+            release.display(),
+        ),
+    ]);
+    let original_config = config.clone();
+    let old_client = old_leader.client.clone();
+    let old_apply = tokio::spawn(async move { old_client.apply(&original_config).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    councils[0]
+        .change_membership(std::collections::BTreeSet::from([2]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !councils[1].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let new_leader = Harness::start_with(HarnessOptions {
+        council: Some(councils[1].clone()),
+        node_name: Some("node-2".into()),
+        ..Default::default()
+    })
+    .await;
+    if mode == "spec" {
+        config.job.get_mut("migrate").unwrap().command = Some(vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'; exit 0", replacement.display()),
+        ]);
+    } else if mode == "ordinary-job" {
+        config.app.clear();
+        let job = config.job.get_mut("migrate").unwrap();
+        job.run_before.clear();
+        job.command = Some(vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'; exit 0", replacement.display()),
+        ]);
+    } else if mode == "ordinary-app" {
+        config.job.clear();
+        config.app.get_mut("api").unwrap().image = Some("competing".into());
+    } else if mode == "target" {
+        let mut app = config.app.remove("api").unwrap();
+        app.image = Some("replacement".into());
+        config.app.insert("other-api".into(), app);
+        config.job.get_mut("migrate").unwrap().run_before = vec!["app.other-api".into()];
+    }
+    let retry =
+        tokio::time::timeout(Duration::from_secs(3), new_leader.client.apply(&config)).await;
+    // Release before assertions so even unchanged production's erroneous
+    // second launch is cleaned up and the original process does not linger.
+    std::fs::write(&release, b"release").unwrap();
+    let stale_result = tokio::time::timeout(Duration::from_secs(10), old_apply)
+        .await
+        .unwrap()
+        .unwrap();
+    let final_state = councils[1].desired_state().await;
+    drop(new_leader);
+    drop(old_leader);
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
+    let error = retry
+        .expect("an uncertain replicated claim must refuse promptly")
+        .expect_err(
+            "the new leader admitted another attempt under an uncertain prerequisite claim",
+        );
+    assert!(error.to_string().contains("409"), "{mode}: {error}");
+    assert!(
+        stale_result.is_err(),
+        "the old leader committed its stale worker result: {stale_result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(attempts).unwrap().lines().count(),
+        1
+    );
+    assert!(!replacement.exists());
+    assert_eq!(final_state.apps[&app_id].image.as_deref(), Some("old"));
+    assert!(
+        !final_state
+            .apps
+            .contains_key(&AppId::new("other-api", "default"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_leader_cannot_repeat_an_uncertain_prerequisite_attempt() {
+    assert_handover_keeps_an_uncertain_prerequisite_claim("same").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_a_prerequisite_spec_cannot_bypass_its_handover_claim() {
+    assert_handover_keeps_an_uncertain_prerequisite_claim("spec").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_a_prerequisite_target_cannot_bypass_its_handover_claim() {
+    assert_handover_keeps_an_uncertain_prerequisite_claim("target").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_job_apply_cannot_take_over_a_prerequisite_claim_after_handover() {
+    assert_handover_keeps_an_uncertain_prerequisite_claim("ordinary-job").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_app_apply_cannot_bypass_its_prerequisite_claim_after_handover() {
+    assert_handover_keeps_an_uncertain_prerequisite_claim("ordinary-app").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_cluster_prerequisites_are_refused_before_any_app_commit() {
+    let council = single_node_leader().await;
+    let harness = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        ..Default::default()
+    })
+    .await;
+    let http = reqwest::Client::new();
+    for body in [
+        "[job.migrate]\nimage='proc-grill:image-ignored'\ncommand=['true']\nrun_before=['app.absent']\n",
+        "[app.web]\nimage='proc-grill:image-ignored'\nnamespace='production'\n[job.migrate]\nimage='proc-grill:image-ignored'\ncommand=['true']\nnamespace='other'\nrun_before=['app.web']\n",
+        "[app.web]\nimage='proc-grill:image-ignored'\n[job.migrate]\nimage='proc-grill:image-ignored'\ncommand=['true']\nrun_before=['job.web']\n",
+    ] {
+        let response = http
+            .post(format!("{}/v1/apply", harness.base_url))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "accepted {body}"
+        );
+        let error = response.text().await.unwrap();
+        assert!(error.contains("run_before"), "{error}");
+        assert!(council.desired_state().await.apps.is_empty());
+    }
+    drop(harness);
+    council.shutdown().await.unwrap();
+}
+
+fn corrected_apply_migration_record(records: &std::path::Path) -> serde_json::Value {
+    let checkpoint: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(records.join("job-attempts.checkpoint")).unwrap())
+            .unwrap();
+    checkpoint["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["name"] == "migrate" && job["namespace"] == "default")
+        .expect("the actual migration attempt must be durably recorded")
+        .clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_on_the_same_node() {
+    let council = single_node_leader().await;
+    let app_id = reliaburger::meat::AppId::new("api", "default");
+    council
+        .write(reliaburger::council::types::RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: Box::new(
+                Config::parse("[app.api]\nimage='old'\n")
+                    .unwrap()
+                    .app
+                    .remove("api")
+                    .unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let records = scratch.path().join("instances");
+    let attempts = scratch.path().join("attempts");
+    let first = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        node_name: Some("same-node".into()),
+        records_dir: Some(records.clone()),
+        ..Default::default()
+    })
+    .await;
+    let mut config = Config::parse(
+        "[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n",
+    )
+    .unwrap();
+    config.job.get_mut("migrate").unwrap().command = Some(vec![
+        "sh".into(),
+        "-c".into(),
+        format!("printf 'failed\\n' >> '{}'; exit 1", attempts.display()),
+    ]);
+    let failed = tokio::time::timeout(Duration::from_secs(10), first.client.apply(&config))
+        .await
+        .expect("failed migration never returned its settled result");
+    assert!(failed.is_err(), "{failed:?}");
+    let state = council.desired_state().await;
+    assert_eq!(state.apps[&app_id].image.as_deref(), Some("old"));
+    assert!(
+        state.prerequisite_claims.is_empty(),
+        "a positively observed and durably settled failure must release its claim"
+    );
+    let failed_record = corrected_apply_migration_record(&records);
+    assert_eq!(failed_record["phase"]["Exited"]["code"], 1);
+    assert_eq!(
+        failed_record["spec"]["run_before"],
+        serde_json::json!(["app.api"])
+    );
+    assert_eq!(failed_record["restart_count"], 0);
+    let failed_generation = failed_record["generation"].as_u64().unwrap();
+    assert!(failed_generation > 0);
+    assert_eq!(std::fs::read_to_string(&attempts).unwrap(), "failed\n");
+
+    // Restart this same node from its durable records before correction.
+    // Adoption must preserve the terminal failed generation and NoRetry spec.
+    drop(first);
+    let corrected = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        node_name: Some("same-node".into()),
+        records_dir: Some(records.clone()),
+        ..Default::default()
+    })
+    .await;
+    let recovered = corrected_apply_migration_record(&records);
+    assert_eq!(recovered["phase"]["Exited"]["code"], 1);
+    assert_eq!(recovered["generation"], failed_record["generation"]);
+    assert_eq!(recovered["restart_count"], 0);
+    assert_eq!(
+        recovered["spec"]["run_before"],
+        failed_record["spec"]["run_before"]
+    );
+    config.job.get_mut("migrate").unwrap().command = Some(vec![
+        "sh".into(),
+        "-c".into(),
+        format!("printf 'corrected\\n' >> '{}'; exit 0", attempts.display()),
+    ]);
+    let result = tokio::time::timeout(Duration::from_secs(10), corrected.client.apply(&config))
+        .await
+        .expect("corrected migration never settled");
+    assert!(
+        result.is_ok(),
+        "corrected apply remained blocked: {result:?}"
+    );
+    let state = council.desired_state().await;
+    assert_eq!(state.apps[&app_id].image.as_deref(), Some("new"));
+    assert!(state.prerequisite_claims.is_empty());
+    let completed = corrected_apply_migration_record(&records);
+    assert_eq!(completed["phase"]["Exited"]["code"], 0);
+    assert!(completed["generation"].as_u64().unwrap() > failed_generation);
+    assert_eq!(completed["restart_count"], 0);
+    assert_eq!(
+        completed["spec"]["run_before"],
+        serde_json::json!(["app.api"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(&attempts).unwrap(),
+        "failed\ncorrected\n",
+        "an automatic retry must not repeat the failed side effect"
+    );
+    drop(corrected);
+    council.shutdown().await.unwrap();
+}
+
+struct PrerequisiteReleaseOnDrop(std::path::PathBuf);
+
+impl Drop for PrerequisiteReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"release");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision() {
+    use reliaburger::bun::deploy_operations::{DeployOperationOutcome, DeployTargetKind};
+    use reliaburger::council::types::RaftRequest;
+    use reliaburger::meat::AppId;
+
+    let council = single_node_leader().await;
+    let app_id = AppId::new("api", "default");
+    let old = Config::parse("[app.api]\nimage='old'\n")
+        .unwrap()
+        .app
+        .remove("api")
+        .unwrap();
+    council
+        .write(RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: Box::new(old),
+        })
+        .await
+        .unwrap();
+    let harness = Harness::start_with(HarnessOptions {
+        council: Some(council.clone()),
+        ..Default::default()
+    })
+    .await;
+    let scratch = tempfile::tempdir().unwrap();
+    let started = scratch.path().join("started");
+    let release = scratch.path().join("release");
+    let finished = scratch.path().join("finished");
+    let release_on_drop = PrerequisiteReleaseOnDrop(release.clone());
+    let command = format!(
+        "touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; touch '{}'; exit 0",
+        started.display(),
+        release.display(),
+        finished.display()
+    );
+    let mut config = Config::parse(
+        "[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n",
+    )
+    .unwrap();
+    config.job.get_mut("migrate").unwrap().command = Some(vec!["sh".into(), "-c".into(), command]);
+    let client = harness.client.clone();
+    let apply = tokio::spawn(async move { client.apply(&config).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual ProcessGrill migration must acknowledge its blocked phase");
+
+    let blocked = council.desired_state().await;
+    assert_eq!(blocked.apps[&app_id].image.as_deref(), Some("old"));
+    assert_eq!(blocked.prerequisite_claims.len(), 1);
+    let (claim_id, claim) = blocked.prerequisite_claims.into_iter().next().unwrap();
+    assert!(!claim.apps_committed);
+    assert!(claim.blocks("api", "default"));
+
+    // Discover the observable node-local operation through the real API. Its
+    // deploy ID differs from the replicated prerequisite ownership identity.
+    let snapshot = harness.client.deploy_operations().await.unwrap();
+    assert_eq!(snapshot.active_deploys.len(), 1);
+    let operation = &snapshot.active_deploys[0];
+    assert!(operation.targets.iter().any(|target| {
+        target.kind == DeployTargetKind::App
+            && target.name == "api"
+            && target.namespace == "default"
+    }));
+    assert!(operation.targets.iter().any(|target| {
+        target.kind == DeployTargetKind::Job
+            && target.name == "migrate"
+            && target.namespace == "default"
+    }));
+    let deploy_id = operation.id.clone();
+    assert_ne!(deploy_id.as_str(), claim_id);
+    let cancellation = harness
+        .client
+        .cancel_deploy(deploy_id.as_str())
+        .await
+        .expect("the actual cancellation route must acknowledge the live operation");
+    assert_eq!(cancellation.id, deploy_id);
+    assert!(cancellation.cancellation_requested_at.is_some());
+    assert!(cancellation.outcome.is_none());
+    assert!(
+        !finished.exists(),
+        "migration gate opened before cancellation"
+    );
+
+    // Exit zero after the cancellation was acknowledged. A successful child
+    // exit must not erase accepted cancellation or publish the gated app.
+    std::fs::write(&release, b"release").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !finished.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("released migration must reach its successful exit phase");
+    let result = tokio::time::timeout(Duration::from_secs(10), apply)
+        .await
+        .expect("cancelled apply must reach a bounded observable outcome")
+        .unwrap();
+    let after = council.desired_state().await;
+    let snapshot = harness.client.deploy_operations().await.unwrap();
+    let observed = snapshot
+        .history
+        .iter()
+        .chain(snapshot.active_deploys.iter())
+        .find(|operation| operation.id == deploy_id)
+        .expect("cancellation cannot erase the operation's observable identity")
+        .clone();
+    // Release owned runtime/server resources before checking the frozen oracle.
+    drop(release_on_drop);
+    drop(harness);
+    council.shutdown().await.unwrap();
+
+    assert_eq!(
+        after.apps[&app_id].image.as_deref(),
+        Some("old"),
+        "a cancelled migration published a new desired app after its zero exit"
+    );
+    assert_eq!(
+        after.prerequisite_claims.get(&claim_id),
+        Some(&claim),
+        "cancellation must retain the exact uncommitted ownership claim"
+    );
+    assert!(
+        result.is_err(),
+        "cancelled apply reported success: {result:?}"
+    );
+    assert_eq!(observed.id, deploy_id);
+    assert!(observed.cancellation_requested_at.is_some());
+    assert_ne!(observed.outcome, Some(DeployOperationOutcome::Completed));
+}
+
 async fn write_admission_fixture(
     council: &reliaburger::council::CouncilNode,
     mut request: reliaburger::council::RaftRequest,
@@ -3952,4 +4668,239 @@ async fn write_admission_fixture(
         _ => {}
     }
     council.write(request).await
+}
+
+// Append these helpers/tests to tests/suite/batch.rs AFTER root534+actual543 merge.
+// Reuses the existing real-Council Harness, full_node_job, jobs_from,
+// pending_capacity_worker, remote_capacity_options and fast_config helpers unchanged.
+fn held_capacity_config() -> Config {
+    Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nimage='migration:v1'\ncpu='5'\nrun_before=['app.web']\n[job.notify]\nimage='notify:v1'\ncpu='3'\n").unwrap()
+}
+fn held_capacity_probe(
+    name: &str,
+    cpu: &str,
+) -> BTreeMap<String, reliaburger::config::job::JobSpec> {
+    jobs_from(&format!(
+        "[job.{name}]\nimage='proc-grill:image-ignored'\ncommand=['true']\ncpu='{cpu}'\n"
+    ))
+}
+async fn begin_held_capacity(council: &CouncilNode) -> String {
+    let operation_id = "1234567890abcdef1234567890abcdef".to_owned();
+    let result = council
+        .write(reliaburger::council::RaftRequest::PrerequisiteBegin {
+            operation_id: operation_id.clone(),
+            term: council.current_term(),
+            config: Box::new(held_capacity_config()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            result,
+            reliaburger::council::CouncilResponse::Refused { .. }
+        ),
+        "{result:?}"
+    );
+    operation_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_http_respects_held_jobs_before_reports_and_releases_only_the_completed_migration() {
+    let council = single_node_leader().await;
+    let operation_id = begin_held_capacity(&council).await;
+    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
+    let harness = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
+    let first = harness
+        .client
+        .submit_batch(&held_capacity_probe("precommit-probe", "4"))
+        .await
+        .unwrap();
+    // The established batch API returns 202 with Unschedulable entries when
+    // fresh nodes lack headroom; do not invent a different HTTP error contract.
+    assert_eq!(first["assigned"], 0, "{first}");
+    assert_eq!(
+        first["unschedulable"],
+        serde_json::json!(["precommit-probe"])
+    );
+    assert!(
+        dispatches.try_recv().is_err(),
+        "unschedulable work was dispatched"
+    );
+    let result = council
+        .write(reliaburger::council::RaftRequest::PrerequisiteCommit { operation_id })
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            result,
+            reliaburger::council::CouncilResponse::Refused { .. }
+        ),
+        "{result:?}"
+    );
+    let ordinary = harness
+        .client
+        .submit_batch(&held_capacity_probe("ordinary-held-probe", "6"))
+        .await
+        .unwrap();
+    assert_eq!(ordinary["assigned"], 0, "{ordinary}");
+    assert!(dispatches.try_recv().is_err());
+    let freed = harness
+        .client
+        .submit_batch(&held_capacity_probe("migration-released-probe", "4"))
+        .await
+        .unwrap();
+    assert_eq!(freed["assigned"], 1, "{freed}");
+    let dispatch = tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        dispatch["execution_labels"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["name"],
+        "migration-released-probe"
+    );
+    drop(harness);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_ordinary_runtime_settlement_releases_held_capacity_for_batch_http() {
+    let council = single_node_leader().await;
+    let records = tempfile::tempdir().unwrap();
+    let mut options = local_capacity_options(council.clone(), "node-1");
+    options.records_dir = Some(records.path().to_path_buf());
+    let executor = Harness::start_with(options).await;
+    let config = Config::parse(
+        "[job.completed-ordinary]\nimage='proc-grill:image-ignored'\ncommand=['true']\n",
+    )
+    .unwrap();
+    executor.client.apply(&config).await.unwrap();
+    // This portable positive control deliberately has zero resource requests:
+    // ProcessGrill cannot enforce CPU limits. Resourceful reservation release
+    // is verified separately through the real Raft state-machine lifecycle.
+    // Completion is from the real ProcessGrill and owned Agent settlement
+    // watcher. No fixture directly submits JobApplyComplete in this control.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if council.desired_state().await.prerequisite_claims.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("positive actual runtime settlement did not release ownership");
+    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
+    let submitter = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
+    let released = submitter
+        .client
+        .submit_batch(&full_node_job("positive-release-probe"))
+        .await
+        .unwrap();
+    assert_eq!(released["assigned"], 1, "{released}");
+    tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(submitter);
+    drop(executor);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_leader_preserves_held_job_footprint_with_fresh_capacity_evidence() {
+    let network = InMemoryRaftRouter::new();
+    let mut councils = Vec::new();
+    for id in [1, 2] {
+        let node = Arc::new(
+            CouncilNode::new(
+                id,
+                fast_config(),
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, node.raft().clone()).await;
+        councils.push(node);
+    }
+    councils[0]
+        .initialize(BTreeMap::from([(
+            1,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "leader"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !councils[0].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let operation_id = begin_held_capacity(&councils[0]).await;
+    let original_term = councils[0].current_term();
+    councils[0]
+        .add_learner(
+            2,
+            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "new-leader"),
+        )
+        .await
+        .unwrap();
+    councils[0]
+        .change_membership(std::collections::BTreeSet::from([2]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !councils[1].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(councils[1].current_term() > original_term);
+    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
+    // Harness publishes a receive-deadline/leadership epoch for this CURRENT
+    // leader, so a refusal cannot be explained by an old reporting epoch.
+    let mut options = remote_capacity_options(councils[1].clone(), address);
+    options.node_name = Some("new-leader".into());
+    let submitter = Harness::start_with(options).await;
+    let release = councils[1]
+        .write(reliaburger::council::RaftRequest::PrerequisiteFailed {
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            release,
+            reliaburger::council::CouncilResponse::Refused { .. }
+        ),
+        "{release:?}"
+    );
+    let held = submitter
+        .client
+        .submit_batch(&held_capacity_probe("handover-probe", "4"))
+        .await
+        .unwrap();
+    assert_eq!(held["assigned"], 0, "{held}");
+    assert!(dispatches.try_recv().is_err());
+    assert!(
+        councils[1]
+            .desired_state()
+            .await
+            .prerequisite_claims
+            .contains_key(&operation_id)
+    );
+    drop(submitter);
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
 }

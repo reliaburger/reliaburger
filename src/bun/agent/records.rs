@@ -690,7 +690,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     _ => ContainerState::Stopped,
                 };
                 instance.retry_pending = matches!(job.phase, crate::bun::jobs::JobPhase::Exited { code } if code != 0)
-                    && job.restart_count < crate::bun::jobs::MAX_RETRIES;
+                    && job.restart_count < crate::bun::jobs::MAX_RETRIES
+                    && job.spec.run_before.is_empty();
                 instance.oci_spec = Some(spec);
                 instance.last_restart = Some(now);
             }

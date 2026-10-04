@@ -233,7 +233,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let job = next
             .get_mut(&id.0)
             .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
-        if count > MAX_RETRIES
+        if !job.spec.run_before.is_empty()
+            || count > MAX_RETRIES
             || count < job.restart_count
             || matches!(
                 job.phase,
@@ -476,7 +477,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Transition Running → Stopping → Stopped
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
-            instance.retry_pending = exit_code.is_some_and(|code| code != 0);
+            instance.retry_pending = exit_code.is_some_and(|code| code != 0)
+                && self
+                    .recorded_jobs
+                    .get(&id.0)
+                    .is_some_and(|job| job.spec.run_before.is_empty());
             if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                 instance.state = s;
             }
@@ -508,6 +513,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )
                 .await;
             }
+            return;
+        }
+
+        // A failed migration is terminal for its apply. Only another explicit
+        // apply may start a new generation after confirmed cleanup.
+        if self
+            .recorded_jobs
+            .get(&id.0)
+            .is_some_and(|job| !job.spec.run_before.is_empty())
+        {
             return;
         }
 
