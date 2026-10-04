@@ -807,6 +807,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .claim_upload_directory()
         .await
         .context("cannot recover registry upload ownership")?;
+    blob_store
+        .configure_storage_limit(
+            reliaburger::config::types::parse_byte_size(&config.images.max_storage)
+                .context("invalid images.max_storage")?,
+        )
+        .await
+        .context("cannot account physical image storage")?;
 
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
@@ -919,6 +926,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // long before them, so the source is injected late via a OnceLock
     // slot shared by ImageStore clones.
     let cluster_image_store = runtime.image_store();
+    if let Some(store) = &cluster_image_store {
+        store
+            .set_blob_store(Arc::clone(&blob_store))
+            .map_err(anyhow::Error::msg)?;
+    }
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -2720,15 +2732,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Arc::clone(&api_token_store),
         service_token.clone(),
     ));
-    // Storage quotas (REG4): a per-repository ceiling derived from
-    // `[images] max_storage` divided across repositories is more than an
-    // operator asked for; we apply `max_storage` as the registry-wide cap
-    // and leave per-repository unlimited unless configured.
-    let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig {
-        per_repository_bytes: 0,
-        total_bytes: reliaburger::config::types::parse_byte_size(&config.images.max_storage)
-            .unwrap_or(0),
-    };
+    // Physical payloads, including temporary uploads and runtime pulls, share
+    // the configured BlobStore cap. Logical per-repository policy is separate.
+    let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig::default();
     let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
         reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
     );

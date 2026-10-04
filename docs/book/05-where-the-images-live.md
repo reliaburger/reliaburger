@@ -1160,7 +1160,7 @@ Scoped blob probes use the same rule. If HEAD reported global presence while
 publication required a destination upload, a normal client would skip the upload
 and fail later. Returning 404 prompts it to send the bytes it owns. Shared storage
 still keeps one final copy, and an existing catalogue reference lets subsequent
-pushes reuse it. Bare blobs from the old format need another upload before scoped
+pushes reuse it. Bare blobs without a receipt need a destination upload before scoped
 publication; catalogue references remain valid after restart.
 
 Collecting or rejecting corrupt bytes removes their receipts. Retiring a leased
@@ -1168,3 +1168,47 @@ repository removes only that generation's evidence, preserving other repositorie
 authority and shared content. The regressions cover foreign configurations,
 layers and index children, successful ordinary pushes, persisted receipts,
 failed digest checks, receipt-write failures and exact-generation retirement.
+
+### Count the bytes before writing them
+
+A catalogue total cannot protect a disk. A client can upload blobs without ever
+publishing a manifest, and an unfinished upload consumes space before it becomes
+a catalogue reference. Counting each image's descriptors also counts a shared
+layer repeatedly while missing runtime pulls and temporary copies.
+
+The configured image maximum now belongs to the local blob store. Its clones
+share one byte budget. Startup reconstructs usage from compressed blobs and
+leftover upload files and repository receipts, and each blocking write reserves
+its bytes before touching disk. The mutex holds the reservation and file
+operation together, so a disconnected request cannot release space while its
+worker still writes.
+Moving an upload into the CAS transfers its reservation. Deleting a file releases
+capacity only after confirmed removal; an uncertain cleanup keeps the charge.
+An existing verified blob can be reused without storing another copy. Reuse
+still syncs the payload and directory before acknowledgement; a previous write
+might have renamed successfully but failed its final durability sync. These
+transactions sync files and their containing directories. Syncing the parent
+entries of newly created digest directories remains part of the final lifecycle
+hardening ([#555](https://github.com/reliaburger/reliaburger/issues/555));
+the quota fix alone does not prove those entries survive power loss.
+
+The runtime receives the same `Arc<BlobStore>` before it starts pulling images.
+Registry uploads, peer transfers, replication, upstream cache fills and runtime
+pulls therefore share the cap. The cap covers compressed CAS blobs, temporary
+uploads and repository authority receipt payloads, including atomic-write copies.
+It also limits the directory to 65,536 payload files, which bounds empty uploads
+and small receipts. This is a payload-byte policy, not filesystem block
+allocation. Unpacked root filesystems, catalogue files and filesystem overhead
+need their own disk capacity. Logical per-repository limits remain a separate
+policy.
+
+The tests fill the cap with bare blobs, reject a chunk before it grows the disk,
+race two upload reservations, restart with existing payloads, and hide an upload
+directory to prove failed cleanup cannot free capacity. A transfer test checks
+the peer commit path, and a runtime pull test checks the shared store wiring.
+
+The HTTP errors keep the failure's owner clear: an exhausted physical budget
+returns 413, a malformed upload session remains 400, and an I/O failure while
+appending to a server-owned upload path returns 500. The cleanup regression replaces an upload
+file with a directory, checks that 500 leaves it fenced, then repairs the path
+and proves a later cleanup releases the reservation.
