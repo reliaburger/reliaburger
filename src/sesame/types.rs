@@ -60,6 +60,25 @@ pub struct WrappedKey {
     pub hkdf_info: String,
 }
 
+/// Where a CA stands in a rotation (F04 R1).
+///
+/// Outside a rotation every CA is `Active`. Beginning a rotation adds the new
+/// CA as `Active` and marks the one it replaces `Retiring`: verifiers still
+/// trust it, but nothing new is signed with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaState {
+    /// Signs new certificates and is trusted by every verifier.
+    Active,
+    /// Trusted, never used to sign, and due to go once the rotation is
+    /// finalised.
+    Retiring {
+        /// When the longest-lived leaf this CA could have signed before the
+        /// rotation began expires. After it nothing can depend on the CA, so
+        /// finalise no longer has to prove that leaves moved.
+        until: SystemTime,
+    },
+}
+
 /// One CA in the hierarchy (root, node, workload, or ingress).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CertificateAuthority {
@@ -78,8 +97,22 @@ pub struct CertificateAuthority {
     pub not_after: SystemTime,
     /// The parent CA's serial (None for the root CA).
     pub issuer_serial: Option<SerialNumber>,
-    /// Generation counter, incremented on `relish ca rotate`.
+    /// Generation counter: 0 at init, one more for each rotation of the
+    /// role (`RaftRequest::CaRotationBegin`).
     pub generation: u64,
+    /// Whether this CA signs, or is only trusted while a rotation finishes.
+    pub state: CaState,
+}
+
+/// The node leaf the council last issued to a node, kept so finalising a Node
+/// CA rotation can tell whether any node still depends on the retiring CA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLeafRecord {
+    /// The serial allocated for the leaf.
+    pub serial: SerialNumber,
+    /// The generation of the Node CA that was active when the serial was
+    /// allocated, which is the CA that signs it.
+    pub ca_generation: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +499,8 @@ pub struct SecurityState {
     /// `namespace/app/ENV_KEY` (PKI8). An encrypted secret with no entry
     /// counts as "unknown generation" and blocks finalise until re-encrypted.
     pub secret_seals: std::collections::BTreeMap<String, SecretSeal>,
+    /// The latest node leaf issued to each node, keyed by node id (F04 R1).
+    pub node_leaves: std::collections::BTreeMap<String, NodeLeafRecord>,
 }
 
 impl SecurityState {
@@ -477,11 +512,39 @@ impl SecurityState {
             || !self.api_tokens.is_empty()
     }
 
-    /// Get the CA for a given role.
-    pub fn get_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
+    /// The CA that signs new certificates for a role: the newest `Active`
+    /// one. `None` when the state holds no CA for the role.
+    pub fn active_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
         self.certificate_authorities
             .iter()
-            .find(|ca| ca.role == role)
+            .filter(|ca| ca.role == role && ca.state == CaState::Active)
+            .max_by_key(|ca| ca.generation)
+    }
+
+    /// Every CA a verifier should accept for a role, the active one first and
+    /// then any that are retiring. Outside a rotation that's one CA.
+    pub fn trusted_cas(&self, role: CaRole) -> Vec<&CertificateAuthority> {
+        let mut cas: Vec<&CertificateAuthority> = self
+            .certificate_authorities
+            .iter()
+            .filter(|ca| ca.role == role)
+            .collect();
+        // `false` sorts before `true`, so the active CA leads, then the
+        // retiring ones newest first.
+        cas.sort_by_key(|ca| {
+            (
+                ca.state != CaState::Active,
+                std::cmp::Reverse(ca.generation),
+            )
+        });
+        cas
+    }
+
+    /// The CA a role is rotating away from, if a rotation is in progress.
+    pub fn retiring_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
+        self.certificate_authorities
+            .iter()
+            .find(|ca| ca.role == role && matches!(ca.state, CaState::Retiring { .. }))
     }
 
     /// The **active** keypair for a scope — the one new secrets should be

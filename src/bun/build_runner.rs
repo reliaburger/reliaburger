@@ -1908,6 +1908,7 @@ mod tests {
             oidc_signing_config: Some(oidc_config),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
+            node_leaves: std::collections::BTreeMap::new(),
         };
         node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
             .await
@@ -1951,7 +1952,7 @@ mod tests {
             .await
             .unwrap();
             let security = council.security_state().await;
-            let authority = security.get_ca(CaRole::Workload).unwrap();
+            let authority = security.active_ca(CaRole::Workload).unwrap();
             let (issuer_key, issuer_params) =
                 ca::ca_signing_material(authority, council.wrapping_ikm().unwrap()).unwrap();
             let issuer = issuer_params.self_signed(&issuer_key).unwrap();

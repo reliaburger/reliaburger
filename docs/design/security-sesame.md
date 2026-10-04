@@ -232,10 +232,13 @@ pub struct CertificateAuthority {
     /// The parent CA's serial (None for the root CA).
     pub issuer_serial: Option<SerialNumber>,
 
-    /// Generation counter, intended to increment on `relish ca rotate`.
-    /// CA rotation is not implemented yet (§5.8), so this stays at its
-    /// initial value in practice.
+    /// Generation counter: 0 at init, one more per rotation of the role
+    /// (`RaftRequest::CaRotationBegin`, §5.8).
     pub generation: u64,
+
+    /// `Active` signs and is trusted; `Retiring { until }` is only trusted,
+    /// until the rotation is finalised.
+    pub state: CaState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1018,13 +1021,27 @@ On each council node (intended design):
 
 ### 5.8 CA Rotation
 
-> **Status: planned — not yet implemented.** There is no `relish ca` command
-> family (no `ca rotate`, `ca rotate --root`, or generation bump). CA rotation,
-> the dual-signing transition, and root cross-signing below are design, not
-> shipped code. (Certificate *revocation* via the CRL — §5.7,
-> `RaftRequest::RevokeCertificate` — is separate and does ship.) The
-> `CertificateAuthority.generation` counter exists but is never incremented,
-> because nothing rotates a CA yet.
+> **Status: partly implemented (F04 R1, #362).** The council state can hold
+> several CAs per role. Each has a `CaState` (`Active` or `Retiring { until }`);
+> `SecurityState::active_ca(role)` is the one that signs and
+> `trusted_cas(role)` is every one a verifier accepts. Two Raft requests drive
+> a rotation, the same shape as secret rotation:
+>
+> - `CaRotationBegin { role, ca }` adds `ca` as the active CA (generation + 1,
+>   signed by the active root, wrapped key present) and marks the old one
+>   `Retiring` until the longest leaf it could have signed expires. A second
+>   rotation of the same role is refused until the first is finalised; a retry
+>   of the same generation changes nothing. Root rotation is refused for now.
+> - `CaRotationFinalize { role, now_unix_ms }` drops the retiring CA. For the
+>   Node CA it's refused while any node's latest leaf
+>   (`SecurityState::node_leaves`, recorded when the council allocates the
+>   serial) came from the retiring CA; workload and ingress leaves aren't
+>   tracked one by one, so for those it's refused until the window ends.
+>
+> There is still no `relish ca` command family, and verifiers don't yet trust
+> more than one CA per role (F04 R2). The flow below is the remaining design.
+> (Certificate *revocation* via the CRL — §5.7, `RaftRequest::RevokeCertificate`
+> — is separate and does ship.)
 
 **Intermediate CA rotation (`relish ca rotate`) — planned:**
 

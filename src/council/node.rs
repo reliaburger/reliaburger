@@ -478,10 +478,10 @@ impl CouncilNode {
 
         // Get Workload CA
         let workload_ca = security_state
-            .get_ca(CaRole::Workload)
+            .active_ca(CaRole::Workload)
             .ok_or_else(|| CouncilError::SecurityError("no Workload CA in state".to_string()))?;
         let root_ca = security_state
-            .get_ca(CaRole::Root)
+            .active_ca(CaRole::Root)
             .ok_or_else(|| CouncilError::SecurityError("no Root CA in state".to_string()))?;
 
         let workload_ca_cert_der = workload_ca.certificate_der.clone();
@@ -1606,6 +1606,7 @@ mod tests {
             oidc_signing_config: Some(oidc_config),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
+            node_leaves: std::collections::BTreeMap::new(),
         };
         node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
             .await

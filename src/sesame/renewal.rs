@@ -120,10 +120,10 @@ pub(crate) fn validate_peer(
     state: &SecurityState,
 ) -> Result<String, RenewalError> {
     let node_ca = state
-        .get_ca(CaRole::Node)
+        .active_ca(CaRole::Node)
         .ok_or_else(|| RenewalError::Unavailable("Node CA is unavailable".into()))?;
     let root_ca = state
-        .get_ca(CaRole::Root)
+        .active_ca(CaRole::Root)
         .ok_or_else(|| RenewalError::Unavailable("Root CA is unavailable".into()))?;
     cert::validate_chain(&peer.0, &node_ca.certificate_der, &root_ca.certificate_der)
         .map_err(|error| RenewalError::Identity(error.to_string()))?;

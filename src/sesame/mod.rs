@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod bootstrap;
 pub mod ca;
+pub mod ca_rotation;
 pub mod cert;
 pub mod connection;
 pub mod credentials;

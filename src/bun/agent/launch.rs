@@ -462,7 +462,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
         let root_ca = security_state
-            .get_ca(crate::sesame::types::CaRole::Root)
+            .active_ca(crate::sesame::types::CaRole::Root)
             .map(|ca| ca.certificate_der.clone());
         let verified = crate::meat::scheduler::verify_image_signature(
             image,

@@ -25,8 +25,8 @@ pub(super) async fn cluster_ca_handler(State(state): State<ApiState>) -> Respons
     };
     let security = council.security_state().await;
     let (Some(node_ca), Some(root_ca)) = (
-        security.get_ca(crate::sesame::types::CaRole::Node),
-        security.get_ca(crate::sesame::types::CaRole::Root),
+        security.active_ca(crate::sesame::types::CaRole::Node),
+        security.active_ca(crate::sesame::types::CaRole::Root),
     ) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
