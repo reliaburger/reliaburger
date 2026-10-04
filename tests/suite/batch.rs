@@ -44,6 +44,8 @@ struct HarnessOptions {
     /// Nodes to report capacity for (name → the aggregated view).
     capacity_nodes: Vec<String>,
     stale_capacity_nodes: Vec<String>,
+    aggregated_override:
+        Option<tokio::sync::watch::Receiver<reliaburger::reporting::aggregator::AggregatedState>>,
     /// Trusted authentication context injected by this test server's boundary.
     auth_context: Option<reliaburger::sesame::auth::AuthContext>,
     log_sink: Option<mpsc::Sender<reliaburger::ketchup::types::LogRecord>>,
@@ -119,7 +121,9 @@ impl Harness {
             state
         };
         let (_aggregated_tx, aggregated_rx) = tokio::sync::watch::channel(aggregated);
-        let aggregated_rx = if options.capacity_nodes.is_empty() {
+        let aggregated_rx = if options.aggregated_override.is_some() {
+            options.aggregated_override
+        } else if options.capacity_nodes.is_empty() {
             None
         } else {
             Some(aggregated_rx)
@@ -609,6 +613,109 @@ async fn simultaneous_batch_admissions_share_durable_capacity_across_api_process
     );
     assert_eq!(unschedulable, 1);
     assert_eq!(records, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_leader_refuses_previous_term_capacity_until_the_aggregator_publishes() {
+    let network = InMemoryRaftRouter::new();
+    let mut councils = Vec::new();
+    for id in [1, 2] {
+        let node = Arc::new(
+            CouncilNode::new(
+                id,
+                fast_config(),
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, node.raft().clone()).await;
+        councils.push(node);
+    }
+    councils[0]
+        .initialize(BTreeMap::from([(
+            1,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "leader"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !councils[0].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    councils[0]
+        .add_learner(
+            2,
+            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "new-leader"),
+        )
+        .await
+        .unwrap();
+    let (address, _dispatches, _worker_tasks) = pending_capacity_worker().await;
+    let old_term = councils[0].current_term();
+    let reporting_network = reliaburger::reporting::transport::InMemoryReportingNetwork::new();
+    let transport = reporting_network
+        .register("127.0.0.1:9010".parse().unwrap())
+        .await;
+    let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(old_term);
+    let (mut aggregator, old_snapshot) = reliaburger::reporting::aggregator::ReportAggregator::new(
+        transport,
+        Default::default(),
+        CancellationToken::new(),
+        None,
+        Some(epoch_rx),
+        None,
+    );
+    aggregator.insert_local_report(reliaburger::reporting::types::StateReport {
+        node_id: reliaburger::meat::NodeId::new("node-1"),
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        running_apps: Vec::new(),
+        cached_specs: Vec::new(),
+        resource_usage: reliaburger::reporting::types::ResourceUsage {
+            cpu_total_millicores: 8000,
+            memory_total_mb: 16384,
+            ..Default::default()
+        },
+        event_log: Vec::new(),
+        has_buildah: false,
+    });
+    councils[0]
+        .change_membership(std::collections::BTreeSet::from([2]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !councils[1].is_leader().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut options = remote_capacity_options(councils[1].clone(), address);
+    options.node_name = Some("new-leader".into());
+    options.aggregated_override = Some(old_snapshot.clone());
+    assert!(councils[1].current_term() > old_term);
+    let next_leader = Harness::start_with(options).await;
+    let response = reqwest::Client::new().post(format!("{}/v1/batch", next_leader.base_url))
+        .json(&serde_json::json!({"jobs":[{"name":"second","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
+        .send().await.unwrap();
+    let status = response.status();
+    let records = councils[1].desired_state().await.batch_state.batches.len();
+    drop(next_leader);
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(records, 0);
+    assert_eq!(
+        old_snapshot.borrow().reports.len(),
+        1,
+        "the old watch snapshot must remain published throughout the control"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
