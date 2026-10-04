@@ -658,17 +658,22 @@ impl ClusterSource {
         // (REG1): the cache serves the manifest GET and peers pull it.
         self.state
             .store
-            .write_blob(&manifest.manifest_bytes, &manifest.digest)?;
+            .write_blob_async(manifest.manifest_bytes, manifest.digest.clone())
+            .await?;
         self.state
             .store
-            .write_blob(&manifest.config_bytes, &manifest.config.digest)?;
+            .write_blob_async(manifest.config_bytes, manifest.config.digest.clone())
+            .await?;
         for layer in &manifest.layers {
             if self.state.store.has_blob(&layer.digest) {
                 continue;
             }
             let bytes = upstream.fetch_blob(image, layer).await?;
             // write_blob verifies the digest — a lying upstream fails here.
-            self.state.store.write_blob(&bytes, &layer.digest)?;
+            self.state
+                .store
+                .write_blob_async(bytes, layer.digest.clone())
+                .await?;
         }
 
         let total_size = manifest.layers.iter().map(|l| l.size).sum();
@@ -698,11 +703,15 @@ impl ClusterSource {
         tag: &str,
     ) -> Result<(), PickleError> {
         for (descriptor, bytes) in &index.manifests {
-            self.state.store.write_blob(bytes, &descriptor.digest)?;
+            self.state
+                .store
+                .write_blob_async(bytes.clone(), descriptor.digest.clone())
+                .await?;
         }
         self.state
             .store
-            .write_blob(&index.index_bytes, &index.digest)?;
+            .write_blob_async(index.index_bytes.clone(), index.digest.clone())
+            .await?;
 
         let size = index.index_bytes.len() as u64;
         let layers: Vec<LayerDescriptor> = index

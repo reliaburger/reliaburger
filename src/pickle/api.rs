@@ -128,6 +128,12 @@ impl PickleState {
         headers: &HeaderMap,
         principal: Option<&crate::sesame::auth::AuthContext>,
     ) -> Result<RegistryWriteAccess, Response> {
+        if self.quota.total_bytes != 0 {
+            self.store
+                .configure_storage_limit(self.quota.total_bytes)
+                .await
+                .map_err(registry_write_error)?;
+        }
         let lease = headers
             .get("x-reliaburger-test-lease")
             .map(|value| value.to_str())
@@ -203,7 +209,11 @@ impl PickleState {
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
     async fn enforce_quota(&self, repository: &str, incoming: u64) -> Result<(), Response> {
-        if self.quota.is_unlimited() {
+        let logical_quota = QuotaConfig {
+            total_bytes: 0,
+            ..self.quota
+        };
+        if logical_quota.is_unlimited() {
             return Ok(());
         }
         let (repo_current, total_current) = self
@@ -211,7 +221,7 @@ impl PickleState {
             .await
             .map_err(registry_write_error)?;
         match super::registry_auth::check_quota(
-            &self.quota,
+            &logical_quota,
             repository,
             incoming,
             repo_current,
@@ -1056,7 +1066,7 @@ async fn blob_upload_initiate(
             .await
         {
             Ok(id) => id,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(error) => return registry_write_error(error),
         };
         drop(access);
         return blob_upload_complete(state, name, &upload_id, &digest_str, headers_in, body).await;
@@ -1078,7 +1088,7 @@ async fn blob_upload_initiate(
             );
             (StatusCode::ACCEPTED, headers).into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(error) => registry_write_error(error),
     }
 }
 
@@ -1193,7 +1203,7 @@ async fn stream_upload(
                 .store
                 .write_upload_chunk(upload_id, &chunk)
                 .await
-                .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+                .map_err(registry_write_error)?;
         }
         state
             .store
@@ -1334,6 +1344,7 @@ async fn blob_upload_complete(
         Err(super::types::PickleError::InvalidUploadId(_)) => {
             StatusCode::BAD_REQUEST.into_response()
         }
+        Err(error @ super::types::PickleError::StorageQuotaExceeded) => registry_write_error(error),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1400,6 +1411,7 @@ const INDEX_MEDIA_TYPES: [&str; 2] = [
 
 fn registry_write_error(error: super::types::PickleError) -> Response {
     let status = match error {
+        super::types::PickleError::StorageQuotaExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         super::types::PickleError::LeaseDenied(_) => StatusCode::FORBIDDEN,
         super::types::PickleError::ReplicationFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1743,11 +1755,7 @@ async fn manifest_put(
     )
     .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to store manifest blob: {e}")})),
-        )
-            .into_response();
+        return registry_write_error(e);
     }
     if let Err(error) =
         record_commit_with_access(state, manifest, reference.to_string(), &access).await
@@ -5365,6 +5373,128 @@ mod tests {
             );
         }
         assert!(state.catalog_snapshot("ordinary").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn physical_quota_counts_bare_blobs_without_a_manifest() {
+        let (mut state, _dir) = test_state();
+        state.quota.total_bytes = 2 + serde_json::to_vec(&("web", Option::<&str>::None))
+            .unwrap()
+            .len() as u64;
+        let app = test_router(state.clone());
+        for (bytes, expected) in [
+            (b"aa".as_slice(), StatusCode::CREATED),
+            (b"bb".as_slice(), StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let digest = compute_sha256(bytes);
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+                        .body(Body::from(bytes.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "bare blobs consume the physical ceiling"
+            );
+        }
+        assert_eq!(state.store.list_blobs().unwrap().len(), 1);
+        assert!(state.catalog.read().await.manifests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn physical_quota_refuses_an_oversized_chunk_before_disk_growth() {
+        let (mut state, _dir) = test_state();
+        state.quota.total_bytes = 2;
+        let app = test_router(state.clone());
+        let started = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let location = started.headers()["location"].to_str().unwrap();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri(location)
+                    .body(Body::from(b"oversized".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let paths = std::fs::read_dir(state.store.base_dir().join("uploads")).unwrap();
+        assert_eq!(
+            paths
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_quota_counts_distinct_repository_receipts_for_one_shared_blob() {
+        let (mut state, _dir) = test_state();
+        let receipt_bytes = serde_json::to_vec(&("repo-0", Option::<&str>::None))
+            .unwrap()
+            .len() as u64;
+        // The third upload copy still fits; its new receipt must be refused
+        // after digest verification rather than growing metadata past the cap.
+        state.quota.total_bytes = 4 + 2 * receipt_bytes;
+        let app = test_router(state.clone());
+        let digest = compute_sha256(b"aa");
+        for index in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v2/repo-{index}/blobs/uploads/?digest={}",
+                            digest.as_str()
+                        ))
+                        .body(Body::from(b"aa".to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if index < 2 {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+        }
+        assert_eq!(state.store.list_blobs().unwrap().len(), 1);
+        let receipts = state
+            .store
+            .blob_path(&digest)
+            .parent()
+            .unwrap()
+            .join("repositories");
+        assert_eq!(std::fs::read_dir(receipts).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(state.store.base_dir().join("uploads"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     /// REG4: a push that would breach the repository quota is refused with
