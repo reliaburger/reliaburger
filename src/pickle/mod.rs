@@ -17,6 +17,7 @@ pub mod pull;
 pub mod registry_auth;
 pub mod replication;
 pub mod signing;
+mod storage_budget;
 pub mod store;
 pub mod types;
 pub mod upstream;
