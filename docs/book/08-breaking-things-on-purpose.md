@@ -1127,6 +1127,40 @@ For each profile group, the scheduler sorts nodes by available capacity (most ro
 
 The complexity is O(nodes × profiles + total_jobs). If you have 100 nodes and all jobs are identical (1 profile), it's O(100 + 100,000) — essentially linear in the number of jobs. Even with 100 different profiles, it's O(10,000 + 100,000). The per-job pipeline would be O(100 × 100,000) — ten million evaluations.
 
+Suppose the reports say a node has eight free CPUs. One batch requests all
+eight, and a second batch arrives before the next report. Both fit the same
+report. A lock in the leader process won't fix this across a leader change,
+and the ordinary app scheduler has to respect the first batch too.
+
+We therefore commit each batch's resource reservation before dispatch. Both
+schedulers start with the worker reports, then add committed app placements
+and batch reservations that those reports haven't represented yet. We match
+batch evidence by namespace and execution identity, so another execution of
+the same logical job doesn't consume its reservation. The resource quantities
+are requests, the same quantities the ordinary scheduler uses.
+
+The commit carries the Raft log position from the snapshot used to plan it.
+The state machine compares that position with its previous applied entry
+before changing either placements or batches. If another admission got there
+first, the candidate is refused and the leader plans again. This is a
+compare-and-swap operation: Rust's `Option<LogId>` represents either the exact
+position we read or the absence of any applied entry. After a bounded number
+of competing writes, submission returns a retryable error. Clustered batch
+submission also needs fresh capacity reports; missing reports don't turn a
+cluster into an unlimited standalone node.
+
+A timeout tells us that we couldn't establish the outcome. It doesn't tell us
+that the process exited. An unknown dispatch or runtime outcome therefore
+keeps its durable reservation and remains nonterminal, including after leader
+handover. Dropping a watcher or exhausting dispatch retries doesn't release
+capacity either. A callback needs exit evidence for the exact execution before
+it can make the job terminal. Only a positively observed exit or explicit
+fenced retirement releases the reservation.
+Our regression tests submit through two independent API processes with one
+shared council, keep reports behind committed app placements, and lose a
+runner beyond the observation deadline. Each case checks the public outcome
+and the replicated state.
+
 The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
 
 Each job name must be unique within its batch, including jobs in different namespaces. Submission builds a map keyed by that label before assigning execution identities. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.

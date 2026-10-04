@@ -1721,6 +1721,30 @@ mod tests {
     }
 
     #[test]
+    fn stale_reports_never_offer_batch_capacity() {
+        let node = crate::meat::NodeId("stale".into());
+        let mut aggregated = AggregatedState::default();
+        aggregated.reports.insert(
+            node.clone(),
+            report_with_usage(
+                &node,
+                crate::reporting::types::ResourceUsage {
+                    cpu_total_millicores: 8000,
+                    memory_total_mb: 16384,
+                    ..Default::default()
+                },
+            ),
+        );
+        aggregated.stale_nodes.insert(node.clone());
+        let members = vec![NodeMembershipInfo {
+            node_id: node,
+            address: "127.0.0.1:9117".parse().unwrap(),
+            api_advertised: true,
+        }];
+        assert!(capacities_from_reports(&members, &aggregated).is_empty());
+    }
+
+    #[test]
     fn local_capacity_schedules_everything() {
         let mut capacities = local_only_capacity("local");
         let jobs: Vec<BatchJob> = (0..100)
@@ -1758,6 +1782,7 @@ mod tests {
             job_outcome(&[status("stopped", None)], "j", "default"),
             None
         );
+        assert_eq!(job_outcome(&[status("failed", None)], "j", "default"), None);
         assert_eq!(
             job_outcome(&[status("failed", Some(1))], "j", "default"),
             Some(1)
