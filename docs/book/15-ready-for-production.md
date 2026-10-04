@@ -4515,6 +4515,123 @@ does. The slow-disk scenario stays at 250 ms, and it now waits for the
 `discovery:startup-cleanup` readiness to turn ready before judging, because
 the port goes back a tick before the last writes.
 
+#### One write a turn
+
+Two writes a tick held for a week. Then the 0.1.4 candidate's compressed
+soak ran on a hosted runner, three 2-vCPU VMs sharing one disk, and failed
+on nothing but the turn budget (#505). Every slow command turn in every
+journal had the same name: `sync_cluster_consumer`, 300 to 700 ms through
+setup, and then this after the leader kill:
+
+```
+12:44:12 node-2 bun: agent loop turn took 1095 ms in command (sync_cluster_consumer)
+```
+
+The code hadn't changed since 0.1.3, and the catalogue was three services.
+Nothing in that path scales with it. What the turn histograms did show was
+that 116 of node 2's 159 command turns finished within 10 ms, and a consumer
+sync arrives with every placement poll and reads the runtime inventory every
+time. So the read wasn't it, at least not usually. The slow syncs were the
+ones that changed the view,
+and changing the view is where the journal comes in. Publishing a new view
+writes it as `Publishing` before the kernel sees it, then `Active`, then a
+compacted history once the requests holding older views have let go. Three
+fsync'd writes, each of them a temporary file, an `fsync`, a rename and an
+`fsync` of the directory. A node's first answer after a restart is worse:
+`Withdrawing`, `Withdrawn`, the receipts it proved, `Publishing`, `Active`.
+Five. At roughly 400 ms a write on that disk, both add up to the journals.
+
+Persists are allowed inline (decision 2 of #351) only while a slow disk
+keeps every turn in budget, and here it didn't. The scenario that shows it,
+`status_answers_while_a_consumer_sync_journals_to_a_slow_disk`, recovers a
+consumer, sets `LoopStall::Persist` to 400 ms and sends two leader answers.
+On the old code a status queued behind the first one took 2.08 s.
+
+Moving the journal itself off the loop would mean a discovery journal that's
+somewhere else for a while, and some forty places read it. So the sync
+became a sequence of steps instead, one write each, and the loop takes them
+on separate turns:
+
+```rust
+enum ConsumerStep {
+    Withdraw(ConsumerPublication),
+    ProveReceipts(ConsumerPublication),
+    Publish(ConsumerPublication),
+    Activate,
+    Compact,
+}
+```
+
+A Rust enum variant can carry data, so the step knows which view it's
+publishing without a separate field that may or may not be set. The step
+reads the journal afresh each time, so a receipt the leader confirmed between
+two steps stays confirmed. The loop holds the sync that's under way, and the
+leader's reply channel with it, and answers after the last step. That's also
+when the view lease is renewed, exactly as before. A view installed a turn
+earlier after a lapse can't route anywhere it shouldn't meanwhile, because the
+kernel enforces the lapsed lease until then.
+
+Two `select!` branches drive the steps:
+
+```rust
+_ = std::future::ready(()), if self.consumer_syncs.step_first() => { ... }
+// ... deploy ops, then commands ...
+_ = std::future::ready(()), if !self.consumer_syncs.is_idle() => { ... }
+```
+
+`std::future::ready(())` is a future that's already finished, so the branch
+fires as soon as its `if` guard holds. The first branch sits above deploy ops
+and commands but stands aside for one turn after each step, and the second,
+below commands, takes the step when nothing else is waiting. Steps and
+commands take turns, so a burst of either can't hold the other back.
+
+Splitting the turns opened a gap the single turn never had. Between
+`Withdrawn` and `Publish`, other turns run, and a stop that asks
+`own_view_names` whether any view still names its instance would hear "no"
+from a journal that says everything is withdrawn. The view about to be
+published was built before, though, and might name it. So `own_view_names`
+also asks the step that's under way. `a_local_address_stays_held_between_a_withdrawal_and_its_publication`
+checks exactly that.
+
+As with #422, the guard that doesn't depend on the disk counts.
+`a_consumer_sync_journals_at_most_one_write_a_turn` drives both syncs one
+step at a time and checks the writes per turn: `[1, 1, 1, 1, 1, 0]` for the
+recovery's answer (the last step compacts a history that's already one view
+long) and `[1, 1, 1]` for a changed view, in the same order as before. The local republication that runs at the end of a turn after a
+health change takes the same steps, and a turn that took a step leaves it
+for the next one.
+
+#### Counting instead of timing
+
+The same day, the oldest slow-disk scenario,
+`status_answers_while_every_persist_waits_on_a_slow_disk`, failed once on a
+hosted macOS runner (#508): `agent loop turn took
+1109 ms in restart_step`. At 150 ms a persist, that sounds like seven writes
+in one turn. So we counted them. `LoopStalls` now keeps a count per turn as
+well as a total (`begin_turn` clears it, and `hold` remembers the most any
+turn reached), and the restart's turn makes exactly one persist. Seven
+writes would have been a bug to split. One write and a second of something
+else is the runner: the turn also pays for the record's real fsyncs, and on
+macOS `sync_all` is `F_FULLFSYNC`, which flushes the drive's cache and queues
+behind every other test process doing the same.
+
+The scenario was timing a disk it doesn't control. The slowed persist exists
+to stand in for that disk, so the verdict now counts persists instead: no turn
+may make more than two (`MOST_PERSISTS_IN_A_TURN`, the rule #422 settled on),
+and status must still answer. That's stricter than the stopwatch, not
+looser. Put three persists into the record write and the new verdict fails
+straight away, while the old one would have passed: every turn came in under
+500 ms.
+
+The consumer-sync scenario from #505 had the same stopwatch, and the next
+day it failed the same way (#585): a status took 1.39 s behind a changed
+view on a hosted macOS runner. A status may wait two turns, each holding one
+400 ms slowed journal write, so the host's real fsyncs had about 200 ms of
+the budget left, and they took about 570 ms. It now counts too: status must
+answer, and no turn may journal more than one write. Run two sync steps in
+one turn and it fails straight away, with a worst turn of 840 ms that the
+stopwatch would have passed.
+
 #### A test that raced the clock
 
 One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`
@@ -5404,6 +5521,8 @@ The testing assessment after 0.1.0 found three pieces of evidence that couldn't 
 
 The cgroup v2 detector's test called the detector on Linux and threw the answer away (`let _ = result;`). It proved the function didn't panic. It would have passed if the detector said "v1" on a v2 host, or "v2" on a host with no cgroups at all. The fix is a small filesystem boundary: `check_cgroup_v2` now just passes `/sys/fs/cgroup` to `check_cgroup_v2_at(root: &Path)`, and three tests hand it fake mount trees in a temporary directory, one with `cgroup.controllers` (v2), one with a per-controller directory and no controllers file (v1), and one that doesn't exist. The host test still runs, and now it asserts: every Linux host that runs the suite is provisioned with v2, so a failure there is a real finding. How do we know the new tests can fail? We broke the detector on purpose, dropping the controllers check, and watched the v1 test go red.
 
+A checkpoint-capacity fixture has a different trap: it can spend most of its watchdog rewriting an ever larger inventory before reaching the boundary it wants to test. The batch fixture still submits real HTTP requests, waits for real completed jobs, reaches the actual 16 MiB checkpoint limit and retries an admitted execution before and after restart. Its valid image specifications now approach the API's 2 MiB request limit, so fewer whole-inventory writes reach that same capacity. An independent serialized-size assertion keeps every request within the production limit. We retain the hosted timeout separately; a shorter local run doesn't establish its complete cause.
+
 The node-pressure acceptance test was `#[ignore]`d (good) but, when selected without `RELIABURGER_NODE_PRESSURE_TESTS=1`, printed "skipped" and returned. Nextest has no idea what "skipped" means in a test's stderr. It saw a function return and reported a pass. Selecting an ignored test is a request to run it, so a missing prerequisite is now an `assert_eq!` failure with a message saying which variable to set. The one pattern we left alone is the subprocess fixture: a test that exists only to be re-executed by its parent (its `#[ignore]` reason says so) still returns when the parent didn't start it, because `make test-linux` selects whole binaries and would otherwise fail on every fixture.
 
 The third was the V02 loop summary, the script that turns hours of stress loops into a verdict. It wrote `Verdict: **FAIL**` and exited 0. It counted a JUnit `<skipped/>` as a run. And its combined mode summarised whichever lanes happened to upload a file, so a lane that never ran simply left the table, and the denominator shrank to fit. Now every row carries a status (pass, fail, skip or incomplete) and the commit it belongs to. A test with fewer runs than its loop's iterations is incomplete. The combined record is checked against `scripts/release/v02-loop-lanes.json`, the list of lanes the workflow runs, and a unit test keeps that list in step with the workflow matrix. A missing lane, a missing test, a stray lane or a record from another commit fails the summary, and the exit status finally says the same thing as the text.
@@ -5416,10 +5535,106 @@ Every Make gate passes `--no-tests=fail`, so we felt covered. We weren't. That f
 
 The fix has two halves, both in `scripts/ci/ignored_owners.py`. The first reads every `#[ignore = "..."]` in the tree and insists the reason names an owner that exists: `make <gate>` for a Makefile target that runs ignored tests, a `scripts/` path, `subprocess fixture` (and then something else in the file has to start it), or an issue number for deferred work. `make check-ignored` runs it, and so does `make ci`. Fixing the reasons found three root-only volume and image tests that no gate selected at all, plus the `crane` test, which now has `make test-standard-clients` and a step in the acceptance job that installs a pinned, checksummed `crane`.
 
-The second half is the one that catches the rename. Each CI job keeps one JUnit report per suite, and a final job, `ignored-test evidence`, checks that every test whose owner CI runs shows up in one of them. A test owned by `make test-linux` that's absent from every report fails the run, with its file and line. Gates CI can't run (Apple silicon, an NVIDIA GPU, a real S3 bucket, a VM we can reboot) are manual, so the check doesn't ask them for evidence.
+The second half catches the rename by binding each exact binary and full test
+name to its owner. JUnit is useful, but a case appearing in an old or failed run
+isn't enough. The final `ignored-test evidence` job now requires the successful
+current owner envelope: discovery, completion, command status and input hashes.
+A case absent from its owner's selected completion fails the run. Gates CI can't
+run (Apple silicon, an NVIDIA GPU, a real S3 bucket, a VM we can reboot) retain
+their manual policy; a portable fixture can't supply their result.
 
 That needed the reports first. Every nextest run under the `ci` profile writes the same `target/nextest/ci/junit.xml`, so the acceptance job, which runs three suites in a row, uploaded only the last one (when it uploaded anything: only the portable and privileged Linux jobs did). `scripts/ci/keep-junit.sh` now runs after each suite. It *moves* the report to `target/junit/<suite>.xml` and writes the command, commit, run and host beside it. Moving matters: if a later suite dies before nextest writes anything, a copy would leave the earlier report in place to be passed off as the later one's. Instead the keep step fails, because the suite produced no evidence.
 
 The script that picks which jobs a pull request runs got its own fixtures too, small Git repositories built in a temporary directory. The first one we wrote found a bug. `git diff --name-only` follows renames and lists only the destination, so moving a source file into `docs/` looked like a documentation-only change and skipped every Rust job. It now passes `--no-renames`. Another fixture covers a stacked pull request that GitHub retargets to `main` when the branch under it merges. GitHub reports that as an `edited` event, which `ci.yml` didn't listen to, so the heavy suites waited for the next push. A separate `ci-retarget.yml` now listens for `edited`, runs only when the base changed, and calls the whole of CI. Why not add `edited` to `ci.yml` itself? Because a title edit would start a run whose skipped jobs land on the same commit as the real results.
 
 And `make ci-full` is gone. It ran formatting, lint, the portable tests and the benchmarks, which is *fewer* checks than `make ci` (no doctests) and none of the privileged, cluster or upgrade suites its name promised. `make ci-bench` runs `make ci` and then the benchmarks, and a test checks that `make -n ci-bench` contains every command of `make -n ci`.
+
+### The command is part of the result
+
+Imagine coverage runs every required assertion successfully, then its report
+command fails. The JUnit looks lovely. Coverage failed. We have to preserve both
+observations, and the owner of the whole command supplies the verdict.
+
+The finite [matrix](../testing/qualification-matrix.md) records the concrete
+contract cases for the audit fixes and final lifecycle controls. Each row names
+its binary, full test name and applicable owner. It retains overlaps as
+references to one execution, including the strengthened default oracles. The
+original ignored declarations stay visible; twenty exact legacy mappings let
+the isolated OCI driver satisfy those particular Linux-owner cases. There is
+no rule that says every similarly named test counts too.
+
+Before a producer runs, the workflow knows which of its eleven owner gates the
+current changes require. It captures the checkout, workflow run, attempt and host, then
+keeps the successful producer outputs and their payload hashes. Aggregation
+uses those trusted outputs to verify the reports. A late artifact can't invent
+its own parent or decide that a missing job was optional. Archive users also
+verify the successful current builder's archive and executable identity.
+
+Coverage gets the same treatment. Its owner wraps the existing `make coverage`
+recipe once, keeping the clean, instrumented nextest run, reports and unchanged
+line floor. Discovery uses the instrumented run's actual selectors and
+environment, not a fresh ordinary test run after coverage has ended. Both child
+completion and the parent's later report/floor results belong to the record.
+The optimised cron owner imports the production parser into a small independent
+crate so numeric wraparound is exercised in an optimised build. Its two required
+boundary cases don't replace the full imported selection.
+
+### Break the assertion's promise deliberately
+
+A regression test needs a way to say no. Keep a small variant that changes the
+behaviour under test, run the exact oracle and retain what failed. Then restore
+the intended implementation and run it again. A compile error or unavailable
+runtime is a failed setup, not an assertion catching the defect. Python models
+can prove a report parser refuses stale or incomplete input. They can't prove
+that a Rust child ran, a real OCI job finished or a coverage floor passed.
+
+For publication, the awkward moment is often cancellation after the write has
+started. A blocking writer can outlive the future that awaited it. Chapter 6's
+pending owner keeps rows, immutable publication bytes and checkpoint identity
+alive until acknowledgement is complete. The controls pause an actual writer
+at an explicit boundary, cancel or fail the operation, then inspect query, retry
+and reopen outcomes. A temporary directory or controlled object store is useful
+for forcing that ordering. Physical interruption and real cloud durability
+remain separate evidence.
+
+The matrix also keeps the boundaries that names can hide. Smoker's three
+cgroup-setting controls exercise temporary file I/O and restoration. Real node
+pressure needs its actual owner. Apple Container needs a suitable macOS runtime;
+a fake executable on a hosted runner doesn't provide it. The original seventeen
+manual/subprocess classifications remain separate from CI authority.
+
+### Keep unknown failures unknown
+
+A startup fixture timed out before Bun's listener announcement, and its printed
+log was empty. A later isolated diagnostic passed. We still don't know why the
+original startup stalled. An empty readable log, a missing log and invalid UTF-8
+were previously rendered alike; distinguishing those observations improves the
+next diagnosis without proving this one's cause.
+
+Retain the failed full run and its JUnit before a diagnostic overwrites the
+runner's output path. Record the exact unchanged diagnostic separately, with
+zero retries and the original deadlines. Bounded phase labels, actual child
+observation and owned capture completion explain more than an arbitrary timeout
+increase. They mustn't print tokens, security files or secret arguments. The
+[dated qualification template](../qualification/2026-10-04-final-codebase-qualification.template.md)
+leaves actual Rust, coverage, OCI and current CI results pending until their
+matching execution records exist.
+
+Build caches can retain empty directories after removing old reports. CI clears
+only the generated execution-envelope directory after restoring each cache,
+before its first owner starts. Owners still refuse reuse within the job. The
+privileged storage owner keeps its reports private while running; an always-run
+step returns that completed report directory to the runner before upload. This
+changes file ownership without replacing the producer's exit status.
+
+A Cargo subcommand executable can still require its subcommand token when
+called directly. The coverage owner observes `cargo-llvm-cov llvm-cov --version`,
+then binds that exact query to the pinned tool bytes. Manual-operation fixtures
+also use the same controlled environment for subprocesses and direct Python
+calls, so the host CI marker cannot silently change which refusal they test.
+
+The pinned coverage tool also reorders its nextest arguments: it appends the
+parsed profile after passthrough flags. The owner predicts that observed order
+exactly, including the manifest and instrumented target directory. A recorded
+command fixture checks the prediction; changing or omitting a selector still
+fails before discovery or execution.

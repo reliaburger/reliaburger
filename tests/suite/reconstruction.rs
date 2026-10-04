@@ -110,6 +110,8 @@ fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedStat
         );
     }
     AggregatedState {
+        leadership_epoch: None,
+        receive_deadlines: Default::default(),
         reports,
         stale_nodes: vec![],
         capabilities: HashMap::new(),
@@ -129,17 +131,19 @@ async fn reconstruction_matching_state_no_corrections() {
     let leader = &nodes[(leader_id - 1) as usize];
 
     // Write scheduling decisions to Raft.
-    leader
-        .write(RaftRequest::SchedulingDecision(SchedulingDecision {
+    write_admission_fixture(
+        leader,
+        RaftRequest::SchedulingDecision(SchedulingDecision {
             app_id: AppId::new("web", "prod"),
             placements: vec![Placement {
                 node_id: NodeId::new("worker-1"),
                 resources: Resources::new(100, 128 * 1024 * 1024, 0),
                 ordinal: 0,
             }],
-        }))
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .unwrap();
 
     // Read desired state from the new leader.
     let desired = leader.desired_state().await;
@@ -190,28 +194,32 @@ async fn reconstruction_missing_app_detected() {
     let leader = &nodes[(leader_id - 1) as usize];
 
     // Desired: web/prod on worker-1, api/prod on worker-2.
-    leader
-        .write(RaftRequest::SchedulingDecision(SchedulingDecision {
+    write_admission_fixture(
+        leader,
+        RaftRequest::SchedulingDecision(SchedulingDecision {
             app_id: AppId::new("web", "prod"),
             placements: vec![Placement {
                 node_id: NodeId::new("worker-1"),
                 resources: Resources::new(100, 128 * 1024 * 1024, 0),
                 ordinal: 0,
             }],
-        }))
-        .await
-        .unwrap();
-    leader
-        .write(RaftRequest::SchedulingDecision(SchedulingDecision {
+        }),
+    )
+    .await
+    .unwrap();
+    write_admission_fixture(
+        leader,
+        RaftRequest::SchedulingDecision(SchedulingDecision {
             app_id: AppId::new("api", "prod"),
             placements: vec![Placement {
                 node_id: NodeId::new("worker-2"),
                 resources: Resources::new(200, 256 * 1024 * 1024, 0),
                 ordinal: 0,
             }],
-        }))
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .unwrap();
 
     let desired = leader.desired_state().await;
 
@@ -256,4 +264,24 @@ async fn reconstruction_missing_app_detected() {
         result.unknown_nodes.iter().any(|n| n.0 == "worker-3"),
         "worker-3 should be unknown"
     );
+}
+
+async fn write_admission_fixture(
+    council: &reliaburger::council::CouncilNode,
+    mut request: reliaburger::council::RaftRequest,
+) -> Result<reliaburger::council::CouncilResponse, reliaburger::council::CouncilError> {
+    let previous = council.desired_state().await.last_applied_log;
+    match &mut request {
+        reliaburger::council::RaftRequest::BatchRegister {
+            expected_log_id, ..
+        } => *expected_log_id = previous,
+        reliaburger::council::RaftRequest::SchedulingDecision(decision) => {
+            request = reliaburger::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
+            }
+        }
+        _ => {}
+    }
+    council.write(request).await
 }

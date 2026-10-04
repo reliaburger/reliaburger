@@ -164,3 +164,7 @@ clean: ## Remove build artefacts and generated files
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  make %-12s %s\n", $$1, $$2}'
+
+.PHONY: test-contract-boundaries
+test-contract-boundaries: ## Run the actual-source optimized cron boundary contract
+	$(NEXTEST) --manifest-path tests/contracts/cron/Cargo.toml --config-file tests/contracts/cron/nextest.toml --release --locked

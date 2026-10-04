@@ -94,7 +94,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.4: incompatible binary: found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49. …
+refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49. …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -131,6 +131,9 @@ it before recording a run, with the message above
 And 0.1.4: protocol 34, state format still 49. A 0.1.3 cluster's leader
 refuses it the same way
 ([upgrading from 0.1.3](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-013)).
+And 0.1.5: protocol 40 and state format 57. A 0.1.4 cluster's leader refuses
+it the same way
+([upgrading from 0.1.4](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-014)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -147,7 +150,7 @@ line says what it found and what it needs, so even a truncated journal line
 carries it:
 
 ```text
-incompatible state format: found 47; this binary (reliaburger v0.1.4 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: …
+incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: …
 ```
 
 A join between mismatched binaries fails the same way, starting
@@ -163,11 +166,20 @@ in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs
 
 Point the config at a repository and the council leader keeps the cluster in
 step with it. It merges the TOML files under `path` (an app declared in two
-files is an error) and validates the result like `relish apply`. Unlike
-`relish compile`, it doesn't derive namespaces from directories or read
-`_defaults.toml`, so set `namespace` in each app. And unlike `apply`, which
-only adds and updates, GitOps reconciles: delete an app from the repository
-and it goes from the cluster.
+files is an error) and validates the result like `relish apply`. Its watched
+tree uses the same inherited `_defaults.toml` values and directory namespaces
+as `relish compile`. The configured `path` is the root: its own name adds no
+namespace, and defaults outside it are not inherited. A workload's explicit
+namespace wins. GitOps reconciles deletions too: delete an app from the
+repository and it goes from the cluster.
+
+GitOps reconciles apps, namespaces and permissions. Any `[job.*]` declaration,
+including a cron registration or a `run_before = ["app.web"]` migration, refuses
+the whole commit before desired-state writes. The failed sync names the jobs;
+the applied SHA stays at the previous successful commit. Use `relish apply`
+with the migration and dependent app in the same manifest to execute their
+ordering, or `relish batch` for batch work. Lettuce has no durable job identity
+or dispatch path tied to a Git revision yet.
 
 ```toml
 [gitops]
@@ -207,6 +219,24 @@ GitLab's `X-Gitlab-Token`. It refuses replays and is rate-limited
 (`webhook_rate_limit`, 10 a minute by default). A delivery refused for the
 rate limit isn't counted as seen, so the provider's retry gets through.
 
+A follower forwards an authenticated webhook to the leader. A clustered
+`202 Accepted` confirms that the cluster has durably accepted the delivery;
+the sync finishes later and pending work survives a leader change. A push
+arriving during a sync remains pending for a later run. If leadership or
+replication cannot be confirmed, the endpoint returns `503`; retrying the
+original delivery ID is safe. Admission has one five-second budget, including
+waiting for the validator, resolving the leader and forwarding or replicating
+the trigger. Timing out releases the local rate and replay reservation.
+The cluster retains the most recent 1,000
+committed delivery IDs across restarts and leader changes. A delivery still
+in that inventory is refused as a replay; one that was not admitted can be
+tried again. Older delivery IDs can be admitted again after eviction.
+
+Durable webhook admission changes both protocol and state formats. Check
+`bun --compatibility` before upgrading. Before 1.0, recreate the cluster
+with matching new binaries and re-apply the repository; older-format logs
+and snapshots are refused rather than migrated.
+
 ## Backing up the council
 
 The council holds the cluster's desired state: apps, jobs, tokens and the
@@ -231,16 +261,30 @@ relish council recover --data-dir /var/lib/reliaburger/data \
   --from s3://backups/prod-council --master-key /etc/reliaburger/master.key
 ```
 
-Without `--from`, it uses the node's own latest snapshot. It moves the dead
+Without `--from`, it rebuilds the state from the node's own Raft directory:
+its snapshot, if it has taken one, plus every committed log entry after it.
+That only works on a node that was a voter, and the log is encrypted, so pass
+`--master-key` (it defaults to `/etc/reliaburger/master.key` when that file
+exists). Entries the node hadn't seen committed are left out. It moves the dead
 council's Raft directory aside (to `.raft-recovery-*/previous` in the data
 directory, where you can delete it once the cluster is healthy) and stamps a
 new recovery epoch. It refuses while the node is still running, and the next
 start finishes a recovery that crashed part-way. Starting the node brings up a
 one-voter council that grows again as nodes rejoin, even if its config still
 lists `cluster.join` seeds. New members receive the whole restored state.
-Anything written after the backup is lost. It refuses while it can still see a
-live council; `--force` skips that check, and using it against a cluster
-that's still alive splits the brain.
+Anything written after the backup is lost. The restored state keeps its API
+tokens, join tokens and certificate revocations: the node's
+`security.bootstrap_path` file seeds only a brand-new cluster, never a
+recovered one. Nodes that saw the old council publish a newer service
+catalogue than the backup holds still follow the recovered one, because each
+recovery starts a new range of catalogue generations; a leader of the replaced
+council stays refused.
+
+Before it starts, it asks the local agent whether any voter is still alive
+and refuses if one is; `--force` skips that check. The node is stopped by
+then, though, so in practice nothing answers and the check passes. Make sure
+yourself that the other voters are really gone: recovering a cluster that's
+still alive splits the brain.
 
 You need `--force` when a majority is gone but not every voter, say two of
 three. The survivor can't regrow the council alone (changing membership needs

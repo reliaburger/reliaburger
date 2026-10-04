@@ -959,6 +959,13 @@ fn apply_request(&mut self, request: &RaftRequest) {
 }
 ```
 
+This early version committed one placement at a time. The current scheduler
+commits a complete `SchedulingDecisions` pass with the log revision it used to
+plan. Raft refuses stale plans and publishes the whole validated pass atomically,
+so app placements and batch reservations share a capacity budget. The original
+unguarded variant is refused; [batch scheduling](08-breaking-things-on-purpose.md#batch-scheduling)
+explains the admission boundary.
+
 Exhaustive `match` — add a new variant and the compiler forces you to handle it everywhere. Compare that to a `switch` in Go, where a forgotten `case` silently falls through to nothing.
 
 ### Snapshots and the JSON key problem
@@ -2307,16 +2314,18 @@ One subtlety. After recovery, the cluster looks brand new to Raft, but the world
 A monotonic counter, stamped into the restored state:
 
 ```rust
-pub fn persist_recovered_snapshot(
-    snapshot_db: &Database,
-    mut state: DesiredState,
-) -> Result<(), redb::Error> {
-    state.recovery_epoch = state.recovery_epoch.saturating_add(1);
-    state.last_applied_log = None;
-    state.last_membership = StoredMembership::default();
-    // ...persist
+impl DesiredState {
+    pub fn enter_recovery_epoch(&mut self) {
+        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+        self.last_applied_log = None;
+        self.last_membership = StoredMembership::default();
+        self.endpoint_withdrawals
+            .enter_recovery_epoch(self.recovery_epoch);
+    }
 }
 ```
+
+Both recovery paths call it: the offline one that writes the snapshot `relish council recover` leaves behind, and the in-process one the tests use. The last line comes later in this section, in "Three more from the field".
 
 `saturating_add` is Rust's "add, but clamp at the maximum instead of overflowing." A plain `+` on an integer that's already at `u64::MAX` would panic in a debug build and wrap around in a release build — both wrong. Saturating arithmetic is the boring-correct choice for a counter that only ever goes up. Recover a cluster twice and the epoch reads 2; anything tagged with epoch 0 or 1 is demonstrably pre-recovery. It's cheap, it's monotonic, and it never lies.
 
@@ -2363,6 +2372,63 @@ And chasing that one turned up a fourth, which had nothing to do with recovery. 
 The last piece is seeing it. One node's council status is only that node's opinion, and a split brain looks perfectly healthy from either half. That was the "both report healthy" part of the report. So `relish council status`, the header `relish status` now prints, and `relish wtf` all ask *every* node, through the relay, and compare. Two serving epochs, two leaders or a fenced node is critical, and each finding names the nodes and the way back.
 
 Is the fence perfect now? No, and the manual says so. An old voter only learns of the new epoch from a node that holds it. Bring two old voters back where they can see each other but not the recovered side, and they have nothing to learn from. That's why the manual's advice after `council recover --force` is blunt: re-enrol the old voters before you start them. If you don't, `relish wtf` will tell you, loudly.
+
+### Three more from the field
+
+The same tester came back with three more reports, all from following the recovery runbook to the letter. Each one is a different way of forgetting that the restored state isn't the only state in the world.
+
+**The bootstrap file that ate the tokens (#477).** A node's config can point at a security bootstrap file: the CAs and keys `relish init` wrote, before anyone had minted an API token. A brand-new council commits it as its first entry, `SecurityStateInit`. The recovered council bootstraps too, so it committed the file on top of the restored state, and the apply arm did what it had always done: replace `security_state` wholesale. Every API token, every join token and every revoked certificate in the backup, gone. The API listener then refused to start, because an empty token store on a public address is exactly what it's meant to refuse.
+
+The fix has two layers. The runtime doesn't seed a state machine that already holds a security state. And the state machine refuses a second `SecurityStateInit` outright:
+
+```rust
+RaftRequest::SecurityStateInit(ss) => {
+    if self.state.security_state.is_initialised() {
+        return Some(CouncilResponse::Refused { reason: /* ... */ });
+    }
+    self.state.security_state = *ss.clone();
+}
+```
+
+Why both? The runtime check fixes the bug. The state machine check fixes the *class* of bug: "initialise" should mean once, and a command that silently overwrites a live security state is a loaded gun whoever pulls the trigger next.
+
+**The generation that went backwards (#478).** Nodes only accept a service catalogue whose generation is at least the newest they've seen. That's the guard that stops a stale leader rolling their routing back, and it's persisted, so it survives a restart. Now restore a backup taken at generation 5 when the dead council had already published generation 7. Every node that saw 7 refuses the recovered council's 5, for good. The scheduler then finds no eligible nodes, and the restored apps never run.
+
+The tempting fix is to relax the guard after a recovery. Don't. The guard is right: a generation lower than one you've seen *is* what a stale leader looks like. What's wrong is that the recovered council speaks with an old voice. So recovery gives it a new one. Each recovery epoch owns its own range of generations:
+
+```rust
+pub const RECOVERY_EPOCH_SHIFT: u32 = 40;
+
+pub fn epoch_floor(epoch: u64) -> u64 {
+    epoch.saturating_mul(1 << RECOVERY_EPOCH_SHIFT)
+}
+
+pub fn enter_recovery_epoch(&mut self, epoch: u64) {
+    self.generation = self.generation.max(Self::epoch_floor(epoch));
+}
+```
+
+`1 << 40` is a left shift, as in C: 2 to the 40th. Epoch 1 publishes from about 1.1 trillion, epoch 2 from 2.2 trillion. The old council would need 2^40 publications to climb out of its range, a million a second for twelve days, so every generation of the new epoch is above every generation of the old one. Nodes follow the recovered council without being told anything, and an old voter that comes back and publishes generation 8 is still refused. `u64::max` returns the larger of two values, so a generation already above the floor is never lowered, and `saturating_mul` clamps instead of wrapping, the same reasoning as `saturating_add` above. The node-side check didn't change at all, which is the point: nobody had to argue about whether it's safe.
+
+**The log nobody read (#479).** Without `--from`, recovery used to read only the node's snapshot. openraft takes the first one after 10,000 log entries. A young cluster, or a quiet one, hadn't got there, so `snapshot.redb` existed but was empty and recovery refused, while `log.redb` sat next to it holding every committed write. Worse, a cluster that *had* snapshotted lost everything committed after its last snapshot, up to 10,000 entries, without a word.
+
+Recovery now does what a node start does: it opens the stores through the same `open_raft_storage` (so an interrupted recovery is finished and the purge boundary is checked), then replays every log entry from the snapshot's position to the node's commit point into the state machine:
+
+```rust
+let committed = log.read_committed().await.map_err(read_error)?;
+if let Some(committed) = committed.filter(|committed| committed.index >= first) {
+    let entries = log
+        .try_get_log_entries(first..=committed.index)
+        .await
+        .map_err(read_error)?;
+    // ...refuse a gap, then apply them in order
+    machine.apply(entries).await?;
+}
+```
+
+`Option::filter` keeps the value only when the closure returns `true`, so a commit point behind the snapshot reads as "nothing to replay". `first..=committed.index` is an inclusive range, both ends included, where `first..committed.index` would stop one short. `read_error` is a closure that captures `master_key` from the enclosing function, so every read failure can say "pass `--master-key`" when the key is missing: a secured cluster encrypts its log at rest, and replay needs the key that sealed it.
+
+Why stop at the commit point and not the end of the log? Entries past it were never agreed by the dead council. Replaying one could resurrect a write whose client was told it failed. A follower's commit point can trail the leader's by a heartbeat, so recovering from a follower may lose the last write or two. That's the same honest cost as a backup's interval, just much smaller.
 
 ### Resigning under disk pressure
 
@@ -2420,9 +2486,63 @@ Why gossip and not a new dedicated message? Because the directory extension is a
 
 Until this wiring existed, the production path fed the reconciler a permanently empty set — the resignation *machinery* was complete and tested, but nothing in a live cluster ever put a name into it. This is the piece that makes it engage.
 
+### Measuring the right disk
+
+The first version measured the wrong thing. It asked the log and metrics stores whether they were over their `max_storage_mb` caps after export and prune, and called that "disk pressure". The 0.1.4 soak caps both stores at 8 MB. Pruning only deletes files that have already been exported, so the unexported logs on the leader stayed over 8 MB for three ticks running, and the leader resigned. The disk was 38% full. Seven `relish test` cases failed with "no cluster leader known yet" while the council changed hands (#510).
+
+A retention cap is a promise about how much history a store keeps. It says nothing about whether Raft can write. So resignation now asks the filesystem that holds the Raft log, through `statvfs(2)`:
+
+```rust
+pub fn is_pressured(&self) -> bool {
+    self.available_bytes == 0 || self.used_percent() >= COUNCIL_DISK_PRESSURE_PERCENT
+}
+```
+
+`COUNCIL_DISK_PRESSURE_PERCENT` is 95, the level `relish wtf` already calls critical. `FilesystemUsage::of` walks up `path.ancestors()` to the nearest directory that exists, because a standalone node has no `raft/` directory yet. `ancestors()` is an iterator over a path and each of its parents, so `find` returns the first one that's there. The block counts come back as `u32` on macOS and `u64` on Linux, so each goes through `u64::from`. On Linux that conversion does nothing and clippy says so; an `#[allow(clippy::useless_conversion)]` keeps one source for both platforms. When the node does resign, the log line says which filesystem, how full it was and how many bytes were left.
+
+### When the disk fills anyway
+
+Resignation takes ten minutes. A disk can fill in less. An external test filled a follower's disk with `fallocate`, and the durable log's `append` returned a `StorageError` for ENOSPC. openraft treats any storage error as fatal: it stops its core task for good and records why in the metrics' `running_state`. Nothing in Bun noticed. The node still answered its API, so `relish wtf` counted it as a healthy member. It never applied another entry, even after the disk was freed, and the cluster was one more failure away from timing out every write (#480).
+
+Restarting the core in process isn't something openraft 0.9 offers, and a restart of bun fixed it at once in the report. So Bun does that. A small watchdog waits for the core to stop:
+
+```rust
+pub async fn raft_core_stopped(
+    mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    shutdown: CancellationToken,
+) -> Option<String> {
+    loop {
+        let running = metrics_rx.borrow_and_update().running_state.clone();
+        if let Err(fatal) = running {
+            return (!shutdown.is_cancelled()).then(|| fatal.to_string());
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            changed = metrics_rx.changed() => {
+                if changed.is_err() {
+                    return (!shutdown.is_cancelled()).then(|| "Raft core task ended".to_string());
+                }
+            }
+        }
+    }
+}
+```
+
+`borrow_and_update` reads the latest metrics and marks them seen, and we clone `running_state` out at once. A `watch` borrow holds a read lock, and holding it across the `.await` below would block the core from publishing. `bool::then` turns `true` into `Some(..)` and `false` into `None`, so an orderly shutdown, which also stops the core, reports nothing. The `changed()` error covers a core that panicked without publishing a reason.
+
+When it fires, Bun logs the reason, cancels its shutdown token and, after the usual orderly stop, returns an error from `main`, so the process exits non-zero. systemd's `Restart=always` starts it again. With the disk still full, the new core fails on its first append and the cycle repeats every few seconds, loudly, with the node down rather than quietly useless. Once there's room, the new core catches up from the leader.
+
+`relish wtf` also learned to see the quiet version. It already asks every node for its council view, which includes the last applied log index. A voter more than 100 entries behind the furthest-applied voter is now a `council-voter-lagging` warning, and `relish council status` prints the same warning. That threshold is generous: replication keeps a healthy voter within a few entries even under steady writes.
+
+The test for the watchdog needed a disk that fills on cue. The in-memory log store grew a test-only switch, compiled only under `#[cfg(test)]`, that makes every later append fail with `from_raw_os_error(28)`, which is ENOSPC. The test bootstraps a one-voter council, flips the switch, writes, and expects the watchdog to report "No space left on device". A second test checks that a cancelled shutdown reports nothing.
+
+On the testing side, `relish test` now waits out a short leader change. Lease creation that gets a 503 whose body says "retry shortly" tries again every 250 ms for up to 30 seconds. The server only says that when no lease was created, so asking again is safe.
+
 ### Testing the whole thing
 
 The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler and watches leadership move off it, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
+
+The three field bugs each got a test that failed first. `security_state_init_never_replaces_an_initialised_security_state` applies a bootstrap on top of a state holding a token, and `a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file` starts a real node, bootstrap file and all, on a recovered directory. `durable_consumer_follows_a_recovered_council_and_still_refuses_the_replaced_one` drives a node's real durable consumer through the old council's generation, the recovered one, and the old one again. And `a_voter_that_never_snapshotted_recovers_from_its_committed_log` runs a one-voter council on durable, encrypted stores, writes fifty entries, stops it and recovers from what's on disk, with unit tests beside it for the commit point, the tail after a snapshot and the missing key.
 
 ## Breaking things on purpose
 

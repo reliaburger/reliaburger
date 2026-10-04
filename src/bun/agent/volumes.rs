@@ -84,6 +84,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let spec = spec.clone();
         let provisioning = async move {
             tokio::task::spawn_blocking(move || {
+                crate::grill::volume::validate_managed_volume_layout(&spec.volumes).map_err(
+                    |reason| crate::grill::volume::VolumeError::CreateFailed {
+                        path: app.clone(),
+                        reason,
+                    },
+                )?;
                 if crate::testkit::lease::valid_test_namespace(&namespace) {
                     manager.prepare_test_storage(&namespace, &app, &spec)?;
                 } else {

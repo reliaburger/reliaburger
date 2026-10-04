@@ -57,7 +57,35 @@ class Tree:
         return ignored_owners.owner_problems(self.root)
 
     def evidence(self, reports):
-        return ignored_owners.evidence_problems(self.root, reports)
+        # Synthetic owner/source tests mock ALREADY verified gate consumers.
+        # Production must never infer owner/context from an artifact filename.
+        import contracts
+        targets, scripts = ignored_owners.ci_owners(self.root)
+        bindings = []
+        for test in ignored_owners.find_ignored(self.root):
+            if not any((kind == "make" and owner in targets) or
+                       (kind == "script" and owner in scripts)
+                       for kind, owner in ignored_owners.owners(test)):
+                continue
+            full_name = test.name
+            if test.path.startswith("src/"):
+                # These toy source fixtures declare one ordinary tests module.
+                full_name = test.path[4:-3].replace("/", "::") + "::tests::" + test.name
+            bindings.append(dict(source=test.path, function=test.name,
+                                 binary=test.binary(), test=full_name))
+        verified, errors = {}, []
+        paths = list(Path(reports).rglob("*.xml"))
+        if not paths:
+            errors.append("no JUnit reports")
+        for path in paths:
+            try:
+                passed = contracts.passed_junit(path)
+                # This is the fake tree's explicit mock consumer result only.
+                verified[("make", path.stem)] = passed
+            except contracts.Invalid as error:
+                errors.append(f"{path.name}: {error}")
+        problems = ignored_owners.evidence_problems(self.root, reports, bindings, verified)
+        return errors + problems
 
 
 def junit(suites):
@@ -210,14 +238,18 @@ class EvidenceTests(unittest.TestCase):
                     {"reliaburger": ["grill::netns::tests::port_mapping"]})
         self.assertEqual(self.tree.evidence(self.reports), [])
 
-    def test_a_libtest_log_from_a_ci_script_counts(self):
+    def test_a_raw_libtest_log_cannot_prove_completed_ci_script(self):
         self.tree.test("tests/oci_crash.rs", "bun_sigkill",
                        '#[ignore = "run through scripts/release/qualify-oci.sh"]')
         self.report("test-linux.xml", {"reliaburger::owned_runc": ["runc_starts"]})
         (self.reports / "oci").mkdir()
         (self.reports / "oci" / "oci_crash-0123abcd.log").write_text(
             "running 1 test\ntest bun_sigkill ... ok\n")
-        self.assertEqual(self.tree.evidence(self.reports), [])
+        # Even an apparent per-case result lacks the actual completed script's
+        # final footer, exit status, current build and assigned owner envelope.
+        problems = self.tree.evidence(self.reports)
+        self.assertTrue(problems)
+        self.assertIn("bun_sigkill", "\n".join(problems))
 
     def test_a_manual_gate_needs_no_ci_evidence(self):
         self.tree.test("src/grill/apple.rs", "apple_runs",

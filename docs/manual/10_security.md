@@ -53,7 +53,7 @@ through a port forward that arrives on the node's loopback.
 
 ```sh
 relish token create --name ci-deploy --role deployer --namespaces shop --ttl-days 90
-relish token list      # name, role, created and expiry times (UTC)
+relish token list      # name, role, times (UTC), last use and scope
 relish token revoke ci-deploy
 ```
 
@@ -76,6 +76,42 @@ only a hash, so `TOKEN="$(relish token create ...)"` captures it. Tokens don't
 expire unless you give `--ttl-days`. `revoke` refuses to remove the last admin
 token; create its replacement first. Revoking a token, or letting it expire,
 also ends every dashboard session that was logged in with it.
+
+`relish token list` shows, for each token, its role, when it was created, when
+it expires (`never`, `(in 30d)` or `(expired)`), when it was **last used** and
+its **scope** (`all`, or `apps=… namespaces=…`). New columns are added on the
+right, so a script that cuts the older ones out keeps working; `-o json` gives
+the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
+never) plus a `principal` id that matches the `principal` of that token's audit
+events.
+
+Last use is kept in memory on each node, not in the cluster's replicated state,
+so it's cheap. The node you ask collects every node's answer and shows the
+latest. Two things follow:
+
+- a node that doesn't answer leaves a gap, and `token list` names it on stderr
+  (`warning: last use incomplete: node-3 timed out`);
+- a node forgets what it saw when it restarts, so a token can look *less*
+  recently used than it was, never more. `never` means no node that's up has
+  seen it since starting.
+
+### Expired tokens
+
+An expired token is refused at once (`401 token expired`). A day later (the
+24-hour grace, so `token list` still shows why a client started failing) the
+council leader removes it from the store. The sweep runs hourly and records a
+`token.expired_swept` event per token, with principal `system`, in
+`relish events`.
+
+The sweep never removes the last admin token, and never empties the store. An
+empty store is the bootstrap window: the API lets everyone in so the first
+token can be created. If every admin token has expired, the one that expired
+most recently stays: still refused, but present, so the API stays closed.
+Expiry alone can lock you out of token management, sweep or no sweep, so keep
+one admin token without `--ttl-days`, or mint the next admin token before the
+current one lapses. With no admin token at all, the most recently expired
+token stays. A store whose every token has expired is
+not empty, so it keeps refusing anonymous requests.
 
 ### Permissions
 
@@ -154,7 +190,9 @@ that starts the instance decrypts the value into its environment. If it can't
 decrypt, it refuses to start the instance rather than pass the ciphertext
 through. On the node, the plaintext goes only into files that root (or, for
 rootless runc, the user running Bun) alone can read, and the container spec
-that carries it is deleted when the instance stops.
+that carries it is deleted when the instance stops. The runtime's record of a
+stopped instance keeps the names of its environment variables, never their
+values.
 
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the
@@ -228,8 +266,25 @@ openssl pkey -in ci-signing.pem -pubout -outform DER | tail -c 65 | base64
 certificates last a year and cluster-issued ingress certificates 90 days. Nodes
 renew their certificates at the midpoint of their validity without restarting
 (a development cluster can shorten both lifetimes for soak testing, see
-`[security] leaf_lifetime_override_secs` in the reference), and a
+`[security] leaf_lifetime_override_secs` in the reference). A node's API and
+registry listeners close a connection, after letting in-flight requests finish,
+before the certificate its client presented expires, so a peer reconnects with
+its renewed certificate even over a connection that never goes idle. A
 new node joins with a single-use token and a certificate signing request, so
 its private key never leaves it. Every node needs the cluster's master key
 (`*-master.key` from `init`): it unwraps the CA keys and the secret keys, and
 seals council backups. Keep it safe and backed up.
+
+### Cluster build signing authority
+
+Cluster build signers receive code-signing certificates valid for at most five
+years, bounded by the Workload CA's expiry. The build runner renews cached
+signers before expiry. Workload mTLS certificates continue to last one hour.
+
+An image signature is checked against its certificate chain at deployment time.
+The leaf, every intermediate and the trusted root must be currently valid; expiry
+or revocation of an authority can shorten the signature's usable lifetime.
+Renewing a signer does not extend signatures already attached to images. Re-sign
+retained images before their chain expires, and after retiring or revoking their
+signing authority. Images signed under the previous one-hour certificate policy
+also need re-signing. The signature timestamp does not extend certificate validity.

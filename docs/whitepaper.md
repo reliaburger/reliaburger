@@ -249,7 +249,7 @@ schedule = "0 3 * * *"
 
 **High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions. The bin-packing allocator ships; the full delegated dispatch-and-completion pipeline is a Phase 12 deliverable (see [design/scheduler-meat.md](design/scheduler-meat.md) §5.2). On-demand and scheduled Jobs run today.
 
-**Build jobs:** Jobs can build container images and push them to the Pickle registry via the `pickle://` scheme. Build jobs require a `destination` field (a `pickle://` reference) that scopes registry access. Lettuce injects `${GIT_SHA}` for tag synchronisation.
+**Image builds:** `relish build` builds container images from `[build.*]` declarations and pushes them to Pickle. A `destination` field (a `pickle://` reference) scopes registry access. This is a manual build path; Lettuce does not dispatch build jobs or inject `${GIT_SHA}` into their tags.
 
 > For batch scheduling and build job details, see [design/scheduler-meat.md](design/scheduler-meat.md) and [design/registry-pickle.md](design/registry-pickle.md).
 
@@ -499,7 +499,7 @@ There are three cases, and they behave differently.
 - **A majority of voters fails, but some survive.** There's no quorum, so nothing can be elected, scheduled or written; apps keep running. If the lost voters come back, quorum returns and the cluster carries on where it left off. If they're gone for good, the survivors can't regrow the council on their own (changing Raft membership needs a quorum too), so this becomes the operator-triggered recovery below. `relish council recover` refuses while it can still see a live voter, so here you pass `--force` on one stopped survivor after making sure the dead voters won't return. The recovered node carries a new recovery epoch. An old voter that later hears of it, from a Raft refusal or from gossip, fences itself: it serves no Raft and refuses writes until you re-enrol it with `relish council re-enrol`. A restarted voter checks its peers' gossiped epochs before it serves Raft, so old voters that can reach the recovered side never re-form their council. Old voters that can reach only each other have nothing to learn the new epoch from, so re-enrol them before starting them; `relish council status` and `relish wtf` compare every node's view and show a fence or a split as critical.
 - **Every voter fails at once.** There's nothing left to elect from.
 
-Recovery from the last two cases is deliberately operator-triggered rather than automatic, because it discards the dead cluster's Raft history. A surviving node restores the desired state from the last sealed backup (or from its own durable snapshot if it was a voter), re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council. The cost is honest: anything written after the last backup is lost. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, so a minority side simply has no quorum. Nodes on the minority side operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
+Recovery from the last two cases is deliberately operator-triggered rather than automatic, because it discards the dead cluster's Raft history. A surviving node restores the desired state from the last sealed backup (or, if it was a voter, from its own snapshot and committed log), re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council. The cost is honest: anything written after the last backup is lost. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, so a minority side simply has no quorum. Nodes on the minority side operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
 
 > **Design note (fully-automatic recovery).** The original design called for *pre-seeded* recovery candidates chosen for zone diversity, gossiped as an encrypted list, so the highest-priority survivor could assume leadership with no operator in the loop. That remains an architecture proposal, not shipped behaviour: the operator-triggered restore above is what the binary does today (`relish council recover`, [design/gossip-mustard.md](design/gossip-mustard.md)). We chose to ship the operator-in-the-loop path first because full-council loss is the one failure where discarding history is unavoidable, and a human confirming *which* backup to restore is cheaper than getting an automated tie-break wrong.
 
@@ -649,7 +649,7 @@ auto_rollback = true       # revert on health check failure
 
 Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the new leader resumes the rolling update from the last committed step after the learning period. If you submit a new deploy while a rollout is in progress, it supersedes the in-progress rollout: in-flight instances are drained and replaced with the newest version directly, skipping the intermediate target.
 
-**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start.
+**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start. The target app must be in the same apply and namespace. Cluster apply records ownership before execution and publishes dependent app revisions only after positive zero exit and durable confirmation; uncertainty or leader replacement retains the fence. Recurring schedules are supported on standalone nodes and are refused by cluster apply.
 
 > For the deploy state machine, connection draining protocol, and autoscaling, see [design/deployments.md](design/deployments.md).
 
@@ -660,6 +660,10 @@ Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the n
 ### 14.1 Built-In Sync Engine (Lettuce)
 
 Lettuce is Reliaburger's built-in GitOps engine, replacing ArgoCD and Flux with a sync loop compiled directly into the Bun binary.
+
+CLI compilation and Lettuce share the resolver for inherited `_defaults.toml` values and directory-derived namespaces. Lettuce resolves the configured watch directory from the verified Git commit; defaults outside that directory are not inherited. Malformed input or an unrepresentable namespace collision refuses the whole sync before desired-state changes. GitOps refuses duplicate resource definitions, while CLI compilation reports deterministic overrides within a namespace.
+
+Lettuce reconciles apps, namespaces and permissions. Any job declaration, including a scheduled job or a `run_before` migration, refuses the entire validated commit before desired-state changes. The failed sync leaves the previous applied SHA intact. Execute migration jobs and their dependent apps together through `relish apply`, or submit batch work through `relish batch`. GitOps job execution awaits a durable revision-to-run identity and dispatch path.
 
 **Configuration:**
 
@@ -875,7 +879,7 @@ Brioche provides a franchise overview page: all peered clusters, their health st
 
 ### 21.4 Cross-Cluster Image Pull and GitOps
 
-Peered clusters can pull images from one another's Pickle registries on demand (lazy, not eagerly replicated) using the existing OCI Distribution API over the trust relationship. For GitOps, Lettuce supports shared repositories with per-cluster directories: a `_defaults.toml` provides shared configuration, and per-cluster directories override as needed. Each cluster's Lettuce independently syncs its own directory.
+Peered clusters can pull images from one another's Pickle registries on demand (lazy, not eagerly replicated) using the existing OCI Distribution API over the trust relationship. For GitOps, Lettuce supports shared repositories with per-cluster watch directories. A `_defaults.toml` inside the watched tree provides shared values, and child directories can override them. Each cluster independently resolves its watched tree; defaults outside its watch root are not inherited.
 
 ### 21.5 Trust Model
 
@@ -1047,7 +1051,7 @@ Three layers of mitigation. First, Reliaburger recommends managed databases for 
 
 ### Q10: Will TOML configuration get unwieldy at 50+ apps?
 
-Reliaburger supports directory-mode configuration where each app lives in its own file, merged at deploy time. A `_defaults.toml` file provides shared values (common env vars, memory limits, deploy strategy) inherited by all apps unless overridden. `relish fmt` formats files; `relish lint` validates configuration and catches common errors. The GitOps engine (Lettuce) works with directory trees natively.
+Reliaburger supports directory-mode configuration where each app lives in its own file, merged at deploy time. A `_defaults.toml` file provides shared values (common env vars, memory limits, deploy strategy) inherited by all apps unless overridden. `relish fmt` formats files; `relish lint` validates configuration and catches common errors. The GitOps engine (Lettuce) uses the same tree resolver for defaults and directory namespaces, with its configured watch directory as the root. It refuses malformed or ambiguous trees before applying changes.
 
 ### Q11: Doesn't the eBPF approach require a modern kernel? What about older systems?
 

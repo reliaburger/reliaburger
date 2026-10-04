@@ -1,0 +1,22 @@
+    Blocking waiting for file lock on build directory
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (bin "relish") generated 1 warning
+warning: `reliaburger` (bin "bun") generated 1 warning (1 duplicate)
+   Compiling reliaburger v0.1.4 (/Users/miko/github/reliaburger)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 21s
+     Running tests/audit_cli_gitops_repro.rs (target/debug/deps/audit_cli_gitops_repro-a69f3d50f8c245b9)
+
+running 7 tests
+test dry_run_reports_replica_port_env_changes_unchanged ... ok
+test cli_validation_rejects_permissions_for_an_existing_cluster_namespace ... ok
+test shared_defaults_drop_env_memory_and_deploy_settings ... ok
+test directory_compile_returns_success_after_dropping_an_invalid_workload_file ... ok
+test same_named_apps_in_distinct_namespaces_are_silently_lost ... ok
+test gitops_successfully_ignores_jobs_including_migration_gates ... ok
+test gitops_cannot_read_the_documented_defaults_directory ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+

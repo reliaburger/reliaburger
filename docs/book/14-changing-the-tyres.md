@@ -466,7 +466,13 @@ Three Rust-meets-Unix notes. `CString` is the NUL-terminated string C expects �
 
 What about all the open sockets, the redb database, the log files? This is where a decision Rust's std made years ago quietly pays off: every file descriptor Rust opens is `O_CLOEXEC` — closed atomically by the kernel *during* exec. No shutdown code runs (there's no code left to run), yet the listener port is free for the new process to bind, and redb's file locks (which live on the fds) evaporate with them. The new binary just... boots, like any boot. There's a sub-second blip where the API answers nothing; gossip shrugs it off (the incarnation number bumps on restart, existing behaviour).
 
-One genuinely awkward wrinkle: the upgrade arrives over HTTP, and the response must escape the process before exec destroys the socket. The agent replies `202 Accepted` after `prepare` succeeds, then sleeps 200ms before `execute`. Yes, a sleep. The alternatives (hooking response-flush completion through axum's internals) buy precision nobody needs — the caller polls `/v1/version` to observe the outcome anyway, so a lost response is survivable; the sleep just makes it rare.
+One genuinely awkward wrinkle: the upgrade arrives over HTTP, and the response must escape the process before exec destroys the socket. The agent replies `202 Accepted` after `prepare` succeeds, then waits for that reply to leave before `execute`.
+
+The first version slept 200 ms instead. Yes, a sleep. We argued that hooking response-flush completion through axum's internals bought precision nobody needed, since the caller polls `/v1/version` anyway. Then a three-node test on a busy CI runner got `AgentUnreachable` from a node that upgraded perfectly well (#526). The handler hadn't been scheduled to write its answer within 200 ms, so exec closed the socket first. The orchestrator shrugs that off and re-sends, but `relish upgrade apply` told the operator the agent was unreachable while the node swapped itself out underneath them.
+
+The fix turned out to need no axum internals at all. Our own connection loop (`serve_http_connection`, in `src/sesame/connection.rs`) already owns the Hyper connection future, and that future only finishes once every answer on the connection is written and the socket is closed. So it hands each request a `ConnectionClosed` extension, a `CancellationToken` cancelled by a drop guard (a local whose `Drop` cancels the token, so it fires however the function returns, early exits included). The upgrade handlers answer with `Connection: close`, which makes Hyper close the connection straight after the 202, and pass the extension to the agent inside the `UpgradeApply` command. The agent waits on it, bounded at two seconds so a client that stops reading can't keep the node on the old version, and only then execs. `an_upgrade_execs_only_after_its_answer_is_delivered` holds the "delivered" signal back and checks that the marker is still `Staged` well past the old 200 ms.
+
+The sleep turned out to have been hiding a second bug. A leader rolling the cluster back directs itself last, and it records "directive sent" only after the send returns (§14.9 explains why it sends first). With the 200 ms pause, that Raft write usually beat the exec. Without it, the leader exec'd straight after its answer left, its successor process found the node still `Pending` and sent the rollback again, and the node refused: a rollback marker was already verifying. Upgrades never hit this, because a re-delivered upgrade with the same `upgrade_id` was already a polite no-op. Rollbacks now get the same treatment: a rollback to the version the in-flight marker is rolling back to answers `Ok(None)`, and a re-delivery that starts nothing clears the drain flag rather than leaving the node refusing work.
 
 ### Draining, verifying, committing
 
@@ -585,7 +591,7 @@ A refusal is only as good as its first line. The 0.1.0 version said `invalid or 
 So every refusal now leads with the pair, then the remedy, then a link to the policy:
 
 ```text
-incompatible state format: found 47; this binary (reliaburger v0.1.4 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
+incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
 ```
 
 A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
@@ -605,7 +611,7 @@ Two bits of `thiserror` syntax are new here. `{found}` names a field of the vari
 
 `this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.3 (465fdeb)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
 
-The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 33, state 49; this binary (...) needs protocol 34, state 49`.
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 34, state 49; this binary (...) needs protocol 40, state 57`.
 
 The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
 
@@ -1407,7 +1413,7 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49` (a 0.1.3 cluster offered 0.1.4), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49` (a 0.1.4 cluster offered 0.1.5), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 

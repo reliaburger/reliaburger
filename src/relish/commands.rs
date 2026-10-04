@@ -42,7 +42,7 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
         eprint!("{report}");
         eprintln!();
     }
-    loaded.config.validate()?;
+    loaded.config.validate_intrinsic()?;
     Ok(loaded.config)
 }
 
@@ -86,7 +86,7 @@ async fn apply_with_client(
         // updates and unchanged resources render as such instead of every
         // resource claiming to be a create. No agent → the all-create plan.
         let current = match client.health().await {
-            Ok(()) => client.current_resources().await.ok(),
+            Ok(()) => Some(client.current_resources().await?),
             Err(_) => None,
         };
         let plan = generate_plan(&config, current.as_deref());
@@ -969,8 +969,9 @@ fn print_standalone_council(
 /// Recover a cluster whose entire council was lost (12b.2 D21/CP12).
 ///
 /// Offline by design: run it against a STOPPED node. It restores the desired
-/// state (from a sealed backup or the node's own durable snapshot), wipes the
-/// dead cluster's Raft log, and stamps a fresh recovery epoch. The next start
+/// state (from a sealed backup or the node's own snapshot and committed
+/// log), retires the dead cluster's Raft log, and stamps a fresh recovery
+/// epoch. The next start
 /// re-bootstraps a single-voter council the reconciler regrows.
 pub async fn council_recover(
     data_dir: &std::path::Path,
@@ -1001,18 +1002,21 @@ pub async fn council_recover(
         );
     }
 
-    // Load the master key when a sealed backup is the source.
-    let master_key = if from.is_some() {
-        let path = master_key_path
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("/etc/reliaburger/master.key"));
-        Some(
-            crate::sesame::bootstrap::load_master_key(&path)
-                .map_err(|e| RelishError::Recovery(format!("load master key: {e}")))?,
-        )
-    } else {
-        None
+    // A sealed backup always needs the master key. The node's own Raft log
+    // needs it when the cluster encrypts the log, so use one given, or the
+    // default one if it exists; a keyless cluster has none.
+    let default_key = std::path::Path::new("/etc/reliaburger/master.key");
+    let key_path = match master_key_path {
+        Some(path) => Some(path),
+        None if from.is_some() || default_key.exists() => Some(default_key),
+        None => None,
     };
+    let master_key = key_path
+        .map(|path| {
+            crate::sesame::bootstrap::load_master_key(path)
+                .map_err(|e| RelishError::Recovery(format!("load master key: {e}")))
+        })
+        .transpose()?;
 
     let source = match from {
         Some(url) => RecoverySource::BackupUrl(url.to_string()),
@@ -1023,12 +1027,14 @@ pub async fn council_recover(
         .await
         .map_err(|e| RelishError::Recovery(e.to_string()))?;
     let app_count = state.apps.len();
+    let token_count = state.security_state.api_tokens.len();
     let prior_epoch = state.recovery_epoch;
 
     recover_data_dir(data_dir, state).map_err(|e| RelishError::Recovery(e.to_string()))?;
 
     println!("Council recovery complete.");
     println!("  Restored apps:   {app_count}");
+    println!("  API tokens:      {token_count}");
     println!("  Recovery epoch:  {} -> {}", prior_epoch, prior_epoch + 1);
     println!("  Data directory:  {}", data_dir.display());
     println!();
@@ -1151,7 +1157,7 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
 /// otherwise an unreachable agent is an error (X5).
 pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
-    config.validate()?;
+    config.validate_intrinsic()?;
 
     let client = BunClient::default_local();
 
@@ -1159,7 +1165,7 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
         // Same live diff as `apply --dry-run`: a reachable agent supplies
         // current state so the plan shows updates, not universal creates.
         let current = match client.health().await {
-            Ok(()) => client.current_resources().await.ok(),
+            Ok(()) => Some(client.current_resources().await?),
             Err(_) => None,
         };
         let plan = generate_plan(&config, current.as_deref());
@@ -2286,27 +2292,47 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// List API tokens from SecurityState via the agent.
-pub async fn token_list() -> Result<(), RelishError> {
-    let tokens = BunClient::default_local().token_list().await?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    print!("{}", render_token_list(&tokens, now));
+/// List API tokens via the agent, with every node's last use merged in.
+pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
+    let listing = BunClient::default_local().token_list().await?;
+    // A member that didn't answer may hold a more recent use; say so on
+    // stderr so `-o json` stays parseable.
+    for warning in &listing.warnings {
+        eprintln!("warning: last use incomplete: {warning}");
+    }
+    match output {
+        OutputFormat::Human => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            print!("{}", render_token_list(&listing.tokens, now));
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&listing).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&listing).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
     Ok(())
 }
 
 /// The `relish token list` table: UTC creation and expiry times, with how
-/// long a live token has left.
+/// long a live token has left, when it was last used and its scope.
+///
+/// New columns go on the right, so a script that cuts the older ones out
+/// by position keeps working.
 fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String {
     use std::fmt::Write as _;
     if tokens.is_empty() {
         return "no tokens\n".to_string();
     }
     let mut out = format!(
-        "{:<20} {:<12} {:<21} {}\n",
-        "NAME", "ROLE", "CREATED", "EXPIRES"
+        "{:<20} {:<12} {:<21} {:<31} {:<21} {}\n",
+        "NAME", "ROLE", "CREATED", "EXPIRES", "LAST USED", "SCOPE"
     );
     for token in tokens {
         let expires = match token.expires_at {
@@ -2314,17 +2340,39 @@ fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String
             Some(at) if at <= now => format!("{} (expired)", format_utc(at)),
             Some(at) => format!("{} (in {})", format_utc(at), format_duration(at - now)),
         };
+        let last_used = token
+            .last_used
+            .map_or_else(|| "never".to_string(), format_utc);
         // Writing to a String can't fail.
         let _ = writeln!(
             out,
-            "{:<20} {:<12} {:<21} {}",
+            "{:<20} {:<12} {:<21} {:<31} {:<21} {}",
             token.name,
             token.role,
             format_utc(token.created_at),
-            expires
+            expires,
+            last_used,
+            render_token_scope(&token.scope),
         );
     }
     out
+}
+
+/// A token's scope for the table: `all`, or the apps and namespaces it's
+/// confined to.
+fn render_token_scope(scope: &super::client::TokenScopeSummary) -> String {
+    let mut parts = Vec::new();
+    if let Some(apps) = &scope.apps {
+        parts.push(format!("apps={}", apps.join(",")));
+    }
+    if let Some(namespaces) = &scope.namespaces {
+        parts.push(format!("namespaces={}", namespaces.join(",")));
+    }
+    if parts.is_empty() {
+        "all".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
@@ -2621,6 +2669,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_loading_defers_namespace_existence_to_live_admission() {
+        for manifest in [
+            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+        ] {
+            let file = write_temp_config(manifest);
+            let loaded = load_manifest(&source(file.path())).await;
+            assert!(
+                loaded.is_ok(),
+                "a live-context reference was rejected locally: {loaded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_loading_defers_build_namespace_existence_to_live_admission() {
+        let file = write_temp_config(
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+        );
+        let loaded = load_manifest(&source(file.path())).await;
+        assert!(
+            loaded.is_ok(),
+            "an existing live build namespace was rejected locally: {loaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intrinsic_manifest_validation_still_refuses_invalid_fields() {
+        for manifest in [
+            "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
+            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
+            "[app.web]\nnamespace = 'existing'\n",
+        ] {
+            let file = write_temp_config(manifest);
+            assert!(
+                load_manifest(&source(file.path())).await.is_err(),
+                "accepted {manifest}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_dry_run_refuses_a_failed_live_comparison() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+            )
+            .route(
+                "/v1/apps",
+                axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        client
+            .health()
+            .await
+            .expect("fixture must be a live bun response");
+        let file = write_temp_config("[app.web]\nimage = 'web:v1'\n");
+        let result =
+            apply_with_client(&source(file.path()), OutputFormat::Json, true, &client).await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "a failed live comparison became an offline create plan"
+        );
+    }
+
+    #[tokio::test]
     async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token");
@@ -2706,43 +2828,70 @@ mod tests {
     }
 
     #[test]
-    fn token_list_renders_human_times_and_expiry() {
-        use super::super::client::TokenSummary;
+    fn token_list_renders_human_times_expiry_last_use_and_scope() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
         // 2026-09-25 12:00:00 UTC.
         let now = 1_790_337_600;
         let tokens = vec![
             TokenSummary {
                 name: "ci-bot".to_string(),
                 role: "deployer".to_string(),
+                scope: TokenScopeSummary {
+                    apps: None,
+                    namespaces: Some(vec!["shop".to_string()]),
+                },
                 created_at: now - 86_400,
                 expires_at: Some(now + 30 * 86_400),
+                last_used: Some(now - 600),
             },
             TokenSummary {
                 name: "admin".to_string(),
                 role: "admin".to_string(),
+                scope: TokenScopeSummary::default(),
                 created_at: now - 3 * 86_400,
                 expires_at: None,
+                last_used: Some(now),
             },
             TokenSummary {
                 name: "old-reader".to_string(),
                 role: "read-only".to_string(),
+                scope: TokenScopeSummary {
+                    apps: Some(vec!["web".to_string(), "api".to_string()]),
+                    namespaces: Some(vec!["shop".to_string()]),
+                },
                 created_at: now - 90 * 86_400,
                 expires_at: Some(now - 3_600),
+                last_used: None,
             },
             TokenSummary {
                 name: "short".to_string(),
                 role: "read-only".to_string(),
+                scope: TokenScopeSummary::default(),
                 created_at: now,
                 expires_at: Some(now + 5_400),
+                last_used: None,
             },
         ];
         insta::assert_snapshot!(render_token_list(&tokens, now), @r"
-        NAME                 ROLE         CREATED               EXPIRES
-        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)
-        admin                admin        2026-09-22 12:00 UTC  never
-        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)
-        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)
+        NAME                 ROLE         CREATED               EXPIRES                         LAST USED             SCOPE
+        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)   2026-09-25 11:50 UTC  namespaces=shop
+        admin                admin        2026-09-22 12:00 UTC  never                           2026-09-25 12:00 UTC  all
+        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)  never                 apps=web,api namespaces=shop
+        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)    never                 all
         ");
+    }
+
+    /// An older agent's answer has no scope or last use; it still parses,
+    /// as unscoped and never used.
+    #[test]
+    fn token_listing_parses_an_answer_without_scope_or_last_use() {
+        let listing: super::super::client::TokenListing = serde_json::from_str(
+            r#"{"tokens":[{"name":"a","role":"admin","created_at":1,"expires_at":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listing.tokens[0].last_used, None);
+        assert_eq!(listing.tokens[0].scope, Default::default());
+        assert!(listing.warnings.is_empty());
     }
 
     #[test]
@@ -3021,6 +3170,7 @@ spec:
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            volume_homes: Vec::new(),
         }
     }
 

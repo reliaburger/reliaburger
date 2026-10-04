@@ -258,7 +258,7 @@ impl DurableLogStore {
 
     /// Directly persist entries. Shared by `append` and used by tests (openraft's
     /// `LogFlushed` callback is `pub(crate)`, so tests exercise this instead).
-    fn write_entries(
+    pub(crate) fn write_entries(
         &self,
         entries: impl IntoIterator<Item = Entry<TypeConfig>>,
     ) -> Result<(), StorageError<u64>> {

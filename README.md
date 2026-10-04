@@ -159,7 +159,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 - `relish token`: Manage API tokens
   - `relish token create --name <NAME>`: Create a new API token
-  - `relish token list`: List all API tokens
+  - `relish token list`: List all API tokens with their scope, expiry and last use
   - `relish token revoke <NAME>`: Revoke an API token by name
 - `relish secret`: Manage secrets (encrypt values for use in app configs)
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
@@ -264,6 +264,12 @@ it would take out every replica or put the council's quorum at risk.
 blue-green switches, autoscaling on metrics, jobs, cron and batch. Point the
 cluster at a Git repository and the leader keeps it in sync, verifying commit
 signatures if you ask it to.
+
+Batch jobs retain distinct execution identities and their original scoped
+labels across retries and recovery. Finite durable history keeps replay fences;
+see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and batches share
+committed capacity reservations across leader changes. Clustered admission
+requires current, unexpired reports and refuses new work on retired nodes.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary

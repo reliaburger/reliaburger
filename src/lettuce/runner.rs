@@ -49,6 +49,8 @@ pub fn spawn_gitops_sync(
         let repo_dir = data_dir.join("gitops-repo");
         let poll = Duration::from_secs(config.poll_interval_secs.max(1));
         let mut ticker = tokio::time::interval(poll);
+        let mut triggers = council.gitops_trigger_updates();
+        let mut leadership = council.metrics();
 
         // Tracked locally so a run of failures backs off (GIT4): the delay
         // is `poll * 2^failures`, capped, and is also mirrored into the
@@ -56,9 +58,11 @@ pub fn spawn_gitops_sync(
         let mut consecutive_failures: u32 = 0;
 
         loop {
-            tokio::select! {
+            let durable_wake = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => false,
+                change = triggers.changed() => { if change.is_err() { break } true },
+                change = leadership.changed() => { if change.is_err() { break } true },
                 signal = webhook_rx.recv() => {
                     if signal.is_none() {
                         break; // sender dropped
@@ -66,14 +70,23 @@ pub fn spawn_gitops_sync(
                     // Drain any queued webhook signals so a burst
                     // collapses into a single sync.
                     while webhook_rx.try_recv().is_ok() {}
+                    false
                 }
-            }
+            };
 
             if !council.is_leader().await {
                 continue;
             }
 
             let desired = council.desired_state().await;
+            if durable_wake
+                && !desired
+                    .gitops_sync_state
+                    .as_ref()
+                    .is_some_and(|sync| sync.requested_generation > sync.completed_generation)
+            {
+                continue;
+            }
             let current_apps = desired.apps.clone();
             let current_namespaces = desired.namespaces.clone();
             let current_permissions = desired.permissions.clone();
@@ -155,7 +168,17 @@ pub fn spawn_gitops_sync(
 
             // Hard failures: nothing to apply.
             match &outcome.result {
-                SyncResult::Skipped { .. } => continue,
+                SyncResult::Skipped { .. } => {
+                    let mut state = desired.gitops_sync_state.clone().unwrap_or_default();
+                    state.completed_generation = state.requested_generation;
+                    if let Err(error) = council
+                        .write(RaftRequest::GitOpsSyncUpdate(Box::new(state)))
+                        .await
+                    {
+                        eprintln!("gitops: could not acknowledge unchanged sync: {error}");
+                    }
+                    continue;
+                }
                 SyncResult::Failure { error } => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     record_failure(
@@ -173,10 +196,9 @@ pub fn spawn_gitops_sync(
             }
 
             // Apply each change through the SAME desired-state writes a
-            // manual `relish apply` makes (12b.2 T6). Every kind now maps
-            // to a request — apps, namespaces, permissions — so nothing is
-            // silently skipped the way a `None` used to drop jobs and
-            // namespaces on the floor.
+            // manual `relish apply` makes (12b.2 T6). Every supported kind
+            // maps to a request: apps, namespaces and permissions. Trees
+            // containing jobs were explicitly refused by `execute_sync`.
             //
             // Atomicity (D12): `last_applied_commit` advances only if
             // EVERY write in the sync succeeds. The old code advanced the
@@ -243,10 +265,11 @@ pub fn spawn_gitops_sync(
 
 /// Whether the recorded sync state has no error left to clear.
 fn sync_state_is_clean(desired: &DesiredState) -> bool {
-    desired
-        .gitops_sync_state
-        .as_ref()
-        .is_some_and(|state| state.last_error.is_none() && state.consecutive_failures == 0)
+    desired.gitops_sync_state.as_ref().is_some_and(|state| {
+        state.last_error.is_none()
+            && state.consecutive_failures == 0
+            && state.requested_generation == state.completed_generation
+    })
 }
 
 /// Sleep for the back-off delay, waking early on shutdown.
@@ -330,6 +353,7 @@ async fn record_success(
     };
     let now = now_millis();
     let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
+    sync_state.completed_generation = sync_state.requested_generation;
     sync_state.last_applied_commit = Some(commit.clone());
     sync_state.last_fetched_commit = Some(commit.clone());
     sync_state.phase = SyncPhase::Idle;
@@ -661,5 +685,23 @@ mod tests {
             })
             .is_none()
         );
+    }
+    #[test]
+    fn an_unchanged_commit_still_records_completion_of_a_pending_generation() {
+        let mut desired = DesiredState {
+            gitops_sync_state: Some(SyncState {
+                requested_generation: 1,
+                completed_generation: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!sync_state_is_clean(&desired));
+        desired
+            .gitops_sync_state
+            .as_mut()
+            .unwrap()
+            .completed_generation = 1;
+        assert!(sync_state_is_clean(&desired));
     }
 }

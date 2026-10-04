@@ -606,10 +606,11 @@ enum CouncilCommand {
     /// Recover a cluster whose entire council was lost.
     ///
     /// Run this against a STOPPED surviving node. It restores the desired
-    /// state from a sealed backup (or this node's own durable snapshot),
-    /// wipes the dead cluster's Raft log, and stamps a fresh recovery epoch.
-    /// Starting the node afterwards re-bootstraps a single-voter council that
-    /// the reconciler regrows. Writes made after the last backup are lost.
+    /// state from a sealed backup (or, on a former voter, from its own
+    /// snapshot and committed Raft log), moves the dead cluster's Raft
+    /// directory aside, and stamps a fresh recovery epoch. Starting the node
+    /// afterwards re-bootstraps a single-voter council that the reconciler
+    /// regrows. Writes made after the restored state are lost.
     Recover {
         /// The node's data directory (`[storage] data`), whose `raft/`
         /// subdirectory is recovered in place.
@@ -617,11 +618,12 @@ enum CouncilCommand {
         data_dir: std::path::PathBuf,
         /// Restore from a sealed backup at this object-store URL
         /// (`file://`, `s3://`, `gs://`). Omit to restore from the node's own
-        /// durable snapshot under `data_dir`.
+        /// snapshot and committed Raft log under `data_dir`.
         #[arg(long)]
         from: Option<String>,
         /// Path to the cluster master key file (32-byte hex), needed to
-        /// unseal a backup. Defaults to `/etc/reliaburger/master.key`.
+        /// unseal a backup or read an encrypted Raft log. Defaults to
+        /// `/etc/reliaburger/master.key`.
         #[arg(long)]
         master_key: Option<std::path::PathBuf>,
         /// Skip the "is a council still alive?" safety check. Only pass this
@@ -734,7 +736,7 @@ enum TokenAction {
         #[arg(long)]
         ttl_days: Option<u64>,
     },
-    /// List all API tokens.
+    /// List all API tokens with their scope, expiry and last use.
     List,
     /// Revoke an API token by name.
     Revoke {
@@ -1655,7 +1657,7 @@ async fn main() -> ExitCode {
                 )
                 .await
             }
-            TokenAction::List => commands::token_list().await,
+            TokenAction::List => commands::token_list(cli.output).await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
         },
         Command::JoinToken { action } => match &action {

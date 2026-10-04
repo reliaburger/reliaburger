@@ -450,6 +450,31 @@ The same review caught an identity bug. A multi-volume snapshot deliberately giv
 
 And one line of config validation: `retain = 0` with a schedule set is now refused at startup. At the time each sweep pruned before it uploaded, so retaining nothing deleted every snapshot the moment it was taken.
 
+### Which node's copy?
+
+An external test of 0.1.2 on three EC2 nodes found the next hole, and it had nothing to do with paths. `volapp` ran on node-03. The tester sent `relish snapshot create volapp` to each node's API in turn, and all three said yes. Only node-03's snapshot held the live data. Node-01 and node-02 had snapshotted stale copies of the volume, left behind when the app had moved earlier (#423), and each node's `list` showed only its own. A node with no copy at all answered "not a managed volume". So a "before-upgrade" snapshot could quietly miss the data it was meant to protect.
+
+The cause was one line in each of the four handlers: `ask_agent(...)`, straight to the local agent. The agent resolves the volume from its own disk inventory, and any node with a leftover directory passes that check. The disk can't tell a live volume from an orphan. The council can, because since #423 it records where every managed-volume app lives: its placements, or for a stopped app, the nodes it last ran on (`last_placed_nodes`), so it can go back to its data.
+
+So the handlers now ask the council first. `volume_homes` in `cluster/orchestrate.rs` turns that record into a list of nodes, less any decommissioned one, and it rides along in the desired-app evidence every node can already read (a non-leader forwards that read to the leader). Then a small pure function picks the route:
+
+```rust
+pub(super) fn snapshot_route(self_name: &str, homes: &[String]) -> SnapshotRoute {
+    match homes {
+        [] => SnapshotRoute::Here,
+        _ if homes.iter().any(|home| home == self_name) => SnapshotRoute::Here,
+        [home] => SnapshotRoute::Forward(home.clone()),
+        _ => SnapshotRoute::Ambiguous(homes.to_vec()),
+    }
+}
+```
+
+That `match` uses *slice patterns*, which C and Go don't have. `[]` matches an empty slice, `[home]` matches a slice of exactly one element and binds it, and `_ if ...` is a pattern with a guard: it matches anything, but only when the condition holds. Arms are tried in order, so the guard sees every non-empty list before `[home]` does. No volume home on record (a standalone node, an app the council doesn't know) means answer here, as before. A node that holds one of the copies answers for its own replica. One other home means forward. Several other homes means there's no single right copy, so the request is refused with a 409 that names them.
+
+Forwarding works like the fault routes from Chapter 8. The request goes on with the caller's own `Authorization` header, so the volume's node repeats every role and scope check, plus an `x-reliaburger-snapshot-forwarded` header. A request carrying that header is always answered where it lands, which means two nodes that briefly disagree about where a volume lives can't bounce it between them forever.
+
+The test is the issue's reproduction on a fake three-node cluster in `cluster_routing_tests.rs`: real routers on loopback, a scripted agent per node, `db`'s volume on node-2. It runs create, list, restore and delete through node-1 and node-3 and checks that only node-2's agent saw them, and that the listing came back with node-2's snapshots. Before the fix, node-1 listed its own.
+
 ### Owning the volume, surviving the crash
 
 The same review had four more findings about snapshots, and they share a theme: each check was right at the moment it ran and wrong a moment later.
@@ -482,9 +507,13 @@ Then the receipt. Remember the `uploaded: bool` that served three masters? It se
 
 The flag became a list of receipts, one per destination: the destination's URL (minus credentials, so rotating keys isn't a new destination), the archive and manifest keys, the digest, the size and when it completed. "Needs exporting" now means "no receipt for *this* destination". The sweep uploads first and prunes second, and `prune_plan` holds back anything the current destination hasn't confirmed. We looked at letting disk pressure override that and decided against it for now: silently deleting unexported backups is exactly the bug we were fixing. Held snapshots are counted in the sweep's report and logged instead, so a long outage shows up as a growing number rather than a surprise. This mirrors what Ketchup's log export already did with its acknowledgements (Chapter 6).
 
-Last, memory. The uploader built the whole `.tar.gz` in a `Vec<u8>` before calling `put`. `spawn_blocking` kept the compression off the async threads, but a 50 GiB volume of already-compressed data would still have wanted 50 GiB inside Bun. The archive now streams to a spool file in `.snapshot-spool` on the volumes filesystem, through a small writer that hashes and counts the bytes as they pass. That writer is also where the limits live: it returns an error once the archive would take the filesystem below 5% free, once the stage's deadline passes, or once Bun starts shutting down. The upload then reads the spool back one 8 MiB part at a time through `object_store`'s multipart API, so one part is all it ever holds. The whole upload has a deadline (`upload_timeout_secs`), and a cancelled or timed-out upload is aborted, so S3 doesn't keep the orphaned parts. `NamedTempFile` deletes the spool file when it's dropped, success or failure.
+Last, memory. The uploader built the whole `.tar.gz` in a `Vec<u8>` before calling `put`. `spawn_blocking` kept the compression off the async threads, but a 50 GiB volume of already-compressed data would still have wanted 50 GiB inside Bun. The archive now streams to a spool file in `.snapshot-spool` on the volumes filesystem, through a small writer that hashes and counts the bytes as they pass. That writer is also where the limits live: it returns an error once the archive would cut into the filesystem's reserve (5% of its size, at most 10 GiB), once the stage's deadline passes, or once Bun starts shutting down. The upload then reads the spool back one 8 MiB part at a time through `object_store`'s multipart API, so one part is all it ever holds. The whole upload has a deadline (`upload_timeout_secs`), and a cancelled or timed-out upload is aborted, so S3 doesn't keep the orphaned parts. `NamedTempFile` deletes the spool file when it's dropped, success or failure.
 
 Testing this without gigabytes of fixtures means measuring the right thing. The large-archive test uploads 3 MiB of incompressible bytes with a 256 KiB part size and asserts the uploader never held a part bigger than that. A stalled destination is `object_store`'s own `ThrottledStore` with an hour-long delay per write: the sweep must give up within its deadline, write no receipt, and ship on the next sweep. Cancellation and a full spool get the same treatment.
+
+The quota itself hid a test that depended on the machine running it. At first the writer's limit came straight from `statvfs` on the real spool directory, and the reserve was a flat 5% of the filesystem. On a developer's 926 GiB laptop disk with 35 GiB free, 5% is 46 GiB, so the quota came out as zero and eight upload tests failed with "0 byte spool quota" while CI, on roomier disks, stayed green (issue #524). Two things were wrong. The tests read the host, so their outcome depended on whoever ran them. And the rule was too strict on large disks: refusing to spool 1 GiB when 35 GiB are free protects nothing.
+
+The fix splits the reading from the rule. `spool_quota` is now a pure function of a `DiskSpace { available, total }`, so its edge cases are plain unit tests with no filesystem at all. The reserve is 5% or 10 GiB, whichever is smaller: a small disk keeps its 5%, and a big one keeps 10 GiB, which is plenty of headroom for logs and metadata on the volumes filesystem. The reading comes from a field on the uploader, `spool_space: fn(&Path) -> Result<DiskSpace, String>`, a plain function pointer like the ones in Chapter 1. `from_url` sets it to `host_disk_space`, which calls `statvfs`; the test helpers set it to a fixture that reports a roomy disk. A function pointer suits this better than a trait: there are only two kinds of reading, neither needs state, and `fn` is `Copy` and `Send`, so it moves into the `spawn_blocking` closure without an `Arc`. A new test runs the same export against a fixture disk with nothing free, where it fails with "0 byte spool quota", and then against the roomy one, where it succeeds. Whatever the host disk holds, the tests see only the fixture.
 
 One smaller fix rode along. Snapshot directories were named by flattening the mount path, `/var/lib` to `var-lib`, so `/a/b` and `/a-b` both became `a-b` and an app with both volumes mixed their snapshots. The slug now escapes only `%` and `/` (percent-encoding style), which is reversible, so two paths can never share one. And `list` stopped quietly skipping what it couldn't read. A truncated `meta.json` or an unreadable directory is now an error, so "no snapshots" and "couldn't read the snapshots" no longer look alike.
 

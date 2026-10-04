@@ -355,6 +355,9 @@ pub async fn start(
     // the recovered council must never start a council of its own.
     let snapshot_epoch = state_machine.desired_state().await.recovery_epoch;
     let recovered_bootstrap = state_machine.recovered_bootstrap_pending().await;
+    let restored_security = state_machine
+        .read_desired(|state| state.security_state.is_initialised())
+        .await;
     let bootstrapping = store_fresh && (params.seeds.is_empty() || recovered_bootstrap);
 
     // The recovery fence (C5, #424): this node's epoch claim, stamped on
@@ -468,12 +471,16 @@ pub async fn start(
     if bootstrapping {
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
-        initialise_bootstrap(
-            &council,
-            members,
-            params.bootstrap_security_state.as_deref(),
-        )
-        .await?;
+        // A recovered snapshot already holds the cluster's security state,
+        // tokens included; the bootstrap file is only the init-time copy, so
+        // seeding it would roll the restored state back (#477). The state
+        // machine refuses that too; this just doesn't ask.
+        let bootstrap_security = if restored_security {
+            None
+        } else {
+            params.bootstrap_security_state.as_deref()
+        };
+        initialise_bootstrap(&council, members, bootstrap_security).await?;
         if recovered_bootstrap {
             compact_recovered_log(&council).await?;
         }
@@ -725,6 +732,38 @@ fn spawn_supervised(
         }
         None => {
             tokio::spawn(guarded);
+        }
+    }
+}
+
+/// Wait for this node's Raft core to stop before shutdown, and say why.
+///
+/// openraft stops its core for good on a fatal error. A log append that fails
+/// because the disk is full is one (#480), and nothing restarts the core in
+/// process: the node keeps answering its API but never applies another entry,
+/// so the council looks healthy while it's a voter short. Bun watches this and
+/// exits non-zero, so the service manager restarts it and the restarted core
+/// catches up once space is free.
+///
+/// Returns `None` once `shutdown` is cancelled: an orderly stop also stops the
+/// core, and that isn't a failure.
+pub async fn raft_core_stopped(
+    mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    shutdown: CancellationToken,
+) -> Option<String> {
+    loop {
+        let running = metrics_rx.borrow_and_update().running_state.clone();
+        if let Err(fatal) = running {
+            return (!shutdown.is_cancelled()).then(|| fatal.to_string());
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            changed = metrics_rx.changed() => {
+                if changed.is_err() {
+                    // The core's task ended without publishing why (a panic).
+                    return (!shutdown.is_cancelled()).then(|| "Raft core task ended".to_string());
+                }
+            }
         }
     }
 }
@@ -1519,6 +1558,72 @@ mod tests {
         council.shutdown().await.unwrap();
     }
 
+    async fn bootstrapped_council(
+        log_store: crate::council::log_store::MemLogStore,
+    ) -> CouncilNode {
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        let router = InMemoryRaftRouter::new();
+        let council = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            log_store,
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, council.raft().clone()).await;
+        let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
+        initialise_bootstrap(&council, members, None).await.unwrap();
+        council
+    }
+
+    #[tokio::test]
+    async fn raft_core_stopped_reports_a_failed_log_append() {
+        // #480: a full disk fails the append, openraft stops its core, and
+        // the node must find out rather than carry on not applying anything.
+        let log_store = crate::council::log_store::MemLogStore::new();
+        let council = bootstrapped_council(log_store.clone()).await;
+        let shutdown = CancellationToken::new();
+        let watcher = tokio::spawn(raft_core_stopped(
+            council.raft().metrics(),
+            shutdown.clone(),
+        ));
+
+        log_store.fail_appends();
+        let security = crate::sesame::types::SecurityState::default();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            seed_bootstrap_state(&council, &security),
+        )
+        .await;
+
+        let reason = tokio::time::timeout(Duration::from_secs(10), watcher)
+            .await
+            .expect("the watcher noticed the stopped core")
+            .unwrap()
+            .expect("a stop before shutdown is a failure");
+        assert!(reason.to_lowercase().contains("space"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn raft_core_stopped_is_quiet_on_an_orderly_shutdown() {
+        let council = bootstrapped_council(crate::council::log_store::MemLogStore::new()).await;
+        let shutdown = CancellationToken::new();
+        let watcher = tokio::spawn(raft_core_stopped(
+            council.raft().metrics(),
+            shutdown.clone(),
+        ));
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reason, None);
+    }
+
     fn snap(name: &str, port: u16, now: Instant) -> MembershipSnapshot {
         MembershipSnapshot {
             node_id: NodeId::new(name),
@@ -1772,7 +1877,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let init = crate::sesame::init::initialize_cluster("seedidem", "node-1", &dir).unwrap();
 
-        // The apply arm overwrites, so re-seeding leaves one coherent state.
+        // The apply arm refuses a second seed, so re-seeding leaves the
+        // first state in place.
         seed_bootstrap_state(&council, &init.security_state)
             .await
             .unwrap();

@@ -32,7 +32,7 @@ fn instance(root: &Path) -> InstanceId {
 fn spec(root: &Path, script: &str) -> OciSpec {
     let mut spec: OciSpec = serde_json::from_value(serde_json::json!({
         "root": {"path": "/empty-fixture", "readonly": true},
-        "process": {"args": ["/bin/busybox", "sh", "-c", script], "env": ["PATH=/bin"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+        "process": {"args": ["/bin/busybox", "sh", "-c", script], "env": ["PATH=/bin", format!("API_TOKEN={SECRET}")], "cwd": "/", "user": {"uid": 0, "gid": 0}},
         "mounts": [], "linux": {"namespaces": []}
     })).unwrap();
     spec.mounts = reliaburger::grill::oci::standard_mounts();
@@ -64,6 +64,28 @@ async fn wait_file(path: &Path) {
     .unwrap();
 }
 
+/// Stands in for a value decrypted from `ENC[...]`.
+const SECRET: &str = "owned-runc-decrypted-secret";
+
+/// Whether any regular file below `path` contains `needle`.
+fn contains_text(path: &Path, needle: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("{}: {error}", path.display()),
+        // A root filesystem holds only fixture binaries, and could still hold
+        // a kernel mount if cleanup regressed; never read through one.
+        Ok(metadata) if metadata.is_dir() => std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name() != "rootfs")
+            .any(|entry| contains_text(&entry.path(), needle)),
+        Ok(metadata) if metadata.is_file() => {
+            String::from_utf8_lossy(&std::fs::read(path).unwrap()).contains(needle)
+        }
+        Ok(_) => false,
+    }
+}
+
 fn assert_absent(root: &Path, id: &InstanceId) {
     assert!(!root.join("state").join(&id.0).exists());
     // The spec carries decrypted env; it must not outlive the instance.
@@ -74,6 +96,17 @@ fn assert_absent(root: &Path, id: &InstanceId) {
             .join("config.json")
             .exists()
     );
+    // Nor may the retired intent keep it (#476).
+    for path in [
+        root.join("bundles").join(&id.0),
+        root.join("bundles/.intents/records").join(&id.0),
+    ] {
+        assert!(
+            !contains_text(&path, SECRET),
+            "{} kept a decrypted secret",
+            path.display()
+        );
+    }
     assert!(!reliaburger::grill::netns::namespace_path(id).exists());
     assert!(
         !Path::new("/sys/class/net")
@@ -83,7 +116,7 @@ fn assert_absent(root: &Path, id: &InstanceId) {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_preparation_recovers_original_intent_and_retires_without_adoption() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -127,7 +160,7 @@ async fn runc_owned_preparation_recovers_original_intent_and_retires_without_ado
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -154,7 +187,7 @@ async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstructio
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -206,7 +239,7 @@ async fn owned_runc_fixture() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     let root = tempfile::tempdir().unwrap();
@@ -264,7 +297,7 @@ fn quote(path: &Path) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -338,7 +371,7 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -387,7 +420,7 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
 /// bounded chunks. `#[tokio::test]` is single-threaded, so a stalled 1 ms
 /// timer is the runtime being held.
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
     const LINES: u64 = 200_000;
     const LINE: &str = "spam the quick brown fox jumps over";
@@ -454,7 +487,7 @@ async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn generated_cgroup_path_matches_the_actual_container_before_its_first_instruction() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -496,7 +529,7 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -524,7 +557,7 @@ async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -553,7 +586,7 @@ async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() 
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
     let root = tempfile::tempdir().unwrap();
     let app_name = instance(root.path()).0;
@@ -612,7 +645,7 @@ async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
@@ -725,7 +758,7 @@ async fn retained_addresses_survive_exit_and_recovery_until_the_original_referen
 /// intent `retiring`. Every later Bun (restart, SIGKILL, host reboot) refused
 /// to adopt it and exited, so systemd restarted it forever.
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     use reliaburger::grill::runc_intent::NetworkReferenceState;
@@ -810,7 +843,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources() {
     let root = tempfile::tempdir().unwrap();
     let id = instance(root.path());
@@ -1075,13 +1108,13 @@ async fn restart_after_unit_cgroup_stop(retiring: bool) {
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn restart_after_unit_cgroup_stop_recovers_a_running_generation() {
     restart_after_unit_cgroup_stop(false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn restart_after_unit_cgroup_stop_recovers_a_retiring_generation() {
     restart_after_unit_cgroup_stop(true).await;
 }
@@ -1143,4 +1176,558 @@ async fn owned_runc_unit_stop_fixture() {
     }
     std::fs::write(root.join("shared/unit-ready"), "ready").unwrap();
     tokio::time::sleep(Duration::from_secs(600)).await;
+}
+
+#[path = "support/task_harness.rs"]
+mod capacity_task_harness;
+
+mod capacity_contract {
+
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use reliaburger::bun::agent::BunAgent;
+    use reliaburger::bun::api::{self, NodeMembershipInfo};
+    use reliaburger::config::Config;
+    use reliaburger::council::log_store::MemLogStore;
+    use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use reliaburger::council::node::CouncilNode;
+    use reliaburger::council::state_machine::CouncilStateMachine;
+    use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
+    use reliaburger::grill::image::{ClusterFetchFuture, ClusterImageSource, LocalImageBlobs};
+    use reliaburger::grill::runc::RuncGrill;
+    use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceIdentity, PortAllocator};
+    use reliaburger::relish::client::BunClient;
+    use sha2::{Digest, Sha256};
+    use tokio::sync::{RwLock, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    use super::capacity_task_harness::TestTasks;
+    const TEST_SERVICE_TOKEN: &str = "rbrg_test_service_token";
+
+    struct Harness {
+        client: BunClient,
+        _tasks: TestTasks,
+        _capacity_publisher:
+            tokio::sync::watch::Sender<reliaburger::reporting::aggregator::AggregatedState>,
+    }
+
+    impl Harness {
+        async fn start(council: Arc<CouncilNode>, grill: RuncGrill, records: PathBuf) -> Self {
+            let (cmd_tx, cmd_rx) = mpsc::channel(256);
+            let shutdown = CancellationToken::new();
+            let mut agent = BunAgent::new(
+                grill,
+                PortAllocator::new(42000, 43000),
+                cmd_rx,
+                shutdown.clone(),
+            );
+            agent.set_records_dir(records);
+            agent.adopt_recorded_instances().await.unwrap();
+            let volumes = tempfile::tempdir().unwrap();
+            agent.set_volumes_dir(volumes.path().to_path_buf());
+            let deploy_history = agent.deploy_history_handle();
+            let status_reader = agent.status_reader();
+            let agent_task = tokio::spawn(async move {
+                agent.run().await;
+                drop(agent);
+                drop(volumes);
+            });
+
+            let node = reliaburger::meat::NodeId::new("node-1");
+            let aggregated = reliaburger::reporting::aggregator::AggregatedState {
+                leadership_epoch: Some(council.current_term()),
+                receive_deadlines: [(
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )]
+                .into_iter()
+                .collect(),
+                reports: [(
+                    node.clone(),
+                    reliaburger::reporting::types::StateReport {
+                        node_id: node,
+                        timestamp: std::time::SystemTime::UNIX_EPOCH,
+                        running_apps: Vec::new(),
+                        cached_specs: Vec::new(),
+                        resource_usage: reliaburger::reporting::types::ResourceUsage {
+                            cpu_total_millicores: 8000,
+                            memory_total_mb: 16384,
+                            ..Default::default()
+                        },
+                        event_log: Vec::new(),
+                        has_buildah: false,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            };
+            let (capacity_tx, capacity_rx) = tokio::sync::watch::channel(aggregated);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = api::router_with_upgrade(
+                cmd_tx,
+                None,
+                None,
+                Some(deploy_history),
+                None,
+                None,
+                Some(council),
+                None,
+                Some(TEST_SERVICE_TOKEN.to_string()),
+                None,
+                Some(Arc::new(RwLock::new(vec![NodeMembershipInfo {
+                    node_id: reliaburger::meat::NodeId::new("node-1"),
+                    address: "127.0.0.1:9001".parse().unwrap(),
+                    api_advertised: true,
+                }]))),
+                None,
+                None,
+                9117,
+                None,
+                None,
+                Some(capacity_rx),
+                "default".to_string(),
+                Some("node-1".to_string()),
+                reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
+                reliaburger::cluster::ClusterHttp::plaintext(),
+                5050,
+                "http",
+                256 * 1024 * 1024,
+                false,
+                reliaburger::bun::capabilities::StaticCapabilities::default(),
+                reliaburger::bun::readiness::ReadinessTracker::new(),
+                None,
+                None,
+                Some(status_reader),
+            );
+            let server_shutdown = shutdown.clone();
+            let server_task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                    .await
+                    .unwrap();
+            });
+            let tasks = TestTasks::new(shutdown, vec![agent_task, server_task]);
+            let client = BunClient::new(&format!("http://127.0.0.1:{port}"));
+            let mut acknowledged = false;
+            for _ in 0..20 {
+                if client.health().await.is_ok() {
+                    acknowledged = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                acknowledged,
+                "actual owned-capacity API did not acknowledge startup"
+            );
+            Self {
+                client,
+                _tasks: tasks,
+                _capacity_publisher: capacity_tx,
+            }
+        }
+    }
+    fn fast_config() -> CouncilConfig {
+        CouncilConfig {
+            heartbeat_interval_ms: 50,
+            election_timeout_min_ms: 150,
+            election_timeout_max_ms: 400,
+            snapshot_threshold: 100,
+            max_in_snapshot_log_to_keep: 50,
+        }
+    }
+
+    /// A single-node council, initialised so it becomes leader.
+    async fn single_node_leader() -> Arc<CouncilNode> {
+        let router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, router.clone());
+        let node = CouncilNode::new(
+            1,
+            fast_config(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, node.raft().clone()).await;
+        let mut members = BTreeMap::new();
+        members.insert(
+            1u64,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
+        );
+        node.initialize(members).await.unwrap();
+
+        let node = Arc::new(node);
+        for _ in 0..40 {
+            if node.is_leader().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        node
+    }
+
+    /// Hermetic bytes, not a mocked runtime or invented terminal outcome.
+    /// Actual ImageStore validates the config and unpacks the fixture layer;
+    /// actual owned RuncGrill creates/starts/reaps its BusyBox child.
+    struct StaticBusyBoxImage(LocalImageBlobs);
+
+    impl ClusterImageSource for StaticBusyBoxImage {
+        fn fetch_cluster_image<'a>(
+            &'a self,
+            repository: &'a str,
+            tag: &'a str,
+        ) -> ClusterFetchFuture<'a> {
+            Box::pin(async move {
+                if tag == "v1"
+                    && (repository == "owned-capacity" || repository.ends_with("/owned-capacity"))
+                {
+                    Ok(Some(self.0.clone()))
+                } else {
+                    Err("owned-capacity fixture refuses external image fallback".into())
+                }
+            })
+        }
+    }
+
+    fn static_busybox_store(root: &Path) -> ImageStore {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (directory, mode) in [("bin", 0o755), ("work", 0o777)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(mode);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(0);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, directory, std::io::empty())
+                .unwrap();
+        }
+        let busybox = std::fs::read("/usr/bin/busybox").unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(busybox.len() as u64);
+        header.set_mode(0o755);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "bin/busybox", busybox.as_slice())
+            .unwrap();
+        let layer = archive.into_inner().unwrap().finish().unwrap();
+        let config = br#"{"config":{"User":"65534:65534","WorkingDir":"/","Env":["PATH=/bin"]}}"#;
+        let store = ImageStore::new(root.join("images"));
+        let layer_digest = format!("sha256:{:x}", Sha256::digest(&layer));
+        let config_digest = format!("sha256:{:x}", Sha256::digest(config));
+        let layer_path = store.blob_path(&layer_digest);
+        let config_path = store.blob_path(&config_digest);
+        for (path, data) in [
+            (&layer_path, layer.as_slice()),
+            (&config_path, config.as_slice()),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, data).unwrap();
+        }
+        store.set_cluster_source(Arc::new(StaticBusyBoxImage(LocalImageBlobs {
+            layers: vec![layer_path],
+            config: config_path,
+            config_digest,
+        })));
+        store
+    }
+
+    /// Own every actual runtime resource in this fixture root, including the
+    /// ordinary job and any subsequently admitted physical batch executions.
+    /// The guard runs after the harness's acknowledged task shutdown on unwind.
+    struct OwnedRuntimeCleanup {
+        runtime: RuncGrill,
+        armed: bool,
+    }
+
+    impl OwnedRuntimeCleanup {
+        async fn finish(&mut self) {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                for entry in self.runtime.launch_inventory().await.unwrap().unwrap() {
+                    self.runtime.kill(&entry.instance_id).await.unwrap();
+                    assert_eq!(
+                        self.runtime.state(&entry.instance_id).await.unwrap(),
+                        ContainerState::Stopped
+                    );
+                    assert!(
+                        !reliaburger::grill::netns::namespace_path(&entry.instance_id).exists()
+                    );
+                    assert!(
+                        !Path::new("/sys/class/net")
+                            .join(reliaburger::grill::netns::host_veth_name(
+                                &entry.instance_id
+                            ))
+                            .exists()
+                    );
+                }
+            })
+            .await
+            .expect("owned-capacity runtime cleanup exceeded its existing owned-fixture bound");
+            self.armed = false;
+        }
+    }
+
+    impl Drop for OwnedRuntimeCleanup {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let runtime = self.runtime.clone();
+            let cleaned = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    tokio::time::timeout(Duration::from_secs(20), async move {
+                        let Some(entries) = runtime.launch_inventory().await.ok().flatten() else {
+                            return false;
+                        };
+                        for entry in entries {
+                            if runtime.kill(&entry.instance_id).await.is_err() {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .await
+                    .unwrap_or(false)
+                })
+            });
+            if !cleaned {
+                eprintln!(
+                    "owned-capacity fixture cleanup remains unconfirmed; retain failed receipt"
+                );
+            }
+        }
+    }
+
+    struct CouncilCleanup(Arc<CouncilNode>);
+
+    impl Drop for CouncilCleanup {
+        fn drop(&mut self) {
+            let node = self.0.clone();
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), node.shutdown()).await;
+                });
+            });
+        }
+    }
+
+    struct ReleaseOnDrop(PathBuf);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+
+    fn ordinary_record(records: &Path, namespace: &str) -> serde_json::Value {
+        let checkpoint: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(records.join("job-attempts.checkpoint")).unwrap(),
+        )
+        .unwrap();
+        checkpoint["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["name"] == "ordinary" && job["namespace"] == namespace)
+            .expect("actual ordinary job attempt was not durably recorded")
+            .clone()
+    }
+
+    fn fresh_capacity(harness: &Harness, term: u64) {
+        harness._capacity_publisher.send_modify(|state| {
+            state.leadership_epoch = Some(term);
+            for deadline in state.receive_deadlines.values_mut() {
+                *deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires root, runc, overlayfs, cgroup v2, static /usr/bin/busybox, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
+    async fn runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http() {
+        assert!(nix::unistd::geteuid().is_root());
+        assert!(Path::new("/sys/fs/cgroup/cgroup.controllers").is_file());
+        let root = tempfile::tempdir().unwrap();
+        let suffix = root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.')
+            .to_lowercase();
+        let namespace = format!("cap-{suffix}");
+        let runtime = RuncGrill::new(
+            root.path().join("bundles"),
+            static_busybox_store(root.path()),
+            false,
+            root.path().join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap();
+        let mut cleanup = OwnedRuntimeCleanup {
+            runtime: runtime.clone(),
+            armed: true,
+        };
+        let council = single_node_leader().await;
+        let _council_cleanup = CouncilCleanup(council.clone());
+        assert!(council.is_leader().await);
+        let records = root.path().join("records");
+        let harness = Harness::start(council.clone(), runtime.clone(), records.clone()).await;
+        let ordinary = Config::parse(&format!(
+            "[job.ordinary]\nimage='owned-capacity:v1'\nnamespace='{namespace}'\ncpu='1'\nmemory='128Mi'\n"
+        )).unwrap();
+        let mut ordinary = ordinary;
+        ordinary.job.get_mut("ordinary").unwrap().command = Some(vec![
+            "/bin/busybox".into(), "sh".into(), "-c".into(),
+            r#"/bin/busybox touch /work/ready; attempts=0; while [ ! -e /work/release ]; do attempts=$((attempts+1)); [ "$attempts" -le 3000 ] || exit 75; /bin/busybox sleep 0.02; done; /bin/busybox touch /work/released; exit 0"#.into(),
+        ]);
+        assert_eq!(ordinary.job["ordinary"].cpu.unwrap().request, 1000);
+        assert_eq!(
+            ordinary.job["ordinary"].memory.unwrap().request,
+            128 * 1024 * 1024
+        );
+        tokio::time::timeout(Duration::from_secs(20), harness.client.apply(&ordinary))
+            .await
+            .expect("real ordinary apply did not acknowledge")
+            .unwrap();
+        let identity = InstanceIdentity::new(&namespace, "ordinary", 0).instance_id();
+        let rootfs = root.path().join("bundles").join(&identity.0).join("rootfs");
+        let release = ReleaseOnDrop(rootfs.join("work/release"));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !rootfs.join("work/ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual owned child did not acknowledge its blocked phase");
+        assert!(!rootfs.join("work/released").exists());
+        assert_eq!(
+            runtime.state(&identity).await.unwrap(),
+            ContainerState::Running
+        );
+        let claim = council.desired_state().await;
+        assert_eq!(claim.prerequisite_claims.len(), 1);
+        let (operation_id, held) = claim.prerequisite_claims.iter().next().unwrap();
+        assert!(held.apps_committed);
+        assert_eq!(held.config, ordinary);
+        let footprint = reliaburger::meat::admission::held_job_requests(&claim);
+        assert_eq!(footprint.cpu_millicores, 1000);
+        assert_eq!(footprint.memory_bytes, 128 * 1024 * 1024);
+        let captured = ordinary_record(&records, &namespace);
+        assert_eq!(captured["runtime"], "Runc");
+        assert_eq!(captured["phase"], "Launching");
+        assert_eq!(captured["batch_execution"], serde_json::Value::Null);
+        assert!(captured["generation"].as_u64().unwrap() > 0);
+
+        let probe = |name: &str, cpu: &str, memory: &str| {
+            Config::parse(&format!(
+            "[job.{name}]\nimage='owned-capacity:v1'\nnamespace='{namespace}'\ncommand=['/bin/busybox','true']\ncpu='{cpu}'\nmemory='{memory}'\n"
+        )).unwrap().job
+        };
+        // Isolate each resource as well as refusing the whole-worker request.
+        // A combined probe alone could conceal a missing CPU or memory charge.
+        for (name, cpu, memory) in [
+            ("full-before-terminal", "8", "16Gi"),
+            ("cpu-before-terminal", "8", "128Mi"),
+            ("memory-before-terminal", "100m", "16Gi"),
+        ] {
+            fresh_capacity(&harness, council.current_term());
+            let refused = tokio::time::timeout(
+                Duration::from_secs(20),
+                harness.client.submit_batch(&probe(name, cpu, memory)),
+            )
+            .await
+            .expect("blocked capacity admission did not settle")
+            .unwrap();
+            assert_eq!(refused["assigned"], 0, "{refused}");
+            assert_eq!(refused["unschedulable"], serde_json::json!([name]));
+            assert_eq!(
+                council
+                    .desired_state()
+                    .await
+                    .prerequisite_claims
+                    .get(operation_id),
+                Some(held)
+            );
+            assert_eq!(ordinary_record(&records, &namespace), captured);
+            assert_eq!(
+                runtime.state(&identity).await.unwrap(),
+                ContainerState::Running
+            );
+        }
+
+        // No fixture sends JobApplyComplete or an execution callback. This
+        // releases only the actual owned child; Agent must observe its current
+        // zero exit, persist that exact generation and settle its real claim.
+        std::fs::write(&release.0, b"release").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while council
+                .desired_state()
+                .await
+                .prerequisite_claims
+                .contains_key(operation_id)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exact real terminal receipt did not settle the held claim");
+        let terminal = ordinary_record(&records, &namespace);
+        assert_eq!(terminal["generation"], captured["generation"]);
+        assert_eq!(terminal["spec"], captured["spec"]);
+        assert_eq!(terminal["runtime"], captured["runtime"]);
+        assert_eq!(terminal["phase"], serde_json::json!({"Exited":{"code":0}}));
+        assert_eq!(terminal["restart_count"], 0);
+        assert_eq!(
+            reliaburger::meat::admission::held_job_requests(&council.desired_state().await),
+            Default::default()
+        );
+
+        fresh_capacity(&harness, council.current_term());
+        let admitted = tokio::time::timeout(
+            Duration::from_secs(20),
+            harness
+                .client
+                .submit_batch(&probe("full-after-terminal", "8", "16Gi")),
+        )
+        .await
+        .expect("released capacity admission did not settle")
+        .unwrap();
+        assert_eq!(admitted["assigned"], 1, "{admitted}");
+        assert_eq!(admitted["unschedulable"], serde_json::json!([]));
+        let batch_id = admitted["batch_id"].as_u64().unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let summary = harness.client.batch_status(batch_id).await.unwrap();
+                if summary["done"] == true {
+                    assert_eq!(summary["completed"], 1, "{summary}");
+                    assert_eq!(summary["failed"], 0, "{summary}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("actual newly admitted batch child did not terminate");
+        drop(release);
+        drop(harness);
+        cleanup.finish().await;
+    }
 }

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -13,7 +13,36 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub const MAX_TLS_CONNECTION_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// Time reserved for HTTP requests to drain before the lifetime limit.
+/// A connection that lives for less than twice this drains for half its life.
 pub const TLS_CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a TLS connection whose client presented `peer_certificate` may
+/// stay open, counted from `now`.
+///
+/// TLS checks the client's certificate once, at the handshake, and a pooled
+/// client connection that never goes idle can outlive that certificate by
+/// hours. Renewal installs a new leaf, but only new handshakes present it
+/// (#509). So the lifetime is [`MAX_TLS_CONNECTION_LIFETIME`], cut short to
+/// the instant the client's leaf expires. A client without a certificate gets
+/// the full lifetime; a certificate this function can't read gets none.
+pub fn tls_connection_lifetime(peer_certificate: Option<&[u8]>, now: SystemTime) -> Duration {
+    let Some(certificate_der) = peer_certificate else {
+        return MAX_TLS_CONNECTION_LIFETIME;
+    };
+    let Ok((_, leaf)) = x509_parser::parse_x509_certificate(certificate_der) else {
+        return Duration::ZERO;
+    };
+    let expires = u64::try_from(leaf.validity().not_after.timestamp())
+        .ok()
+        .and_then(|seconds| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+    let Some(expires) = expires else {
+        return Duration::ZERO;
+    };
+    expires
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_TLS_CONNECTION_LIFETIME)
+}
 
 /// An I/O stream whose lifetime limit follows it through HTTP upgrades.
 ///
@@ -86,6 +115,30 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for LifetimeLimitedIo<S> {
 /// actually happened on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsTransport;
+
+/// Request extension that resolves once the connection carrying the request
+/// has finished: every answer on it written and flushed, and the socket
+/// closed.
+///
+/// [`serve_http_connection`] attaches it to every request. A handler whose
+/// answer must reach the client before the process execs (a self-upgrade)
+/// answers with `Connection: close` and hands this to whoever execs, so
+/// the exec waits for the answer instead of guessing how long it takes.
+#[derive(Debug, Clone)]
+pub struct ConnectionClosed(tokio_util::sync::CancellationToken);
+
+impl ConnectionClosed {
+    /// One that resolves when `token` is cancelled, for callers (and tests)
+    /// that stand in for a connection.
+    pub fn from_token(token: tokio_util::sync::CancellationToken) -> Self {
+        Self(token)
+    }
+
+    /// Wait until the connection has closed.
+    pub async fn wait(&self) {
+        self.0.cancelled().await
+    }
+}
 
 /// Deadlines every HTTP listener in Bun applies to the connections it accepts.
 ///
@@ -291,6 +344,10 @@ pub async fn serve_http_connection<I>(
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let closed = tokio_util::sync::CancellationToken::new();
+    // Cancelled however this function returns, after the connection is done.
+    let _closed_on_return = closed.clone().drop_guard();
+    let router = router.layer(axum::Extension(ConnectionClosed(closed)));
     let io = StallGuardedIo::new(io, timeouts.request_head, timeouts.write_stall);
     let hyper_service = hyper_util::service::TowerToHyperService::new(router);
     let builder = http_builder(&timeouts);
@@ -300,7 +357,10 @@ pub async fn serve_http_connection<I>(
     let drain_at = async {
         match lifetime {
             Some(lifetime) => {
-                tokio::time::sleep(lifetime.saturating_sub(TLS_CONNECTION_DRAIN_GRACE)).await
+                // A short lifetime (a client leaf about to expire) still gets
+                // half of it to serve requests before draining starts.
+                let grace = TLS_CONNECTION_DRAIN_GRACE.min(lifetime / 2);
+                tokio::time::sleep(lifetime - grace).await
             }
             None => std::future::pending().await,
         }
@@ -356,7 +416,9 @@ pub async fn serve_router_plain(
 /// Every request carries [`TlsTransport`], the client's address as
 /// `axum::extract::ConnectInfo<SocketAddr>`, and the client's leaf certificate
 /// as [`super::renewal::TlsPeerCertificate`] when it presented one.
-/// Connections retire after [`MAX_TLS_CONNECTION_LIFETIME`].
+/// Connections retire after [`MAX_TLS_CONNECTION_LIFETIME`], or when the
+/// client's leaf certificate expires if that comes first
+/// ([`tls_connection_lifetime`]).
 pub async fn serve_router_over_tls(
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
@@ -364,6 +426,29 @@ pub async fn serve_router_over_tls(
     timeouts: ConnectionTimeouts,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    serve_router_over_tls_with_clock(
+        listener,
+        acceptor,
+        router,
+        timeouts,
+        shutdown,
+        SystemTime::now,
+    )
+    .await;
+}
+
+// Inject only the lifetime calculation clock. TLS certificate verification
+// continues to use its real clock, including in the renewal regression.
+async fn serve_router_over_tls_with_clock<F>(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    router: axum::Router,
+    timeouts: ConnectionTimeouts,
+    shutdown: tokio_util::sync::CancellationToken,
+    lifetime_clock: F,
+) where
+    F: Fn() -> SystemTime + Clone + Send + Sync + 'static,
+{
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -377,20 +462,24 @@ pub async fn serve_router_over_tls(
                     router.clone(),
                     timeouts,
                     shutdown.clone(),
+                    lifetime_clock.clone(),
                 ));
             }
         }
     }
 }
 
-async fn serve_tls_connection(
+async fn serve_tls_connection<F>(
     tcp: tokio::net::TcpStream,
     remote: std::net::SocketAddr,
     acceptor: tokio_rustls::TlsAcceptor,
     router: axum::Router,
     timeouts: ConnectionTimeouts,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+    lifetime_clock: F,
+) where
+    F: Fn() -> SystemTime + Send + Sync + 'static,
+{
     let Ok(Ok(tls)) = tokio::time::timeout(timeouts.tls_handshake, acceptor.accept(tcp)).await
     else {
         return;
@@ -404,19 +493,287 @@ async fn serve_tls_connection(
         .peer_certificates()
         .and_then(|certificates| certificates.first())
         .cloned();
+    let lifetime = tls_connection_lifetime(
+        peer_certificate
+            .as_ref()
+            .map(|certificate| certificate.as_ref()),
+        lifetime_clock(),
+    );
     let router = match peer_certificate {
         Some(certificate) => router.layer(axum::Extension(super::renewal::TlsPeerCertificate(
             certificate,
         ))),
         None => router,
     };
-    let tls = LifetimeLimitedIo::new(tls, MAX_TLS_CONNECTION_LIFETIME);
-    serve_http_connection(
-        tls,
-        router,
-        timeouts,
-        Some(MAX_TLS_CONNECTION_LIFETIME),
-        shutdown,
-    )
-    .await;
+    let tls = LifetimeLimitedIo::new(tls, lifetime);
+    serve_http_connection(tls, router, timeouts, Some(lifetime), shutdown).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sesame::{
+        ca, cert, credentials::LiveNodeIdentity, identity_store, identity_store::NodeIdentity,
+        mtls, renewal::TlsPeerCertificate, types::SerialNumber,
+    };
+    use std::time::SystemTime;
+
+    /// Bun execs straight after it answers an upgrade, and exec closes every
+    /// socket, so the answer has to be on the wire first (#526). The
+    /// extension resolves only once Hyper has written a closing answer in
+    /// full and ended the connection.
+    #[tokio::test]
+    async fn connection_closed_waits_until_a_closing_answer_is_written() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                move |axum::Extension(closed): axum::Extension<ConnectionClosed>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let _ = seen_tx.send(closed);
+                        (
+                            [(axum::http::header::CONNECTION, "close")],
+                            "x".repeat(4096),
+                        )
+                    }
+                },
+            ),
+        );
+        // A small pipe: the answer can't all be written until the client reads.
+        let (client, server) = tokio::io::duplex(64);
+        tokio::spawn(serve_http_connection(
+            server,
+            router,
+            ConnectionTimeouts::PRODUCTION,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let (mut read, mut write) = tokio::io::split(client);
+        write
+            .write_all(b"POST / HTTP/1.1\r\nhost: bun\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let closed = seen.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), closed.wait())
+                .await
+                .is_err(),
+            "resolved while the answer was still unread"
+        );
+        let mut answer = Vec::new();
+        read.read_to_end(&mut answer).await.unwrap();
+        assert!(answer.ends_with("x".repeat(4096).as_bytes()));
+        tokio::time::timeout(Duration::from_secs(5), closed.wait())
+            .await
+            .expect("still open after the whole answer was read");
+    }
+
+    /// A node identity for `node` whose leaf lives for `lifetime`.
+    fn node_identity(
+        hierarchy: &ca::CaHierarchy,
+        node: &str,
+        serial: u64,
+        lifetime: Duration,
+    ) -> NodeIdentity {
+        let (csr, private_key_der) = ca::create_node_csr(node).unwrap();
+        let (certificate_der, serial) = ca::sign_node_csr(
+            &csr,
+            node,
+            SerialNumber(serial),
+            lifetime,
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        NodeIdentity {
+            node_id: node.into(),
+            certificate_der,
+            private_key_der,
+            serial,
+            ca_generation: 0,
+            node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+            root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+            not_before: SystemTime::UNIX_EPOCH,
+            not_after: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn leaf_not_after(certificate_der: &[u8]) -> SystemTime {
+        let (_, leaf) = x509_parser::parse_x509_certificate(certificate_der).unwrap();
+        SystemTime::UNIX_EPOCH + Duration::from_secs(leaf.validity().not_after.timestamp() as u64)
+    }
+
+    #[test]
+    fn a_connection_without_a_client_certificate_gets_the_full_lifetime() {
+        assert_eq!(
+            tls_connection_lifetime(None, SystemTime::now()),
+            MAX_TLS_CONNECTION_LIFETIME
+        );
+    }
+
+    #[test]
+    fn a_connection_ends_when_its_client_leaf_expires() {
+        let hierarchy = ca::generate_ca_hierarchy("leaf-lifetime", b"test-ikm").unwrap();
+        let leaf = node_identity(&hierarchy, "client", 11, Duration::from_secs(600));
+        let expires = leaf_not_after(&leaf.certificate_der);
+        let at = |before_expiry| expires - Duration::from_secs(before_expiry);
+        assert_eq!(
+            tls_connection_lifetime(Some(&leaf.certificate_der), at(120)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            tls_connection_lifetime(Some(&leaf.certificate_der), expires),
+            Duration::ZERO
+        );
+        assert_eq!(
+            tls_connection_lifetime(
+                Some(&leaf.certificate_der),
+                expires + Duration::from_secs(5)
+            ),
+            Duration::ZERO,
+            "an expired leaf gets no lifetime at all"
+        );
+    }
+
+    #[test]
+    fn a_long_lived_client_leaf_still_retires_at_the_maximum_lifetime() {
+        let hierarchy = ca::generate_ca_hierarchy("leaf-lifetime-max", b"test-ikm").unwrap();
+        let leaf = node_identity(&hierarchy, "client", 11, Duration::from_secs(86_400));
+        assert_eq!(
+            tls_connection_lifetime(Some(&leaf.certificate_der), SystemTime::now()),
+            MAX_TLS_CONNECTION_LIFETIME
+        );
+    }
+
+    #[test]
+    fn an_unreadable_client_certificate_gets_no_lifetime() {
+        assert_eq!(
+            tls_connection_lifetime(Some(b"not a certificate"), SystemTime::now()),
+            Duration::ZERO
+        );
+    }
+
+    // Keep the real TLS accept loop, live certificate resolver and pooled
+    // client, but decouple TLS handshake validity from the retirement clock.
+    async fn pooled_renewal_fixture(retire_connection: bool) -> Result<(), String> {
+        let hierarchy = ca::generate_ca_hierarchy("pooled-renewal", b"test-ikm").unwrap();
+        let server = node_identity(&hierarchy, "server", 10, Duration::from_secs(3600));
+        let old_leaf = node_identity(&hierarchy, "client", 11, Duration::from_secs(120));
+        let old_leaf_expires = leaf_not_after(&old_leaf.certificate_der);
+        let lifetime = Duration::from_millis(400);
+        let directory = tempfile::tempdir().unwrap();
+        identity_store::save(directory.path(), &old_leaf).unwrap();
+        let live = LiveNodeIdentity::load(directory.path()).unwrap();
+        let deadline = std::sync::Arc::new(std::sync::OnceLock::<tokio::time::Instant>::new());
+        let expired_request = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_deadline = deadline.clone();
+        let handler_expired = expired_request.clone();
+        let router = axum::Router::new().route(
+            "/peer",
+            axum::routing::get(move |peer: axum::Extension<TlsPeerCertificate>| {
+                let deadline = handler_deadline.clone();
+                let expired = handler_expired.clone();
+                async move {
+                    let serial = cert::serial_from_der(&peer.0.0).unwrap().0;
+                    if serial == 11
+                        && deadline
+                            .get()
+                            .is_some_and(|at| tokio::time::Instant::now() >= *at)
+                    {
+                        expired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    serial.to_string()
+                }
+            }),
+        );
+        let config = mtls::build_api_server_config(&server, mtls::CrlHandle::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/peer", listener.local_addr().unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let clock_deadline = deadline.clone();
+        let serving = tokio::spawn(serve_router_over_tls_with_clock(
+            listener,
+            tokio_rustls::TlsAcceptor::from(config),
+            router,
+            ConnectionTimeouts::PRODUCTION,
+            shutdown.clone(),
+            move || {
+                let _ = clock_deadline.set(tokio::time::Instant::now() + lifetime);
+                if retire_connection {
+                    old_leaf_expires - lifetime
+                } else {
+                    SystemTime::UNIX_EPOCH
+                }
+            },
+        ));
+        let http =
+            mtls::build_live_cluster_http_client(&live, mtls::CrlHandle::default(), None).unwrap();
+        let presented = || async {
+            http.get(&url)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await?
+                .text()
+                .await
+        };
+        let result = async {
+            let first = presented().await.map_err(|error| error.to_string())?;
+            if first != "11" {
+                return Err(format!("first connection presented {first}"));
+            }
+            let expires = *deadline
+                .get()
+                .expect("TLS lifetime clock was read after handshake");
+            let renewed = node_identity(&hierarchy, "client", 12, Duration::from_secs(3600));
+            live.replace(renewed).await.unwrap();
+            let finish = expires + Duration::from_secs(5);
+            let mut observed_renewal = false;
+            while tokio::time::Instant::now() < finish {
+                let sent_at = tokio::time::Instant::now();
+                // Graceful/hard retirement can race a pooled request. A
+                // bounded transport error is allowed, but a successful old
+                // identity after expiry is always a failure.
+                if let Ok(serial) = presented().await {
+                    if serial == "11" && sent_at >= expires {
+                        return Err(
+                            "server accepted the expired leaf over a pooled connection".into()
+                        );
+                    }
+                    if serial != "11" && serial != "12" {
+                        return Err(format!("unexpected leaf serial {serial}"));
+                    }
+                    if serial == "12" && sent_at >= expires {
+                        observed_renewal = true;
+                    }
+                }
+                if expired_request.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("server accepted the expired leaf over a pooled connection".into());
+                }
+                if observed_renewal {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err("pooled client never reconnected with its renewed leaf".into())
+        }
+        .await;
+        shutdown.cancel();
+        serving.await.unwrap();
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_opened_before_renewal_never_presents_the_expired_leaf() {
+        pooled_renewal_fixture(true).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_renewal_fixture_detects_disabled_connection_retirement() {
+        assert_eq!(
+            pooled_renewal_fixture(false).await.unwrap_err(),
+            "server accepted the expired leaf over a pooled connection"
+        );
+    }
 }

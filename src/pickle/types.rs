@@ -845,6 +845,8 @@ pub struct AttachSignature {
 /// Errors from Pickle operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PickleError {
+    #[error("physical image storage quota exceeded")]
+    StorageQuotaExceeded,
     /// Lease authority or exact repository ownership could not be established.
     #[error("repository lease denied: {0}")]
     LeaseDenied(String),

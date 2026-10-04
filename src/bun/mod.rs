@@ -28,6 +28,7 @@ mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
+pub mod token_sweep;
 pub mod top;
 pub mod volume_maintenance;
 
@@ -43,6 +44,12 @@ use crate::grill::{GrillError, InstanceId};
 /// Errors from Bun agent operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BunError {
+    /// Trusted dispatch attempted to change an existing execution owner.
+    #[error("batch execution conflict: {0}")]
+    BatchConflict(String),
+    /// Predictable admission limit; existing executions remain available.
+    #[error("batch execution capacity is unavailable: {0}")]
+    BatchCapacity(String),
     /// Durable job execution evidence cannot be established.
     #[error("job state is unavailable: {0}")]
     JobState(String),
@@ -153,6 +160,9 @@ pub enum BunError {
     /// Deploy was rejected (e.g. process workload binary not in allowlist).
     #[error("deploy failed for {app_name:?}: {reason}")]
     DeployFailed { app_name: String, reason: String },
+    /// The prerequisite's observed nonzero status was durably settled.
+    #[error("run_before job {app_name} exited with {code}")]
+    PrerequisiteFailed { app_name: String, code: i32 },
 
     /// A fault injection was rejected (safety rail, or unsupported on
     /// this platform / without the eBPF feature).

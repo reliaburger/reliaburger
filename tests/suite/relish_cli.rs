@@ -19,8 +19,8 @@ fn version_reports_the_compiled_binary() {
     let output = run(&["--version"]);
     assert!(output.status.success());
     let expected = match reliaburger::upgrade::version::build_commit() {
-        Some(commit) => format!("relish 0.1.4 ({})\n", &commit[..7]),
-        None => "relish 0.1.4\n".to_string(),
+        Some(commit) => format!("relish 0.1.5 ({})\n", &commit[..7]),
+        None => "relish 0.1.5\n".to_string(),
     };
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     assert!(output.stderr.is_empty());
@@ -370,4 +370,24 @@ fn apply_refuses_plain_http_manifest_urls() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn directory_compile_refuses_partial_output_when_an_input_is_invalid() {
+    for invalid_file in ["bad.toml", "_defaults.toml"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("good.toml"),
+            "[app.web]\nimage = \"web:1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(invalid_file), "this is not valid TOML [[[").unwrap();
+        let output = run(&["compile", dir.path().to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "partial manifest escaped on stdout"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(invalid_file));
+    }
 }

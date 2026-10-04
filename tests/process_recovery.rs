@@ -416,47 +416,118 @@ async fn corrupt_intent_refuses_recovery_and_duplicate_launch() {
     assert!(recovered.create(&id, &spec("exit 0")).await.is_err());
 }
 
+struct ReleaseOwnedHelper(std::path::PathBuf);
+impl Drop for ReleaseOwnedHelper {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"release");
+    }
+}
+
+fn redacted_owner_phase(directory: &Path, id: &InstanceId) -> String {
+    let record = std::fs::read(
+        directory
+            .join("process-owners")
+            .join(&id.0)
+            .join("owner.json"),
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    match record {
+        Some(record) => format!(
+            "phase={} pid={:?}",
+            record["phase"]["state"].as_str().unwrap_or("unavailable"),
+            record["phase"]["pid"].as_u64()
+        ),
+        None => "owner-record-unavailable".into(),
+    }
+}
+
 #[tokio::test]
 async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let launched = directory.path().join("helper-started");
+    let release = directory.path().join("release-helper");
+    let released = directory.path().join("helper-released");
+    // The guard exists before the launch; unwinding cannot leave our owned
+    // wrapper gated forever. It signals a file, never an unverified PID.
+    let _release_on_failure = ReleaseOwnedHelper(release.clone());
     let wrapper = directory.path().join("delayed-bun");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\ntouch '{}'\nsleep 0.2\nexec '{}' \"$@\"\n",
-            launched.display(),
-            env!("CARGO_BIN_EXE_bun")
-        ),
-    )
-    .unwrap();
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\ntouch '{}'\ndeadline=$(( $(date +%s) + 15 ))\nwhile [ ! -f '{}' ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\ntouch '{}'\nexec '{}' \"$@\"\n",
+        launched.display(), release.display(), released.display(), env!("CARGO_BIN_EXE_bun")
+    )).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let grill = ProcessGrill::with_owner(directory.path().to_path_buf(), wrapper);
     let id = InstanceId("default__cancelled-caller-0".into());
     grill.create(&id, &spec("sleep 30")).await.unwrap();
-    let starting = tokio::spawn({
+    let began = tokio::time::Instant::now();
+    let mut starting = tokio::spawn({
         let grill = grill.clone();
         let id = id.clone();
         async move { grill.start(&id).await }
     });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while !launched.exists() {
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            if launched.exists() { break; }
+            tokio::select! {
+                result = &mut starting => panic!("start completed before helper acknowledgement: {result:?}"),
+                _ = poll.tick() => {}
+            }
+        }
+    }).await;
+    if ready.is_err() {
+        starting.abort();
+        let canceled = starting.await;
+        panic!(
+            "owned-helper phase=started elapsed={:?} started={} released={} task={canceled:?} {}",
+            began.elapsed(),
+            launched.exists(),
+            released.exists(),
+            redacted_owner_phase(directory.path(), &id)
+        );
+    }
+    assert!(
+        !released.exists(),
+        "helper passed the gate before cancellation"
+    );
+    starting.abort();
+    assert!(starting.await.unwrap_err().is_cancelled());
+    std::fs::write(&release, b"release").unwrap();
+    let observed_release = tokio::time::timeout(Duration::from_secs(15), async {
+        while !released.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap();
-    starting.abort();
-    assert!(starting.await.unwrap_err().is_cancelled());
+    .await;
+    assert!(
+        observed_release.is_ok(),
+        "owned-helper phase=released elapsed={:?} started={} released={} {}",
+        began.elapsed(),
+        launched.exists(),
+        released.exists(),
+        redacted_owner_phase(directory.path(), &id)
+    );
     let recovered = runtime(directory.path());
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let recovered_running = tokio::time::timeout(Duration::from_secs(15), async {
         while !matches!(recovered.state(&id).await, Ok(ContainerState::Running)) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if recovered_running.is_err() {
+        // Ask the authenticated recovered runtime to clean up; never signal
+        // the informational pid from our redacted diagnostic record.
+        let cleanup = tokio::time::timeout(Duration::from_secs(2), recovered.kill(&id)).await;
+        panic!(
+            "owned-helper phase=recovered-running elapsed={:?} started={} released={} cleanup={cleanup:?} {}",
+            began.elapsed(),
+            launched.exists(),
+            released.exists(),
+            redacted_owner_phase(directory.path(), &id)
+        );
+    }
     recovered.kill(&id).await.unwrap();
     stopped(&recovered, &id).await;
 }
@@ -694,11 +765,14 @@ fn write_job_checkpoint(directory: &Path, phase: &str) {
     let job = serde_json::json!({
         "name":"work", "namespace":"default", "spec": config.job["work"],
         "runtime":"Process", "generation":1, "restart_count":1,
-        "phase":phase, "runtime_absent":false,
+        "phase":phase, "runtime_absent":false, "batch_execution":null,
     });
     std::fs::write(
         directory.join("job-attempts.checkpoint"),
-        serde_json::to_vec(&serde_json::json!({"schema":2, "jobs":[job]})).unwrap(),
+        serde_json::to_vec(
+            &serde_json::json!({"schema":3, "jobs":[job], "retired_batch_executions":[]}),
+        )
+        .unwrap(),
     )
     .unwrap();
 }

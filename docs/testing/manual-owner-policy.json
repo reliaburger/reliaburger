@@ -1,0 +1,307 @@
+[
+  {
+    "source": "src/bun/gpu.rs",
+    "function": "nvidia_detector_finds_hardware",
+    "binary": "reliaburger",
+    "test": "bun::gpu::tests::nvidia_detector_finds_hardware",
+    "reason": "requires an NVIDIA GPU and nvidia-smi (RELIABURGER_GPU_TESTS); run with make test-gpu",
+    "owners": [
+      {
+        "kind": "make",
+        "name": "test-gpu"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "/// Real-hardware acceptance: on a node with an NVIDIA GPU, the detector",
+      "/// enumerates at least one card. Gated so it only runs where the",
+      "/// hardware and `nvidia-smi` exist (`make test-gpu`).",
+      "#[test]",
+      "#[ignore = \"requires an NVIDIA GPU and nvidia-smi (RELIABURGER_GPU_TESTS); run with make test-gpu\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "src/grill/apple.rs",
+    "function": "apple_serves_a_readonly_bind_mount_with_requested_identity_and_port",
+    "binary": "reliaburger",
+    "test": "grill::apple::tests::apple_serves_a_readonly_bind_mount_with_requested_identity_and_port",
+    "reason": "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple",
+    "owners": [
+      {
+        "kind": "make",
+        "name": "test-apple"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "src/grill/apple.rs",
+    "function": "pinned_test_workload_runs_under_apple_container",
+    "binary": "reliaburger",
+    "test": "grill::apple::tests::pinned_test_workload_runs_under_apple_container",
+    "reason": "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple",
+    "owners": [
+      {
+        "kind": "make",
+        "name": "test-apple"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "src/grill/apple.rs",
+    "function": "adopt_re_tracks_a_running_apple_container",
+    "binary": "reliaburger",
+    "test": "grill::apple::tests::adopt_re_tracks_a_running_apple_container",
+    "reason": "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple",
+    "owners": [
+      {
+        "kind": "make",
+        "name": "test-apple"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "src/ketchup/export.rs",
+    "function": "export_to_real_s3_manual",
+    "binary": "reliaburger",
+    "test": "ketchup::export::tests::export_to_real_s3_manual",
+    "reason": "requires AWS credentials and RELIABURGER_TEST_S3_URL; run with make test-s3",
+    "owners": [
+      {
+        "kind": "make",
+        "name": "test-s3"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "// Real S3/GCS export lives in a named, ignored manual suite so it never",
+      "// silently passes without credentials (test-harness honesty rule).",
+      "#[tokio::test]",
+      "#[ignore = \"requires AWS credentials and RELIABURGER_TEST_S3_URL; run with make test-s3\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "src/testkit/pinned_images.rs",
+    "function": "pinned_images_serve_verified_from_the_local_test_mirror",
+    "binary": "reliaburger",
+    "test": "testkit::pinned_images::tests::pinned_images_serve_verified_from_the_local_test_mirror",
+    "reason": "requires the local test mirror (scripts/test-images/mirror.py run)",
+    "owners": [
+      {
+        "kind": "script",
+        "name": "scripts/test-images/mirror.py"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "/// Reads every pinned image from the mirror alone (no upstream fallback),",
+      "/// so a gap in the warm list or a bad cache fails here, not mid-suite.",
+      "#[tokio::test]",
+      "#[ignore = \"requires the local test mirror (scripts/test-images/mirror.py run)\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_owner_process_fixture",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_owner_process_fixture",
+    "reason": "subprocess fixture for actual egress owner death",
+    "owners": [],
+    "original_attributes": [
+      "",
+      "#[test]",
+      "#[ignore = \"subprocess fixture for actual egress owner death\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "actual_bun_kernel_discovery_host_reboot",
+    "binary": "reliaburger::oci_crash",
+    "test": "actual_bun_kernel_discovery_host_reboot",
+    "reason": "run through scripts/release/qualify-discovery-reboot.sh on a disposable VM",
+    "owners": [
+      {
+        "kind": "script",
+        "name": "scripts/release/qualify-discovery-reboot.sh"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "#[cfg(feature = \"ebpf\")]",
+      "#[tokio::test]",
+      "#[ignore = \"run through scripts/release/qualify-discovery-reboot.sh on a disposable VM\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "owned_network_fixture",
+    "binary": "reliaburger::owned_network",
+    "test": "owned_network_fixture",
+    "reason": "subprocess fixture for owned namespace crash recovery",
+    "owners": [],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"subprocess fixture for owned namespace crash recovery\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "owned_rootless_fixture",
+    "binary": "reliaburger::owned_rootless",
+    "test": "owned_rootless_fixture",
+    "reason": "subprocess fixture for rootless caller death",
+    "owners": [],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"subprocess fixture for rootless caller death\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "owned_runc_fixture",
+    "binary": "reliaburger::owned_runc",
+    "test": "owned_runc_fixture",
+    "reason": "subprocess fixture for owned Runc caller death",
+    "owners": [],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"subprocess fixture for owned Runc caller death\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "actual_host_reboot_preserves_holds_and_retires_original_execution",
+    "binary": "reliaburger::owned_runc",
+    "test": "actual_host_reboot_preserves_holds_and_retires_original_execution",
+    "reason": "run only through scripts/release/qualify-oci-reboot.sh in a disposable Linux VM",
+    "owners": [
+      {
+        "kind": "script",
+        "name": "scripts/release/qualify-oci-reboot.sh"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "/// Two-phase fixture: the driver must actually power-cycle the disposable VM.",
+      "#[tokio::test]",
+      "#[ignore = \"run only through scripts/release/qualify-oci-reboot.sh in a disposable Linux VM\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "owned_runc_unit_stop_fixture",
+    "binary": "reliaburger::owned_runc",
+    "test": "owned_runc_unit_stop_fixture",
+    "reason": "subprocess fixture for a KillMode=control-group stop",
+    "owners": [],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"subprocess fixture for a KillMode=control-group stop\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/power_cut.rs",
+    "function": "actual_power_cut_preserves_acknowledged_log_exports",
+    "binary": "reliaburger::power_cut",
+    "test": "actual_power_cut_preserves_acknowledged_log_exports",
+    "reason": "run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM",
+    "owners": [
+      {
+        "kind": "script",
+        "name": "scripts/release/qualify-storage-power-cut.sh"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "/// Two-phase fixture: the driver must actually cut the disposable VM's power.",
+      "#[tokio::test]",
+      "#[ignore = \"run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/power_cut.rs",
+    "function": "actual_power_cut_preserves_acknowledged_lease_operations",
+    "binary": "reliaburger::power_cut",
+    "test": "actual_power_cut_preserves_acknowledged_lease_operations",
+    "reason": "run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM",
+    "owners": [
+      {
+        "kind": "script",
+        "name": "scripts/release/qualify-storage-power-cut.sh"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "/// Two-phase fixture: the driver must actually cut the disposable VM's power.",
+      "#[tokio::test]",
+      "#[ignore = \"run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/power_cut.rs",
+    "function": "actual_power_cut_preserves_acknowledged_council_backups",
+    "binary": "reliaburger::power_cut",
+    "test": "actual_power_cut_preserves_acknowledged_council_backups",
+    "reason": "run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM",
+    "owners": [
+      {
+        "kind": "script",
+        "name": "scripts/release/qualify-storage-power-cut.sh"
+      }
+    ],
+    "original_attributes": [
+      "",
+      "/// Two-phase fixture: the driver must actually cut the disposable VM's power.",
+      "#[tokio::test]",
+      "#[ignore = \"run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM\"]"
+    ],
+    "ci": false
+  },
+  {
+    "source": "tests/runtime_selection.rs",
+    "function": "automatic_selection_child",
+    "binary": "reliaburger::runtime_selection",
+    "test": "automatic_selection_child",
+    "reason": "subprocess fixture with a private PATH",
+    "owners": [],
+    "original_attributes": [
+      "",
+      "#[tokio::test]",
+      "#[ignore = \"subprocess fixture with a private PATH\"]"
+    ],
+    "ci": false
+  }
+]

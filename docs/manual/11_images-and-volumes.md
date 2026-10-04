@@ -47,6 +47,22 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+## Storage ceiling
+
+`[images] max_storage` bounds each node's compressed CAS blob, temporary upload
+and repository authority receipt payload bytes. The store also allows at most
+65,536 payload files, including empty uploads and receipts. Registry pushes, peer replication,
+upstream cache fills and runtime image pulls share this ceiling. An upload chunk
+that would exceed it is refused before writing, with HTTP 413 from the registry. Completed uploads remain charged
+without a manifest; deleting confirmed payloads returns their space to the budget.
+The accounting is rebuilt from disk at startup.
+
+Unpacked root filesystems, catalogue files and filesystem overhead need
+additional disk capacity. This cap measures payload bytes, not filesystem
+block allocation. Reusing an existing verified blob does not charge its bytes
+twice, but uploading another physical copy needs room for that temporary copy
+until completion.
+
 ## Building images
 
 `relish build` builds images from your config straight into Pickle:
@@ -219,6 +235,15 @@ relish apply db.toml     # start it again
 Restore overwrites the live volume, so stop the app first. On other
 filesystems, snapshot commands fail with an error saying so.
 
+A managed volume lives on the node that runs its app, and snapshot commands
+act there whichever node you send them to: the node that receives one asks the
+council where the app's volume lives and forwards the request, with your own
+credential, to that node. A stopped app's volume is wherever it last ran. A
+copy of the volume that an app left behind on another node is never
+snapshotted or restored by mistake. When an app with several replicas keeps a
+volume on each of several nodes, send the command to one of those nodes; any
+other node refuses it with a 409 that names them.
+
 While a restore runs it owns the app's volumes: `relish apply` for that app,
 automatic restarts, and any other snapshot command for it get a "retry
 shortly" refusal (a 409) until the restore finishes. The restored volume keeps
@@ -266,7 +291,9 @@ which destinations hold each one.
 
 Archives are streamed to a spool file in `<volumes>/.snapshot-spool` and
 uploaded in 8 MiB parts, so a large volume doesn't need its size in memory.
-The spool never takes the volumes filesystem below 5% free. Objects land under
+The spool always leaves 5% of the volumes filesystem free, or 10 GiB on a
+filesystem larger than 200 GiB; an archive that would cut into that reserve
+fails and is retried on the next sweep. Objects land under
 `<prefix>/<namespace>/<app>/<node>/<volume>/`: the archive is
 `archives/sha256-<digest>.tar.gz`, and a JSON manifest in `manifests/` names
 the snapshot, its volume, node and creation time. Two nodes running the same

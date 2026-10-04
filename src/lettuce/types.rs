@@ -76,6 +76,15 @@ impl GitOpsConfig {
 /// display sync status.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncState {
+    /// Accepted webhook generations survive coordinator replacement.
+    #[serde(default)]
+    pub requested_generation: u64,
+    /// A successful run acknowledges only the generation it captured at start.
+    #[serde(default)]
+    pub completed_generation: u64,
+    /// Bounded replay receipts, hashed to avoid retaining provider payloads.
+    #[serde(default)]
+    pub webhook_receipts: VecDeque<[u8; 32]>,
     /// The commit that was last successfully applied.
     pub last_applied_commit: Option<CommitInfo>,
     /// The commit that was last fetched (may differ if verify/parse failed).

@@ -345,6 +345,9 @@ pub struct ApiState {
     /// live. Read by the auth middleware. Production Bun always supplies one;
     /// `None` remains available to small embedded/test routers.
     pub token_store: Option<crate::sesame::auth::TokenStore>,
+    /// When each API token last authenticated a request on this node, shared
+    /// with the auth middleware that records it.
+    pub token_last_used: crate::sesame::auth::TokenLastUsed,
     /// The cluster's internal service token, presented on cross-node fan-out
     /// calls so peers accept them as the system principal. `None` single-node.
     pub service_token: Option<String>,
@@ -506,6 +509,7 @@ pub fn router_with_upgrade(
     jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
     status: Option<super::agent::StatusReader>,
 ) -> Router {
+    let token_last_used = crate::sesame::auth::new_token_last_used();
     let state = ApiState {
         cmd_tx,
         status,
@@ -523,6 +527,7 @@ pub fn router_with_upgrade(
         rollup_store,
         membership,
         token_store: token_store.clone(),
+        token_last_used: token_last_used.clone(),
         service_token: service_token.clone(),
         cluster_http,
         api_port,
@@ -553,7 +558,8 @@ pub fn router_with_upgrade(
     let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
         service_token,
-    );
+    )
+    .with_last_used(token_last_used);
     if let Some(verifier) = jwt_verifier {
         auth_state = auth_state.with_jwt_verifier(verifier);
     }
@@ -851,6 +857,20 @@ async fn ask_agent<T>(
         .map_err(|_| internal_error("agent dropped response"))
 }
 
+/// New execution-ownership metadata must bound both queueing and the reply.
+/// Keep the legacy helper's semantics for its existing consumers.
+// The HTTP response crosses this helper directly to the calling route.
+#[allow(clippy::result_large_err)]
+pub(super) async fn ask_agent_bounded<T>(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> AgentCommand,
+) -> Result<T, Response> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), ask_agent(cmd_tx, build)).await {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(agent_unavailable()),
+    }
+}
+
 fn internal_error(message: &str) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -902,7 +922,7 @@ async fn enforce_cluster_permission(
 
 /// The replicated `[permission]` map, keyed by token name. Empty without a
 /// council (single-node mode, where permissions can't be configured).
-async fn permission_map(
+pub(crate) async fn permission_map(
     state: &ApiState,
 ) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
     match &state.council {
@@ -1122,7 +1142,7 @@ async fn known_node_api_url(
 
 /// Preserve the end user's credential so the target node repeats every
 /// authentication and server-policy check.
-fn copy_forwarded_auth(
+pub(crate) fn copy_forwarded_auth(
     mut request: reqwest::RequestBuilder,
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {

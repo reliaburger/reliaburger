@@ -13,7 +13,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::*;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
+use sha2::{Digest, Sha256};
 
 use super::scan::{ParquetTable, list_local, list_remote, streaming_session};
 use super::types::{MayoError, MetricKey, Sample};
@@ -54,30 +55,8 @@ fn parse_object_store(
     Ok((Arc::from(store), prefix))
 }
 
-/// Seed the flush counter for a remote backend by listing existing
-/// `metrics_NNNNNN.parquet` objects under `prefix` and returning one past the
-/// highest — so a restart resumes numbering instead of clobbering data.
-async fn next_remote_flush_counter(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &object_store::path::Path,
-) -> Result<u64, MayoError> {
-    use futures_util::StreamExt;
-    let mut listing = store.list(Some(prefix));
-    let mut max_seen: Option<u64> = None;
-    while let Some(item) = listing.next().await {
-        let meta = item.map_err(|e| MayoError::ObjectStore(e.to_string()))?;
-        let name = meta.location.filename().unwrap_or("");
-        if let Some(rest) = name.strip_prefix("metrics_")
-            && let Some(digits) = rest.strip_suffix(".parquet")
-            && let Ok(n) = digits.parse::<u64>()
-        {
-            max_seen = Some(max_seen.map_or(n, |m| m.max(n)));
-        }
-    }
-    Ok(max_seen.map_or(0, |m| m + 1))
-}
-
 /// Serialise a RecordBatch to in-memory Parquet bytes (for object-store PUT).
+#[cfg(test)]
 fn batch_to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, MayoError> {
     let mut buffer = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)
@@ -96,6 +75,8 @@ pub const APP_QUERY_ROW_LIMIT: usize = 10_000;
 
 /// Most rows one unfiltered `/v1/metrics?name=*` query returns from one node.
 pub const ALL_QUERY_ROW_LIMIT: usize = 10_000;
+
+const MAX_PENDING_METRIC_ROWS: usize = 1_000_000;
 
 /// Escape a value for safe interpolation into a single-quoted SQL string
 /// literal (M1). DataFusion follows standard SQL: a `'` inside a literal is
@@ -170,15 +151,137 @@ pub(crate) fn write_batch_parquet(
     Ok(())
 }
 
-/// A drained buffer ready to be written to Parquet, decoupled from the store so
-/// the caller can release its lock before the (blocking) write (OBS5/M3).
+#[cfg(test)]
+#[derive(Debug)]
+struct MayoCreationConfirmationFault {
+    child: PathBuf,
+    failing: std::sync::atomic::AtomicBool,
+    visits: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+#[cfg(test)]
+impl MayoCreationConfirmationFault {
+    fn observe(&self, child: &Path) -> Result<(), MayoError> {
+        if self.child != child {
+            return Ok(());
+        }
+        self.visits.lock().unwrap().push(child.to_path_buf());
+        if self.failing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(MayoError::Io(std::io::Error::other(
+                "controlled Mayo creation-entry confirmation failure",
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MayoWriteStage {
+    BeforePublication,
+    AfterPublication,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MayoWriteGate {
+    stage: MayoWriteStage,
+    first: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    finished: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release_local: std::sync::Condvar,
+    release_remote: tokio::sync::Semaphore,
+    fail_parent_sync: std::sync::atomic::AtomicBool,
+    parent_sync_visits: std::sync::atomic::AtomicUsize,
+    creation_confirmation_fault: std::sync::Mutex<Option<Arc<MayoCreationConfirmationFault>>>,
+}
+#[cfg(test)]
+impl MayoWriteGate {
+    fn new(stage: MayoWriteStage) -> Self {
+        Self {
+            stage,
+            first: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release_local: std::sync::Condvar::new(),
+            release_remote: tokio::sync::Semaphore::new(0),
+            fail_parent_sync: std::sync::atomic::AtomicBool::new(false),
+            parent_sync_visits: std::sync::atomic::AtomicUsize::new(0),
+            creation_confirmation_fault: std::sync::Mutex::new(None),
+        }
+    }
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release_local.notify_all();
+        self.release_remote.add_permits(1);
+    }
+    fn wait_local(&self, stage: MayoWriteStage) {
+        if self.stage != stage || self.first.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        self.entered.notify_one();
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release_local.wait(released).unwrap();
+        }
+    }
+    async fn wait_async(&self, stage: MayoWriteStage) -> bool {
+        if self.stage != stage || self.first.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        self.entered.notify_one();
+        self.release_remote.acquire().await.unwrap().forget();
+        true
+    }
+}
+#[cfg(test)]
+struct ReleaseMayoWriteGate(Arc<MayoWriteGate>);
+#[cfg(test)]
+impl Drop for ReleaseMayoWriteGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+#[cfg(test)]
+struct MayoAttemptFinished(Arc<MayoWriteGate>);
+#[cfg(test)]
+impl Drop for MayoAttemptFinished {
+    fn drop(&mut self) {
+        self.0.finished.notify_one();
+    }
+}
+
+// Keep publication identity and encoded bytes stable across cancellation,
+// uncertain PUT and proved collision.
+
+#[derive(Clone)]
+struct EncodedMayoPublication {
+    payload: object_store::PutPayload,
+    digest: [u8; 32],
+}
+
+/// An immutable batch retained by its store until publication is confirmed.
+/// Clones share encoded bytes, write ownership and completion state. Dropping
+/// a caller or its clone does not discard the store's pending rows.
+#[derive(Clone)]
 pub struct PendingFlush {
     batch: RecordBatch,
     target: FlushTarget,
+    publication: String,
+    encoded: Arc<std::sync::Mutex<Option<EncodedMayoPublication>>>,
+    local_parent_entries: Arc<std::sync::Mutex<Option<Vec<PathBuf>>>>,
+    writing: Arc<tokio::sync::Mutex<()>>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    foreign_collision: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    test_gate: Option<Arc<MayoWriteGate>>,
+    #[cfg(test)]
+    creation_confirmation_fault: Option<Arc<MayoCreationConfirmationFault>>,
 }
 
-/// Where a [`PendingFlush`] is written — a local Parquet file or an
-/// object-store key (H8).
+#[derive(Clone)]
 enum FlushTarget {
     Local {
         data_dir: PathBuf,
@@ -190,65 +293,453 @@ enum FlushTarget {
     },
 }
 
-/// Flush a shared store without holding its lock across the (blocking) write.
-///
-/// Drains the buffer under a brief write lock, releases it, then writes the
-/// Parquet file on the blocking pool (OBS5/M3). Returns `true` if a file was
-/// written, `false` if the buffer was empty. Extracted from the `bun`
-/// collection task so the drain-then-write-off-lock sequence is unit-testable
-/// instead of living only in the binary.
-pub async fn flush_off_lock(
-    store: &std::sync::Arc<tokio::sync::RwLock<MayoStore>>,
-) -> Result<bool, MayoError> {
-    let pending = {
-        let mut guard = store.write().await;
-        guard.take_flush_batch()?
-    };
-    match pending {
-        Some(p) => {
-            // Keep a cheap (Arc-backed) handle on the drained samples so a
-            // failed write can put them back rather than lose them (M6): the
-            // buffer was already cleared under the lock, so nothing else holds
-            // them.
-            let batch = p.batch.clone();
-            match write_pending_flush(p).await {
-                Ok(()) => Ok(true),
-                Err(e) => {
-                    store.write().await.reabsorb_batch(&batch);
-                    Err(e)
+impl PendingFlush {
+    fn encode(&self) -> Result<EncodedMayoPublication, MayoError> {
+        let mut encoded = self.encoded.lock().map_err(|_| {
+            MayoError::Io(std::io::Error::other(
+                "Mayo publication encoding cache poisoned",
+            ))
+        })?;
+        if let Some(encoded) = &*encoded {
+            return Ok(encoded.clone());
+        }
+        let properties = datafusion::parquet::file::properties::WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![datafusion::parquet::file::metadata::KeyValue {
+                key: "reliaburger.mayo.publication".into(),
+                value: Some(self.publication.clone()),
+            }]))
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, self.batch.schema(), Some(properties))
+            .map_err(|error| MayoError::Arrow(error.to_string()))?;
+        writer
+            .write(&self.batch)
+            .map_err(|error| MayoError::Arrow(error.to_string()))?;
+        writer
+            .close()
+            .map_err(|error| MayoError::Arrow(error.to_string()))?;
+        let publication = EncodedMayoPublication {
+            digest: Sha256::digest(&bytes).into(),
+            payload: bytes.into(),
+        };
+        *encoded = Some(publication.clone());
+        Ok(publication)
+    }
+
+    fn targets(&self, source: &super::scan::ParquetSource) -> bool {
+        match (&self.target, source) {
+            (FlushTarget::Local { path, .. }, super::scan::ParquetSource::Local(candidate)) => {
+                path == candidate
+            }
+            (
+                FlushTarget::Remote { key, .. },
+                super::scan::ParquetSource::Remote { location, .. },
+            ) => key == location,
+            _ => false,
+        }
+    }
+
+    // A matching key or matching sample values do not establish ownership.
+    // Digest includes immutable bytes plus the independent publication ID.
+    async fn owns_source(&self, source: &super::scan::ParquetSource) -> Result<bool, MayoError> {
+        let pending = self.clone();
+        let encoded = tokio::task::spawn_blocking(move || pending.encode())
+            .await
+            .map_err(|error| MayoError::Io(std::io::Error::other(error.to_string())))??;
+        match source {
+            super::scan::ParquetSource::Local(path) => {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || local_mayo_publication_matches(&path, &encoded))
+                    .await
+                    .map_err(|error| MayoError::Io(std::io::Error::other(error.to_string())))?
+            }
+            super::scan::ParquetSource::Remote {
+                store,
+                location,
+                size,
+            } => {
+                if *size != encoded.payload.content_length() as u64 {
+                    return Ok(false);
                 }
+                let response = match store
+                    .get_opts(location, object_store::GetOptions::default())
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(false),
+                    Err(error) => return Err(MayoError::ObjectStore(error.to_string())),
+                };
+                remote_mayo_publication_matches(response, &encoded).await
             }
         }
-        None => Ok(false),
     }
 }
 
-/// Persist a [`PendingFlush`] to disk on the blocking pool. Runs with no lock
-/// held, so concurrent queries proceed while the write is in flight.
+fn mayo_digest_matches(size: usize, digest: Sha256, encoded: &EncodedMayoPublication) -> bool {
+    size == encoded.payload.content_length()
+        && <[u8; 32]>::from(digest.finalize()) == encoded.digest
+}
+
+async fn remote_mayo_publication_matches(
+    response: object_store::GetResult,
+    encoded: &EncodedMayoPublication,
+) -> Result<bool, MayoError> {
+    use futures_util::StreamExt;
+    if response.meta.size != encoded.payload.content_length() as u64 {
+        return Ok(false);
+    }
+    let mut stream = response.into_stream();
+    let mut digest = Sha256::new();
+    let mut size = 0usize;
+    while let Some(bytes) = stream.next().await {
+        let bytes = bytes.map_err(|error| MayoError::ObjectStore(error.to_string()))?;
+        size = size.saturating_add(bytes.len());
+        if size > encoded.payload.content_length() {
+            return Ok(false);
+        }
+        digest.update(bytes);
+    }
+    Ok(mayo_digest_matches(size, digest, encoded))
+}
+
+fn local_mayo_publication_matches(
+    path: &Path,
+    encoded: &EncodedMayoPublication,
+) -> Result<bool, MayoError> {
+    use std::io::Read;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(MayoError::Io(error)),
+    };
+    if !metadata.is_file() || metadata.len() != encoded.payload.content_length() as u64 {
+        return Ok(false);
+    }
+    let mut file = std::fs::File::open(path).map_err(MayoError::Io)?;
+    let mut chunk = [0; 64 * 1024];
+    let mut size = 0usize;
+    let mut digest = Sha256::new();
+    loop {
+        let count = file.read(&mut chunk).map_err(MayoError::Io)?;
+        if count == 0 {
+            break;
+        }
+        size = size.saturating_add(count);
+        if size > encoded.payload.content_length() {
+            return Ok(false);
+        }
+        digest.update(&chunk[..count]);
+    }
+    Ok(mayo_digest_matches(size, digest, encoded))
+}
+
+// The configured data directory's own entry is always reconfirmed, including
+// a fresh store reopening a path left visible by an uncertain old publication.
+// A live pending handle also retains its originally missing creation chain.
+// Unrelated pre-existing ancestor entries are outside this configured scope.
+fn local_mayo_parent_entries(
+    pending: &PendingFlush,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>, MayoError> {
+    let mut retained = pending.local_parent_entries.lock().map_err(|_| {
+        MayoError::Io(std::io::Error::other(
+            "Mayo directory confirmation cache poisoned",
+        ))
+    })?;
+    if let Some(entries) = &*retained {
+        return Ok(entries.clone());
+    }
+    let mut child = data_dir.to_path_buf();
+    let mut entries = Vec::new();
+    if let Some(parent) = data_dir.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        entries.push(parent.to_path_buf());
+    }
+    loop {
+        match std::fs::metadata(&child) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(MayoError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "Mayo directory creation path contains a non-directory",
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = child.parent().ok_or_else(|| {
+                    MayoError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Mayo missing directory has no parent",
+                    ))
+                })?;
+                // A single relative component has the current directory as its
+                // parent; File::open("") cannot confirm that entry.
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                if entries.last().is_none_or(|entry| entry != parent) {
+                    entries.push(parent.to_path_buf());
+                }
+                child = parent.to_path_buf();
+            }
+            Err(error) => return Err(MayoError::Io(error)),
+        }
+    }
+    *retained = Some(entries.clone());
+    Ok(entries)
+}
+
+// Confirm each new ancestor before descent. An existing directory reconfirms
+// its immediate parent entry because an earlier failed mkdir may have left it
+// visible. Recursion stops at the first existing directory; unrelated existing
+// filesystem ancestry is not scanned or synchronized.
+fn prepare_local_mayo_directory(
+    directory: &Path,
+    #[cfg(test)] fault: Option<&MayoCreationConfirmationFault>,
+) -> Result<(), MayoError> {
+    match std::fs::metadata(directory) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(MayoError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "Mayo directory creation path contains a non-directory",
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = directory
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                prepare_local_mayo_directory(
+                    parent,
+                    #[cfg(test)]
+                    fault,
+                )?;
+            }
+            if let Err(error) = std::fs::create_dir(directory)
+                && (error.kind() != std::io::ErrorKind::AlreadyExists
+                    || !std::fs::metadata(directory)
+                        .map_err(MayoError::Io)?
+                        .is_dir())
+            {
+                return Err(MayoError::Io(error));
+            }
+        }
+        Err(error) => return Err(MayoError::Io(error)),
+    }
+    if let Some(parent) = directory.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        #[cfg(test)]
+        if let Some(fault) = fault {
+            fault.observe(directory)?;
+        }
+        std::fs::File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(MayoError::Io)?;
+    }
+    Ok(())
+}
+
+fn write_owned_local_mayo(
+    pending: &PendingFlush,
+    encoded: &EncodedMayoPublication,
+) -> Result<(), MayoError> {
+    use std::io::Write;
+    let FlushTarget::Local { data_dir, path } = &pending.target else {
+        return Err(MayoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Mayo local writer received a remote publication target",
+        )));
+    };
+    // Freeze the owned creation chain BEFORE preparing directories. A failed parent
+    // sync must retain this inventory even though those directories now exist.
+    let parent_entries = local_mayo_parent_entries(pending, data_dir)?;
+    prepare_local_mayo_directory(
+        data_dir,
+        #[cfg(test)]
+        pending.creation_confirmation_fault.as_deref(),
+    )?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".mayo-pending-")
+        .tempfile_in(data_dir)
+        .map_err(MayoError::Io)?;
+    for bytes in &encoded.payload {
+        temporary.write_all(bytes).map_err(MayoError::Io)?;
+    }
+    temporary.as_file().sync_all().map_err(MayoError::Io)?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A directory blocking publication is an ordinary retryable IO
+            // refusal. Only a real foreign file is a proved identity collision.
+            if !std::fs::metadata(path).map_err(MayoError::Io)?.is_file() {
+                return Err(MayoError::Io(error.error));
+            }
+            if !local_mayo_publication_matches(path, encoded)? {
+                pending
+                    .foreign_collision
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(MayoError::Io(std::io::Error::other(
+                    "foreign Mayo publication collision",
+                )));
+            }
+            std::fs::File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(MayoError::Io)?;
+        }
+        Err(error) => return Err(MayoError::Io(error.error)),
+    }
+    // Propagate directory sync errors: completed means durable, not merely visible.
+    std::fs::File::open(data_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(MayoError::Io)?;
+    for parent in parent_entries {
+        #[cfg(test)]
+        if let Some(fault) = &pending.creation_confirmation_fault {
+            let fault_parent = fault.child.parent().map(|parent| {
+                if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                }
+            });
+            if fault_parent == Some(parent.as_path()) {
+                fault.observe(&fault.child)?;
+            }
+        }
+        #[cfg(test)]
+        if let Some(gate) = &pending.test_gate {
+            gate.parent_sync_visits
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if gate
+                .fail_parent_sync
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(MayoError::Io(std::io::Error::other(
+                    "controlled Mayo parent-directory confirmation failure",
+                )));
+            }
+        }
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(MayoError::Io)?;
+    }
+    Ok(())
+}
+
+/// Write at most two batches without holding the store lock during I/O.
+/// Finish an older pending batch first, then one current buffer snapshot;
+/// concurrent collection cannot extend the pass indefinitely. Each pending
+/// batch shares a write guard, including blocking work surviving cancellation.
+pub async fn flush_off_lock(
+    store: &Arc<tokio::sync::RwLock<MayoStore>>,
+) -> Result<bool, MayoError> {
+    let mut wrote = false;
+    for _ in 0..2 {
+        let pending = store.write().await.take_flush_batch()?;
+        let Some(pending) = pending else { break };
+        write_pending_flush(pending).await?;
+        store.write().await.clear_completed_flush();
+        wrote = true;
+    }
+    Ok(wrote)
+}
+
+/// Publish or verify the retained immutable batch without a store lock.
+/// Clones serialize writes through their shared guard. Completion requires
+/// successful publication or verified matching bytes and, for local storage,
+/// the file and directory-entry confirmations. Cancellation does not clear
+/// store ownership; an already running local blocking writer may still finish.
 pub async fn write_pending_flush(pending: PendingFlush) -> Result<(), MayoError> {
-    let PendingFlush { batch, target } = pending;
-    match target {
-        FlushTarget::Local { data_dir, path } => tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&data_dir).map_err(MayoError::Io)?;
-            write_batch_parquet(&path, &batch)
+    use std::sync::atomic::Ordering;
+    let writing = pending.writing.clone().lock_owned().await;
+    if pending.completed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if pending.foreign_collision.load(Ordering::Acquire) {
+        return Err(MayoError::ObjectStore(
+            "foreign Mayo publication collision; retarget through the store".into(),
+        ));
+    }
+    match &pending.target {
+        FlushTarget::Local { .. } => tokio::task::spawn_blocking(move || {
+            let _writing = writing;
+            #[cfg(test)]
+            let _finished = pending
+                .test_gate
+                .as_ref()
+                .map(|gate| MayoAttemptFinished(gate.clone()));
+            #[cfg(test)]
+            if let Some(gate) = &pending.test_gate {
+                gate.wait_local(MayoWriteStage::BeforePublication);
+            }
+            let encoded = pending.encode()?;
+            write_owned_local_mayo(&pending, &encoded)?;
+            #[cfg(test)]
+            if let Some(gate) = &pending.test_gate {
+                gate.wait_local(MayoWriteStage::AfterPublication);
+            }
+            pending.completed.store(true, Ordering::Release);
+            Ok(())
         })
         .await
-        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?,
+        .map_err(|error| MayoError::Io(std::io::Error::other(error.to_string())))?,
         FlushTarget::Remote { store, key } => {
-            // Encode off the runtime (Arrow's writer is blocking), then PUT the
-            // bytes to the object store.
-            let bytes = tokio::task::spawn_blocking(move || batch_to_parquet_bytes(&batch))
-                .await
-                .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))??;
-            store
-                .put(&key, object_store::PutPayload::from(bytes))
-                .await
-                .map_err(|e| MayoError::ObjectStore(e.to_string()))?;
+            let store = store.clone();
+            let key = key.clone();
+            let encoder = pending.clone();
+            // Move the mutex guard onto the blocking pool during encoding, so
+            // cancellation cannot let another attempt overlap that owned work.
+            let (writing, encoded) = tokio::task::spawn_blocking(move || {
+                let encoded = encoder.encode()?;
+                Ok::<_, MayoError>((writing, encoded))
+            })
+            .await
+            .map_err(|error| MayoError::Io(std::io::Error::other(error.to_string())))??;
+            let _writing = writing;
+            let result = store
+                .put_opts(
+                    &key,
+                    encoded.payload.clone(),
+                    object_store::PutOptions {
+                        mode: object_store::PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => {}
+                Err(
+                    object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. },
+                ) => {
+                    let response = store
+                        .get_opts(&key, object_store::GetOptions::default())
+                        .await
+                        .map_err(|error| MayoError::ObjectStore(error.to_string()))?;
+                    if !remote_mayo_publication_matches(response, &encoded).await? {
+                        pending.foreign_collision.store(true, Ordering::Release);
+                        return Err(MayoError::ObjectStore(
+                            "foreign Mayo publication collision".into(),
+                        ));
+                    }
+                }
+                Err(error) => return Err(MayoError::ObjectStore(error.to_string())),
+            }
+            pending.completed.store(true, Ordering::Release);
             Ok(())
         }
     }
 }
-
 /// Whether `data_dir` contains at least one `.parquet` file.
 pub(crate) fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
     std::fs::read_dir(data_dir)
@@ -276,6 +767,7 @@ struct BufferedSample {
 /// buffer, skipping whatever the files' statistics rule out, so a query's
 /// memory is its working set regardless of how much history is on disk.
 pub struct MayoStore {
+    pending: Option<PendingFlush>,
     /// In-memory buffer of unflushed samples.
     buffer: Vec<BufferedSample>,
     /// Local directory for Parquet files (also the checkpoint dir under a
@@ -286,6 +778,8 @@ pub struct MayoStore {
     /// Counter for unique Parquet file names. Seeded past any existing files
     /// so a restart never clobbers a previous run's data.
     flush_counter: u64,
+    #[cfg(test)]
+    test_gate: Option<Arc<MayoWriteGate>>,
 }
 
 impl MayoStore {
@@ -297,17 +791,20 @@ impl MayoStore {
     pub fn new(data_dir: PathBuf) -> Self {
         let flush_counter = next_flush_counter(&data_dir, "metrics");
         Self {
+            pending: None,
             buffer: Vec::new(),
             data_dir,
             backend: Backend::Local,
             flush_counter,
+            #[cfg(test)]
+            test_gate: None,
         }
     }
 
     /// Open a store, backing it with an object store when `object_store_url` is
-    /// set (H8) or a local `data_dir` otherwise. For the remote backend the
-    /// flush counter is seeded by listing existing `metrics_*.parquet` objects,
-    /// so a restart resumes numbering instead of clobbering prior data.
+    /// set (H8) or a local `data_dir` otherwise. Generic opens read the whole
+    /// configured archive. Remote chunks use fresh random 128-bit names and
+    /// create-only PUTs, so simultaneous writers never replace existing data.
     pub async fn open(
         data_dir: PathBuf,
         object_store_url: Option<&str>,
@@ -316,13 +813,38 @@ impl MayoStore {
             return Ok(Self::new(data_dir));
         };
         let (store, prefix) = parse_object_store(url)?;
-        let flush_counter = next_remote_flush_counter(&store, &prefix).await?;
+        let flush_counter = 0;
         Ok(Self {
+            pending: None,
             buffer: Vec::new(),
             data_dir,
             backend: Backend::Remote { store, prefix },
             flush_counter,
+            #[cfg(test)]
+            test_gate: None,
         })
+    }
+
+    /// Open a production node's archive within the configured bucket. The
+    /// stable opaque owner is hashed, so labels and path characters cannot
+    /// accidentally merge writers. Generic `open` still reads the full archive.
+    pub async fn open_for_node(
+        data_dir: PathBuf,
+        object_store_url: Option<&str>,
+        owner: &str,
+    ) -> Result<Self, MayoError> {
+        let mut store = Self::open(data_dir, object_store_url).await?;
+        if let Backend::Remote { prefix, .. } = &mut store.backend {
+            if owner.is_empty() {
+                return Err(MayoError::ObjectStore(
+                    "node archive owner is required".into(),
+                ));
+            }
+            *prefix = prefix
+                .clone()
+                .join(format!("nodes/{:x}", Sha256::digest(owner.as_bytes())).as_str());
+        }
+        Ok(store)
     }
 
     /// The local directory where Parquet files are stored (the configured
@@ -333,12 +855,22 @@ impl MayoStore {
 
     /// Insert a metric sample into the buffer.
     pub fn insert(&mut self, key: &MetricKey, sample: Sample) {
+        self.clear_completed_flush();
         self.buffer.push(BufferedSample {
             timestamp: sample.timestamp,
             metric_name: key.name.0.clone(),
             labels_json: key.labels_json(),
             value: sample.value,
         });
+        let reserved = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| pending.batch.num_rows());
+        let available = MAX_PENDING_METRIC_ROWS.saturating_sub(reserved);
+        if self.buffer.len() > available {
+            let overflow = self.buffer.len() - available;
+            self.buffer.drain(0..overflow);
+        }
     }
 
     /// Insert with the current timestamp (convenience).
@@ -349,6 +881,11 @@ impl MayoStore {
     /// Number of unflushed samples in the buffer.
     pub fn buffer_len(&self) -> usize {
         self.buffer.len()
+            + self
+                .pending
+                .as_ref()
+                .filter(|pending| !pending.completed.load(std::sync::atomic::Ordering::Acquire))
+                .map_or(0, |pending| pending.batch.num_rows())
     }
 
     /// Convert the buffer to an Arrow RecordBatch.
@@ -376,71 +913,96 @@ impl MayoStore {
         Ok(Some(batch))
     }
 
-    /// Flush the buffer: convert to RecordBatch, write Parquet, drop from
-    /// memory. The write runs on the blocking pool (OBS5/M3).
-    ///
-    /// This convenience keeps the whole operation under `&mut self`. Callers
-    /// holding a shared lock across many concurrent readers should instead use
-    /// [`take_flush_batch`](Self::take_flush_batch) + [`write_pending_flush`]
-    /// so the lock is released during the I/O and queries never starve.
+    fn clear_completed_flush(&mut self) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.completed.load(std::sync::atomic::Ordering::Acquire))
+        {
+            self.pending = None;
+        }
+    }
+
+    fn allocate_flush_target(&mut self) -> FlushTarget {
+        let filename = format!("metrics_{:06}.parquet", self.flush_counter);
+        self.flush_counter += 1;
+        match &self.backend {
+            Backend::Local => FlushTarget::Local {
+                data_dir: self.data_dir.clone(),
+                path: self.data_dir.join(filename),
+            },
+            Backend::Remote { store, prefix } => FlushTarget::Remote {
+                store: store.clone(),
+                key: prefix
+                    .clone()
+                    .join(format!("metrics_{:032x}.parquet", rand::random::<u128>()).as_str()),
+            },
+        }
+    }
+
+    /// Flush at most two batches: older pending rows, then the current buffer.
+    /// Publication failure or cancellation preserves pending ownership; only
+    /// confirmed completion permits its removal. This method borrows the store
+    /// through I/O; use `flush_off_lock` when readers must remain concurrent.
     pub async fn flush(&mut self) -> Result<(), MayoError> {
-        let Some(pending) = self.take_flush_batch()? else {
-            return Ok(());
-        };
-        let batch = pending.batch.clone();
-        if let Err(e) = write_pending_flush(pending).await {
-            // A failed write must not discard the drained samples (M6).
-            self.reabsorb_batch(&batch);
-            return Err(e);
+        for _ in 0..2 {
+            let Some(pending) = self.take_flush_batch()? else {
+                break;
+            };
+            write_pending_flush(pending).await?;
+            self.clear_completed_flush();
         }
         Ok(())
     }
 
-    /// Put a drained flush batch back into the buffer after a failed write, so
-    /// the samples are retried on the next flush instead of lost (M6). Rows are
-    /// appended; ordering doesn't matter (queries sort by timestamp).
-    pub(crate) fn reabsorb_batch(&mut self, batch: &RecordBatch) {
-        let (Some(timestamps), Some(names), Some(labels), Some(values)) = (
-            batch.column(0).as_any().downcast_ref::<UInt64Array>(),
-            batch.column(1).as_any().downcast_ref::<StringArray>(),
-            batch.column(2).as_any().downcast_ref::<StringArray>(),
-            batch.column(3).as_any().downcast_ref::<Float64Array>(),
-        ) else {
-            eprintln!("mayo: could not re-buffer a failed flush batch (schema mismatch)");
-            return;
-        };
-        for i in 0..batch.num_rows() {
-            self.buffer.push(BufferedSample {
-                timestamp: timestamps.value(i),
-                metric_name: names.value(i).to_string(),
-                labels_json: labels.value(i).to_string(),
-                value: values.value(i),
-            });
-        }
-    }
-
-    /// Drain the buffer into a self-contained [`PendingFlush`] the caller writes
-    /// later, outside any lock. Bumps the flush counter and clears the buffer
-    /// immediately, so the on-disk file name is reserved before the (slow)
-    /// write. Returns `None` when there's nothing to flush.
+    /// Return the retained pending batch or freeze and retain the current buffer.
+    /// Clear only confirmed completion. A proved foreign collision changes the
+    /// destination while preserving immutable rows and encoded bytes. The clone
+    /// can be written off-lock; dropping it does not acknowledge publication.
     pub fn take_flush_batch(&mut self) -> Result<Option<PendingFlush>, MayoError> {
+        self.clear_completed_flush();
+        if let Some(previous) = self.pending.take_if(|pending| {
+            pending
+                .foreign_collision
+                .load(std::sync::atomic::Ordering::Acquire)
+        }) {
+            // Retarget only a proved foreign collision while holding the store
+            // exclusively; preserve immutable payload and directory ownership.
+            let retargeted = PendingFlush {
+                target: self.allocate_flush_target(),
+                writing: Arc::new(tokio::sync::Mutex::new(())),
+                completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                foreign_collision: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                ..previous
+            };
+            self.pending = Some(retargeted);
+        }
+        if let Some(pending) = &self.pending {
+            return Ok(Some(pending.clone()));
+        }
         let Some(batch) = self.buffer_to_batch()? else {
             return Ok(None);
         };
-        let filename = format!("metrics_{:06}.parquet", self.flush_counter);
-        self.buffer.clear();
-        self.flush_counter += 1;
-        let target = match &self.backend {
-            Backend::Local => FlushTarget::Local {
-                data_dir: self.data_dir.clone(),
-                path: self.data_dir.join(&filename),
-            },
-            Backend::Remote { store, prefix, .. } => FlushTarget::Remote {
-                store: Arc::clone(store),
-                key: prefix.clone().join(filename.as_str()),
-            },
+        let pending = PendingFlush {
+            batch,
+            target: self.allocate_flush_target(),
+            publication: format!("{:032x}", rand::random::<u128>()),
+            encoded: Arc::new(std::sync::Mutex::new(None)),
+            local_parent_entries: Arc::new(std::sync::Mutex::new(None)),
+            writing: Arc::new(tokio::sync::Mutex::new(())),
+            completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            foreign_collision: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            test_gate: self.test_gate.clone(),
+            #[cfg(test)]
+            creation_confirmation_fault: self
+                .test_gate
+                .as_ref()
+                .and_then(|gate| gate.creation_confirmation_fault.lock().unwrap().clone()),
         };
-        Ok(Some(PendingFlush { batch, target }))
+        self.buffer.clear();
+        self.pending = Some(pending.clone());
+        Ok(Some(pending))
     }
 
     /// Build a DataFusion session exposing a `metrics` table over all data:
@@ -452,8 +1014,9 @@ impl MayoStore {
     /// [`session`](Self::session) for a query whose SQL only wants samples at
     /// or after `since`.
     ///
-    /// The `metrics` table is streamed (#377): nothing is read here beyond a
-    /// listing of file names. Each query reads its files one at a time, skips
+    /// The `metrics` table is streamed (#377): this method lists file names
+    /// and verifies only the exact retained publication, if present, so that
+    /// its memory rows do not duplicate a committed archive chunk. Each query reads its files one at a time, skips
     /// files and row groups whose footer statistics rule out its time range
     /// or metric names, and decodes only the columns it uses. `since` is one
     /// more lower bound for that pruning; the SQL's own `timestamp`
@@ -464,10 +1027,36 @@ impl MayoStore {
             Backend::Local => list_local(&self.data_dir)?,
             Backend::Remote { store, prefix } => list_remote(store, prefix, "metrics").await?,
         };
+        let mut memory = Vec::new();
+        if let Some(batch) = self.buffer_to_batch()? {
+            memory.push(batch);
+        }
+        let mut archived = Vec::new();
+        if let Some(pending) = &self.pending {
+            memory.push(pending.batch.clone());
+            for source in sources {
+                if pending.targets(&source) && pending.owns_source(&source).await? {
+                    continue;
+                }
+                archived.push(source);
+            }
+        } else {
+            archived = sources;
+        }
+        // The exact immutable source listing and retained batch are one query
+        // snapshot; an atomic publication after listing cannot add a duplicate.
+        let memory = if memory.is_empty() {
+            None
+        } else {
+            Some(
+                datafusion::arrow::compute::concat_batches(&Arc::new(metrics_schema()), &memory)
+                    .map_err(|error| MayoError::Arrow(error.to_string()))?,
+            )
+        };
         let table = ParquetTable::new(
             Arc::new(metrics_schema()),
-            sources,
-            self.buffer_to_batch()?,
+            archived,
+            memory,
             since,
             "metrics",
         );
@@ -845,6 +1434,9 @@ impl MayoStore {
             if !path.extension().is_some_and(|e| e == "parquet") {
                 continue;
             }
+            if self.pending.as_ref().is_some_and(|pending| {
+                matches!(&pending.target, FlushTarget::Local { path: owned, .. } if owned == &path)
+            }) { continue; }
             let newest = file_max_timestamp(&path).unwrap_or_else(|| {
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
@@ -1037,22 +1629,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reabsorb_batch_restores_drained_samples() {
-        // M6: a failed write must not lose the drained samples. take_flush_batch
-        // clears the buffer; reabsorb_batch puts the rows back so the next flush
-        // retries them.
-        let (mut store, _dir) = test_store();
-        let key = MetricKey::simple("cpu");
-        store.insert(&key, Sample::at(1, 1.0));
-        store.insert(&key, Sample::at(2, 2.0));
+    async fn reserving_a_flush_retains_queryable_samples_until_persistence() {
+        let (mut store, _directory) = test_store();
+        store.insert(&MetricKey::simple("cpu"), Sample::at(1, 1.0));
+        store.insert(&MetricKey::simple("cpu"), Sample::at(2, 2.0));
         let pending = store.take_flush_batch().unwrap().unwrap();
-        assert_eq!(store.buffer_len(), 0, "take_flush_batch drains the buffer");
-        store.reabsorb_batch(&pending.batch);
-        assert_eq!(store.buffer_len(), 2, "the samples are back for a retry");
-        // And they still flush and query correctly afterwards.
+        assert_eq!(store.buffer_len(), 2);
+        assert_eq!(store.query("cpu", 0, 10).await.unwrap().len(), 2);
+        write_pending_flush(pending).await.unwrap();
+        assert_eq!(store.query("cpu", 0, 10).await.unwrap().len(), 2);
+        assert_eq!(store.buffer_len(), 0);
         store.flush().await.unwrap();
-        let rows = store.query("cpu", 0, 10).await.unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(store.query("cpu", 0, 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1854,5 +2442,928 @@ mod tests {
             let store = format!("{store:?}");
             assert!(store.contains("fsync: true"), "{destination}: {store}");
         }
+    }
+    #[tokio::test]
+    async fn simultaneous_object_store_writers_keep_both_nodes_history() {
+        let bucket = tempfile::tempdir().unwrap();
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
+        let mut first = MayoStore::open(first_dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        let mut second = MayoStore::open(second_dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        let first_key = MetricKey::with_labels(
+            "cpu",
+            std::collections::BTreeMap::from([("node".into(), "a".into())]),
+        );
+        let second_key = MetricKey::with_labels(
+            "cpu",
+            std::collections::BTreeMap::from([("node".into(), "b".into())]),
+        );
+        first.insert(&first_key, Sample::at(100, 11.0));
+        second.insert(&second_key, Sample::at(100, 22.0));
+        let (a, b) = tokio::join!(first.flush(), second.flush());
+        a.unwrap();
+        b.unwrap();
+        let rows = first.query("cpu", 0, 200).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one node overwrote the other node's first chunk"
+        );
+        assert!(rows.iter().any(|row| row.3 == 11.0));
+        assert!(rows.iter().any(|row| row.3 == 22.0));
+        first.insert(&first_key, Sample::at(101, 12.0));
+        second.insert(&second_key, Sample::at(101, 23.0));
+        let (a, b) = tokio::join!(first.flush(), second.flush());
+        a.unwrap();
+        b.unwrap();
+        let restarted = MayoStore::open(first_dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        assert_eq!(restarted.query("cpu", 0, 200).await.unwrap().len(), 4);
+        assert_eq!(std::fs::read_dir(bucket.path()).unwrap().count(), 4);
+    }
+    #[tokio::test]
+    async fn node_archives_are_scoped_but_generic_queries_read_all_owners() {
+        let bucket = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
+        let mut one =
+            MayoStore::open_for_node(local.path().join("one"), Some(&url), "cluster:a/node:a")
+                .await
+                .unwrap();
+        let mut two =
+            MayoStore::open_for_node(local.path().join("two"), Some(&url), "cluster:a/node:b")
+                .await
+                .unwrap();
+        let key = MetricKey::simple("cpu");
+        one.insert(&key, Sample::at(100, 11.0));
+        two.insert(&key, Sample::at(100, 22.0));
+        one.flush().await.unwrap();
+        two.flush().await.unwrap();
+        assert_eq!(
+            one.query("cpu", 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.3)
+                .collect::<Vec<_>>(),
+            vec![11.0]
+        );
+        assert_eq!(
+            two.query("cpu", 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.3)
+                .collect::<Vec<_>>(),
+            vec![22.0]
+        );
+        let recovered = MayoStore::open_for_node(
+            local.path().join("lost-local-dir"),
+            Some(&url),
+            "cluster:a/node:a",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered
+                .query("cpu", 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.3)
+                .collect::<Vec<_>>(),
+            vec![11.0]
+        );
+        let all = MayoStore::open(local.path().join("archive-reader"), Some(&url))
+            .await
+            .unwrap();
+        assert_eq!(all.query("cpu", 0, 200).await.unwrap().len(), 2);
+        assert!(
+            MayoStore::open_for_node(local.path().join("empty-owner"), Some(&url), "")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_only_remote_chunks_refuse_collisions_without_replacing_history() {
+        let bucket = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
+        let mut store = MayoStore::open(local.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        let key = MetricKey::simple("cpu");
+        store.insert(&key, Sample::at(100, 11.0));
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        let FlushTarget::Remote {
+            store: remote,
+            key: location,
+        } = &pending.target
+        else {
+            panic!("expected remote flush")
+        };
+        let mut earlier = MayoStore::new(local.path().join("earlier"));
+        earlier.insert(&key, Sample::at(100, 99.0));
+        let bytes = batch_to_parquet_bytes(&earlier.buffer_to_batch().unwrap().unwrap()).unwrap();
+        remote
+            .put_opts(
+                location,
+                object_store::PutPayload::from(bytes),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(write_pending_flush(pending).await.is_err());
+        assert_mayo_values(&store, &[11.0, 99.0]).await;
+        // The store retains the batch and retargets only a proved collision.
+        store.flush().await.unwrap();
+        let mut values: Vec<_> = store
+            .query("cpu", 0, 200)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.3)
+            .collect();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![11.0, 99.0]);
+    }
+    // Insert inside src/mayo/store.rs::tests. Requires the separate cfg(test)
+    // MayoWriteGate instrumentation patch; no production ownership fix here.
+
+    #[derive(Debug)]
+    struct GatedMayoObjectStore {
+        inner: Arc<object_store::memory::InMemory>,
+        gate: Arc<MayoWriteGate>,
+        fail_after_commit: bool,
+        fail_reads: std::sync::atomic::AtomicBool,
+        attempts: std::sync::Mutex<Vec<object_store::path::Path>>,
+    }
+
+    impl std::fmt::Display for GatedMayoObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "gated Mayo object store")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for GatedMayoObjectStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.attempts.lock().unwrap().push(location.clone());
+            assert!(matches!(options.mode, object_store::PutMode::Create));
+            let _finished = MayoAttemptFinished(self.gate.clone());
+            self.gate
+                .wait_async(MayoWriteStage::BeforePublication)
+                .await;
+            let result = self.inner.put_opts(location, payload, options).await?;
+            let first_committed = self.gate.wait_async(MayoWriteStage::AfterPublication).await;
+            if first_committed && self.fail_after_commit {
+                return Err(object_store::Error::Generic {
+                    store: "gated Mayo fixture",
+                    source: Box::new(std::io::Error::other("response lost after committed PUT")),
+                });
+            }
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(object_store::Error::Generic {
+                    store: "gated Mayo fixture",
+                    source: Box::new(std::io::Error::other(
+                        "publication ownership read unavailable",
+                    )),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures_util::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn gated_remote_mayo(
+        directory: &std::path::Path,
+        stage: MayoWriteStage,
+        fail_after_commit: bool,
+    ) -> (MayoStore, Arc<GatedMayoObjectStore>, Arc<MayoWriteGate>) {
+        let gate = Arc::new(MayoWriteGate::new(stage));
+        let remote = Arc::new(GatedMayoObjectStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            gate: gate.clone(),
+            fail_after_commit,
+            fail_reads: std::sync::atomic::AtomicBool::new(false),
+            attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut store = MayoStore::new(directory.to_path_buf());
+        store.backend = Backend::Remote {
+            store: remote.clone(),
+            prefix: object_store::path::Path::from("node-owned"),
+        };
+        (store, remote, gate)
+    }
+
+    async fn assert_mayo_values(store: &MayoStore, expected: &[f64]) {
+        let mut actual: Vec<_> = store
+            .query("cpu", 0, 200)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.3)
+            .collect();
+        actual.sort_by(f64::total_cmp);
+        assert_eq!(
+            actual, expected,
+            "pending/publication query lost or duplicated a sample"
+        );
+    }
+
+    async fn wait_for_mayo_gate(notification: &tokio::sync::Notify) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), notification.notified())
+            .await
+            .unwrap();
+    }
+
+    async fn assert_canceled_local_mayo_error_retains_owned_rows(shared: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let gate = Arc::new(MayoWriteGate::new(MayoWriteStage::BeforePublication));
+        let _release_on_failure = ReleaseMayoWriteGate(gate.clone());
+        let mut local = MayoStore::new(directory.path().to_path_buf());
+        local.test_gate = Some(gate.clone());
+        local.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        // This makes the real atomic publication fail after the caller is canceled.
+        // A directory cannot be replaced with the completed Parquet file.
+        let refused_target = directory.path().join("metrics_000000.parquet");
+        std::fs::create_dir(&refused_target).unwrap();
+        let store = Arc::new(tokio::sync::RwLock::new(local));
+        let writer = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                if shared {
+                    flush_off_lock(&store).await.map(|_| ())
+                } else {
+                    store.write().await.flush().await
+                }
+            })
+        };
+        wait_for_mayo_gate(&gate.entered).await;
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            store.read().await.buffer_len(),
+            1,
+            "canceling the caller discarded the only store-owned sample"
+        );
+        store
+            .write()
+            .await
+            .insert(&MetricKey::simple("cpu"), Sample::at(101, 22.0));
+        gate.release();
+        wait_for_mayo_gate(&gate.finished).await;
+        assert_eq!(
+            store.read().await.buffer_len(),
+            2,
+            "a detached blocking writer failure discarded pending rows"
+        );
+        std::fs::remove_dir(&refused_target).unwrap();
+        // The intentional directory blocker is not a valid archived Parquet file.
+        // Remove it before querying, so the fixture tests retained ownership rather
+        // than the scanner's treatment of a directory named *.parquet.
+        assert_mayo_values(&*store.read().await, &[11.0, 22.0]).await;
+        assert!(flush_off_lock(&store).await.unwrap());
+        assert_mayo_values(&*store.read().await, &[11.0, 22.0]).await;
+        assert_eq!(store.read().await.buffer_len(), 0);
+        let reopened = MayoStore::new(directory.path().to_path_buf());
+        assert_mayo_values(&reopened, &[11.0, 22.0]).await;
+    }
+
+    #[tokio::test]
+    async fn canceled_local_mayo_error_retains_owned_rows_for_retry() {
+        for shared in [false, true] {
+            assert_canceled_local_mayo_error_retains_owned_rows(shared).await;
+        }
+    }
+
+    async fn assert_canceled_local_mayo_publication_is_visible_once(shared: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let gate = Arc::new(MayoWriteGate::new(MayoWriteStage::AfterPublication));
+        let _release_on_failure = ReleaseMayoWriteGate(gate.clone());
+        let mut local = MayoStore::new(directory.path().to_path_buf());
+        local.test_gate = Some(gate.clone());
+        local.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let store = Arc::new(tokio::sync::RwLock::new(local));
+        let writer = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                if shared {
+                    flush_off_lock(&store).await.map(|_| ())
+                } else {
+                    store.write().await.flush().await
+                }
+            })
+        };
+        wait_for_mayo_gate(&gate.entered).await;
+        assert!(directory.path().join("metrics_000000.parquet").is_file());
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            store.read().await.buffer_len(),
+            1,
+            "published-but-unacknowledged rows must remain store-owned"
+        );
+        assert_mayo_values(&*store.read().await, &[11.0]).await;
+        assert_eq!(
+            store.read().await.prune(u64::MAX).unwrap(),
+            0,
+            "retention removed a still-owned publication before completion"
+        );
+        assert_mayo_values(&*store.read().await, &[11.0]).await;
+        store
+            .write()
+            .await
+            .insert(&MetricKey::simple("cpu"), Sample::at(101, 22.0));
+        assert_mayo_values(&*store.read().await, &[11.0, 22.0]).await;
+        gate.release();
+        wait_for_mayo_gate(&gate.finished).await;
+        assert!(flush_off_lock(&store).await.unwrap());
+        assert_mayo_values(&*store.read().await, &[11.0, 22.0]).await;
+        assert_mayo_values(
+            &MayoStore::new(directory.path().to_path_buf()),
+            &[11.0, 22.0],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn canceled_local_mayo_publication_is_visible_once_while_writer_is_owned() {
+        for shared in [false, true] {
+            assert_canceled_local_mayo_publication_is_visible_once(shared).await;
+        }
+    }
+
+    async fn assert_canceled_remote_mayo_is_retryable(stage: MayoWriteStage, shared: bool) {
+        use futures_util::TryStreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut local, remote, gate) = gated_remote_mayo(directory.path(), stage, false);
+        let _release_on_failure = ReleaseMayoWriteGate(gate.clone());
+        local.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let store = Arc::new(tokio::sync::RwLock::new(local));
+        let writer = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                if shared {
+                    flush_off_lock(&store).await.map(|_| ())
+                } else {
+                    store.write().await.flush().await
+                }
+            })
+        };
+        wait_for_mayo_gate(&gate.entered).await;
+        let before = remote
+            .inner
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            usize::from(stage == MayoWriteStage::AfterPublication)
+        );
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        wait_for_mayo_gate(&gate.finished).await;
+        assert_eq!(
+            store.read().await.buffer_len(),
+            1,
+            "canceling an uncertain remote PUT discarded its pending batch"
+        );
+        assert_mayo_values(&*store.read().await, &[11.0]).await;
+        store
+            .write()
+            .await
+            .insert(&MetricKey::simple("cpu"), Sample::at(101, 22.0));
+        assert_mayo_values(&*store.read().await, &[11.0, 22.0]).await;
+        assert!(flush_off_lock(&store).await.unwrap());
+        assert_mayo_values(&*store.read().await, &[11.0, 22.0]).await;
+        let attempts = remote.attempts.lock().unwrap().clone();
+        assert_eq!(attempts.len(), 3, "one retry plus one new immutable chunk");
+        assert_eq!(
+            attempts[0], attempts[1],
+            "uncertain PUT retried under a new key"
+        );
+        assert_ne!(attempts[1], attempts[2]);
+        assert_eq!(
+            remote
+                .inner
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let (mut reopened, _, _) = gated_remote_mayo(directory.path(), stage, false);
+        reopened.backend = Backend::Remote {
+            store: remote,
+            prefix: object_store::path::Path::from("node-owned"),
+        };
+        assert_mayo_values(&reopened, &[11.0, 22.0]).await;
+    }
+
+    #[tokio::test]
+    async fn canceled_remote_mayo_before_commit_keeps_rows_queryable() {
+        for shared in [false, true] {
+            assert_canceled_remote_mayo_is_retryable(MayoWriteStage::BeforePublication, shared)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_remote_mayo_after_commit_retries_the_same_verified_chunk() {
+        for shared in [false, true] {
+            assert_canceled_remote_mayo_is_retryable(MayoWriteStage::AfterPublication, shared)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn errored_remote_mayo_after_commit_neither_duplicates_nor_rekeys_its_rows() {
+        use futures_util::TryStreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, remote, gate) =
+            gated_remote_mayo(directory.path(), MayoWriteStage::AfterPublication, true);
+        let _release_on_failure = ReleaseMayoWriteGate(gate.clone());
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let writer = tokio::spawn(async move {
+            let result = store.flush().await;
+            (store, result)
+        });
+        wait_for_mayo_gate(&gate.entered).await;
+        gate.release();
+        let (mut store, result) = writer.await.unwrap();
+        assert!(
+            result.is_err(),
+            "fixture must lose the response after commit"
+        );
+        assert_mayo_values(&store, &[11.0]).await;
+        store.flush().await.unwrap();
+        assert_mayo_values(&store, &[11.0]).await;
+        let attempts = remote.attempts.lock().unwrap().clone();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0], attempts[1],
+            "an uncertain failure allocated a fresh key"
+        );
+        assert_eq!(
+            remote
+                .inner
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_identical_sample_chunk_is_kept_and_the_pending_publication_is_rekeyed() {
+        use futures_util::TryStreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        let remote = Arc::new(object_store::memory::InMemory::new());
+        let mut store = MayoStore::new(directory.path().to_path_buf());
+        store.backend = Backend::Remote {
+            store: remote.clone(),
+            prefix: object_store::path::Path::from("node-owned"),
+        };
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        let FlushTarget::Remote { key, .. } = &pending.target else {
+            panic!("expected remote target");
+        };
+        let refused_key = key.clone();
+        // Independent publication identity, identical metric rows. A sample-only
+        // comparison must never mistake this older publication for our pending one.
+        let foreign_publication = format!("{:032x}", rand::random::<u128>());
+        let properties = datafusion::parquet::file::properties::WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![datafusion::parquet::file::metadata::KeyValue {
+                key: "reliaburger.mayo.publication".into(),
+                value: Some(foreign_publication),
+            }]))
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, pending.batch.schema(), Some(properties)).unwrap();
+        writer.write(&pending.batch).unwrap();
+        writer.close().unwrap();
+        remote
+            .put_opts(
+                &refused_key,
+                bytes.into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(write_pending_flush(pending).await.is_err());
+        assert_mayo_values(&store, &[11.0, 11.0]).await;
+        store.flush().await.unwrap();
+        assert_mayo_values(&store, &[11.0, 11.0]).await;
+        let objects = remote.list(None).try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(
+            objects.len(),
+            2,
+            "foreign history was replaced or pending rows lost"
+        );
+        assert!(objects.iter().any(|object| object.location == refused_key));
+        let mut reopened = MayoStore::new(directory.path().to_path_buf());
+        reopened.backend = Backend::Remote {
+            store: remote,
+            prefix: object_store::path::Path::from("node-owned"),
+        };
+        assert_mayo_values(&reopened, &[11.0, 11.0]).await;
+    }
+
+    #[test]
+    fn failed_mayo_backlog_is_bounded_without_discarding_the_owned_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = MayoStore::new(directory.path().to_path_buf());
+        let key = MetricKey::simple("cpu");
+        store.insert(&key, Sample::at(100, 11.0));
+        let original = store.take_flush_batch().unwrap().unwrap();
+        let original_path = match original.target {
+            FlushTarget::Local { path, .. } => path,
+            _ => unreachable!(),
+        };
+        for _ in 0..1_000_100 {
+            store.insert(&key, Sample::at(101, 22.0));
+        }
+        assert!(
+            store.buffer_len() <= 1_000_000,
+            "failed publication grew the backlog beyond its row cap"
+        );
+        let retry = store.take_flush_batch().unwrap().unwrap();
+        let retry_path = match retry.target {
+            FlushTarget::Local { path, .. } => path,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            retry_path, original_path,
+            "backlog shedding discarded the protected publication"
+        );
+        assert_eq!(retry.batch.num_rows(), 1);
+        assert_eq!(
+            retry
+                .batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            11.0
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_remote_mayo_ownership_read_retains_the_same_publication() {
+        use futures_util::TryStreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, remote, gate) =
+            gated_remote_mayo(directory.path(), MayoWriteStage::AfterPublication, true);
+        let _release_on_failure = ReleaseMayoWriteGate(gate.clone());
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let writer = tokio::spawn(async move {
+            let result = store.flush().await;
+            (store, result)
+        });
+        wait_for_mayo_gate(&gate.entered).await;
+        gate.release();
+        let (mut store, result) = writer.await.unwrap();
+        assert!(
+            result.is_err(),
+            "fixture must lose the committed PUT response"
+        );
+        remote
+            .fail_reads
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            store.flush().await.is_err(),
+            "unknown ownership must not allocate a fresh key"
+        );
+        assert_eq!(
+            store.buffer_len(),
+            1,
+            "unproved publication lost its retained sample"
+        );
+        assert!(
+            store.query("cpu", 0, 200).await.is_err(),
+            "unknown ownership must not return duplicated or silently hidden rows"
+        );
+        remote
+            .fail_reads
+            .store(false, std::sync::atomic::Ordering::Release);
+        store.flush().await.unwrap();
+        assert_mayo_values(&store, &[11.0]).await;
+        let attempts = remote.attempts.lock().unwrap().clone();
+        assert_eq!(attempts.len(), 3);
+        assert!(
+            attempts.iter().all(|key| key == &attempts[0]),
+            "transient ownership failure retargeted an uncertain publication"
+        );
+        assert_eq!(
+            remote
+                .inner
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_mayo_parent_confirmation_failure_retries_the_owned_creation_chain() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("created-outer/created-inner/metrics");
+        let gate = Arc::new(MayoWriteGate::new(MayoWriteStage::BeforePublication));
+        let _release_on_failure = ReleaseMayoWriteGate(gate.clone());
+        gate.fail_parent_sync.store(true, Ordering::Release);
+        // Publication runs without waiting; the controlled fault applies only to
+        // actual owned parent-entry confirmation, after real file publication.
+        gate.release();
+        let mut store = MayoStore::new(directory.clone());
+        store.test_gate = Some(gate.clone());
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let first = store.flush().await;
+        assert!(
+            matches!(first,
+        Err(MayoError::Io(ref error))
+        if error.to_string().contains("controlled Mayo parent-directory confirmation failure")),
+            "flush must refuse uncertain owned-directory publication: {first:?}"
+        );
+        assert!(directory.join("metrics_000000.parquet").is_file());
+        assert_eq!(
+            store.buffer_len(),
+            1,
+            "uncertain directory entry lost retained ownership"
+        );
+        assert_mayo_values(&store, &[11.0]).await;
+        let failed_visits = gate.parent_sync_visits.load(Ordering::Acquire);
+        assert!(
+            failed_visits > 0,
+            "fixture never reached real parent confirmation"
+        );
+        gate.fail_parent_sync.store(false, Ordering::Release);
+        store.flush().await.unwrap();
+        // The newly created directories now exist. Retry must retain their original
+        // three parent entries instead of rediscovering an empty creation chain.
+        assert!(
+            gate.parent_sync_visits.load(Ordering::Acquire) >= failed_visits + 3,
+            "retry forgot owned ancestor entries after the first publication error"
+        );
+        assert_eq!(store.buffer_len(), 0);
+        assert_mayo_values(&store, &[11.0]).await;
+        let reopened = MayoStore::new(directory);
+        assert_mayo_values(&reopened, &[11.0]).await;
+    }
+
+    #[tokio::test]
+    async fn reopened_mayo_reconfirms_a_visible_owned_directory_entry_before_ack() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("owned-metrics");
+        let first_gate = Arc::new(MayoWriteGate::new(MayoWriteStage::BeforePublication));
+        let _first_release = ReleaseMayoWriteGate(first_gate.clone());
+        first_gate.fail_parent_sync.store(true, Ordering::Release);
+        first_gate.release();
+        let mut first = MayoStore::new(directory.clone());
+        first.test_gate = Some(first_gate);
+        first.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let first_result = first.flush().await;
+        assert!(
+            matches!(first_result,
+        Err(MayoError::Io(ref error))
+        if error.to_string().contains("controlled Mayo parent-directory confirmation failure")),
+            "first publication did not reach its controlled uncertainty: {first_result:?}"
+        );
+        assert!(directory.join("metrics_000000.parquet").is_file());
+        drop(first);
+        // Reopen a genuine visible archive left by the failed writer. The fresh
+        // handle cannot use the old in-memory missing-directory inventory.
+        let gate = Arc::new(MayoWriteGate::new(MayoWriteStage::BeforePublication));
+        let _release_on_failure = ReleaseMayoWriteGate(gate.clone());
+        gate.fail_parent_sync.store(true, Ordering::Release);
+        gate.release();
+        let mut reopened = MayoStore::new(directory.clone());
+        reopened.test_gate = Some(gate.clone());
+        reopened.insert(&MetricKey::simple("cpu"), Sample::at(101, 22.0));
+        let result = reopened.flush().await;
+        assert!(
+            matches!(result,
+        Err(MayoError::Io(ref error))
+        if error.to_string().contains("controlled Mayo parent-directory confirmation failure")),
+            "fresh store acknowledged an unconfirmed visible owned directory: {result:?}"
+        );
+        assert_eq!(reopened.buffer_len(), 1);
+        assert_mayo_values(&reopened, &[11.0, 22.0]).await;
+        let failed_visits = gate.parent_sync_visits.load(Ordering::Acquire);
+        assert!(
+            failed_visits > 0,
+            "fresh store skipped configured directory-entry confirmation"
+        );
+        gate.fail_parent_sync.store(false, Ordering::Release);
+        reopened.flush().await.unwrap();
+        assert!(gate.parent_sync_visits.load(Ordering::Acquire) > failed_visits);
+        assert_eq!(reopened.buffer_len(), 0);
+        assert_mayo_values(&MayoStore::new(directory), &[11.0, 22.0]).await;
+    }
+
+    fn mayo_creation_confirmation_fixture(
+        directory: &std::path::Path,
+        child: &std::path::Path,
+    ) -> (MayoStore, Arc<MayoCreationConfirmationFault>) {
+        let fault = Arc::new(MayoCreationConfirmationFault {
+            child: child.to_path_buf(),
+            failing: std::sync::atomic::AtomicBool::new(true),
+            visits: std::sync::Mutex::new(Vec::new()),
+        });
+        let gate = Arc::new(MayoWriteGate::new(MayoWriteStage::BeforePublication));
+        gate.release();
+        *gate.creation_confirmation_fault.lock().unwrap() = Some(fault.clone());
+        let mut store = MayoStore::new(directory.to_path_buf());
+        store.test_gate = Some(gate);
+        (store, fault)
+    }
+
+    #[tokio::test]
+    async fn missing_mayo_ancestor_is_confirmed_before_descendants_or_publication() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let outer = root.path().join("owned-outer");
+        let inner = outer.join("owned-inner");
+        let directory = inner.join("metrics");
+        let (mut store, fault) = mayo_creation_confirmation_fixture(&directory, &outer);
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let result = store.flush().await;
+        assert!(
+            matches!(result, Err(MayoError::Io(ref error))
+            if error.to_string().contains("controlled Mayo creation-entry confirmation failure")),
+            "missing ancestor confirmation was not refused: {result:?}"
+        );
+        assert_eq!(&*fault.visits.lock().unwrap(), std::slice::from_ref(&outer));
+        assert!(outer.is_dir(), "fault must follow its actual mkdir");
+        assert!(
+            !inner.exists(),
+            "descendant was created before ancestor confirmation"
+        );
+        assert!(
+            !directory.exists(),
+            "publication tree survived an unconfirmed ancestor"
+        );
+        assert_eq!(store.buffer_len(), 1);
+        assert_mayo_values(&store, &[11.0]).await;
+        store.insert(&MetricKey::simple("cpu"), Sample::at(101, 22.0));
+        assert_mayo_values(&store, &[11.0, 22.0]).await;
+        fault.failing.store(false, Ordering::Release);
+        store.flush().await.unwrap();
+        assert!(
+            fault.visits.lock().unwrap().len() >= 2,
+            "retry failed to reconfirm the visible outer entry"
+        );
+        assert_eq!(store.buffer_len(), 0);
+        assert_mayo_values(&store, &[11.0, 22.0]).await;
+        let parquet = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "parquet")
+            })
+            .count();
+        assert_eq!(parquet, 2, "each immutable pending batch must publish once");
+        assert_mayo_values(&MayoStore::new(directory), &[11.0, 22.0]).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_mayo_store_reconfirms_visible_outer_entry_before_descent() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let outer = root.path().join("owned-outer");
+        let inner = outer.join("owned-inner");
+        let directory = inner.join("metrics");
+        // First configure the outer directory itself. This leaves just that
+        // shared entry uncertain even under the current post-publication
+        // proposal, so the second half independently tests a fresh handle.
+        let (mut first, first_fault) = mayo_creation_confirmation_fixture(&outer, &outer);
+        first.insert(&MetricKey::simple("cpu"), Sample::at(100, 11.0));
+        let result = first.flush().await;
+        assert!(
+            matches!(result, Err(MayoError::Io(ref error))
+            if error.to_string().contains("controlled Mayo creation-entry confirmation failure")),
+            "first writer never reached entry-confirmation uncertainty: {result:?}"
+        );
+        assert_eq!(
+            &*first_fault.visits.lock().unwrap(),
+            std::slice::from_ref(&outer)
+        );
+        assert!(outer.is_dir());
+        assert!(!inner.exists());
+        assert!(!directory.exists());
+        assert_eq!(first.buffer_len(), 1);
+        assert_mayo_values(&first, &[11.0]).await;
+        drop(first);
+        // The fixed writer has not published its old buffer. The intermediate
+        // proposal may have published in `outer`, outside the fresh deeper
+        // archive. This case does not claim recovery of uncommitted memory.
+        let (mut fresh, fault) = mayo_creation_confirmation_fixture(&directory, &outer);
+        fresh.insert(&MetricKey::simple("cpu"), Sample::at(101, 22.0));
+        let result = fresh.flush().await;
+        assert!(
+            matches!(result, Err(MayoError::Io(ref error))
+            if error.to_string().contains("controlled Mayo creation-entry confirmation failure")),
+            "fresh handle descended through an unconfirmed visible outer entry: {result:?}"
+        );
+        assert_eq!(&*fault.visits.lock().unwrap(), std::slice::from_ref(&outer));
+        assert!(!inner.exists());
+        assert!(!directory.exists());
+        assert_eq!(fresh.buffer_len(), 1);
+        assert_mayo_values(&fresh, &[22.0]).await;
+        fault.failing.store(false, Ordering::Release);
+        fresh.flush().await.unwrap();
+        assert!(fault.visits.lock().unwrap().len() >= 2);
+        assert_eq!(fresh.buffer_len(), 0);
+        assert_mayo_values(&fresh, &[22.0]).await;
+        let parquet = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "parquet")
+            })
+            .count();
+        assert_eq!(parquet, 1);
+        assert_mayo_values(&MayoStore::new(directory), &[22.0]).await;
     }
 }

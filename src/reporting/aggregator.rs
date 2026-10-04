@@ -40,6 +40,11 @@ const EVICTION_MULTIPLIER: u32 = 3;
 /// the current leadership epoch.
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedState {
+    /// Raft term under which this exact watch snapshot was published.
+    /// None denotes a standalone aggregator without a leadership channel.
+    pub leadership_epoch: Option<u64>,
+    /// Local monotonic receive deadlines; never serialized or sender-provided.
+    pub receive_deadlines: HashMap<NodeId, Instant>,
     /// Latest report from each worker node.
     pub reports: HashMap<NodeId, StateReport>,
     /// Nodes whose last report was *received* longer ago than
@@ -50,6 +55,18 @@ pub struct AggregatedState {
     pub capabilities: HashMap<NodeId, NodeCapabilityReport>,
     /// Fresh critical-subsystem evidence. Absence means unready.
     pub readiness: HashMap<NodeId, NodeReadinessReport>,
+}
+
+impl AggregatedState {
+    /// Whether this exact published report still has receive-time provenance.
+    pub fn report_is_fresh(&self, node: &NodeId) -> bool {
+        self.reports.contains_key(node)
+            && !self.stale_nodes.contains(node)
+            && self
+                .receive_deadlines
+                .get(node)
+                .is_some_and(|deadline| *deadline > Instant::now())
+    }
 }
 
 /// A stored report plus the aggregator-side metadata that decides its fate.
@@ -418,6 +435,18 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             .collect();
 
         AggregatedState {
+            leadership_epoch: self.epoch_rx.as_ref().map(|_| epoch),
+            receive_deadlines: self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.epoch == epoch)
+                .filter_map(|(node, entry)| {
+                    entry
+                        .received_at
+                        .checked_add(stale_timeout)
+                        .map(|deadline| (node.clone(), deadline))
+                })
+                .collect(),
             reports,
             stale_nodes,
             capabilities,
