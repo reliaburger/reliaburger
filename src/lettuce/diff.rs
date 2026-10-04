@@ -183,17 +183,10 @@ pub fn compute_diff(
         }
     }
 
-    // Jobs are deliberately absent from the diff. A job runs to
-    // completion; it isn't reconciled desired state, so there's no job
-    // map in Raft to compare against (see `config_to_desired_writes`).
-    // The old code compared every git job against an always-empty set,
-    // so it emitted an `Add` for every job on *every* sync — a change the
-    // applier then silently dropped (`ChangePayload::Generic` maps to no
-    // write) while inflating `summary.added`. That's the GIT2b bug: a job
-    // "removed" from git was never in the desired state to begin with, so
-    // it can't be re-added, and a job present in git is dispatched by the
-    // one-shot deploy path, not by reconciliation. Emitting nothing here
-    // keeps the summary honest and the applier free of no-op changes.
+    // Jobs are absent from desired-state diffs: no reconciled job map exists
+    // in Raft. `execute_sync` explicitly refuses any tree containing jobs
+    // before reaching this function, so dependent apps cannot be published
+    // while a migration is omitted. Manual apply owns job execution.
 
     let summary = DiffSummary {
         added,

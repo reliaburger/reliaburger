@@ -1096,6 +1096,12 @@ agent's command loop.
 
 ## Batch scheduling
 
+Submitting a batch can start a host process just as applying a job can. We check the caller's token role and app/namespace scope, the namespace's `deploy` grant, and `host-exec` for an explicit binary or script before registering or dispatching any job. Followers make the same check and forward the caller's credential, so the leader rechecks its current permission map. Using the cluster service token for that hop would turn a restricted user into a system principal.
+
+We validate the complete job group through `Config::validate_against`, passing the committed namespace context. A missing runtime or conflicting `image`, `exec` and `script` fields fail before any registration. The authenticated internal runner uses the same preflight, so a service credential cannot bypass specification or lease validation.
+
+Batch dispatch doesn't carry server-owned test-lease ownership. We refuse test namespaces, lease headers and test-owned image repositories through this route. Those jobs must use the lease-aware apply path, which records their ownership before runtime mutation. Our tests pin scope refusal, deploy and host-execution grants, and rejection of unowned test storage references.
+
 The Meat scheduler's Filter→Score→Select→Commit pipeline evaluates every node for every placement. That's the right trade-off for long-running apps where quality of placement matters — you want the best node, not just any node. But for batch jobs (short-lived, many identical instances), you need throughput.
 
 One hundred thousand jobs. One hundred nodes. Under one second.

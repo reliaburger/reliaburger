@@ -783,7 +783,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.publish_backend_kernel(&ServiceId::new(&entry.namespace, &entry.app_name), &map)
                 .await?;
         }
-        *self.routing_table.write().await = table;
+        let mut current = self.routing_table.write().await;
+        table.inherit_local_health(&current);
+        *current = table;
+        drop(current);
         self.service_map_tx.send_replace(map);
         Ok(())
     }

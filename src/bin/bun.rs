@@ -318,6 +318,66 @@ fn load_node_identity(
         .transpose()
 }
 
+/// Stable archive ownership must survive a node restart without depending on
+/// its human label or local path. Enrolled nodes use their cluster trust root
+/// and certificate node ID. Plaintext nodes persist an opaque owner alongside
+/// their state; restoring a remote archive also requires restoring this file.
+fn configured_metrics_archive_owner(config: &NodeConfig) -> anyhow::Result<String> {
+    if config.metrics.object_store_url.is_empty() {
+        return Ok(String::new());
+    }
+    metrics_archive_owner(config, &config.storage.data)
+}
+
+fn metrics_archive_owner(
+    config: &NodeConfig,
+    data_base: &std::path::Path,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    if let Some(live) = load_node_identity(config)? {
+        let identity = live.snapshot();
+        return Ok(format!(
+            "tls:{:x}:{}",
+            Sha256::digest(&identity.root_ca_der),
+            identity.node_id
+        ));
+    }
+    let path = data_base.join("metrics-archive-owner");
+    std::fs::create_dir_all(data_base)
+        .with_context(|| format!("create archive owner directory {}", data_base.display()))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            let owner = format!("{:032x}", rand::random::<u128>());
+            file.write_all(owner.as_bytes())?;
+            file.sync_all()?;
+            std::fs::File::open(data_base)?.sync_all()?;
+            Ok(format!("plain:{owner}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let owner = std::fs::read_to_string(&path)
+                .with_context(|| format!("read archive owner {}", path.display()))?;
+            if owner.len() != 32 || !owner.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                anyhow::bail!(
+                    "invalid metrics archive owner in {}; restore the node state backup",
+                    path.display()
+                );
+            }
+            std::fs::File::open(&path)?.sync_all()?;
+            std::fs::File::open(data_base)?.sync_all()?;
+            Ok(format!("plain:{owner}"))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("persist archive owner {}", path.display()))
+        }
+    }
+}
+
 /// Enforce the `require_mtls` mode matrix before the cluster starts.
 ///
 /// With `require_mtls` set and no identity on disk, the node cannot speak the
@@ -807,6 +867,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .claim_upload_directory()
         .await
         .context("cannot recover registry upload ownership")?;
+    blob_store
+        .configure_storage_limit(
+            reliaburger::config::types::parse_byte_size(&config.images.max_storage)
+                .context("invalid images.max_storage")?,
+        )
+        .await
+        .context("cannot account physical image storage")?;
 
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
@@ -919,6 +986,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // long before them, so the source is injected late via a OnceLock
     // slot shared by ImageStore clones.
     let cluster_image_store = runtime.image_store();
+    if let Some(store) = &cluster_image_store {
+        store
+            .set_blob_store(Arc::clone(&blob_store))
+            .map_err(anyhow::Error::msg)?;
+    }
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -946,10 +1018,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // With `[metrics] object_store_url` set, metrics are persisted to and
     // queried from an object store (s3://, gs://, file://) so they survive node
     // loss (H8); otherwise Parquet stays in the local metrics dir.
+    let archive_owner = configured_metrics_archive_owner(&config)?;
     let mayo_store = Arc::new(RwLock::new(
-        MayoStore::open(metrics_dir, Some(config.metrics.object_store_url.as_str()))
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to open metrics store: {e}"))?,
+        MayoStore::open_for_node(
+            metrics_dir,
+            Some(config.metrics.object_store_url.as_str()),
+            &archive_owner,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open metrics store: {e}"))?,
     ));
 
     // Create the agent (extract deploy history handle before spawning).
@@ -2720,15 +2797,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Arc::clone(&api_token_store),
         service_token.clone(),
     ));
-    // Storage quotas (REG4): a per-repository ceiling derived from
-    // `[images] max_storage` divided across repositories is more than an
-    // operator asked for; we apply `max_storage` as the registry-wide cap
-    // and leave per-repository unlimited unless configured.
-    let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig {
-        per_repository_bytes: 0,
-        total_bytes: reliaburger::config::types::parse_byte_size(&config.images.max_storage)
-            .unwrap_or(0),
-    };
+    // Physical payloads, including temporary uploads and runtime pulls, share
+    // the configured BlobStore cap. Logical per-repository policy is separate.
+    let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig::default();
     let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
         reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
     );
@@ -4033,5 +4104,152 @@ mod tests {
             "anonymous"
         );
         shutdown.cancel();
+    }
+    #[test]
+    fn metrics_archive_owners_survive_restarts_and_plaintext_label_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = root.path().to_path_buf();
+        config.node.name = Some("same-label".into());
+        let first = metrics_archive_owner(&config, &root.path().join("first")).unwrap();
+        let second = metrics_archive_owner(&config, &root.path().join("second")).unwrap();
+        assert_ne!(
+            first, second,
+            "duplicate human labels must not share archives"
+        );
+        config.node.name = Some("renamed-label".into());
+        assert_eq!(
+            metrics_archive_owner(&config, &root.path().join("first")).unwrap(),
+            first
+        );
+        let backup = root.path().join("recovered");
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::copy(
+            root.path().join("first/metrics-archive-owner"),
+            backup.join("metrics-archive-owner"),
+        )
+        .unwrap();
+        assert_eq!(metrics_archive_owner(&config, &backup).unwrap(), first);
+    }
+
+    #[test]
+    fn metrics_archive_owner_refuses_corruption_and_failed_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = root.path().to_path_buf();
+        std::fs::write(root.path().join("metrics-archive-owner"), "partial").unwrap();
+        assert!(
+            metrics_archive_owner(&config, root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("invalid metrics archive owner")
+        );
+        let blocked = root.path().join("regular-file");
+        std::fs::write(&blocked, "blocked").unwrap();
+        assert!(metrics_archive_owner(&config, &blocked).is_err());
+    }
+
+    #[test]
+    fn remote_plaintext_owners_refuse_configured_paths_that_would_share_a_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let shared_fallback = root.path().join("shared-user-fallback");
+        let mut first = NodeConfig::default();
+        first.node.name = Some("first-node".into());
+        // A valid, explicitly configured empty identity directory lets a
+        // plaintext node reach the storage fallback instead of failing an
+        // unrelated identity lookup under the blocked data path.
+        let identities = root.path().join("empty-identities");
+        std::fs::create_dir(&identities).unwrap();
+        first.security.identity_dir = Some(identities);
+        first.metrics.object_store_url = "s3://bucket/archive".into();
+        first.storage.data = root.path().join("blocked-first");
+        std::fs::write(&first.storage.data, "not a directory").unwrap();
+        let mut second = first.clone();
+        second.node.name = Some("second-node".into());
+        second.storage.data = root.path().join("blocked-second");
+        std::fs::write(&second.storage.data, "not a directory").unwrap();
+        // A per-user fallback would choose the same archive identity for two
+        // distinct nodes. Remote production startup refuses both configured paths.
+        assert_eq!(
+            metrics_archive_owner(&first, &shared_fallback).unwrap(),
+            metrics_archive_owner(&second, &shared_fallback).unwrap()
+        );
+        assert!(configured_metrics_archive_owner(&first).is_err());
+        assert!(configured_metrics_archive_owner(&second).is_err());
+        first.metrics.object_store_url.clear();
+        assert!(
+            configured_metrics_archive_owner(&first).unwrap().is_empty(),
+            "local metrics keep their existing fallback behavior"
+        );
+    }
+
+    #[test]
+    fn enrolled_metrics_archive_owner_uses_the_root_and_certificate_node_id() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        reliaburger::relish::commands::init(first.path(), "first-cluster", "shared-label").unwrap();
+        reliaburger::relish::commands::init(second.path(), "second-cluster", "shared-label")
+            .unwrap();
+        let config_one = NodeConfig::from_file(&first.path().join("reliaburger.toml")).unwrap();
+        let config_two = NodeConfig::from_file(&second.path().join("reliaburger.toml")).unwrap();
+        let one = metrics_archive_owner(&config_one, first.path()).unwrap();
+        let two = metrics_archive_owner(&config_two, second.path()).unwrap();
+        assert_ne!(one, two);
+        assert!(one.ends_with(":shared-label"));
+        assert_eq!(
+            metrics_archive_owner(&config_one, first.path()).unwrap(),
+            one
+        );
+        assert!(!first.path().join("metrics-archive-owner").exists());
+    }
+
+    #[test]
+    fn enrolled_metrics_archive_owner_survives_leaf_renewal_and_uses_certificate_node_id() {
+        use reliaburger::sesame::{ca, identity_store, types::SerialNumber};
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = directory.path().to_path_buf();
+        config.node.name = Some("first-human-label".into());
+        let hierarchy = ca::generate_ca_hierarchy("archive-owner", b"archive-owner-test").unwrap();
+        let issue = |node_id: &str, serial| {
+            let (certificate_der, private_key_der, serial) = ca::issue_node_cert(
+                node_id,
+                SerialNumber(serial),
+                &hierarchy.node.signing_keypair,
+                &hierarchy.node.certificate_params,
+            )
+            .unwrap();
+            identity_store::NodeIdentity {
+                node_id: node_id.into(),
+                certificate_der,
+                private_key_der,
+                serial,
+                ca_generation: 0,
+                node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+                root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+                not_before: std::time::SystemTime::UNIX_EPOCH,
+                not_after: std::time::SystemTime::UNIX_EPOCH,
+            }
+        };
+        let identity = node_identity_dir(&config);
+        let original = issue("certificate-node", 100);
+        identity_store::save(&identity, &original).unwrap();
+        let owner = metrics_archive_owner(&config, directory.path()).unwrap();
+        config.node.name = Some("renamed-human-label".into());
+        let renewed = issue("certificate-node", 101);
+        assert_ne!(renewed.certificate_der, original.certificate_der);
+        identity_store::save(&identity, &renewed).unwrap();
+        assert_eq!(
+            metrics_archive_owner(&config, directory.path()).unwrap(),
+            owner,
+            "renewing a leaf under the same root and NodeId must reopen its archive"
+        );
+        identity_store::save(&identity, &issue("another-certificate-node", 102)).unwrap();
+        assert_ne!(
+            metrics_archive_owner(&config, directory.path()).unwrap(),
+            owner,
+            "human labels must not select the archive for a different certificate NodeId"
+        );
+        assert!(!directory.path().join("metrics-archive-owner").exists());
     }
 }

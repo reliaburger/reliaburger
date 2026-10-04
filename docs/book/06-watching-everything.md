@@ -52,6 +52,12 @@ object_store_url = "s3://my-bucket/reliaburger-metrics"
 
 Same code, same queries, same dashboard. The only difference is where the bytes go. Your metrics survive node failures because they're in S3, not on a local disk that just caught fire.
 
+Remote metric chunks use random 128-bit names and create-only PUTs. Two nodes starting with the same empty bucket cannot choose `metrics_000000.parquet` and silently overwrite each other. Even a name collision refuses the second write and leaves its samples available for retry.
+
+Bun opens a node-owned prefix beneath that bucket. For an enrolled node, the owner combines the cluster root CA fingerprint with the node ID in its certificate; renewing a leaf certificate under the same root and node ID keeps the same archive. A different root CA or a newly enrolled node identity gets a different prefix; the archive-wide reader can still inspect the earlier prefix. Plaintext nodes keep an opaque owner in `metrics-archive-owner` under the configured `[storage] data` directory. Back up that file: restoring only a remote bucket cannot identify which plaintext node's history to reopen. A human label or local directory path never chooses the prefix. Remote archive startup refuses an unwritable configured data directory or corrupt owner. Set `[storage] data` to a writable directory owned by that node, or restore its owner file from backup. Falling back to the common per-user state directory could give two nodes the same archive owner, so remote plaintext archives never use that fallback. Ordinary local metrics keep their existing fallback behaviour.
+
+Each production node queries its own prefix, so cluster fan-out and rollups count each archive once. Remote retention still belongs to the bucket lifecycle policy; the existing remote prune path remains a no-op. `MayoStore::open` remains an archive-wide API for explicit offline queries; `open_for_node` is the production scope. This changes the durable ownership contract even though the Parquet columns stay the same, so it increments the state generation. Startup, joins and upgrades refuse the earlier generation; recreate the cluster with fresh node state rather than rolling across that boundary. The earlier shared prefix cannot prove which node owns each chunk, so we preserve it separately instead of guessing an owner or migrating it into a scoped archive.
+
 ## Collecting metrics
 
 The `sysinfo` crate gives us cross-platform system metrics without writing platform-specific code. On both Linux and macOS, we collect:
@@ -293,6 +299,10 @@ Second, the client filters too, for `-f` and for `--json-field`, which the serve
 ### The unified query path
 
 Both the flushed Parquet files and the unflushed in-memory buffer are included in every DataFusion query. Same trick we use for metrics. There's no blind spot — you see logs from 30 seconds ago in the same SQL query as logs from last week. No merging, no separate code paths, no seams.
+
+A failed flush used to drain the only in-memory copy before it wrote Parquet. An unwritable directory or a failed ingest-checkpoint rename then lost captured rows while their live offsets still claimed they had been read. The store now owns one pending batch until both its Parquet file and capture checkpoint are durable. Retrying reserves the same filename, serialises writers for that batch and finishes it before advancing a newer checkpoint. An async caller can be cancelled while its blocking writer runs; that writer retains its I/O guard, and the store retains the rows for the next attempt.
+
+Queries keep their own copy of the pending batch and exclude its immutable sequence range from the disk relation. A rename during the disk scan therefore cannot add a second copy. New rows are allocated and inserted together under the store's write lock, so they always lie above that reserved range. Failed directory writes, failed checkpoint writes and an explicitly paused, cancelled writer are tested through reads, later appends, retries and reopening the capture checkpoint. A process crash between publishing Parquet and saving the checkpoint can still replay a batch on restart: the in-memory owner disappears with the process. That restart boundary, and the Parquet helper's discarded directory-sync error, need separate recovery qualification.
 
 ## The dashboard
 
@@ -730,6 +740,8 @@ in both modes and checks each line's stream. Across the two streams the order
 is the order the lines were read in: neither file stamps its lines, so a
 stdout line and a stderr line written within the same poll can swap places.
 Within one stream, the order is exact.
+
+A file follower can also reach EOF before the process has exited: the child may write its last bytes between the empty read and the next state check. After confirming that the child stopped, the follower scans both files once more before declaring EOF. It preserves the existing resume offsets, so that final scan adds only unseen bytes. Two tests hold the follower at the earlier empty read, release the real child to write stdout and stderr and exit, then check the final lines and their byte positions, including a resumed capture.
 
 A process exiting and its pipe readers reaching EOF are separate events. The in-memory runtime now owns both reader tasks and tracks their completion. A final snapshot waits for that completion outside the process-map lock, and a follower scans once more after completion before returning. `Stopping` is not EOF. This prevents a short-lived child from being reported stopped while its final stdout or stderr chunk is still waiting to reach the buffers.
 

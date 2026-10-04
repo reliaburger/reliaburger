@@ -742,7 +742,7 @@ Two tests pin the behaviour down. The first deploys an app whose `create` sleeps
 
 ## One config, two front doors, one path
 
-A Reliaburger config file describes more than apps. It can declare namespaces (with resource budgets), permissions (who can do what), jobs, and image builds — all in the same TOML. And there are two ways to get that file into the cluster. You can run `relish apply` by hand, or you can commit it to a git repo and let the Lettuce GitOps engine sync it. Same file, two front doors.
+A Reliaburger config file describes more than apps. It can declare namespaces (with resource budgets), permissions (who can do what), jobs, and image builds — all in the same TOML. Apps, namespaces and permissions have two routes into desired state: manual `relish apply` and the Lettuce GitOps engine. Manual apply additionally executes jobs. GitOps refuses a tree containing any job before it writes desired state; sharing the configuration format does not give Lettuce a job execution path.
 
 Here's the question that keeps you up at night: do those two doors lead to the same room? If `relish apply` writes an app but silently drops the namespace, while GitOps writes the namespace but mangles the app's identity, then "declarative" is a lie. The cluster's state depends on *how* you applied the config, not *what's in it*. That's the worst kind of bug, because it only shows up when someone switches from one door to the other and wonders why their quota vanished.
 
@@ -830,6 +830,16 @@ The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the 
 The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
 
 The first version of this fix only checked the outer `Err`, and a static review (B15) caught what that misses. `council.write` returns `Result<CouncilResponse, CouncilError>`, and `Err` only means Raft didn't commit the entry. An entry can commit and still be *refused*: the state machine applies it in log order, decides it isn't allowed, and answers `Ok(CouncilResponse::Refused { reason })` with desired state untouched. An app in an `rbtest-*` namespace is one, since only a leased test write may create those. That `Ok` counted as applied, and the commit advanced past a change that never happened. The `match` above names the refusal next to the transport error, so both stop the sync. The pattern `A | B` in one arm matches either shape, and `Ok(_)` after it catches every other response. The test drives `apply_changes` on a real leader with an `rbtest-lease/web` app and expects the refusal to come back as that resource's id.
+
+## Validating with the right namespace context
+
+A permission file can refer to `prod` after an earlier apply created that namespace. The CLI only has the new file, so a validation pass that insists on seeing `[namespace.prod]` there rejects a valid request. Adding the declaration to satisfy the CLI can replace the namespace's existing quota. The server had the right `validate_against` method, but its earlier validation pass rejected the request before that method ran.
+
+We now share the field checks and make the available context explicit. `validate_intrinsic` checks names, resource values, workload specifications, permission actions and build destination syntax. It leaves permission/build namespace existence for live admission. `validate_against` passes the union of inline declarations and committed namespaces to the same checks; offline `validate` uses only inline declarations.
+
+The helper takes `Option<&[String]>`. `None` means the caller has no authoritative namespace catalogue yet; `Some` supplies a borrowed slice, so validation reads the catalogue without owning or copying it. The CLI's apply and deploy paths use the intrinsic pass. A cluster API repeats it, forwards the original credential if needed, and the leader performs the context check before any desired-state write. Standalone admission and offline lint still use full validation.
+
+A build-only apply also reaches the leader for validation, although build execution remains the separate build route. The regressions use the actual HTTP client against a leader and a three-council follower: existing references succeed without replacing the stored quota, and ghost references fail without adding a permission or app. They also check both permission and build manifest loading locally.
 
 ## The namespace bug that got away
 
@@ -1513,3 +1523,32 @@ Parsing and reading errors now return through `Result` and `?`, including errors
 A shared `memory` limit is useful only if it reaches the resolved app. The old directory compiler accepted any TOML keys in `_defaults.toml`, but copied only `image`. Typed defaults now carry image, memory, CPU and environment into apps and jobs, plus deployment settings into apps. Unknown keys and malformed values fail with the defaults file's path. A default image does not turn an explicit host executable or script into a container.
 
 Inheritance merges fields: a child directory can change CPU while keeping its parent's image and memory. Environment keys and deployment options merge individually. A workload's explicit fields win, including `max_unavailable = 0` and `auto_rollback = false`; omitted options inherit. An empty environment table adds no overrides. Regression fixtures resolve parent, child and workload values, then round-trip the manifest to prove its resource settings survive serialization.
+
+### One configuration tree for CLI and GitOps
+
+A repository containing `_defaults.toml` used to compile through the CLI and fail through GitOps: Lettuce tried to parse the defaults file as a workload. A directory namespace also disappeared on the Git path. We now pass both inputs to `compile_sources`, an internal resolver that accepts a `BTreeMap<PathBuf, String>`. `BTreeMap` visits keys in order, so the resolver can process the root files and then each child directory deterministically. The filesystem adapter reads the tree; the Git adapter reads the verified commit under the configured watch directory.
+
+Both paths inherit typed defaults and use the nearest directory name when a workload omits its namespace. The watch root itself contributes no namespace. The resolver returns `Result<CompileResult, TreeError>`: `?` propagates a malformed file or identity collision before a caller can use partial desired state. GitOps refuses duplicate definitions, while CLI compilation retains its warning for deterministic overrides within one namespace. Neither can represent two resources of the same kind and bare name in different namespaces.
+
+The regression compares physical CLI compilation with a real Git sync under a watched subdirectory, first unsigned and then with a trusted SSH commit signature. It checks the resulting app specification and resource identity. Other cases cover nested defaults, directory-only namespaces, duplicate definitions and malformed trees. These exercise the adapters and the sync diff as well as the resolver.
+### Comparing a complete deployment specification
+
+A dry run used to compare only image strings. Keeping an image unchanged while
+changing replicas, a port, environment variables or resource limits therefore
+printed an unchanged workload. The preview now fingerprints the complete
+serialized desired specification. Namespace is part of the resource identity:
+`app.team/web` and `app.other/web` have separate evidence. Replica ordinals are
+placement details, so they do not alter an app's desired-spec fingerprint.
+
+The API returns this evidence for apps, jobs, namespace quotas and permissions.
+Council state supplies the authoritative app, namespace and permission specs;
+local job checkpoints supply job specs. The endpoint filters the result through
+the caller's app and namespace scope. If different executions of one logical
+job have different specifications, their combined evidence is unknown.
+
+An absent fingerprint cannot prove equality. The plan prints `?` and serializes
+`unknown` for incomplete evidence, while a known image change still proves an
+update. An offline preview states that its creates assume no live comparison.
+A failed live lookup returns an error instead of manufacturing an empty cluster.
+Tests exercise the client-to-router-to-agent path and same-image changes, along
+with quotas, permissions, namespace separation and incomplete evidence.
