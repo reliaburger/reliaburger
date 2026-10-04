@@ -21,6 +21,9 @@ pub struct CurrentResourceStatus {
     pub resource: String,
     /// Image currently deployed, when the resource kind has one.
     pub image: Option<String>,
+    /// Complete effective desired-spec evidence; absence means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// Status of a single workload instance.
