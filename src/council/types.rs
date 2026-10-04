@@ -164,6 +164,8 @@ pub enum RaftRequest {
     /// Register a batch, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.
     BatchRegister {
+        /// Revision used to plan this complete allocation.
+        expected_log_id: Option<openraft::LogId<u64>>,
         batch: crate::meat::batch_tracker::BatchRecord,
     },
     /// Record a job's state transition within a tracked batch. An
@@ -171,7 +173,9 @@ pub enum RaftRequest {
     BatchJobUpdate {
         batch_id: u64,
         job_name: String,
+        namespace: String,
         status: crate::meat::batch_tracker::JobStatus,
+        exit_code: Option<i32>,
     },
     /// Register a build, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.
@@ -336,6 +340,23 @@ pub enum RaftRequest {
     /// remove from `now_unix_ms` alone, so every replica removes the same
     /// tokens. It never removes the last Admin and never empties the store.
     SweepExpiredApiTokens { now_unix_ms: u64 },
+    /// Hold migration intent before authorising any execution or app revision.
+    PrerequisiteBegin {
+        operation_id: String,
+        term: u64,
+        config: Box<crate::config::Config>,
+    },
+    /// Publish the held manifest atomically after durable prerequisite success.
+    PrerequisiteCommit { operation_id: String },
+    /// Release a positively failed, durably settled prerequisite operation.
+    PrerequisiteFailed { operation_id: String },
+    /// Release ordinary-job intent after trusted positive terminal proof.
+    JobApplyComplete { operation_id: String },
+    /// Commit one complete placement pass against its original admission revision.
+    SchedulingDecisions {
+        expected_log_id: Option<openraft::LogId<u64>>,
+        decisions: Vec<SchedulingDecision>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +506,11 @@ pub struct DesiredState {
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
+    /// Migration intent, retained across handover when the outcome is uncertain.
+    /// Missing ownership state is refused rather than decoded as an empty fence.
+    #[serde(deserialize_with = "super::prerequisites::deserialize_claims")]
+    pub prerequisite_claims:
+        std::collections::BTreeMap<String, super::prerequisites::PrerequisiteClaim>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

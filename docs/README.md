@@ -120,8 +120,38 @@ firings until it restarts and reloads its state.
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations; keep using the same node endpoint for a
 lease's lifetime. Creation needs an unscoped credential and the server's
-isolated-workload test grant. Ordinary jobs stay node-local; there's no cluster
-job scheduling.
+isolated-workload test grant. Ordinary cluster apply forwards jobs to the
+leader and reserves their identities until positive terminal settlement;
+there is no ordinary job placement across workers. Leased test work stays on
+the receiving node. Cluster apply refuses recurring schedules; register cron
+on a standalone node.
+
+Apply `run_before` migrations and their dependent apps together in the same
+namespace. The cluster records ownership before execution and publishes app
+revisions only after positive zero exit and durable success confirmation. A
+known failed migration can be corrected explicitly; an unknown outcome,
+leadership change or recovery keeps its claim held without automatic replay.
+
+`relish batch` gives each accepted job a distinct execution identity. Repeated
+logical labels retain their original namespace for scoped status and logs;
+select an explicit instance to read a particular run. Internal dispatch retries
+reuse the durably owned attempt and cannot launch it twice. Batch submission
+rejects `schedule` and `run_before`; use ordinary apply for those declarations.
+
+Replay history is finite and never pruned into identity reuse. The council keeps
+at most 131,072 ownership entries or 32 MiB of encoded history, and each runner's
+job checkpoint is limited to 16 MiB with room reserved for active transitions.
+Full history refuses new admission while preserving existing executions. Further
+admission then requires a fresh cluster. See [batch execution ownership](book/08-breaking-things-on-purpose.md)
+for acknowledgement uncertainty, retry and retirement semantics.
+
+Apps and batches share committed capacity reservations across leader changes.
+Clustered batch admission requires a live capacity publisher, reports from the
+current Raft term and unexpired local receive deadlines. Missing evidence returns
+503. Planning and registration have a five-second budget; a late committed
+reservation stays held and that timed-out request dispatches no work. Unknown
+runtime outcomes retain capacity. Durably retired nodes are excluded even while
+gossip still advertises them as alive.
 
 ### Registry behaviour
 
@@ -1376,3 +1406,5 @@ machines.
 
 They're one part of a release's acceptance, not all of it; the
 [release runbook](releasing.md) lists the gates a candidate has to pass.
+
+Held cluster jobs conservatively reserve their CPU/memory requests on every app or batch placement candidate until positive settlement. This can over-reserve; it does not add initial node-local job capacity admission.

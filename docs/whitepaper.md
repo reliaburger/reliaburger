@@ -649,7 +649,7 @@ auto_rollback = true       # revert on health check failure
 
 Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the new leader resumes the rolling update from the last committed step after the learning period. If you submit a new deploy while a rollout is in progress, it supersedes the in-progress rollout: in-flight instances are drained and replaced with the newest version directly, skipping the intermediate target.
 
-**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start.
+**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start. The target app must be in the same apply and namespace. Cluster apply records ownership before execution and publishes dependent app revisions only after positive zero exit and durable confirmation; uncertainty or leader replacement retains the fence. Recurring schedules are supported on standalone nodes and are refused by cluster apply.
 
 > For the deploy state machine, connection draining protocol, and autoscaling, see [design/deployments.md](design/deployments.md).
 

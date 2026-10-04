@@ -2408,6 +2408,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rerun_unknown_jobs: bool,
     ) {
         let worker = DeployWorker {
+            prepared_batch_jobs: None,
             rerun_unknown_jobs,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
@@ -12713,4 +12714,427 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
     );
     shutdown.cancel();
     task.await.unwrap();
+}
+
+async fn recovered_owned_exit_preserves_retirement_provenance(
+    runtime: crate::grill::records::RuntimeKind,
+) {
+    use crate::bun::jobs::{BatchExecutionOwnership, JobInventory, JobPhase, RecordedJob};
+    let records = tempfile::tempdir().unwrap();
+    let volumes = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(runtime);
+    let id = InstanceId("default__batch-retained-object-0".into());
+    let name = "batch-retained-object";
+    let spec = Config::parse(&format!("[job.{name}]\nimage='myapp:v1'\n"))
+        .unwrap()
+        .job
+        .remove(name)
+        .unwrap();
+    let job = RecordedJob {
+        name: name.into(),
+        namespace: "default".into(),
+        batch_execution: Some(BatchExecutionOwnership {
+            batch_id: 42,
+            logical_name: "migration".into(),
+            spec_digest: crate::meat::batch_execution::spec_digest("default", "migration", &spec)
+                .unwrap(),
+            observed_exit_code: Some(0),
+            observed_restart_count: Some(0),
+        }),
+        spec,
+        runtime,
+        generation: 1,
+        restart_count: 0,
+        phase: JobPhase::Exited { code: 0 },
+        runtime_absent: false,
+    };
+    crate::bun::jobs::persist_inventory(
+        records.path(),
+        JobInventory {
+            jobs: BTreeMap::from([(id.0.clone(), job)]),
+            retired: BTreeMap::new(),
+        },
+    )
+    .unwrap();
+    let mut record = adoption_record(&id.0, name, false);
+    record.is_job = true;
+    record.app_spec = None;
+    record.runtime = runtime;
+    record.runc_container_id =
+        (runtime == crate::grill::records::RuntimeKind::Runc).then(|| id.0.clone());
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_adopt_result(&id, false);
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+    assert_eq!(agent.recorded_jobs[&id.0].batch_terminal_exit(), Some(0));
+    // A confirmed process stop must retain the same object-absence distinction.
+    agent
+        .finish_app_stop(
+            name,
+            "default",
+            app_stop::AppStop {
+                instances: vec![id.clone()],
+                owns_job: true,
+                taken_restarts: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let compact = agent.release_retired_workload(name, "default").await;
+    if runtime == crate::grill::records::RuntimeKind::Process {
+        compact.unwrap();
+        assert_eq!(
+            agent.retired_batch_executions[&id.0].terminal_exit(),
+            Some(0)
+        );
+    } else {
+        assert!(
+            compact.is_err(),
+            "a retained stopped OCI object was compacted as absent"
+        );
+        assert!(
+            !agent.recorded_jobs[&id.0].runtime_absent,
+            "process exit became object-absence provenance"
+        );
+        assert!(agent.retired_batch_executions.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recovered_owned_process_exit_allows_positive_compact_retirement() {
+    recovered_owned_exit_preserves_retirement_provenance(
+        crate::grill::records::RuntimeKind::Process,
+    )
+    .await;
+}
+#[tokio::test]
+async fn recovered_owned_apple_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Apple)
+        .await;
+}
+#[tokio::test]
+async fn recovered_owned_runc_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Runc)
+        .await;
+}
+
+#[tokio::test]
+async fn prerequisite_failure_is_durably_settled_before_the_gate_reports_failure() {
+    let records = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(1));
+    let events = drain_deploy(&mut agent, run_before_config()).await;
+    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+    assert_eq!(
+        agent.recorded_jobs[&id.0].phase,
+        crate::bun::jobs::JobPhase::Exited { code: 1 }
+    );
+    assert!(!agent.supervisor.get_instance(&id).unwrap().retry_pending);
+}
+
+#[tokio::test]
+async fn prerequisite_failed_attempt_cannot_claim_an_automatic_retry() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(1));
+    let _ = drain_deploy(&mut agent, run_before_config()).await;
+    agent.observe_job_exit(&id, Some(1)).await;
+    agent
+        .supervisor
+        .get_instance_mut(&id)
+        .unwrap()
+        .restart_count = 1;
+    assert!(
+        agent.claim_job_retry(&id).await.is_err(),
+        "a failed prerequisite must not restart outside its apply gate"
+    );
+}
+
+#[tokio::test]
+async fn prerequisite_trust_preflight_refuses_before_any_migration_launch() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    agent.trust_policy.require_signatures = true;
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(0));
+    let events = drain_deploy(&mut agent, run_before_config()).await;
+    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(operation, _)| operation == "create" || operation == "start"),
+        "unverified apply launched its migration: {:?}",
+        grill.calls()
+    );
+}
+
+#[tokio::test]
+async fn ordinary_cluster_job_receipt_requires_current_positive_terminal_evidence() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let config = job_config();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config).unwrap();
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Pending,
+        "startup Complete cannot release a still-running ordinary job reservation"
+    );
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(0));
+    agent.observe_job_exit(&id, Some(0)).await;
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Terminal
+    );
+}
+
+#[tokio::test]
+async fn ordinary_cluster_job_receipt_cannot_reuse_a_previous_generation_or_uncertain_publication()
+{
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = job_config();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config).unwrap();
+    agent
+        .recorded_jobs
+        .get_mut("default__migrate-0")
+        .unwrap()
+        .generation += 1;
+    assert!(
+        matches!(
+            agent.cluster_jobs_settlement(&receipt),
+            ClusterJobSettlement::Unknown(_)
+        ),
+        "a replacement generation cannot settle its predecessor's reservation"
+    );
+    agent
+        .recorded_jobs
+        .get_mut("default__migrate-0")
+        .unwrap()
+        .generation -= 1;
+    agent.job_store_uncertain = true;
+    assert!(matches!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Unknown(_)
+    ));
+}
+
+#[tokio::test]
+async fn ordinary_cluster_job_receipt_retains_retrying_failure_and_unconfirmed_stop() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = job_config();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config).unwrap();
+    let record = agent.recorded_jobs.get_mut("default__migrate-0").unwrap();
+    record.phase = crate::bun::jobs::JobPhase::Exited { code: 1 };
+    record.restart_count = 1;
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Pending
+    );
+    let record = agent.recorded_jobs.get_mut("default__migrate-0").unwrap();
+    record.phase = crate::bun::jobs::JobPhase::Stopped;
+    record.runtime_absent = false;
+    assert!(matches!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Unknown(_)
+    ));
+    agent
+        .recorded_jobs
+        .get_mut("default__migrate-0")
+        .unwrap()
+        .runtime_absent = true;
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Terminal
+    );
+}
+
+#[tokio::test]
+async fn cluster_cron_registration_ack_is_not_a_terminal_execution_receipt() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
+    agent.register_scheduled_jobs(&config).await.unwrap();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    assert!(
+        agent
+            .scheduled_jobs
+            .contains_key(&("tick".into(), "default".into()))
+    );
+    assert!(agent.recorded_jobs.is_empty());
+    let receipt = agent.capture_cluster_jobs(&config);
+    assert!(
+        match &receipt {
+            Err(_) => true,
+            Ok(receipt) => agent.cluster_jobs_settlement(receipt) != ClusterJobSettlement::Terminal,
+        },
+        "registration ACK cannot retire recurring ownership as an exited execution"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_ordinary_job_does_not_make_its_registered_cron_peer_terminal() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let mut config = job_config();
+    let schedule = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
+    config.job.extend(schedule.job);
+    agent.register_scheduled_jobs(&config).await.unwrap();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config);
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(0));
+    agent.observe_job_exit(&id, Some(0)).await;
+    assert!(
+        match &receipt {
+            Err(_) => true,
+            Ok(receipt) => agent.cluster_jobs_settlement(receipt) != ClusterJobSettlement::Terminal,
+        },
+        "ordinary exit must not silently erase registered scheduled ownership"
+    );
+}
+
+#[tokio::test]
+async fn scheduled_receipt_does_not_prove_retirement_when_schedule_publication_is_uncertain() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
+    agent.register_scheduled_jobs(&config).await.unwrap();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = super::cluster_jobs::ClusterJobReceipt {
+        executions: BTreeMap::new(),
+    };
+    agent.scheduled_jobs_store_uncertain = true;
+    assert!(matches!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Unknown(_)
+    ));
+}
+
+#[tokio::test]
+async fn prerequisite_cannot_launch_under_a_still_registered_cron_identity() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let cron = Config::parse("[job.migrate]\nimage='test:v1'\nschedule='0 0 30 2 *'\n").unwrap();
+    agent.register_scheduled_jobs(&cron).await.unwrap();
+    let running = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    let (response, answer) = oneshot::channel();
+    tx.send(AgentCommand::PreparePrerequisites {
+        config: run_before_config(),
+        response,
+    })
+    .await
+    .unwrap();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+        .await
+        .expect("actual prerequisite preparation did not settle")
+        .unwrap();
+    if let Ok((_, operation)) = &prepared {
+        operation
+            .finish(
+                crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                "test-owned unlaunched preparation completed",
+            )
+            .await;
+    }
+    shutdown.cancel();
+    let agent = running.await.unwrap();
+    assert!(
+        prepared.is_err(),
+        "a migration was prepared under a registered recurring identity"
+    );
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(op, _)| op == "create" || op == "start")
+    );
+    assert!(
+        agent
+            .scheduled_jobs
+            .contains_key(&("migrate".into(), "default".into()))
+    );
+}
+
+async fn assert_preparation_refuses_predictable_job_policy(config: Config, process: bool) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    if process {
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Process);
+    }
+    let running = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    let (response, answer) = oneshot::channel();
+    tx.send(AgentCommand::PreparePrerequisites { config, response })
+        .await
+        .unwrap();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+        .await
+        .expect("job policy preparation did not settle")
+        .unwrap();
+    if let Ok((_, operation)) = &prepared {
+        operation
+            .finish(
+                crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                "test-owned unlaunched preparation completed",
+            )
+            .await;
+    }
+    shutdown.cancel();
+    let agent = running.await.unwrap();
+    assert!(
+        prepared.is_err(),
+        "predictable job policy refusal admitted a prepared cluster operation"
+    );
+    assert!(
+        agent.recorded_jobs.is_empty(),
+        "preparation persisted execution intent"
+    );
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(op, _)| op == "create" || op == "start")
+    );
+}
+
+#[tokio::test]
+async fn prerequisite_preparation_refuses_denied_host_job_before_claiming_migration() {
+    let mut config = run_before_config();
+    let mut denied = Config::parse("[job.denied]\nexec='/bin/sh'\n").unwrap();
+    config.job.append(&mut denied.job);
+    assert_preparation_refuses_predictable_job_policy(config, false).await;
+}
+
+#[tokio::test]
+async fn prerequisite_preparation_refuses_unenforceable_ordinary_tail_limits() {
+    let mut config = run_before_config();
+    let mut denied = Config::parse("[job.denied]\nimage='test:v1'\ncpu='100m'\n").unwrap();
+    config.job.append(&mut denied.job);
+    assert_preparation_refuses_predictable_job_policy(config, true).await;
+}
+
+#[tokio::test]
+async fn prerequisite_preparation_refuses_unenforceable_migration_limits() {
+    let mut config = run_before_config();
+    let limited = Config::parse("[job.migrate]\nimage='myapp:v1'\ncommand=['echo', 'migrating']\nrun_before=['app.web']\ncpu='100m'\n").unwrap();
+    config.job = limited.job;
+    assert_preparation_refuses_predictable_job_policy(config, true).await;
 }

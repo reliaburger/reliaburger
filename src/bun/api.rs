@@ -857,6 +857,20 @@ async fn ask_agent<T>(
         .map_err(|_| internal_error("agent dropped response"))
 }
 
+/// New execution-ownership metadata must bound both queueing and the reply.
+/// Keep the legacy helper's semantics for its existing consumers.
+// The HTTP response crosses this helper directly to the calling route.
+#[allow(clippy::result_large_err)]
+pub(super) async fn ask_agent_bounded<T>(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> AgentCommand,
+) -> Result<T, Response> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), ask_agent(cmd_tx, build)).await {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(agent_unavailable()),
+    }
+}
+
 fn internal_error(message: &str) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,

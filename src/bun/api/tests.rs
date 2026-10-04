@@ -2574,7 +2574,7 @@ async fn cluster_lease_delete_waits_for_system_retirement_acknowledgements() {
         }),
     ] {
         assert!(!matches!(
-            council.write(request).await.unwrap(),
+            write_admission_fixture(&council, request).await.unwrap(),
             CouncilResponse::Refused { .. }
         ));
     }
@@ -3805,15 +3805,123 @@ async fn apply_as_context(
     app.clone().oneshot(request).await.unwrap().status()
 }
 
+/// Authority/command fixture observations, never evidence of a real runtime.
+enum WorkloadAdmissionTrace {
+    Prepared {
+        config: crate::config::Config,
+        operation_id: crate::bun::deploy_operations::DeployOperationId,
+    },
+    RanPrerequisites {
+        config: crate::config::Config,
+        operation_id: crate::bun::deploy_operations::DeployOperationId,
+    },
+    CapturedJobs {
+        config: crate::config::Config,
+        receipt: Arc<crate::bun::agent::ClusterJobReceipt>,
+    },
+    Command(AgentCommand),
+}
+
 async fn workload_admission_fixture(
     tag: &str,
 ) -> (
     Router,
     Arc<crate::council::CouncilNode>,
-    mpsc::Receiver<AgentCommand>,
+    mpsc::Receiver<WorkloadAdmissionTrace>,
 ) {
     let council = seeded_council(tag).await;
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, mut incoming) = mpsc::channel(16);
+    let (mutations, rx) = mpsc::channel(16);
+    let tracker = crate::bun::deploy_operations::DeployOperationTracker::default();
+    tokio::spawn(async move {
+        let mut generation = 0_u64;
+        while let Some(command) = incoming.recv().await {
+            match command {
+                AgentCommand::BatchOwnedExecutions { response, .. } => {
+                    // This fixture owns no batch runtime. Only this read-only
+                    // answer is omitted from the mutation trace.
+                    let _ = response.send(Default::default());
+                }
+                AgentCommand::PreparePrerequisites { config, response } => {
+                    let operation = tracker.start(&config).await.unwrap();
+                    if mutations
+                        .send(WorkloadAdmissionTrace::Prepared {
+                            config: config.clone(),
+                            operation_id: operation.id().clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    response.send(Ok((config, operation))).unwrap();
+                }
+                AgentCommand::RunPrerequisites {
+                    config,
+                    operation,
+                    response,
+                } => {
+                    if mutations
+                        .send(WorkloadAdmissionTrace::RanPrerequisites {
+                            config,
+                            operation_id: operation.id().clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    response.send(Ok(())).unwrap();
+                }
+                AgentCommand::CaptureClusterJobs { config, response } => {
+                    generation += 1;
+                    let executions = config
+                        .job
+                        .iter()
+                        .map(|(name, spec)| {
+                            assert!(spec.run_before.is_empty());
+                            let namespace = spec.namespace.as_deref().unwrap_or("default");
+                            let id = crate::grill::InstanceIdentity::new(namespace, name, 0)
+                                .instance_id();
+                            let proof = crate::bun::agent::ClusterJobExecution {
+                                name: name.clone(),
+                                namespace: namespace.into(),
+                                generation,
+                                spec_digest: crate::meat::batch_execution::spec_digest(
+                                    namespace, name, spec,
+                                )
+                                .unwrap(),
+                            };
+                            (id.0, proof)
+                        })
+                        .collect();
+                    let receipt = Arc::new(crate::bun::agent::ClusterJobReceipt { executions });
+                    if mutations
+                        .send(WorkloadAdmissionTrace::CapturedJobs {
+                            config,
+                            receipt: receipt.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    response.send(Ok(receipt)).unwrap();
+                }
+                command => {
+                    // Dispatch and settlement requests remain visible, with
+                    // their actual response/event senders owned by the test.
+                    if mutations
+                        .send(WorkloadAdmissionTrace::Command(command))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
     let app = router(
         tx,
         None,
@@ -3831,6 +3939,127 @@ async fn workload_admission_fixture(
         None,
     );
     (app, council, rx)
+}
+
+/// Observe every positive command phase and explicitly settle its exact claim.
+/// The canonical receipt is a synthetic actor input; ProcessGrill suite cases
+/// separately qualify actual execution, persistence and terminal evidence.
+async fn assert_authorised_job_dispatch_and_settlement(
+    commands: &mut mpsc::Receiver<WorkloadAdmissionTrace>,
+    council: &crate::council::CouncilNode,
+    expected: &crate::config::Config,
+    rerun: bool,
+) {
+    async fn next(commands: &mut mpsc::Receiver<WorkloadAdmissionTrace>) -> WorkloadAdmissionTrace {
+        tokio::time::timeout(std::time::Duration::from_secs(5), commands.recv())
+            .await
+            .expect("authorised job command phase did not arrive")
+            .expect("authority fixture stopped before a required command phase")
+    }
+    let WorkloadAdmissionTrace::Prepared {
+        config,
+        operation_id,
+    } = next(commands).await
+    else {
+        panic!("authorised clustered job must prepare before any dispatch")
+    };
+    assert_eq!(&config, expected);
+    if expected.job.values().any(|job| !job.run_before.is_empty()) {
+        let WorkloadAdmissionTrace::RanPrerequisites {
+            config,
+            operation_id: ran_id,
+        } = next(commands).await
+        else {
+            panic!("migration must run after preparation and before ordinary dispatch")
+        };
+        assert_eq!(&config, expected);
+        assert_eq!(ran_id, operation_id);
+    }
+    let WorkloadAdmissionTrace::Command(dispatch) = next(commands).await else {
+        panic!("ordinary job dispatch did not follow its actual preparation/run phases")
+    };
+    let (config, events) = match dispatch {
+        AgentCommand::Deploy { config, events } if !rerun => (config, events),
+        AgentCommand::RerunJobs { config, events } if rerun => (config, events),
+        _ => panic!("authority fixture observed the wrong dispatch kind"),
+    };
+    let ordinary = crate::config::Config {
+        job: expected
+            .job
+            .iter()
+            .filter(|(_, spec)| spec.run_before.is_empty())
+            .map(|(name, spec)| (name.clone(), spec.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    assert_eq!(config, ordinary);
+    let desired = council.desired_state().await;
+    assert_eq!(desired.prerequisite_claims.len(), 1);
+    let (claim_id, claim) = desired.prerequisite_claims.into_iter().next().unwrap();
+    assert!(claim.apps_committed);
+    assert_eq!(&claim.config, expected);
+    assert_ne!(claim_id, operation_id.as_str());
+    events
+        .send(ApplyEvent::Complete {
+            created: ordinary.job.len(),
+            instances: vec![],
+        })
+        .await
+        .unwrap();
+    drop(events);
+    let WorkloadAdmissionTrace::CapturedJobs { config, receipt } = next(commands).await else {
+        panic!("startup acknowledgement must capture the ordinary job receipt")
+    };
+    assert_eq!(config, ordinary);
+    assert_eq!(receipt.executions.len(), ordinary.job.len());
+    for (name, spec) in &ordinary.job {
+        let namespace = spec.namespace.as_deref().unwrap_or("default");
+        let id = crate::grill::InstanceIdentity::new(namespace, name, 0).instance_id();
+        let execution = &receipt.executions[&id.0];
+        assert_eq!(execution.name, *name);
+        assert_eq!(execution.namespace, namespace);
+        assert!(execution.generation > 0);
+        assert_eq!(
+            execution.spec_digest,
+            crate::meat::batch_execution::spec_digest(namespace, name, spec).unwrap()
+        );
+    }
+    let WorkloadAdmissionTrace::Command(AgentCommand::ClusterJobsSettlement {
+        receipt: observed,
+        response,
+    }) = next(commands).await
+    else {
+        panic!("ordinary claim must be settled through its actual watcher request")
+    };
+    assert!(Arc::ptr_eq(&receipt, &observed));
+    assert_eq!(
+        council
+            .desired_state()
+            .await
+            .prerequisite_claims
+            .get(&claim_id),
+        Some(&claim)
+    );
+    response
+        .send(crate::bun::agent::ClusterJobSettlement::Terminal)
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        loop {
+            let claims = council.desired_state().await.prerequisite_claims;
+            if !claims.contains_key(&claim_id) {
+                assert!(claims.is_empty());
+                break;
+            }
+            assert_eq!(claims.get(&claim_id), Some(&claim));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("exact ordinary claim did not settle after the finite terminal actor reply");
+    assert!(matches!(
+        commands.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -3955,9 +4184,13 @@ async fn explicit_job_rerun_preserves_authority_and_refuses_mixed_manifests() {
         .unwrap();
     request.extensions_mut().insert(deployer_context());
     assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
-    assert!(
-        matches!(commands.recv().await, Some(AgentCommand::RerunJobs { config, .. }) if config.job.len() == 1)
-    );
+    assert_authorised_job_dispatch_and_settlement(
+        &mut commands,
+        &council,
+        &crate::config::Config::parse(manifest).unwrap(),
+        true,
+    )
+    .await;
     assert!(council.desired_state().await.apps.is_empty());
     council.shutdown().await.unwrap();
 }
@@ -3998,10 +4231,16 @@ async fn job_apply_checks_namespace_and_app_scope_before_enqueuing_work() {
         .await,
         StatusCode::OK
     );
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(AgentCommand::Deploy { .. })
-    ));
+    assert_authorised_job_dispatch_and_settlement(
+        &mut commands,
+        &council,
+        &crate::config::Config::parse(
+            "[job.allowed]\nimage = \"test:v1\"\nnamespace = \"allowed\"\n",
+        )
+        .unwrap(),
+        false,
+    )
+    .await;
     council.shutdown().await.unwrap();
 }
 
@@ -4092,10 +4331,13 @@ async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and
                     "{manifest}"
                 );
                 if expected == StatusCode::OK {
-                    assert!(matches!(
-                        commands.try_recv(),
-                        Ok(AgentCommand::Deploy { .. })
-                    ));
+                    assert_authorised_job_dispatch_and_settlement(
+                        &mut commands,
+                        &council,
+                        &crate::config::Config::parse(&manifest).unwrap(),
+                        false,
+                    )
+                    .await;
                 } else {
                     assert!(matches!(
                         commands.try_recv(),
@@ -7475,4 +7717,758 @@ async fn dry_run_endpoint_refuses_unavailable_agent_evidence() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_log_metadata_refuses_a_stalled_agent_within_a_bounded_wait() {
+    let (tx, mut held_commands) = mpsc::channel(16);
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    let mut request = axum::http::Request::get("/v1/logs/migration/default")
+        .body(Body::empty())
+        .unwrap();
+    let mut reader = deployer_context();
+    reader.role = crate::sesame::types::ApiRole::ReadOnly;
+    reader.scoped_apps = Some(vec!["migration".into()]);
+    reader.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(reader);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        held_commands.try_recv(),
+        Ok(AgentCommand::ResolveExecutionLogs { .. })
+    ));
+    assert!(
+        held_commands.try_recv().is_err(),
+        "a timed-out lookup enqueued work"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_apply_metadata_refuses_a_stalled_agent_before_work() {
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    let mut request = axum::http::Request::post("/v1/apply")
+        .body(Body::from("[job.migration]\nimage='test:v1'\n"))
+        .unwrap();
+    let mut deployer = deployer_context();
+    deployer.scoped_apps = Some(vec!["migration".into()]);
+    deployer.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(deployer);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned apply metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(AgentCommand::BatchOwnedExecutions { .. })
+    ));
+    assert!(
+        commands.try_recv().is_err(),
+        "timed-out admission enqueued a deploy or run"
+    );
+}
+
+#[tokio::test]
+async fn owned_internal_run_metadata_refuses_a_stalled_agent_before_writes_or_launch() {
+    let council = seeded_council("owned-metadata-bound").await;
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let mut request = axum::http::Request::post("/v1/batch/run")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "batch_id": 1, "jobs": [{"name": "batch-bound", "spec": {"image": "test:v1"}}],
+                "execution_labels": {"batch-bound": {"name": "migration", "namespace": "default"}}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let mut system = deployer_context();
+    system.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+    system.principal_id = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+    system.role = crate::sesame::types::ApiRole::Admin;
+    request.extensions_mut().insert(system);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned internal metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(AgentCommand::BatchOwnedExecutions { .. })
+    ));
+    assert!(
+        commands.try_recv().is_err(),
+        "timed-out admission enqueued a worker"
+    );
+    let desired = council.desired_state().await;
+    assert!(desired.apps.is_empty());
+    assert!(desired.batch_state.batches.is_empty());
+    assert!(desired.batch_state.execution_owners.is_empty());
+    assert_eq!(desired.batch_state.next_batch_id, 1);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn owned_remote_log_metadata_bounds_the_local_collision_check() {
+    let council = seeded_council("owned-remote-metadata-bound").await;
+    let batch = serde_json::from_value(serde_json::json!({
+        "jobs": [{"name": "migration", "execution_name": "batch-remote-bound", "namespace": "default", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+        "submitted_at_epoch_secs": 1
+    })).unwrap();
+    write_admission_fixture(
+        &council,
+        crate::council::RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch,
+        },
+    )
+    .await
+    .unwrap();
+    let before = council.desired_state().await;
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let mut request = axum::http::Request::get(
+        "/v1/logs/entries/batch-remote-bound/default?instance=default__batch-remote-bound-0",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let mut reader = deployer_context();
+    reader.role = crate::sesame::types::ApiRole::ReadOnly;
+    reader.scoped_apps = Some(vec!["migration".into()]);
+    reader.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(reader);
+    let (result, (_held_response, mut commands)) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request)),
+        async {
+            let Some(AgentCommand::ResolveExecutionLogs { response, .. }) = commands.recv().await
+            else {
+                panic!("first metadata phase must resolve the explicit selector");
+            };
+            response
+                .send(Err(crate::bun::BunError::BatchConflict(
+                    "no local owner".into(),
+                )))
+                .unwrap();
+            let Some(AgentCommand::Status { response }) = commands.recv().await else {
+                panic!("remote ownership needs a local ordinary collision check");
+            };
+            (response, commands)
+        }
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "metadata lookup enqueued work"
+    );
+    let after = council.desired_state().await;
+    assert_eq!(after.apps, before.apps);
+    assert_eq!(after.batch_state, before.batch_state);
+    council.shutdown().await.unwrap();
+    let response = result
+        .expect("remote collision metadata did not end within the overall deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// Append inside src/bun/api/tests.rs. OFFTREE, UNCOMPILED and UNRUN.
+// This expresses root's proposed durable ordinary-job reservation seam:
+// after an ordinary job is admitted, a prerequisite cannot claim its identity.
+// If the final seam uses a different progress event, adapt only the bounded
+// acknowledgement predicate. No sleeps or production test hooks are needed.
+
+async fn receive_prerequisite_mutation(
+    commands: &mut mpsc::Receiver<AgentCommand>,
+) -> Option<AgentCommand> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match commands.recv().await? {
+                AgentCommand::BatchOwnedExecutions { response, .. } => {
+                    // These preparation fixtures own no batch executions.
+                    response.send(Default::default()).unwrap();
+                }
+                mutation => return Some(mutation),
+            }
+        }
+    })
+    .await
+    .expect("prerequisite actor did not receive a bounded mutation")
+}
+
+#[tokio::test]
+async fn an_admitted_job_only_apply_owns_its_name_before_agent_dispatch() {
+    let council = seeded_council("ordinary-job-prerequisite-overlap").await;
+    let original = crate::config::Config::parse("[job.migrate]\nimage='migration:v1'\n").unwrap();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+    let sentinel_tx = cmd_tx.clone();
+    let actor_config = original.clone();
+    let released = Arc::new(tokio::sync::Notify::new());
+    let actor_release = released.clone();
+    let actor = tokio::spawn(async move {
+        let prepare = receive_prerequisite_mutation(&mut cmd_rx)
+            .await
+            .expect("agent command channel closed before preparation");
+        let AgentCommand::PreparePrerequisites { config, response } = prepare else {
+            panic!("ordinary apply sent the wrong preparation command")
+        };
+        assert_eq!(config, actor_config);
+        let tracker = crate::bun::deploy_operations::DeployOperationTracker::default();
+        let operation = tracker.start(&config).await.unwrap();
+        let (sentinel_response, _sentinel_answer) = oneshot::channel();
+        sentinel_tx
+            .send(AgentCommand::CurrentResources {
+                response: sentinel_response,
+            })
+            .await
+            .unwrap();
+        // Preparation can now finish, but the ordinary Deploy will remain
+        // blocked behind this sentinel until the competing claim is tested.
+        response.send(Ok((config, operation))).unwrap();
+        actor_release.notified().await;
+        let sentinel = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("blocked queue lost its sentinel")
+            .expect("command channel closed before releasing dispatch");
+        assert!(matches!(sentinel, AgentCommand::CurrentResources { .. }));
+        let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("original admitted job did not dispatch")
+            .expect("agent sender disappeared");
+        let AgentCommand::Deploy { config, events } = dispatch else {
+            panic!("ordinary job worker sent the wrong dispatch command")
+        };
+        assert_eq!(config, actor_config);
+        events
+            .send(ApplyEvent::Complete {
+                created: 1,
+                instances: vec![],
+            })
+            .await
+            .unwrap();
+        drop(events);
+        let capture = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("startup acknowledgement did not request captured job generations")
+            .expect("agent sender disappeared before capture");
+        let AgentCommand::CaptureClusterJobs { config, response } = capture else {
+            panic!("startup acknowledgement requested the wrong evidence")
+        };
+        assert_eq!(config, actor_config);
+        // A fake command acknowledgement has no durable attempt record. That
+        // must never clear the real replicated ordinary-job ownership.
+        response
+            .send(Err("test actor has no durable job generation proof".into()))
+            .unwrap();
+    });
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/apply")
+                .header("content-type", "text/plain")
+                .body(Body::from("[job.migrate]\nimage='migration:v1'\n"))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("ordinary apply did not finish preparation")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut observed = Vec::new();
+        loop {
+            let frame = body
+                .frame()
+                .await
+                .expect("apply ended before admission")
+                .unwrap();
+            if let Some(bytes) = frame.data_ref() {
+                observed.extend_from_slice(bytes);
+                if parse_sse_events(&observed).iter().any(|event| {
+                    matches!(event, ApplyEvent::Progress { message }
+                        if message.contains("job(s) deploying on this node"))
+                }) {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("ordinary job never acknowledged its blocked dispatch phase");
+    let competing = crate::config::Config::parse(
+        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n",
+    )
+    .unwrap();
+    let admission = council
+        .write(crate::council::RaftRequest::PrerequisiteBegin {
+            operation_id: "55555555555555555555555555555555".into(),
+            term: council.current_term(),
+            config: Box::new(competing),
+        })
+        .await
+        .unwrap();
+    released.notify_one();
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+        .await
+        .expect("ordinary apply did not settle")
+        .unwrap()
+        .to_bytes();
+    tokio::time::timeout(std::time::Duration::from_secs(5), actor)
+        .await
+        .expect("fake agent did not settle its owned commands")
+        .unwrap();
+    let state = council.desired_state().await;
+    council.shutdown().await.unwrap();
+    assert!(
+        matches!(admission, crate::council::CouncilResponse::Refused { .. }),
+        "the same job was admitted for dispatch and also claimed by a migration"
+    );
+    assert!(
+        parse_sse_events(&terminal)
+            .iter()
+            .any(|event| matches!(event, ApplyEvent::Complete { created: 1, .. }))
+    );
+    assert_eq!(
+        state.prerequisite_claims.len(),
+        1,
+        "an unproven fake startup must retain the ordinary job's ownership"
+    );
+    let held = state.prerequisite_claims.values().next().unwrap();
+    assert_eq!(held.config, original);
+    assert!(held.apps_committed);
+}
+
+// Append to src/bun/api/tests.rs. UNCOMPILED/UNRUN tests-only expected-red control.
+#[tokio::test]
+async fn cluster_scheduled_apply_is_refused_before_claim_or_desired_writes() {
+    let council = seeded_council("cluster-cron-early-refusal").await;
+    let before = council.desired_state().await;
+    let body = "[app.web]\nimage='web:v2'\n[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n";
+    let original = crate::config::Config::parse(body).unwrap();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+    let actor_cancel = tokio_util::sync::CancellationToken::new();
+    let stop_actor = actor_cancel.clone();
+    let actor = tokio::spawn(async move {
+        let command = tokio::select! {
+            _ = stop_actor.cancelled() => return false,
+            command = receive_prerequisite_mutation(&mut cmd_rx) => command,
+        };
+        let Some(AgentCommand::PreparePrerequisites { config, response }) = command else {
+            panic!("unexpected command before schedule admission")
+        };
+        assert_eq!(config, original);
+        let tracker = crate::bun::deploy_operations::DeployOperationTracker::default();
+        let operation = tracker.start(&config).await.unwrap();
+        response.send(Ok((config, operation))).unwrap();
+        // The old path can now acquire/commit its claim but cannot dispatch a
+        // cron runtime. Closing this receiver makes the resulting SSE finite.
+        drop(cmd_rx);
+        true
+    });
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/apply")
+                .header("content-type", "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("cluster cron admission did not reply")
+    .unwrap();
+    let status = response.status();
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("cluster cron response did not finish")
+    .unwrap()
+    .to_bytes();
+    actor_cancel.cancel();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), actor)
+        .await
+        .expect("fake preparation actor did not stop")
+        .unwrap();
+    let after = council.desired_state().await;
+    council.shutdown().await.unwrap();
+    // Cleanup precedes product assertions, so the expected-red run cannot
+    // leave the fake actor or actual Raft node running on a failed assertion.
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(!prepared, "unsupported clustered cron reached preparation");
+    assert_eq!(
+        after.apps, before.apps,
+        "refused schedule mutated desired apps"
+    );
+    assert_eq!(
+        after.namespaces, before.namespaces,
+        "refused schedule mutated namespaces"
+    );
+    assert_eq!(
+        after.permissions, before.permissions,
+        "refused schedule mutated grants"
+    );
+    assert_eq!(
+        after.prerequisite_claims, before.prerequisite_claims,
+        "refused schedule retained an admission claim"
+    );
+}
+
+/// Handler-only boundary fixture: finite actor acknowledgements reach an actual
+/// Council write, whose existing test hook models a lost quorum. This actor is
+/// not evidence of a real runtime exit; suite::batch covers the real child path.
+#[derive(Clone, Copy)]
+enum HangingPrerequisiteWrite {
+    Begin,
+    Commit,
+    KnownFailed,
+}
+
+async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPrerequisiteWrite) {
+    use crate::bun::deploy_operations::{DeployOperationOutcome, DeployOperationTracker};
+    let tag = match boundary {
+        HangingPrerequisiteWrite::Begin => "prerequisite-hung-begin",
+        HangingPrerequisiteWrite::Commit => "prerequisite-hung-commit",
+        HangingPrerequisiteWrite::KnownFailed => "prerequisite-hung-known-failed",
+    };
+    let council = seeded_council(tag).await;
+    let before = council.desired_state().await;
+    let tracker = DeployOperationTracker::default();
+    let actor_tracker = tracker.clone();
+    let actor_council = council.clone();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+    let actor = tokio::spawn(async move {
+        let prepare = receive_prerequisite_mutation(&mut cmd_rx)
+            .await
+            .expect("agent command channel closed before preparation");
+        let AgentCommand::PreparePrerequisites { config, response } = prepare else {
+            panic!("incorrect preparation command before the selected write boundary")
+        };
+        let operation = actor_tracker.start(&config).await.unwrap();
+        let operation_id = operation.id().clone();
+        if matches!(boundary, HangingPrerequisiteWrite::Begin) {
+            actor_council.hang_writes();
+        }
+        response.send(Ok((config, operation))).unwrap();
+        if matches!(boundary, HangingPrerequisiteWrite::Begin) {
+            return (operation_id, None);
+        }
+        let run = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("committed Begin did not dispatch its prerequisite actor")
+            .expect("prerequisite actor channel closed");
+        let AgentCommand::RunPrerequisites {
+            operation,
+            response,
+            ..
+        } = run
+        else {
+            panic!("incorrect command after actual prerequisite intent commitment")
+        };
+        assert_eq!(operation.id(), &operation_id);
+        let held = actor_council.desired_state().await.prerequisite_claims;
+        assert_eq!(held.len(), 1, "RunPrerequisites preceded durable Begin");
+        let held = held.into_iter().next().unwrap();
+        assert!(!held.1.apps_committed);
+        // Set the existing gate before the finite successful actor reply. Only
+        // the subsequent actual PrerequisiteCommit write can now be pending.
+        actor_council.hang_writes();
+        match boundary {
+            HangingPrerequisiteWrite::Commit => response.send(Ok(())).unwrap(),
+            HangingPrerequisiteWrite::KnownFailed => response
+                .send(Err(crate::bun::agent::PrerequisiteFailure {
+                    message: "bounded test actor observed a persisted nonzero exit".into(),
+                    settled: true,
+                }))
+                .unwrap(),
+            HangingPrerequisiteWrite::Begin => unreachable!(),
+        }
+        (operation_id, Some(held))
+    });
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    // The API's normal prerequisite queue budget is five seconds. Keep one
+    // second of observation margin; this is not a deadline increase in product.
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/apply")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(
+                        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, bytes)
+    })
+    .await;
+    let (operation_id, held) = tokio::time::timeout(std::time::Duration::from_secs(5), actor)
+        .await
+        .expect("finite boundary actor did not terminate")
+        .unwrap();
+    let after = council.desired_state().await;
+    let operations = tracker.snapshot().await;
+    council.shutdown().await.unwrap();
+    // No runtime/actor/Raft engine remains owned by this fixture on expected
+    // baseline failure; its Tokio runtime also owns the API's pending worker.
+    assert_eq!(after.apps, before.apps, "hung write published desired apps");
+    assert_eq!(after.namespaces, before.namespaces);
+    assert_eq!(after.permissions, before.permissions);
+    if let Some((claim_id, claim)) = held {
+        assert_eq!(after.prerequisite_claims.get(&claim_id), Some(&claim));
+    } else {
+        assert_eq!(after.prerequisite_claims, before.prerequisite_claims);
+    }
+    let (status, bytes) =
+        observed.expect("lost-quorum prerequisite write never produced a bounded API outcome");
+    match boundary {
+        HangingPrerequisiteWrite::Begin => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+        HangingPrerequisiteWrite::Commit | HangingPrerequisiteWrite::KnownFailed => {
+            assert_eq!(status, StatusCode::OK);
+            let events = parse_sse_events(&bytes);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Error { .. })),
+                "{events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                "{events:?}"
+            );
+        }
+    }
+    let operation = operations
+        .history
+        .iter()
+        .find(|operation| operation.id == operation_id)
+        .expect("hung write did not retain a terminal diagnostic operation");
+    assert_eq!(operation.outcome, Some(DeployOperationOutcome::Unknown));
+}
+
+#[tokio::test]
+async fn hung_prerequisite_begin_returns_bounded_unavailability_without_publication() {
+    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Begin).await;
+}
+
+#[tokio::test]
+async fn hung_prerequisite_commit_returns_terminal_error_and_retains_exact_claim() {
+    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Commit).await;
+}
+
+#[tokio::test]
+async fn hung_known_failed_prerequisite_settlement_returns_error_and_retains_claim() {
+    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::KnownFailed).await;
+}
+
+#[tokio::test]
+async fn hung_terminal_job_claim_settlement_exits_its_watcher_and_retains_claim() {
+    use crate::bun::agent::{ClusterJobExecution, ClusterJobReceipt, ClusterJobSettlement};
+    use crate::council::{CouncilResponse, RaftRequest};
+    use sha2::{Digest, Sha256};
+    let council = seeded_council("hung-terminal-job-settlement").await;
+    let config = crate::config::Config::parse("[job.work]\nimage='work:v1'\n").unwrap();
+    let operation_id = "55555555555555555555555555555555".to_string();
+    let begin = council
+        .write(RaftRequest::PrerequisiteBegin {
+            operation_id: operation_id.clone(),
+            term: council.current_term(),
+            config: Box::new(config.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(begin, CouncilResponse::Refused { .. }));
+    let commit = council
+        .write(RaftRequest::PrerequisiteCommit {
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(commit, CouncilResponse::Refused { .. }));
+    let before = council.desired_state().await;
+    let held = before.prerequisite_claims[&operation_id].clone();
+    assert!(held.apps_committed);
+    assert!(held.blocks("work", "default"));
+    let mut canonical = config.job["work"].clone();
+    canonical.namespace = Some("default".into());
+    let spec_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&("default", "work", canonical)).unwrap(),
+    ));
+    let instance = crate::grill::InstanceIdentity::new("default", "work", 0).instance_id();
+    let receipt = Arc::new(ClusterJobReceipt {
+        executions: std::collections::BTreeMap::from([(
+            instance.0,
+            ClusterJobExecution {
+                name: "work".into(),
+                namespace: "default".into(),
+                generation: 1,
+                spec_digest,
+            },
+        )]),
+    });
+    let expected_receipt = receipt.clone();
+    let actor_council = council.clone();
+    let (commands, mut requests) = mpsc::channel(1);
+    let actor = tokio::spawn(async move {
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+            .await
+            .expect("watcher did not request finite local settlement evidence")
+            .unwrap();
+        let AgentCommand::ClusterJobsSettlement { receipt, response } = request else {
+            panic!("watcher requested the wrong settlement evidence")
+        };
+        assert!(Arc::ptr_eq(&receipt, &expected_receipt));
+        // The actor reply is a boundary input, not a claim of real execution.
+        // Only the subsequent actual JobApplyComplete write is made to hang.
+        actor_council.hang_writes();
+        response.send(ClusterJobSettlement::Terminal).unwrap();
+    });
+    let mut watcher = super::apply::spawn_job_apply_settlement(
+        commands,
+        council.clone(),
+        operation_id.clone(),
+        receipt,
+    );
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(6), &mut watcher).await;
+    if finished.is_err() {
+        watcher.abort();
+        let _ = watcher.await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), actor)
+        .await
+        .expect("settlement actor failed to terminate")
+        .unwrap();
+    let after = council.desired_state().await;
+    council.shutdown().await.unwrap();
+    assert_eq!(after.apps, before.apps);
+    assert_eq!(after.prerequisite_claims.get(&operation_id), Some(&held));
+    assert!(
+        finished.is_ok(),
+        "known-terminal settlement left an unbounded Council watcher"
+    );
+    assert!(
+        finished.unwrap().is_ok(),
+        "bounded settlement watcher panicked"
+    );
+}
+
+async fn write_admission_fixture(
+    council: &crate::council::CouncilNode,
+    mut request: crate::council::RaftRequest,
+) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
+    let previous = council.desired_state().await.last_applied_log;
+    match &mut request {
+        crate::council::RaftRequest::BatchRegister {
+            expected_log_id, ..
+        } => *expected_log_id = previous,
+        crate::council::RaftRequest::SchedulingDecision(decision) => {
+            request = crate::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
+            }
+        }
+        _ => {}
+    }
+    council.write(request).await
 }

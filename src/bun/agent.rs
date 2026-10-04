@@ -80,6 +80,9 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
+mod batch_jobs;
+mod cluster_jobs;
+pub use cluster_jobs::{ClusterJobReceipt, ClusterJobSettlement};
 mod commands;
 mod consumer;
 mod council_requests;
@@ -96,6 +99,10 @@ mod identity;
 mod identity_signing;
 mod job_runs;
 mod launch;
+#[cfg(test)]
+pub(crate) use cluster_jobs::ClusterJobExecution;
+#[cfg(test)]
+pub(crate) use launch::PrerequisiteFailure;
 mod launch_evidence;
 mod logs;
 mod networking;
@@ -117,7 +124,7 @@ mod trace;
 mod volumes;
 
 use app_stop::{PendingStops, StopPurpose};
-pub use commands::{AgentCommand, ApplyEvent, FaultClearance};
+pub use commands::{AgentCommand, ApplyEvent, FaultClearance, LogExecutionSelection};
 pub use consumer::ConsumerUpdate;
 use deploy_ops::{DeployOp, DeployOps, PreparedInstance, RollingInstance};
 use deploy_worker::DeployWorker;
@@ -669,6 +676,7 @@ pub struct BunAgent<G: Grill> {
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
     recorded_jobs: BTreeMap<String, super::jobs::RecordedJob>,
+    retired_batch_executions: BTreeMap<String, super::jobs::RetiredBatchExecution>,
     job_store_uncertain: bool,
     /// Self-upgrade manager. `None` when upgrades are not configured
     /// (upgrade commands then answer with an error).
@@ -873,6 +881,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
             recorded_jobs: BTreeMap::new(),
+            retired_batch_executions: BTreeMap::new(),
             job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1025,6 +1034,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
             recorded_jobs: BTreeMap::new(),
+            retired_batch_executions: BTreeMap::new(),
             job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1305,7 +1315,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let grill = self.supervisor.grill().clone();
         let id = instance_id.clone();
-        let app = app_name.to_string();
+        let app = self.logical_execution_name(instance_id, app_name);
         let namespace = namespace.to_string();
 
         let (line_tx, mut line_rx) = mpsc::channel::<crate::ketchup::types::CapturedLine>(256);
