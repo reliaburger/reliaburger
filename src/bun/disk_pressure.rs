@@ -357,7 +357,7 @@ mod tests {
             .truncate(false)
             .open(directory.path().join("_export_checkpoint.lock"))
             .unwrap();
-        holder.try_lock().unwrap();
+        let holder = crate::file_lock::FileLock::try_lock(holder).unwrap();
         let release = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
             drop(holder);

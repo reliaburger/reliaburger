@@ -17,6 +17,7 @@ use super::InstanceId;
 use super::oci::OciSpec;
 use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch};
 use crate::durable::validate_directory;
+use crate::file_lock::{FileLock, FileLockError};
 
 mod prune;
 
@@ -603,7 +604,9 @@ fn create_directory(path: &Path) -> io::Result<()> {
     validate_directory(path)
 }
 
-fn operation_lock(directory: &Path) -> io::Result<File> {
+/// Serialise operations on one process directory, waiting up to two seconds
+/// for another operation to finish.
+fn operation_lock(directory: &Path) -> io::Result<FileLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -612,26 +615,15 @@ fn operation_lock(directory: &Path) -> io::Result<File> {
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(directory.join("client.lock"))?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "process operation is busy",
-                ));
-            }
-            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    FileLock::lock_within(file, Duration::from_secs(2)).map_err(|error| match error {
+        FileLockError::Busy => {
+            io::Error::new(io::ErrorKind::WouldBlock, "process operation is busy")
         }
-    }
-    Ok(file)
+        FileLockError::Io(error) => error,
+    })
 }
 
-fn wait_for_owner_lock(directory: &Path) -> io::Result<File> {
+fn wait_for_owner_lock(directory: &Path) -> io::Result<FileLock> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match process_owner::lock_owner(directory) {
@@ -800,7 +792,7 @@ mod tests {
     /// A live owner that hangs up on its first clients without answering, the
     /// way the real one drops a client slower than its read timeout.
     struct ImpatientOwner {
-        _lock: File,
+        _lock: FileLock,
         socket_directory: PathBuf,
     }
 
@@ -846,6 +838,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.socket_directory);
         }
+    }
+
+    /// Bun spawns workloads while it prepares, starts and signals others, so
+    /// the operation lock is taken beside process spawning. A child mid-spawn
+    /// holds a copy of every descriptor until its `exec`: a lock closed
+    /// without unlocking stayed held by that copy after its guard was gone
+    /// (#613, the #285 class). `operation_lock`'s own retry hides that, so
+    /// the test probes the file without waiting straight after each drop.
+    #[test]
+    fn a_dropped_operation_lock_is_free_while_other_threads_spawn_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let _spawning = crate::file_lock::SpawningThreads::start(2);
+        let probe = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.path().join("client.lock"))
+                .unwrap()
+        };
+        let mut still_held = 0;
+        for _ in 0..1000 {
+            let operation = operation_lock(directory.path()).unwrap();
+            drop(operation);
+            if FileLock::try_lock(probe()).is_err() {
+                still_held += 1;
+            }
+        }
+        assert_eq!(still_held, 0, "operation locks still held after drop");
     }
 
     #[tokio::test(flavor = "multi_thread")]

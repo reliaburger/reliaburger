@@ -12,6 +12,7 @@ use aya::programs::CgroupSockAddr;
 use serde::{Deserialize, Serialize};
 
 use super::{OnionEbpf, REQUIRED_MAPS, REQUIRED_PROGRAMS, check_prerequisites};
+use crate::file_lock::FileLock;
 
 #[path = "ownership/kernel.rs"]
 mod kernel;
@@ -44,18 +45,11 @@ struct OwnedLink {
     attach_type: u32,
 }
 
+// Pins keep kernel enforcement alive after the claim is released.
 pub(super) struct Ownership {
-    lock: File,
+    _lock: FileLock,
     manifest: Manifest,
     links: Vec<OwnedLink>,
-}
-
-impl Drop for Ownership {
-    fn drop(&mut self) {
-        // Pins keep kernel enforcement alive. Explicit unlock also prevents a
-        // forked pre-exec child from retaining the recovery claim accidentally.
-        let _ = self.lock.unlock();
-    }
 }
 
 fn private_directory(path: &Path) -> io::Result<bool> {
@@ -113,9 +107,9 @@ fn claim(
     {
         return Err(io::Error::other("invalid kernel ownership lock"));
     }
-    lock.try_lock().map_err(io::Error::other)?;
+    let lock = FileLock::try_lock(lock).map_err(io::Error::other)?;
     if fresh {
-        lock.sync_all()?;
+        lock.file().sync_all()?;
         File::open(&state_directory)?.sync_all()?;
         if let Some(parent) = state_directory.parent() {
             File::open(parent)?.sync_all()?;
@@ -237,7 +231,7 @@ fn claim(
         ));
     }
     Ok(Ownership {
-        lock,
+        _lock: lock,
         manifest,
         links: Vec::new(),
     })
