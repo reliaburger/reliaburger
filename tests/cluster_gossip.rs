@@ -1613,22 +1613,23 @@ async fn rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing(
     );
     traffic_stop.cancel();
     while traffic_tasks.join_next().await.is_some() {}
-    let log = traffic.lock().unwrap();
-    assert!(
-        log.failures.is_empty(),
-        "mTLS traffic failed during the rotation ({} of {}): {:?}",
-        log.failures.len(),
-        log.ok + log.failures.len() as u64,
-        log.failures
-    );
-    for name in names {
-        assert_eq!(
-            log.replicas[name],
-            BTreeSet::from([format!("{name}-replica")]),
-            "the app replica on {name} restarted"
+    {
+        let log = traffic.lock().unwrap();
+        assert!(
+            log.failures.is_empty(),
+            "mTLS traffic failed during the rotation ({} of {}): {:?}",
+            log.failures.len(),
+            log.ok + log.failures.len() as u64,
+            log.failures
         );
+        for name in names {
+            assert_eq!(
+                log.replicas[name],
+                BTreeSet::from([format!("{name}-replica")]),
+                "the app replica on {name} restarted"
+            );
+        }
     }
-    drop(log);
 
     // Raft still replicates over the rotated mTLS transport.
     let leader_council = nodes

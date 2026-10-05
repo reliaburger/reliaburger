@@ -6820,6 +6820,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-cluster_gossip-rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing",
+          "binary": "reliaburger::cluster_gossip",
+          "test": "rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_gossip.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-cluster_gossip-leased_token_cleanup_survives_leader_failure_without_revoking_operator_tokens",
           "binary": "reliaburger::cluster_gossip",
           "test": "leased_token_cleanup_survives_leader_failure_without_revoking_operator_tokens",
