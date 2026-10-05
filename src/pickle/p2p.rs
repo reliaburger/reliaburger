@@ -558,6 +558,18 @@ impl ClusterSource {
         else {
             return Ok(None);
         };
+        // A pull of a reference bound at apply asks for the digest, but the
+        // next apply binds the tag. Remember the tag beside the digest, so
+        // an apply while upstream is down can bind from the cache (F03 U1).
+        // Only on a fresh fill: a cached digest is an older binding, and
+        // re-pulling it (a rollback) mustn't move the tag back.
+        if !cached
+            && let Some(tag) = &image.bound_tag
+            && let Err(error) =
+                super::api::record_commit(&self.state, root.clone(), tag.clone()).await
+        {
+            eprintln!("warning: pull-through cache could not record {cached_repo}:{tag}: {error}");
+        }
         self.materialise_for_architecture(
             &cached_repo,
             root,
@@ -701,6 +713,7 @@ impl ClusterSource {
             registry: image.registry.clone(),
             repository: image.repository.clone(),
             tag: platform.as_str().to_string(),
+            bound_tag: None,
         };
         let manifest = upstream.fetch_manifest(&pinned).await?;
         if manifest.digest != *platform {

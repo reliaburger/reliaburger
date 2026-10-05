@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::council::node::CouncilNode;
 use crate::council::types::{CouncilResponse, DesiredState, RaftRequest};
+use crate::pickle::binding::ImageBinder;
 
 use super::diff::{ChangePayload, ResourceChange};
 use super::git::GitRepo;
@@ -38,12 +39,16 @@ const MAX_SYNC_HISTORY: usize = 100;
 /// moved, so a manual change is repaired on the next tick (B16). The
 /// returned handle finishes once `shutdown` is cancelled; a `git` child
 /// running at that moment is killed rather than waited for (B19).
+///
+/// With a `binder` (the leader's runtime pulls images), each app's images
+/// bind to digests as they're written, as a manual apply binds them.
 pub fn spawn_gitops_sync(
     council: Arc<CouncilNode>,
     config: GitOpsConfig,
     mut webhook_rx: mpsc::Receiver<()>,
     data_dir: PathBuf,
     shutdown: CancellationToken,
+    binder: Option<ImageBinder>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let repo_dir = data_dir.join("gitops-repo");
@@ -209,7 +214,7 @@ pub fn spawn_gitops_sync(
             // the whole set. Writes are idempotent (spec upsert / delete),
             // so re-applying an already-committed change is a harmless
             // no-op.
-            let applied = match apply_changes(&council, &outcome.changes).await {
+            let applied = match apply_changes(&council, &outcome.changes, binder.as_ref()).await {
                 Ok(applied) => applied,
                 Err(unapplied) => {
                     let sha = outcome
@@ -450,15 +455,34 @@ fn now_millis() -> u64 {
 /// that the state machine refused. The caller must advance `last_applied_commit` only on `Ok` — that's
 /// the D12 atomicity guarantee: a half-applied sync leaves the commit
 /// unadvanced so the next tick re-applies the whole (idempotent) set.
+///
+/// With a `binder`, an app's images bind to digests before its write; an
+/// image that can't be bound fails the change like a refused write, and
+/// the error names the image.
 pub async fn apply_changes(
     council: &CouncilNode,
     changes: &[ResourceChange],
+    binder: Option<&ImageBinder>,
 ) -> Result<usize, String> {
     let mut applied = 0usize;
     for change in changes {
-        let Some(request) = change_to_request(change) else {
+        let Some(mut request) = change_to_request(change) else {
             continue; // jobs/builds: not reconciled desired state
         };
+        if let (Some(binder), RaftRequest::AppSpec { app_id, spec }) = (binder, &mut request) {
+            let catalog = council.manifest_catalog().await;
+            match binder.bind_app(&app_id.name, spec, &catalog).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        println!("gitops: {binding}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("gitops: failed to apply {}: {error}", change_id(change));
+                    return Err(format!("{} ({error})", change_id(change)));
+                }
+            }
+        }
         // A committed entry the state machine refused left desired state
         // unchanged, so it's as unapplied as a failed write (B15).
         match council.write(request).await {

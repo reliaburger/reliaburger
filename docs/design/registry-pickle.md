@@ -17,6 +17,7 @@ Core capabilities:
 - **Pull-through cache.** For images from external registries (Docker Hub, GHCR, ECR), Pickle acts as a transparent pull-through cache. The first node to need an external image pulls it from upstream; every subsequent node pulls from the peer cache.
 - **OCI Distribution API.** Stock OCI clients push and pull over the standard `/v2/` API. What a client needs depends on the listener (see §1.2): `relish build` and peer replication send an API token as a bearer; `docker`, `crane` and other Basic-auth clients log in with an API token as the password, over TLS only.
 - **Integrated image signing.** Keyless signing via workload identity, in Reliaburger's own format (not cosign's), with optional enforcement that unsigned images are unschedulable. Key-based cosign signatures in the classic `.sig` layout are read for upstream images (§5.6).
+- **Digest binding.** The node that accepts an apply binds every image tag to the manifest digest it names then (`nginx:1.27@sha256:…`), so every node, restart and replacement pulls the same bytes (F03 U1, #361).
 - **Build job integration.** Build jobs push directly to Pickle via the `pickle://` URI scheme through a scoped Unix socket, eliminating the need for Docker-in-Docker or external CI registries.
 
 ### 1.1 Current listener and evidence contract
@@ -121,7 +122,7 @@ routable, so this only affects hand-built configurations.
 | **Raft** (council consensus) | Stores image manifests (the metadata describing which layers compose an image) for consistency. The Raft state machine is the authoritative source for manifest data, tag-to-digest mappings, and the peer location map (which nodes hold which layers). |
 | **Mustard** (gossip protocol) | Provides cluster membership and peer discovery. Pickle uses Mustard to discover which nodes are alive and their network addresses, enabling peer selection for replication and parallel downloads. Mustard also disseminates node resource summaries that inform peer selection (e.g., least-loaded node). |
 | **Sesame** (security / mTLS / identity) | Provides the mTLS certificates for secure inter-node layer transfers and the Workload CA that mints the persistent per-namespace build-signer identity used for keyless image signing (an X.509 leaf, not a JWT). Verification chains the signature back to the cluster root CA. |
-| **Meat** (scheduler) | Consumes image availability from Raft state to make scheduling decisions. Meat considers an image schedulable once its manifest exists in Raft with sufficient replication. Meat refuses to schedule unsigned images when `require_signatures = true`. |
+| **Meat** (scheduler) | Consumes image availability from Raft state to make scheduling decisions. Meat considers an image schedulable once its manifest exists in Raft with sufficient replication. Meat places unsigned images; Bun refuses to deploy them when `require_signatures = true` (§8.2). |
 
 ---
 
@@ -438,7 +439,7 @@ pub enum SpareReason {
     WithinRetention,
 }
 
-/// Cosign-compatible image signature.
+/// An image signature in Pickle's own format (not cosign's).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageSignature {
     /// The signing method.
@@ -734,7 +735,9 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
    their own registry, because a mirror could answer a mutable tag with a
    different image. Loopback mirrors use plain HTTP.
 
-4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached.
+4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached. Since F03 U1 this matters less: an apply binds each tag to a digest (`redis:7-alpine@sha256:…`), so pulls ask for the digest and a moved tag changes nothing until the next apply. A fresh fill of a bound reference also records the image under the tag it carries, so an apply while upstream is down can bind the tag from the cache.
+
+5. **Binding at apply.** The node that handles `POST /v1/apply` (the leader, on a cluster), the GitOps runner, and a standalone node's apply resolve each tag through `pickle::binding::ImageBinder`: Pickle's catalogue for a Pickle image, otherwise a manifest `HEAD` upstream (20 s), otherwise the cached tag. With none of those the apply fails rather than store an unbound tag. A reference that already carries a digest is left alone, which is why a rollback restores the digest that ran. Bun attaches a binder only when its runtime pulls images; under ProcessGrill the image is a placeholder and stays as written.
 
 ```rust
 /// Pull-through cache resolution for an external image reference.
@@ -1162,9 +1165,10 @@ Build jobs are granted write access to Pickle only through a Unix socket mounted
 
 When `require_signatures = true`:
 
-- **Unsigned images are accepted but unschedulable.** Pushes never fail due to missing signatures, which avoids breaking CI pipelines. However, Meat refuses to schedule unsigned images. This creates a clear separation: the registry accepts all valid OCI images; the scheduler enforces trust policy.
+- **Unsigned images are accepted but undeployable.** Pushes never fail due to missing signatures, which avoids breaking CI pipelines. However, Bun refuses to deploy unsigned images (`enforce_image_signature`, before every deploy); Meat still places them. This creates a clear separation: the registry accepts all valid OCI images; the node that would run one enforces trust policy.
 - **Keyless signing eliminates key management.** Build nodes sign automatically with the cluster's persistent per-namespace build-signer identity (a Workload-CA leaf). No operator-provisioned signing keys to rotate, distribute, or protect.
 - **External signatures are Reliaburger's own, not cosign's.** Teams pushing from external CI sign with `relish sign` and list their public keys in each node's `trust_policy.keys`. Pickle verifies the signature over the digest string against those keys. Cosign signatures are read only for upstream images, in the classic `.sig` layout (§5.6).
+- **Upstream images follow node rules.** `[[images.trust_policy.upstream]]` in `node.toml` names the registries and repositories a node runs images from (the most specific `match` wins); `upstream_default.allow = false` refuses the rest, at apply and again in Bun before every deploy (F03 U2, #361). Pickle's own images are judged by signature, not by these rules.
 - **Signature verification is cached.** Once a manifest's signature is verified and recorded in Raft, subsequent scheduling decisions don't re-verify. The signature status is part of the `ManifestMetadata`.
 
 ### 8.3 Pull-Through Cache Credential Handling
@@ -1335,9 +1339,9 @@ Test: build job auto-signs image
 
 Test: unsigned image is unschedulable
   - Enable require_signatures = true.
-  - Push image externally without cosign signature.
+  - Push image externally without a signature.
   - Attempt to deploy app referencing the image.
-  - Verify Meat refuses to schedule (unsigned).
+  - Verify Bun refuses the deploy (unsigned), naming the image.
   - Verify relish inspect shows "unsigned".
 
 Test: external relish sign signature accepted

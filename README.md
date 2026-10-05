@@ -245,6 +245,8 @@ Nodes join with single-use tokens and certificate signing requests.
 Certificates renew themselves. Secrets live in your config encrypted to the
 cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
+Every apply binds image tags to digests, so a moved tag can't change what runs,
+and node config can limit which upstream registries images may come from.
 
 **A registry on every node.** Pickle is an OCI registry built into the cluster.
 Push once and nodes pull layers from each other. It also caches upstream

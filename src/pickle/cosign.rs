@@ -130,6 +130,7 @@ pub fn signature_reference(image: &ImageReference, digest: &Digest) -> ImageRefe
         registry: image.registry.clone(),
         repository: image.repository.clone(),
         tag: signature_tag(digest),
+        bound_tag: None,
     }
 }
 

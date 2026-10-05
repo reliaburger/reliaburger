@@ -3208,6 +3208,7 @@ fn require_signatures_policy() -> crate::config::node::TrustPolicySection {
     crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![],
+        ..Default::default()
     }
 }
 
@@ -3857,6 +3858,7 @@ async fn relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key() 
     agent.set_trust_policy(crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![operator.public_key_base64()],
+        ..Default::default()
     });
 
     // Signed with the trusted key: admitted, pinned to the signed digest.
@@ -3893,6 +3895,7 @@ async fn moving_a_tag_after_signing_leaves_the_new_digest_unsigned() {
     agent.set_trust_policy(crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![operator.public_key_base64()],
+        ..Default::default()
     });
 
     // Someone re-pushes v1 with different bytes: the signature covered
@@ -3915,6 +3918,80 @@ async fn signing_a_digest_the_catalogue_does_not_hold_is_refused() {
         matches!(&result, Err(BunError::SecurityError { reason }) if reason.contains("refused")),
         "got: {result:?}"
     );
+}
+
+// --- upstream trust rules at deploy (F03 U2, #361) ---
+
+/// `[images.trust_policy]` allowing only Docker Hub's official images.
+fn official_images_only() -> crate::config::node::TrustPolicySection {
+    crate::config::node::TrustPolicySection {
+        upstream: vec![crate::config::node::UpstreamTrustRule {
+            pattern: "docker.io/library/*".to_string(),
+            require_signatures: false,
+        }],
+        upstream_default: crate::config::node::UpstreamDefault { allow: false },
+        ..Default::default()
+    }
+}
+
+/// A council-backed agent whose runtime pulls images, under `policy`.
+async fn pulling_agent(
+    raft_port: u16,
+    policy: crate::config::node::TrustPolicySection,
+) -> (Arc<CouncilNode>, BunAgent<MockGrill>) {
+    let council = catalogue_council(raft_port).await;
+    let mut agent = agent_with_council(council.clone());
+    agent
+        .supervisor
+        .grill()
+        .set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    agent.set_trust_policy(policy);
+    (council, agent)
+}
+
+/// Bun is the enforcement: an image the apply never judged (a spec already
+/// in Raft, a node with a stricter policy) is refused at deploy, by name.
+#[tokio::test]
+async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
+    let (_council, agent) = pulling_agent(9310, official_images_only()).await;
+    let refused = agent
+        .enforce_image_signature(&app("ghcr.io/evil/miner:1"))
+        .await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|reason| reason.contains("ghcr.io/evil/miner:1")),
+        "{refused:?}"
+    );
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let allowed = agent
+        .enforce_image_signature(&app(&format!("nginx:1.27@{digest}")))
+        .await;
+    assert_eq!(allowed, Ok(None));
+}
+
+/// The rules are for images from outside Pickle.
+#[tokio::test]
+async fn a_deploy_leaves_pickle_images_to_require_signatures() {
+    let (council, agent) = pulling_agent(9311, official_images_only()).await;
+    push_manifest(&council, "team/web", "v1", &"5".repeat(64)).await;
+    let result = agent
+        .enforce_image_signature(&app("localhost:5050/team/web:v1"))
+        .await;
+    assert_eq!(result, Ok(None));
+}
+
+/// Under ProcessGrill an image is a placeholder nobody pulls, so there's
+/// nothing for the upstream rules to judge (decision 5).
+#[tokio::test]
+async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
+    let council = catalogue_council(9312).await;
+    let mut agent = agent_with_council(council);
+    agent.set_trust_policy(official_images_only());
+    let result = agent
+        .enforce_image_signature(&app("proc-grill:image-ignored"))
+        .await;
+    assert_eq!(result, Ok(None));
 }
 
 #[tokio::test]

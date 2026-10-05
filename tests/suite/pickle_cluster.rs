@@ -904,6 +904,43 @@ async fn pull_through_caches_once_then_serves_peers() {
     );
 }
 
+/// F03 U1: once applies bind every image, pulls ask for `nginx:v1@sha256:…`
+/// and never for the bare tag. The cache must still remember the tag, or
+/// an apply with upstream down could never bind from it (decision 2).
+#[tokio::test]
+async fn a_bound_pull_through_remembers_the_tag_for_binding_offline() {
+    use reliaburger::grill::image::ImageReference;
+    use reliaburger::pickle::binding::{BindSource, Binding, bind_image};
+    use reliaburger::pickle::upstream::{OciUpstream, UpstreamRegistry};
+
+    let (upstream, _) = Registry::start_counted(9).await;
+    push_test_image(&upstream.base_url(), "nginx", "v1").await;
+    let tagged = format!("{}/nginx:v1", upstream.addr);
+    let digest = OciUpstream::insecure_http(Default::default())
+        .head_manifest_digest(&ImageReference::parse(&tagged).unwrap())
+        .await
+        .unwrap();
+    let bound = ImageReference::parse(&format!("{tagged}@{}", digest.as_str())).unwrap();
+
+    let node = Registry::start(1, false).await;
+    cluster_source_with_upstream(&node)
+        .ensure_external_image_with_peers(&bound, &[])
+        .await
+        .unwrap()
+        .expect("pull-through should serve the bound image");
+
+    // Upstream is now unreachable: the binder has no registry to ask.
+    let catalog = node.state.catalog.read().await.clone();
+    let binding = bind_image(&tagged, &catalog, None).await.unwrap();
+    assert!(
+        matches!(
+            &binding,
+            Binding::Bound { digest: cached, source: BindSource::Cache, .. } if *cached == digest
+        ),
+        "{binding:?}"
+    );
+}
+
 /// D2: `pull_through = false` is a clean fall-through, not an error.
 #[tokio::test]
 async fn pull_through_disabled_is_a_fall_through() {
