@@ -8879,7 +8879,7 @@ fn adoption_record(
     };
     let app_spec: AppSpec = toml::from_str(spec_toml).unwrap();
     crate::grill::records::InstanceRecord {
-        schema: 2,
+        schema: crate::grill::records::RECORD_SCHEMA,
         instance_id: instance.to_string(),
         namespace: "default".to_string(),
         app_name: app.to_string(),
@@ -8889,6 +8889,7 @@ fn adoption_record(
         runtime: crate::grill::records::RuntimeKind::Process,
         pid: 4242,
         pid_started_at: 1000,
+        boot_id: crate::grill::records::current_boot(),
         runc_container_id: None,
         log_stem: None,
         host_port: Some(30123),
@@ -9328,7 +9329,8 @@ async fn started_rootless_instance_persists_network_recreation_state() {
 
     let persisted = crate::grill::records::load_records(records.path()).unwrap();
     assert_eq!(persisted.len(), 1);
-    assert_eq!(persisted[0].schema, 2);
+    assert_eq!(persisted[0].schema, crate::grill::records::RECORD_SCHEMA);
+    assert_eq!(persisted[0].boot_id, crate::grill::records::current_boot());
     assert_eq!(persisted[0].rootless_network, Some(rootless_network));
 }
 
@@ -9449,6 +9451,37 @@ async fn corrupt_adoption_record_never_sweeps_its_workload_identity() {
             .is_some(),
         "unreadable ownership was incorrectly treated as absence"
     );
+}
+
+#[tokio::test]
+async fn a_retired_stale_record_does_not_stop_the_other_instances_adopting() {
+    // #607: the runtime retires a generation whose record names another
+    // process; startup carries on with everything else on the node.
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let records = tempfile::tempdir().unwrap();
+    agent.set_records_dir(records.path().to_path_buf());
+    for (index, app) in ["frontend", "redis"].into_iter().enumerate() {
+        let mut record = adoption_record(&format!("default__{app}-0"), app, false);
+        record.host_port = Some(30123 + index as u16);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+    }
+    let stale = InstanceId("default__frontend-0".into());
+    let healthy = InstanceId("default__redis-0".into());
+    grill.set_adopt_result(&stale, false);
+    grill.set_adopt_result(&healthy, true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    assert!(agent.supervisor.get_instance(&stale).is_none());
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy).unwrap().state,
+        ContainerState::Running
+    );
+    let kept: Vec<_> = crate::grill::records::load_records(records.path())
+        .unwrap()
+        .into_iter()
+        .map(|record| record.instance_id)
+        .collect();
+    assert_eq!(kept, vec![healthy.0]);
 }
 
 #[tokio::test]

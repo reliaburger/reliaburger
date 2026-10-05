@@ -896,14 +896,16 @@ impl RuncGrill {
                 runtime.owned_cleanup(&id, &context).await?;
                 return Ok(false);
             };
-            // Same ±2 s tolerance as every other adoption: /proc start times
-            // are derived from boot time, which moves with NTP steps.
-            if adoption.pid != launcher_pid
-                || !crate::grill::records::process_matches(launcher_pid, adoption.pid_started_at)
-            {
-                return Err(io::Error::other(
-                    "adoption process identity conflicts with runtime owner",
-                ));
+            // The owner proves which launcher runs this generation. An
+            // adoption record naming another process is stale: retire the
+            // generation so the instance starts again. Refusing here took
+            // the agent, and every workload on the node, down with it (#607).
+            if adoption.pid != launcher_pid || !crate::grill::records::is_live(&adoption) {
+                eprintln!(
+                    "runc: {id}: adoption record names another process than the running launcher {launcher_pid}; retiring the generation"
+                );
+                runtime.owned_cleanup(&id, &context).await?;
+                return Ok(false);
             }
             runtime
                 .remember_launcher(&id, &context, launcher_pid)

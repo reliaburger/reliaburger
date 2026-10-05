@@ -1469,7 +1469,7 @@ mod tests {
         }
 
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: id.0.clone(),
             namespace: "payments".to_string(),
             app_name: "rootfs-adoption".to_string(),
@@ -1479,6 +1479,7 @@ mod tests {
             runtime: crate::grill::records::RuntimeKind::Runc,
             pid,
             pid_started_at: started_at,
+            boot_id: crate::grill::records::current_boot(),
             runc_container_id: Some(id.0.clone()),
             // Owned adoption checks the launcher's log identity too.
             log_stem: original.log_stem(&id).await,
