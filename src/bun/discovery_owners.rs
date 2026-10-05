@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::durable::{Access, read_json, validate_file};
+use crate::file_lock::{FileLock, FileLockError};
 use crate::grill::runc_intent::NetworkReference;
 use crate::onion::{service_id::ServiceId, service_map::ServiceMap, types::ServiceEntry};
 
@@ -86,7 +87,7 @@ pub struct DiscoveryJournal {
     directory: PathBuf,
     inventory: DiscoveryInventory,
     uncertain: bool,
-    _claim: File,
+    _claim: FileLock,
     #[cfg(test)]
     write_pause: Option<(
         tokio::sync::oneshot::Sender<()>,
@@ -286,11 +287,12 @@ impl DiscoveryJournal {
             .create_new(fresh)
             .open(directory.join("owner.lock"))?;
         validate_file(&claim, Access::Exclusive)?;
-        claim.try_lock().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => {
+        // Every refusal below drops the claim, which unlocks it.
+        let claim = FileLock::try_lock(claim).map_err(|error| match error {
+            FileLockError::Busy => {
                 io::Error::new(io::ErrorKind::WouldBlock, "discovery owner is busy")
             }
-            std::fs::TryLockError::Error(error) => error,
+            FileLockError::Io(error) => error,
         })?;
         let inventory = match read_checkpoint(directory) {
             Ok(inventory) if !fresh => inventory,
@@ -301,7 +303,7 @@ impl DiscoveryJournal {
             }
             Err(error) if fresh && error.kind() == io::ErrorKind::NotFound => {
                 let empty = DiscoveryInventory::default();
-                claim.sync_all()?;
+                claim.file().sync_all()?;
                 write_checkpoint(directory, &empty)?;
                 empty
             }

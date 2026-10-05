@@ -11,18 +11,9 @@ use tokio::sync::Mutex;
 
 use super::InstanceId;
 use super::netns::{MAX_CONTAINERS_PER_NODE, MAX_NODE_INDEX};
+use crate::file_lock::FileLock;
 
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024;
-
-// Closing the parent descriptor alone can leave a lock held briefly by a
-// concurrently forked child before exec. Explicit unlock retires that ownership.
-struct JournalLock(std::fs::File);
-
-impl Drop for JournalLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,9 +122,8 @@ impl NetworkLeases {
                     "network lease lock is not a regular file",
                 ));
             }
-            lock.try_lock()
+            let _lock = FileLock::try_lock(lock)
                 .map_err(|e| std::io::Error::other(format!("network address pool is busy: {e}")))?;
-            let _lock = JournalLock(lock);
             let path = directory.join(".network-leases.json");
             let mut journal = crate::durable::read_json_if_exists::<Journal>(
                 &path,

@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::types::KetchupError;
+use crate::file_lock::{FileLock, FileLockError};
 
 /// The checkpoint filename both Bun tasks and `relish logs-export` use, so
 /// there is exactly one authoritative record of what has been exported.
@@ -161,24 +162,6 @@ fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
     Ok(url)
 }
 
-/// The `flock` on a source's `_export_checkpoint.lock`, released when dropped.
-///
-/// A `flock` belongs to the open file description, not to the descriptor, and
-/// a child process that another thread is spawning holds a copy of every
-/// descriptor until its `exec` closes it. Closing ours alone could leave the
-/// lock held by that copy for a moment, so the next export straight after
-/// was refused as busy (#519). Unlocking explicitly releases it for every
-/// copy at once.
-struct ExportLock(std::fs::File);
-
-impl Drop for ExportLock {
-    fn drop(&mut self) {
-        // Nothing useful can be done with a failed unlock: closing the
-        // descriptor straight after still releases the lock eventually.
-        let _ = self.0.unlock();
-    }
-}
-
 /// Export local Parquet log files to an object store.
 ///
 /// Ships any `.parquet` files in `source_dir` whose durable id isn't yet in
@@ -205,12 +188,12 @@ pub async fn export_logs(
             options.mode(0o600);
         }
         let file = options.open(directory.join("_export_checkpoint.lock"))?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(KetchupError::ExportBusy),
-            Err(std::fs::TryLockError::Error(error)) => return Err(KetchupError::Io(error)),
-        }
-        let lock = ExportLock(file);
+        // The guard unlocks when dropped, so a child mid-spawn can't keep the
+        // next export busy (#519).
+        let lock = FileLock::try_lock(file).map_err(|error| match error {
+            FileLockError::Busy => KetchupError::ExportBusy,
+            FileLockError::Io(error) => KetchupError::Io(error),
+        })?;
         let path = directory.join(CHECKPOINT_FILENAME);
         let current = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
@@ -528,7 +511,7 @@ mod tests {
             .truncate(false)
             .open(source.path().join("_export_checkpoint.lock"))
             .unwrap();
-        holder.try_lock().unwrap();
+        let _holder = FileLock::try_lock(holder).unwrap();
 
         let mut checkpoint = ExportCheckpoint::default();
         let result = export_logs(
