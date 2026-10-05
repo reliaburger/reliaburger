@@ -94,7 +94,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49. …
+refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49. …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary

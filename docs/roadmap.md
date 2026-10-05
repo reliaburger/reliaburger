@@ -221,7 +221,7 @@ migration and no feature gate
   The self-upgrade fixes for the privileged Linux `oci_crash` flake are in
   too, but that flake isn't proven gone yet, so
   [#526](https://github.com/reliaburger/reliaburger/issues/526) stays open. 0.1.5
-  changes the protocol and state formats (34 and 49 in 0.1.4; 40 and 57 now,
+  changes the protocol and state formats (34 and 49 in 0.1.4; 40 and 58 now,
   for the token sweep and the audit fixes), so a 0.1.4 cluster can't roll to
   it: recreate the cluster
   ([upgrading from 0.1.4](releasing.md#upgrading-from-014)).

@@ -809,6 +809,10 @@ impl super::Grill for ProcessGrill {
                 )),
             };
         }
+        // A process recorded in an earlier boot is gone, whatever now holds its pid.
+        if !records::from_this_boot(record) {
+            return Ok(false);
+        }
         let (running, _) =
             poll_adopted_process(record.pid, record.pid_started_at).map_err(|error| {
                 GrillError::StateUnavailable {
@@ -1139,7 +1143,7 @@ mod tests {
 
     fn record_for(instance: &InstanceId, pid: u32, started_at: u64) -> InstanceRecord {
         InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: instance.0.clone(),
             namespace: "default".to_string(),
             app_name: "test".to_string(),
@@ -1149,6 +1153,7 @@ mod tests {
             runtime: RuntimeKind::Process,
             pid,
             pid_started_at: started_at,
+            boot_id: crate::grill::records::current_boot(),
             runc_container_id: None,
             log_stem: None,
             host_port: None,
