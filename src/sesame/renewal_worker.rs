@@ -62,6 +62,10 @@ impl RenewalMonitor {
 /// Pause after a failed renewal attempt before the next one.
 pub const RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// How often the worker looks for a Node CA rotation to follow (F04 R4):
+/// the same cadence as Bun's security refresh, which installs the trust set.
+pub const ROTATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// One renewal owner for one durable identity. The HTTP client refuses redirects
 /// and uses a fresh TLS connection for each attempt, with the current live leaf.
 pub struct NodeRenewalWorker {
@@ -144,10 +148,23 @@ impl NodeRenewalWorker {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut retry_at = tokio::time::Instant::now();
         let mut last_error = None;
+        let mut rotation_checked_at: Option<tokio::time::Instant> = None;
+        let mut rotation_due = false;
         loop {
             tokio::select! { biased;
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
+            }
+            // A Node CA rotation (F04 R4): acknowledge the new trust set once
+            // it's installed, and renew early when it's this node's turn.
+            if rotation_checked_at
+                .is_none_or(|checked| checked.elapsed() >= ROTATION_CHECK_INTERVAL)
+            {
+                rotation_checked_at = Some(tokio::time::Instant::now());
+                rotation_due = tokio::select! { biased;
+                    _ = shutdown.cancelled() => return,
+                    due = self.follow_rotation(&council, &membership, local_api) => due,
+                };
             }
             let current = self.identity.snapshot();
             let now = SystemTime::now();
@@ -174,7 +191,7 @@ impl NodeRenewalWorker {
                 .not_before
                 .checked_add(lifetime / 2)
                 .unwrap_or(current.not_before);
-            if now < due {
+            if now < due && !rotation_due {
                 self.state.send_replace(RenewalState::Valid);
                 continue;
             }
@@ -192,6 +209,7 @@ impl NodeRenewalWorker {
                 Ok(()) => {
                     self.state.send_replace(RenewalState::Valid);
                     last_error = None;
+                    rotation_due = false;
                 }
                 Err(error) => {
                     self.state.send_replace(RenewalState::Retrying);
@@ -205,13 +223,48 @@ impl NodeRenewalWorker {
         }
     }
 
-    async fn renew(
+    /// Follow a Node CA rotation from this node's replica of the council
+    /// state: acknowledge the new trust set once this node has installed it
+    /// (Bun's security refresh installs it), and say whether it's this node's
+    /// turn to renew onto the new CA. A failed acknowledgement is logged once
+    /// and retried on the next check.
+    async fn follow_rotation(
         &self,
         council: &crate::council::CouncilNode,
         membership: &RwLock<Vec<crate::bun::api::NodeMembershipInfo>>,
         local_api: SocketAddr,
-    ) -> Result<(), String> {
-        use base64::Engine as _;
+    ) -> bool {
+        let state = council.security_state().await;
+        let current = self.identity.snapshot();
+        if super::ca_rotation::trust_acknowledgement_due(&state, &current.node_id, &current.trust)
+            .is_some()
+        {
+            let acknowledged = tokio::time::timeout(
+                Duration::from_secs(15),
+                self.acknowledge_trust(council, membership, local_api),
+            )
+            .await
+            .unwrap_or_else(|_| Err("trust acknowledgement timed out".into()));
+            if let Err(error) = acknowledged {
+                eprintln!("node trust acknowledgement failed; retrying: {error}");
+            }
+        }
+        super::ca_rotation::early_renewal_due(
+            &state,
+            &current.node_id,
+            current.ca_generation,
+            SystemTime::now(),
+        )
+    }
+
+    /// The current council leader's API address: this node's own when it
+    /// leads, otherwise the one the leader advertises.
+    async fn leader_endpoint(
+        &self,
+        council: &crate::council::CouncilNode,
+        membership: &RwLock<Vec<crate::bun::api::NodeMembershipInfo>>,
+        local_api: SocketAddr,
+    ) -> Result<SocketAddr, String> {
         let current = self.identity.snapshot();
         let leader_name = {
             let metrics = council.metrics();
@@ -225,17 +278,61 @@ impl NodeRenewalWorker {
                 .name
                 .clone()
         };
-        let endpoint = if leader_name == current.node_id {
-            local_api
-        } else {
-            membership
-                .read()
-                .await
+        if leader_name == current.node_id {
+            return Ok(local_api);
+        }
+        membership
+            .read()
+            .await
+            .iter()
+            .find(|node| node.node_id.0 == leader_name)
+            .map(|node| node.address)
+            .ok_or_else(|| "current leader has no advertised API endpoint".to_string())
+    }
+
+    /// Tell the leader which Node CAs this node trusts now.
+    async fn acknowledge_trust(
+        &self,
+        council: &crate::council::CouncilNode,
+        membership: &RwLock<Vec<crate::bun::api::NodeMembershipInfo>>,
+        local_api: SocketAddr,
+    ) -> Result<(), String> {
+        let endpoint = self.leader_endpoint(council, membership, local_api).await?;
+        let current = self.identity.snapshot();
+        let request = super::renewal::TrustAcknowledgement {
+            compatibility: crate::compatibility::CURRENT,
+            node_ca_fingerprints: current
+                .trust
+                .node_cas
                 .iter()
-                .find(|node| node.node_id.0 == leader_name)
-                .map(|node| node.address)
-                .ok_or("current leader has no advertised API endpoint")?
+                .map(|der| super::identity_store::root_ca_fingerprint(der))
+                .collect(),
         };
+        let response = self
+            .http
+            .post(format!("https://{endpoint}/v1/cluster/trust-ack"))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "trust acknowledgement endpoint returned {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn renew(
+        &self,
+        council: &crate::council::CouncilNode,
+        membership: &RwLock<Vec<crate::bun::api::NodeMembershipInfo>>,
+        local_api: SocketAddr,
+    ) -> Result<(), String> {
+        use base64::Engine as _;
+        let current = self.identity.snapshot();
+        let endpoint = self.leader_endpoint(council, membership, local_api).await?;
         let node_id = current.node_id.clone();
         let (csr, key) = tokio::task::spawn_blocking(move || super::ca::create_node_csr(&node_id))
             .await

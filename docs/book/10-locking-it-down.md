@@ -1272,6 +1272,122 @@ Can you see the gap in the workload story? The new Workload CA signs from the mo
 
 The ingress swap has its own test in `wrapper::tls`, which handshakes against a listener, swaps the resolver, and sees the next handshake present the new certificate.
 
+## Rotating a CA, part three: the operator signs
+
+Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` sealed it away, and chapter 4's `relish ca backup` put it in a file the operator keeps. The maintainer's decision was to keep it there. So who signs the new intermediate?
+
+The answer is the oldest trick in PKI. The cluster makes the new key pair and sends a certificate signing request (a CSR: "here's my public key, please certify it"). The operator signs it on their own machine with the root key from the backup, and sends back only the certificate. The new private key never leaves the cluster. The root key never reaches it.
+
+```text
+relish ca rotate --role node --root-backup prod-root.age
+```
+
+### Prepare: a key that waits
+
+The first call is `POST /v1/ca/rotation/prepare`. The leader generates a P-256 key, wraps it with the master key exactly as `relish init` wraps an intermediate's, and builds a CSR for it:
+
+```rust
+pub fn create_intermediate_csr(
+    role: CaRole,
+    wrapping_ikm: &[u8],
+) -> Result<(Vec<u8>, WrappedKey), CaError>
+```
+
+Where does the key live while the operator types their passphrase? We could have kept it in the leader's memory. Then a leader election between prepare and begin loses it, and the operator's carefully signed certificate certifies a key nobody has. So it goes through Raft, in a third log entry:
+
+```rust
+CaRotationPrepare {
+    role: CaRole,
+    generation: u64,
+    csr_der: Vec<u8>,
+    private_key_wrapped: WrappedKey,
+},
+```
+
+Applying it stores a `PendingIntermediate` in `SecurityState`, one per role (asking again replaces it, in case the operator lost the CSR), and allocates a serial from `next_serial`. The serial matters more than it looks. `validate_peer` checks the CRL for the leaf, the Node CA *and* the root, by serial, so an intermediate whose serial collided with a revoked certificate would revoke itself. Letting the council pick it means it can't collide. The answer carries the serial, the CSR and the fingerprint of the root that must sign it. Prepare refuses the same things begin does: the root, a role that's already mid-rotation, and a generation that isn't the active one plus one.
+
+### Sign: only the public key counts
+
+On the operator's side, `relish` opens the backup with R3's code, which checks the root's fingerprint against the one the council just sent. Another cluster's backup is refused before its key is ever used. Then:
+
+```rust
+pub fn sign_intermediate_csr(
+    csr_der: &[u8],
+    role: CaRole,
+    cluster_name: &str,
+    serial: SerialNumber,
+    root_key_der: &[u8],
+    root_certificate_der: &[u8],
+) -> Result<Vec<u8>, CaError>
+```
+
+It takes the CSR's public key and nothing else. The name, the path length of zero, the key usages and the five-year lifetime are the ones every intermediate of that role gets, from the same `intermediate_ca_params` that `relish init` now uses. A CSR can't ask for more than an intermediate is allowed. The certificate is also clamped to the root's lifetime, by the same `bound_leaf_validity` that keeps a node leaf inside its issuer.
+
+### Begin: does the certificate answer the question?
+
+`POST /v1/ca/rotation/begin` carries the certificate back, and the leader checks it before proposing anything, in `intermediate_from_signed`. Is there a CSR waiting for this role? Does the certificate certify *that* key? Does it carry the allocated serial? Is it a CA certificate, signed by the active root?
+
+The key comparison is where we met a small Rust surprise:
+
+```rust
+use x509_parser::certification_request::X509CertificationRequest;
+use x509_parser::prelude::FromDer as _;
+
+let (_, request) = X509CertificationRequest::from_der(&pending.csr_der)?;
+```
+
+Without the second `use`, `from_der` doesn't exist. It's a method of the `FromDer` trait, and in Rust a trait's methods are only callable where the trait is in scope. Go has no equivalent (methods belong to the type), and in Python they'd just be there. The `as _` imports the trait without binding its name, which says "I want the methods, not the name". The compiler's error message even suggests the import, which is more than most languages manage.
+
+Once the certificate passes, it becomes a `CertificateAuthority` with the pending wrapped key and the pending generation, and the leader proposes part one's `CaRotationBegin`. Applying it clears the pending CSR. From that moment both CAs are trusted and new leaves come from the new one.
+
+### Closing the gap from part two
+
+Part two ended on a gap: the new CA signs from the moment the rotation begins, but a node only trusts it after its next security refresh. Renew a node in those few seconds and a peer that hasn't refreshed yet refuses its new leaf.
+
+The fix is to ask. Every node's renewal worker now checks its own replica of the council state every five seconds. Once its live identity holds exactly the trust set the state describes, it tells the leader:
+
+```rust
+pub struct TrustAcknowledgement {
+    pub compatibility: Compatibility,
+    pub node_ca_fingerprints: Vec<String>,
+}
+```
+
+`POST /v1/cluster/trust-ack` is a node-to-node route, authenticated by the node's TLS client certificate like renewal. The leader doesn't take the node's word for which generation it trusts: it refuses unless the list contains every Node CA the council trusts, and then records the active generation in the node's `NodeLeafRecord::trust_generation` through a fourth log entry, `AcknowledgeNodeTrust`. A late, older acknowledgement never moves the record backwards. A node seen for the first time (a join) starts out acknowledging the active CA, because its join bundle carried the whole set.
+
+### Renewing early, in order
+
+Node leaves live a year and renew at the midpoint. Waiting six months for the rotation to finish isn't a plan, so nodes renew early, and `early_renewal_due` decides when:
+
+1. Nobody moves until every live node has acknowledged the new trust set. That's the gap closed.
+2. Then the nodes go one at a time, in node-id order. Each waits until every node before it holds a leaf from the new CA.
+3. A node that's stuck mustn't hold the rest up forever, so each node also has a slot: `EARLY_RENEWAL_STAGGER` (a minute) per place in the order, counted from when the new CA was made. When its slot comes, it goes anyway.
+
+Why one at a time, when renewal swaps credentials without restarting anything? Because if something about the new CA is wrong, we'd rather find out on one node than on all of them at once. The order comes from the `BTreeMap` the council keeps the records in, which iterates sorted, so every node computes the same order from its own replica without asking anyone.
+
+The slot arithmetic has a small type puzzle in it. `Duration::saturating_mul` takes a `u32`, and a node's place is a `usize`:
+
+```rust
+let place = u32::try_from(earlier.len()).unwrap_or(u32::MAX);
+now >= started + EARLY_RENEWAL_STAGGER.saturating_mul(place)
+```
+
+Rust never converts between integer widths behind your back (C would truncate silently, Go makes you write a conversion that can still wrap). `try_from` returns a `Result`, and a cluster with more than four billion nodes earlier in the order gets the largest slot rather than a panic.
+
+### Finalise, for real
+
+Part one's finalise already refused while a node's latest leaf came from the retiring Node CA. It now also refuses, by name, every live node that hasn't acknowledged the new trust set, and tells the operator to decommission a node that's gone for good rather than wait for it. Workload leaves move by themselves within their hour (a workload renews every half hour), and part two's resolver reload re-mints ingress certificates from the new CA, so for those roles finalise keeps part one's rule and waits out the window. We didn't track workload and ingress leaves one by one to shorten that; an hour is short, and the ingress window is the honest one until R7 states the grace policy.
+
+### The tests
+
+Every refusal has a unit test in `ca_rotation.rs`: prepare refuses the root, a rotation in progress and a skipped generation, and allocates nothing when it refuses; a certificate is refused without a pending CSR, for another key, with another serial, from another root, and for another role; an acknowledgement is refused from an unknown node and for a generation the council doesn't have; finalise is refused until every node acknowledges. `nodes_renew_early_one_after_another_once_all_trust_the_new_ca` and `a_stuck_node_delays_the_next_one_only_by_its_slot` pin the ordering. In `ca.rs`, a CSR signed by the root chains to it and its certificate carries the key the cluster wrapped (we sign a node leaf with it to prove it), and a key that isn't the root's doesn't chain. `ca_cmd.rs` signs a real `relish init` cluster's CSR with its backup and refuses another cluster's backup by fingerprint.
+
+The test that matters most is in `tests/cluster_gossip.rs`, run by `make test-cluster`. `rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing` starts three nodes whose Raft and reporting run over mTLS, with the renewal worker, the renewal API and the trust refresh that Bun runs. Each node serves an app replica on a required-mTLS listener built from its live identity, and every node calls every other one ten times a second, with a fresh handshake each time. Then it rotates the Node CA through the real API, signing the CSR with a root backup. It checks that the nodes move in order, that finalise is refused until they have, that the trust set shrinks to the new CA on every node afterwards, that Raft still replicates, that every replica answers with the id it started with (nothing restarted), and that not one request failed.
+
+It failed three times in its first nine runs, and not because of the rotation. A watcher task recorded the order in which nodes moved by polling every 50 ms, and the test sometimes checked the order the instant the last node moved, before the watcher's next poll. The fix was to wait for the watcher too. A test that's flaky for its own reasons teaches you nothing about the code, so it's worth running a new cluster test in a loop before you trust it.
+
+Four things went into the Raft log, the snapshot and a node-to-node body (`PendingIntermediate`, `trust_generation`, two `RaftRequest` variants and the acknowledgement), so the protocol and state generations in `src/compatibility.rs` went up by one each.
+
 ## Certificate revocation
 
 Sometimes you need to revoke a certificate before it expires. A node gets compromised, a workload's key leaks, or you rotate a CA. The Certificate Revocation List (CRL) tracks which serial numbers are no longer trusted.

@@ -1,7 +1,8 @@
 //! `relish ca backup` and `relish ca verify`: the root CA backup the operator
-//! holds (F04 R3).
+//! holds (F04 R3), and `relish ca rotate`, which signs a new intermediate
+//! with it (F04 R4).
 //!
-//! Both run offline. `backup` runs where the master key is, on the node
+//! `backup` and `verify` run offline. `backup` runs where the master key is, on the node
 //! `relish init` ran on, and reads the three files init wrote there: the
 //! master key, the security bootstrap state and the sealed root key. The
 //! root key goes from there straight into a file sealed to the operator's
@@ -16,7 +17,9 @@ use age::secrecy::SecretString;
 
 use super::RelishError;
 use crate::sesame::bootstrap;
+use crate::sesame::ca_rotation::{PreparedRotation, SignedIntermediate};
 use crate::sesame::root_backup::{self, BackupOpener, BackupSeal, RootBackup, SealKind};
+use crate::sesame::types::CaRole;
 
 /// The directory `relish ca backup` looks in when `--dir` isn't given, where
 /// the Linux server guide runs `relish init`.
@@ -182,6 +185,98 @@ fn open_and_verify(
     let backup = RootBackup::open(&sealed, &opener)?;
     backup.verify(fingerprint, now)?;
     Ok(backup)
+}
+
+/// `relish ca rotate --role ROLE --root-backup FILE`: rotate an intermediate
+/// CA (F04 R4).
+///
+/// The council makes the new key and sends a CSR. The backup is opened here
+/// and checked against the root the cluster trusts, the CSR is signed with
+/// the root key, and only the certificate goes back. The root key never
+/// leaves this machine.
+pub async fn ca_rotate(
+    role: CaRole,
+    root_backup: &Path,
+    passphrase: &PassphraseSource,
+    identity: Option<&Path>,
+) -> Result<(), RelishError> {
+    let client = super::client::BunClient::default_local();
+    let prepared = client.ca_rotation_prepare(role).await?;
+    let backup = open_and_verify(
+        root_backup,
+        &prepared.root_fingerprint,
+        passphrase,
+        identity,
+        SystemTime::now(),
+    )?;
+    let signed = sign_prepared_rotation(&backup, &prepared)?;
+    let message = client.ca_rotation_begin(&signed).await?;
+    println!("{message}");
+    println!();
+    match role {
+        CaRole::Node => println!(
+            "Every node now acknowledges the new trust set, then renews onto the new CA one at \
+             a time."
+        ),
+        CaRole::Workload => {
+            println!("Workload certificates move to the new CA as they renew, within the hour.")
+        }
+        CaRole::Ingress | CaRole::Root => println!(
+            "Ingress certificates now come from the new CA; each node re-mints its routes' \
+             certificates as it picks the new CA up."
+        ),
+    }
+    println!(
+        "Retire the old CA with `relish ca rotate --role {} --finalize`; it says what is still \
+         waiting if it's too early.",
+        role_flag(role)
+    );
+    Ok(())
+}
+
+/// `relish ca rotate --role ROLE --finalize`: retire the old CA, refused
+/// while anything could still depend on it.
+pub async fn ca_rotate_finalize(role: CaRole) -> Result<(), RelishError> {
+    let client = super::client::BunClient::default_local();
+    println!("{}", client.ca_rotation_finalize(role).await?);
+    Ok(())
+}
+
+/// Sign the council's CSR with the backup's root. Split from [`ca_rotate`]
+/// so tests can run it without a cluster.
+fn sign_prepared_rotation(
+    backup: &RootBackup,
+    prepared: &PreparedRotation,
+) -> Result<SignedIntermediate, RelishError> {
+    use base64::Engine as _;
+    let csr_der = base64::engine::general_purpose::STANDARD
+        .decode(&prepared.csr_b64)
+        .map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("the council sent an unreadable CSR: {e}"),
+        })?;
+    let certificate_der = crate::sesame::ca::sign_intermediate_csr(
+        &csr_der,
+        prepared.role,
+        &backup.cluster,
+        crate::sesame::types::SerialNumber(prepared.serial),
+        &backup.private_key_der()?,
+        &backup.certificate_der()?,
+    )?;
+    Ok(SignedIntermediate {
+        role: prepared.role,
+        certificate_b64: base64::engine::general_purpose::STANDARD.encode(certificate_der),
+    })
+}
+
+/// How `--role` spells a role.
+fn role_flag(role: CaRole) -> &'static str {
+    match role {
+        CaRole::Node => "node",
+        CaRole::Workload => "workload",
+        CaRole::Ingress => "ingress",
+        CaRole::Root => "root",
+    }
 }
 
 fn print_summary(backup: &RootBackup) {
@@ -472,6 +567,94 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("relish init"), "{err}");
+    }
+
+    /// A CSR the way the council's prepare step answers it.
+    fn prepared(role: CaRole, fingerprint: &str) -> PreparedRotation {
+        use base64::Engine as _;
+        let (csr, _) = crate::sesame::ca::create_intermediate_csr(role, b"ikm").unwrap();
+        PreparedRotation {
+            role,
+            generation: 1,
+            serial: 77,
+            csr_b64: base64::engine::general_purpose::STANDARD.encode(csr),
+            root_fingerprint: fingerprint.to_string(),
+        }
+    }
+
+    #[test]
+    fn rotate_signs_the_councils_csr_with_the_backup_root() {
+        use base64::Engine as _;
+        let (dir, fingerprint) = init_cluster("prod");
+        let out = dir.path().join("root.age");
+        let path = passphrase_file(dir.path(), PASSPHRASE);
+        let seal = BackupSeal::Passphrase(read_passphrase_file(&path).unwrap());
+        write_backup(&out, dir.path(), None, &seal, SystemTime::now()).unwrap();
+        let backup = open_and_verify(
+            &out,
+            &fingerprint,
+            &PassphraseSource::File(path),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let signed =
+            sign_prepared_rotation(&backup, &prepared(CaRole::Node, &fingerprint)).unwrap();
+        assert_eq!(signed.role, CaRole::Node);
+        let certificate = base64::engine::general_purpose::STANDARD
+            .decode(&signed.certificate_b64)
+            .unwrap();
+        let root = backup.certificate_der().unwrap();
+        crate::sesame::cert::verify_signature(&certificate, &root).unwrap();
+        assert_eq!(
+            crate::sesame::cert::serial_from_der(&certificate).unwrap(),
+            crate::sesame::types::SerialNumber(77)
+        );
+    }
+
+    #[test]
+    fn rotate_refuses_a_backup_of_another_root_before_signing() {
+        let (ours, our_fingerprint) = init_cluster("prod");
+        let (theirs, _) = init_cluster("prod");
+        let out = ours.path().join("theirs.age");
+        let path = passphrase_file(ours.path(), PASSPHRASE);
+        let seal = BackupSeal::Passphrase(read_passphrase_file(&path).unwrap());
+        write_backup(&out, theirs.path(), None, &seal, SystemTime::now()).unwrap();
+
+        // `ca_rotate` opens the backup against the fingerprint the council
+        // sent with the CSR, so another cluster's root never signs.
+        let council = prepared(CaRole::Node, &our_fingerprint);
+        let err = open_and_verify(
+            &out,
+            &council.root_fingerprint,
+            &PassphraseSource::File(path),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RelishError::RootBackup(RootBackupError::ForeignRoot { .. })
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rotate_refuses_an_unreadable_csr() {
+        let (dir, fingerprint) = init_cluster("prod");
+        let out = dir.path().join("root.age");
+        let path = passphrase_file(dir.path(), PASSPHRASE);
+        let seal = BackupSeal::Passphrase(read_passphrase_file(&path).unwrap());
+        let backup = write_backup(&out, dir.path(), None, &seal, SystemTime::now()).unwrap();
+        let mut garbled = prepared(CaRole::Workload, &fingerprint);
+        garbled.csr_b64 = "bm90IGEgY3Ny".into();
+        assert!(matches!(
+            sign_prepared_rotation(&backup, &garbled),
+            Err(RelishError::CertificateAuthority(_))
+        ));
     }
 
     #[test]

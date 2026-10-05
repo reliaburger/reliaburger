@@ -384,6 +384,20 @@ pub enum RaftRequest {
     /// keeps working until the rotation's grace end (F05 I3). Refused for a
     /// name that doesn't exist or belongs to a test lease.
     RotateApiToken(crate::sesame::types::TokenRotation),
+    /// Hold a key the leader made for the role's next intermediate, and its
+    /// CSR, until the operator signs it with the root (F04 R4). Allocates the
+    /// certificate's serial and answers `SerialAllocated`. The rules live in
+    /// [`crate::sesame::ca_rotation::prepare`].
+    CaRotationPrepare {
+        role: crate::sesame::types::CaRole,
+        generation: u64,
+        csr_der: Vec<u8>,
+        private_key_wrapped: crate::sesame::types::WrappedKey,
+    },
+    /// A node has installed the trust set that includes Node CA
+    /// `generation` (F04 R4). The leader proposes it for the node that
+    /// authenticated the request.
+    AcknowledgeNodeTrust { node_id: String, generation: u64 },
 }
 
 // ---------------------------------------------------------------------------

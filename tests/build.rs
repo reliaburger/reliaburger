@@ -257,6 +257,7 @@ async fn single_node_leader_with_security() -> Arc<CouncilNode> {
         crl: reliaburger::sesame::types::Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
         node_leaves: std::collections::BTreeMap::new(),
+        pending_intermediates: Vec::new(),
     };
     node.write(reliaburger::council::types::RaftRequest::SecurityStateInit(
         Box::new(security_state),
@@ -1303,6 +1304,7 @@ async fn bootstrap_security(leader: &CouncilNode) {
         crl: reliaburger::sesame::types::Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
         node_leaves: std::collections::BTreeMap::new(),
+        pending_intermediates: Vec::new(),
     };
     leader
         .write(reliaburger::council::types::RaftRequest::SecurityStateInit(

@@ -2574,6 +2574,57 @@ impl BunClient {
         Ok(response["upgrade_id"].as_str().unwrap_or("?").to_string())
     }
 
+    /// Ask the council for a CSR for `role`'s next intermediate (F04 R4).
+    pub async fn ca_rotation_prepare(
+        &self,
+        role: crate::sesame::types::CaRole,
+    ) -> Result<crate::sesame::ca_rotation::PreparedRotation, RelishError> {
+        let body = serde_json::to_string(&crate::sesame::ca_rotation::RotationRole { role })
+            .map_err(|e| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to encode request: {e}"),
+            })?;
+        let response = self.post_json("/v1/ca/rotation/prepare", body).await?;
+        serde_json::from_value(response).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse the prepared rotation: {e}"),
+        })
+    }
+
+    /// Send the root-signed certificate and begin the rotation. Returns the
+    /// council's message.
+    pub async fn ca_rotation_begin(
+        &self,
+        signed: &crate::sesame::ca_rotation::SignedIntermediate,
+    ) -> Result<String, RelishError> {
+        let body = serde_json::to_string(signed).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to encode request: {e}"),
+        })?;
+        let response = self.post_json("/v1/ca/rotation/begin", body).await?;
+        Ok(response["message"]
+            .as_str()
+            .unwrap_or("rotation begun")
+            .to_string())
+    }
+
+    /// Retire the old CA of `role`. Returns the council's message.
+    pub async fn ca_rotation_finalize(
+        &self,
+        role: crate::sesame::types::CaRole,
+    ) -> Result<String, RelishError> {
+        let body = serde_json::to_string(&crate::sesame::ca_rotation::RotationRole { role })
+            .map_err(|e| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to encode request: {e}"),
+            })?;
+        let response = self.post_json("/v1/ca/rotation/finalize", body).await?;
+        Ok(response["message"]
+            .as_str()
+            .unwrap_or("rotation finalised")
+            .to_string())
+    }
+
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}{path}", self.base_url);
         let response = self

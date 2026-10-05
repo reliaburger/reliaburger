@@ -202,6 +202,10 @@ pub enum RelishError {
     #[error("{0}")]
     RootBackup(#[from] crate::sesame::root_backup::RootBackupError),
 
+    /// The root couldn't sign the council's intermediate CSR (F04 R4).
+    #[error("{0}")]
+    CertificateAuthority(#[from] crate::sesame::ca::CaError),
+
     /// The master key or security state `relish init` wrote couldn't be read.
     #[error("{0}")]
     SecurityFiles(#[from] crate::sesame::bootstrap::BootstrapError),

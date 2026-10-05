@@ -9319,3 +9319,100 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
         "only the admitted leader consumes the wakeup"
     );
 }
+
+/// F04 R4 through the API: prepare answers with a CSR the operator can
+/// sign, and each step refuses what it should.
+#[tokio::test]
+async fn ca_rotation_routes_hand_out_a_csr_and_refuse_bad_steps() {
+    use crate::sesame::ca_rotation::PreparedRotation;
+    let council = seeded_council_with_ikm("ca-rotation-routes").await;
+    let (app, shutdown, tok) = router_for_council(council.clone()).await;
+    let post = |uri: &'static str, body: String| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {tok}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }
+    };
+
+    // Nothing to finalise, and a typo is not a role.
+    let (status, _) = post("/v1/ca/rotation/finalize", r#"{"role":"Node"}"#.into()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post("/v1/ca/rotation/prepare", r#"{"role":"Nodes"}"#.into()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post("/v1/ca/rotation/prepare", r#"{"role":"Root"}"#.into()).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the root isn't an intermediate"
+    );
+
+    let (status, body) = post("/v1/ca/rotation/prepare", r#"{"role":"Node"}"#.into()).await;
+    assert_eq!(status, StatusCode::OK);
+    let prepared: PreparedRotation = serde_json::from_slice(&body).unwrap();
+    assert_eq!(prepared.generation, 1);
+    let security = council.security_state().await;
+    let root = security
+        .active_ca(crate::sesame::types::CaRole::Root)
+        .unwrap();
+    assert_eq!(
+        prepared.root_fingerprint,
+        crate::sesame::identity_store::root_ca_fingerprint(&root.certificate_der)
+    );
+    assert_eq!(security.pending_intermediates.len(), 1);
+
+    // A certificate another root signed for that CSR is refused, and the
+    // rotation doesn't begin.
+    use base64::Engine as _;
+    let foreign =
+        crate::sesame::ca::generate_root_ca("elsewhere", crate::sesame::types::SerialNumber(1))
+            .unwrap();
+    let certificate = crate::sesame::ca::sign_intermediate_csr(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&prepared.csr_b64)
+            .unwrap(),
+        crate::sesame::types::CaRole::Node,
+        "elsewhere",
+        crate::sesame::types::SerialNumber(prepared.serial),
+        &foreign.private_key_der,
+        &foreign.ca.certificate_der,
+    )
+    .unwrap();
+    let body = serde_json::to_string(&crate::sesame::ca_rotation::SignedIntermediate {
+        role: crate::sesame::types::CaRole::Node,
+        certificate_b64: base64::engine::general_purpose::STANDARD.encode(certificate),
+    })
+    .unwrap();
+    let (status, body) = post("/v1/ca/rotation/begin", body).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not signed by the active root"),
+        "{json}"
+    );
+    assert!(
+        council
+            .security_state()
+            .await
+            .retiring_ca(crate::sesame::types::CaRole::Node)
+            .is_none()
+    );
+    shutdown.cancel();
+}

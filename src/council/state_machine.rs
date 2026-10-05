@@ -2117,6 +2117,42 @@ impl StateMachineInner {
                     }),
                 };
             }
+            RaftRequest::CaRotationPrepare {
+                role,
+                generation,
+                csr_der,
+                private_key_wrapped,
+            } => {
+                return Some(
+                    match crate::sesame::ca_rotation::prepare(
+                        &mut self.state.security_state,
+                        *role,
+                        *generation,
+                        csr_der.clone(),
+                        private_key_wrapped.clone(),
+                    ) {
+                        Ok(serial) => CouncilResponse::SerialAllocated { serial: serial.0 },
+                        Err(error) => CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        },
+                    },
+                );
+            }
+            RaftRequest::AcknowledgeNodeTrust {
+                node_id,
+                generation,
+            } => {
+                return match crate::sesame::ca_rotation::acknowledge_trust(
+                    &mut self.state.security_state,
+                    node_id,
+                    *generation,
+                ) {
+                    Ok(()) => None,
+                    Err(error) => Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    }),
+                };
+            }
             RaftRequest::CaRotationFinalize { role, now_unix_ms } => {
                 let now = std::time::SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_millis(*now_unix_ms);
@@ -5651,6 +5687,22 @@ mod tests {
         };
         assert!(reason.contains("node-a"), "{reason}");
 
+        // F04 R4: node-a says it trusts the new CA, then renews onto it.
+        assert_eq!(
+            inner.apply_request(&RaftRequest::AcknowledgeNodeTrust {
+                node_id: "node-a".into(),
+                generation: 1,
+            }),
+            None
+        );
+        let still_old_leaf = inner.apply_request(&RaftRequest::CaRotationFinalize {
+            role: CaRole::Node,
+            now_unix_ms,
+        });
+        assert!(
+            matches!(&still_old_leaf, Some(CouncilResponse::Refused { reason }) if reason.contains("leaves from the retiring CA")),
+            "{still_old_leaf:?}"
+        );
         inner.apply_request(&RaftRequest::AllocateNodeSerial {
             node_id: "node-a".into(),
         });
@@ -5663,6 +5715,70 @@ mod tests {
             inner.state.security_state.trusted_cas(CaRole::Node).len(),
             1
         );
+    }
+
+    /// F04 R4 through the log: prepare allocates the serial the operator's
+    /// certificate must carry and answers with it, a prepare during a
+    /// rotation is refused, and so is an acknowledgement from a node the
+    /// council has no leaf for.
+    #[test]
+    fn ca_rotation_prepare_and_trust_acknowledgements_through_the_log() {
+        use crate::sesame::types::{CaRole, CertificateAuthority};
+        let mut inner = StateMachineInner::default();
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
+        inner.state.security_state = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![
+                CertificateAuthority {
+                    private_key_wrapped: None,
+                    ..hierarchy.root.ca.clone()
+                },
+                hierarchy.node.ca.clone(),
+            ],
+            next_serial: 10,
+            ..Default::default()
+        };
+        let (csr_der, private_key_wrapped) =
+            crate::sesame::ca::create_intermediate_csr(CaRole::Node, &[4; 32]).unwrap();
+        let prepare = RaftRequest::CaRotationPrepare {
+            role: CaRole::Node,
+            generation: 1,
+            csr_der,
+            private_key_wrapped,
+        };
+        assert_eq!(
+            inner.apply_request(&prepare),
+            Some(CouncilResponse::SerialAllocated { serial: 10 })
+        );
+        assert_eq!(inner.state.security_state.pending_intermediates.len(), 1);
+
+        let stranger = inner.apply_request(&RaftRequest::AcknowledgeNodeTrust {
+            node_id: "stranger".into(),
+            generation: 0,
+        });
+        assert!(matches!(stranger, Some(CouncilResponse::Refused { .. })));
+
+        let generated = crate::sesame::ca::generate_intermediate_ca(
+            CaRole::Node,
+            "rotate",
+            crate::sesame::types::SerialNumber(50),
+            hierarchy.root.ca.serial,
+            &hierarchy.root.signing_keypair,
+            &hierarchy.root.certificate_params,
+            &[4; 32],
+        )
+        .unwrap();
+        inner.apply_request(&RaftRequest::CaRotationBegin {
+            role: CaRole::Node,
+            ca: Box::new(CertificateAuthority {
+                generation: 1,
+                ..generated.ca
+            }),
+        });
+        assert!(inner.state.security_state.pending_intermediates.is_empty());
+        assert!(matches!(
+            inner.apply_request(&prepare),
+            Some(CouncilResponse::Refused { .. })
+        ));
     }
 
     /// Only the cluster-wide generation-0 key opens the root CA backup; a

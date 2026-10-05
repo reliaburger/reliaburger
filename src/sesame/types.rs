@@ -113,6 +113,32 @@ pub struct NodeLeafRecord {
     /// The generation of the Node CA that was active when the serial was
     /// allocated, which is the CA that signs it.
     pub ca_generation: u64,
+    /// The newest Node CA generation the node has acknowledged trusting
+    /// (F04 R4). A node acknowledges once it has installed the council's
+    /// trust set, so a Node CA rotation re-issues leaves only after every
+    /// node will accept them, and finalises only after that too.
+    pub trust_generation: u64,
+}
+
+/// An intermediate CA the council has made a key for and is waiting for the
+/// operator to sign (F04 R4).
+///
+/// `relish ca rotate` asks for it, signs the CSR with the root key it holds
+/// locally and sends the certificate back. The private key never leaves the
+/// cluster and the root key never reaches it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingIntermediate {
+    /// Which intermediate this replaces.
+    pub role: CaRole,
+    /// The generation the new CA will have: the active one's plus one.
+    pub generation: u64,
+    /// The serial the certificate must carry, allocated by the council so it
+    /// never collides with a revoked one.
+    pub serial: SerialNumber,
+    /// The PKCS#10 request for the new key, DER.
+    pub csr_der: Vec<u8>,
+    /// The new private key, wrapped with the cluster's wrapping key.
+    pub private_key_wrapped: WrappedKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +584,9 @@ pub struct SecurityState {
     pub secret_seals: std::collections::BTreeMap<String, SecretSeal>,
     /// The latest node leaf issued to each node, keyed by node id (F04 R1).
     pub node_leaves: std::collections::BTreeMap<String, NodeLeafRecord>,
+    /// Intermediates waiting for the operator's signature, at most one per
+    /// role (F04 R4).
+    pub pending_intermediates: Vec<PendingIntermediate>,
 }
 
 impl SecurityState {
