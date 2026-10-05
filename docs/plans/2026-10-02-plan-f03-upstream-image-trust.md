@@ -62,6 +62,7 @@ For a rule with `require_signatures = true`, the node verifies a cosign signatur
 - Each layer of type `application/vnd.dev.cosign.simplesigning.v1+json` is a payload whose `critical.image.docker-manifest-digest` must equal the bound digest, and whose `dev.cosignproject.cosign/signature` annotation is a base64 ECDSA P-256 signature over the payload bytes.
 - Accept when any layer verifies against any of the rule's `cosign_keys`. `ring` already does ECDSA P-256, so no new crypto crate.
 - **Not in this plan:** keyless signing (Fulcio certificates and Rekor transparency-log proofs), which needs network trust roots and their rotation; and the newer Sigstore bundle stored as an OCI referrer. Both are worth having; neither is needed to say "only run what our key signed". Whether the bundle format should come first depends on what the images people use actually publish, so we'll check a sample (Chainguard, distroless, our own release images) before starting U3.
+- **Moved:** U3's keyless half, and the Sigstore bundle, are now F03c ([#619](https://github.com/reliaburger/reliaburger/issues/619)), planned in [F03c: keyless cosign and Sigstore bundles](2026-10-05-plan-f03c-keyless-cosign.md).
 
 ### U4. Docs that match
 
