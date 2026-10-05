@@ -158,10 +158,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 **Security and access** ([security and access](docs/manual/10_security.md))
 
 - `relish token`: Manage API tokens
-  - `relish token create --name <NAME>`: Create a new API token (deployer and read-only tokens live 90 days unless `--ttl-days` or `--no-expiry`)
+  - `relish token create --name <NAME>`: Create a new API token
   - `relish token list`: List all API tokens with their scope, expiry and last use
-  - `relish token rotate <NAME>`: Give a token a new secret; the old one keeps working for 24 hours
   - `relish token revoke <NAME>`: Revoke an API token by name
+  - `relish token rotate <NAME>`: Give a token a new secret under the same name. The old secret keeps working for the grace period, then stops
 - `relish secret`: Manage secrets (encrypt values for use in app configs)
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
   - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
