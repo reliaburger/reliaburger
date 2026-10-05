@@ -14,6 +14,8 @@ use crate::sesame::types::CaRole;
 /// internal service principal) holding cluster-wide `action`, and a council
 /// to ask. Each handler names its action, so the route matrix's static guard
 /// can see it.
+// `Response` is large, but it is the reply the handler sends as-is.
+#[allow(clippy::result_large_err)]
 async fn authorise(
     auth: Option<&crate::sesame::auth::AuthContext>,
     state: &ApiState,
@@ -53,6 +55,8 @@ fn write_failed(error: crate::council::CouncilError) -> Response {
     }
 }
 
+// `Response` is large, but it is the reply the handler sends as-is.
+#[allow(clippy::result_large_err)]
 fn parse<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, Response> {
     serde_json::from_str(body).map_err(|error| {
         error_response(
