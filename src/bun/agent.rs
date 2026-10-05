@@ -673,6 +673,10 @@ pub struct BunAgent<G: Grill> {
     /// Pickle-hosted images are gated on a valid signature. Defaults to
     /// permissive so single-node / untrusted setups are unaffected.
     trust_policy: crate::config::node::TrustPolicySection,
+    /// Where cosign signatures for upstream rules with `require_signatures`
+    /// are read from. `None` until Bun sets one (its runtime pulls images);
+    /// a signature check without one refuses the image.
+    signature_source: Option<crate::pickle::cosign::SignatureSource>,
     /// Directory for on-disk instance records ({data_dir}/instances).
     /// When set, started instances are recorded so a future bun (after a
     /// crash restart or a self-upgrade exec) can adopt them instead of
@@ -882,6 +886,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
+            signature_source: None,
             records_dir: None,
             recorded_jobs: BTreeMap::new(),
             retired_batch_executions: BTreeMap::new(),
@@ -1035,6 +1040,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
+            signature_source: None,
             records_dir: None,
             recorded_jobs: BTreeMap::new(),
             retired_batch_executions: BTreeMap::new(),
@@ -1156,6 +1162,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// signatures, deploys verify Pickle-hosted images before creating them.
     pub fn set_trust_policy(&mut self, trust_policy: crate::config::node::TrustPolicySection) {
         self.trust_policy = trust_policy;
+    }
+
+    /// Set where this node reads cosign signatures from (F03 U3).
+    pub fn set_signature_source(&mut self, source: crate::pickle::cosign::SignatureSource) {
+        self.signature_source = Some(source);
     }
 
     /// Set the node's schedulable capacity (system totals minus the

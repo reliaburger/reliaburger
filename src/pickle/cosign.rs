@@ -26,6 +26,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
 use serde::Deserialize;
+use std::sync::{Arc, OnceLock};
 
 use super::types::{Digest, LayerDescriptor};
 use super::upstream::{UpstreamRegistry, UpstreamRoot};
@@ -340,24 +341,143 @@ fn check_payload(bound: &Digest, signed: &SignedPayload, keys: &[CosignKey]) -> 
     Ok(())
 }
 
+/// Where a node reads cosign signatures from: the pull-through cache when
+/// it's on (each `.sig` image is fetched from upstream once for the whole
+/// cluster), otherwise the image's registry directly.
+#[derive(Clone)]
+pub struct SignatureSource {
+    /// Filled once the cluster's pull-through cache exists; Bun builds the
+    /// agent long before it.
+    cache: Arc<OnceLock<Arc<super::p2p::ClusterSource>>>,
+    /// Asks registries over HTTPS.
+    remote: Arc<dyn UpstreamRegistry>,
+    /// Asks loopback registries (`localhost:5000`) over plain HTTP.
+    loopback: Arc<dyn UpstreamRegistry>,
+}
+
+impl SignatureSource {
+    /// A source that asks `remote` about registries elsewhere and `loopback`
+    /// about those on this host, until [`Self::use_cache`] is called.
+    pub fn new(remote: Arc<dyn UpstreamRegistry>, loopback: Arc<dyn UpstreamRegistry>) -> Self {
+        Self {
+            cache: Arc::default(),
+            remote,
+            loopback,
+        }
+    }
+
+    /// Read signatures through `cache` from now on. Only the first call
+    /// counts; every clone of this source sees it.
+    pub fn use_cache(&self, cache: Arc<super::p2p::ClusterSource>) {
+        let _ = self.cache.set(cache);
+    }
+
+    /// The signature payloads for `image` at `digest`.
+    pub async fn payloads(
+        &self,
+        image: &ImageReference,
+        digest: &Digest,
+    ) -> Result<Vec<SignedPayload>, CosignError> {
+        if let Some(cache) = self.cache.get()
+            && let Some(payloads) = cache.cosign_signature(image, digest).await?
+        {
+            return Ok(payloads);
+        }
+        let registry = if crate::grill::image::is_loopback_registry(&image.registry) {
+            self.loopback.as_ref()
+        } else {
+            self.remote.as_ref()
+        };
+        fetch_signature(registry, image, digest).await
+    }
+}
+
+/// The `cosign sign --key` fixture in `tests/fixtures/cosign/`, served by a
+/// stand-in registry, for tests here and in Bun's deploy check.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixture {
     use super::*;
     use crate::pickle::types::PickleError;
     use crate::pickle::upstream::{UpstreamFuture, UpstreamManifest};
 
-    // Real `cosign sign --key` output (cosign v3.1.3, classic `.sig` layout):
-    // see tests/fixtures/cosign/ for how it was produced.
-    const PAYLOAD: &[u8] = include_bytes!("../../tests/fixtures/cosign/payload.json");
-    const SIGNATURE: &str = include_str!("../../tests/fixtures/cosign/signature.b64");
-    const PUBLIC_KEY: &str = include_str!("../../tests/fixtures/cosign/cosign.pub");
-    const OTHER_KEY: &str = include_str!("../../tests/fixtures/cosign/other.pub");
-    const SIGNATURE_MANIFEST: &[u8] =
+    pub(crate) const PAYLOAD: &[u8] = include_bytes!("../../tests/fixtures/cosign/payload.json");
+    pub(crate) const PUBLIC_KEY: &str = include_str!("../../tests/fixtures/cosign/cosign.pub");
+    pub(crate) const OTHER_KEY: &str = include_str!("../../tests/fixtures/cosign/other.pub");
+    pub(crate) const SIGNATURE_MANIFEST: &[u8] =
         include_bytes!("../../tests/fixtures/cosign/signature-manifest.json");
     const SIGNATURE_CONFIG: &[u8] =
         include_bytes!("../../tests/fixtures/cosign/signature-config.json");
-    const SIGNED_DIGEST: &str =
+    /// The digest the fixture's payload names.
+    pub(crate) const SIGNED_DIGEST: &str =
         "sha256:5a90fa845f2397b0d429dd19ae5f64aaf0007eaea308c935e7cab63a8c820cce";
+
+    /// A registry holding the fixture's signature image, or nothing at all.
+    pub(crate) struct FixtureRegistry {
+        pub(crate) signed: bool,
+    }
+
+    impl UpstreamRegistry for FixtureRegistry {
+        fn head_manifest_digest<'a>(
+            &'a self,
+            _image: &'a ImageReference,
+        ) -> UpstreamFuture<'a, Digest> {
+            unimplemented!("signature checks fetch, they don't HEAD")
+        }
+
+        fn fetch_manifest<'a>(
+            &'a self,
+            _image: &'a ImageReference,
+        ) -> UpstreamFuture<'a, UpstreamManifest> {
+            unimplemented!("signature checks read the root")
+        }
+
+        fn fetch_root<'a>(&'a self, image: &'a ImageReference) -> UpstreamFuture<'a, UpstreamRoot> {
+            let signed_tag = signature_tag(&Digest::new(SIGNED_DIGEST).expect("fixture digest"));
+            let answer = if self.signed && image.tag == signed_tag {
+                Ok(UpstreamRoot::Image(UpstreamManifest {
+                    digest: crate::pickle::store::compute_sha256(SIGNATURE_MANIFEST),
+                    manifest_bytes: SIGNATURE_MANIFEST.to_vec(),
+                    config: LayerDescriptor {
+                        digest: crate::pickle::store::compute_sha256(SIGNATURE_CONFIG),
+                        size: SIGNATURE_CONFIG.len() as u64,
+                        media_type: "application/vnd.oci.image.config.v1+json".into(),
+                        platform: None,
+                    },
+                    config_bytes: SIGNATURE_CONFIG.to_vec(),
+                    layers: vec![],
+                }))
+            } else {
+                Err(PickleError::ReplicationFailed(format!(
+                    "manifest unknown: {}",
+                    image.tag
+                )))
+            };
+            Box::pin(async move { answer })
+        }
+
+        fn fetch_blob<'a>(
+            &'a self,
+            _image: &'a ImageReference,
+            layer: &'a LayerDescriptor,
+        ) -> UpstreamFuture<'a, Vec<u8>> {
+            let answer = if layer.digest == crate::pickle::store::compute_sha256(PAYLOAD) {
+                Ok(PAYLOAD.to_vec())
+            } else {
+                Err(PickleError::BlobNotFound(layer.digest.clone()))
+            };
+            Box::pin(async move { answer })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::{OTHER_KEY, PAYLOAD, PUBLIC_KEY, SIGNATURE_MANIFEST, SIGNED_DIGEST};
+    use super::*;
+
+    // Real `cosign sign --key` output (cosign v3.1.3, classic `.sig` layout):
+    // see tests/fixtures/cosign/ for how it was produced.
+    const SIGNATURE: &str = include_str!("../../tests/fixtures/cosign/signature.b64");
 
     fn signed_digest() -> Digest {
         Digest::new(SIGNED_DIGEST).unwrap()
@@ -540,62 +660,7 @@ mod tests {
         );
     }
 
-    /// A registry holding the fixture's signature image, or nothing at all.
-    struct Registry {
-        signed: bool,
-    }
-
-    impl UpstreamRegistry for Registry {
-        fn head_manifest_digest<'a>(
-            &'a self,
-            _image: &'a ImageReference,
-        ) -> UpstreamFuture<'a, Digest> {
-            unimplemented!("signature checks fetch, they don't HEAD")
-        }
-
-        fn fetch_manifest<'a>(
-            &'a self,
-            _image: &'a ImageReference,
-        ) -> UpstreamFuture<'a, UpstreamManifest> {
-            unimplemented!("signature checks read the root")
-        }
-
-        fn fetch_root<'a>(&'a self, image: &'a ImageReference) -> UpstreamFuture<'a, UpstreamRoot> {
-            let answer = if self.signed && image.tag == signature_tag(&signed_digest()) {
-                Ok(UpstreamRoot::Image(UpstreamManifest {
-                    digest: crate::pickle::store::compute_sha256(SIGNATURE_MANIFEST),
-                    manifest_bytes: SIGNATURE_MANIFEST.to_vec(),
-                    config: LayerDescriptor {
-                        digest: crate::pickle::store::compute_sha256(SIGNATURE_CONFIG),
-                        size: SIGNATURE_CONFIG.len() as u64,
-                        media_type: "application/vnd.oci.image.config.v1+json".into(),
-                        platform: None,
-                    },
-                    config_bytes: SIGNATURE_CONFIG.to_vec(),
-                    layers: vec![],
-                }))
-            } else {
-                Err(PickleError::ReplicationFailed(format!(
-                    "manifest unknown: {}",
-                    image.tag
-                )))
-            };
-            Box::pin(async move { answer })
-        }
-
-        fn fetch_blob<'a>(
-            &'a self,
-            _image: &'a ImageReference,
-            layer: &'a LayerDescriptor,
-        ) -> UpstreamFuture<'a, Vec<u8>> {
-            let answer = if layer.digest == crate::pickle::store::compute_sha256(PAYLOAD) {
-                Ok(PAYLOAD.to_vec())
-            } else {
-                Err(PickleError::BlobNotFound(layer.digest.clone()))
-            };
-            Box::pin(async move { answer })
-        }
-    }
+    use super::fixture::FixtureRegistry as Registry;
 
     fn image() -> ImageReference {
         ImageReference::parse("ghcr.io/acme/web:1.2").unwrap()

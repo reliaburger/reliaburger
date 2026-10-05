@@ -519,6 +519,43 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::pickle::trust::check_upstream(&self.trust_policy, image).map_err(|e| e.to_string())
     }
 
+    /// The cosign signature check `image` owes before it deploys, if its
+    /// upstream rule requires one (F03 U3). The caller runs it off the agent
+    /// loop: it fetches the `.sig` image.
+    ///
+    /// Paths, images under the process runtime and Pickle's own images owe
+    /// nothing, as with [`Self::enforce_upstream_rules`]. A standalone node,
+    /// with no cluster catalogue, checks every image its rules name.
+    pub(super) async fn cosign_check(
+        &self,
+        image: Option<&str>,
+    ) -> Option<crate::pickle::trust::CosignCheck> {
+        if !self
+            .trust_policy
+            .upstream
+            .iter()
+            .any(|rule| rule.require_signatures)
+        {
+            return None;
+        }
+        let image = image.filter(|image| crate::grill::image::looks_like_image_ref(image))?;
+        if self.supervisor.grill().runtime_kind() == crate::grill::records::RuntimeKind::Process {
+            return None;
+        }
+        if let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) {
+            // LOOP-INLINE: reads the local council state machine; no quorum round trip
+            let catalog = council.manifest_catalog().await;
+            if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_some() {
+                return None;
+            }
+        }
+        crate::pickle::trust::CosignCheck::for_image(
+            &self.trust_policy,
+            image,
+            self.signature_source.as_ref(),
+        )
+    }
+
     /// Every age identity that could decrypt this namespace's secrets, newest
     /// generation first: the namespace's own keys once it has one, the
     /// cluster-wide keys otherwise, never both (F05 I4).

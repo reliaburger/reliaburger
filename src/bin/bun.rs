@@ -1800,6 +1800,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     agent.set_log_sink(log_tx, capture_offsets);
     agent.set_readiness_tracker(readiness.clone());
     agent.set_trust_policy(config.images.trust_policy.clone());
+    // F03 U3: an upstream rule with `require_signatures` needs the image's
+    // cosign `.sig`, read through the pull-through cache once it exists
+    // (below) or straight from the registry. Only where the runtime pulls
+    // images, like digest binding.
+    let signature_source = runtime_pulls_images.then(|| {
+        let credentials = reliaburger::pickle::upstream::resolve_credentials(
+            &config.images.external_registries,
+            |name| std::env::var(name).ok(),
+        );
+        reliaburger::pickle::cosign::SignatureSource::new(
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::new(
+                credentials.clone(),
+            )),
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::insecure_http(
+                credentials,
+            )),
+        )
+    });
+    if let Some(source) = &signature_source {
+        agent.set_signature_source(source.clone());
+    }
     agent.set_records_dir(instances_dir.clone());
     if durable_discovery {
         let directory = data_base.join("discovery");
@@ -3010,23 +3031,25 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             &config.images.external_registries,
             |name| std::env::var(name).ok(),
         );
-        image_store.set_cluster_source(std::sync::Arc::new(
-            reliaburger::pickle::p2p::ClusterSource {
-                state: pickle_state.clone(),
-                members: replication_membership.clone(),
-                registry_port: config.images.registry_port,
-                peer_scheme: registry_scheme.to_string(),
-                concurrency: config.images.p2p_concurrency,
-                client: registry_client.clone(),
-                upstream: Some(std::sync::Arc::new(
-                    reliaburger::pickle::upstream::OciUpstream::new(credentials)
-                        .with_mirrors(config.images.mirrors.clone()),
-                )),
-                pull_through: config.images.pull_through,
-                cache_recheck_secs: config.images.cache_recheck_secs,
-                fill_lock: tokio::sync::Mutex::new(()),
-            },
-        ));
+        let cluster_source = std::sync::Arc::new(reliaburger::pickle::p2p::ClusterSource {
+            state: pickle_state.clone(),
+            members: replication_membership.clone(),
+            registry_port: config.images.registry_port,
+            peer_scheme: registry_scheme.to_string(),
+            concurrency: config.images.p2p_concurrency,
+            client: registry_client.clone(),
+            upstream: Some(std::sync::Arc::new(
+                reliaburger::pickle::upstream::OciUpstream::new(credentials)
+                    .with_mirrors(config.images.mirrors.clone()),
+            )),
+            pull_through: config.images.pull_through,
+            cache_recheck_secs: config.images.cache_recheck_secs,
+            fill_lock: tokio::sync::Mutex::new(()),
+        });
+        if let Some(source) = &signature_source {
+            source.use_cache(cluster_source.clone());
+        }
+        image_store.set_cluster_source(cluster_source);
     }
 
     let registry_lease_state = pickle_state.clone();

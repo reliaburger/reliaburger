@@ -3928,6 +3928,7 @@ fn official_images_only() -> crate::config::node::TrustPolicySection {
         upstream: vec![crate::config::node::UpstreamTrustRule {
             pattern: "docker.io/library/*".to_string(),
             require_signatures: false,
+            cosign_keys: vec![],
         }],
         upstream_default: crate::config::node::UpstreamDefault { allow: false },
         ..Default::default()
@@ -3992,6 +3993,98 @@ async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
         .enforce_image_signature(&app("proc-grill:image-ignored"))
         .await;
     assert_eq!(result, Ok(None));
+}
+
+// --- cosign signatures on upstream images at deploy (F03 U3, #361) ---
+
+/// A standalone agent whose runtime pulls images, requiring a cosign
+/// signature by `key` on `ghcr.io/acme/*`, reading signatures from the
+/// fixture registry (which holds the `.sig` for the fixture digest only).
+fn cosign_agent(key: &str) -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    agent.set_trust_policy(crate::config::node::TrustPolicySection {
+        upstream: vec![crate::config::node::UpstreamTrustRule {
+            pattern: "ghcr.io/acme/*".to_string(),
+            require_signatures: true,
+            cosign_keys: vec![key.to_string()],
+        }],
+        ..Default::default()
+    });
+    let registry: Arc<dyn crate::pickle::upstream::UpstreamRegistry> =
+        Arc::new(crate::pickle::cosign::fixture::FixtureRegistry { signed: true });
+    agent.set_signature_source(crate::pickle::cosign::SignatureSource::new(
+        registry.clone(),
+        registry,
+    ));
+    (agent, tx, shutdown)
+}
+
+fn web_config(image: &str) -> Config {
+    Config::parse(&format!("[app.web]\nimage = \"{image}\"\n")).unwrap()
+}
+
+/// Deploy `image` through the agent loop; the error event's message, if any.
+async fn deploy_refusal(key: &str, image: &str) -> Option<String> {
+    let (agent, tx, shutdown) = cosign_agent(key);
+    let handle = tokio::spawn(async move {
+        let mut agent = agent;
+        agent.run().await;
+    });
+    let events = send_deploy(&tx, web_config(image)).await;
+    shutdown.cancel();
+    let _ = handle.await;
+    events.into_iter().find_map(|event| match event {
+        ApplyEvent::Error { message } => Some(message),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn an_image_signed_by_a_trusted_cosign_key_deploys() {
+    use crate::pickle::cosign::fixture::{PUBLIC_KEY, SIGNED_DIGEST};
+    let image = format!("ghcr.io/acme/web:1.2@{SIGNED_DIGEST}");
+    assert_eq!(deploy_refusal(PUBLIC_KEY, &image).await, None);
+}
+
+#[tokio::test]
+async fn an_unsigned_image_is_refused_at_deploy_by_name() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    let image = format!("ghcr.io/acme/web:1.2@sha256:{}", "1".repeat(64));
+    let refusal = deploy_refusal(PUBLIC_KEY, &image).await.expect("refused");
+    assert!(refusal.contains(&image), "{refusal}");
+    assert!(refusal.contains("no cosign signature"), "{refusal}");
+}
+
+#[tokio::test]
+async fn an_image_signed_by_another_key_is_refused_at_deploy_by_name() {
+    use crate::pickle::cosign::fixture::{OTHER_KEY, SIGNED_DIGEST};
+    let image = format!("ghcr.io/acme/web:1.2@{SIGNED_DIGEST}");
+    let refusal = deploy_refusal(OTHER_KEY, &image).await.expect("refused");
+    assert!(refusal.contains(&image), "{refusal}");
+    assert!(
+        refusal.contains("verifies under the trusted keys"),
+        "{refusal}"
+    );
+}
+
+/// A signature covers a digest, so a tag the apply didn't bind can't be
+/// checked; the deploy says so rather than guess.
+#[tokio::test]
+async fn an_unbound_image_under_a_signature_rule_is_refused() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    let refusal = deploy_refusal(PUBLIC_KEY, "ghcr.io/acme/web:1.2")
+        .await
+        .expect("refused");
+    assert!(refusal.contains("ghcr.io/acme/web:1.2"), "{refusal}");
+    assert!(refusal.contains("isn't bound"), "{refusal}");
+}
+
+/// Images no signature rule names deploy as before.
+#[tokio::test]
+async fn an_image_outside_the_signature_rules_needs_no_signature() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    assert_eq!(deploy_refusal(PUBLIC_KEY, "nginx:1.27").await, None);
 }
 
 #[tokio::test]
