@@ -44,11 +44,20 @@ pub(super) struct ConsumerAnswer {
     pub(super) response: oneshot::Sender<Result<ConsumerUpdate, BunError>>,
 }
 
-/// What a synchronisation does next. Each step journals at most one
-/// discovery write: on the soak's disks a write took about 400 ms, and the
-/// five a recovery's first answer needs held one turn for two seconds
-/// (#505). The steps keep the order the single-turn version had.
+/// What a synchronisation does next. Each step takes at most one slow
+/// await: one discovery write, or the runtime inventory read that builds
+/// the candidate view. On the soak's disks a write took about 400 ms, and
+/// the five a recovery's first answer needs held one turn for two seconds
+/// (#505); after a restart, the inventory read and the first write held
+/// one turn for 1.1 s (#603). The steps keep the order the single-turn
+/// version had.
 enum ConsumerStep {
+    /// Record the answer's withdrawal obligations, and journal its view's
+    /// first change, unless it is the view already published.
+    Journal {
+        publication: ConsumerPublication,
+        withdrawals: Vec<EndpointWithdrawalInstruction>,
+    },
     /// Withdraw every earlier view (the journal already says Withdrawing),
     /// then publish this one.
     Withdraw(ConsumerPublication),
@@ -108,7 +117,8 @@ impl ConsumerSyncs {
     /// journal doesn't yet list it as the only one.
     fn pending_publication(&self) -> Option<&ConsumerPublication> {
         match &self.current.as_ref()?.next {
-            ConsumerStep::Withdraw(publication)
+            ConsumerStep::Journal { publication, .. }
+            | ConsumerStep::Withdraw(publication)
             | ConsumerStep::ProveReceipts(publication)
             | ConsumerStep::Publish(publication) => Some(publication),
             ConsumerStep::Activate | ConsumerStep::Compact => None,
@@ -465,9 +475,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Check a leader answer and journal its first change. Every path
-    /// journals at most one discovery write here; [`Self::consumer_step`]
-    /// takes the rest, one write a step (#505).
+    /// Build the view a leader answer asks for, from the runtime's launch
+    /// inventory and the local service map. This step reads the inventory
+    /// and journals nothing; [`Self::consumer_step`] takes the rest, one
+    /// write a step (#505, #603).
     async fn first_consumer_step(
         &mut self,
         generation: u64,
@@ -487,6 +498,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let publication = self
             .consumer_candidate(generation, catalog, ingress)
             .await?;
+        Ok(Progress::Next(ConsumerStep::Journal {
+            publication,
+            withdrawals,
+        }))
+    }
+
+    /// Record a leader answer's withdrawal obligations and journal its
+    /// first change: at most one discovery write.
+    async fn journal_consumer_answer(
+        &mut self,
+        publication: ConsumerPublication,
+        withdrawals: Vec<EndpointWithdrawalInstruction>,
+    ) -> Result<Progress, BunError> {
+        // Read afresh, as every later step does: since the candidate turn a
+        // receipt may have been confirmed, or the view lease lapsed.
         let mut owner = self
             .consumer_owner()
             .cloned()
@@ -557,6 +583,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// the ownership afresh, so a receipt confirmed between turns stays gone.
     async fn consumer_step(&mut self, step: ConsumerStep) -> Result<Progress, BunError> {
         match step {
+            ConsumerStep::Journal {
+                publication,
+                withdrawals,
+            } => self.journal_consumer_answer(publication, withdrawals).await,
             ConsumerStep::Withdraw(publication) => {
                 if !self.withdraw_consumer_view().await? {
                     // Requests still hold earlier backends. The journal says
@@ -622,23 +652,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Take a leader answer, or a local republication, through the loop
-    /// (#505). Its first step runs now; the rest run on later turns, one
-    /// write each, and whoever asked hears the result after the last one.
-    /// While one synchronisation is under way a newer answer waits for it,
-    /// and replaces any answer already waiting: the leader's poll sends one
-    /// at a time, so an older waiting answer is one its poll gave up on.
+    /// (#505). It only queues here: every step, the first included, runs on
+    /// a later turn of its own, so the turn that asked takes no slow await
+    /// for it (#603). Whoever asked hears the result after the last step.
+    /// An answer waits for any synchronisation under way, and replaces any
+    /// answer already waiting: the leader's poll sends one at a time, so an
+    /// older waiting answer is one its poll gave up on.
     pub(super) async fn request_consumer_sync(&mut self, request: ConsumerRequest) {
-        if !self.consumer_syncs.is_idle() {
-            if let Some(superseded) = self.consumer_syncs.waiting.replace(request) {
-                self.answer_consumer_sync(
-                    superseded.answer,
-                    Err(failure("superseded by a newer leader answer")),
-                )
-                .await;
-            }
-            return;
+        if let Some(superseded) = self.consumer_syncs.waiting.replace(request) {
+            self.answer_consumer_sync(
+                superseded.answer,
+                Err(failure("superseded by a newer leader answer")),
+            )
+            .await;
         }
-        self.start_consumer_sync(request).await;
     }
 
     async fn start_consumer_sync(&mut self, request: ConsumerRequest) {
@@ -884,8 +911,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// The loop's end-of-turn republication after a local change: like
-    /// [`Self::refresh_consumer_view`], but its writes run as steps on later
-    /// turns. While another synchronisation is under way the view stays
+    /// [`Self::refresh_consumer_view`], but its inventory read and writes
+    /// run as steps on later turns. While another synchronisation is under way the view stays
     /// marked stale, and a turn after it finishes starts this one.
     pub(super) async fn start_consumer_refresh(&mut self) {
         if !self.consumer_view_stale || !self.consumer_syncs.is_idle() {
@@ -908,9 +935,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.consumer_view_stale = false;
             return;
         };
-        // A failure marks it stale again (`answer_consumer_sync`).
+        // A failure marks it stale again (`answer_consumer_sync`). The
+        // sync is idle, so this queues without superseding anything; its
+        // first step, the inventory read, runs on a turn of its own.
         self.consumer_view_stale = false;
-        self.start_consumer_sync(ConsumerRequest {
+        self.request_consumer_sync(ConsumerRequest {
             generation: last.generation,
             catalog: last.catalog,
             ingress: last.ingress,
