@@ -1,12 +1,14 @@
 # Research: moving a running container between nodes (0.4.0)
 
-28 September 2026; revised 5 October 2026. Research and an implementation
+28 September 2026; revised 6 October 2026. Research and an implementation
 proposal, with no product code. Release: **0.4.0, "Full container migration"**.
 
 The original maintainer decisions are retained in section 13. The 5 October
 review strengthens the outcome contract, recovery rules, built-in demonstration
 and conformance gates. The full apps-and-jobs scope stays. A failed spike changes
 the design or blocks the release; it does not silently weaken the contract.
+The 6 October additions explain CRIU limits and select Redis and PostgreSQL as
+the first two real-application demonstration and qualification targets.
 All commands and configuration additions below are proposed unless section 2
 explicitly identifies an existing capability.
 
@@ -17,6 +19,7 @@ explicitly identifies an existing capability.
 - [x] Refresh code assertions against fetched **main**, not the PR's old base.
 - [x] Define continuity, explicit fallback, activation and source independence.
 - [x] Design a built-in demonstration and versioned conformance cases.
+- [x] Select Redis first and PostgreSQL second, with concrete database assertions.
 - [x] Review the revised document for cross-section consistency.
 - [ ] Run the integration and design spikes in section 10.
 - [ ] Set measured interruption envelopes and re-estimate after the spikes.
@@ -24,7 +27,7 @@ explicitly identifies an existing capability.
 
 Code baseline: `origin/main` at
 [`ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`](https://github.com/reliaburger/reliaburger/commit/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98),
-fetched 5 October 2026. It includes the boot-relative process adoption fix
+refetched 6 October 2026. It includes the boot-relative process adoption fix
 (#609). The earlier `ff854cbf` baseline is superseded. Baseline links in section 2
 are pinned to this main commit; subsequent implementation must refresh them.
 The branch incorporates that main commit without rewriting the PR history.
@@ -229,7 +232,7 @@ state and report a successful live move.
 **How the built-in tests expose the boundary.** Host-level `criu check` establishes
 kernel prerequisites, not that a particular running workload can migrate
 ([check semantics](https://criu.org/CLI/cmd/check)). The proposed Relish demo proves
-its pinned fixture and recorded source/target configuration. Workload qualification
+its pinned fixtures and recorded source/target configuration. Workload qualification
 must also exercise the application's real resource use under load: a resource
 can appear only after startup, so an image digest or initial preflight cannot
 guarantee every future checkpoint. Recheck at the actual dump boundary and handle
@@ -940,16 +943,26 @@ relish test --filter migration
 ```
 
 Reuse `src/testkit` rather than a second demonstration engine. Add a short
-`migration` group that checks fresh capabilities, chooses a compatible pair,
-stages a digest-pinned fixture through existing image infrastructure, leases an
-isolated namespace, creates state, opens real client traffic, moves A to B and
-back, observes the outcome and confirms cleanup. Serialise its moves and bound
+`migration` group whose first two application targets are **Redis, then PostgreSQL**
+(section 9.2.1). It checks fresh capabilities, chooses a compatible pair, stages
+digest-pinned database images through existing image infrastructure, leases an
+isolated namespace, creates state, opens real client traffic, moves each database
+A to B and back, observes the outcome and confirms cleanup. Run the targets
+sequentially; serialise their moves and bound
 resource use; default execution does not cordon/drain real nodes, restart Bun or
 inject faults. Small bounded heap/disk data and a few minutes are targets to
-measure, not a promised runtime. No operator TOML, Redis scripts, SSH, image
+measure, not a promised runtime. No operator TOML, Redis/SQL scripts, SSH, image
 builder or external load generator is required.
 
-Only qualified nodes run the fixture. Known absence reports **not demonstrated**
+The command automatically provisions both databases, credentials, schema/data
+and built-in client observations, and removes its owned resources afterward.
+Print separate Redis and PostgreSQL verdicts and the combined result. If either
+required target is unavailable, refused or untested, the two-target demonstration
+cannot pass. A later target-specific selection is explicitly partial, not the
+default demonstration or strict conformance. These are future tests, not claims
+that either database is already qualified.
+
+Only qualified nodes run the fixtures. Known absence reports **not demonstrated**
 with actionable reasons; collection failure is unknown. An explicitly requested
 migration demonstration returns nonzero if it cannot exercise its core live
 case. Optional subcases in broader development runs may be typed skips, but
@@ -961,10 +974,11 @@ before timed migration.
 Illustrative human output (these are not measurements):
 
 ```text
-Testing migration on your cluster
+Testing migration: Redis, then PostgreSQL
   Source: worker-2   Target: worker-3
 
-Created state in memory and on disk.
+Redis:
+Created random state in memory; no managed volume or persistence.
 Opened a connection that stays open throughout the move.
 
 Moving worker-2 -> worker-3...
@@ -977,7 +991,13 @@ Moving worker-3 -> worker-2...
   Connection preserved; no reconnection
   Longest response pause: 201 ms
 
-PASS: both moves preserved state and connections.
+PostgreSQL:
+  Committed rows preserved across both moves
+  Open transactions committed on their original sessions
+  Active queries completed without resubmission
+  Longest response pause: <measured per move>
+
+PASS: Redis and PostgreSQL preserved their required state and sessions.
 Cleanup confirmed.
 ```
 
@@ -1006,8 +1026,9 @@ The fixture provides:
   selected metadata; an open descriptor advances across a move.
 - A persistent raw TCP session, a separately exercised ingress/WebSocket session,
   and an outbound session to an observer peer that is not on the moving source.
-  The short demo covers a bounded subset and labels it; conformance covers every
-  required path. New connections after cutover check publication/credentials.
+  The short database demo covers its declared native client paths (9.2.1);
+  mechanism conformance covers the additional required ingress/outbound paths.
+  New connections after cutover check publication/credentials.
 - Numbered operations with response/state hash-chain evidence. A separate observer
   records requests, acknowledgements, unresolved responses and committed state.
 
@@ -1031,9 +1052,79 @@ both moves to reveal source-forwarding chains.
 
 Also test a **memory-only app with no managed volume**, so drain cannot silently
 classify it as stateless. Exercise additional kernel/fd metadata cases in the
-full suite. Retain pinned real-application checks (at least Redis memory-only,
-and a storage-backed application once qualified) in release validation; the
-custom fixture is precise evidence but cannot establish general compatibility.
+full suite. The custom fixture remains mechanism/diagnostic coverage; the first
+two practitioner-facing application targets and required real-application checks
+are Redis and PostgreSQL below. A custom-fixture pass cannot substitute for either
+database or establish general compatibility.
+
+### 9.2.1 First two application targets: Redis and PostgreSQL
+
+Pin actual Redis and PostgreSQL server images for arm64 and x86_64, with exact
+version, digest and tested configuration in a versioned fixture manifest.
+Provision them through ordinary app/runtime/storage/migration APIs under test
+leases. Bundle the bounded protocol clients and observation logic in the test
+runner; users should not need `redis-cli`, `psql`, SQL files or a load generator.
+Do not patch either database to reconstruct lost state or substitute replication,
+promotion, process restart or reconnect for movement of the original execution.
+
+**Target 1: Redis.** The short demonstration starts a standalone memory-only
+server with persistence disabled and no managed volume. Inject random values
+after startup and continuously issue numbered writes/reads on an original TCP
+connection during A->B->A. The independent ledger verifies every acknowledged
+non-expiring value and sequence; no restart can reload the dataset from disk.
+Observe server run identity as supporting evidence alongside the original socket
+and data, not as the sole proof. Expiring keys are tested separately against
+elapsed observer time and a declared tolerance: migration must not reset TTLs
+or pretend that external time stopped.
+
+The full conformance/release variants add managed-volume RDB/AOF persistence,
+background saves and AOF rewrites under concurrent writes. Include active child
+processes and all relevant files in the consistent cut; revalidate data and
+persistence artifacts afterward. Redis documents these separate persistence
+mechanisms and their forked background work
+([persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)).
+CRIU's Redis/containerd example is precedent, not proof of our source-off or
+session contract ([example](https://criu.org/index.php?mobileaction=toggle_view_mobile&title=Containerd)).
+
+**Target 2: PostgreSQL.** Start with a pinned PostgreSQL 18 build, explicitly
+`io_method=worker`, a small managed-volume dataset, ordinary shared-memory settings
+and no third-party extensions. Worker mode is the documented default and avoids
+the specific io_uring descriptor blocker; this is a candidate configuration, not
+evidence that the remaining kernel/runtime resources can restore
+([I/O methods](https://www.postgresql.org/docs/18/runtime-config-resource.html#GUC-IO-METHOD)).
+Keep durable commit settings; do not disable fsync or weaken acknowledgements to
+make the demonstration easier. Move the whole server process tree, shared state,
+data directory and WAL at a validated consistent cut, including any separately
+configured storage paths. No disk-only crash recovery can stand in for preserved
+in-memory transactions and sessions.
+
+The short PostgreSQL case runs continuous numbered committed writes while a
+separate original session holds an open transaction across each cutover. Check
+its uncommitted work/session-local state, then commit once on that same connection
+and verify the rows from another observer session. Also prove a bounded long-running
+query is active before cutover and that its original request completes without
+resubmission. Give that query its own bounded execution deadline; continuous
+short probes measure cutover interruption, not its deliberate execution time.
+All previously acknowledged commits must remain present; unresolved
+commit responses are reconciled by operation identity and reported separately,
+not treated as failed transactions or automatically retried. Repeated moves must
+preserve both data and these session behaviours.
+
+Full qualification adds concurrent vacuum/checkpoint activity, contention, larger
+WAL/data and dirty-memory rates, and verifies storage integrity and continued
+durability after movement. Tests must observe the intended background activity
+overlapping cutover, not merely issue a command that finishes beforehand. A real
+io_uring-configured negative case belongs in S8: it must refuse safely on the
+researched unsupported CRIU release, not silently change backend or restart.
+
+Both targets use section 9.2's independent acknowledgement/session observations,
+per-cutover maximum pause, lease cleanup and fresh-connection checks. Their full
+qualification includes actual drain followed by source shutdown/restart under
+section 9.5. Report database version/configuration, persistence/I/O mode, workload
+size and tested architecture/backend/direction. Passing these bounded standalone
+configurations does not certify Redis Cluster/Sentinel, PostgreSQL replication/HA,
+arbitrary extensions, other I/O methods or all production dataset sizes. Expand
+those claims only with additional named cases and recorded evidence.
 
 ### 9.3 Leases, interruption and cleanup
 
@@ -1079,6 +1170,7 @@ not mandatory when another proven method satisfies the same contract.
 | Checkpoint | Memory, computation, open-fd state and filesystem cut survive; declared TCP closure is tested, not confused with live. |
 | Live | Original computation and qualified inbound/outbound/ingress sessions survive A->B->A with no restart/reconnect. |
 | In-memory-only intent | No-volume checkpoint/live apps follow migration policy during actual drain qualification. |
+| Database targets | Required Redis memory-only and persistence variants, and PostgreSQL worker-mode durable writes/open transactions/active queries, as specified in 9.2.1. Neither database can be replaced by the custom fixture or omitted from a complete manifest. |
 | Storage | Each claimed backend preserves content/deletions/metadata and quota enforcement; copied data is authoritative only after validated cutover. |
 | Identity | Logical replica/job execution is retained; fresh authenticated operations succeed after movement and rotation/reload. |
 | Jobs | Exact execution/run/retry ownership survives; completed work and observed external effects are not replayed. |
@@ -1104,6 +1196,7 @@ indefinite certificate after hosts, routes or binaries change.
 Report schema additions: contract/manifest version and selection completeness;
 build and per-node runtime/CRIU/kernel/architecture fingerprints; node/pool/direction,
 image digest, storage backend, network/ingress/egress paths; workload state size,
+database version/configuration and persistence/I/O mode where applicable;
 dirty/client rate and interruption budget; acknowledgement/state/session evidence;
 per-cutover maximum pause and recovery tail; methods used and outstanding source
 dependencies; refusal/recovery/degradation; and independent cleanup. Redact memory,
@@ -1159,7 +1252,9 @@ model tests; finite sampling alone is not proof.
 2. Populate memory/filesystem state, open inbound/outbound/ingress sessions and
    record acknowledgements independently under continuous traffic.
 3. Run the actual `relish drain` path, including a no-volume memory workload and
-   a running job. Verify it reports source-independent completion.
+   a running job. Include both Redis and PostgreSQL in required database
+   qualification, preserving their original sessions and database assertions.
+   Verify it reports source-independent completion.
 4. Immediately stop the source VM or use an equivalent proven loss of its complete
    data plane. Do not replace this with Bun exit or `NodeTransportGate` quiescence;
    those can leave NAT/tunnel/proxy dependencies alive.
@@ -1199,7 +1294,7 @@ resources. x86_64 pre-copy and arm64 methods need separate hardware evidence.
 | S13 | Consistent frozen filesystem cut, metadata/whiteouts/unlinked files, same-size/mtime modifications, quota and loop/Btrfs provisioning. |
 | S14 | Credential mobility or tested reload/rotation, fresh authenticated sessions and source retirement authority. |
 | S15 | No-swap reservations, protected transfer-key recovery across Bun/owner/node loss, staged import confinement and interruption cleanup. |
-| S16 | Tiny signed/pinned multi-architecture fixture, independent acknowledgement ledger and real data-plane probes without reconnection/retry masking. |
+| S16 | Tiny signed/pinned mechanism fixture plus Redis first and PostgreSQL worker-mode second, on both architectures. Prove memory-only/persistent data, original sessions, open SQL transactions and active queries with independent ledgers and no reconnection/retry masking (9.2.1). |
 | S17 | Migration under authenticated test leases; expiry/stop/cleanup at every boundary on both nodes. |
 | S18 | Versioned profile completeness, directional pools and recorded evidence; partial/skip/unknown cannot certify conformance. |
 | S19 | Actual drain followed by source VM shutdown/restart under live traffic, with independent entry/observer topology and no resurrection. |
@@ -1227,14 +1322,16 @@ runners can support CRIU; unavailable hardware gets an explicit owner and releas
 qualification lane, not a green mock substitute.
 
 **Built-in operator cases:** short demonstration and complete migration profile
-run the same fixture/scenario/assertions with different coverage/load. Recovery
+run the same Redis/PostgreSQL fixtures/scenarios/assertions with different
+coverage/load, alongside mechanism fixtures in conformance. Recovery
 cases share observations but use explicit chaos selection and node-state authority.
 Wire catalogue, capabilities, lease/authz routes, reports and built-in manual
 consistently; verify the documented commands select real required cases.
 
 **Release/soak:** repeat A->B->A under load with the volume writer, memory-only
-counter and real application fixtures; exercise main's recovery faults and the
-source-off case. Cover both architectures, every claimed backend, ingress/egress
+counter and the required Redis/PostgreSQL fixtures; exercise main's recovery
+faults and each database's source-off case. Cover both architectures, every claimed
+backend, ingress/egress
 paths, jobs and credential continuity. Retain acknowledgement/session ledgers,
 per-cutover latencies, generation transitions, fingerprints and cleanup outcomes.
 Retries must not erase first failures. No pass on an empty run or skipped-only lane.
@@ -1245,8 +1342,9 @@ checks cannot drift into a separate weaker demonstration.
 **Packaging:** package pinned qualified CRIU/runc in the appliance/managed Linux
 guests, check Ubuntu 26.04 availability before depending on a PPA, and expose
 runtime capabilities in `wtf`/dry-run. No automatic PPA installation on an existing
-cluster from `relish test`. Verify signed fixture image availability before timing;
-support existing mirrors/local staging rather than depending on a mutable tag.
+cluster from `relish test`. Verify signed mechanism and Redis/PostgreSQL fixture
+image availability before timing; support existing mirrors/local staging rather
+than depending on a mutable tag.
 
 ## 11. Implementation order and effort
 
@@ -1260,12 +1358,14 @@ Work in dependency order, behind meaningful tests, while keeping the full 0.4.0
 release acceptance scope:
 
 1. Refresh main evidence; implement fixture/observer and ownership/policy/model
-   tests; run feasibility spikes before locking the transport/network design.
+   tests; prepare Redis then PostgreSQL fixtures and run their feasibility spikes
+   before locking the transport/network design.
 2. Cordon/drain ownership and status, held assignments, exclusive source fencing,
    activation and safe recovery. Cold managed-data moves provide the first path.
 3. Stable logical/storage/job identities, consistent copy and capacity reservations.
 4. Checkpoint runtime/stdio/time/egress, secure no-swap transfer and recoverable
-   journals/keys; credential continuity.
+   journals/keys; credential continuity. Establish real Redis and PostgreSQL
+   checkpoint/state/session results before extending live guarantees.
 5. Qualified memory/filesystem pre-copy and optional post-copy with honest failure
    envelope; interruption measurements.
 6. Source-independent addresses, egress mapping and ingress ownership; actual
@@ -1273,8 +1373,8 @@ release acceptance scope:
 7. Demonstration/catalogue/lease ownership, versioned conformance, capability/pool
    evidence, JSON reports and benchmark envelopes throughout the work, not bolted
    on after the mechanisms.
-8. Real applications, recovery/soak on both architectures/backends, documentation
-   and the new 0.4.0 book chapter; final release qualification.
+8. Required Redis/PostgreSQL recovery/soak on both architectures/backends,
+   documentation and the new 0.4.0 book chapter; final release qualification.
 
 Intermediate mechanisms can land with their actual weaker guarantees, but cannot
 be advertised as live-conformant or used to declare a seamless drain complete.
@@ -1287,6 +1387,9 @@ to satisfy this release's continuity contract.
 Review completed 5 October against fetched main `ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`.
 CRIU primer and refusal coverage reviewed 6 October against the same freshly
 fetched main and upstream v4.2.1; main has not advanced since the preceding review.
+The same day's database revision makes Redis and PostgreSQL required application
+targets in the demo, strict manifest, source-off qualification and implementation
+order; it does not record completed database migration experiments.
 This is a design/document review, not completed migration qualification.
 Validation on this refreshed checkout: `git diff --check`, section/fence/local-link
 checks, all 19 pinned-main source references and proposed TOML syntax passed.
@@ -1310,6 +1413,7 @@ run, and the proposed migration commands/profiles remain unimplemented.
 | Test fixture leases forbidden; source node fault mistaken for power-off. | Authenticated cross-node lease lifecycle; actual VM/data-plane loss. S17/S19. |
 | Selected green tests mistaken for whole-cluster conformance. | Versioned manifest completeness, pools/directions, observed evidence and tiers. S18. |
 | CRIU installation or a successful fixture implies arbitrary workloads can move. | Explain dump blockers, conditional resources and external-state boundaries; workload-specific and late-resource qualification with refusal fixtures. Section 3, S8 and strict conformance. |
+| Real database compatibility is deferred behind a synthetic fixture. | Redis first and PostgreSQL second are required targets, with memory-only state, durable data, open transactions, active queries and source-off evidence; 9.2.1 and S16. |
 | Every deadline assumed to yield terminal successful ownership. | Held recovery/unavailability when proof is missing; model tests permit it. |
 | Stale baseline/protocol and job attempt design. | Main 40/58 and existing job generations/spec digests/replay fences, refreshed before implementation. |
 
@@ -1364,3 +1468,12 @@ and distinguishes historical choices from required new design work:
   are separate acknowledged cases and mandatory full-conformance/release evidence.
 - The old effort estimate is superseded pending the expanded spikes. All code
   assertions use fetched main, and the merge preserves the PR's existing history.
+
+### Database demonstration targets, authorised 6 October 2026
+
+The maintainer selected Redis and PostgreSQL as the first two demonstration
+targets. Section 9.2.1 defines their initial configurations and observations;
+both are required in the one-command demonstration and versioned conformance,
+with persistence/background-work and source-off variants in full qualification.
+Database versions and image digests are pinned during implementation/qualification;
+no unrun experiment or universal database compatibility is asserted here.
