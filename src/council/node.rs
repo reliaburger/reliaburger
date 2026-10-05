@@ -1618,6 +1618,7 @@ mod tests {
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),
+            pending_intermediates: Vec::new(),
         };
         node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
             .await

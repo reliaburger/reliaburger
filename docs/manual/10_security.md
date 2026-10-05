@@ -297,8 +297,8 @@ relish ca backup --out prod-root-backup.age --recipient age1...
 for scripts. The backup is never sealed to a cluster key: those rotate, and
 this file has to outlive them. Store it off the cluster, away from the
 passphrase or identity that opens it. The root's key never goes into the
-council or onto another node; rotating an intermediate (coming in a later
-release) will ask for this file rather than keep the root on the cluster.
+council or onto another node; rotating an intermediate (below) asks for this
+file rather than keep the root on the cluster.
 
 Check a backup at any time, with no cluster running:
 
@@ -314,6 +314,55 @@ certificate's, or that belongs to another cluster. A wrong passphrase or
 identity doesn't open it at all. Since the file is a standard age file, the
 `age` tool opens it too, and inside is JSON with the certificate and key in
 PEM.
+
+## Rotating an intermediate CA
+
+The root signs three intermediates: the Node CA (node-to-node mTLS), the
+Workload CA (workload identities) and the Ingress CA (`tls = "cluster"`
+routes). Replace one with:
+
+```sh
+relish ca rotate --role node --root-backup prod-root-backup.age
+relish ca rotate --role workload --root-backup prod-root-backup.age --identity ~/.age/operator.key
+```
+
+The cluster makes the new key and sends a certificate signing request.
+`relish` opens your backup on your machine (asking for its passphrase, or
+using `--passphrase-file` or `--identity`), checks it's the root your cluster
+trusts, signs the request and sends back only the certificate. The root's key
+never leaves your machine, and the new CA's key never leaves the cluster. Run
+it against the council leader, with an Admin token that isn't scoped to a
+namespace; a follower answers with the leader's name.
+
+From then on both CAs are trusted and new certificates come from the new one:
+
+- **Node:** every node installs the new trust set within seconds and tells the
+  leader. Once all have, the nodes renew onto the new CA one at a time, in
+  node-name order, without restarting anything. A node that doesn't move holds
+  the next one up for a minute at most.
+- **Workload:** workloads renew their identity every half hour, so they move
+  within the hour.
+- **Ingress:** each node re-mints its routes' certificates from the new CA
+  within a few seconds.
+
+When the old CA has nothing left to do, retire it:
+
+```sh
+relish ca rotate --role node --finalize
+```
+
+For the Node CA that's refused until every node has acknowledged the new
+trust set and holds a certificate from the new CA, and the refusal names the
+nodes still waiting. Decommission a node that's gone for good, or it holds the
+rotation up. For the Workload and Ingress CAs, finalise waits until every
+certificate the old CA could have signed has expired: an hour for workloads,
+90 days for ingress. One rotation per CA at a time: finalise before starting
+another. Running `rotate` again before it begins (say, after a typo in the
+passphrase) is fine; the cluster replaces the earlier request. Each step is
+an audit event (`ca.rotation_prepared`, `ca.rotation_begun`,
+`ca.rotation_finalised`) in `relish events`.
+
+Rotating the root itself isn't supported yet.
 
 ## Workload identity
 

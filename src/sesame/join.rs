@@ -583,6 +583,7 @@ mod tests {
             crl: super::super::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),
+            pending_intermediates: Vec::new(),
         };
 
         (state, token_plaintext, master_secret)

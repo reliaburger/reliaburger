@@ -61,9 +61,13 @@ pub struct Compatibility {
 /// `GET /v1/cluster/ca`, the workload CA bundle in a signing answer
 /// (`WorkloadCsrResponse::ca_bundle_der`), and the trust set in a node's
 /// identity snapshot (`node.bundle.json` schema 3) (F04 R2, #362).
+/// Intermediate rotation: the pending CSRs (`SecurityState::pending_intermediates`),
+/// each node's trust acknowledgement (`NodeLeafRecord::trust_generation`),
+/// the `CaRotationPrepare` and `AcknowledgeNodeTrust` Raft requests and the
+/// `POST /v1/cluster/trust-ack` body a node sends the leader (F04 R4, #362).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 43,
-    state: 60,
+    protocol: 44,
+    state: 61,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

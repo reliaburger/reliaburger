@@ -553,6 +553,11 @@ target/debug/relish ca backup --out prod-root-backup.age --dir cluster
 target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
 ```
 
+The same file is what replaces an intermediate CA later:
+`relish ca rotate --role node --root-backup prod-root-backup.age` signs the
+cluster's new Node CA on your machine, and `--finalize` retires the old one
+once every node has moved (see the manual's security chapter).
+
 This is a one-node Raft cluster: clustered code paths are live, but it cannot
 survive a node failure. The API listens at `https://127.0.0.1:9117`. On macOS, use the [managed Linux VM quickstart](quickstart.md) for containers.
 

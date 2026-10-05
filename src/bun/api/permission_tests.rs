@@ -305,6 +305,9 @@ fn refuses_system_principal(path: &str) -> bool {
             | "/v1/join-token/create"
             | "/v1/identity/sign"
             | "/v1/secret/rotate"
+            | "/v1/ca/rotation/prepare"
+            | "/v1/ca/rotation/begin"
+            | "/v1/ca/rotation/finalize"
             | "/v1/nodes/decommission"
     )
 }

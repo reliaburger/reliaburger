@@ -45,6 +45,7 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 // the helpers at the bottom of this file are the ones several groups share.
 mod apply;
 mod apps;
+mod ca;
 mod deploys;
 mod discovery;
 mod faults;
@@ -67,6 +68,7 @@ mod upgrade;
 pub(crate) use apply::leader_api_url;
 use apply::{apply_handler, cluster_apply};
 use apps::{delete_handler, exec_handler, stop_handler};
+use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
     cluster_deploy_history, deploy_cancel_handler, deploys_active_handler, deploys_history_handler,
     deploys_operations_handler, rollback_handler,
@@ -87,7 +89,7 @@ use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
     producer_retirement_handler, refuse_retired_tls_peer, workload_csr_handler,
 };
-use join::{cluster_ca_handler, join_handler, node_renewal_handler};
+use join::{cluster_ca_handler, join_handler, node_renewal_handler, node_trust_ack_handler};
 use logs::{
     logs_cross_node_handler, logs_entries_handler, logs_export_handler, logs_handler,
     logs_sql_handler, ws_logs_handler,
@@ -641,6 +643,10 @@ pub fn router_with_upgrade(
             post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
+            "/v1/cluster/trust-ack",
+            post(node_trust_ack_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/v1/registry/query",
             post(registry_query_handler)
                 .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
@@ -778,6 +784,12 @@ pub fn router_with_upgrade(
         .route("/v1/join-token/create", post(join_token_create_handler))
         .route("/v1/secret/public-key", get(secret_public_key_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
+        .route("/v1/ca/rotation/prepare", post(ca_rotation_prepare_handler))
+        .route("/v1/ca/rotation/begin", post(ca_rotation_begin_handler))
+        .route(
+            "/v1/ca/rotation/finalize",
+            post(ca_rotation_finalize_handler),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::sesame::auth::auth_middleware,

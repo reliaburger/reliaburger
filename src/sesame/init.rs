@@ -135,8 +135,10 @@ pub fn initialize_cluster(
             NodeLeafRecord {
                 serial,
                 ca_generation: 0,
+                trust_generation: 0,
             },
         )]),
+        pending_intermediates: Vec::new(),
     };
 
     Ok(InitResult {
@@ -218,6 +220,7 @@ mod tests {
             NodeLeafRecord {
                 serial: result.node_certificate.serial,
                 ca_generation: 0,
+                trust_generation: 0,
             }
         );
     }

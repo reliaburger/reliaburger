@@ -128,35 +128,7 @@ pub fn generate_intermediate_ca(
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
     let private_key_der = key_pair.serialize_der();
-
-    let role_name = match role {
-        CaRole::Node => "Node",
-        CaRole::Workload => "Workload",
-        CaRole::Ingress => "Ingress",
-        CaRole::Root => {
-            return Err(CaError::InvalidInput(
-                "root CA is not an intermediate".into(),
-            ));
-        }
-    };
-
-    let mut params = CertificateParams::default();
-    let mut dn = DistinguishedName::new();
-    dn.push(
-        DnType::CommonName,
-        format!("Reliaburger {role_name} CA - {cluster_name}"),
-    );
-    dn.push(DnType::OrganizationName, "Reliaburger");
-    params.distinguished_name = dn;
-    // Path length 0 = can sign end-entity certs but not further sub-CAs
-    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
-    set_validity(&mut params, INTERMEDIATE_CA_LIFETIME)?;
+    let params = intermediate_ca_params(role, cluster_name, serial)?;
 
     // Sign with parent — both self_signed and signed_by consume their params,
     // so we clone before calling.
@@ -171,9 +143,11 @@ pub fn generate_intermediate_ca(
         .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
-    // Wrap the private key
-    let wrap_info = format!("reliaburger-{}-ca-wrap-v1", role_name.to_lowercase());
-    let wrapped = crypto::wrap_key(wrapping_ikm, &private_key_der, &wrap_info)?;
+    let wrapped = crypto::wrap_key(
+        wrapping_ikm,
+        &private_key_der,
+        &intermediate_wrap_info(role)?,
+    )?;
 
     let ca = CertificateAuthority {
         role,
@@ -193,6 +167,121 @@ pub fn generate_intermediate_ca(
         signing_keypair: key_pair,
         certificate_params: params,
     })
+}
+
+/// The name an intermediate's certificate and key wrapping use for its role.
+fn intermediate_role_name(role: CaRole) -> Result<&'static str, CaError> {
+    match role {
+        CaRole::Node => Ok("Node"),
+        CaRole::Workload => Ok("Workload"),
+        CaRole::Ingress => Ok("Ingress"),
+        CaRole::Root => Err(CaError::InvalidInput(
+            "root CA is not an intermediate".into(),
+        )),
+    }
+}
+
+/// The HKDF info an intermediate's wrapped private key is bound to.
+fn intermediate_wrap_info(role: CaRole) -> Result<String, CaError> {
+    Ok(format!(
+        "reliaburger-{}-ca-wrap-v1",
+        intermediate_role_name(role)?.to_lowercase()
+    ))
+}
+
+/// The certificate params every intermediate of `role` gets: its name, a
+/// path length of 0 (it signs leaves, never another CA), its key usages and
+/// five years from now. `relish init` and `relish ca rotate` both use them.
+fn intermediate_ca_params(
+    role: CaRole,
+    cluster_name: &str,
+    serial: SerialNumber,
+) -> Result<CertificateParams, CaError> {
+    let role_name = intermediate_role_name(role)?;
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(
+        DnType::CommonName,
+        format!("Reliaburger {role_name} CA - {cluster_name}"),
+    );
+    dn.push(DnType::OrganizationName, "Reliaburger");
+    params.distinguished_name = dn;
+    // Path length 0 = can sign end-entity certs but not further sub-CAs
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
+    set_validity(&mut params, INTERMEDIATE_CA_LIFETIME)?;
+    Ok(params)
+}
+
+/// Make the key for a new intermediate of `role` and a CSR for it: the
+/// council's half of `relish ca rotate` (F04 R4).
+///
+/// Returns the CSR (DER) and the private key wrapped with `wrapping_ikm`,
+/// the way `relish init` wraps an intermediate's key. The plaintext key
+/// never leaves this function.
+pub fn create_intermediate_csr(
+    role: CaRole,
+    wrapping_ikm: &[u8],
+) -> Result<(Vec<u8>, super::types::WrappedKey), CaError> {
+    let role_name = intermediate_role_name(role)?;
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, format!("Reliaburger {role_name} CA"));
+    dn.push(DnType::OrganizationName, "Reliaburger");
+    params.distinguished_name = dn;
+    let csr = params
+        .serialize_request(&key_pair)
+        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
+    let wrapped = crypto::wrap_key(
+        wrapping_ikm,
+        &key_pair.serialize_der(),
+        &intermediate_wrap_info(role)?,
+    )?;
+    Ok((csr.der().to_vec(), wrapped))
+}
+
+/// Sign a cluster-made intermediate CSR with the root: the operator's half
+/// of `relish ca rotate` (F04 R4).
+///
+/// Only the CSR's public key is used. The name, constraints and usages are
+/// the ones every intermediate of `role` gets, so a CSR can't ask for more,
+/// and the certificate never outlives the root. Returns the certificate DER.
+pub fn sign_intermediate_csr(
+    csr_der: &[u8],
+    role: CaRole,
+    cluster_name: &str,
+    serial: SerialNumber,
+    root_key_der: &[u8],
+    root_certificate_der: &[u8],
+) -> Result<Vec<u8>, CaError> {
+    let csr_der = rustls::pki_types::CertificateSigningRequestDer::from(csr_der.to_vec());
+    let csr = rcgen::CertificateSigningRequestParams::from_der(&csr_der)
+        .map_err(|e| CaError::SignFailed(format!("failed to parse the intermediate CSR: {e}")))?;
+    let root_key = rustls::pki_types::PrivateKeyDer::try_from(root_key_der.to_vec())
+        .map_err(|e| CaError::SignFailed(format!("invalid root key DER: {e}")))?;
+    let root_keypair = KeyPair::from_der_and_sign_algo(&root_key, &rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| CaError::SignFailed(format!("invalid root key: {e}")))?;
+    let root_params = CertificateParams::from_ca_cert_der(
+        &rustls::pki_types::CertificateDer::from(root_certificate_der.to_vec()),
+    )
+    .map_err(|e| CaError::SignFailed(format!("invalid root certificate: {e}")))?;
+
+    let mut params = intermediate_ca_params(role, cluster_name, serial)?;
+    bound_leaf_validity(&mut params, &root_params)?;
+    let root = root_params
+        .self_signed(&root_keypair)
+        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
+    let certificate = params
+        .signed_by(&csr.public_key, &root, &root_keypair)
+        .map_err(|e| CaError::SignFailed(e.to_string()))?;
+    Ok(certificate.der().to_vec())
 }
 
 /// The SPIFFE-style URI that binds a certificate to a specific node id.
@@ -669,6 +758,7 @@ fn set_validity(params: &mut CertificateParams, lifetime: Duration) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sesame::cert;
     use std::time::SystemTime;
 
     #[test]
@@ -811,6 +901,85 @@ mod tests {
         let wrapped = node_ca.ca.private_key_wrapped.as_ref().unwrap();
         let unwrapped = crypto::unwrap_key(wrapping_ikm, wrapped).unwrap();
         assert_eq!(unwrapped, node_ca.private_key_der);
+    }
+
+    #[test]
+    fn a_root_signed_intermediate_csr_chains_to_the_root_and_keeps_the_cluster_key() {
+        let root = generate_root_ca("rotate", SerialNumber(1)).unwrap();
+        let ikm = b"rotate-ikm";
+        let (csr, wrapped) = create_intermediate_csr(CaRole::Node, ikm).unwrap();
+
+        let certificate = sign_intermediate_csr(
+            &csr,
+            CaRole::Node,
+            "rotate",
+            SerialNumber(42),
+            &root.private_key_der,
+            &root.ca.certificate_der,
+        )
+        .unwrap();
+
+        cert::verify_signature(&certificate, &root.ca.certificate_der).unwrap();
+        cert::check_issuer_binding(&certificate, &root.ca.certificate_der).unwrap();
+        assert_eq!(
+            cert::serial_from_der(&certificate).unwrap(),
+            SerialNumber(42)
+        );
+
+        // The certificate carries the key the cluster wrapped, so the
+        // cluster can sign leaves with it once the rotation begins.
+        let ca = CertificateAuthority {
+            role: CaRole::Node,
+            certificate_der: certificate,
+            private_key_wrapped: Some(wrapped),
+            serial: SerialNumber(42),
+            not_before: std::time::SystemTime::now(),
+            not_after: std::time::SystemTime::now(),
+            issuer_serial: Some(SerialNumber(1)),
+            generation: 1,
+            state: CaState::Active,
+        };
+        let (keypair, params) = ca_signing_material(&ca, ikm).unwrap();
+        let (leaf, _, _) = issue_node_cert("node-a", SerialNumber(43), &keypair, &params).unwrap();
+        cert::validate_chain(&leaf, &ca.certificate_der, &root.ca.certificate_der).unwrap();
+    }
+
+    #[test]
+    fn an_intermediate_csr_for_the_root_role_is_refused() {
+        assert!(matches!(
+            create_intermediate_csr(CaRole::Root, b"ikm"),
+            Err(CaError::InvalidInput(_))
+        ));
+        let root = generate_root_ca("rotate", SerialNumber(1)).unwrap();
+        let (csr, _) = create_intermediate_csr(CaRole::Node, b"ikm").unwrap();
+        assert!(matches!(
+            sign_intermediate_csr(
+                &csr,
+                CaRole::Root,
+                "rotate",
+                SerialNumber(2),
+                &root.private_key_der,
+                &root.ca.certificate_der,
+            ),
+            Err(CaError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn signing_with_a_key_that_is_not_the_roots_does_not_chain() {
+        let root = generate_root_ca("rotate", SerialNumber(1)).unwrap();
+        let impostor = generate_root_ca("rotate", SerialNumber(1)).unwrap();
+        let (csr, _) = create_intermediate_csr(CaRole::Node, b"ikm").unwrap();
+        let certificate = sign_intermediate_csr(
+            &csr,
+            CaRole::Node,
+            "rotate",
+            SerialNumber(2),
+            &impostor.private_key_der,
+            &root.ca.certificate_der,
+        )
+        .unwrap();
+        assert!(cert::verify_signature(&certificate, &root.ca.certificate_der).is_err());
     }
 
     #[test]

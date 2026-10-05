@@ -385,7 +385,7 @@ enum Command {
         #[command(subcommand)]
         action: SecretAction,
     },
-    /// Back up and check the cluster's root CA, offline.
+    /// Back up the cluster's root CA, check the backup, and rotate intermediates.
     Ca {
         #[command(subcommand)]
         action: CaAction,
@@ -883,6 +883,54 @@ enum CaAction {
         #[arg(long)]
         identity: Option<PathBuf>,
     },
+    /// Rotate an intermediate CA, signing the new one with your root backup.
+    ///
+    /// The cluster makes the new key and sends a CSR. `relish` opens the
+    /// backup here, checks it is the root the cluster trusts, signs the CSR
+    /// and sends back only the certificate: the root key never leaves this
+    /// machine. Both CAs are trusted until you finalise. Node leaves are
+    /// re-issued at once, one node at a time; workload leaves move within
+    /// their hour; ingress certificates are re-minted from the new CA.
+    ///
+    /// Run it again with `--finalize` to retire the old CA. That's refused
+    /// until every node trusts the new CA and holds a leaf from it (Node), or
+    /// until the old CA's leaves have expired (Workload, Ingress).
+    Rotate {
+        /// The intermediate to rotate.
+        #[arg(long, value_enum)]
+        role: CaRotationRole,
+        /// The sealed root backup `relish ca backup` wrote.
+        #[arg(long, required_unless_present = "finalize")]
+        root_backup: Option<PathBuf>,
+        /// Retire the old CA instead of starting a rotation.
+        #[arg(long, conflicts_with_all = ["root_backup", "passphrase_file", "identity"])]
+        finalize: bool,
+        /// Read the backup's passphrase from the first line of this file
+        /// instead of asking.
+        #[arg(long, conflicts_with = "identity")]
+        passphrase_file: Option<PathBuf>,
+        /// Your age identity file, for a backup sealed with `--recipient`.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+}
+
+/// The intermediates `relish ca rotate` can rotate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CaRotationRole {
+    Node,
+    Workload,
+    Ingress,
+}
+
+impl From<CaRotationRole> for reliaburger::sesame::types::CaRole {
+    fn from(role: CaRotationRole) -> Self {
+        match role {
+            CaRotationRole::Node => Self::Node,
+            CaRotationRole::Workload => Self::Workload,
+            CaRotationRole::Ingress => Self::Ingress,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -1745,6 +1793,36 @@ async fn main() -> ExitCode {
                     identity.as_deref(),
                 )
             }
+            CaAction::Rotate {
+                role,
+                root_backup,
+                finalize,
+                passphrase_file,
+                identity,
+            } => {
+                use reliaburger::relish::ca_cmd::PassphraseSource;
+                let role = (*role).into();
+                match (finalize, root_backup) {
+                    (true, _) => reliaburger::relish::ca_cmd::ca_rotate_finalize(role).await,
+                    (false, Some(root_backup)) => {
+                        let passphrase = match passphrase_file {
+                            Some(path) => PassphraseSource::File(path.clone()),
+                            None => PassphraseSource::Prompt,
+                        };
+                        reliaburger::relish::ca_cmd::ca_rotate(
+                            role,
+                            root_backup,
+                            &passphrase,
+                            identity.as_deref(),
+                        )
+                        .await
+                    }
+                    (false, None) => Err(reliaburger::relish::RelishError::InvalidFlag {
+                        flag: "root-backup".to_string(),
+                        reason: "a rotation needs the root backup to sign with".to_string(),
+                    }),
+                }
+            }
         },
         Command::Token { action } => match &action {
             TokenAction::Create {
@@ -2163,6 +2241,67 @@ mod tests {
             ])
             .is_err(),
             "a recipient and a passphrase are two different seals"
+        );
+    }
+
+    #[test]
+    fn ca_rotate_needs_a_root_backup_unless_finalising() {
+        assert!(
+            Cli::try_parse_from(["relish", "ca", "rotate", "--role", "node"]).is_err(),
+            "a rotation is signed with the root backup"
+        );
+        assert!(
+            Cli::try_parse_from(["relish", "ca", "rotate", "--role", "root", "--finalize"])
+                .is_err(),
+            "the root isn't an intermediate"
+        );
+        let cli = Cli::try_parse_from([
+            "relish",
+            "ca",
+            "rotate",
+            "--role",
+            "workload",
+            "--root-backup",
+            "root.age",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Rotate {
+                    role: CaRotationRole::Workload,
+                    root_backup: Some(_),
+                    finalize: false,
+                    ..
+                }
+            })
+        ));
+        let cli = Cli::try_parse_from(["relish", "ca", "rotate", "--role", "node", "--finalize"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Rotate {
+                    role: CaRotationRole::Node,
+                    root_backup: None,
+                    finalize: true,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "ca",
+                "rotate",
+                "--role",
+                "node",
+                "--finalize",
+                "--root-backup",
+                "root.age",
+            ])
+            .is_err(),
+            "finalising signs nothing"
         );
     }
 

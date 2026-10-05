@@ -58,7 +58,7 @@ Root CA (offline after init, signs only intermediate CAs)
                        Lifetime: 5 years. Stored encrypted in Raft.
 ```
 
-The root CA private key is used **only** during `relish init` (and, once it ships, `relish ca rotate --root` — CA rotation is planned, see §5.8). After signing the three intermediates, the root private key is encrypted with the cluster's age public key, written to a sealed backup file on the admin's machine, and deleted from all cluster nodes. No cluster node holds the root CA private key during normal operation.
+The root CA private key is used **only** during `relish init` and on the operator's own machine, when `relish ca rotate` signs a new intermediate from the operator's backup (and, once it ships, `relish ca rotate --root`; see §5.8). After signing the three intermediates, the root private key is encrypted with the cluster's age public key, written to a sealed backup file on the admin's machine, and deleted from all cluster nodes. No cluster node holds the root CA private key during normal operation.
 
 All three intermediate CAs chain to the same root, so a single trust anchor (the root CA certificate) is sufficient for any verifier.
 
@@ -1021,7 +1021,7 @@ On each council node (intended design):
 
 ### 5.8 CA Rotation
 
-> **Status: partly implemented (F04 R1, #362).** The council state can hold
+> **Status: intermediates implemented (F04 R1–R4, #362); root rotation planned.** The council state can hold
 > several CAs per role. Each has a `CaState` (`Active` or `Retiring { until }`);
 > `SecurityState::active_ca(role)` is the one that signs and
 > `trusted_cas(role)` is every one a verifier accepts. Two Raft requests drive
@@ -1050,19 +1050,23 @@ On each council node (intended design):
 >
 > The `relish ca` family has `ca backup` and `ca verify` (F04 R3): an
 > operator-held root backup sealed to a passphrase or an age recipient, checked
-> offline for key match, expiry and fingerprint. There is no `ca rotate` or
-> `ca rotate --root` yet (R4, R5). The flow below is the remaining design.
+> offline for key match, expiry and fingerprint. `ca rotate` rotates an
+> intermediate (F04 R4, below). There is no `ca rotate --root` yet (R5).
 > (Certificate *revocation* via the CRL — §5.7, `RaftRequest::RevokeCertificate`
 > — is separate and does ship.)
 
-**Intermediate CA rotation (`relish ca rotate`) — planned:**
+**Intermediate CA rotation (`relish ca rotate --role node|workload|ingress --root-backup <file>`, F04 R4):**
 
-1. Generate a new intermediate CA keypair (for whichever CA is being rotated, or all three).
-2. Sign the new intermediate with the root CA. (The root CA private key is needed only for this step; it is decrypted from the sealed backup provided by the operator.)
-3. Store the new intermediate CA in Raft alongside the old one.
-4. **Dual-signing period begins:** both old and new intermediate CAs are trusted. The new intermediate is used for all new certificate issuance.
-5. Over time, all existing certificates expire and are re-issued under the new intermediate.
-6. Once all certificates issued by the old intermediate have expired (or been re-issued), the old intermediate is revoked and removed.
+1. **Prepare** (`POST /v1/ca/rotation/prepare {role}`). The leader generates the new P-256 key, wraps it with the master key and proposes `RaftRequest::CaRotationPrepare { role, generation, csr_der, private_key_wrapped }`. Applying it stores a `PendingIntermediate` (one per role; a second prepare replaces the first) and allocates the certificate's serial from `next_serial`, so it can't collide with a revoked serial. Refused for the root, for a role mid-rotation and for a generation other than the active one's plus one. The answer carries the CSR, generation, serial and the active root's fingerprint.
+2. **Sign** (on the operator's machine). `relish` opens the R3 backup, checks its fingerprint against the one the council sent, and signs the CSR with `ca::sign_intermediate_csr`: only the CSR's public key is used; name, path length 0, key usages and five-year lifetime are fixed per role and clamped to the root's validity. The root key never reaches the cluster.
+3. **Begin** (`POST /v1/ca/rotation/begin {role, certificate_b64}`). The leader checks the certificate with `ca_rotation::intermediate_from_signed` (pending CSR for the role, same public key, allocated serial, CA certificate, signed by the active root), builds the `CertificateAuthority` with the pending wrapped key and proposes `CaRotationBegin`, which clears the pending CSR. Both CAs are trusted; new leaves come from the new one.
+4. **Re-issue.**
+   - *Node:* each node's renewal worker checks its replica every 5 s. Once its live identity holds exactly the council's trust set it sends `POST /v1/cluster/trust-ack {node_ca_fingerprints}` (node-to-node, TLS-peer authenticated); the leader refuses unless every trusted Node CA is listed, then proposes `AcknowledgeNodeTrust { node_id, generation }`, which raises `NodeLeafRecord::trust_generation` (never lowers it; a join starts at the active generation). When every live node has acknowledged, nodes renew early (`ca_rotation::early_renewal_due`) one at a time in node-id order, each after every earlier node holds a new-CA leaf, or after its slot (`EARLY_RENEWAL_STAGGER`, 60 s per place from the new CA's issue time) if one is stuck.
+   - *Workload:* leaves renew every 30 minutes, so they move within the hour.
+   - *Ingress:* the resolver reload (R2) re-mints route certificates from the new CA within 5 s.
+5. **Finalise** (`POST /v1/ca/rotation/finalize {role}`, `relish ca rotate --role R --finalize`). For the Node CA, refused while any live (not decommissioned) node hasn't acknowledged the active generation or still has a latest leaf from the retiring CA, naming the nodes. For Workload and Ingress, refused until the retiring window ends (an hour, 90 days). Then the retiring CA is removed.
+
+All three admin routes need an unscoped Admin user (never the service principal) with the cluster-wide `admin` permission, and must reach the leader: a follower answers 421 naming it. Each step records an audit event (`ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`).
 
 **Root CA rotation (`relish ca rotate --root`):**
 

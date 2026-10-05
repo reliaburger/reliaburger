@@ -100,6 +100,55 @@ pub(super) async fn node_renewal_handler(
     }
 }
 
+/// A node acknowledges the council's trust set (F04 R4). Node-to-node only,
+/// authenticated by the node's own TLS client certificate like renewal.
+pub(super) async fn node_trust_ack_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(request): Json<crate::sesame::renewal::TrustAcknowledgement>,
+) -> Response {
+    use crate::sesame::renewal::{RenewalError, acknowledge_trust};
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "a trust acknowledgement requires a TLS client certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        acknowledge_trust(council, &peer, &request),
+    )
+    .await
+    {
+        Ok(Ok(generation)) => Json(serde_json::json!({ "generation": generation })).into_response(),
+        Ok(Err(error)) => {
+            let status = match &error {
+                RenewalError::Identity(_) => StatusCode::FORBIDDEN,
+                RenewalError::Request(_) => StatusCode::CONFLICT,
+                RenewalError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "trust acknowledgement timed out",
+        )
+            .into_response(),
+    }
+}
+
 pub(super) async fn join_handler(
     State(state): State<ApiState>,
     Json(body): Json<crate::sesame::join::JoinRequest>,
