@@ -144,6 +144,8 @@ The recommendations were approved as written:
 
 **Scope:**
 - I1 shipped in 0.1.4 (#473).
-- I2 is on the 0.1.5 train (#483).
-- I3 and I4 are 0.1.5.
-- I5 and I6 come later.
+- I2 shipped in 0.1.5 (#483).
+- I3 is on the 0.1.6 train. As built, the rotation grace is a per-call
+  `--grace-hours` rather than a node setting, and `last_used` stays node-local
+  (decision 2), so the stored token gained only `previous_secret`.
+- I4 follows; I5 and I6 come later.

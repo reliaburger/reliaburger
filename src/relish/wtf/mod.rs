@@ -16,7 +16,8 @@ pub use model::{
     ClusterEvidence, CorrelatedEvent, CouncilObservation, CpuThrottleObservation,
     DeployObservation, DiskObservation, Evidence, FaultObservation, LogObservation,
     NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
-    ServiceObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
+    ServiceObservation, TokenObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary,
+    WtfUnknown,
 };
 
 /// Current serialised `wtf` report contract.

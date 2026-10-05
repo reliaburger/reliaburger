@@ -134,7 +134,7 @@ refuses it the same way
 And 0.1.5: protocol 40 and state format 57. A 0.1.4 cluster's leader refuses
 it the same way
 ([upgrading from 0.1.4](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-014)).
-And 0.1.6: protocol 41 and state format 58. A 0.1.5 cluster's leader refuses
+And 0.1.6: protocol 44 and state format 61. A 0.1.5 cluster's leader refuses
 it the same way
 ([upgrading from 0.1.5](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-015)).
 

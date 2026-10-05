@@ -492,7 +492,7 @@ When a node needs to sign a workload CSR or issue a join certificate, it reads t
 
 ## Token management
 
-API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (Argon2id-hashed before storage), `relish token list` shows active tokens via the `/v1/token/list` endpoint, and `relish token revoke` removes a token via `/v1/token/revoke`.
+API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (Argon2id-hashed before storage), `relish token list` shows active tokens via the `/v1/token/list` endpoint, `relish token rotate` gives one a new secret via `/v1/token/rotate`, and `relish token revoke` removes a token via `/v1/token/revoke`.
 
 `relish token list` used to print `created_at` exactly as the API sent it, Unix seconds, and ignored `expires_at` altogether, so the one thing you most want to know about a CI token (when does it stop working?) was missing. The client now deserialises the response into a typed `TokenSummary` with `expires_at: Option<u64>` instead of poking at a `serde_json::Value`, and the table shows UTC times plus `never`, `(in 30d)` or `(expired)`. The `time` crate, already a dependency for certificate validity windows, does the calendar arithmetic: `OffsetDateTime::from_unix_timestamp` returns a `Result`, because an `i64` of seconds can land outside the years it can represent. The rendering is a pure function of the token list and "now", so an `insta` inline snapshot pins the whole table, and a change in the output shows up as a diff in the test source rather than a vague assertion failure.
 
@@ -525,6 +525,101 @@ The rule that took the most thought is what the sweep must *not* remove. Remembe
 So the sweep keeps the last Admin, even an expired one (the one that expired most recently, if there are several), and it never empties the store, even if there's no Admin left at all. The token it keeps can't authenticate anyone, but its presence keeps the store non-empty, and a non-empty store means the API stays closed. A test pins that from the other side: a store whose every token has expired still answers an anonymous request with `401`.
 
 Each removal is audited like a revoke. The leader records a `token.expired_swept` event per token, with principal `system`, since no person asked for it.
+
+### Rotating a token without an outage
+
+Picture a CI token baked into forty pipelines. It leaked, or it's simply old, and you want a new one. Before rotation existed, the only way was revoke-and-recreate: revoke, and every pipeline fails until someone pastes the new secret into each one. Create the new one first under another name, and now `[permission]` specs, dashboards and runbooks all name the wrong token. Neither is great.
+
+`relish token rotate ci` gives the token a new secret under the same name, and the old secret keeps working for a grace period (24 hours unless you say otherwise). You roll the new secret out, and the old one quietly stops. A leaked secret gets `--grace-hours 0`, which ends it on the spot.
+
+Where does the old secret live for those 24 hours? We considered keeping it as a second token with a hidden name, and dropped the idea: names are unique in the store, revoke and the sweep reason about names, and a hidden twin would have to be taught to every one of them. Instead `ApiToken` grew one optional field:
+
+```rust
+pub struct ApiToken {
+    // ... name, token_hash, token_salt, role, scope, expires_at, created_at
+    #[serde(default)]
+    pub previous_secret: Option<PreviousSecret>,
+}
+
+pub struct PreviousSecret {
+    pub token_hash: Vec<u8>,
+    pub token_salt: Vec<u8>,
+    pub valid_until: SystemTime,
+}
+```
+
+Validation now checks the current hash and then, if there is one, the previous hash, and returns *which* matched:
+
+```rust
+pub enum MatchedSecret {
+    Current,
+    Previous,
+}
+```
+
+The answer matters because of the principal. Back in "When was this token last used?" a token's principal became `token:<sha256 of its hash>`, so that a reused name never inherits anything. Rotation changes the hash, so it changes the principal, and the old secret keeps its own. A dashboard session is keyed by the principal that logged in, so a session opened with the old secret checks the *old* secret's `valid_until` on every request and ends with it. We didn't write any session-ending code for rotation. The identity we chose earlier did the work.
+
+Like the sweep, the rotation is decided before it reaches Raft. The node that takes the request mints the secret, hashes it (on the blocking pool, Argon2 being slow on purpose), reads the clock once and proposes a `RotateApiToken(TokenRotation)` carrying the new hash, the new expiry and the old secret's grace end. The state machine just installs it:
+
+```rust
+pub fn apply_rotation(token: &mut ApiToken, rotation: &TokenRotation) {
+    let old_hash = std::mem::replace(&mut token.token_hash, rotation.token_hash.clone());
+    let old_salt = std::mem::replace(&mut token.token_salt, rotation.token_salt.clone());
+    token.previous_secret = rotation
+        .previous_valid_until
+        .map(|valid_until| PreviousSecret {
+            token_hash: old_hash,
+            token_salt: old_salt,
+            valid_until,
+        });
+    token.created_at = rotation.rotated_at;
+    token.expires_at = rotation.expires_at;
+}
+```
+
+`std::mem::replace` deserves a word if you come from C or Go. In C you'd copy the old pointer out and assign the new one; in Go you'd do the same with a slice header. Rust won't let you simply *move* a field out of a struct you only borrowed (`&mut token`), because for a moment the struct would have a hole in it. `mem::replace` does both halves as one operation: it puts the new value in and hands you the old one, so the struct is never incomplete and the old bytes move into `PreviousSecret` without a copy. Its sibling `mem::take` does the same with the type's default value.
+
+A second rotation replaces the previous secret, so at most two secrets ever work for one token. And unlike a revoke, a rotation may touch the last Admin. The store still has the same Admin afterwards, just with a new secret, so the bootstrap window stays shut.
+
+Two smaller decisions. The new secret gets the same lifetime *length* the old one had, so a 90-day token stays a 90-day token instead of quietly becoming permanent. And the old secret never outlives the old expiry: rotating a token that expires in an hour gives its old secret an hour, not a day. `Option::filter` keeps that tidy:
+
+```rust
+let previous_valid_until = now
+    .checked_add(grace)
+    .map(|until| stored.expires_at.map_or(until, |at| until.min(at)))
+    .filter(|until| *until > now);
+```
+
+`filter` turns `Some(x)` into `None` when the closure says no, so a zero grace, or a token already past its expiry, ends the old secret at once with no special case.
+
+The node that took the request also installs the rotation in its own token store straight away, so the new secret works on the very next request there. The other nodes catch up on their five-second refresh from Raft, and since the old secret keeps working meanwhile, nobody notices the gap.
+
+### A default lifetime, except for Admins
+
+Until now a token without `--ttl-days` lived forever, and forever is the default people actually get. Deployer and ReadOnly tokens now get 90 days unless you pass `--ttl-days` or, deliberately, `--no-expiry`. The node that answers reads the default from `[security.tokens] default_ttl`.
+
+Admin tokens are exempt, and the reason is the same trap the sweep avoids. If every Admin token expires, nobody can create the next one, and the bootstrap window doesn't reopen (the store isn't empty). A default lifetime on Admins would arm that trap for every cluster that forgot a calendar reminder. So Admins don't expire unless you say so, and `relish wtf` nags instead: it warns about an Admin token whose secret is more than 90 days old, and about any token that expires within 14 days. `relish token list` gives the 14-day warning too, on stderr so `-o json` stays parseable.
+
+The config value is a string like `"90d"`, `"12h"` or `"none"`, and we wanted a bad one to fail when the node loads its config, not on the first `token create` a month later. Serde can do that with a newtype:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TokenTtl(pub Option<std::time::Duration>);
+
+impl TryFrom<String> for TokenTtl {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> { /* "90d", "12h", "none" */ }
+}
+```
+
+`try_from = "String"` tells serde to deserialise a plain `String` first and then call our `TryFrom` impl. Its `Err` becomes a deserialisation error that names the field, so `default_ttl = "90"` (no unit) stops the node at startup with a message saying what it expected. The rest of the code only ever sees a parsed `Option<Duration>`.
+
+### A name isn't an identity
+
+`[permission.<name>]` specs are keyed by token name, and that bit us in a quiet way. Revoke `ci` and create a new `ci`, and the new token silently picks up the old spec. Maybe that's what you meant. Maybe it's a different team's token that happens to share a name, now carrying permissions nobody chose for it.
+
+We didn't change the key (specs are written by hand in TOML, and names are what people write). Instead `token create` refuses a name that has a spec and tells you how to proceed: remove or re-apply the spec, or pass `--inherit-permissions` to say "yes, that's what I want". Rotation doesn't ask, because rotation *is* the same token, and its spec following the name is the point.
 
 ## Enforcing what the tokens promise
 
@@ -1437,6 +1532,8 @@ Image signing (`src/pickle/signing.rs`) is the clearest example of testing a sec
 
 The per-instance lifecycle has its own regression suite spread across the layers it touches: `identity_mount_source_is_per_instance_not_per_app` (OCI spec), `two_replicas_of_one_app_get_distinct_identity_dirs_and_keys` (the overwrite bug), `deploy_prepares_and_stop_removes_per_instance_identity_dirs` and `rolling_redeploy_leaves_only_live_instances_identity_dirs` (agent lifecycle), and `adoption_restores_identity_and_rotation_schedule_from_disk` plus `adoption_sweeps_orphaned_identity_dirs` (restart safety). The tmpfs backing itself only shows up under Linux as root, so `identity_dir_is_tmpfs_backed_under_root` self-skips elsewhere and runs in the Lima rig. On the rotation side, the state machine's verify-before-retire behaviour is pinned by `finalize_refused_while_a_secret_is_sealed_under_an_old_generation`, `finalize_succeeds_after_secrets_re_encrypted_under_the_new_generation`, `concurrent_second_rotation_refused_until_finalised`, `same_generation_rotation_retry_is_idempotent`, and the compatibility fixture `legacy_secret_without_generation_metadata_blocks_finalize`; the API tests assert the refusals surface as `409`s.
 
+Token rotation is tested at three layers, and the tests came first. In `sesame/token.rs`, `the_old_secret_works_inside_the_grace_period_and_stops_after_it` drives `validate_token_at` with an injected `now` either side of the grace end, so no test sleeps for a day; `a_second_rotation_ends_the_first_old_secret` and `the_old_secret_never_outlives_the_old_expiry` pin the edges, and `admin_tokens_are_exempt_from_the_default_lifetime` pins decision 6. In `sesame/auth.rs`, `a_session_opened_with_the_old_secret_ends_with_its_grace_period` shows the principal doing the session work. And `bun/api/token_tests.rs` goes through the real router and a one-node council: the old secret works and the new one works at once, a zero-grace rotation ends the old secret *and* its dashboard session, the `[permission]` spec still binds the rotated token, the last Admin can rotate itself, a `token.rotated` event names the caller without ever containing the new secret, a token created without a lifetime gets 90 days, and a name with a spec needs `--inherit-permissions`. On the `wtf` side, `a_token_expiring_within_fourteen_days_is_a_warning` and `an_admin_token_older_than_ninety_days_without_an_expiry_is_a_warning` feed the pure diagnosis engine a fixed snapshot.
+
 ### Integration tests — the lifecycles
 
 Two integration files drive whole features through the library, no running agent required:
@@ -1633,7 +1730,7 @@ Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
 - Images are signed (keyless by the build signer, or with an operator key via `relish sign`) and verified before they deploy
 - SecurityState (CAs, tokens, keypairs, CRL, secret seals) is replicated through Raft
 - The agent provisions identity during deploy and rotates certificates every 30 minutes
-- API tokens are managed via `relish token list/revoke`
+- API tokens are managed via `relish token create/list/rotate/revoke`; Deployer and ReadOnly tokens live 90 days by default, and a rotation keeps the old secret working for a grace period
 - Secret keys rotate with a dual-key transition window, one rotation at a time, and finalise verifies every stored secret is re-sealed before the old key is retired
 - The CRL tracks revoked certificates
 - Egress DNS re-resolves asynchronously

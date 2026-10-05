@@ -61,9 +61,11 @@ pub struct Compatibility {
 /// `GET /v1/cluster/ca`, the workload CA bundle in a signing answer
 /// (`WorkloadCsrResponse::ca_bundle_der`), and the trust set in a node's
 /// identity snapshot (`node.bundle.json` schema 3) (F04 R2, #362).
+/// API token rotation: `RaftRequest::RotateApiToken` and each stored token's
+/// `ApiToken::previous_secret`, the old secret during its grace period (F05 I3).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 43,
-    state: 60,
+    protocol: 44,
+    state: 61,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

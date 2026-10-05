@@ -298,6 +298,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // node fan-out asking a peer for its last-use times (F05 I2).
     gated(Get, "/v1/token/list", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/token/rotate", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
     route(Get, "/v1/secret/public-key", AnyToken),
     gated(Post, "/v1/secret/rotate", Admin, Cluster(SECRET_WRITE)),
@@ -871,6 +872,7 @@ mod tests {
         for handler in [
             "token_create_handler",
             "token_revoke_handler",
+            "token_rotate_handler",
             "join_token_create_handler",
             "secret_rotate_handler",
         ] {
