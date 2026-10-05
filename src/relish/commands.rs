@@ -679,10 +679,10 @@ pub(super) fn node_identity_from_init(
     use crate::sesame::types::CaRole;
 
     let state = &init_result.security_state;
-    let node_ca = state.get_ca(CaRole::Node).ok_or_else(|| {
+    let node_ca = state.active_ca(CaRole::Node).ok_or_else(|| {
         RelishError::InitFailed("security state is missing the Node CA".to_string())
     })?;
-    let root_ca = state.get_ca(CaRole::Root).ok_or_else(|| {
+    let root_ca = state.active_ca(CaRole::Root).ok_or_else(|| {
         RelishError::InitFailed("security state is missing the root CA".to_string())
     })?;
 

@@ -53,9 +53,12 @@ pub struct Compatibility {
 /// Per-namespace secret keys: `NamespaceSpec::secret_key` and the values a
 /// namespace's first key re-seals (`RaftRequest::RotateSecretKey::resealed`)
 /// (F05 I4, #363).
+/// Several CAs per role: each CA's `CaState`, the node leaf records
+/// (`SecurityState::node_leaves`) and the `CaRotationBegin` and
+/// `CaRotationFinalize` Raft requests (F04 R1, #362).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 41,
-    state: 58,
+    protocol: 42,
+    state: 59,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

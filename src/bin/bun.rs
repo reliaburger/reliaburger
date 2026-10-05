@@ -558,7 +558,7 @@ async fn build_ingress_cert_resolver(
 
     let ikm = council.wrapping_ikm()?;
     let state = council.security_state().await;
-    let ingress_ca = state.get_ca(CaRole::Ingress)?;
+    let ingress_ca = state.active_ca(CaRole::Ingress)?;
     let (keypair, params) = match reliaburger::sesame::ca::ca_signing_material(ingress_ca, ikm) {
         Ok(material) => material,
         Err(e) => {

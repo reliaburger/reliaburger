@@ -359,7 +359,12 @@ async fn renewal_refuses_revoked_node_and_root_issuers() {
     for role in [CaRole::Node, CaRole::Root] {
         let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
         let council = council(&hierarchy, true).await;
-        let issuer_serial = council.security_state().await.get_ca(role).unwrap().serial;
+        let issuer_serial = council
+            .security_state()
+            .await
+            .active_ca(role)
+            .unwrap()
+            .serial;
         council
             .write(RaftRequest::RevokeCertificate(CrlEntry {
                 serial: issuer_serial,
@@ -1052,7 +1057,7 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
         bootstrap::load_master_key(node.security.master_key_path.as_ref().unwrap()).unwrap();
     let state =
         bootstrap::load_bootstrap_state(node.security.bootstrap_path.as_ref().unwrap()).unwrap();
-    let issuer = state.get_ca(CaRole::Node).unwrap();
+    let issuer = state.active_ca(CaRole::Node).unwrap();
     let ca_key = rustls::pki_types::PrivateKeyDer::try_from(
         crypto::unwrap_key(&master, issuer.private_key_wrapped.as_ref().unwrap()).unwrap(),
     )

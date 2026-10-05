@@ -1029,6 +1029,81 @@ We checked the fallback tests the cheap way: put the old "namespace keys, then c
 
 `RotateSecretKey` grew a field and `NamespaceSpec` a flag, both in the Raft log and the snapshot, so the protocol and state generations in `src/compatibility.rs` went up by one each.
 
+## Rotating a CA, part one: room for two
+
+Secret rotation had a head start. `age_keypairs` was always a vector, so holding two keys for a while was a matter of marking one read-only. The CAs weren't so lucky. `SecurityState` stored them in a `Vec` too, but every reader asked for "the" CA of a role:
+
+```rust
+pub fn get_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
+    self.certificate_authorities.iter().find(|ca| ca.role == role)
+}
+```
+
+Push a second Node CA into that vector and `find` returns whichever happens to come first. Which one signs a node's renewal? Whichever one `push` left in front. That's the bug secret rotation had in its first version, and we weren't going to write it twice.
+
+So a CA now knows where it stands:
+
+```rust
+pub enum CaState {
+    Active,
+    Retiring { until: SystemTime },
+}
+```
+
+`Retiring` is an enum variant that carries a named field, like a tagged union in C where the compiler checks the tag for you. You can't read `until` off a CA without first matching that it *is* retiring, so there's no "expiry time of an active CA" for a careless caller to misread. `get_ca` is gone. In its place are two questions with different answers:
+
+- `active_ca(role)` is the CA that signs: the newest `Active` one of the role.
+- `trusted_cas(role)` is every CA a verifier should accept, active first, then any that are retiring.
+
+```rust
+cas.sort_by_key(|ca| (ca.state != CaState::Active, std::cmp::Reverse(ca.generation)));
+```
+
+Rust compares tuples field by field and `false` sorts before `true`, so the active CA leads and the retiring ones follow, newest first. `Reverse` flips the ordering of the value it wraps (we met it in chapter 1, turning a max-heap into a min-heap).
+
+Removing `get_ca` was the point. Every caller had to choose, and the compiler listed all of them. A signer asks `active_ca`. A verifier will ask `trusted_cas`, once it can hold more than one (that's the next step, and the larger one).
+
+### Two log entries, same shape as secrets
+
+Rotation is two `RaftRequest`s, appended to the end of the enum like every new variant:
+
+```rust
+CaRotationBegin { role: CaRole, ca: Box<CertificateAuthority> },
+CaRotationFinalize { role: CaRole, now_unix_ms: u64 },
+```
+
+The rules sit in `src/sesame/ca_rotation.rs` as plain functions over `&mut SecurityState`, and the state machine turns their errors into `CouncilResponse::Refused`. Begin checks, in order:
+
+1. The role isn't the root. Rotating the root needs cross-signing and a new join fingerprint, and it's a later step of the plan.
+2. A CA of the same role and generation already exists? Then this is a retried proposal, and it changes nothing. That's the idempotence rule from `RotateSecretKey`: the first-applied entry wins.
+3. A retiring CA of the role already exists? Refused. One rotation per role at a time, because a third generation stacked on an unfinished second multiplies the ways to strand a node.
+4. The new CA is exactly one generation newer than the active one, carries its wrapped key (the council has to sign with it), and is signed by the active root. The state machine checks the signature itself, so a proposal can't slip in a CA that nothing would trust.
+
+Then the old CA becomes `Retiring { until }`. When is `until`? The longest a leaf it signed could live: a year for Node, 90 days for Ingress, an hour for Workload. We count from the new CA's `not_before` (plus the five-minute backdate every certificate gets), not from `SystemTime::now()`. A Raft entry is applied on every replica, at different moments, and a clock read inside apply would give each one a different `until`. The certificate travels in the log, so its timestamp is the same everywhere.
+
+The same reasoning is why finalise carries `now_unix_ms`. The plan wrote it as `CaRotationFinalize { role }`, but finalise has to ask "has the window ended?", and a state machine that answers that from its own clock diverges. The proposer reads the clock once and the log carries the answer, exactly as `SweepExpiredApiTokens` does.
+
+### Who still depends on the old CA?
+
+Finalise drops the retiring CA, so it has to know that nothing still chains to it. For secrets we recorded the sealing generation at write time, because that's the only moment it's knowable. The Node CA has the same problem with the same answer.
+
+Every node leaf gets its serial from a Raft entry, `ConsumeJoinTokenForIssue` on join or `AllocateNodeSerial` on renewal. So applying either now records the node's latest leaf:
+
+```rust
+pub struct NodeLeafRecord {
+    pub serial: SerialNumber,
+    pub ca_generation: u64,
+}
+```
+
+`ca_generation` is the Node CA that's active when the serial is allocated. The signer reads the council state *after* that commit, so it signs with that CA, or with a newer one if a rotation begins in between. The record can be too old, never too new, and too old only delays finalise. The first node's leaf is the exception: `relish init` signs it without a council, so init writes its record by hand.
+
+Finalise for the Node CA is then a filter: any node whose latest leaf has the retiring generation (or an older one) and isn't decommissioned blocks it, by name. Workload and ingress leaves aren't recorded one by one (a workload renews every half hour, and ingress serials are random), so for those roles finalise waits for `until`. Once `until` passes, it doesn't matter what the records say: every leaf the old CA could have signed has expired.
+
+Is a record proof that the node *installed* its new leaf? No. A renewal whose answer is lost leaves a record that's newer than the leaf on disk. The node retries, because it still needs the leaf, and the operator-facing rotation (the plan's R4) adds an acknowledgement from every node before it finalises.
+
+The tests in `ca_rotation.rs` pin each rule: the generation goes from 0 to 1, a retried begin is a no-op, a stacked rotation is refused and leaves the state untouched while another role rotates freely, a CA from a different root is refused, and finalise is refused while `node-b` still holds its old leaf, then passes once its renewal is allocated. `ca_rotation_through_the_log_waits_for_every_node_leaf` in the state machine drives the same story through real log entries.
+
 ## Certificate revocation
 
 Sometimes you need to revoke a certificate before it expires. A node gets compromised, a workload's key leaks, or you rotate a CA. The Certificate Revocation List (CRL) tracks which serial numbers are no longer trusted.

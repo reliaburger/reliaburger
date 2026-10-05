@@ -391,7 +391,7 @@ pub fn sign_join_csr(
     if state.crl.retired_nodes.contains_key(node_id) {
         return Err(JoinError::NodeRetired);
     }
-    let node_ca = state.get_ca(CaRole::Node).ok_or(JoinError::NoNodeCa)?;
+    let node_ca = state.active_ca(CaRole::Node).ok_or(JoinError::NoNodeCa)?;
     let wrapped_key = node_ca
         .private_key_wrapped
         .clone()
@@ -399,7 +399,7 @@ pub fn sign_join_csr(
     let node_ca_generation = node_ca.generation;
     let node_ca_der = node_ca.certificate_der.clone();
     let root_ca_der = state
-        .get_ca(CaRole::Root)
+        .active_ca(CaRole::Root)
         .map(|ca| ca.certificate_der.clone())
         .unwrap_or_default();
 
@@ -525,6 +525,7 @@ mod tests {
             oidc_signing_config: None,
             crl: super::super::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
+            node_leaves: std::collections::BTreeMap::new(),
         };
 
         (state, token_plaintext, master_secret)
