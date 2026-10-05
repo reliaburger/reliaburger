@@ -149,6 +149,7 @@ mod tests {
             scope: TokenScope::default(),
             expires_at,
             created_at: SystemTime::UNIX_EPOCH,
+            previous_secret: None,
         }
     }
 

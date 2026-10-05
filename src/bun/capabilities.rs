@@ -93,6 +93,10 @@ pub struct StaticCapabilities {
     pub diagnostics: crate::bun::diagnostics::DiagnosticStaticEvidence,
     /// Server-owned diagnostic policy. A client can inspect but not expand it.
     pub test_policy: crate::testkit::safety::ClusterTestPolicy,
+    /// `[security.tokens]`: the lifetime this node gives a new API token
+    /// that names none. Not reported as a capability; it rides here because,
+    /// like `test_policy`, only the startup path knows it.
+    pub token_lifetime: crate::sesame::token::TokenLifetimePolicy,
 }
 
 /// The subsystems whose presence shows up as `Some(..)` on `ApiState`.

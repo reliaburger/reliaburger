@@ -52,8 +52,9 @@ through a port forward that arrives on the node's loopback.
 ## API tokens
 
 ```sh
-relish token create --name ci-deploy --role deployer --namespaces shop --ttl-days 90
+relish token create --name ci-deploy --role deployer --namespaces shop
 relish token list      # name, role, times (UTC), last use and scope
+relish token rotate ci-deploy
 relish token revoke ci-deploy
 ```
 
@@ -72,10 +73,55 @@ tokens and join tokens, rotate secrets, sign images, decommission nodes, clear
 every fault, or apply `[namespace]` and `[permission]` declarations.
 
 `create` prints the plaintext token once, on stdout, and the cluster keeps
-only a hash, so `TOKEN="$(relish token create ...)"` captures it. Tokens don't
-expire unless you give `--ttl-days`. `revoke` refuses to remove the last admin
-token; create its replacement first. Revoking a token, or letting it expire,
-also ends every dashboard session that was logged in with it.
+only a hash, so `TOKEN="$(relish token create ...)"` captures it. Its expiry
+goes to stderr. `revoke` refuses to remove the last admin token; create its
+replacement first. Revoking a token, or letting it expire, also ends every
+dashboard session that was logged in with it.
+
+### Lifetimes
+
+Deployer and read-only tokens live **90 days** unless you say otherwise:
+
+- `--ttl-days 30` gives a token 30 days instead;
+- `--no-expiry` gives it none, which you have to ask for by name;
+- admin tokens get no default expiry, because a cluster whose every admin
+  token had expired would have nobody left to create the next one.
+
+The default comes from the node that answers the `create`, in its config:
+
+```toml
+[security.tokens]
+default_ttl = "90d"   # or "12h", or "none" for no default
+```
+
+`relish token list` warns on stderr about every token that has expired or
+expires within 14 days, with the `rotate` command to run. `relish wtf` raises
+the same warning, and also warns about an admin token whose secret is more
+than 90 days old.
+
+### Rotation
+
+```sh
+relish token rotate ci-deploy                  # old secret works for 24 hours
+relish token rotate ci-deploy --grace-hours 2
+relish token rotate ci-deploy --grace-hours 0  # a leaked secret: stop it now
+```
+
+`rotate` gives the token a new secret under the same name and prints it once,
+on stdout. The new secret works at once on the node you asked, and on the
+others within five seconds. The old one keeps working until the end of the
+grace period (stderr says when), so you can roll the new secret out to every
+client before the old one stops. After that, the old secret gets
+`401 token rotated`.
+
+What stays with the name: the role, the scope, any `[permission]` spec, and
+the lifetime (a 90-day token gets a fresh 90 days). What doesn't: dashboard
+sessions logged in with the old secret end when it does, and audit events and
+last use name each secret by its own `principal`. You can rotate the last
+admin token; the cluster keeps the same admin, with a new secret. Rotating
+twice in a row ends the first secret at the second rotation, so at most two
+secrets ever work. Each rotation leaves a `token.rotated` event with the
+caller and the end of the grace period.
 
 `relish token list` shows, for each token, its role, when it was created, when
 it expires (`never`, `(in 30d)` or `(expired)`), when it was **last used** and
@@ -108,8 +154,8 @@ empty store is the bootstrap window: the API lets everyone in so the first
 token can be created. If every admin token has expired, the one that expired
 most recently stays: still refused, but present, so the API stays closed.
 Expiry alone can lock you out of token management, sweep or no sweep, so keep
-one admin token without `--ttl-days`, or mint the next admin token before the
-current one lapses. With no admin token at all, the most recently expired
+one admin token without an expiry (the default for admins), or mint the next
+admin token before the current one lapses. With no admin token at all, the most recently expired
 token stays. A store whose every token has expired is
 not empty, so it keeps refusing anonymous requests.
 
@@ -152,7 +198,23 @@ A browser session keeps its token's permissions. Nodes talking to each other
 use the cluster's internal identity, which no block can restrict, so
 `relish logs` and `relish top` still gather every node's answer; the
 node you asked filters it. `relish wtf` reads health, membership and
-diagnostics, none of which a permission block gates.
+diagnostics, none of which a permission block gates. Its token check reads
+`token list`, which needs an unscoped admin; with any other credential `wtf`
+reports token lifetimes as unknown.
+
+A block belongs to a token *name*, so it outlives the token. Revoke `ci-deploy`
+and create a new `ci-deploy`, and the new token would quietly pick up the old
+block. `relish token create` refuses that:
+
+```text
+a [permission.ci-deploy] spec exists, and a token named "ci-deploy" would
+inherit it; pass --inherit-permissions to accept that, or remove or re-apply
+the spec first
+```
+
+Pass `--inherit-permissions` when the new token should have that block.
+`relish token rotate` doesn't ask: rotating keeps the same token, so its block
+stays.
 
 Take care putting a block on an admin token. Leave out `admin` and that token
 loses token management and upgrades. Keep at least one admin token with no

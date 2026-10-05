@@ -343,9 +343,93 @@ pub struct SecuritySection {
     /// the council leader for node renewals, the signing member for joins,
     /// each node for its own ingress leaves.
     pub leaf_lifetime_override_secs: Option<u64>,
+
+    /// API token defaults (`[security.tokens]`).
+    pub tokens: TokensSection,
+}
+
+/// API token defaults (`[security.tokens]`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokensSection {
+    /// The lifetime of a Deployer or ReadOnly token created without
+    /// `--ttl-days` or `--no-expiry`: `"90d"`, `"12h"`, or `"none"` for no
+    /// default. Admin tokens never get one. Default `"90d"`.
+    pub default_ttl: TokenTtl,
+}
+
+/// A default token lifetime as `[security.tokens] default_ttl` spells it.
+///
+/// `#[serde(try_from = "String")]` makes serde read the TOML value as a
+/// `String` and then call our `TryFrom` impl, so a bad value fails the
+/// config load with its field named, instead of surfacing at the first
+/// `relish token create`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TokenTtl(pub Option<std::time::Duration>);
+
+impl Default for TokenTtl {
+    fn default() -> Self {
+        Self(Some(crate::sesame::token::DEFAULT_TOKEN_TTL))
+    }
+}
+
+impl TryFrom<String> for TokenTtl {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value == "none" {
+            return Ok(Self(None));
+        }
+        let invalid = || {
+            format!(
+                "default_ttl {value:?} is not a positive number of days (\"90d\") \
+                 or hours (\"12h\"), or \"none\""
+            )
+        };
+        let (count, unit_seconds) = if let Some(days) = value.strip_suffix('d') {
+            (days, 86_400)
+        } else if let Some(hours) = value.strip_suffix('h') {
+            (hours, 3_600)
+        } else {
+            return Err(invalid());
+        };
+        let seconds = count
+            .parse::<u64>()
+            .ok()
+            .filter(|count| *count > 0)
+            .and_then(|count| count.checked_mul(unit_seconds))
+            // A lifetime past the year 2^64 seconds can't be added to now.
+            .filter(|seconds| {
+                std::time::SystemTime::now()
+                    .checked_add(std::time::Duration::from_secs(*seconds))
+                    .is_some()
+            })
+            .ok_or_else(invalid)?;
+        Ok(Self(Some(std::time::Duration::from_secs(seconds))))
+    }
+}
+
+impl From<TokenTtl> for String {
+    fn from(ttl: TokenTtl) -> Self {
+        match ttl.0 {
+            None => "none".to_string(),
+            Some(lifetime) if lifetime.as_secs().is_multiple_of(86_400) => {
+                format!("{}d", lifetime.as_secs() / 86_400)
+            }
+            Some(lifetime) => format!("{}h", lifetime.as_secs().div_ceil(3_600)),
+        }
+    }
 }
 
 impl SecuritySection {
+    /// The lifetime this node gives a new token that names none.
+    pub fn token_lifetime(&self) -> crate::sesame::token::TokenLifetimePolicy {
+        crate::sesame::token::TokenLifetimePolicy {
+            default_ttl: self.tokens.default_ttl.0,
+        }
+    }
+
     /// Lifetime of node leaves this member signs (joins and renewals).
     pub fn node_leaf_lifetime(&self) -> std::time::Duration {
         self.shortened(crate::sesame::ca::NODE_LEAF_LIFETIME)
@@ -1073,6 +1157,38 @@ mod tests {
             error.to_string().contains("without a scheme or path"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn token_default_ttl_is_ninety_days_unless_configured() {
+        let day = std::time::Duration::from_secs(86_400);
+        assert_eq!(
+            NodeConfig::parse("").unwrap().security.token_lifetime(),
+            crate::sesame::token::TokenLifetimePolicy {
+                default_ttl: Some(90 * day)
+            }
+        );
+        let config = NodeConfig::parse("[security.tokens]\ndefault_ttl = \"30d\"\n").unwrap();
+        assert_eq!(config.security.token_lifetime().default_ttl, Some(30 * day));
+        let config = NodeConfig::parse("[security.tokens]\ndefault_ttl = \"12h\"\n").unwrap();
+        assert_eq!(
+            config.security.token_lifetime().default_ttl,
+            Some(std::time::Duration::from_secs(12 * 3_600))
+        );
+        let config = NodeConfig::parse("[security.tokens]\ndefault_ttl = \"none\"\n").unwrap();
+        assert_eq!(config.security.token_lifetime().default_ttl, None);
+    }
+
+    #[test]
+    fn token_default_ttl_refuses_zero_unitless_and_overflowing_values() {
+        for value in ["0d", "90", "ninety", "-1d", "99999999999999999d", ""] {
+            let toml = format!("[security.tokens]\ndefault_ttl = \"{value}\"\n");
+            let error = NodeConfig::parse(&toml).unwrap_err();
+            assert!(
+                error.to_string().contains("default_ttl"),
+                "{value}: {error}"
+            );
+        }
     }
 
     #[test]

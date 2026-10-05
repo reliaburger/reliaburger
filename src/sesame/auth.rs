@@ -176,31 +176,24 @@ fn extract_bearer(header_value: &str) -> Option<&str> {
 /// Authenticate a request by validating the Bearer token.
 ///
 /// Returns the `AuthContext` if the token is valid, or an HTTP error response.
+/// A token's old secret, inside the grace period after `relish token rotate`,
+/// authenticates as the same token but as its own principal (F05 I3).
 pub fn authenticate(
     plaintext_token: &str,
     tokens: &[ApiToken],
 ) -> Result<AuthContext, (StatusCode, String)> {
-    // Try to find a matching token. If the hash matches but the token
-    // is expired, we want to report "expired" specifically.
-    let stored = match token::find_valid_token(plaintext_token, tokens) {
-        Ok(t) => t,
-        Err(_) => {
-            // Check if any token's hash matches but is expired
-            for t in tokens {
-                // If the hash matches (ignoring expiry), it's an expired token
-                if let Some(expires) = t.expires_at
-                    && std::time::SystemTime::now() > expires
-                {
-                    // Could be this token — check hash by creating temp non-expired copy
-                    let mut temp = t.clone();
-                    temp.expires_at = None;
-                    if token::validate_token(plaintext_token, &temp).is_ok() {
-                        return Err((StatusCode::UNAUTHORIZED, "token expired".to_string()));
-                    }
-                }
-            }
-            return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    let (stored, matched) = match token::find_valid_token(plaintext_token, tokens) {
+        Ok(found) => found,
+        Err(token::TokenError::Expired) => {
+            return Err((StatusCode::UNAUTHORIZED, "token expired".to_string()));
         }
+        Err(token::TokenError::Rotated) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "token rotated: this secret has stopped working".to_string(),
+            ));
+        }
+        Err(_) => return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string())),
     };
 
     // Defence in depth (AUTH4): the system principal is a side-channel
@@ -213,38 +206,67 @@ pub fn authenticate(
         return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
     }
 
+    let principal_id = match (matched, &stored.previous_secret) {
+        (token::MatchedSecret::Previous, Some(previous)) => {
+            principal_for_hash(&previous.token_hash)
+        }
+        _ => token_principal_id(stored),
+    };
     Ok(AuthContext {
         token_name: stored.name.clone(),
-        principal_id: token_principal_id(stored),
+        principal_id,
         role: stored.role,
         scoped_apps: stored.scope.apps.clone(),
         scoped_namespaces: stored.scope.namespaces.clone(),
     })
 }
 
-/// The stable principal id for a stored token: a digest of its hash, so it
-/// names this exact credential rather than its (reusable) name.
+/// The stable principal id for a stored token's current secret: a digest of
+/// its hash, so it names this exact credential rather than its (reusable)
+/// name. A rotation changes it.
 pub(crate) fn token_principal_id(token: &ApiToken) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, &token.token_hash);
+    principal_for_hash(&token.token_hash)
+}
+
+/// The principal id of the secret behind an Argon2id hash.
+fn principal_for_hash(token_hash: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, token_hash);
     format!("token:{}", hex::encode(digest.as_ref()))
 }
 
-/// The stored token that `principal_id` names, if it is still in the store.
-///
-/// The lifetime `'a` says the returned reference borrows from `tokens`, so it
-/// can't outlive the snapshot it was found in.
-pub(crate) fn find_token_by_principal<'a>(
-    principal_id: &str,
-    tokens: &'a [ApiToken],
-) -> Option<&'a ApiToken> {
-    tokens
-        .iter()
-        .find(|token| token_principal_id(token) == principal_id)
+/// A stored token secret, found by its principal id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Credential {
+    /// When the secret stops working: the token's expiry for its current
+    /// secret, the end of the grace period for an old one.
+    pub valid_until: Option<std::time::SystemTime>,
+}
+
+/// The stored secret that `principal_id` names, if it is still in the store:
+/// a token's current secret, or its old one during the grace period after a
+/// rotation.
+pub(crate) fn find_credential(principal_id: &str, tokens: &[ApiToken]) -> Option<Credential> {
+    tokens.iter().find_map(|token| {
+        if token_principal_id(token) == principal_id {
+            return Some(Credential {
+                valid_until: token.expires_at,
+            });
+        }
+        token
+            .previous_secret
+            .as_ref()
+            .filter(|previous| principal_for_hash(&previous.token_hash) == principal_id)
+            .map(|previous| Credential {
+                valid_until: Some(previous.valid_until),
+            })
+    })
 }
 
 /// Whether the credential a browser session was created from still stands
-/// (B11): the exact token must still be in the store and unexpired. A session
-/// from the internal service token holds while that token is configured.
+/// (B11): the exact secret must still be in the store and working. A session
+/// opened with a token's old secret ends when its grace period does. A
+/// session from the internal service token holds while that token is
+/// configured.
 fn session_credential_is_live(
     identity: &super::session::SessionIdentity,
     tokens: &[ApiToken],
@@ -254,10 +276,9 @@ fn session_credential_is_live(
         return service_token_configured;
     }
     let now = std::time::SystemTime::now();
-    find_token_by_principal(&identity.principal_id, tokens)
-        .is_some_and(|token| token.expires_at.is_none_or(|at| now < at))
+    find_credential(&identity.principal_id, tokens)
+        .is_some_and(|credential| credential.valid_until.is_none_or(|at| now < at))
 }
-
 /// Authenticate a bearer without holding the token-store lock (AUTH5).
 ///
 /// Takes ownership of a cloned token list (the caller already released the
@@ -805,6 +826,79 @@ mod tests {
         let err = authenticate(&created.plaintext, &tokens).unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert!(err.1.contains("expired"));
+    }
+
+    /// `created` rotated now with `grace`: the new plaintext and the token.
+    fn rotate(created: &crate::sesame::token::CreatedToken, grace: Duration) -> (String, ApiToken) {
+        let rotation =
+            crate::sesame::token::rotate_token(&created.token, SystemTime::now(), grace).unwrap();
+        let mut token = created.token.clone();
+        crate::sesame::token::apply_rotation(&mut token, &rotation.rotation);
+        (rotation.plaintext, token)
+    }
+
+    /// F05 I3: the old secret is its own principal, so what it opened
+    /// (sessions, last use) ends with it rather than following the name.
+    #[test]
+    fn the_old_secret_authenticates_as_its_own_principal_during_the_grace_period() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let (new_secret, token) = rotate(&created, Duration::from_secs(3_600));
+        let tokens = vec![token.clone()];
+
+        let old = authenticate(&created.plaintext, &tokens).unwrap();
+        let new = authenticate(&new_secret, &tokens).unwrap();
+        assert_eq!(old.token_name, "ci");
+        assert_eq!(new.token_name, "ci");
+        assert_eq!(old.principal_id, token_principal_id(&created.token));
+        assert_eq!(new.principal_id, token_principal_id(&token));
+        assert_ne!(old.principal_id, new.principal_id);
+    }
+
+    #[test]
+    fn an_old_secret_past_its_grace_period_gets_401_saying_it_was_rotated() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let (_, mut token) = rotate(&created, Duration::from_secs(3_600));
+        if let Some(previous) = token.previous_secret.as_mut() {
+            previous.valid_until = SystemTime::now() - Duration::from_secs(1);
+        }
+        let err = authenticate(&created.plaintext, &[token]).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert!(err.1.contains("rotated"), "{}", err.1);
+    }
+
+    #[tokio::test]
+    async fn a_session_opened_with_the_old_secret_ends_with_its_grace_period() {
+        let created = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let (_, token) = rotate(&created, Duration::from_secs(3_600));
+        let store = new_token_store();
+        store.write().await.push(token);
+        let state = AuthState::new(store.clone(), None);
+        // The login handler keys a session by the principal that logged in.
+        let identity = super::super::session::SessionIdentity {
+            token_name: "u".to_string(),
+            principal_id: token_principal_id(&created.token),
+            scope: TokenScope::default(),
+        };
+        let id = state.sessions.create(identity, None).await.id;
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::OK);
+
+        if let Some(previous) = store.write().await[0].previous_secret.as_mut() {
+            previous.valid_until = SystemTime::now() - Duration::from_secs(1);
+        }
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::UNAUTHORIZED);
+        assert!(state.sessions.validate(&id).await.is_none());
+    }
+
+    #[test]
+    fn credential_validity_is_the_grace_end_for_an_old_secret() {
+        let created = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let (_, token) = rotate(&created, Duration::from_secs(3_600));
+        let grace_end = token.previous_secret.as_ref().map(|p| p.valid_until);
+        let tokens = [token.clone()];
+        let old = find_credential(&token_principal_id(&created.token), &tokens).unwrap();
+        assert_eq!(old.valid_until, grace_end);
+        let new = find_credential(&token_principal_id(&token), &tokens).unwrap();
+        assert_eq!(new.valid_until, None);
     }
 
     #[test]

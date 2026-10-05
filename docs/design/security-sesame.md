@@ -22,7 +22,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 1. **Zero-configuration security (target).** A fresh cluster should have mTLS between all nodes, workload identity for all apps, namespace isolation, deny-by-default egress, and encrypted Raft logs. The current egress implementation is narrower: a declared `[app.NAME.egress]` allowlist is deny-by-default and fail-closed, but an app with no block still has unrestricted egress. A cluster-wide default policy remains planned.
 2. **Separation of privilege (target — see the note below).** The intended model is that worker nodes never hold CA private keys and can only obtain certificates for workloads they are scheduled to run. **The current implementation does not yet enforce this key split:** every clustered node loads the same cluster master key and its bootstrap security state, from which it can locally unwrap the age private key, the intermediate CA private keys, and the OIDC signing key (see §3.2). A genuine council/worker key separation is planned, not shipped.
 3. **Data plane survives control plane failures.** Existing certificates, firewall rules, and secrets continue working during council outages. Grace period extensions prevent hard cliffs.
-4. **Short-lived credentials by default (workloads).** Workload certificates live 1 hour, rotated every 30 minutes — this is shipped. **API tokens are the exception:** `relish token create --ttl-days` is optional and has **no default**, so a token created without it **never expires**. A built-in 90-day default and a `token rotate` command are planned, not shipped (see §5.4). Short lifetimes reduce the blast radius of credential theft.
+4. **Short-lived credentials by default.** Workload certificates live 1 hour, rotated every 30 minutes. Deployer and ReadOnly API tokens live 90 days unless created with `--ttl-days` or `--no-expiry`, and `relish token rotate` replaces a secret with a 24-hour overlap (§5.4). Admin tokens are the exception: they get no default expiry, so the cluster can't lock itself out, and `relish wtf` warns about old ones. Short lifetimes reduce the blast radius of credential theft.
 
 ---
 
@@ -399,12 +399,13 @@ pub struct ApiToken {
     /// Optional scope restrictions.
     pub scope: TokenScope,
 
-    /// When the token expires. In the shipped store this is
-    /// `Option<SystemTime>`: `None` means the token never expires. There is
-    /// no default TTL applied at creation (§5.4) — the "90 days" is planned.
+    /// When the token expires; `None` means never. A Deployer or ReadOnly
+    /// token created without `--ttl-days` or `--no-expiry` gets the node's
+    /// `[security.tokens] default_ttl` (90 days); Admin tokens get none (§5.4).
     pub expires_at: Option<SystemTime>,
 
-    /// When the token was created.
+    /// When the token's current secret was issued (creation, then each
+    /// rotation).
     pub created_at: SystemTime,
 
     /// Last time the token was used. Shipped, but *not* stored here: each
@@ -416,9 +417,8 @@ pub struct ApiToken {
     /// Per-token rate limit (requests per second). Default: 100.
     pub rate_limit_rps: u32,
 
-    /// If this token is being rotated, the old token hash that is still
-    /// valid during the grace period. (Planned — there is no `token rotate`
-    /// command or rotation-grace flow yet; see §5.4.)
+    /// After `relish token rotate`, the old secret while it is still
+    /// accepted (shipped as `previous_secret: Option<PreviousSecret>`, §5.4).
     pub rotation_grace: Option<RotationGrace>,
 }
 
@@ -442,7 +442,8 @@ pub struct TokenScope {
     pub actions: Option<Vec<String>>,
 }
 
-/// Grace period state during token rotation.
+/// Grace period state during token rotation (shipped as
+/// `sesame::types::PreviousSecret { token_hash, token_salt, valid_until }`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationGrace {
     /// Hash of the old token that is still accepted.
@@ -869,20 +870,31 @@ Bun on each worker node maintains a rotation schedule for every running workload
 
 ```bash
 $ relish token create --name ci-deploy --role deployer \
-    --apps "web,api" --namespaces "production" --ttl-days 90
+    --apps "web,api" --namespaces "production" --ttl-days 30
 ```
 
 1. Generate a 256-bit cryptographically random token secret.
 2. Hash the secret with Argon2id (salt generated per-token).
 3. Store the hash, salt, role, scope, and expiry in Raft.
-4. Return the plaintext token to the user. It is never stored in plaintext.
+4. Return the plaintext token to the user, with its expiry. It is never stored
+   in plaintext.
 
-**Expiry is opt-in, with no default.** `--ttl-days` is optional; the stored
-`expires_at` is `Option<SystemTime>`, and when it is `None` the token **never
-expires**. Authentication only rejects a token once a *set* expiry has passed.
-A built-in default TTL (the "90 days" the config sketch mentions) is planned but
-not applied today, so a token created without `--ttl-days` is effectively
-permanent until explicitly revoked.
+**Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
+ReadOnly token expires after the answering node's `[security.tokens]
+default_ttl` (`"90d"` by default; `"12h"`-style hours and `"none"` are
+accepted, and a bad value fails config load). `--no-expiry` opts out
+explicitly and conflicts with `--ttl-days`. Admin tokens get no default
+expiry (maintainer decision 6): if every Admin expired, nobody could create
+the next one, and a non-empty store keeps the bootstrap window shut.
+`relish wtf` warns about an Admin token whose secret is older than 90 days,
+and `relish wtf` and `relish token list` warn about any token that has
+expired or expires within 14 days (`sesame::token::TOKEN_EXPIRY_WARNING`).
+
+**Names with a `[permission]` spec (shipped, decision 3).** Specs are keyed by
+token name, so a token created under a name that already has one would
+inherit it silently, for example after a revoke and re-create. `POST
+/v1/token/create` answers `409` in that case unless the request sets
+`inherit_permissions` (`relish token create --inherit-permissions`).
 
 **Scope enforcement (shipped):** `--apps` and `--namespaces` restrict a token
 on every route that names an app and namespace (`authorize_scoped`), filter
@@ -929,20 +941,31 @@ the same explicit token store in standalone and clustered modes, so standalone
 can't bypass the listener check by omitting council state. The check runs before
 runtime, storage or observability startup in standalone mode.
 
-**Rotation (planned — not implemented):**
-
-> There is no `relish token rotate` command. The `TokenAction` CLI enum exposes
-> only `create`, `list`, and `revoke`, and there is no rotation-grace machinery
-> wired to a rotate flow. The design below (dual-accept grace window) is planned.
+**Rotation (shipped, F05 I3):**
 
 ```bash
-$ relish token rotate ci-deploy    # planned
+$ relish token rotate ci-deploy [--grace-hours 24]
 ```
 
-1. Generate a new token secret and hash.
-2. Store the new hash alongside the old hash with a grace period expiry (default 24 hours).
-3. During the grace period, both old and new tokens are accepted.
-4. After the grace period, the old hash is deleted.
+1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
+   new secret and hash, and reads the clock once.
+2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
+   hash and salt, `rotated_at`, the new expiry (the token's previous lifetime
+   length from now, or none) and `previous_valid_until` (now plus the grace,
+   24 hours by default, capped at the old expiry; `None` for a zero grace).
+3. The state machine (`sesame::token::apply_rotation`) moves the old hash into
+   `ApiToken::previous_secret` and installs the new one. A second rotation
+   replaces the previous secret, so at most two secrets work. Unknown names
+   and `rbtest-` lease tokens are refused; the last Admin may rotate.
+4. Validation tries the current secret, then the previous one until its
+   `valid_until`; past that it answers `401 token rotated`. The old secret
+   authenticates as its own principal (the digest of its hash), so last use,
+   audit events and browser sessions opened with it stay separate, and those
+   sessions end when it does.
+5. The answering node installs the rotation in its own token store at once;
+   the others pick it up on their five-second refresh. The handler records a
+   `token.rotated` audit event with the caller and the grace end, never the
+   secret. Role, scope and the `[permission]` spec stay with the name.
 
 **Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
 
@@ -1252,20 +1275,15 @@ external_ca_path = ""
 ### 6.3 API Tokens
 
 ```toml
-# PLANNED — this [security.tokens] block is not parsed today. Token TTL is
-# set per-token via `relish token create --ttl-days` and defaults to no expiry
-# when omitted (§5.4); there is no cluster-wide default TTL, no configurable
-# default rate limit, and no token-rotation grace period (no `token rotate`).
 [security.tokens]
-# Default TTL for new tokens. Default: 90 days.
+# Default lifetime of new Deployer and ReadOnly tokens: "<n>d", "<n>h" or
+# "none". Admin tokens never get one. Default: "90d".
 default_ttl = "90d"
-
-# Default rate limit (requests per second) for new tokens. Default: 100.
-default_rate_limit = 100
-
-# Grace period during token rotation. Default: 24 hours.
-rotation_grace_period = "24h"
 ```
+
+Only `default_ttl` is parsed. The rotation grace is per call
+(`relish token rotate --grace-hours`, 24 by default) rather than a node
+setting, and per-token rate limiting is not part of F05.
 
 ### 6.4 Secret Encryption
 
