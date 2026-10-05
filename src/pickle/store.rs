@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest as Sha2Digest, Sha256};
 
 use super::types::{Digest, PickleError};
+use crate::file_lock::FileLock;
 
 /// Reject any upload id that isn't in the exact shape we generate.
 ///
@@ -47,20 +48,13 @@ pub struct BlobStore {
 /// not to the descriptor. A child process that another thread is spawning
 /// holds a copy of every descriptor until its `exec` closes it, so closing
 /// ours alone could leave the directory owned for a moment, and a
-/// replacement claimed straight after a drop was refused (#497). Dropping
-/// the owner unlocks first, which releases the lock for every copy at once.
+/// replacement claimed straight after a drop was refused (#497). The owner
+/// holds a [`FileLock`], which unlocks first when dropped and so releases the
+/// lock for every copy at once.
 #[derive(Debug)]
 #[must_use = "keep the upload owner alive while registry writers can run"]
 pub struct UploadDirectoryOwner {
-    lock: std::fs::File,
-}
-
-impl Drop for UploadDirectoryOwner {
-    fn drop(&mut self) {
-        // Nothing useful can be done with a failed unlock: closing the
-        // descriptor straight after still releases the lock eventually.
-        let _ = self.lock.unlock();
-    }
+    _lock: FileLock,
 }
 
 impl BlobStore {
@@ -102,12 +96,13 @@ impl BlobStore {
                 options.mode(0o600);
             }
             let lock = options.open(directory.join(".upload-owner.lock"))?;
-            lock.try_lock().map_err(|error| {
-                std::io::Error::other(format!("registry upload directory is busy: {error}"))
-            })?;
             // Own the lock before anything below can refuse the claim, so a
             // refusal unlocks it too.
-            let owner = UploadDirectoryOwner { lock };
+            let owner = UploadDirectoryOwner {
+                _lock: FileLock::try_lock(lock).map_err(|error| {
+                    std::io::Error::other(format!("registry upload directory is busy: {error}"))
+                })?,
+            };
             let uploads = directory.join("uploads");
             std::fs::create_dir_all(&uploads)?;
             if !std::fs::symlink_metadata(&uploads)?.file_type().is_dir() {

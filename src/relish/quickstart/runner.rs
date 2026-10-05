@@ -85,8 +85,10 @@ pub async fn run(options: Options) -> Result<()> {
                 use std::os::unix::fs::OpenOptionsExt;
                 lock_options.mode(0o600);
             }
-            let setup_lock = lock_options.open(operation_root.join("setup.lock"))?;
-            setup_lock.try_lock().context("another managed setup is using this state directory")?;
+            let setup_lock = crate::file_lock::FileLock::try_lock(
+                lock_options.open(operation_root.join("setup.lock"))?,
+            )
+            .context("another managed setup is using this state directory")?;
             if LocalContext::load(&operation_root.join("context.json"))?
                 .is_some_and(|context| context.owner != operation.state.id)
             {

@@ -485,7 +485,7 @@ async fn verify_exports(root: &Path, layout: &ExportLayout) {
         .write(true)
         .open(layout.source.join("_export_checkpoint.lock"))
         .expect("export lock file missing");
-    lock.try_lock()
+    let lock = reliaburger::file_lock::FileLock::try_lock(lock)
         .expect("export lock still held after the power cut");
     drop(lock);
 

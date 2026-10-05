@@ -900,7 +900,8 @@ async fn cancelled_queued_mutation_preserves_successor(mutation: QueuedMutation)
         .write(true)
         .open(owner_directory.join("client.lock"))
         .unwrap();
-    lock.lock().unwrap();
+    let lock =
+        reliaburger::file_lock::FileLock::lock_within(lock, Duration::from_secs(10)).unwrap();
     let stale_spec = spec("exit 42");
     let mut operation: std::pin::Pin<
         Box<dyn Future<Output = Result<(), reliaburger::grill::GrillError>> + Send + '_>,

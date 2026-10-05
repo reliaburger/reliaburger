@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::file_lock::FileLock;
 use crate::relish::RelishError;
 use crate::upgrade::BinaryVersion;
 
@@ -119,25 +120,9 @@ pub struct Operation {
     pub directory: PathBuf,
     /// Current checkpoints; call `save` after a completed external step.
     pub state: ClusterState,
-    _lock: std::sync::Arc<OperationLock>,
-}
-
-/// The `flock` on an operation's `operation.lock`, released when dropped.
-///
-/// A `flock` belongs to the open file description, not to the descriptor, and
-/// a child process that another thread is spawning holds a copy of every
-/// descriptor until its `exec` closes it. Closing our descriptor alone would
-/// leave the lock held by that copy for a moment, so a reopen straight after a
-/// drop could be refused (#285). Unlocking explicitly releases it for every
-/// copy at once.
-struct OperationLock(std::fs::File);
-
-impl Drop for OperationLock {
-    fn drop(&mut self) {
-        // Nothing useful can be done with a failed unlock: closing the
-        // descriptor straight after still releases the lock eventually.
-        let _ = self.0.unlock();
-    }
+    // The `flock` on `operation.lock`, which unlocks when the last clone
+    // drops (#285).
+    _lock: std::sync::Arc<FileLock>,
 }
 
 impl Operation {
@@ -171,7 +156,7 @@ impl Operation {
         let operation = Self {
             directory,
             state,
-            _lock: std::sync::Arc::new(OperationLock(lock)),
+            _lock: std::sync::Arc::new(lock),
         };
         operation.save()?;
         Ok(operation)
@@ -189,7 +174,7 @@ impl Operation {
         Ok(Self {
             directory,
             state,
-            _lock: std::sync::Arc::new(OperationLock(lock)),
+            _lock: std::sync::Arc::new(lock),
         })
     }
 
@@ -302,7 +287,7 @@ fn lock_directory(
     root: &Path,
     name: &str,
     create: bool,
-) -> Result<(PathBuf, std::fs::File), RelishError> {
+) -> Result<(PathBuf, FileLock), RelishError> {
     validate_name(name)?;
     let directory = root.join("clusters").join(name);
     if create {
@@ -323,12 +308,12 @@ fn lock_directory(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let lock = options.open(directory.join("operation.lock"))?;
-    lock.try_lock().map_err(|error| {
-        failed(&format!(
-            "another operation is using cluster {name}: {error}"
-        ))
-    })?;
+    let lock =
+        FileLock::try_lock(options.open(directory.join("operation.lock"))?).map_err(|error| {
+            failed(&format!(
+                "another operation is using cluster {name}: {error}"
+            ))
+        })?;
     Ok((directory, lock))
 }
 
