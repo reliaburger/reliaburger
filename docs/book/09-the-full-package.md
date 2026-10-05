@@ -1513,6 +1513,81 @@ so the signed cold-install gate must exercise it too.
 
 The context also records the other loopback forwards, HTTP ingress on 18080 and the authenticated registry on 15050, so tools don't have to guess guest ports. And the guest's systemd unit mounts bpffs at `/sys/fs/bpf` in an `ExecStartPre` step if the base image didn't, so Bun never starts without the filesystem that holds its eBPF pins.
 
+### One clock, not two
+
+The 0.1.5 soak turned up a bug that wasn't in our code at all. On every node,
+every 10 seconds, the guest journal said the same thing:
+
+```text
+SyncTime: system time synchronized with host (drift was ~140ms)
+systemd-resolved: Clock change detected. Flushing caches.
+```
+
+Two programs owned the guest's clock. Lima 2.1's host agent sends the Mac's
+time to its guest agent every 10 s, and the guest agent sets the wall clock to
+it whenever the two differ by more than 100 ms. Ubuntu also runs
+systemd-timesyncd, which asks an NTP server and nudges the clock's frequency
+rather than stepping it. `timedatectl timesync-status` showed timesyncd at
++500 ppm, the fastest it will slew. So timesyncd sped the clock up, the guest
+agent stepped it back, and round they went: 142 steps and 18.2 s of wall clock
+thrown away on one node over a night. Anything that turns the kernel's
+boot-relative times into wall-clock times moved with it. That's how Bun's
+process adoption ended up crash-looping (#607), and certificates, log
+timestamps and lease timers all saw a clock that went backwards.
+
+Which one should go? Lima gives us no say over its half. The host agent
+starts time sync for every Linux guest that has a guest agent, with no
+setting to turn it off, and dropping the guest agent would drop the port
+forwards the whole quickstart rides on. Chrony would have been a third
+contestant, not a replacement. That left timesyncd, and Lima's is the better
+clock for a laptop anyway:
+
+- **Sleep and wake.** A guest's clock stops while the Mac sleeps. Lima's
+  agent fixes that within 10 s of waking. timesyncd polls every 34 minutes or
+  so once it has settled, and needs the internet to do it.
+- **Offline.** On a train with no Wi-Fi, NTP has nobody to ask. The host
+  always answers.
+- **Network faults.** The guest agent talks to the host over a virtio channel
+  (a vsock on Apple's Virtualization.framework), not over the guest's
+  network. A `netem` delay from `relish test` can't skew it. NTP packets do go
+  through the guest's network. Nodes 2 and 3 started stepping 30 s after a
+  chaos fault loaded `netem` on node 3, though node 1 had started five minutes
+  earlier without one, so `netem` was at most the trigger there.
+
+So the guest image ships with timesyncd switched off. `build_guest_image.sh`
+runs `systemctl disable systemd-timesyncd.service` in the chroot, which only
+removes symlinks and so works without a running systemd. The VM's
+provisioning script does the same for the stock Ubuntu image of development
+runs:
+
+```rust
+const ONE_CLOCK_SOURCE: &str =
+    "if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then\n  \
+     systemctl disable --now systemd-timesyncd.service\nfi\n";
+```
+
+A `const` is a value the compiler bakes in. `&str` is a borrowed string, and
+for a literal the borrow lasts for the whole program (its full type is
+`&'static str`), so it needs no allocation and no owner. The trailing `\` in a
+Rust string literal swallows the line break and the next line's leading
+spaces, which is why the shell's indentation is written out as two spaces
+before it.
+
+The trade-off is that we inherit Lima's bugs. Its agent compares its own
+clock with the host's timestamp after the message has crossed into the VM, so
+on a heavily loaded Mac it mistakes a slow delivery for drift and steps the
+clock back by the delay ([lima#5543](https://github.com/lima-vm/lima/issues/5543),
+with a fix proposed upstream). Without timesyncd pushing the other way that
+happens only under load, not every 10 seconds for the rest of the night.
+
+How do we know it stays fixed? The provisioning test runs the script against
+a stub `systemctl` that logs its arguments and expects `disable --now
+systemd-timesyncd.service` among them, and the guest image test checks the
+build script disables the unit before it seals the image. On real VMs, the
+soak's guest report now prints whether timesyncd is active, which fails the
+check outright, and counts the `SyncTime` steps the guest agent logged since
+the last report. The record lists the total per node.
+
 ### Status from any node
 
 A one-replica app can run on the third VM while your CLI connects to the first.

@@ -609,6 +609,7 @@ def evaluate(evidence, snapshot):
             inventory = parse_inventory(text)
             findings += restart_findings(state, node, inventory, restart_expectations(evidence, node), now)
             findings += resource_trend_findings(state, node, inventory, now)
+            findings += clock_findings(state, node, inventory, fault_window)
             if by_node is not None and node in baseline:
                 leaks += leak_findings(baseline[node]["inventory"], inventory,
                                        baseline[node]["instances"], by_node.get(node, []), node)
@@ -765,6 +766,27 @@ def served_serial_findings(state, kind, node, serial, now):
         return []
     return [finding("ingress-serial", "fail",
                     f"serves {serial}, not the {expected['serial']:X} reloaded {now - expected['since']} s ago", node)]
+
+
+def clock_findings(state, node, inventory, fault_window):
+    """One clock source per guest (#608).
+
+    Lima's guest agent sets the guest clock to the host's every 10 s once
+    they differ by more than 100 ms. systemd-timesyncd running beside it
+    fought it: the agent stepped the clock back every 10 s. Each step the
+    agent logged since the last check is counted; one after a power-on is
+    expected, a steady run of them outside a fault window is not."""
+    findings = []
+    if (inventory.get("timesyncd") or [None])[0] == "active":
+        findings.append(finding("guest-clock", "fail",
+                                "systemd-timesyncd is running beside Lima's guest agent", node))
+    steps = inventory_number(inventory, "clock_steps")
+    if steps:
+        counts = state.setdefault("clock_steps", {})
+        counts[node] = counts.get(node, 0) + steps
+        findings.append(finding("guest-clock-steps", "info" if fault_window else "warn",
+                                f"Lima's guest agent stepped the clock {steps} time(s) since the last check", node))
+    return findings
 
 
 def resource_trend_findings(state, node, inventory, now):
@@ -1118,6 +1140,9 @@ def render(evidence, record):
             f"{node} {over_budget.get(node, 0)}" for node in checked))
     else:
         lines.append("- Agent-loop turns over the 1 s budget: not measured")
+    clock_steps = state.get("clock_steps", {})
+    lines.append("- Guest clock steps by Lima's guest agent: " + (", ".join(
+        f"{node} {count}" for node, count in sorted(clock_steps.items())) or "none"))
     lines.append(f"- Checks evaluated: {state.get('checks', 0)} ({', '.join(f'{kind} {n}' for kind, n in sorted(state.get('check_counts', {}).items()))})")
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")
