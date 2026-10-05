@@ -26,4 +26,5 @@ pub mod root_backup;
 pub mod secret;
 pub mod session;
 pub mod token;
+pub mod trust;
 pub mod types;

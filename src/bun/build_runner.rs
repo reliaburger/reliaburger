@@ -1016,7 +1016,7 @@ pub async fn sign_pushed_image(
         &signature,
         digest,
         &crate::config::node::TrustPolicySection::default(),
-        Some(&signer.root_ca_cert_der),
+        std::slice::from_ref(&signer.root_ca_cert_der),
         None,
     )
     .map_err(|e| format!("signature failed verification against the cluster ca: {e}"))?;
@@ -2092,7 +2092,7 @@ mod tests {
                 require_signatures: true,
                 keys: vec![],
             },
-            Some(&signer.root_ca_cert_der),
+            std::slice::from_ref(&signer.root_ca_cert_der),
             None,
         )
         .unwrap();

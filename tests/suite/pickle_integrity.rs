@@ -389,7 +389,7 @@ async fn peer_pull_uses_the_verified_digest_when_the_tag_moves() {
         Some("web:v1"),
         &catalog_at_verify,
         &policy,
-        Some(&hierarchy.root.ca.certificate_der),
+        std::slice::from_ref(&hierarchy.root.ca.certificate_der),
         None,
     )
     .unwrap()

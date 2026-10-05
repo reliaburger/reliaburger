@@ -1063,7 +1063,7 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
                 require_signatures: true,
                 keys: vec![],
             },
-            Some(&root_ca_der),
+            std::slice::from_ref(&root_ca_der),
             None,
         )
         .expect("the build signature must verify on deploy");
@@ -1453,7 +1453,9 @@ async fn carries_a_verified_signature(
     let security = council.security_state().await;
     let root = security
         .active_ca(reliaburger::sesame::types::CaRole::Root)
-        .map(|ca| ca.certificate_der.clone());
+        .map(|ca| ca.certificate_der.clone())
+        .into_iter()
+        .collect::<Vec<_>>();
     reliaburger::pickle::signing::verify_signature(
         &signature,
         digest,
@@ -1461,7 +1463,7 @@ async fn carries_a_verified_signature(
             require_signatures: true,
             keys: vec![],
         },
-        root.as_deref(),
+        root.as_slice(),
         None,
     )
     .is_ok()

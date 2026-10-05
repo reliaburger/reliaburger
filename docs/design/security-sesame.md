@@ -1038,11 +1038,20 @@ On each council node (intended design):
 >   serial) came from the retiring CA; workload and ingress leaves aren't
 >   tracked one by one, so for those it's refused until the window ends.
 >
+> Every verifier trusts the whole set (F04 R2). A node's identity carries a
+> `TrustSet` (every trusted Node CA and root); the mTLS server and client
+> verifiers, renewal's `validate_peer`, the join bundle and `GET
+> /v1/cluster/ca`, keyless image signatures and the workload `ca.pem` all try
+> each trusted CA. Bun's security refresh installs the council's trust set
+> every five seconds through `LiveNodeIdentity::adopt_trust`, which persists
+> it and refuses any set that isn't the council's or that drops the node's own
+> issuer; listeners read it on every handshake, so it applies without a
+> restart. The ingress resolver rebuilds when the active Ingress CA changes.
+>
 > The `relish ca` family has `ca backup` and `ca verify` (F04 R3): an
 > operator-held root backup sealed to a passphrase or an age recipient, checked
 > offline for key match, expiry and fingerprint. There is no `ca rotate` or
-> `ca rotate --root` yet, and verifiers don't yet trust
-> more than one CA per role (F04 R2). The flow below is the remaining design.
+> `ca rotate --root` yet (R4, R5). The flow below is the remaining design.
 > (Certificate *revocation* via the CRL — §5.7, `RaftRequest::RevokeCertificate`
 > — is separate and does ship.)
 

@@ -693,6 +693,10 @@ pub(super) fn node_identity_from_init(
         private_key_der: cert.private_key_der.clone(),
         serial: cert.serial,
         ca_generation: cert.ca_generation,
+        trust: crate::sesame::trust::TrustSet::single(
+            node_ca.certificate_der.clone(),
+            root_ca.certificate_der.clone(),
+        ),
         node_ca_der: node_ca.certificate_der.clone(),
         root_ca_der: root_ca.certificate_der.clone(),
         not_before: cert.not_before,
@@ -833,7 +837,7 @@ pub async fn join(
              refusing to send the join token"
         )));
     }
-    let (node_ca_der, root_ca_der) = ca
+    let trust = ca
         .decode()
         .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
 
@@ -843,7 +847,7 @@ pub async fn join(
     // key cannot present such a chain, so the handshake fails before the token
     // leaves this node. `request_join` re-checks the pinned fingerprint against
     // the returned bundle as defence in depth.
-    let pinned_client = crate::sesame::mtls::build_ca_pinned_client(node_ca_der, root_ca_der)
+    let pinned_client = crate::sesame::mtls::build_ca_pinned_client(trust)
         .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
 
     let identity = crate::sesame::join::request_join(

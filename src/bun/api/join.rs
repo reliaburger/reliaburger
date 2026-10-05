@@ -35,10 +35,18 @@ pub(super) async fn cluster_ca_handler(State(state): State<ApiState>) -> Respons
             .into_response();
     };
     let encoder = base64::engine::general_purpose::STANDARD;
+    // During a Node CA rotation a member may still present a leaf from the
+    // retiring CA, so the joiner pins every trusted one (F04 R2).
+    let trusted_node_cas: Vec<String> = security
+        .trusted_cas(crate::sesame::types::CaRole::Node)
+        .iter()
+        .map(|ca| encoder.encode(&ca.certificate_der))
+        .collect();
     Json(serde_json::json!({
         "compatibility": crate::compatibility::CURRENT,
         "node_ca_b64": encoder.encode(&node_ca.certificate_der),
         "root_ca_b64": encoder.encode(&root_ca.certificate_der),
+        "trusted_node_cas_b64": trusted_node_cas,
     }))
     .into_response()
 }

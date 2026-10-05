@@ -321,6 +321,10 @@ Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`
 (or `/job/NAME`), and its credentials appear read-only in
 `/run/reliaburger/identity/`: `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`,
 and `token`, an OIDC JWT. Use the certificate for mTLS between your services.
+`ca.pem` is a bundle: every Workload CA the cluster trusts, then the root.
+Usually that's one of each, but while a Workload CA rotation is in progress it
+holds the old CA and the new one, so verify peers against the whole file, not
+just its first certificate.
 The JWT also works as a bearer token against the Reliaburger API, as a
 read-only credential confined to the workload's own app and namespace.
 

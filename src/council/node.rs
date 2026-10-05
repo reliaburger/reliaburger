@@ -30,6 +30,9 @@ pub struct CsrSignResult {
     pub workload_ca_cert_der: Vec<u8>,
     /// DER-encoded Root CA certificate.
     pub root_ca_cert_der: Vec<u8>,
+    /// Every trusted Workload CA and root, for the workload's `ca.pem`
+    /// (F04 R2).
+    pub ca_bundle_der: Vec<Vec<u8>>,
     /// OIDC JWT token (if OIDC config is present).
     pub jwt_token: Option<String>,
     /// Allocated serial number.
@@ -492,6 +495,7 @@ impl CouncilNode {
 
         let workload_ca_cert_der = workload_ca.certificate_der.clone();
         let root_ca_cert_der = root_ca.certificate_der.clone();
+        let ca_bundle_der = crate::sesame::trust::workload_ca_bundle(&security_state);
 
         // Unwrap CA private key
         let wrapped = workload_ca.private_key_wrapped.as_ref().ok_or_else(|| {
@@ -573,6 +577,7 @@ impl CouncilNode {
             cert_der,
             workload_ca_cert_der,
             root_ca_cert_der,
+            ca_bundle_der,
             jwt_token,
             serial,
         })
