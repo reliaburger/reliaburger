@@ -255,7 +255,9 @@ retain = 24                         # default
 
 The leader writes one every `interval_secs`, encrypted with a key derived from
 the cluster's master key. Volumes aren't in it; snapshot those separately (see
-`images-and-volumes`).
+`images-and-volumes`). Nor is the root CA's private key, which never enters the
+council: back that up yourself with `relish ca backup`, sealed to a passphrase
+or your own age key, and check it with `relish ca verify` (see `security`).
 
 If every voter is gone, stop a surviving node and recover it:
 
