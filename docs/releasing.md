@@ -102,7 +102,7 @@ links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
 incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 34, state 49; this binary (reliaburger v0.1.5 (465fdeb)) needs protocol 40, state 57. …
+incompatible cluster formats: found protocol 34, state 49; this binary (reliaburger v0.1.5 (465fdeb)) needs protocol 40, state 58. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -146,7 +146,7 @@ paused run, because no node moved.
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
 `start` fails with both format pairs. A 0.1.4 cluster refuses 0.1.5 like this:
-`refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+`refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -228,7 +228,7 @@ protocol moved from 34 to 40 and the state format from 49 to 57. Recreate
 the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data
 directories aside (or `relish local destroy --yes` a laptop cluster), install
 0.1.5 and re-apply your apps. 0.1.4's leader refuses the upgrade before it records a run, with
-`found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+`found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
 
 ## Signing identity
 

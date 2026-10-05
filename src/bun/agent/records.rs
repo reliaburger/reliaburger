@@ -94,7 +94,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: instance_id.0.clone(),
             namespace: instance.namespace.clone(),
             app_name: instance.app_name.clone(),
@@ -104,6 +104,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             runtime,
             pid,
             pid_started_at,
+            boot_id: crate::grill::records::current_boot(),
             // RunC uses the instance id as the container id (see runc.rs).
             runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
                 .then(|| instance_id.0.clone()),
@@ -155,7 +156,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let identity = crate::grill::InstanceIdentity::parse(&instance.instance_id.0)
             .ok_or_else(|| fail("replacement has an invalid instance identity".into()))?;
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: instance.instance_id.0.clone(),
             namespace: instance.namespace.clone(),
             app_name: instance.app_name.clone(),
@@ -165,6 +166,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             runtime,
             pid,
             pid_started_at,
+            boot_id: crate::grill::records::current_boot(),
             runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
                 .then(|| instance.instance_id.0.clone()),
             log_stem: instance.launch.log_stem.clone(),

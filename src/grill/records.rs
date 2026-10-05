@@ -9,7 +9,9 @@
 //!
 //! A record identifies its process by pid **and** process start time:
 //! pids get reused, and adopting an innocent bystander process because it
-//! inherited a dead workload's pid would be a spectacular bug.
+//! inherited a dead workload's pid would be a spectacular bug. It also names
+//! the kernel boot it was written in, because a start time on Linux counts
+//! from boot and a pid in a later boot can land on the same one.
 
 use std::path::{Path, PathBuf};
 
@@ -49,7 +51,7 @@ pub struct RootlessNetworkRecord {
 /// Everything needed to adopt one running workload instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceRecord {
-    /// Record format version. Currently 2.
+    /// Record format version. Currently [`RECORD_SCHEMA`].
     pub schema: u32,
     /// Instance id string, e.g. `web-0`.
     pub instance_id: String,
@@ -65,9 +67,12 @@ pub struct InstanceRecord {
     /// ProcessGrill: workload PID; runc: launcher PID; Apple: Bun launcher PID.
     /// Apple adoption uses container identity/inspection, not host PID liveness.
     pub pid: u32,
-    /// Process start time (seconds since boot/epoch as reported by the OS)
-    /// for pid-reuse detection.
+    /// Process start, as [`process_start_time`] reports it, for pid-reuse
+    /// detection: clock ticks since boot on Linux, seconds since the epoch
+    /// elsewhere.
     pub pid_started_at: u64,
+    /// The kernel boot the record was written in ([`current_boot`]).
+    pub boot_id: Option<String>,
     /// RunC container id, if this is a runc instance.
     pub runc_container_id: Option<String>,
     /// Base path for log files (`{stem}.stdout` / `{stem}.stderr`), when
@@ -84,6 +89,9 @@ pub struct InstanceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootless_network: Option<RootlessNetworkRecord>,
 }
+
+/// The instance record format this build writes and reads.
+pub const RECORD_SCHEMA: u32 = 3;
 
 /// Record path for an instance id within the records directory.
 pub fn record_path(records_dir: &Path, instance_id: &str) -> PathBuf {
@@ -173,7 +181,8 @@ pub fn load_records(records_dir: &Path) -> std::io::Result<Vec<InstanceRecord>> 
                     std::io::Error::new(std::io::ErrorKind::InvalidData, error),
                 )
             })?;
-        if record.schema != 2 || path.file_stem() != Some(std::ffi::OsStr::new(&record.instance_id))
+        if record.schema != RECORD_SCHEMA
+            || path.file_stem() != Some(std::ffi::OsStr::new(&record.instance_id))
         {
             return Err(contextual(
                 &path,
@@ -188,32 +197,89 @@ pub fn load_records(records_dir: &Path) -> std::io::Result<Vec<InstanceRecord>> 
     Ok(records)
 }
 
-/// The start time of a live process, or `None` if it doesn't exist.
+/// When a live process started, or `None` if it doesn't exist.
+///
+/// On Linux this is the kernel's own record, `/proc/<pid>/stat` field 22:
+/// clock ticks since boot, fixed when the process forks. Turning it into a
+/// wall-clock time needs the boot time, which the kernel derives as "now
+/// minus uptime", so every step of the wall clock moves it. A guest whose
+/// clock was stepped back 17 s in small corrections saw every recorded
+/// process start 17 s earlier and refused to adopt any of them (#607).
+/// Ticks since boot don't move, so Linux compares them exactly.
+///
+/// macOS keeps the absolute start time the kernel stamped at fork, which a
+/// later clock step doesn't change either; it is reported in whole seconds.
 pub fn process_start_time(pid: u32) -> Option<u64> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    system
-        .process(sysinfo::Pid::from_u32(pid))
-        .map(|p| p.start_time())
+    #[cfg(target_os = "linux")]
+    {
+        // Pid 0 names no process.
+        if pid == 0 {
+            return None;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat_start_ticks(&stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        system
+            .process(sysinfo::Pid::from_u32(pid))
+            .map(|p| p.start_time())
+    }
+}
+
+/// The start time, in clock ticks since boot, from a `/proc/<pid>/stat` line.
+///
+/// The command name (field 2) is in parentheses and may itself contain
+/// spaces and `)`, so fields are counted from the last `)`: the state is
+/// field 3, and the start time is field 22.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stat_start_ticks(stat: &str) -> Option<u64> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(22 - 3)?.parse().ok()
+}
+
+/// Whether two [`process_start_time`] readings name the same process start.
+fn same_start(observed: u64, recorded: u64) -> bool {
+    if cfg!(target_os = "linux") {
+        observed == recorded
+    } else {
+        // Whole seconds, which some platforms round differently depending
+        // on when they are asked.
+        observed.abs_diff(recorded) <= 2
+    }
+}
+
+/// The running kernel boot's identity, for [`InstanceRecord::boot_id`].
+///
+/// `None` when the platform doesn't publish one or it can't be read; a record
+/// without a boot identity never matches a live process.
+pub fn current_boot() -> Option<String> {
+    super::process_owner::current_boot_id().ok().flatten()
+}
+
+/// Whether the record was written in the running kernel boot.
+pub fn from_this_boot(record: &InstanceRecord) -> bool {
+    record.boot_id.is_some() && record.boot_id == current_boot()
 }
 
 /// Is the recorded process still the process we started?
 ///
-/// True only if the pid exists AND its start time matches the record
-/// (±2s slack — some platforms round start times differently depending
-/// on when they're asked).
+/// True only if the record was written in this boot, the pid exists, and
+/// its start matches the record.
 pub fn is_live(record: &InstanceRecord) -> bool {
-    process_matches(record.pid, record.pid_started_at)
+    from_this_boot(record) && process_matches(record.pid, record.pid_started_at)
 }
 
 /// Whether `pid` still belongs to the process with the recorded start time.
 pub fn process_matches(pid: u32, recorded_started_at: u64) -> bool {
-    process_start_time(pid).is_some_and(|started_at| started_at.abs_diff(recorded_started_at) <= 2)
+    process_start_time(pid).is_some_and(|started_at| same_start(started_at, recorded_started_at))
 }
 
 /// Poll a process we have no `Child` handle for (an adoptee).
@@ -226,8 +292,8 @@ pub fn process_matches(pid: u32, recorded_started_at: u64) -> bool {
 ///
 /// `pid_started_at` is the adoptee's recorded start time. On the `ECHILD`
 /// liveness path the pid may have exited and been reused by an unrelated
-/// process, so we confirm the live pid's start time still matches (±2s,
-/// mirroring [`is_live`]).
+/// process, so we confirm the live pid's start time still matches (as
+/// [`process_matches`] does).
 /// A mismatch means our adoptee is gone and this pid belongs to someone else,
 /// so it is reported exited — without this a reused pid reads Running forever
 /// and a later stop/kill would signal an innocent process (M23).
@@ -251,7 +317,7 @@ pub fn poll_adopted_process(pid: u32, pid_started_at: u64) -> std::io::Result<(b
         })?;
     let current_start = process_start_time(pid);
     if let Some(current) = current_start
-        && current.abs_diff(pid_started_at) > 2
+        && !same_start(current, pid_started_at)
     {
         // Do not reap an unrelated child after PID reuse either.
         return Ok((false, None));
@@ -310,7 +376,7 @@ mod tests {
 
     fn record(pid: u32, started_at: u64) -> InstanceRecord {
         InstanceRecord {
-            schema: 2,
+            schema: RECORD_SCHEMA,
             instance_id: "web-0".to_string(),
             namespace: "default".to_string(),
             app_name: "web".to_string(),
@@ -320,6 +386,7 @@ mod tests {
             runtime: RuntimeKind::Process,
             pid,
             pid_started_at: started_at,
+            boot_id: current_boot(),
             runc_container_id: None,
             log_stem: None,
             host_port: Some(30123),
@@ -464,6 +531,67 @@ mod tests {
         let my_pid = std::process::id();
         let real_start = process_start_time(my_pid).unwrap();
         assert!(is_live(&record(my_pid, real_start)));
+    }
+
+    #[test]
+    fn liveness_rejects_a_record_from_another_boot() {
+        // Same pid, same start: after a reboot that is a coincidence, not
+        // the process we started.
+        let my_pid = std::process::id();
+        let mut earlier_boot = record(my_pid, process_start_time(my_pid).unwrap());
+        earlier_boot.boot_id = Some("00000000-0000-4000-8000-000000000001".into());
+        assert!(!is_live(&earlier_boot));
+        earlier_boot.boot_id = None;
+        assert!(!is_live(&earlier_boot));
+    }
+
+    #[test]
+    fn start_ticks_count_fields_from_the_last_parenthesis() {
+        // Node 3's runc launcher in the 0.1.5 soak (#607), then a command
+        // name that tries to shift the fields.
+        let soak = "6253 (runc) S 6252 6253 6252 0 -1 4194560 2045 0 0 0 3 1 0 0 20 0 9 0 200840 1252421632 3072 18446744073709551615";
+        assert_eq!(stat_start_ticks(soak), Some(200840));
+        let hostile = "77 (a) b ) c) S 1 77 77 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0";
+        assert_eq!(stat_start_ticks(hostile), Some(12345));
+        assert_eq!(stat_start_ticks("77 (truncated) S 1"), None);
+    }
+
+    /// The kernel's start field, read without the code under test.
+    #[cfg(target_os = "linux")]
+    fn kernel_start_ticks(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let after_name = &stat[stat.rfind(')').unwrap() + 2..];
+        after_name.split(' ').nth(19).unwrap().parse().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_identity_is_the_boot_relative_tick_count_a_clock_step_cannot_move() {
+        // The soak (#607): records written at btime 1791178923 read back 17 s
+        // early once the guest's clock had been stepped back to btime
+        // 1791178906. The identity must be the kernel's fixed tick count,
+        // not a conversion through the moving boot time.
+        let my_pid = std::process::id();
+        assert_eq!(process_start_time(my_pid), Some(kernel_start_ticks(my_pid)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_start_identity_matches_exactly() {
+        let my_pid = std::process::id();
+        let start = process_start_time(my_pid).unwrap();
+        assert!(process_matches(my_pid, start));
+        // One tick is another process start, not rounding.
+        assert!(!process_matches(my_pid, start + 1));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn absolute_start_times_tolerate_rounding() {
+        let my_pid = std::process::id();
+        let start = process_start_time(my_pid).unwrap();
+        assert!(process_matches(my_pid, start + 2));
+        assert!(!process_matches(my_pid, start + 3));
     }
 
     // -- M23: adopted-pid reuse on the ECHILD liveness path ------------------

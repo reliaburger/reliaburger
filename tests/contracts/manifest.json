@@ -5316,6 +5316,33 @@
       ]
     },
     {
+      "id": "issue-607-legacy-oci-owned_runc-a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
+      "issue": 607,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
+          "binary": "reliaburger::owned_runc",
+          "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-original-linux-root-storage",
       "issue": 555,
       "promise": "Complete all uncovered original ignored cases through their declared owner.",

@@ -251,7 +251,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     first.start(&id).await.unwrap();
     let pid = first.pid(&id).await.unwrap().unwrap();
     let mut record = InstanceRecord {
-        schema: 2,
+        schema: reliaburger::grill::records::RECORD_SCHEMA,
         instance_id: id.0.clone(),
         namespace: "default".into(),
         app_name: "owned-runc".into(),
@@ -260,9 +260,8 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
-        // One second off, as an NTP step between launch and recovery would
-        // leave it: the same process, recorded against a moved clock.
-        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap() + 1,
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        boot_id: reliaburger::grill::records::current_boot(),
         runc_container_id: Some(id.0.clone()),
         log_stem: first.log_stem(&id).await,
         host_port: None,
@@ -290,6 +289,68 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Running);
     recovered.kill(&id).await.unwrap();
     assert_absent(root.path(), &id);
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_stale_adoption_record_retires_its_generation_and_others_still_adopt() {
+    // The 0.1.5 soak (#607): an adoption record whose process identity no
+    // longer matched the launcher the owner reported running stopped Bun at
+    // every start, taking every workload on the node down with it.
+    use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let stale = instance(root.path());
+    let healthy = InstanceId(format!("{}-b", stale.0));
+    let specification = spec(root.path(), "exec /bin/busybox sleep 60");
+    let first = runtime(root.path());
+    let mut records = Vec::new();
+    for id in [&stale, &healthy] {
+        first.create(id, &specification).await.unwrap();
+        install_fixture(root.path(), id);
+        first.start(id).await.unwrap();
+        let pid = first.pid(id).await.unwrap().unwrap();
+        records.push(InstanceRecord {
+            schema: reliaburger::grill::records::RECORD_SCHEMA,
+            instance_id: id.0.clone(),
+            namespace: "default".into(),
+            app_name: "owned-runc".into(),
+            replica_index: 0,
+            is_job: false,
+            image: "/empty-fixture".into(),
+            runtime: RuntimeKind::Runc,
+            pid,
+            pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+            boot_id: reliaburger::grill::records::current_boot(),
+            runc_container_id: Some(id.0.clone()),
+            log_stem: first.log_stem(id).await,
+            host_port: None,
+            app_spec: None,
+            oci_spec: specification.clone(),
+            rootless_network: None,
+        });
+    }
+    // The stale record names another start of the launcher's pid, further
+    // off than the ±2 s an older build tolerated.
+    records[0].pid_started_at += 3;
+    drop(first);
+
+    let restarted = runtime(root.path());
+    let stale_adoption = restarted.adopt(&stale, &records[0]).await;
+    let healthy_adoption = restarted.adopt(&healthy, &records[1]).await;
+    let stale_state = restarted.state(&stale).await;
+    let healthy_state = restarted.state(&healthy).await;
+    restarted.kill(&healthy).await.unwrap();
+
+    assert!(
+        matches!(stale_adoption, Ok(false)),
+        "a stale record refused adoption instead of retiring its generation: {stale_adoption:?}"
+    );
+    assert_eq!(stale_state.unwrap(), ContainerState::Stopped);
+    assert_absent(root.path(), &stale);
+    assert!(matches!(healthy_adoption, Ok(true)), "{healthy_adoption:?}");
+    assert_eq!(healthy_state.unwrap(), ContainerState::Running);
+    assert_absent(root.path(), &healthy);
 }
 
 fn quote(path: &Path) -> String {
@@ -773,7 +834,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
     first.start(&id).await.unwrap();
     let pid = first.pid(&id).await.unwrap().unwrap();
     let record = InstanceRecord {
-        schema: 2,
+        schema: reliaburger::grill::records::RECORD_SCHEMA,
         instance_id: id.0.clone(),
         namespace: "default".into(),
         app_name: "owned-runc".into(),
@@ -783,6 +844,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
         runtime: RuntimeKind::Runc,
         pid,
         pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        boot_id: reliaburger::grill::records::current_boot(),
         runc_container_id: Some(id.0.clone()),
         log_stem: first.log_stem(&id).await,
         host_port: None,
@@ -1147,7 +1209,7 @@ async fn owned_runc_unit_stop_fixture() {
     runtime.start(&id).await.unwrap();
     let pid = runtime.pid(&id).await.unwrap().unwrap();
     let record = InstanceRecord {
-        schema: 2,
+        schema: reliaburger::grill::records::RECORD_SCHEMA,
         instance_id: id.0.clone(),
         namespace: "default".into(),
         app_name: "owned-runc".into(),
@@ -1157,6 +1219,7 @@ async fn owned_runc_unit_stop_fixture() {
         runtime: RuntimeKind::Runc,
         pid,
         pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        boot_id: reliaburger::grill::records::current_boot(),
         runc_container_id: Some(id.0.clone()),
         log_stem: runtime.log_stem(&id).await,
         host_port: None,

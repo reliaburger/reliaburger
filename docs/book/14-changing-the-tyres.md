@@ -386,14 +386,11 @@ The sharp edge: **pids get reused**. A record saying "web-0 is pid 4242" proves 
 
 ```rust
 pub fn is_live(record: &InstanceRecord) -> bool {
-    match process_start_time(record.pid) {
-        Some(started_at) => started_at.abs_diff(record.pid_started_at) <= 2,
-        None => false,
-    }
+    from_this_boot(record) && process_matches(record.pid, record.pid_started_at)
 }
 ```
 
-A pid plus its start time is, for practical purposes, a unique process identity. (The `±2s` slack exists because platforms round start times differently depending on when you ask. `abs_diff`, note, is the panic-free way to ask "how far apart" for unsigned integers — `a - b` on `u64` aborts in debug if `b > a`.)
+A pid plus its start time is, for practical purposes, a unique process identity, as long as you stay within one boot. The start time has to be one the clock can't move. On Linux it's the kernel's tick count since boot, from `/proc/<pid>/stat`, and it must match exactly. A wall-clock start time computed from the boot time drifts whenever NTP steps the clock, and in the 0.1.5 release soak that drift stopped a node from starting (Chapter 1 has the story). Ticks restart from zero on every boot, so the record also stores the kernel's boot ID, and `from_this_boot` rejects a record written in any other boot. On macOS the kernel stores an absolute start time at fork, which is safe from later clock steps too. There we keep a two-second slack, because it's reported in whole seconds that platforms round differently depending on when you ask. The comparison uses `abs_diff`, the panic-free way to ask how far apart two unsigned integers are: `a - b` on `u64` panics in a debug build if `b > a`.
 
 ### Problem 2: the pipe trap — logs must be files
 
@@ -426,7 +423,7 @@ match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
 
 It works, and it has two holes. A job that finished while Bun was down has no exit code, so "did my job succeed?" becomes "unknown". And there's a gap between spawning a process and writing its record: crash there and nobody knows the process exists. So in production, neither Bun nor its successor is the parent any more. Every workload, in process mode and under runc alike, runs beneath a small *process owner*: a helper that outlives Bun, records its child before letting it run, reaps it, and writes the real exit code to disk. Chapter 1 walks through how it works for runc and Chapter 8 for process workloads. For this chapter, the point is that Bun's exec can't lose a reaper it never was. After an exec or a restart, Bun reconnects to each owner over its private socket and asks. The poller above survives only in the owner-less, file-backed mode the unit tests use.
 
-Adoption still cross-checks the adoption record against the owner. For runc, the owner must report the `runc run` launcher as running, and its PID and start time must match the record. A rootless container's network helper is an owned process too, so the same machinery covers it.
+Adoption still cross-checks the adoption record against the owner. For runc, the owner must report the `runc run` launcher as running, and its PID and start time must match the record. If they don't, the record is the stale side: the owner decides which launcher runs the generation, so adoption cleans that generation up and the instance starts again, rather than refusing to start Bun at all. A rootless container's network helper is an owned process too, so the same machinery covers it.
 
 Apple Container adoption drops the pid check entirely. An Apple workload runs *inside a VM* managed by the `container` daemon; it was never a child of bun, so there's no pid to fingerprint. The recoverable handle is the container itself: `container inspect <id>` reporting `running` means the VM sailed through our exec, so we re-track the entry and re-discover its IP. A vanished container declines adoption; an inspection that *fails* is an error, not absence, and stops startup rather than deleting a record we might still need. (The Apple adapter isn't part of the 0.1.0 release, for reasons Chapter 1 explains, but its adoption tests still run behind `make test-apple`.)
 
@@ -611,7 +608,7 @@ Two bits of `thiserror` syntax are new here. `{found}` names a field of the vari
 
 `this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.3 (465fdeb)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
 
-The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 34, state 49; this binary (...) needs protocol 40, state 57`.
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 34, state 49; this binary (...) needs protocol 40, state 58`.
 
 The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
 
@@ -1413,7 +1410,7 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49` (a 0.1.4 cluster offered 0.1.5), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49` (a 0.1.4 cluster offered 0.1.5), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 
