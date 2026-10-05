@@ -101,8 +101,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 34, state 49; this binary (reliaburger v0.1.5 (465fdeb)) needs protocol 40, state 57. …
+incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 58. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 34, state 49; this binary (reliaburger v0.1.5 (465fdeb)) needs protocol 40, state 58. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -146,7 +146,7 @@ paused run, because no node moved.
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
 `start` fails with both format pairs. A 0.1.4 cluster refuses 0.1.5 like this:
-`refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+`refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -224,11 +224,11 @@ council's log and to what nodes exchange: per-blob upload receipts in
 Pickle, owned metrics and log archive prefixes, batch attempt identities
 and whole-pass admission, run-before migration fences, webhook trigger
 receipts, and complete spec fingerprints for `apply --dry-run`. So the
-protocol moved from 34 to 40 and the state format from 49 to 57. Recreate
+protocol moved from 34 to 40 and the state format from 49 to 58. Recreate
 the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data
 directories aside (or `relish local destroy --yes` a laptop cluster), install
 0.1.5 and re-apply your apps. 0.1.4's leader refuses the upgrade before it records a run, with
-`found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+`found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
 
 ### Upgrading from 0.1.5
 
@@ -239,11 +239,11 @@ namespace's key carries the values it re-seals. API token rotation (F05 I3)
 adds a Raft entry and keeps a rotated token's old secret beside its new one.
 Intermediate CA rotation and trust bundles (F04 R1, R2) keep several CAs per
 role and send the trusted set in joins, signing answers and node snapshots.
-So the protocol moved from 40 to 44 and the state format from 57 to 61.
+So the protocol moved from 40 to 46 and the state format from 58 to 63.
 Recreate the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data directories aside (or
 `relish local destroy --yes` a laptop cluster), install 0.1.6 and re-apply
 your apps. 0.1.5's leader refuses the upgrade before it records a run, with
-`found protocol 44, state 61; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 57`.
+`found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58`.
 
 ## Signing identity
 

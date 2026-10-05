@@ -50,6 +50,7 @@ pub struct Compatibility {
 /// Replicated migration/job intent and original-generation settlement fences (#534).
 /// Authenticated webhook trigger admission and delivery receipts in durable Raft (#553).
 /// Owned metrics publication metadata and immutable log ingestion checkpoints (#555).
+/// Instance adoption records name their kernel boot and, on Linux, a process start in clock ticks since boot (#607).
 /// Per-namespace secret keys: `NamespaceSpec::secret_key` and the values a
 /// namespace's first key re-seals (`RaftRequest::RotateSecretKey::resealed`)
 /// (F05 I4, #363).

@@ -602,7 +602,7 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let id = InstanceId("apple-evidence".into());
         let record = serde_json::from_value(serde_json::json!({
-            "schema": 2, "instance_id": id.0, "namespace": "default",
+            "schema": crate::grill::records::RECORD_SCHEMA, "instance_id": id.0, "namespace": "default",
             "app_name": "apple-evidence", "replica_index": 0,
             "is_job": false, "image": "unused", "runtime": "Apple",
             "pid": 0, "pid_started_at": 0,
@@ -1049,7 +1049,7 @@ mod tests {
         starter.start(&id).await.expect("start");
 
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: id.0.clone(),
             namespace: "default".to_string(),
             app_name: "apple-adopt".to_string(),
@@ -1059,6 +1059,7 @@ mod tests {
             runtime: crate::grill::records::RuntimeKind::Apple,
             pid: 0,
             pid_started_at: 0,
+            boot_id: None,
             runc_container_id: None,
             log_stem: None,
             host_port: None,
