@@ -452,8 +452,11 @@ keys = []                 # extra trusted ECDSA P-256 public keys, base64
 ```
 
 Images that `relish build` pushes are signed by the cluster's build signer,
-which the policy trusts without a key. Images from external registries and the
-pull-through cache aren't checked, so pin those by digest.
+which the policy trusts without a key. Signatures on images from external
+registries and the pull-through cache aren't checked yet, but every apply binds
+their tags to digests
+([Tags bind to digests at apply](11_images-and-volumes.md#tags-bind-to-digests-at-apply)),
+so what you applied is what runs on every node.
 
 For images you build elsewhere and push to the registry, sign them with your
 own key. Make one, and put the public key it prints in every node's `keys`:
@@ -483,6 +486,45 @@ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ci-signing.p
 openssl pkey -in ci-signing.pem -pubout -outform DER | tail -c 65 | base64
 ```
 
+### Images from other registries
+
+Images from outside the cluster's registry (Docker Hub, GHCR, your own
+registry) follow `[[images.trust_policy.upstream]]` rules, also in each node's
+`node.toml`:
+
+```toml
+[[images.trust_policy.upstream]]
+match = "docker.io/library/*"      # Docker Hub's official images
+
+[[images.trust_policy.upstream]]
+match = "ghcr.io/acme/*"
+
+[images.trust_policy.upstream_default]
+allow = false                      # refuse anything no rule matches
+```
+
+`match` names a repository with its registry, `docker.io/library/nginx`, or a
+prefix ending in `*`. Write Docker Hub shorthand out in full: `nginx` is
+`docker.io/library/nginx`, and `acme/web` is `docker.io/acme/web`. When several
+rules match, the most specific wins: an exact name beats any prefix, and a
+longer prefix beats a shorter one. Tags and digests don't take part, so
+`nginx:1.27` and `nginx@sha256:â€¦` both match `docker.io/library/*`.
+
+With no rules, or with `upstream_default.allow = true` (the default), every
+upstream image is allowed, as before. With `allow = false` the rules are an
+allow-list: an image that matches none is refused, by name, when you apply it
+(HTTP 403, or an error in the apply's stream on a cluster) and again by Bun
+before every deploy. The cluster's own images, and anything else Pickle holds,
+answer to `require_signatures` instead. Pinning an image by digest doesn't
+exempt it.
+
+A rule can't ask for a signature yet: `require_signatures = true` on an
+upstream rule stops the node at startup, until cosign verification lands.
+Keep the rules the same on every node. A node with stricter rules refuses to
+deploy what the leader admitted, and the rules only apply where the runtime
+pulls images (not under the process runtime). On a single node without a
+cluster, the apply is the check.
+
 ### Cosign signatures
 
 `relish sign` signatures aren't cosign signatures. They sign the digest
@@ -505,11 +547,11 @@ cosign sign --key cosign.key --new-bundle-format=false ghcr.io/acme/web@sha256:â
 ```
 
 Keyless signatures (a Fulcio certificate, as Chainguard and distroless images
-carry) aren't checked: there's no key to trust. The per-registry rules that
-turn these checks on (`require_signatures` and `cosign_keys` for each upstream
-repository pattern) are still being built under
-[#361](https://github.com/reliaburger/reliaburger/issues/361); until they ship,
-upstream images aren't signature-checked, so pin them by digest.
+carry) aren't checked: there's no key to trust. Turning the check on for an upstream rule (`require_signatures` with
+`cosign_keys`) is still being built under
+[#361](https://github.com/reliaburger/reliaburger/issues/361); until it ships, a rule
+with `require_signatures = true` stops the node at startup, and upstream
+images are bound to digests but not signature-checked.
 
 ## Between nodes
 

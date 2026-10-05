@@ -818,6 +818,7 @@ gW44LD4On4yfIPRJkluhNQ5G35R5vZyQY5DspOlhl16ImqPQIVADgGQv
         let policy = TrustPolicySection {
             require_signatures: true,
             keys: vec![key.public_key_base64()],
+            ..Default::default()
         };
         verify_signature(&sig, &test_digest(), &policy, &[], None).unwrap();
     }

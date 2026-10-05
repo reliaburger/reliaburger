@@ -523,6 +523,7 @@ impl NodeConfig {
                 reason: "0.1.0 supports a fixed 100-event admission limit; custom limits are not supported".into(),
             });
         }
+        self.images.trust_policy.validate()?;
         // Storage paths must be absolute
         let paths = [
             ("storage.data", &self.storage.data),

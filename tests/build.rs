@@ -1063,6 +1063,7 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
             &reliaburger::config::node::TrustPolicySection {
                 require_signatures: true,
                 keys: vec![],
+                ..Default::default()
             },
             std::slice::from_ref(&root_ca_der),
             None,
@@ -1464,6 +1465,7 @@ async fn carries_a_verified_signature(
         &reliaburger::config::node::TrustPolicySection {
             require_signatures: true,
             keys: vec![],
+            ..Default::default()
         },
         root.as_slice(),
         None,

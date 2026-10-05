@@ -63,13 +63,16 @@ pub struct Compatibility {
 /// identity snapshot (`node.bundle.json` schema 3) (F04 R2, #362).
 /// API token rotation: `RaftRequest::RotateApiToken` and each stored token's
 /// `ApiToken::previous_secret`, the old secret during its grace period (F05 I3).
+/// Image references bound to digests at apply (`nginx:1.27@sha256:…`) in app
+/// and job specs, deploy history and prerequisite claims, and the tag a bound
+/// pull records in the pull-through cache (F03 U1, #361).
 /// Intermediate rotation: the pending CSRs (`SecurityState::pending_intermediates`),
 /// each node's trust acknowledgement (`NodeLeafRecord::trust_generation`),
 /// the `CaRotationPrepare` and `AcknowledgeNodeTrust` Raft requests and the
 /// `POST /v1/cluster/trust-ack` body a node sends the leader (F04 R4, #362).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 45,
-    state: 62,
+    protocol: 46,
+    state: 63,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

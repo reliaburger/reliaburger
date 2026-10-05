@@ -94,6 +94,7 @@ pub fn compute_diff(
                 added += 1;
             }
             Some(current_spec) => {
+                let current_spec = &as_git_wrote_it(git_spec, current_spec);
                 let replicas_changed = replicas_differ(git_spec, current_spec);
                 let other_fields_changed = non_replica_fields_differ(git_spec, current_spec);
 
@@ -229,6 +230,33 @@ pub fn parse_app_resource_id(resource_id: &str) -> Option<AppId> {
     Some(AppId::new(name, namespace))
 }
 
+/// `current` with each image bound at apply read back as the tag Git
+/// names. Raft holds `nginx:1.27@sha256:…` for Git's `nginx:1.27` (F03
+/// U1); that's the binding, not drift. A tag that moves upstream is picked
+/// up when Git changes the app, as a manual apply picks it up when it runs.
+fn as_git_wrote_it(git: &AppSpec, current: &AppSpec) -> AppSpec {
+    let mut current = current.clone();
+    unbind(&mut current.image, git.image.as_deref());
+    for (current_init, git_init) in current.init.iter_mut().zip(&git.init) {
+        unbind(&mut current_init.image, git_init.image.as_deref());
+    }
+    current
+}
+
+/// Replace `image` with `git` when `image` is `git` bound to a digest.
+fn unbind(image: &mut Option<String>, git: Option<&str>) {
+    let Some(git) = git.filter(|git| !git.contains('@')) else {
+        return;
+    };
+    if image
+        .as_deref()
+        .and_then(|image| image.split_once('@'))
+        .is_some_and(|(tag, _)| tag == git)
+    {
+        *image = Some(git.to_string());
+    }
+}
+
 /// Check whether the `replicas` field differs between two app specs.
 fn replicas_differ(a: &AppSpec, b: &AppSpec) -> bool {
     a.replicas != b.replicas
@@ -313,6 +341,65 @@ mod tests {
         assert!(
             matches!(&changes[0], ResourceChange::Remove { resource_id } if resource_id == "app.default/old")
         );
+    }
+
+    /// F03 U1: Raft holds `myapp:v1@sha256:…` where Git says `myapp:v1`.
+    /// That's the binding, not drift, so a quiet repository stays quiet
+    /// instead of re-resolving every tag on every poll.
+    #[test]
+    fn a_bound_image_is_not_drift_from_its_git_tag() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let git = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            [[app.web.init]]
+            image = "busybox:1.36"
+            "#,
+        );
+        let current = make_current_apps(&[(
+            "web",
+            &format!(
+                "image = \"myapp:v1@{digest}\"\n[[init]]\nimage = \"busybox:1.36@{digest}\"\n"
+            ),
+        )]);
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(summary.modified, 0);
+    }
+
+    #[test]
+    fn a_new_tag_in_git_still_changes_a_bound_image() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let git = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v2"
+            "#,
+        );
+        let current = make_current_apps(&[("web", &format!("image = \"myapp:v1@{digest}\""))]);
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
+        assert_eq!(summary.modified, 1);
+        assert!(matches!(
+            &changes[0],
+            ResourceChange::Update { spec: ChangePayload::App(spec), .. }
+                if spec.image.as_deref() == Some("myapp:v2")
+        ));
+    }
+
+    /// Git pinning a different digest is a change, even under the same tag.
+    #[test]
+    fn a_different_digest_pinned_in_git_is_a_change() {
+        let git = parse_config(&format!(
+            "[app.web]\nimage = \"myapp:v1@sha256:{}\"\n",
+            "b".repeat(64)
+        ));
+        let current = make_current_apps(&[(
+            "web",
+            &format!("image = \"myapp:v1@sha256:{}\"", "a".repeat(64)),
+        )]);
+        let (_, summary) = compute_diff(&git, &apps_state(&current), &[]);
+        assert_eq!(summary.modified, 1);
     }
 
     #[test]

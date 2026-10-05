@@ -954,7 +954,17 @@ parallel (rarest layer first). Direct external pulls and Pickle upstream reads r
 and temporary gateway/service/server errors, refused or interrupted connections and
 stalled reads up to four attempts. Each HEAD/manifest/config attempt may take 30 seconds
 within a 2-minute total, and each layer attempt 120 seconds within 6 minutes; authentication,
-malformed responses and digest failures still fail. Operational constraints:
+malformed responses and digest failures still fail.
+
+Where the leader's runtime pulls images, every apply (manual, GitOps or
+standalone) binds each image tag to the digest it names then, storing
+`nginx:1.27@sha256:…`; `relish apply` prints each binding, and history,
+inspect, status and rollback carry the digest. An unreachable registry fails
+the apply unless the pull-through cache holds the tag (F03 U1, #361).
+`[[images.trust_policy.upstream]]` rules in `node.toml` (most specific `match`
+wins) with `upstream_default.allow = false` turn upstream registries into an
+allow-list, checked at apply and in Bun before every deploy (F03 U2).
+Operational constraints:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each
   other's registry URLs from gossip IPs plus the local port setting.

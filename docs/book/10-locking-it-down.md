@@ -310,7 +310,7 @@ require_signatures = true
 keys = ["MFkwEwYHKoZIzj0CAQ..."]  # base64-encoded ECDSA P-256 public keys
 ```
 
-When `require_signatures` is `true`, the scheduler calls `check_image_schedulable()` before placement. If the image exists in Pickle's manifest catalog without a signature, scheduling is rejected. Images from external registries (Docker Hub, GHCR) are not checked -- they're not in the catalog.
+When `require_signatures` is `true`, Bun checks the image before every deploy (`enforce_image_signature` in `src/bun/agent/launch.rs`). The scheduler places the app regardless; the node that would run it refuses. (An earlier draft of this chapter said Meat refused to place it. `check_image_schedulable()` exists, but only its tests call it.) If the image exists in Pickle's manifest catalog without a valid signature, the deploy fails with the image named. Images from external registries (Docker Hub, GHCR) are not checked -- they're not in the catalog.
 
 This design means pushes never fail due to missing signatures. Your CI pipeline keeps working. But unsigned images sit in Pickle, waiting. They're visible in `relish images` but unschedulable until signed. The separation is clean: the registry accepts everything; the scheduler enforces trust.
 
@@ -1833,6 +1833,95 @@ The CLI shape needed a small clap trick. We wanted both `relish sign IMAGE --key
 
 The test that matters is the one the old code could never have passed. `relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key` stands up a single-node council, pushes three manifests, and does what `relish sign` does: resolve through the image listing, sign locally, submit. Then it turns on `require_signatures` with the operator's key and asks the real deploy gate about each image. The operator-signed one comes back pinned to its signed digest. The never-signed one is refused. The one signed by a different key is refused as "not in trust policy". A companion test re-pushes `myapp:v1` with new bytes after signing and checks the new content is refused, because the signature covered the old digest, not the tag. And an `openssl`-generated test key pins the documented `openssl pkey … | tail -c 65 | base64` pipeline to the exact string `keys` expects, so the manual can't drift from the code.
 
+### A tag is a promise nobody keeps
+
+Signatures cover Pickle's images. What about `nginx:1.27`?
+
+Until 0.1.6 the answer was "whatever Docker Hub says today". The spec in Raft kept the tag. A restart pulled it again, the pull-through cache re-checked it every hour, and a replica on a new node resolved it fresh. So one app could run two digests on two nodes, or change its bytes on a restart nobody asked for. Nothing recorded which digest had run, so you couldn't even tell afterwards.
+
+The fix is to resolve the tag once, when you apply, and store both halves: `nginx:1.27@sha256:3f2a…`. OCI references allow a tag and a digest together, and the digest wins. The parser already read that form (it shipped in 0.1.4, along with `pickle::binding::bind_image`, which resolves one tag from the catalogue, upstream or the cache). What was missing was anyone calling it.
+
+We call it in three places, all on the node that writes the spec:
+
+- `POST /v1/apply` on the leader, inside the SSE stream, before the Raft writes. A follower forwards the request and binds nothing itself.
+- The GitOps runner, as it turns each changed app into a `RaftRequest::AppSpec`.
+- A standalone node's apply and rollback, before the command reaches its agent.
+
+The binder is a small struct holding two registry clients as trait objects:
+
+```rust
+#[derive(Clone)]
+pub struct ImageBinder {
+    remote: Arc<dyn UpstreamRegistry>,
+    loopback: Arc<dyn UpstreamRegistry>,
+}
+```
+
+`dyn UpstreamRegistry` is a *trait object*: a pointer to some value that implements the trait, plus a table of its methods, picked at run time. It's Go's interface value, more or less, except Rust makes you say `dyn` so you know you're paying for the indirection. Production fills both slots with `OciUpstream` (HTTPS, and plain HTTP for `localhost:5000`-style registries, the way the runtime pulls them); tests fill them with a fixed answer. `Arc` (an atomically reference-counted pointer) lets every clone of the binder share the same clients.
+
+Bun hands the binder to the routes as an axum `Extension` layer, and only when its runtime actually pulls images. Under ProcessGrill an app's `image` is a placeholder like `proc-grill:image-ignored`; asking Docker Hub about it would fail every apply on a Mac dev cluster. The handler takes `Option<Extension<ImageBinder>>`, so "no layer" arrives as `None` and the image is stored as written. That was the maintainer's call for this question: bind only when the leader's own runtime pulls, and document that a cluster runs one runtime kind.
+
+What if the registry is down? The apply fails with the registry's error, unless the pull-through cache holds the tag, in which case it binds the cached copy and says so. Here we found a hole of our own making. Once every apply binds, every pull asks for `nginx:1.27@sha256:…`, and the cache filed what it fetched under the digest. Nobody ever pulled the bare tag again, so the cache never held "the tag" and the fallback could never fire. `ImageReference` now keeps the tag a bound reference carries (`bound_tag`), and a fresh fill records the image under it too. The suite test `a_bound_pull_through_remembers_the_tag_for_binding_offline` pulls a bound image through the cache, then binds the bare tag with no registry at all.
+
+GitOps needed one more thought. Git says `nginx:1.27`; Raft now says `nginx:1.27@sha256:…`. The diff compared them, saw drift, re-applied, re-bound, and did it again on the next poll, forever. `as_git_wrote_it` reads a bound image back as the tag Git names before comparing, so binding alone isn't drift. A tag that moves upstream gets picked up when the app changes in Git, the same way a manual apply picks it up when you run it.
+
+`relish apply` prints each binding (`web: nginx:1.27 → sha256:3f2a1b9c04d7... (from the registry)`), and because the spec carries the digest, deploy history, `relish inspect` and each instance's status all show it without any change of their own. Rollback came for free too: the spec it restores already names a digest, the binder leaves digests alone, and the rollback runs the bytes that ran before. `a_rollback_restores_the_bound_digest_without_asking_the_registry` proves it with the registry down.
+
+One compile error is worth a paragraph, because you'll meet it. `bind_config` first built a lazy iterator over the config's image slots (`&mut Option<String>`, from apps, their init containers and jobs) and passed it to an `async fn`. Fine on its own. Inside `tokio::spawn`, which needs the whole future to be `Send` for every lifetime, rustc gave up with "implementation of `FnOnce` is not general enough". The iterator's closures carried borrowed lifetimes across an `.await`, and the compiler couldn't prove the result `Send` for all of them. Collecting the slots into a `Vec<(String, &mut Option<String>)>` before the first `.await` fixed it: a `Vec` of references is a plain type with one lifetime, and its `Send`-ness is obvious. When an async function fights you about `Send`, look for a lazy iterator or a guard that lives across an `.await`, and make it concrete before the wait.
+
+Formats moved with it. A node without this code would store and pass around bound references it doesn't expect, so the protocol and state generations went up (`src/compatibility.rs`) and a 0.1.5 cluster refuses this release.
+
+### Saying which registries you trust
+
+Binding fixes *which* bytes run. It says nothing about *whose*. Should a cluster that runs `docker.io/library/*` also run `ghcr.io/someone-you-never-heard-of/miner`? Until now, yes, always. So `node.toml` grew rules for upstream images:
+
+```toml
+[[images.trust_policy.upstream]]
+match = "docker.io/library/*"
+
+[images.trust_policy.upstream_default]
+allow = false
+```
+
+They live in node config for the same reason the signing keys do ("Whose key is it, anyway?"): if an API token could edit the list, a stolen token could add its own registry to it.
+
+Two details of the config types are new Rust. `match` is a keyword, so the field can't be called that; serde's `#[serde(rename = "match")]` keeps the TOML key while the struct says `pattern`. And `upstream_default.allow` must default to `true` (today's behaviour), but `#[derive(Default)]` would give `bool`'s default, `false`. So `UpstreamDefault` writes its own:
+
+```rust
+impl Default for UpstreamDefault {
+    fn default() -> Self {
+        Self { allow: true }
+    }
+}
+```
+
+With `#[serde(default)]` on the struct, a `node.toml` that never mentions the section gets that impl, and so does the parent's derived `Default`. A derive would have quietly flipped every existing cluster to an empty allow-list. (A test, `parse_trust_policy_defaults`, now says `allow` is `true` out loud.)
+
+"The most specific rule wins" is one iterator chain in `pickle::trust::matching_rule`:
+
+```rust
+policy
+    .upstream
+    .iter()
+    .filter_map(|rule| {
+        let specificity = match rule.pattern.strip_suffix('*') {
+            Some(prefix) => repository.starts_with(prefix).then_some((0, prefix.len())),
+            None => (rule.pattern == repository).then_some((1, rule.pattern.len())),
+        }?;
+        Some((specificity, rule))
+    })
+    .max_by_key(|(specificity, _)| *specificity)
+    .map(|(_, rule)| rule)
+```
+
+Tuples compare field by field, left to right, so `(1, _)` (an exact name) beats any `(0, _)` (a prefix), and between two prefixes the longer one wins. `bool::then_some` turns a condition into an `Option`, and the `?` inside the closure skips a rule that doesn't match. In Go you'd write the loop and keep a running best; here `max_by_key` is that loop.
+
+The check runs twice, like the signature check. At apply, `ImageBinder` judges every image before asking any registry about any of them, so a refused apply names the image and costs no network round trip. Then Bun judges again before every deploy (`enforce_upstream_rules`), because a spec can reach a node without passing this apply: one committed before the rules changed, or a node whose `node.toml` is stricter than the leader's. Both checks skip Pickle's own images, which answer to `require_signatures`, and both skip ProcessGrill, where an image is a placeholder.
+
+The refusal is a `thiserror` struct, `UpstreamRefused`, and the binder's error enum wraps it with `#[error(transparent)] NotAllowed(#[from] UpstreamRefused)`. `transparent` reuses the inner message unchanged; `#[from]` writes the `From` impl, so `check_upstream(...)?` inside `bind_slots` converts the error without a `map_err`. The apply route maps it to a 403, beside the 400 for a bad reference and the 502 for an unreachable registry.
+
+A rule can say `require_signatures = true`, and today that stops the node at startup. Checking cosign signatures is the next step (U3). Until it lands, a node that accepted the setting would skip the check it promised, which is the worst kind of security setting: one that's on and does nothing.
+
 ## What we deferred
 
 **TPM sealing** binds the master secret to specific hardware via the TPM chip's Platform Configuration Registers. If someone steals a disk, the master key is useless on different hardware. This is important for production hardening, but requires a TPM 2.0 device and the `tss-esapi` crate (Linux only). We've deferred it to v2.
@@ -1844,6 +1933,8 @@ Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
 - Every workload instance gets a SPIFFE X.509 certificate and OIDC JWT automatically, with exact validity windows and server-rebuilt SANs
 - Identity lives in a per-instance directory (tmpfs-backed on Linux root), created before start, removed with the instance, and restored — schedule and all — across agent restarts
 - Images are signed (keyless by the build signer, or with an operator key via `relish sign`) and verified before they deploy
+- Every apply binds image tags to digests, so every node and restart runs the bytes the apply resolved
+- Node-config rules decide which upstream registries a node will run images from, checked at apply and before every deploy
 - SecurityState (CAs, tokens, keypairs, CRL, secret seals) is replicated through Raft
 - The agent provisions identity during deploy and rotates certificates every 30 minutes
 - API tokens are managed via `relish token create/list/rotate/revoke`; Deployer and ReadOnly tokens live 90 days by default, and a rotation keeps the old secret working for a grace period

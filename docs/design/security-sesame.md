@@ -1150,6 +1150,21 @@ The manifest carries a single signature slot, so a later `relish sign`
 replaces an earlier signature (including a build signer's). Signatures bind
 digests, never tags: re-pushing a tag leaves the new digest unsigned.
 
+The signature format is Pickle's own (P-256 over the digest string), not
+cosign's. Images from outside Pickle carry no signature Pickle checks yet,
+but every apply binds their tags to digests (`nginx:1.27@sha256:…`), so the
+bytes that run are the bytes the apply resolved (F03 U1, #361). Which
+upstream registries a node runs images from is a third trust root,
+`[[images.trust_policy.upstream]]` (`match` a repository or a `*` prefix; the
+most specific rule wins) with `[images.trust_policy.upstream_default] allow`
+(default `true`; `false` makes the rules an allow-list). The node handling an
+apply checks it before contacting any registry, and Bun checks it again before
+every deploy where a council catalogue tells Pickle's images from upstream
+ones (F03 U2). It stays in `node.toml` for the same reason the keys do:
+nothing an API token can change should decide what the cluster trusts. A rule
+with `require_signatures = true` is refused at startup until cosign
+verification (F03 U3) can honour it.
+
 ---
 
 ## 6. Configuration

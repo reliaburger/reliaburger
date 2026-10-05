@@ -1189,3 +1189,6 @@ mod tests;
 
 #[cfg(test)]
 mod cluster_routing_tests;
+
+#[cfg(test)]
+mod binding_tests;
