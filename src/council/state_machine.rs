@@ -1006,8 +1006,14 @@ impl StateMachineInner {
                     });
                 }
                 token.consumed = true;
+                let node_id = token.node_id.clone();
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
+                crate::sesame::ca_rotation::record_node_leaf(
+                    &mut self.state.security_state,
+                    &node_id,
+                    serial,
+                );
                 return Some(CouncilResponse::JoinTokenConsumed { serial });
             }
             RaftRequest::CreateApiToken(token) => {
@@ -2092,7 +2098,38 @@ impl StateMachineInner {
                 }
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
+                crate::sesame::ca_rotation::record_node_leaf(
+                    &mut self.state.security_state,
+                    node_id,
+                    serial,
+                );
                 return Some(CouncilResponse::SerialAllocated { serial });
+            }
+            RaftRequest::CaRotationBegin { role, ca } => {
+                return match crate::sesame::ca_rotation::begin(
+                    &mut self.state.security_state,
+                    *role,
+                    ca,
+                ) {
+                    Ok(_) => None,
+                    Err(error) => Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    }),
+                };
+            }
+            RaftRequest::CaRotationFinalize { role, now_unix_ms } => {
+                let now = std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_millis(*now_unix_ms);
+                return match crate::sesame::ca_rotation::finalize(
+                    &mut self.state.security_state,
+                    *role,
+                    now,
+                ) {
+                    Ok(()) => None,
+                    Err(error) => Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    }),
+                };
             }
             RaftRequest::TestLeasePlacementRetired {
                 lease_id,
@@ -5521,6 +5558,111 @@ mod tests {
         // Gen 1 is retired; gen 0 stays, read-only, because it opens the
         // root CA backup `relish init` wrote (F04 R0).
         assert_eq!(remaining, [(0, true), (2, false)]);
+    }
+
+    /// F04 R1 through the log: a Node CA rotation begins, a second one is
+    /// refused, finalise is refused while a node still holds a leaf from the
+    /// retiring CA, and goes through once that node's renewal is allocated.
+    #[test]
+    fn ca_rotation_through_the_log_waits_for_every_node_leaf() {
+        use crate::sesame::types::{CaRole, CertificateAuthority, SerialNumber};
+        let mut inner = StateMachineInner::default();
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
+        inner.state.security_state = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![
+                CertificateAuthority {
+                    private_key_wrapped: None,
+                    ..hierarchy.root.ca.clone()
+                },
+                hierarchy.node.ca.clone(),
+            ],
+            next_serial: 10,
+            ..Default::default()
+        };
+        // node-a joins under generation 0.
+        inner
+            .state
+            .security_state
+            .join_tokens
+            .push(crate::sesame::types::JoinToken {
+                token_hash: [9; 32],
+                node_id: "node-a".into(),
+                expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+                consumed: false,
+                attestation_mode: crate::sesame::types::AttestationMode::None,
+            });
+        inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: [9; 32],
+        });
+        assert_eq!(
+            inner.state.security_state.node_leaves["node-a"].ca_generation,
+            0
+        );
+
+        let successor = |generation| {
+            let generated = crate::sesame::ca::generate_intermediate_ca(
+                CaRole::Node,
+                "rotate",
+                SerialNumber(50 + generation),
+                hierarchy.root.ca.serial,
+                &hierarchy.root.signing_keypair,
+                &hierarchy.root.certificate_params,
+                &[4; 32],
+            )
+            .unwrap();
+            Box::new(CertificateAuthority {
+                generation,
+                ..generated.ca
+            })
+        };
+        let new_ca = successor(1);
+        let begin = inner.apply_request(&RaftRequest::CaRotationBegin {
+            role: CaRole::Node,
+            ca: new_ca.clone(),
+        });
+        assert_eq!(begin, None);
+        assert_eq!(
+            inner
+                .state
+                .security_state
+                .active_ca(CaRole::Node)
+                .unwrap()
+                .generation,
+            1
+        );
+        let stacked = inner.apply_request(&RaftRequest::CaRotationBegin {
+            role: CaRole::Node,
+            ca: successor(2),
+        });
+        assert!(matches!(stacked, Some(CouncilResponse::Refused { .. })));
+
+        let now_unix_ms = new_ca
+            .not_before
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        let early = inner.apply_request(&RaftRequest::CaRotationFinalize {
+            role: CaRole::Node,
+            now_unix_ms,
+        });
+        let Some(CouncilResponse::Refused { reason }) = early else {
+            panic!("finalise must be refused while node-a holds an old leaf: {early:?}");
+        };
+        assert!(reason.contains("node-a"), "{reason}");
+
+        inner.apply_request(&RaftRequest::AllocateNodeSerial {
+            node_id: "node-a".into(),
+        });
+        let done = inner.apply_request(&RaftRequest::CaRotationFinalize {
+            role: CaRole::Node,
+            now_unix_ms,
+        });
+        assert_eq!(done, None);
+        assert_eq!(
+            inner.state.security_state.trusted_cas(CaRole::Node).len(),
+            1
+        );
     }
 
     /// Only the cluster-wide generation-0 key opens the root CA backup; a

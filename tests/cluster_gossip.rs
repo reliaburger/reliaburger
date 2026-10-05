@@ -168,6 +168,10 @@ fn issued_node_identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> 
         private_key_der,
         serial,
         ca_generation: 0,
+        trust: reliaburger::sesame::trust::TrustSet::single(
+            hierarchy.node.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ),
         node_ca_der: hierarchy.node.ca.certificate_der.clone(),
         root_ca_der: hierarchy.root.ca.certificate_der.clone(),
         not_before: now,
@@ -489,7 +493,8 @@ async fn generated_security_model_protects_all_live_cluster_transports() {
     for (index, node) in nodes.iter().enumerate() {
         let replacement =
             issued_node_identity(&hierarchy, &format!("tls-{}", index + 1), 20 + index as u64);
-        node.2.replace(replacement).await.unwrap();
+        let trust = replacement.trust.clone();
+        node.2.replace(replacement, &trust).await.unwrap();
     }
     let revoked = reliaburger::sesame::types::Crl {
         retired_nodes: Default::default(),
@@ -971,7 +976,8 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
         .to_vec();
     due.private_key_der = key.serialize_der();
     due.serial = SerialNumber(20);
-    nodes[worker_index].2.replace(due).await.unwrap();
+    let trust = due.trust.clone();
+    nodes[worker_index].2.replace(due, &trust).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), entered.notified())
         .await
         .unwrap();

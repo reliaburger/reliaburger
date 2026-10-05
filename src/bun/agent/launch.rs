@@ -461,14 +461,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let catalog = council.manifest_catalog().await;
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
-        let root_ca = security_state
-            .get_ca(crate::sesame::types::CaRole::Root)
-            .map(|ca| ca.certificate_der.clone());
+        // Every root the council trusts (F04 R2): an image signed under one
+        // that's still trusted keeps verifying.
+        let trusted_roots: Vec<Vec<u8>> = security_state
+            .trusted_cas(crate::sesame::types::CaRole::Root)
+            .into_iter()
+            .map(|ca| ca.certificate_der.clone())
+            .collect();
         let verified = crate::meat::scheduler::verify_image_signature(
             image,
             &catalog,
             &self.trust_policy,
-            root_ca.as_deref(),
+            &trusted_roots,
             Some(&security_state.crl),
         )
         .map_err(|e| e.to_string())?;

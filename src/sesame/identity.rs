@@ -216,17 +216,22 @@ pub fn validate_and_sign_csr(
 // ---------------------------------------------------------------------------
 
 /// Build a complete workload identity bundle from a signed certificate.
+///
+/// `ca_bundle` is every CA the workload should trust, in order: the trusted
+/// Workload CAs, then the roots ([`super::trust::workload_ca_bundle`]). It
+/// becomes `ca.pem`, so during a Workload CA rotation a workload accepts
+/// peers whose certificates came from either CA.
 pub fn build_identity_bundle(
     spiffe_uri: SpiffeUri,
     certificate_der: Vec<u8>,
     private_key_der: Vec<u8>,
-    workload_ca_cert_der: &[u8],
-    root_ca_cert_der: &[u8],
+    ca_bundle: &[Vec<u8>],
     jwt_token: String,
 ) -> WorkloadIdentity {
-    let workload_ca_pem = cert::der_to_pem(workload_ca_cert_der, "CERTIFICATE");
-    let root_ca_pem = cert::der_to_pem(root_ca_cert_der, "CERTIFICATE");
-    let ca_chain_pem = format!("{workload_ca_pem}{root_ca_pem}");
+    let ca_chain_pem: String = ca_bundle
+        .iter()
+        .map(|der| cert::der_to_pem(der, "CERTIFICATE"))
+        .collect();
 
     let now = SystemTime::now();
     WorkloadIdentity {
@@ -1001,8 +1006,7 @@ mod tests {
             uri.clone(),
             cert_der,
             private_key_der,
-            &workload_ca_cert_der,
-            &root_ca_cert_der,
+            &[workload_ca_cert_der.clone(), root_ca_cert_der.clone()],
             "test-jwt-token".to_string(),
         );
 
@@ -1036,8 +1040,7 @@ mod tests {
             uri,
             cert_der,
             private_key_der,
-            &workload_ca_cert_der,
-            &root_ca_cert_der,
+            &[workload_ca_cert_der, root_ca_cert_der],
             jwt.to_string(),
         )
     }

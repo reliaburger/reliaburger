@@ -12,7 +12,7 @@ use rcgen::{
 use ring::rand::{SecureRandom, SystemRandom};
 
 use super::crypto;
-use super::types::{CaRole, CertificateAuthority, SerialNumber};
+use super::types::{CaRole, CaState, CertificateAuthority, SerialNumber};
 
 /// Errors from CA operations.
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +101,7 @@ pub fn generate_root_ca(cluster_name: &str, serial: SerialNumber) -> Result<Gene
         not_after: params.not_after.into(),
         issuer_serial: None,
         generation: 0,
+        state: CaState::Active,
     };
 
     Ok(GeneratedCa {
@@ -183,6 +184,7 @@ pub fn generate_intermediate_ca(
         not_after: params.not_after.into(),
         issuer_serial: Some(parent_serial),
         generation: 0,
+        state: CaState::Active,
     };
 
     Ok(GeneratedCa {

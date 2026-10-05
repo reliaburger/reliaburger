@@ -2,7 +2,8 @@
 
 use super::{
     ca, cert, join,
-    types::{CaRole, SecurityState, SerialNumber},
+    trust::TrustSet,
+    types::{SecurityState, SerialNumber},
 };
 use crate::council::{CouncilNode, CouncilResponse, RaftRequest};
 
@@ -119,24 +120,14 @@ pub(crate) fn validate_peer(
     peer: &TlsPeerCertificate,
     state: &SecurityState,
 ) -> Result<String, RenewalError> {
-    let node_ca = state
-        .get_ca(CaRole::Node)
-        .ok_or_else(|| RenewalError::Unavailable("Node CA is unavailable".into()))?;
-    let root_ca = state
-        .get_ca(CaRole::Root)
-        .ok_or_else(|| RenewalError::Unavailable("Root CA is unavailable".into()))?;
-    cert::validate_chain(&peer.0, &node_ca.certificate_der, &root_ca.certificate_der)
+    // Every Node CA the council trusts, so a node holding a leaf from a
+    // retiring CA can still renew onto the new one (F04 R2).
+    let trust = TrustSet::from_state(state)
+        .ok_or_else(|| RenewalError::Unavailable("Node CA or root is unavailable".into()))?;
+    let chain = trust
+        .validate_node_leaf(&peer.0)
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
-    cert::check_issuer_binding(&peer.0, &node_ca.certificate_der)
-        .and_then(|()| {
-            cert::check_issuer_binding(&node_ca.certificate_der, &root_ca.certificate_der)
-        })
-        .map_err(|error| RenewalError::Identity(error.to_string()))?;
-    for certificate in [
-        peer.0.as_ref(),
-        &node_ca.certificate_der,
-        &root_ca.certificate_der,
-    ] {
+    for certificate in [peer.0.as_ref(), chain.node_ca, chain.root] {
         let (_, parsed) = x509_parser::parse_x509_certificate(certificate)
             .map_err(|error| RenewalError::Identity(error.to_string()))?;
         if parsed.serial.to_bytes_be().len() > 8 {

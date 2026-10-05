@@ -367,6 +367,51 @@ struct CachedCertificate {
 /// the cap is defence in depth against a pathologically large route set.
 const MAX_SNI_CACHE: usize = 1024;
 
+/// A certificate resolver whose inner resolver can be swapped under a running
+/// listener (F04 R2).
+///
+/// The ingress listener is bound once, with one resolver. When the Ingress CA
+/// rotates, Bun builds a resolver over the new CA and swaps it in here, and
+/// the next handshake mints its leaf from the new CA. No rebind, no restart.
+pub struct ReloadableCertResolver {
+    // `resolve` is a synchronous rustls callback, so this is a std lock; the
+    // critical section clones an `Arc` and nothing awaits while it's held.
+    current: std::sync::RwLock<Arc<dyn rustls::server::ResolvesServerCert>>,
+}
+
+impl std::fmt::Debug for ReloadableCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadableCertResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReloadableCertResolver {
+    /// Start with `inner` answering every handshake.
+    pub fn new(inner: Arc<dyn rustls::server::ResolvesServerCert>) -> Self {
+        Self {
+            current: std::sync::RwLock::new(inner),
+        }
+    }
+
+    /// Answer every later handshake with `inner`.
+    pub fn replace(&self, inner: Arc<dyn rustls::server::ResolvesServerCert>) {
+        // A poisoned lock means a reader panicked holding a clone of an Arc;
+        // the value itself is intact.
+        *self.current.write().unwrap_or_else(|p| p.into_inner()) = inner;
+    }
+}
+
+impl rustls::server::ResolvesServerCert for ReloadableCertResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let inner = Arc::clone(&self.current.read().unwrap_or_else(|p| p.into_inner()));
+        inner.resolve(client_hello)
+    }
+}
+
 /// Per-SNI ingress certificate resolver backed by the cluster Ingress CA (M8).
 ///
 /// On each TLS handshake it looks at the client's SNI hostname. A cluster-CA
@@ -766,6 +811,100 @@ mod tests {
         // A different host issues a distinct cert.
         let other = resolver.key_for("other.example.com").unwrap();
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    /// A test client that records the server's leaf and trusts anything; the
+    /// point is which certificate the listener presents, not its chain.
+    #[derive(Debug)]
+    struct AcceptAnyServer(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// The leaf a listener with `config` presents to one fresh client.
+    async fn presented_leaf(config: Arc<ServerConfig>) -> Vec<u8> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServer(provider)))
+            .with_no_client_auth();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = async {
+            tokio_rustls::TlsAcceptor::from(config)
+                .accept(server_io)
+                .await
+                .map(drop)
+        };
+        let client = async {
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let stream = tokio_rustls::TlsConnector::from(Arc::new(client))
+                .connect(name, client_io)
+                .await
+                .unwrap();
+            stream.get_ref().1.peer_certificates().unwrap()[0].to_vec()
+        };
+        let (_, leaf) = tokio::join!(server, client);
+        leaf
+    }
+
+    /// F04 R2: an Ingress CA rotation swaps the resolver under a listener
+    /// that's already running, and the next handshake sees the new one.
+    #[tokio::test]
+    async fn a_reloaded_resolver_answers_the_next_handshake() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let old = Arc::new(resolver_with(empty_routes()));
+        let new = Arc::new(resolver_with(empty_routes()));
+        let reloadable = Arc::new(ReloadableCertResolver::new(old.clone()));
+        let config = build_tls_config_with_resolver(reloadable.clone()).unwrap();
+
+        let first = presented_leaf(config.clone()).await;
+        assert_eq!(first, old.default_key.cert[0].to_vec());
+
+        reloadable.replace(new.clone());
+        let second = presented_leaf(config).await;
+        assert_eq!(second, new.default_key.cert[0].to_vec());
     }
 
     /// An empty routing table — every SNI is an unconfigured host.

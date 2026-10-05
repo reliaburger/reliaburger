@@ -9591,8 +9591,10 @@ fn write_test_identity(
         uri,
         cert_der,
         private_key_der,
-        &hierarchy.workload.ca.certificate_der,
-        &hierarchy.root.ca.certificate_der,
+        &[
+            hierarchy.workload.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ],
         "adopted-jwt".to_string(),
     );
     let dir = crate::sesame::identity::instance_identity_dir(volumes, instance);
@@ -12491,6 +12493,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
                 cert_der: issued.certificate_der.clone(),
                 workload_ca_cert_der: vec![1],
                 root_ca_cert_der: vec![2],
+                ca_bundle_der: vec![vec![1], vec![2]],
                 jwt_token: Some("jwt".into()),
             }),
         )

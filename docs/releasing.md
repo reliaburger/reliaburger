@@ -237,11 +237,13 @@ key (`secret_key = true` in `[namespace.X]`, F05 I4), which adds a field to
 every namespace in the council's state, and the Raft entry that creates a
 namespace's key carries the values it re-seals. API token rotation (F05 I3)
 adds a Raft entry and keeps a rotated token's old secret beside its new one.
-So the protocol moved from 40 to 42 and the state format from 57 to 59. Recreate the cluster the same way
-as [from 0.1.0](#upgrading-from-010): move the data directories aside (or
+Intermediate CA rotation and trust bundles (F04 R1, R2) keep several CAs per
+role and send the trusted set in joins, signing answers and node snapshots.
+So the protocol moved from 40 to 44 and the state format from 57 to 61.
+Recreate the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data directories aside (or
 `relish local destroy --yes` a laptop cluster), install 0.1.6 and re-apply
 your apps. 0.1.5's leader refuses the upgrade before it records a run, with
-`found protocol 42, state 59; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 57`.
+`found protocol 44, state 61; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 57`.
 
 ## Signing identity
 

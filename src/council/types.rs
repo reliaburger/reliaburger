@@ -364,6 +364,22 @@ pub enum RaftRequest {
     },
     /// Admit an authenticated webhook before returning 202 to its provider.
     GitOpsSyncRequested { delivery: [u8; 32] },
+    /// Begin rotating an intermediate CA (F04 R1): `ca` becomes the role's
+    /// active CA and the current one retires, still trusted. One rotation
+    /// per role at a time; a retry of the same generation is a no-op. The
+    /// rules live in [`crate::sesame::ca_rotation::begin`].
+    CaRotationBegin {
+        role: crate::sesame::types::CaRole,
+        ca: Box<crate::sesame::types::CertificateAuthority>,
+    },
+    /// Finish rotating an intermediate CA: drop the retiring one, refused
+    /// while a live leaf could still chain to it. `now_unix_ms` is the
+    /// proposer's clock, carried in the log so every replica judges the
+    /// retiring window against the same instant.
+    CaRotationFinalize {
+        role: crate::sesame::types::CaRole,
+        now_unix_ms: u64,
+    },
     /// Give an API token a new secret under the same name; the old secret
     /// keeps working until the rotation's grace end (F05 I3). Refused for a
     /// name that doesn't exist or belongs to a test lease.
