@@ -1018,8 +1018,10 @@ On each council node (intended design):
 
 ### 5.8 CA Rotation
 
-> **Status: planned — not yet implemented.** There is no `relish ca` command
-> family (no `ca rotate`, `ca rotate --root`, or generation bump). CA rotation,
+> **Status: planned — not yet implemented.** The `relish ca` family has only
+> `ca backup` and `ca verify` (F04 R3): an operator-held root backup sealed to
+> a passphrase or an age recipient, checked offline for key match, expiry and
+> fingerprint. There is no `ca rotate`, `ca rotate --root`, or generation bump. CA rotation,
 > the dual-signing transition, and root cross-signing below are design, not
 > shipped code. (Certificate *revocation* via the CRL — §5.7,
 > `RaftRequest::RevokeCertificate` — is separate and does ship.) The

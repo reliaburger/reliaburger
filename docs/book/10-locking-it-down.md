@@ -419,9 +419,9 @@ mycluster-master.key              # hex-encoded 32-byte master secret (0o600)
 mycluster-security-bootstrap.json # full SecurityState as JSON
 ```
 
-The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file.
+The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file, and make an operator-held copy of the root itself with `relish ca backup` (Chapter 4 explains why the sealed file alone isn't enough).
 
-The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON, writes a `SecurityStateInit` command to Raft, and deletes the file. After that, SecurityState lives in Raft and replicates to every council node automatically.
+The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk: `relish ca backup` reads the root certificate and the cluster's `age` keys from it.
 
 ### Turning mTLS on: the mode matrix
 

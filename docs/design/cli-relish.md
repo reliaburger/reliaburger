@@ -688,6 +688,10 @@ relish secret rotate --finalize     # Finalise rotation (drop the old read-only 
 relish secret pubkey --namespace <ns>               # A namespace's own key (secret_key = true)
 relish secret rotate [--finalize] --namespace <ns>  # Rotate one namespace's key (unscoped Admin)
 
+# Root CA backup (offline)
+relish ca backup --out <file> [--dir <init-dir>] [--cluster-name <name>] [--recipient <age1...> | --passphrase-file <path>]
+relish ca verify <file> --fingerprint sha256:... [--passphrase-file <path> | --identity <path>]
+
 # Tokens
 relish token create --name <name>   # Create an API token (default role: read-only)
 relish token create --name <name> --role <admin|deployer|read-only>

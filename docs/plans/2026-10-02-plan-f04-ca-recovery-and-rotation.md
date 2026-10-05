@@ -142,3 +142,5 @@ The recommendations were approved as written:
 5. **Backups:** a passphrase by default, `--recipient` for an age key.
 
 R0 shipped in 0.1.4 (#472).
+
+R3 (the operator-held root backup, `relish ca backup` and `relish ca verify`) is in 0.1.6.

@@ -385,6 +385,11 @@ enum Command {
         #[command(subcommand)]
         action: SecretAction,
     },
+    /// Back up and check the cluster's root CA, offline.
+    Ca {
+        #[command(subcommand)]
+        action: CaAction,
+    },
     /// Manage API tokens.
     Token {
         #[command(subcommand)]
@@ -828,6 +833,55 @@ enum SecretAction {
         /// Rotate this namespace's own key instead of the cluster key.
         #[arg(long)]
         namespace: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CaAction {
+    /// Write the root CA's key and certificate to a sealed file you keep.
+    ///
+    /// Run it on the node where `relish init` ran: it reads the master key,
+    /// the security bootstrap state and the sealed root key from `--dir`. The
+    /// backup holds the root key and certificate plus the cluster, trust
+    /// domain, fingerprint and expiry. It's sealed to a passphrase (asked at
+    /// the terminal, twice) or, with `--recipient`, to your age public key,
+    /// never to a cluster key. The file is never overwritten.
+    Backup {
+        /// Where to write the sealed backup (created owner-only).
+        #[arg(long)]
+        out: PathBuf,
+        /// The directory `relish init` wrote to.
+        #[arg(long, default_value = reliaburger::relish::ca_cmd::DEFAULT_INIT_DIR)]
+        dir: PathBuf,
+        /// The cluster name, when the directory holds more than one.
+        #[arg(long)]
+        cluster_name: Option<String>,
+        /// Seal to this age public key (`age1...`) instead of a passphrase.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        recipient: Option<String>,
+        /// Read the passphrase from the first line of this file instead of
+        /// asking.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Check a root CA backup offline.
+    ///
+    /// Opens the backup and checks that the key matches the certificate,
+    /// that the root hasn't expired and that its fingerprint is the one
+    /// your cluster's nodes pin (printed by `relish init` and `relish join`).
+    Verify {
+        /// The sealed backup `relish ca backup` wrote.
+        file: PathBuf,
+        /// The cluster's root CA fingerprint (`sha256:...`).
+        #[arg(long)]
+        fingerprint: String,
+        /// Read the passphrase from the first line of this file instead of
+        /// asking.
+        #[arg(long, conflicts_with = "identity")]
+        passphrase_file: Option<PathBuf>,
+        /// Your age identity file, for a backup sealed with `--recipient`.
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
 }
 
@@ -1655,6 +1709,43 @@ async fn main() -> ExitCode {
                 namespace,
             } => commands::secret_rotate(*finalize, namespace.as_deref()).await,
         },
+        Command::Ca { action } => match &action {
+            CaAction::Backup {
+                out,
+                dir,
+                cluster_name,
+                recipient,
+                passphrase_file,
+            } => {
+                use reliaburger::relish::ca_cmd::{BackupTarget, PassphraseSource};
+                let target = match (recipient, passphrase_file) {
+                    (Some(recipient), _) => BackupTarget::Recipient(recipient.clone()),
+                    (None, Some(path)) => {
+                        BackupTarget::Passphrase(PassphraseSource::File(path.clone()))
+                    }
+                    (None, None) => BackupTarget::Passphrase(PassphraseSource::Prompt),
+                };
+                reliaburger::relish::ca_cmd::ca_backup(out, dir, cluster_name.as_deref(), &target)
+            }
+            CaAction::Verify {
+                file,
+                fingerprint,
+                passphrase_file,
+                identity,
+            } => {
+                use reliaburger::relish::ca_cmd::PassphraseSource;
+                let passphrase = match passphrase_file {
+                    Some(path) => PassphraseSource::File(path.clone()),
+                    None => PassphraseSource::Prompt,
+                };
+                reliaburger::relish::ca_cmd::ca_verify(
+                    file,
+                    fingerprint,
+                    &passphrase,
+                    identity.as_deref(),
+                )
+            }
+        },
         Command::Token { action } => match &action {
             TokenAction::Create {
                 name,
@@ -2022,6 +2113,77 @@ mod tests {
             updated == readme,
             "README.md's relish command list is out of date; run `{REGENERATE_COMMAND}`"
         );
+    }
+
+    #[test]
+    fn ca_backup_seals_to_a_passphrase_unless_given_a_recipient() {
+        let cli = Cli::try_parse_from(["relish", "ca", "backup", "--out", "root.age"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Backup {
+                    recipient: None,
+                    passphrase_file: None,
+                    cluster_name: None,
+                    ref dir,
+                    ..
+                }
+            }) if dir == std::path::Path::new("/etc/reliaburger")
+        ));
+        let cli = Cli::try_parse_from([
+            "relish",
+            "ca",
+            "backup",
+            "--out",
+            "root.age",
+            "--recipient",
+            "age1example",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Backup {
+                    recipient: Some(ref r),
+                    ..
+                }
+            }) if r == "age1example"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "ca",
+                "backup",
+                "--out",
+                "root.age",
+                "--recipient",
+                "age1example",
+                "--passphrase-file",
+                "p",
+            ])
+            .is_err(),
+            "a recipient and a passphrase are two different seals"
+        );
+    }
+
+    #[test]
+    fn ca_verify_needs_the_clusters_fingerprint() {
+        assert!(Cli::try_parse_from(["relish", "ca", "verify", "root.age"]).is_err());
+        let cli = Cli::try_parse_from([
+            "relish",
+            "ca",
+            "verify",
+            "root.age",
+            "--fingerprint",
+            "sha256:abc",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Verify { ref fingerprint, .. }
+            }) if fingerprint == "sha256:abc"
+        ));
     }
 
     #[test]

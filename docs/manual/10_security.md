@@ -270,6 +270,51 @@ re-sealed, never the values), and every rotation or finalise records
 `secret.rotated` or `secret.rotation_finalised` with the namespace in its
 details. See them with `relish events`.
 
+## Backing up the root CA
+
+`<cluster>-root-ca.age` only opens with the master key and the cluster's own
+state, so it's a backup for the cluster rather than for you. Make your own
+copy of the root, one that opens with something only you hold. Run this on
+the node where `relish init` ran, since that's where the master key, the
+security state and the sealed root are:
+
+```sh
+relish ca backup --out prod-root-backup.age --dir /etc/reliaburger
+```
+
+It asks for a passphrase twice (at least 12 characters) and writes the root's
+private key and certificate, with the cluster, trust domain, fingerprint and
+expiry, into an ASCII-armoured age file. The file is created owner-only, and
+an existing file is never overwritten. If the directory holds more than one
+cluster, add `--cluster-name`. To seal it to your own age key instead of a
+passphrase:
+
+```sh
+relish ca backup --out prod-root-backup.age --recipient age1...
+```
+
+`--passphrase-file PATH` reads the passphrase from the first line of a file,
+for scripts. The backup is never sealed to a cluster key: those rotate, and
+this file has to outlive them. Store it off the cluster, away from the
+passphrase or identity that opens it. The root's key never goes into the
+council or onto another node; rotating an intermediate (coming in a later
+release) will ask for this file rather than keep the root on the cluster.
+
+Check a backup at any time, with no cluster running:
+
+```sh
+relish ca verify prod-root-backup.age --fingerprint sha256:...
+relish ca verify prod-root-backup.age --fingerprint sha256:... --identity ~/.age/operator.key
+```
+
+`--fingerprint` is the root CA fingerprint `relish init` printed and every
+joiner pinned. `verify` refuses a backup whose key doesn't match its
+certificate, whose root has expired, whose recorded fingerprint isn't its
+certificate's, or that belongs to another cluster. A wrong passphrase or
+identity doesn't open it at all. Since the file is a standard age file, the
+`age` tool opens it too, and inside is JSON with the certificate and key in
+PEM.
+
 ## Workload identity
 
 Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`

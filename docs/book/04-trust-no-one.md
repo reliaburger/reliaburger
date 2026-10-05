@@ -129,6 +129,148 @@ Cluster initialised.
     relish join-token create --node-id <node-id>
 ```
 
+## A root backup you hold
+
+Look again at step 7. The root key is sealed to the cluster's own `age` key,
+and that key's private half is wrapped with the master key and stored in the
+security state. So `prod-root-ca.age` opens only for someone holding the
+master key *and* the cluster's state. That's a backup for the cluster. It
+isn't a backup for you. And the cluster's `age` keys rotate: the first
+version of `relish secret rotate --finalize` quietly threw away the very key
+this file was sealed to, and we had to make it keep that one (F04 R0). A
+backup that depends on a key the system rotates is a backup with an expiry
+date nobody wrote down.
+
+What does an operator actually want? The root key and its certificate, in a
+file they keep somewhere far from the cluster, that opens with something only
+they hold. That's `relish ca backup`:
+
+```bash
+$ relish ca backup --out prod-root-backup.age --dir /etc/reliaburger
+Passphrase for the root CA backup:
+Again:
+wrote the root CA backup to prod-root-backup.age
+  cluster:      prod
+  trust domain: prod
+  fingerprint:  sha256:0123...
+  expires:      2036-10-01 (2106475200 unix seconds)
+```
+
+It runs on the node where `relish init` ran, because that's where the three
+ingredients are: the master key, the security bootstrap state and the sealed
+root. It unwraps the cluster's `age` keys with the master key, opens the
+sealed root with whichever one fits, and reseals the key, together with the
+certificate and some metadata, to a passphrase. `--recipient age1...` seals
+it to the operator's own `age` key instead. The plan's open question was
+whether a passphrase is good enough as the default. The maintainer said yes,
+with the recipient as the option, so that's what we built.
+
+We also decided where the root key *lives* after init: with the operator.
+It never goes into Raft, and no node keeps it. When intermediate rotation
+arrives, the CLI will unseal this backup on the operator's machine and sign a
+request the cluster made, so the root key still never touches the cluster.
+That's why this backup has to be good. Some day it's the only copy anyone can
+use.
+
+### The file is just an age file
+
+The sealed file is ASCII-armoured `age`, so `age -d` opens it as well as
+`relish` does, and inside is plain JSON with the certificate and key in PEM.
+We could have invented our own envelope (we already have AES-GCM and Argon2id
+lying around), but a backup you may need in ten years should open with a
+standard tool. With a passphrase, `age` uses scrypt and calibrates its cost to
+about a second on the machine that seals it, and we refuse passphrases
+shorter than 12 characters.
+
+The JSON is a `RootBackup` (in `src/sesame/root_backup.rs`): format tag,
+cluster, trust domain (the cluster name, which is the SPIFFE trust domain),
+fingerprint, expiry, certificate and key. It doesn't `#[derive(Debug)]`. A
+derived `Debug` prints every field, and one stray `{backup:?}` in an error
+message would put the root key in a log. So we write the trait by hand:
+
+```rust
+impl std::fmt::Debug for RootBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootBackup")
+            .field("cluster", &self.cluster)
+            .field("fingerprint", &self.fingerprint)
+            // ...
+            .field("private_key_pem", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+```
+
+`impl Trait for Type` is how Rust attaches an interface to a type, roughly
+what Go does implicitly when a type has the right methods, except that Rust
+makes you say it. `#[derive(...)]` is the compiler writing that `impl` for
+you. Here we'd rather it didn't.
+
+Opening the file needs the right kind of key, and `age` tells you which kind
+from the header. We match on both at once:
+
+```rust
+let mut reader = match (decryptor, with) {
+    (age::Decryptor::Passphrase(d), BackupOpener::Passphrase(passphrase)) => {
+        d.decrypt(passphrase, None).map_err(|e| open_failed(&e))?
+    }
+    (age::Decryptor::Recipients(d), BackupOpener::Identity(identity)) => d
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .map_err(|e| open_failed(&e))?,
+    (age::Decryptor::Passphrase(_), BackupOpener::Identity(_)) => {
+        return Err(RootBackupError::NeedsPassphrase);
+    }
+    (age::Decryptor::Recipients(_), BackupOpener::Passphrase(_)) => {
+        return Err(RootBackupError::NeedsIdentity);
+    }
+};
+```
+
+Matching on a tuple lays out all four combinations as a table, and the
+compiler checks that the table has no holes. Add a third kind of seal and
+this stops compiling until you've said what happens.
+
+The passphrase itself travels as a `SecretString`, from the `secrecy` crate
+that `age` re-exports. It has no `Display`, its `Debug` prints nothing useful,
+and it wipes its memory when dropped. Reading the value takes an explicit
+`.expose_secret()`, which is easy to search for. At the terminal, `relish`
+turns echo off with `termios` before asking, and turns it back on whether or
+not the read worked.
+
+### Verifying without a cluster
+
+A backup you've never checked is a hope. `relish ca verify` opens one and
+checks it offline:
+
+```bash
+$ relish ca verify prod-root-backup.age --fingerprint sha256:0123...
+```
+
+`RootBackup::verify` refuses, in this order:
+
+- a key whose public half isn't the certificate's subject key, or a
+  certificate that its own key doesn't verify (that's an intermediate, not a
+  root);
+- a recorded fingerprint that isn't the certificate's, so the metadata can't
+  lie about what's inside;
+- a root whose fingerprint isn't the one you passed, the `sha256:` value
+  `relish init` printed and every joiner pinned. That's how a backup of
+  another cluster gets caught;
+- a root that has expired.
+
+`relish ca backup` runs the same checks before it writes anything, so it
+never produces a file that `verify` would refuse.
+
+The tests follow the plan's list. A passphrase round trip opens what it
+sealed and verifies. A wrong passphrase doesn't open the file. A key swapped
+in from another root fails with `KeyMismatch`. A root checked one second past
+its `notAfter` fails with `Expired` (we pass the clock in rather than forge a
+certificate from the past). A second cluster's backup, otherwise perfect,
+fails with `ForeignRoot`. Around those sit a few more: an intermediate passed
+off as a root, a tampered fingerprint, a recipient-sealed file that only its
+identity opens, a backup built straight from what `relish init` wrote (and
+not from a wrong master key), and `Debug` output with no key in it.
+
 ## Join tokens and node certificates
 
 New nodes join by presenting a join token:
