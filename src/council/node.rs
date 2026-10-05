@@ -279,6 +279,12 @@ impl CouncilNode {
         self.state_machine.desired_state().await
     }
 
+    /// Borrow the local desired state for `read`, without cloning all of
+    /// it. Follower-local, like [`Self::desired_state`].
+    pub async fn read_desired<T>(&self, read: impl FnOnce(&DesiredState) -> T) -> T {
+        self.state_machine.read_desired(read).await
+    }
+
     /// Establish an applied log barrier before inspecting fault ownership.
     /// A timed-out grant write may still commit. A following no-op must apply
     /// first, so dropping the caller's future cannot hide that reservation.

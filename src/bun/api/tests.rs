@@ -3348,6 +3348,7 @@ async fn secret_public_key_exposes_only_current_public_material_to_scoped_reader
                 .write(crate::council::RaftRequest::RotateSecretKey {
                     scope: crate::sesame::types::AgeKeyScope::ClusterWide,
                     new_keypair: key,
+                    resealed: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -3468,6 +3469,326 @@ async fn secret_rotate_second_rotation_surfaces_as_conflict() {
         "a rotation is already in flight"
     );
     shutdown.cancel();
+}
+
+/// Give `namespace` its first key directly, as the leader's opt-in loop
+/// would, and return it.
+async fn give_namespace_a_key(
+    council: &crate::council::CouncilNode,
+    namespace: &str,
+) -> crate::sesame::types::AgeKeypair {
+    let scope = crate::sesame::types::AgeKeyScope::Namespace(namespace.to_string());
+    let (key, _) = crate::sesame::secret::generate_age_keypair(
+        scope.clone(),
+        council.wrapping_ikm().unwrap(),
+        0,
+    )
+    .unwrap();
+    council
+        .write(crate::council::RaftRequest::RotateSecretKey {
+            scope,
+            new_keypair: key.clone(),
+            resealed: Vec::new(),
+        })
+        .await
+        .unwrap();
+    key
+}
+
+/// F05 I4: `?namespace=` names a namespace's own public key, a namespace
+/// without one is a 404 that says what to do, and a token scoped to other
+/// namespaces can't ask.
+#[tokio::test]
+async fn secret_public_key_serves_a_namespaces_own_key() {
+    let council = seeded_council_with_ikm("public-key-namespace").await;
+    let team_a = give_namespace_a_key(&council, "team-a").await;
+    let (admin, admin_secret) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let team_b_reader = crate::sesame::token::create_token(
+        "team-b-reader",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-b".into()]),
+        },
+        None,
+    )
+    .unwrap();
+    let store = crate::sesame::auth::new_token_store();
+    *store.write().await = vec![admin, team_b_reader.token];
+    let (tx, _rx) = mpsc::channel(1);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let ask = |uri: &'static str, token: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+
+    let (status, body) = ask(
+        "/v1/secret/public-key?namespace=team-a",
+        admin_secret.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["public_key"], team_a.public_key);
+    assert_eq!(json["generation"], 0);
+    let cluster = council.security_state().await;
+    assert_ne!(
+        json["public_key"],
+        cluster.cluster_age_keypair().unwrap().public_key
+    );
+
+    let (status, body) = ask(
+        "/v1/secret/public-key?namespace=team-b",
+        admin_secret.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("secret_key = true"), "{body}");
+
+    let (status, _) = ask(
+        "/v1/secret/public-key?namespace=team-a",
+        team_b_reader.plaintext.clone(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "team-b's token asks about team-a"
+    );
+    let (status, _) = ask("/v1/secret/public-key", team_b_reader.plaintext).await;
+    assert_eq!(status, StatusCode::OK, "the cluster key is still public");
+}
+
+/// F05 I4: a namespace's key rotates and finalises on its own, without
+/// touching the cluster key or another namespace's, and both steps are
+/// audited with the namespace named.
+#[tokio::test]
+async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
+    let (admin, plaintext) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let council = seeded_council_with_ikm("rotate-namespace").await;
+    give_namespace_a_key(&council, "team-a").await;
+    give_namespace_a_key(&council, "team-b").await;
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+
+    let (status, body) = post_authenticated(
+        app.clone(),
+        "/v1/secret/rotate",
+        &plaintext,
+        r#"{"namespace":"team-a"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let generations = |security: &crate::sesame::types::SecurityState| {
+        let mut keys: Vec<(String, u64, bool)> = security
+            .age_keypairs
+            .iter()
+            .map(|kp| {
+                let scope = match &kp.scope {
+                    crate::sesame::types::AgeKeyScope::ClusterWide => "cluster".to_string(),
+                    crate::sesame::types::AgeKeyScope::Namespace(ns) => ns.clone(),
+                };
+                (scope, kp.generation, kp.read_only)
+            })
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        generations(&council.security_state().await),
+        [
+            ("cluster".to_string(), 0, false),
+            ("team-a".to_string(), 0, true),
+            ("team-a".to_string(), 1, false),
+            ("team-b".to_string(), 0, false),
+        ]
+    );
+
+    let (status, body) = post_authenticated(
+        app.clone(),
+        "/v1/secret/rotate",
+        &plaintext,
+        r#"{"namespace":"team-a","finalize":true}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        generations(&council.security_state().await),
+        [
+            ("cluster".to_string(), 0, false),
+            ("team-a".to_string(), 1, false),
+            ("team-b".to_string(), 0, false),
+        ]
+    );
+
+    let recorded = events.read().await.recent(20, None, None);
+    let audited: Vec<(Option<&str>, Option<&str>, Option<&str>)> = recorded
+        .iter()
+        .map(|event| {
+            (
+                event.action.as_deref(),
+                event.details.get("scope").map(String::as_str),
+                event.details.get("namespace").map(String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        audited,
+        [
+            (Some("secret.rotated"), Some("namespace"), Some("team-a")),
+            (
+                Some("secret.rotation_finalised"),
+                Some("namespace"),
+                Some("team-a")
+            ),
+        ]
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|event| event.details.get("token_name").map(String::as_str) == Some("root-op"))
+    );
+}
+
+/// F05 I4, decision 4: only an Admin scoped to the whole cluster rotates a
+/// namespace's key. An Admin scoped to that very namespace can't, and a
+/// namespace without a key can't be rotated into having one.
+#[tokio::test]
+async fn only_an_unscoped_admin_rotates_a_namespace_key() {
+    let council = seeded_council_with_ikm("rotate-namespace-who").await;
+    give_namespace_a_key(&council, "team-a").await;
+    let (admin, admin_secret) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let mut tokens = vec![admin];
+    let mut refused = Vec::new();
+    for (name, role) in [
+        ("team-a-admin", crate::sesame::types::ApiRole::Admin),
+        ("team-a-deployer", crate::sesame::types::ApiRole::Deployer),
+    ] {
+        let scoped = crate::sesame::token::create_token(
+            name,
+            role,
+            crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        tokens.push(scoped.token);
+        refused.push(scoped.plaintext);
+    }
+    let store = crate::sesame::auth::new_token_store();
+    *store.write().await = tokens;
+    let (tx, _rx) = mpsc::channel(1);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let body = r#"{"namespace":"team-a"}"#;
+
+    for secret in &refused {
+        assert_eq!(
+            post_status(app.clone(), "/v1/secret/rotate", secret, body).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert!(
+        !council
+            .security_state()
+            .await
+            .age_keypairs
+            .iter()
+            .any(|kp| kp.read_only),
+        "a refused rotation changes no key"
+    );
+    assert_eq!(
+        post_status(
+            app.clone(),
+            "/v1/secret/rotate",
+            &admin_secret,
+            r#"{"namespace":"team-b"}"#
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "team-b never opted in"
+    );
+    assert!(!council.security_state().await.has_namespace_key("team-b"));
+    assert_eq!(
+        post_status(
+            app.clone(),
+            "/v1/secret/rotate",
+            &admin_secret,
+            r#"{"namespcae":"team-a"}"#
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "a misspelt field must not rotate the cluster key instead"
+    );
+    assert_eq!(
+        post_status(app, "/v1/secret/rotate", &admin_secret, body).await,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

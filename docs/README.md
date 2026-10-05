@@ -544,6 +544,15 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.tom
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
+Then keep a copy of the root CA that only you can open, sealed to a passphrase
+(or `--recipient` for your age key), and check it offline against the
+fingerprint `init` printed:
+
+```sh
+target/debug/relish ca backup --out prod-root-backup.age --dir cluster
+target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
+```
+
 This is a one-node Raft cluster: clustered code paths are live, but it cannot
 survive a node failure. The API listens at `https://127.0.0.1:9117`. On macOS, use the [managed Linux VM quickstart](quickstart.md) for containers.
 
@@ -1373,6 +1382,14 @@ follower may briefly report the previous generation during rotation; fetch
 again and re-encrypt if that generation has been finalised before deployment.
 `relish test --filter secrets-config` checks actual container decryption and
 config-file mounting on a cluster with a container runtime.
+
+A namespace with `secret_key = true` in `[namespace.X]` gets its own key, and
+its values then decrypt only with that key. Fetch it with
+`GET /v1/secret/public-key?namespace=X` (`relish secret pubkey --namespace X`);
+a token scoped to other namespaces gets 403. Rotate it with
+`relish secret rotate [--finalize] --namespace X`, which takes an unscoped
+Admin. Until the master key is split, every node can still unwrap every
+namespace's key.
 
 ### OCI release qualification
 

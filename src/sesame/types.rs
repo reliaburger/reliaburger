@@ -389,6 +389,26 @@ pub struct SecretSeal {
     pub generation: u64,
 }
 
+/// One stored secret that a namespace's first key re-sealed (F05 I4).
+///
+/// When a namespace opts in to its own key, the leader decrypts each of the
+/// namespace's `ENC[AGE:...]` values with the cluster-wide key and seals
+/// the same plaintext again with the new namespace key. The new key and
+/// every re-sealed value commit in one Raft entry, so no replica ever sees
+/// the key without the values it can open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResealedSecret {
+    /// The app whose environment holds the value.
+    pub app_id: crate::meat::types::AppId,
+    /// The environment variable's name.
+    pub env_key: String,
+    /// The `ENC[AGE:...]` value the leader read. If the stored value has
+    /// changed since, the whole entry is refused.
+    pub previous: String,
+    /// The same plaintext sealed under the namespace's key.
+    pub sealed: String,
+}
+
 // ---------------------------------------------------------------------------
 // Join token
 // ---------------------------------------------------------------------------
@@ -581,6 +601,27 @@ impl SecurityState {
         kps
     }
 
+    /// Whether `namespace` has a secret key of its own (F05 I4).
+    pub fn has_namespace_key(&self, namespace: &str) -> bool {
+        let scope = AgeKeyScope::Namespace(namespace.to_string());
+        self.age_keypairs.iter().any(|kp| kp.scope == scope)
+    }
+
+    /// Every keypair that may decrypt a value stored in `namespace`, newest
+    /// generation first.
+    ///
+    /// A namespace with a key of its own gets only its own keys: no
+    /// fallback to the cluster-wide key, or a value sealed for the whole
+    /// cluster would still open there and the boundary would be nominal
+    /// (F05 I4). A namespace without one uses the cluster-wide keys.
+    pub fn decryption_keypairs(&self, namespace: &str) -> Vec<&AgeKeypair> {
+        if self.has_namespace_key(namespace) {
+            self.age_keypairs_for_scope(&AgeKeyScope::Namespace(namespace.to_string()))
+        } else {
+            self.age_keypairs_for_scope(&AgeKeyScope::ClusterWide)
+        }
+    }
+
     /// The active cluster-wide age keypair (for encrypting new secrets).
     pub fn cluster_age_keypair(&self) -> Option<&AgeKeypair> {
         self.active_age_keypair(&AgeKeyScope::ClusterWide)
@@ -694,6 +735,49 @@ mod tests {
             vec![2, 1, 0],
             "decryption tries newest generation first"
         );
+    }
+
+    #[test]
+    fn a_namespace_without_its_own_key_decrypts_with_the_cluster_keys() {
+        let state = SecurityState {
+            age_keypairs: vec![
+                age_kp(AgeKeyScope::ClusterWide, 0, true),
+                age_kp(AgeKeyScope::ClusterWide, 1, false),
+                age_kp(AgeKeyScope::Namespace("team-a".into()), 0, false),
+            ],
+            ..SecurityState::default()
+        };
+        assert!(!state.has_namespace_key("team-b"));
+        let scopes: Vec<(AgeKeyScope, u64)> = state
+            .decryption_keypairs("team-b")
+            .iter()
+            .map(|kp| (kp.scope.clone(), kp.generation))
+            .collect();
+        assert_eq!(
+            scopes,
+            [(AgeKeyScope::ClusterWide, 1), (AgeKeyScope::ClusterWide, 0)],
+            "team-a's key never opens team-b's values"
+        );
+    }
+
+    #[test]
+    fn a_namespace_with_its_own_key_never_falls_back_to_the_cluster_key() {
+        let team_a = AgeKeyScope::Namespace("team-a".into());
+        let state = SecurityState {
+            age_keypairs: vec![
+                age_kp(AgeKeyScope::ClusterWide, 0, false),
+                age_kp(team_a.clone(), 0, true),
+                age_kp(team_a.clone(), 1, false),
+            ],
+            ..SecurityState::default()
+        };
+        assert!(state.has_namespace_key("team-a"));
+        let scopes: Vec<(AgeKeyScope, u64)> = state
+            .decryption_keypairs("team-a")
+            .iter()
+            .map(|kp| (kp.scope.clone(), kp.generation))
+            .collect();
+        assert_eq!(scopes, [(team_a.clone(), 1), (team_a, 0)]);
     }
 
     #[test]

@@ -102,6 +102,20 @@ U1 first (about a week): it fixes the drift on its own and everything else build
 
 - The reference parser reads `repo:tag@sha256:…`, and the trust-policy lookup drops the tag before its digest lookup. Without that second fix, an unsigned Pickle image written as `app:v1@sha256:…` would have counted as external and skipped `require_signatures` once the pull worked.
 - `pickle::binding::bind_image` resolves a tag from the catalogue, upstream, or the cached copy, with unit tests. It isn't wired into apply until questions 1, 2 and 5 are settled.
+- **U3 format check (4 October 2026),** with `curl` against each registry's API: the tag's digest, then `sha256-<hex>.sig` and the OCI referrers of that digest.
+
+  | Image | `.sig` | Referrers | Signer |
+  |-------|--------|-----------|--------|
+  | `cgr.dev/chainguard/static:latest` | yes (`.att` too) | empty | keyless (Fulcio certificate and Rekor bundle annotations) |
+  | `gcr.io/distroless/static-debian12:latest` | yes (`.att` too) | empty | keyless |
+  | `ghcr.io/sigstore/cosign/cosign:v2.4.1` | yes, two payloads | API unsupported | keyless |
+  | `ghcr.io/fluxcd/source-controller:v1.4.1` | yes (`.att` too) | API unsupported | keyless |
+  | `ghcr.io/kyverno/kyverno:v1.15.2` | no (`.att` only) | API unsupported | attestations only |
+  | `docker.io/library/nginx:latest` | no | empty | none |
+  | `quay.io/prometheus/prometheus:latest` | no | empty | none |
+
+  The classic `.sig` layout is what's published; nobody in the sample uses the referrer bundle yet, and Chainguard's payload names the digest its tag resolves to, which is what U1 binds to. Every public signature is keyless, so U3's key-based check serves teams signing their own images, and keyless is the next gap. cosign 3.1 writes the bundle as a referrer by default and marks `--new-bundle-format=false` deprecated, so the bundle can't wait long. Reliaburger publishes no container images of its own, so there was nothing of ours to check.
+- **U3 verifier** (`src/pickle/cosign.rs`): `CosignKey::from_pem`, `fetch_signature` (straight from the registry) and `ClusterSource::cosign_signature` (through the pull-through cache), and `verify_signature`, which checks the signature with `ring` before parsing the payload, then requires the payload to name the bound digest. The fixture in `tests/fixtures/cosign/` is real `cosign sign --key` output (cosign 3.1.3, `--new-bundle-format=false --tlog-upload=false`). The unit tests cover a wrong key, a payload for another digest, a tampered payload and a missing `.sig`; `tests/suite/pickle_cluster.rs` reads the fixture from an in-process registry directly and through the cache. Wiring it into the upstream rules waits for U2.
 
 ## Decisions (maintainer, 2 October 2026)
 

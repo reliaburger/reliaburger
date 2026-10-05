@@ -22,6 +22,7 @@ pub mod oidc;
 pub mod raft_encryption;
 pub mod renewal;
 pub mod renewal_worker;
+pub mod root_backup;
 pub mod secret;
 pub mod session;
 pub mod token;
