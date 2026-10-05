@@ -1084,6 +1084,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         scope: TokenScope::default(),
         expires_at: None,
         created_at: SystemTime::now(),
+        previous_secret: None,
     };
     council
         .write(RaftRequest::CreateApiToken(operator.clone()))
@@ -1114,6 +1115,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         },
         expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(lease.expires_at_unix_ms)),
         created_at: SystemTime::now(),
+        previous_secret: None,
     };
     let admitted = council
         .write(RaftRequest::TestLeaseApiToken {

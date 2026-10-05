@@ -380,6 +380,10 @@ pub enum RaftRequest {
         role: crate::sesame::types::CaRole,
         now_unix_ms: u64,
     },
+    /// Give an API token a new secret under the same name; the old secret
+    /// keeps working until the rotation's grace end (F05 I3). Refused for a
+    /// name that doesn't exist or belongs to a test lease.
+    RotateApiToken(crate::sesame::types::TokenRotation),
     /// Hold a key the leader made for the role's next intermediate, and its
     /// CSR, until the operator signs it with the root (F04 R4). Allocates the
     /// certificate's serial and answers `SerialAllocated`. The rules live in
@@ -764,10 +768,19 @@ mod tests {
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH,
+                previous_secret: None,
             }),
             RaftRequest::RevokeApiToken {
                 name: "ci-deploy".to_string(),
             },
+            RaftRequest::RotateApiToken(crate::sesame::types::TokenRotation {
+                name: "ci-deploy".to_string(),
+                token_hash: vec![7, 8, 9],
+                token_salt: vec![1, 1, 1],
+                rotated_at: std::time::SystemTime::UNIX_EPOCH,
+                expires_at: None,
+                previous_valid_until: Some(std::time::SystemTime::UNIX_EPOCH),
+            }),
             RaftRequest::AllocateSerial,
         ];
 

@@ -1059,6 +1059,29 @@ impl StateMachineInner {
                     .api_tokens
                     .retain(|t| t.name != *name);
             }
+            RaftRequest::RotateApiToken(rotation) => {
+                // A leased test token's cleanup matches it by its hash, so a
+                // rotation would orphan it; those stay with their lease.
+                // Unlike a revoke, a rotation may touch the last Admin: the
+                // store keeps the same Admin, only its secret changes.
+                if rotation.name.starts_with("rbtest-") {
+                    return Some(CouncilResponse::Refused {
+                        reason: "test-lease tokens can't be rotated".into(),
+                    });
+                }
+                let Some(token) = self
+                    .state
+                    .security_state
+                    .api_tokens
+                    .iter_mut()
+                    .find(|token| token.name == rotation.name)
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("no API token named {:?}", rotation.name),
+                    });
+                };
+                crate::sesame::token::apply_rotation(token, rotation);
+            }
             RaftRequest::SweepExpiredApiTokens { now_unix_ms } => {
                 // The entry carries the leader's clock, so replicas never
                 // consult their own: all of them remove the same tokens.
@@ -5502,6 +5525,7 @@ mod tests {
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH,
+                previous_secret: None,
             }],
             next_serial: 900,
             ..Default::default()
@@ -6504,6 +6528,7 @@ mod tests {
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
+            previous_secret: None,
         };
         inner.apply_request(&RaftRequest::CreateApiToken(token));
         assert_eq!(inner.state.security_state.api_tokens.len(), 1);
@@ -6521,6 +6546,7 @@ mod tests {
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
+            previous_secret: None,
         };
         inner.apply_request(&RaftRequest::CreateApiToken(token));
         assert_eq!(inner.state.security_state.api_tokens.len(), 1);
@@ -6545,6 +6571,7 @@ mod tests {
             expires_at: expires_unix_ms
                 .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
             created_at: std::time::UNIX_EPOCH,
+            previous_secret: None,
         }
     }
 
@@ -6683,6 +6710,7 @@ mod tests {
             scope: TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
+            previous_secret: None,
         };
 
         let mut inner = StateMachineInner::default();
@@ -6741,6 +6769,90 @@ mod tests {
             .map(|t| t.name.clone())
             .collect();
         assert_eq!(admins, vec!["admin-b".to_string()]);
+    }
+
+    fn rotation_for(name: &str, hash: u8) -> crate::sesame::types::TokenRotation {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        crate::sesame::types::TokenRotation {
+            name: name.to_string(),
+            token_hash: vec![hash; 3],
+            token_salt: vec![hash; 3],
+            rotated_at: now,
+            expires_at: None,
+            previous_valid_until: Some(now + std::time::Duration::from_secs(3_600)),
+        }
+    }
+
+    #[test]
+    fn rotate_replaces_the_secret_and_keeps_the_name_role_and_scope() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        let scope = TokenScope {
+            apps: Some(vec!["web".into()]),
+            namespaces: None,
+        };
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
+            name: "ci".to_string(),
+            token_hash: vec![1, 2, 3],
+            token_salt: vec![4, 5, 6],
+            role: ApiRole::Deployer,
+            scope: scope.clone(),
+            expires_at: None,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        }));
+
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for("ci", 9)));
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        let token = &inner.state.security_state.api_tokens[0];
+        assert_eq!(token.name, "ci");
+        assert_eq!(token.role, ApiRole::Deployer);
+        assert_eq!(token.scope, scope);
+        assert_eq!(token.token_hash, vec![9; 3]);
+        let previous = token.previous_secret.as_ref().unwrap();
+        assert_eq!(previous.token_hash, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rotate_is_allowed_for_the_last_admin() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
+            name: "root".to_string(),
+            token_hash: vec![1, 2, 3],
+            token_salt: vec![4, 5, 6],
+            role: ApiRole::Admin,
+            scope: TokenScope::default(),
+            expires_at: None,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        }));
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for("root", 7)));
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        let tokens = &inner.state.security_state.api_tokens;
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].role, ApiRole::Admin);
+        assert_eq!(tokens[0].token_hash, vec![7; 3]);
+    }
+
+    #[test]
+    fn rotate_refuses_an_unknown_name_and_a_leased_test_token() {
+        let mut inner = StateMachineInner::default();
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for("ghost", 1)));
+        assert!(matches!(response, Some(CouncilResponse::Refused { .. })));
+
+        inner.state.security_state.api_tokens.push(leased_token());
+        let name = inner.state.security_state.api_tokens[0].name.clone();
+        let before = inner.state.security_state.api_tokens[0].clone();
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for(&name, 1)));
+        assert!(matches!(response, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(inner.state.security_state.api_tokens[0], before);
     }
 
     #[test]
@@ -7584,6 +7696,7 @@ mod tests {
                 std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(100),
             ),
             created_at: std::time::SystemTime::UNIX_EPOCH,
+            previous_secret: None,
         }
     }
 

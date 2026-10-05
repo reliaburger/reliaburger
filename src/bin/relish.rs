@@ -737,9 +737,19 @@ enum TokenAction {
         /// Restrict to specific namespaces (comma-separated).
         #[arg(long)]
         namespaces: Option<String>,
-        /// TTL in days (e.g. 90).
-        #[arg(long)]
+        /// TTL in days (e.g. 30). Without it, deployer and read-only tokens
+        /// get the cluster's default lifetime (90 days unless
+        /// `[security.tokens] default_ttl` says otherwise); admin tokens
+        /// don't expire.
+        #[arg(long, conflicts_with = "no_expiry")]
         ttl_days: Option<u64>,
+        /// Never expire, instead of the default lifetime.
+        #[arg(long)]
+        no_expiry: bool,
+        /// Give the token the `[permission]` spec already keyed by its name.
+        /// Without this, creating a token under such a name is refused.
+        #[arg(long)]
+        inherit_permissions: bool,
     },
     /// List all API tokens with their scope, expiry and last use.
     List,
@@ -747,6 +757,16 @@ enum TokenAction {
     Revoke {
         /// Token name to revoke.
         name: String,
+    },
+    /// Give a token a new secret under the same name. The old secret keeps
+    /// working for the grace period, then stops.
+    Rotate {
+        /// Token name to rotate.
+        name: String,
+        /// Hours the old secret keeps working (default 24). 0 ends it at
+        /// once, for a leaked secret.
+        #[arg(long)]
+        grace_hours: Option<u64>,
     },
 }
 
@@ -1831,18 +1851,34 @@ async fn main() -> ExitCode {
                 apps,
                 namespaces,
                 ttl_days,
+                no_expiry,
+                inherit_permissions,
             } => {
-                commands::token_create(
-                    name,
-                    role,
-                    apps.as_deref(),
-                    namespaces.as_deref(),
-                    *ttl_days,
-                )
+                use reliaburger::relish::client::{TokenLifetime, TokenRequest};
+                let split = |list: &Option<String>| {
+                    list.as_ref()
+                        .map(|list| list.split(',').map(|s| s.trim().to_string()).collect())
+                };
+                let lifetime = match (ttl_days, no_expiry) {
+                    (Some(days), _) => TokenLifetime::Days(*days),
+                    (None, true) => TokenLifetime::Never,
+                    (None, false) => TokenLifetime::Default,
+                };
+                commands::token_create(&TokenRequest {
+                    name: name.clone(),
+                    role: role.clone(),
+                    apps: split(apps),
+                    namespaces: split(namespaces),
+                    lifetime,
+                    inherit_permissions: *inherit_permissions,
+                })
                 .await
             }
             TokenAction::List => commands::token_list(cli.output).await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
+            TokenAction::Rotate { name, grace_hours } => {
+                commands::token_rotate(name, *grace_hours).await
+            }
         },
         Command::JoinToken { action } => match &action {
             JoinTokenAction::Create { node_id, ttl } => {

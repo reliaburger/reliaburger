@@ -697,10 +697,13 @@ relish ca rotate --role <node|workload|ingress> --finalize   # Retire the old CA
 # Tokens
 relish token create --name <name>   # Create an API token (default role: read-only)
 relish token create --name <name> --role <admin|deployer|read-only>
-relish token create --name <name> --ttl-days <days>
+relish token create --name <name> --ttl-days <days>  # Default: 90 days (admins: none)
+relish token create --name <name> --no-expiry
+relish token create --name <name> --inherit-permissions # Accept an existing [permission.<name>]
 relish token create --name <name> --apps <list>       # Scope to specific apps
 relish token create --name <name> --namespaces <list> # Scope to namespaces
-relish token list                   # List all API tokens
+relish token list                   # List all API tokens (warns about expiry within 14 days)
+relish token rotate <name> [--grace-hours 24]          # New secret; old one works for the grace
 relish token revoke <name>          # Revoke a token by name
 relish join-token create --node-id <id> [--ttl 15m]   # One single-use node-enrolment token
 

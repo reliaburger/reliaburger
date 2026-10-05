@@ -110,6 +110,7 @@ async fn a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file()
         scope: Default::default(),
         expires_at: None,
         created_at: std::time::SystemTime::UNIX_EPOCH,
+        previous_secret: None,
     };
     let restored = DesiredState {
         security_state: SecurityState {

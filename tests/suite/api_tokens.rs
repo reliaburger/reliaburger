@@ -171,7 +171,8 @@ async fn create(router: Router, name: &str, ttl: Option<u64>) -> StatusCode {
             Request::post("/v1/token/create")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"name": name, "role": "deployer", "ttl_days": ttl})
+                    // No TTL means an explicit `--no-expiry`, not the default lifetime.
+                    serde_json::json!({"name": name, "role": "deployer", "ttl_days": ttl, "no_expiry": ttl.is_none()})
                         .to_string(),
                 ))
                 .unwrap(),
