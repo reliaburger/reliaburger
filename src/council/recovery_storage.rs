@@ -8,6 +8,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use super::{DesiredState, state_machine::CouncilStateMachine};
+use crate::file_lock::FileLock;
 
 fn io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
@@ -19,7 +20,8 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 
 /// Serialise storage opening with recovery, including the gap between renames.
 /// Live stores keep their redb locks after the opening guard is released.
-pub(crate) fn lock(raft: &Path) -> io::Result<File> {
+/// The returned guard unlocks when dropped (#606).
+pub(crate) fn lock(raft: &Path) -> io::Result<FileLock> {
     let parent = raft
         .parent()
         .ok_or_else(|| io_error("Raft directory needs a parent"))?;
@@ -30,8 +32,7 @@ pub(crate) fn lock(raft: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(raft.with_extension("recovery-lock"))?;
-    file.try_lock().map_err(io_error)?;
-    Ok(file)
+    FileLock::try_lock(file).map_err(io_error)
 }
 
 /// Hold every existing store's redb lock, refusing a store a live node has
@@ -181,6 +182,48 @@ pub(crate) fn replace(raft: &Path, state: DesiredState) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child another thread is spawning shares every open file description
+    /// until it calls `exec`, so a lock closed without unlocking can outlive
+    /// its guard and refuse the next opening (#606, the #285 class).
+    #[test]
+    fn a_dropped_guard_is_retaken_while_other_threads_spawn_processes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let raft = root.path().join("raft");
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let spawning = Arc::clone(&spawning);
+                std::thread::spawn(move || {
+                    while spawning.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let refused = (0..1000).filter(|_| lock(&raft).is_err()).count();
+        spawning.store(false, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(refused, 0, "openings refused by a lock nobody holds");
+    }
+
+    #[test]
+    fn a_held_guard_refuses_another_opening() {
+        let root = tempfile::tempdir().unwrap();
+        let raft = root.path().join("raft");
+        let held = lock(&raft).unwrap();
+        assert!(lock(&raft).is_err());
+        drop(held);
+        let _retaken = lock(&raft).unwrap();
+    }
 
     #[tokio::test]
     async fn audit_restart_finishes_each_recovery_rename_boundary() {

@@ -932,7 +932,7 @@ that drops an operation and reopens it straight away was refused every so
 often with "another operation is using cluster". A loop of 100 reopens with two
 threads spawning `true` in the background was refused 69 times.
 
-So the lock is now a small type of its own whose `Drop` (the destructor we met
+So the lock became a small type of its own whose `Drop` (the destructor we met
 in Chapter 1) unlocks before the file closes:
 
 ```rust
@@ -957,12 +957,78 @@ We fixed that lock and missed its neighbours. Five days later the same
 refusal turned up in three more places that take an `flock` and let a plain
 `File` close it: the local context's `context.lock` (#500), Pickle's upload
 directory owner (#497, in Chapter 5) and the log export checkpoint (#519, in
-Chapter 6). Each now holds the file in a small type whose `Drop` unlocks
-first: `ContextLock`, `UploadDirectoryOwner` and `ExportLock`. Each got the
+Chapter 6). Each got a small type of its own whose `Drop` unlocks first:
+`ContextLock`, `UploadDirectoryOwner` and `ExportLock`. Each got the
 same test as the operation lock: a hundred or more lock-and-drop rounds beside
 two threads spawning `true`. Before the fix the upload owner's version was refused
 75 times out of 100. The lesson is a boring one. When you fix a class of bug,
 grep for the class, not just the line in the stack trace.
+
+We didn't, not properly. Two days later the Raft recovery lock failed the
+same way (#606, in Chapter 2), and while fixing it we found three more locks
+that returned a plain `File`: the quickstart's `setup.lock`, the discovery
+journal's claim and `process_control`'s operation lock. Auditing for #613
+turned up a fourth, the process owner lock that `process_control` takes to
+fence a dead owner. The operation lock is the worrying one. Bun takes it to prepare, start and signal a process
+workload, and Bun spawns processes all day. It retries for two seconds, so a
+user would have seen a slow operation rather than a refusal, but a loop of a
+thousand take-and-drop rounds beside two spawning threads found the lock still
+held straight after the drop 5 to 20 times a run, in ten runs out of ten.
+
+Eight small guard types, each with the same three-line `Drop`, plus four
+locks with none, is how the class kept coming back: every new lock was a chance to forget it. So now there
+is one, `file_lock::FileLock`, and every file lock in `src/` goes through it:
+
+```rust
+pub struct FileLock {
+    file: File,
+}
+
+impl FileLock {
+    pub fn try_lock(file: File) -> Result<Self, FileLockError> {
+        close_on_exec(&file)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(FileLockError::Busy),
+            Err(std::fs::TryLockError::Error(error)) => Err(FileLockError::Io(error)),
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+```
+
+`try_lock` takes the `File` by value, so once you've asked for a lock the only
+way to the file is through the guard (its `file()` method lends it out for a
+`sync_all` or a `metadata` call). There's no window between locking and
+wrapping in which an early `return` could close a locked file: the guard
+exists the moment the lock does. A sibling, `lock_within`, polls a busy lock
+until a timeout, which is what the operation lock needed. `close_on_exec`
+makes sure the descriptor has `FD_CLOEXEC` set, so a child drops its copy at
+`exec`. The standard library already opens every file that way, so this is a
+belt to go with the braces, for a `File` built from a raw descriptor.
+
+The existing guards kept their names where they carry more than the lock
+(`UploadDirectoryOwner` holds a `FileLock` now) and disappeared where they
+didn't (`ContextLock`, `ExportLock`, the quickstart's `OperationLock` and
+`RecoveryLock` are all plain `FileLock`s).
+
+Then we made forgetting impossible to merge. A unit test,
+`file_lock::source_rule`, parses every file under `src/` with `syn` (the
+parser procedural macros use) and fails on anything that looks like a file
+lock outside `src/file_lock.rs`: an `flock`, a `Flock`, a `LOCK_EX`, a
+`TryLockError`, an `.unlock()`, or a `.try_lock()` on a local variable.
+Syntax can't see types, though, and every `Mutex` has a `try_lock` and a
+`lock` too. The test lets a `.try_lock()` on a struct field through, because
+that's where all our in-memory mutexes live. For the gaps, `clippy.toml` lists
+`File`'s lock methods under `disallowed-methods`, and Clippy *does* know the
+types: `file.try_lock()` anywhere except inside `FileLock` is a lint error, and
+CI treats warnings as errors. Two checks, one syntactic and one type-aware,
+for a bug we'd otherwise keep fixing one lock at a time.
 
 ### Download before you trust, verify before you replace
 

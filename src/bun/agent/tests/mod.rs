@@ -11351,6 +11351,7 @@ async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_rec
             response,
         })
         .await;
+    recovered.finish_consumer_syncs().await;
     let retry = reply.await.unwrap().unwrap();
     assert!(!retry.published);
     assert_eq!(retry.receipts, vec![1]);
