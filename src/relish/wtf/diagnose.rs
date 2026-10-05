@@ -39,6 +39,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_disks(inputs, &mut report);
         check_certificates(inputs, &mut report);
         check_registry(inputs, &mut report);
+        check_tokens(inputs, &mut report);
     }
     record_application_unknowns(&inputs.applications, inputs.app.as_deref(), &mut report);
     check_crashloops(inputs, &mut report);
@@ -80,6 +81,7 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("disks", &evidence.disks, "cluster", report);
     record_unknown("certificates", &evidence.certificates, "cluster", report);
     record_unknown("registry", &evidence.registry, "cluster", report);
+    record_unknown("tokens", &evidence.tokens, "cluster", report);
 }
 
 fn record_application_unknowns(
@@ -1073,6 +1075,82 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// Tokens about to stop working, and Admin tokens old enough to rotate.
+///
+/// Admin tokens are exempt from the default lifetime (F05 decision 6), so
+/// age is the only nudge they get.
+fn check_tokens(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(tokens) = inputs.cluster.tokens.value() else {
+        return;
+    };
+    let now = inputs.collected_at;
+    let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
+    let admin_age = crate::sesame::token::ADMIN_TOKEN_AGE_WARNING.as_secs();
+    let mut found = false;
+    for token in tokens {
+        let resource = format!("token.{}", token.name);
+        let finding = match token.expires_at {
+            Some(at) if at <= now => Some(WtfFinding {
+                id: "token-expired".to_string(),
+                title: format!("API token {} has expired", token.name),
+                details: vec![format!(
+                    "{} token expired at {at}; the expiry sweep removes it a day later",
+                    token.role
+                )],
+                suggestion: format!(
+                    "create a replacement, or `relish token rotate {}` to give it a new secret",
+                    token.name
+                ),
+                correlated_events: Vec::new(),
+                affected_resource: resource,
+            }),
+            Some(at) if at <= horizon => Some(WtfFinding {
+                id: "token-expiring".to_string(),
+                title: format!("API token {} expires soon", token.name),
+                details: vec![format!(
+                    "{} token expires in {} days",
+                    token.role,
+                    (at - now) / (24 * 60 * 60)
+                )],
+                suggestion: format!(
+                    "`relish token rotate {}` and move its clients to the new secret",
+                    token.name
+                ),
+                correlated_events: Vec::new(),
+                affected_resource: resource,
+            }),
+            None if token.role == "admin" && now.saturating_sub(token.created_at) > admin_age => {
+                Some(WtfFinding {
+                    id: "admin-token-old".to_string(),
+                    title: format!("admin token {} is old and never expires", token.name),
+                    details: vec![format!(
+                        "its secret was issued {} days ago",
+                        now.saturating_sub(token.created_at) / (24 * 60 * 60)
+                    )],
+                    suggestion: format!(
+                        "`relish token rotate {}` and move its clients to the new secret",
+                        token.name
+                    ),
+                    correlated_events: Vec::new(),
+                    affected_resource: resource,
+                })
+            }
+            _ => None,
+        };
+        if let Some(finding) = finding {
+            found = true;
+            report.warnings.push(finding);
+        }
+    }
+    if !found {
+        report.ok.push(WtfOk {
+            id: "tokens".to_string(),
+            description: "no API token expires within 14 days, and no admin token is past 90 days"
+                .to_string(),
+        });
+    }
+}
+
 fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(registries) = inputs.cluster.registry.value() else {
         return;
@@ -1135,6 +1213,7 @@ mod tests {
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
         DeployObservation, DiskObservation, FaultObservation, LogObservation, NodeObservation,
         RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
+        TokenObservation,
     };
 
     const NOW: u64 = 2_000_000;
@@ -1190,6 +1269,10 @@ mod tests {
                     redundancy_possible: true,
                     under_replicated_layers: 0,
                 }]),
+                tokens: available(vec![
+                    token("admin", "admin", NOW - 10 * DAY, None),
+                    token("ci", "deployer", NOW - 10 * DAY, Some(NOW + 80 * DAY)),
+                ]),
             },
             applications: ApplicationEvidence {
                 restarts: available(Vec::new()),
@@ -1220,6 +1303,96 @@ mod tests {
 
     fn available<T>(value: T) -> Evidence<T> {
         Evidence::available(NOW, value)
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn token(name: &str, role: &str, created_at: u64, expires_at: Option<u64>) -> TokenObservation {
+        TokenObservation {
+            name: name.to_string(),
+            role: role.to_string(),
+            created_at,
+            expires_at,
+        }
+    }
+
+    fn warning_ids(report: &WtfReport) -> Vec<(&str, &str)> {
+        report
+            .warnings
+            .iter()
+            .map(|finding| (finding.id.as_str(), finding.affected_resource.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn healthy_tokens_are_ok() {
+        let report = diagnose(&healthy_inputs());
+        assert!(report.ok.iter().any(|ok| ok.id == "tokens"), "{report:?}");
+        assert!(warning_ids(&report).is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_token_expiring_within_fourteen_days_is_a_warning() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.tokens = available(vec![
+            token("admin", "admin", NOW - DAY, None),
+            token("ci", "deployer", 0, Some(NOW + 3 * DAY)),
+            token("edge", "read-only", NOW - DAY, Some(NOW + 14 * DAY)),
+            token("later", "read-only", NOW - DAY, Some(NOW + 15 * DAY)),
+            token("gone", "read-only", 0, Some(NOW - 60)),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(
+            warning_ids(&report),
+            [
+                ("token-expired", "token.gone"),
+                ("token-expiring", "token.ci"),
+                ("token-expiring", "token.edge"),
+            ]
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "tokens"));
+    }
+
+    #[test]
+    fn an_admin_token_older_than_ninety_days_without_an_expiry_is_a_warning() {
+        let mut inputs = healthy_inputs();
+        // Late enough for a 91-day-old token; only token findings matter here.
+        let now = 100 * DAY;
+        inputs.collected_at = now;
+        inputs.cluster.tokens = available(vec![
+            token("old-root", "admin", now - 91 * DAY, None),
+            token("young-root", "admin", now - 89 * DAY, None),
+            // Not exempt from expiry, so its age is not the problem.
+            token("old-ci", "deployer", now - 91 * DAY, None),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(
+            warning_ids(&report),
+            [("admin-token-old", "token.old-root")]
+        );
+        assert!(
+            report.warnings[0]
+                .suggestion
+                .contains("relish token rotate old-root"),
+            "{:?}",
+            report.warnings[0]
+        );
+    }
+
+    #[test]
+    fn unreadable_token_evidence_is_unknown_not_ok() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.tokens = Evidence::Unavailable {
+            reason: "token list: 403".to_string(),
+        };
+        let report = diagnose(&inputs);
+        assert!(
+            report
+                .unknown
+                .iter()
+                .any(|unknown| unknown.source == "tokens")
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "tokens"));
     }
 
     #[test]

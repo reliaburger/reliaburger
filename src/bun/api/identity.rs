@@ -307,6 +307,12 @@ pub(super) async fn token_create_handler(
         namespaces: Option<Vec<String>>,
         #[serde(default)]
         ttl_days: Option<u64>,
+        /// No expiry, overriding the node's default lifetime.
+        #[serde(default)]
+        no_expiry: bool,
+        /// Take over the `[permission]` spec already keyed by this name.
+        #[serde(default)]
+        inherit_permissions: bool,
         #[serde(default)]
         lease_id: Option<String>,
     }
@@ -399,12 +405,52 @@ pub(super) async fn token_create_handler(
         None
     };
 
+    // Decision 3 (F05): `[permission]` specs are keyed by name, so a token
+    // created under a name that has one would silently inherit it, as a
+    // re-created token used to inherit its revoked namesake's. Inheriting
+    // has to be asked for.
+    if !req.inherit_permissions
+        && council
+            .desired_state()
+            .await
+            .permissions
+            .contains_key(&req.name)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "a [permission.{name}] spec exists, and a token named {name:?} would \
+                     inherit it; pass --inherit-permissions to accept that, or remove or \
+                     re-apply the spec first",
+                    name = req.name
+                )
+            })),
+        )
+            .into_response();
+    }
+
     let scope = crate::sesame::types::TokenScope {
         apps: req.apps.clone(),
         namespaces: req.namespaces.clone(),
     };
     let mut expires_at = match req.ttl_days {
-        None => None,
+        Some(_) if req.no_expiry => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "ttl_days and no_expiry can't both be given"
+                })),
+            )
+                .into_response();
+        }
+        None if req.no_expiry => None,
+        // No lifetime asked for: this node's `[security.tokens]` default,
+        // which Admin tokens are exempt from.
+        None => state
+            .static_capabilities
+            .token_lifetime
+            .default_expiry(role, std::time::SystemTime::now()),
         Some(days) => {
             let expiry = days
                 .checked_mul(86_400)
@@ -438,6 +484,7 @@ pub(super) async fn token_create_handler(
     // Argon2id hashing is deliberately slow + memory-hungry (M7): run it on the
     // blocking pool so it doesn't stall the async runtime worker.
     let name = req.name.clone();
+    let expires_unix = expires_at.map(unix_seconds);
     let created = match tokio::task::spawn_blocking(move || {
         crate::sesame::token::create_token(&name, role, scope, expires_at)
     })
@@ -476,6 +523,9 @@ pub(super) async fn token_create_handler(
         ("token".to_string(), req.name.clone()),
         ("role".to_string(), req.role.clone()),
     ]);
+    if let Some(at) = expires_unix {
+        details.insert("expires_at".to_string(), at.to_string());
+    }
     if let Some(apps) = &req.apps {
         details.insert("apps".to_string(), apps.join(","));
     }
@@ -495,6 +545,199 @@ pub(super) async fn token_create_handler(
         "name": req.name,
         "role": req.role,
         "token": created.plaintext,
+        "expires_at": expires_unix,
+    }))
+    .into_response()
+}
+
+/// Seconds since the Unix epoch; zero for a time before it.
+fn unix_seconds(at: std::time::SystemTime) -> u64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Install a committed rotation in this node's auth store now, so the new
+/// secret works on the next request here instead of after the next periodic
+/// refresh from Raft (every 5 seconds). Other nodes pick it up on theirs.
+async fn apply_rotation_locally(state: &ApiState, rotation: &crate::sesame::types::TokenRotation) {
+    let Some(store) = &state.token_store else {
+        return;
+    };
+    // The write lock covers one in-memory update; it's never held across I/O.
+    let mut tokens = store.write().await;
+    // Skip a token the periodic refresh already brought up to date, or the
+    // new secret would be installed over itself and the old one lost.
+    if let Some(token) = tokens
+        .iter_mut()
+        .find(|token| token.name == rotation.name && token.token_hash != rotation.token_hash)
+    {
+        crate::sesame::token::apply_rotation(token, rotation);
+    }
+}
+
+/// Give an API token a new secret under the same name (F05 I3).
+///
+/// The new secret works at once. The old one keeps working for the grace
+/// period (24 hours unless `grace_hours` says otherwise; 0 ends it now, for
+/// a leaked secret), so clients can move over without an outage. The old
+/// secret is its own principal, so browser sessions opened with it end with
+/// it. The token's role, scope and `[permission]` spec stay with the name.
+/// Rotating the last Admin is fine: the store keeps the same Admin.
+pub(super) async fn token_rotate_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    #[derive(serde::Deserialize)]
+    struct RotateRequest {
+        name: String,
+        #[serde(default)]
+        grace_hours: Option<u64>,
+    }
+
+    let req: RotateRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let grace = match req.grace_hours {
+        None => crate::sesame::token::DEFAULT_ROTATION_GRACE,
+        Some(hours) => match hours.checked_mul(3_600) {
+            Some(seconds) => std::time::Duration::from_secs(seconds),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "grace_hours is too large" })),
+                )
+                    .into_response();
+            }
+        },
+    };
+
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+    let Some(stored) = council
+        .security_state()
+        .await
+        .api_tokens
+        .into_iter()
+        .find(|token| token.name == req.name)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no API token named {:?}", req.name) })),
+        )
+            .into_response();
+    };
+
+    // Argon2id hashing runs on the blocking pool (M7), as in create.
+    let rotated = match tokio::task::spawn_blocking(move || {
+        crate::sesame::token::rotate_token(&stored, std::time::SystemTime::now(), grace)
+    })
+    .await
+    {
+        Ok(Ok(rotated)) => rotated,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "token hashing task failed" })),
+            )
+                .into_response();
+        }
+    };
+    let expires_at = rotated.rotation.expires_at.map(unix_seconds);
+    let previous_valid_until = rotated.rotation.previous_valid_until.map(unix_seconds);
+
+    match council
+        .write(crate::council::RaftRequest::RotateApiToken(
+            rotated.rotation.clone(),
+        ))
+        .await
+    {
+        Ok(crate::council::CouncilResponse::Refused { reason }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+    apply_rotation_locally(&state, &rotated.rotation).await;
+
+    let mut details = std::collections::BTreeMap::from([("token".to_string(), req.name.clone())]);
+    let summary = match previous_valid_until {
+        Some(until) => {
+            details.insert("previous_valid_until".to_string(), until.to_string());
+            format!(
+                "API token {} rotated; the old secret works until {until}",
+                req.name
+            )
+        }
+        None => {
+            details.insert("previous_valid_until".to_string(), "now".to_string());
+            format!(
+                "API token {} rotated; the old secret stopped working at once",
+                req.name
+            )
+        }
+    };
+    record_caller_audit(
+        &state,
+        auth.as_deref(),
+        crate::bun::events::EventKind::Token,
+        "token.rotated",
+        details,
+        summary,
+    )
+    .await;
+    Json(serde_json::json!({
+        "name": req.name,
+        "token": rotated.plaintext,
+        "expires_at": expires_at,
+        "previous_valid_until": previous_valid_until,
     }))
     .into_response()
 }
