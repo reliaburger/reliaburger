@@ -319,7 +319,9 @@ migration and no feature gate
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [#268](https://github.com/reliaburger/reliaburger/pull/268)). Drain and
   uncordon, cold moves that carry volumes, CRIU checkpoint and restore,
-  pre-dump iterations, lazy pages and TCP handoff, for apps and jobs. Also
+  pre-dump iterations, lazy pages and TCP handoff, for apps and jobs.
+  Required continuity and explicit fallback policy, a built-in migration
+  demonstration, versioned conformance and source-shutdown qualification. Also
   managed-volume retirement and the Apple runtime (F10,
   [#367](https://github.com/reliaburger/reliaburger/issues/367)).
 - [ ] **After 0.4.0: book v2 and the full CLI tour.** Book v2: a distilled

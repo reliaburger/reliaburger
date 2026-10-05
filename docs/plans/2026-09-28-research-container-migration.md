@@ -1,209 +1,164 @@
 # Research: moving a running container between nodes (0.4.0)
 
-28 September 2026. Research and a recommendation only; no product code.
-The maintainer answered the open questions the same day. The
-[decisions](#13-decisions-28-september-2026) are at the end, and the scope,
-design and estimate below follow them. The release is **0.4.0**, "Full
-container migration".
+28 September 2026; revised 5 October 2026. Research and an implementation
+proposal, with no product code. Release: **0.4.0, "Full container migration"**.
 
-## Progress (for whoever resumes this)
+The original maintainer decisions are retained in section 13. The 5 October
+review strengthens the outcome contract, recovery rules, built-in demonstration
+and conformance gates. The full apps-and-jobs scope stays. A failed spike changes
+the design or blocks the release; it does not silently weaken the contract.
+All commands and configuration additions below are proposed unless section 2
+explicitly identifies an existing capability.
 
-- [x] Branch `research/container-migration` from `origin/main` (ff854cbf)
-- [x] 1. Recommendation (summary)
-- [x] 2. What the codebase does today (verified by reading the code)
-- [x] 3. CRIU, runc and the ecosystem today (sourced)
-- [x] 4. GPU checkpointing and where the demand really is (sourced)
-- [x] 5. Design for Reliaburger
-- [x] 6. Compatibility (pre-1.0: bump and start fresh)
-- [x] 7. Security
-- [x] 8. Observability and UX
-- [x] 9. Demo
-- [x] 10. Testing plan
-- [x] 11. Effort and phasing
-- [x] 12. Where the initial analysis holds and where it doesn't
-- [x] 13. Open questions for the maintainer
-- [x] Draft PR opened (#268)
-- [x] Maintainer decisions recorded (28 September 2026); scope, phasing and
-      effort revised for the full version
+## Progress and next work
 
-All sections are written and the decisions are in. Next step: after the
-release soak frees the Lima VMs, and with an x86_64 Linux host for the
-pre-dump work, spikes S1-S11 (section 10). If a spike shows a piece can't
-work on our spec, go back to the maintainer rather than drop it quietly.
+- [x] Research CRIU/runc and the current storage/runtime integration.
+- [x] Record the 28 September maintainer decisions.
+- [x] Refresh code assertions against fetched **main**, not the PR's old base.
+- [x] Define continuity, explicit fallback, activation and source independence.
+- [x] Design a built-in demonstration and versioned conformance cases.
+- [x] Review the revised document for cross-section consistency.
+- [ ] Run the integration and design spikes in section 10.
+- [ ] Set measured interruption envelopes and re-estimate after the spikes.
+- [ ] Implement and qualify the full release scope.
 
-## 1. Recommendation
+Code baseline: `origin/main` at
+[`ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`](https://github.com/reliaburger/reliaburger/commit/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98),
+fetched 5 October 2026. It includes the boot-relative process adoption fix
+(#609). The earlier `ff854cbf` baseline is superseded. Baseline links in section 2
+are pinned to this main commit; subsequent implementation must refresh them.
+The branch incorporates that main commit without rewriting the PR history.
 
-*Revised after the maintainer's decisions of 28 September 2026. The first
-draft proposed shipping cold moves and drain in 0.2.0 with CRIU as an
-experimental opt-in, and leaving pre-dump, lazy pages, TCP handoff and jobs
-for later. The maintainer said no: 0.4.0 ships the whole thing.*
+## 1. Recommendation and the continuity contract
 
-0.4.0, "Full container migration", ships every layer of the move, for apps
-and jobs:
+Build one coordinated stateful-move pipeline: cordon/drain, cold relocation,
+checkpoint/restore, filesystem pre-sync, memory pre-copy where supported,
+post-copy where its risk is accepted, and connection-preserving network
+ownership. Apps and running job executions participate. Ship the demonstration
+and conformance suite with the feature.
 
-1. **Drain and uncordon.** `relish drain <node>` cordons a node and empties
-   it; `relish uncordon` puts it back. Stateless instances are rescheduled;
-   stateful ones are migrated.
-2. **Cold moves that carry volumes.** Stop the source, copy its managed
-   volumes, cold-start on the target. This is what drain does unless the app
-   asks for more.
-3. **CRIU checkpoint and restore** (`mode = "checkpoint"`): the same move,
-   plus the process memory, through `runc checkpoint` and `runc restore`.
-4. **Live moves** (`mode = "live"`): volume pre-sync while the app runs,
-   iterative memory pre-dumps, lazy pages (post-copy restore) and TCP
-   handoff, so established connections survive and the frozen time covers
-   the last delta, not the whole memory.
+The research's strengths remain: memory is only part of the move; node-local
+volumes need an explicit data path; runtime owners and journals must survive
+agent restarts; and eligibility, egress, stdio and failure testing need proving
+on the actual generated OCI spec. Use the runc CLI under existing owners rather
+than reconstructing its namespace and mount handling through a new CRIU client.
 
-When CRIU refuses at dump time, a move falls back to cold on the target with
-the data already moved; within live mode, each layer whose precondition is
-missing is dropped on its own (section 5.7).
+The advantage to demonstrate over **core Kubernetes** is a native, integrated
+planned evacuation of qualified stateful workloads that retains execution,
+acknowledged state and sessions within a measured interruption budget. It is
+not a claim of superiority on every workload or reliability dimension. The
+[current KEP-5823](https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/5823-pod-level-checkpoint-restore/README.md#non-goals)
+excludes cross-node restore and live migration SLOs from its initial scope
+(checked 5 October 2026). That proposal is moving; our product promise must
+stand on its own evidence.
 
-Why still build it in that order? Because each layer needs the one below
-it. The fallback the maintainer asked for (a clean restart when CRIU says
-no) is itself a volume-carrying move, and Reliaburger can't do one today.
-Managed volumes are node-local and the scheduler sends an app back to the
-node that holds them (`VolumeHome`, `src/cluster/orchestrate.rs`). Incus just
-shipped the same layering as "near-live" migration after calling CRIU
-fragile ([Incus 7.4](https://linuxiac.com/incus-7-4-adds-near-live-container-migration-for-zfs-and-btrfs/), accessed 28 Sep 2026).
+### What "seamless" means
 
-Two corrections to the brief still stand. First, there is no drain to hook
-into: `relish drain` is still marked *planned* in the whitepaper, and the
-only "node drain" in the code is a chaos fault. Second, planned binary
-upgrades don't need migration at all, because runc owners outlive Bun and
-the new Bun adopts running instances. The maintenance case that does need it
-is a host reboot (kernel, firmware, hardware).
+A **bounded interruption requiring no application restart, client reconnection
+or manual repair**, within a declared compatibility and failure envelope.
 
-Two hard limits shape the design:
+| Dimension | Required observation for a successful live move |
+|---|---|
+| Execution | The same computation resumes; startup and completed job work are not replayed. |
+| State | Memory and the local filesystem form a consistent cut. Migration does not lose acknowledged progress. |
+| Sessions | Qualified inbound, outbound and ingress sessions remain established; clients do not reconnect. TCP retransmission is allowed. |
+| Interruption | Client-observed pauses meet the selected envelope's budget, including post-restore page faults. |
+| Ownership | At most one workload generation can execute and write, including during partitions and recovery. |
+| Completion | No pages, storage, NAT mappings, forwarding chains or required proxy sockets remain on the source. |
+| Failure | The requested guarantee is not silently weakened. An unresolved owner or missing state is reported and held for recovery. |
 
-- **Pre-dump needs soft-dirty tracking, which arm64 mainline kernels don't
-  have.** Live mode therefore takes two shapes, chosen per migration from
-  what the source node reports (`criu check --feature mem_dirty_track`): on
-  x86_64, pre-dump iterations then a short final dump; on arm64, a single
-  dump with lazy pages, so the frozen time is still small but the memory
-  streams in after restore. The Apple-silicon quickstart can demo live mode;
-  pre-dump itself needs x86_64 hardware to test (the 0.3.0 Wyse 3040s are
-  x86_64, and so are GitHub's hosted runners). Section 5.7.
-- **TCP handoff collides with node-local addresses.** Container addresses
-  come from a per-node `/23` and are never routed between nodes; clients
-  reach instances at `node_ip:host_port`. Keeping a connection means keeping
-  its 4-tuple on both ends. The design (section 5.3) takes the container
-  address over on the target and tunnels the handed-off connections through
-  the source for a bounded window. It needs no cluster-wide routing change,
-  at the price of the source staying up until those connections end or the
-  window closes.
+A frozen singleton cannot do useful work for a short interval. Do not advertise
+universal zero downtime. An acceptable terminal pause may violate a game's
+latency budget or a remote lease deadline. Remote clocks, transactions, tokens
+and locks continue advancing while the container is frozen. A time namespace
+does not pause them. Qualification covers the application's relevant timeouts.
 
-Still runc-rootful only. Position it for long-running batch work first (the
-use with production evidence), then single-instance dev and game servers.
-GPU warm starts stay out: every shipping product we could verify uses gVisor
-or CRIU with NVIDIA patches that aren't upstream yet, we have no GPU
-hardware, and CUDA checkpointing needs host RAM at least as large as the GPU
-memory in use.
+This contract is for **planned movement with both nodes initially available**.
+Unexpected source loss before all state is transferred is a separate availability
+promise requiring suitable replication. Do not present migration as a substitute
+for application or storage fault tolerance, a coordinated snapshot of arbitrary
+external services, or exactly-once external side effects.
 
-Effort: roughly **23 to 29 focused weeks** for one engineer, about twice the
-first draft's 12 to 16, and about half of it CRIU-specific now. See
-[section 11](#11-effort-and-phasing).
+### Mechanisms and permitted fallback are separate
 
-## 2. What the codebase does today
+| Requested mode | Default preservation requirement | Default on failure |
+|---|---|---|
+| `cold` | Managed-volume data; a new computation is expected. | Recover the authoritative volume copy or wait. |
+| `checkpoint` | Memory, execution and filesystem; established TCP may be closed as declared. | Abort before activation, or wait for safe recovery afterward. |
+| `live` | Checkpoint guarantees plus qualified session continuity and interruption budget. | Abort before activation, or wait for safe recovery afterward. |
 
-Everything here was checked against `origin/main` at `ff854cbf` on 28
-September 2026. Nothing in `src/` or `docs/` mentions CRIU or checkpointing a
-process; the word "checkpoint" only appears for the reconciler's
-`applied-placements.json`.
+Checkpoint and live **do not default to cold restart**. A caller may explicitly
+allow restart fallback if the workload tolerates losing memory and sessions.
+That result is reported as a degraded relocation with the actual mode and
+lost guarantees, never a successful continuity/conformance result. A job cold
+restart is a new execution of its code even if some bookkeeping identity is
+retained; it must follow its retry/side-effect policy, not impersonate a resumed
+attempt that consumed no retry.
 
-**Runc runs in the foreground under an owner.** `RuncGrill::owned_start`
-(`src/grill/runc/owned.rs`) launches `runc --root <state> run --bundle <dir> <id>`
-as the `Launcher` role of a durable intent generation
-(`src/grill/runc_intent.rs`). The owner is Bun re-executed as a helper
-(`__process-exec-gate`) and survives Bun restarts. The container's stdout and
-stderr are **regular files** opened in append mode (`output.stdout`,
-`output.stderr`, `src/grill/process_owner.rs`); stdin is a pipe. That matters
-below: runc's restore only re-attaches *pipe* descriptors.
+Dropping an optimisation is allowed only when the remaining mechanisms still
+meet the requested outcome. Missing soft-dirty tracking can change how memory
+moves; dropping TCP handoff cannot satisfy required connection continuity.
+Eligibility is a fresh check and reservation, not a guarantee against a later
+crash. Failures after admission follow section 5.6.
 
-**Every instance gets its own network namespace and a node-local address.**
-`netns.rs` gives node *N* a `/23` from `10.0.0.0/8` and hands containers
-addresses from it; the spec's `network` namespace is pointed at the
-pre-created path. Addresses are not portable between nodes. Host ports are
-published with nftables DNAT per instance.
+## 2. What main does today
 
-**Writable image roots are private overlays.** `rootfs::mount_private` mounts
-the shared, content-addressed image as the lower layer and keeps
-`rootfs-upper` beside the bundle. Anything the process wrote outside its
-volumes lives there and would have to travel with it.
+Assertions below were checked by reading fetched main at `ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`.
+There is no implemented process migration pipeline or migration test group.
+Existing reconciliation checkpoints are not CRIU images.
 
-**Rootful containers share one user namespace mapping.** Container ids
-`0..65536` map to host `2_000_000_000..` on every node (`src/grill/userns.rs`),
-so ownership is the same on the source and the target. There's no seccomp or
-AppArmor profile in the generated OCI spec today.
+| Area | Verified current behaviour and consequence |
+|---|---|
+| Runtime ownership | `RuncGrill::owned_start` drives runc under durable intent/owner helpers that outlive Bun. Stdout/stderr are append-mode regular capture files. Restore must join this ownership model and preserve capture ingestion. |
+| Adoption | Records identify processes by kernel boot and boot-relative start ticks on Linux; cgroup attribution also verifies launcher parentage and nested init identity. Restore gets new host evidence, never copied source PIDs/ticks. |
+| Network | Rootful runc uses an external network namespace, node-local `/23` addresses, host-port DNAT and source masquerade. These are not a cluster-portable network identity. |
+| Root filesystem | Immutable image lower layers have private per-instance overlay upper/work directories. The writable upper state matters to restore. |
+| User namespace and policy | Rootful user mappings are uniform; cgroup-keyed egress is installed before normal start. Restore must prove enforcement before any workload instruction executes. |
+| Managed volumes | Paths remain per namespace/app/mount on each node, with plain-directory, loop-ext4 and Btrfs backends. They are not per logical replica; independent movement cannot split a shared writer group or merge separate target data. |
+| Logical replica identity | `Placement` now includes a cluster-wide replica `ordinal`; `InstanceIdentity` includes namespace, app, generation and ordinal. Preserve the logical replica and change its host/runtime generation, instead of inventing a fresh logical instance on every move. |
+| Scheduling/home | `VolumeHome` uses `last_placed_nodes`; unavailable volume homes wait unless explicitly released. Migration must atomically replace authoritative home information with the ownership cutover. |
+| Jobs | Node-local `RecordedJob` includes run generation, restart count, phase and trusted batch ownership (`spec_digest`). Raft batch records retain execution names/spec digests and replay fences. Migration extends these records rather than creating a parallel attempt-number ledger. |
+| Discovery | Endpoint withdrawal acknowledgements fence address reuse. Ordinary retirement removes routes; live handoff needs its own publication/withdrawal ordering to avoid destroying retained sessions. |
+| Workload credentials | CSR signing derives workload identity from instance identity and checks placement for apps. Private-key caching in restored memory still requires an explicit credential-mobility/reload design. |
+| Drain/upgrades | Operator drain is still planned. Upgrade cordons and Smoker's simulated drain exist; planned Bun exec upgrades adopt running workloads. Kernel/firmware reboot is the migration maintenance case. |
+| Built-in tests | `relish test` runs client-side public API cases in leased `rbtest-*` namespaces, with pinned OCI fixtures, capability evidence, deadlines and confirmed cleanup. It has development/full-runtime profiles and a separate acknowledged chaos catalogue. |
+| Profile completeness | Current profile rules mark selected cases required by capability. They do not define a versioned complete migration manifest or certify every migration-compatible node pair. |
+| Node fault/shutdown | Smoker's `NodeTransportGate` suppresses cluster transport traffic; it does not remove kernel NAT/proxy state. Managed `relish local` has VM start/stop support with endpoint/quorum safeguards. Source-independence qualification needs actual VM/network loss. |
+| Formats | Current `compatibility::CURRENT` is protocol **40**, state **58**. New incompatible formats bump from the then-current main values; do not pin a future release to these numbers. |
 
-**Managed volumes are per app, per node, not per instance.** The host path is
-`volumes/<namespace>/<app>/<mount path>` (`VolumeManager::create_managed_volume`,
-`src/grill/volume.rs`), with three backends: plain directory, sparse file +
-ext4 + loop mount, or Btrfs subvolume with a qgroup limit (`src/grill/btrfs.rs`).
-PR #267 found two instances of one app overlapping on one volume during a
-surge-first rollout and made volume apps roll stop-first. Snapshots
-(`src/grill/snapshot.rs`) are Btrfs-only and can be tarred and uploaded to
-object storage. Host-path volumes are bind mounts of whatever the operator
-named.
+### Main evidence
 
-**Placements carry no instance identity.** A `Placement` is a node id and
-reserved resources (`src/meat/types.rs`); `/v1/placements/{node}` serves an
-app and a replica *count* per node (`NodeAssignment`,
-`src/cluster/orchestrate.rs`), and the node names instances locally
-(`InstanceIdentity`: namespace, app, optional deploy generation, ordinal). The
-orchestration is desired-state and idempotent by design: "there is no
-per-instance RPC whose failure needs bespoke bookkeeping". Migration is
-exactly that kind of RPC, so it needs its own durable state machine.
+The following are source entry points, all pinned to the verified main revision:
 
-**Volumes pull apps home.** When an app has no placement left, the leader
-reserves it on the nodes in `DesiredState::last_placed_nodes`, the nodes
-that hold its managed volumes, and waits for room there rather than place it
-elsewhere.
+- [Runtime ownership: `src/grill/runc/owned.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/runc/owned.rs#L752)
+- [Boot/process evidence: `src/grill/records.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/records.rs#L212)
+- [Capture ownership: `src/grill/process_owner.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/process_owner.rs#L55)
+- [Namespace addressing/NAT: `src/grill/netns.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/netns.rs#L166)
+- [Private overlay: `src/grill/rootfs.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/rootfs.rs#L76)
+- [Managed volumes: `src/grill/volume.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/volume.rs#L135)
+- [Replica placement: `src/meat/types.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/meat/types.rs#L202)
+- [Instance identity: `src/grill/mod.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/mod.rs#L95)
+- [Volume homes: `src/cluster/orchestrate.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/cluster/orchestrate.rs#L985)
+- [Job records: `src/bun/jobs.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/bun/jobs.rs#L48)
+- [Raft batch ownership: `src/meat/batch_tracker.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/meat/batch_tracker.rs#L233)
+- [Workload signing: `src/cluster/workload_identity.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/cluster/workload_identity.rs#L89)
+- [Test runner: `src/relish/test_cmd.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/relish/test_cmd.rs#L43)
+- [Test acceptance profiles: `src/testkit/runner.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/testkit/runner.rs#L569)
+- [Evidence/cleanup report: `src/testkit/report.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/testkit/report.rs#L237)
+- [Test resource policy: `src/testkit/safety.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/testkit/safety.rs#L86)
+- [Transport fault: `src/smoker/node_fault.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/smoker/node_fault.rs#L12)
+- [Ingress sessions: `src/wrapper/websocket.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/wrapper/websocket.rs#L61)
+- [Compatibility: `src/compatibility.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/compatibility.rs#L54)
 
-**There's no operator drain or cordon.** The whitepaper lists
-`relish drain <node>` as planned. What exists: the upgrade cordon
-(`apply_upgrade_cordon`, used during rolling binary upgrades), the Smoker
-fault `relish fault node-drain` (simulated graceful departure), and
-`relish decommission-node`, which requires the operator to attest that the
-node's workloads are already stopped.
+## 3. CRIU, runc and ecosystem research
 
-**Upgrades keep workloads running.** Self-upgrade execs the new Bun, which
-adopts the running instances through their owners (the V02 soak journal in
-PR #267 shows "adopted 1 running instance(s)"). A reboot is different: the
-intent journal refuses a generation "from a previous kernel boot" and the
-instance cold-starts.
-
-**Discovery withdraws before addresses are reused.** Endpoints are published
-cluster-wide by the leader (`RaftRequest::PublishEndpoints`) from health
-reports; a retiring instance's routes are withdrawn and every consumer
-acknowledges the withdrawal (`AcknowledgeEndpointWithdrawal`,
-`src/onion/withdrawal.rs`) before its address can be reused. A migrated
-instance is a new endpoint on the target and a withdrawn one on the source,
-which this machinery already handles.
-
-**Egress rules are keyed on the workload cgroup and programmed before start.**
-`honours_cgroup_path` lets Bun program egress between `create` and `start`.
-`runc restore` has no such gap: it creates and resumes in one call.
-
-**Formats.** Raft log entries and snapshots are JSON (`src/council/durable_log.rs`),
-but `RaftRequest` is an enum, so a new variant is incompatible. `AppSpec`,
-`DeploySpec` and `VolumeSpec` carry `#[serde(deny_unknown_fields)]`, so even an
-optional field there is incompatible. `NodeAssignments` has no
-`deny_unknown_fields` and already grew an optional `ingress` field. The
-`IntentConfiguration` and owner records are node-local and also
-`deny_unknown_fields`. `CURRENT` is protocol 27, state 44.
-
-**Test infrastructure.** Guest images are Ubuntu 24.04 (arm64 and x86_64) with
-`runc uidmap btrfs-progs nftables iptables iproute2`
-(`scripts/release/guest-images.json`). No CRIU. Ubuntu 24.04 has no `criu`
-package in the archive at all; the upstream PPA publishes 4.2.1 for noble
-([Launchpad criu](https://launchpad.net/ubuntu/+source/criu),
-[CRIU PPA](https://launchpad.net/~criu/+archive/ubuntu/ppa), both accessed 28 Sep 2026).
-CI runs on `ubuntu-latest` and has a "privileged Linux" job.
-
-## 3. CRIU, runc and the ecosystem today
-
-All links accessed 28 September 2026. "Unverified" means we couldn't find a
-primary source; treat it as a spike question, not a fact.
+This is the retained research snapshot from 28 September 2026, with the
+Kubernetes proposal corrected against its current text on 5 October. Version,
+architecture and support claims below are research inputs, not a qualification
+of our generated spec. Recheck upstream releases and actual node capabilities
+before packaging. "Unverified" means a spike must establish it. Sections 1 and
+5-10 define the revised contract and override the old research's suggestions
+about fallback, matching CPUs and dropping connections.
 
 ### CRIU
 
@@ -265,9 +220,10 @@ primary source; treat it as a spike question, not a fact.
   and runc supports it from 1.2. CPU features aren't checked unless you ask
   (`--cpu-cap`, [Cpuinfo](https://criu.org/Cpuinfo)), and glibc keeps using
   whatever it detected at start-up
-  ([LPC 2024](https://lpc.events/event/18/contributions/1811/)). Migrate only
-  between identical CPU models, or accept the crash.
-- **Lower downtime later.** Pre-dump and `--track-mem` rely on soft-dirty
+  ([LPC 2024](https://lpc.events/event/18/contributions/1811/)). The revised
+  design requires feature checks within a qualified compatibility pool; identical
+  CPU models alone do not prove portability (section 7).
+- **Memory transfer capabilities (September snapshot).** Pre-dump and `--track-mem` rely on soft-dirty
   tracking, which **arm64 mainline kernels still don't have** as far as we
   can find; the 2023-24 patches weren't merged
   ([LKML](https://lkml.iu.edu/2403.1/03203.html),
@@ -340,24 +296,25 @@ side (section 5.4). Revisit rust-criu only if we ever drop runc.
 | Tool | Checkpoint | Restore | Cross-host | Notes |
 |---|---|---|---|---|
 | Podman | yes | yes | yes, `--export`/`--import` tarball with rootfs diff, zstd | `--tcp-established` needs the same IP; `--name` can't combine with it ([checkpoint](https://docs.podman.io/en/latest/markdown/podman-container-checkpoint.1.html), [restore](https://docs.podman.io/en/latest/markdown/podman-container-restore.1.html), [guide](https://podman.io/docs/checkpoint)) |
-| Kubernetes KEP-2008 | kubelet `POST /checkpoint/...` writes a tar | **none in core** | no | Beta since 1.30, still beta ([kep.yaml](https://raw.githubusercontent.com/kubernetes/enhancements/master/keps/sig-node/2008-forensic-container-checkpointing/kep.yaml), [kubelet API](https://kubernetes.io/docs/reference/node/kubelet-checkpoint-api/)). Restore happens below Kubernetes: CRI-O since 1.25, containerd 2.1 ([containerd#10365](https://github.com/containerd/containerd/pull/10365)) |
-| Kubernetes KEP-5823 | pod-level | yes | **explicit non-goal** | Alpha scope is same node, same pod object; cross-node restore, volumes and devices are non-goals ([KEP-5823](https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/5823-pod-level-checkpoint-restore)). A [secondary source](https://palark.com/blog/kubernetes-1-37-release-features/) puts alpha in 1.37 |
+| Kubernetes KEP-2008 | kubelet `POST /checkpoint/...` writes a tar | **not provided by KEP-2008** | no | Beta since 1.30, still beta ([kep.yaml](https://raw.githubusercontent.com/kubernetes/enhancements/master/keps/sig-node/2008-forensic-container-checkpointing/kep.yaml), [kubelet API](https://kubernetes.io/docs/reference/node/kubelet-checkpoint-api/)). Restore happens below Kubernetes: CRI-O since 1.25, containerd 2.1 ([containerd#10365](https://github.com/containerd/containerd/pull/10365)) |
+| Kubernetes KEP-5823 | proposed pod-level | proposed | **initial non-goal** | The current initial scope creates a new Pod on the same node; in-place restore, cross-node restore, live migration SLOs, shared volumes and devices are non-goals ([KEP-5823](https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/5823-pod-level-checkpoint-restore)). No release availability is inferred from this proposal |
 | Docker | experimental `docker checkpoint` | yes | not as a feature | [docs](https://docs.docker.com/reference/cli/docker/checkpoint/) |
 | Incus | CRIU for containers | yes | yes | Docs: only "very basic containers" migrate reliably; 7.4 added snapshot-sync "near-live" moves instead ([docs](https://linuxcontainers.org/incus/docs/main/howto/move_instances/), [7.4](https://linuxiac.com/incus-7-4-adds-near-live-container-migration-for-zfs-and-btrfs/)) |
 | Apple `container` | none | none | none | No checkpoint, suspend or migrate command ([command reference](https://github.com/apple/container/blob/main/docs/command-reference.md)) |
 
 The Kubernetes [Checkpoint/Restore Working Group](https://www.kubernetes.dev/blog/2026/01/21/introducing-checkpoint-restore-wg/)
 (January 2026) lists migration for maintenance among its use cases, so
-cross-node restore in a mainstream orchestrator's *core* is genuinely
-unshipped. That's the honest version of "more than anyone else ships": true
-for core Kubernetes, not true for Podman, Borg, Cast AI or Cedana.
+Kubernetes is actively working on these use cases. The narrower native planned
+migration claim in section 1 is the comparison to establish; Podman, Borg, Cast AI
+and Cedana already provide checkpoint/migration mechanisms in other forms.
 
 **ProcessGrill and Apple Container can't take part in the CRIU mode.**
 Apple's runtime runs each container in a VM behind a CLI with no checkpoint
 verb. ProcessGrill runs host processes with no namespaces: CRIU would have to
 restore host PIDs, host paths and host sockets on another host, which is the
-case CRIU is worst at. Both refuse `--checkpoint` with a clear error. The
-cold-start move (section 5) could serve them later, but 0.4.0 keeps it
+case with additional host-level dependencies. Both must refuse checkpoint and
+live migration with a clear error. The cold-start move (section 5) could serve
+them later, but this migration proposal keeps it
 runc-only so there's one data path to test.
 
 ## 4. GPU checkpointing and where the demand really is
@@ -431,449 +388,414 @@ stop-and-copy downtime. A stateful dev or game server makes the better
 
 ## 5. Design for Reliaburger
 
-### 5.1 Scope for 0.4.0
+### 5.1 Scope, admission and ownership units
 
-The maintainer's "checkpoint-on-drain" survives, with two changes: the drain
-has to be built, and the restart fallback has to be a *move*.
+**In:** operator cordon/drain/uncordon; explicit migration; cold, checkpoint and
+live modes; apps and running jobs; managed data; volume/rootfs pre-sync; tested
+memory pre-copy/post-copy; connection ownership; a built-in demonstration,
+conformance profiles and a release qualification lane on both architectures.
 
-**In:**
+**Out:** GPUs, rootless/non-runc migration, automatic balancing/preemption
+policies, universal cross-architecture restore, arbitrary coordinated external
+state, and transparent movement of every possible socket/device/kernel feature.
+Apple runtime work elsewhere in 0.4.0 does not imply Apple migration support.
+Unsupported host-path/runtime/device cases block drain; an explicit force-stop
+is reported as a stop with data left in place, not a successful move.
 
-- `relish drain <node>` and `relish uncordon <node>`: cordon the node (no new
-  placements), then empty it. Instances without managed volumes are
-  rescheduled the way a rolling deploy would, respecting `max_unavailable`
-  (the whitepaper's promise for drain). Instances with managed volumes, and
-  running job attempts, are *migrated*. Instances with a host-path volume
-  block the drain; `relish drain --force` stops them, with their data left
-  in place.
-- `relish migrate <namespace>/<app> --to <node> [--instance <id>]
-  [--mode cold|checkpoint|live]`: move one instance on purpose, and
-  `relish migrate <namespace>/<job> --attempt <n> --to <node>` for a running
-  job attempt.
-- Three modes, one pipeline, opted into per app or job with
-  `[app.<name>.migration] mode = "cold" | "checkpoint" | "live"` (and
-  `[job.<name>.migration]`). A drain moves anything that hasn't opted in
-  cold.
-  - **cold**: stop the source, copy its managed volumes, cold-start on the
-    target. Works for any rootful runc app or job.
-  - **checkpoint**: the same, plus `runc checkpoint` on the source, the CRIU
-    image and the writable rootfs layer in the payload, and `runc restore`
-    on the target. If CRIU refuses at dump time, the source is still running
-    (CRIU resumes it on failure) and the migration continues as **cold**. If
-    restore fails on the target, it cold-starts there with the volumes
-    already moved.
-  - **live**: checkpoint, plus volume pre-sync while the app runs, memory
-    pre-dump iterations (x86_64) or lazy pages (both architectures), and TCP
-    handoff (section 5.7).
-- Jobs: a running attempt moves without spending a retry. It keeps its
-  attempt number; the job's durable attempt ledger (`src/bun/jobs.rs`) and
-  the batch tracker in Raft record the node change under the migration id,
-  so a crash mid-move can neither count it as a failure nor run it twice.
-- Rootful runc only.
+Drain follows **migration intent**, including for apps with no volumes. An
+in-memory cache or job with `mode = "checkpoint"`/`"live"` must enter this
+pipeline. Only workloads whose policy allows restart are ordinary reschedules.
+For unspecified app policy, the historical cold default remains; that default
+is not a promise of state continuity. An unspecified job may be restarted only
+when its own retry/restart policy permits it; otherwise it blocks drain.
 
-**Out, explicitly:**
+The move unit is a logical replica or a declared storage-sharing group. Until
+per-replica volumes exist, the source must have no other instance using those
+app volumes and the target must have no separate live/data ownership that would
+be overwritten. If that cannot be established, block or move the whole supported
+group; never silently split writers or merge copies. Lock volume identity as
+well as the app, and preserve placement ordinals.
 
-- GPUs, rootless runc, Apple Container, ProcessGrill: `migrate` refuses them
-  up front, and drain reports them as blocking (or stops them with
-  `--force`).
-- Automatic triggers: rebalancing, spot/preemption notices, autoscaling.
-  Rebalancing is a scheduler policy question we shouldn't answer in the same
-  release as the mechanism.
-- Binary upgrades. They don't restart workloads (section 2).
-- Handing off a connection that doesn't come through the source node's
-  address or masquerade (a client on the source node that dialled the
-  container address directly). It's reset.
+Admission checks and reserves:
 
-**Eligibility** (checked by the leader before anything happens, reported by
-`relish migrate --dry-run`):
+1. Exact source instance/job execution, spec digest, logical identity and current
+   runtime/ownership generation. No conflicting deploy, stop, snapshot restore,
+   scale or migration; honour recovery fences and resource leases.
+2. Target readiness, compatible placement labels, runtime/architecture/CPU and
+   qualified kernel/CRIU/filesystem/namespace combination. A newer CRIU version
+   and a CPU superset alone are not a complete portability proof.
+3. Image availability and bounded storage, memory and transfer capacity on both
+   nodes, including resident workload memory plus no-swap dump/restore buffers,
+   retained copies and control-plane headroom. Reserve them; a free-space sample
+   is not a reservation. Limit concurrent moves per node/link.
+4. Actual required preservation and latency envelope. Report incompatible layers
+   and alternate explicitly permitted outcomes in dry-run. An address collision
+   cannot quietly turn a required live move into a disconnecting move.
+5. Network, credentials and external lease/timeout requirements of the qualified
+   workload. Unsupported sessions or active exec/attach dependencies are refused
+   or explicitly excluded by the selected profile.
+6. For test fixtures, authenticated lease ownership throughout source, target,
+   payload, route and volume lifecycle (section 9). Ordinary test permission
+   never authorises draining unrelated workloads.
 
-1. The app runs on runc, rootful, with no GPU and no host-path volume.
-2. The instance is the only instance of its app on the source, and the target
-   runs none. Managed volumes are per app per node, so moving one of two
-   instances would either strand the other's volume or merge two copies on the
-   target. Singletons are the target workload anyway.
-3. No rollout, stop, delete, upgrade, test lease or other migration is active
-   for the app or either node.
-4. The target is alive, ready, not cordoned, matches placement labels, has
-   the resources, and has disk (and tmpfs, for checkpoint mode) for the payload.
-5. Checkpoint and live modes: both nodes report CRIU 4.2 or newer and the
-   source's CRIU is no newer than the target's; the target's CPU has every
-   feature the source's had (section 7); and the source can hold the
-   plaintext dump in memory (section 5.5). A mode that fails these is
-   **refused** with the reason, never silently downgraded, and
-   `relish migrate --dry-run` says which modes would pass. During a drain,
-   an opted-in instance that fails them is listed as blocking, and the
-   operator can move it cold explicitly.
-6. Live mode's extra layers each have their own precondition (section 5.7).
-   A missing one drops that layer, not the move, and the status says which
-   layers ran.
+CRIU, same-architecture execution restore, source CPU features and dump/restore
+RAM are checkpoint/live prerequisites. Cold mode instead checks target image
+and persistent-data compatibility and copy capacity; it does not require CRIU
+or reservation of a process dump. Every mode still requires exclusive ownership.
 
-### 5.2 What travels
+### 5.2 State that travels and consistent filesystem copies
 
-| State | Where it lives on the source | Cold | Checkpoint | Live |
-|---|---|---|---|---|
-| Managed volumes | `volumes/<ns>/<app>/...` (plain, loop ext4, Btrfs) | tar stream | tar stream | pre-synced while running, last delta after the freeze |
-| Writable rootfs layer | `<bundle>/rootfs-upper` | not moved (a cold restart starts fresh today too) | tar stream (restored files reference it) | pre-synced, last delta after the freeze |
-| Process memory, fds, namespaces | kernel | none | CRIU image | pre-dumps and a final dump, or lazy pages from the source's page server |
-| Image layers | image store | target pulls through Pickle **before** the source stops | same | same |
-| Captured stdout/stderr | `output.stdout`/`output.stderr` | stays; Ketchup has already ingested it | stays, see 5.4 | same |
-| Network identity | `/23` per node | new address and netns on the target | same; netns is external to CRIU | the container address is lent to the target for the handoff window (5.3) |
-| Workload certificate | per instance, key generated on the node | new instance, new certificate | new certificate; old one revoked (section 7) | same |
+| State | Cold | Checkpoint/live |
+|---|---|---|
+| Managed-volume contents/metadata | Carry the authoritative stopped contents. | Carry a filesystem cut compatible with the frozen execution. |
+| Writable overlay upper | Starts fresh by the declared cold semantics. | Carry changes, deleted-file whiteouts, opaque-directory/xattr state and required metadata. |
+| Memory, fds, namespaces | New computation. | Preserve qualified process/kernel state and open-file positions. |
+| Immutable image layers | Pull and verify before stopping. | Same; exact lower-layer digest and mount features must match. |
+| Capture output | Retain and ingest source tail. | Reattach target captures with uninterrupted ingestion identity; do not assume the source tail was already ingested. |
+| Network | New address/sessions as declared. | Checkpoint may close TCP; live retains supported tuples and all required external mappings. |
+| Credentials | New process loads current credentials. | Explicit mobility or tested reload policy; replacing mounted files alone is insufficient. |
 
-The copy of each volume stays on the source, renamed out of the way
-(`volumes/.migrated/<migration-id>/...`), until the migration completes and a
-retention period passes. That's what makes the fallbacks below possible, and
-it's also the one-writer rule from PR #267 in another form: the source copy
-is never mounted again unless the migration resolves *back* to the source.
+Pre-sync is opportunistic; only the frozen final cut is authoritative. A
+size/mtime-only comparison does not establish that an unchanged-sized file has
+unchanged contents. Use verified content/block deltas or a conservative complete
+final copy, with correct deletion, rename, hardlink, sparse-file, ownership,
+ACL/xattr and supported filesystem semantics. Couple the final memory image and
+filesystem manifest to the same cut/generation; in-flight writes and open or
+unlinked files are spike/test cases. Multi-volume cuts stop all relevant writers.
+Preserve application-acknowledged state; define the workload's durability
+expectations rather than pretending unacknowledged operations were committed.
 
-A plain `tar` of a stopped volume is consistent for every backend, so cold
-and checkpoint modes don't need `btrfs send`. Live mode pre-syncs while the
-app runs, then sends only the last delta after the freeze, as Incus 7.4
-does: Btrfs volumes with a snapshot and incremental `btrfs send`, the other
-backends with repeated rsync-style passes (a file whose size or mtime
-changed goes again). The final pass runs after the freeze, so it's
-consistent for every backend.
+Btrfs snapshot/incremental send is a candidate for that backend. Loop-ext4 moves
+must re-provision its target quota/mount bookkeeping and preserve complete image
+identities; copying files without an enforced target limit is incomplete. Plain
+and overlay data need explicit metadata-preserving import. Tar is a transport,
+not proof of these properties. Overlay details are in the
+[Linux documentation](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html#whiteouts-and-opaque-directories)
+(checked 5 October 2026).
 
-### 5.3 Identity and networking
+Keep a source snapshot/tombstone until retention permits deletion, but label it
+with its cut and ownership generation. After target activation it is stale
+recovery material, not a live fallback volume. Cleanup, snapshots and volume
+retirement must respect active migration ownership and never remount that copy
+from ordinary desired-state reconciliation.
 
-- **Instance identity.** Placements carry no instance identity, so the
-  target allocates a fresh local `InstanceId` as it would for any new
-  replica. A `MigrationId` links the two in events, logs and status. The
-  app's service name, DNS name and service VIP don't change.
-- **Discovery.** The source instance retires the normal way, so its routes
-  go through the existing withdrawal ledger and every consumer acknowledges
-  them before the address is reused. The target instance is published by the
-  leader once its health check passes. Nothing new is needed here, and that's
-  one of the reasons to keep addresses node-local.
-- **TCP in cold and checkpoint modes.** Drop. `runc checkpoint` has no
-  `--tcp-close` flag, so we pass CRIU's `tcp-close` through the
-  `org.criu.config` annotation (a small CRIU config file Reliaburger writes
-  per checkpoint). Without it, CRIU refuses to dump a process with an
-  established connection.
-- **TCP handoff in live mode.** CRIU's `--tcp-established` restores a
-  connection with `TCP_REPAIR`, but only if the restored socket keeps its
-  4-tuple: the same local address in the target's netns, and the peer's
-  packets still reaching it. Neither holds today. Container addresses come
-  from a per-node `/23`, are never routed between nodes, and two nodes whose
-  names hash alike can own identical-looking ranges. Every client, inside or
-  outside the cluster, reaches an instance at `node_ip:host_port` through the
-  source's nftables DNAT, and outbound traffic leaves through the source's
-  masquerade. Both directions of every existing connection are pinned to the
-  source node.
+### 5.3 Logical identity and source-independent networking
 
-  Two designs fit:
+Preserve the logical namespace/app/ordinal or job execution. A migration id links
+host/runtime generations for audit; it must not replace logical workload identity.
+The app service/DNS name and logical service VIP stay stable while backend
+ownership moves. Cached hostnames, node-local environment values and references
+to external resources are part of workload qualification; arbitrary process
+memory cannot be safely rewritten to make them portable. New host PIDs, boot
+ticks, owner records and cgroup identifiers are validated on the target. Do not
+transplant source host identity evidence.
 
-  1. **Forward through the source (proposed).** The target's netns borrows
-     the instance's container address for the migration: the target
-     reserves it in its `network_leases` journal under the migration id, and
-     refuses the handoff if it collides with an address of its own (the move
-     then drops connections and takes a fresh address, as checkpoint mode
-     does). Before restoring, the target reads the handed-off sockets'
-     4-tuples from the CRIU image into an nftables set. An IPIP tunnel
-     between the two node addresses carries those flows and only those.
-     Inbound packets still arrive at the source, pass its existing DNAT and
-     conntrack entry, and go down the tunnel instead of to a local veth; the
-     target policy-routes replies for tuples in the set back up the tunnel,
-     where the source's conntrack reverses the NAT exactly as before.
-     Outbound connections work the same way through the source's
-     masquerade. New connections never touch the tunnel: Onion publishes the
-     target's own `node_ip:host_port` backend once it's healthy, and the
-     source's is withdrawn through the existing ledger. The tunnel lasts for
-     a handoff window (default 10 minutes, per app), then comes down and any
-     survivors are reset. The source can't drain away while connections
-     still use it, so `relish drain` waits for the window (or `--timeout`),
-     and if the source dies the handed-off connections break, which is what
-     happens to them today anyway. Cost: about 3-4 weeks, most of it the
-     fencing (the borrowed address goes back through the same lease and
-     withdrawal rules as any other, `src/onion/lease.rs`) and the crash
-     cases. Nothing changes in how the rest of the cluster routes.
-  2. **Cluster-routable instance addresses.** Give every instance a
-     cluster-unique `/32` allocated by the leader and routed between nodes
-     (routes over gossip, or an overlay), so an address can simply move.
-     Cast AI needed a forked AWS VPC CNI for the same thing. It takes the
-     source out of the path, but it rewrites Onion's routing and its lease
-     invariant ("container addresses are never routed between nodes"), the
-     firewall's keys and every address test, for one feature. About 6-8
-     weeks, and a new class of split-brain bugs. Not for 0.4.0; it's the
-     answer if handoff through the source proves too limiting.
+For checkpoint, declared TCP closure is supplied through CRIU configuration;
+prove its interaction with external namespaces and the app's recovery behaviour.
+For live, maintain qualified inbound, outbound and ingress session identity.
+Include IPv4/IPv6 where supported, connection states, socket queues, packet
+locking between dump/restore, conntrack timeouts, MTU and reverse-path filtering
+in the network qualification. UDP/QUIC and other unsupported session families
+must have explicit policy; established-TCP support is not a universal session
+promise. CRIU requires packet locking to prevent transient resets and restoration
+of the original address ([TCP connection](https://www.criu.org/TCP_connection),
+research accessed 28 September; source requirements rechecked 5 October 2026).
 
-  Ingress (Wrapper) holds its own upstream connections to the instance, and
-  from the source's point of view they're ordinary handed-off connections,
-  so they survive too. Spike S11 proves the tunnel and `TCP_REPAIR` together
-  on our spec.
-- **eBPF and firewall.** Onion's maps and the Sesame firewall live on the
-  host and key on container addresses and cgroup ids, so nothing about them is
-  inside the CRIU image. The target programs them for its new instance as
-  usual. The catch: Bun installs cgroup-keyed egress policy between `runc
-  create` and `runc start`, and `runc restore` has no such gap. The plan is
-  to pre-create the cgroup, install the policy for its id, then restore into
-  it (spike S4). If that can't be made reliable, checkpoint mode refuses apps
-  with an egress policy.
-- **Time.** Checkpoint-mode containers get a time namespace (OCI 1.1,
-  runc 1.2+) so CRIU can keep `CLOCK_MONOTONIC` continuous across hosts.
+**Release direction: portable network ownership.** Cluster-unique movable
+workload addresses (`/32`, and `/128` if IPv6 is supported) remove node-pool
+collisions. They need authenticated route ownership, generation fencing and
+acknowledged route changes. Stable addresses do not move source NAT state by
+themselves. Specify an independent/transferable egress mapping owner with the
+same externally visible address/port and necessary conntrack state. Qualify
+where upstream routing permits that address to move. If a required external
+mapping is intrinsically tied to the source host, that topology cannot pass the
+source-independent profile; do not hide it behind source forwarding.
 
-### 5.4 The stdio problem
+Wrapper's upstream and client-facing sockets are separate. Moving a backend
+socket does not move the client's TCP/TLS/WebSocket session held by Wrapper.
+Use an ingress owner outside the drained source, or a separately proven proxy
+state/connection transfer. A profile names and tests this topology. Draining a
+node hosting required ingress sockets blocks until their dependency is removed
+or an explicit disconnect policy is accepted; force is not seamless completion.
 
-runc only re-attaches pipe descriptors on restore. Our containers write
-stdout and stderr to regular files in the owner's directory, so CRIU would
-try to reopen the source's file paths on the target, where they don't exist
-(or have a different size, which fails file validation). Three ways out, in
-order of preference, to be settled by spike S2:
+**Intermediate spike: forwarding through the source.** The old borrowed-address,
+CRIU tuple-set and source-conntrack tunnel is useful to test TCP_REPAIR. Reserve
+addresses and fence flows, use authenticated/protected inter-node transport, and
+prove packet-lock ordering. It does not meet source independence: source failure
+breaks sessions, and expiring a ten-minute window resets survivors. It may be
+reported as a weaker experimental outcome if explicitly requested, but cannot
+pass live conformance or unblock the 0.4.0 continuity release gate. Test second
+and subsequent moves to rule out forwarding chains and stale tuple leases.
 
-1. **CRIU `inherit-fd` through `org.criu.config`.** If runc's `criu swrk`
-   child inherits runc's own stdout and stderr (which the owner points at the
-   *target's* capture files), a config line mapping the image's file paths to
-   those descriptors makes CRIU reuse them. Smallest change, if runc doesn't
-   close them first.
-2. **Pipes for checkpoint-mode containers.** Give the container pipes and
-   have the owner copy them into the capture files. runc then handles
-   restore for us. It changes the owner, which is some of the most
-   carefully fenced code in the tree, so it's the fallback.
-3. **Recreate the path.** Make the target's capture file path identical and
-   pre-size it. Fragile; last resort.
+**Publication and withdrawal.** Prepare target network/firewall state before
+activation. Preserve old flows while new connections switch; ordinary source
+retirement must not erase needed conntrack, firewall, forwarding or proxy state.
+Reconcile discovery withdrawal with migration ownership; an endpoint becoming
+healthy does not prove source independence. Wait for the required network
+ownership acknowledgements before releasing/reusing addresses.
 
-### 5.5 Transfer
+**Egress and time.** No restored instruction may run before its cgroup egress
+policy is enforced. Pre-created cgroups or a reliable stopped-restore barrier
+must be proven on runc; otherwise refuse affected workloads. Create time
+namespaces before original launch when needed, and qualify timer/clock behaviour
+across hosts. External deadlines continue advancing regardless.
 
-- **Channel.** The target *pulls* the payload from the source over a new
-  node-to-node route on the Bun API (`System` principal, node-id mTLS, as the
-  other node routes). Pulling lets the target control disk use and resume a
-  broken transfer with a range request.
-- **Not Pickle.** Pickle already moves build contexts as blobs, so it's
-  tempting. But its store is catalogued, replicated, garbage-collected and
-  readable by any node that can pull. A process-memory dump must not land in
-  a registry, even briefly. Pickle's only job here is making sure the image
-  layers are on the target before the source stops.
-- **Format.** One stream: a tar with `criu/`, `rootfs-upper/` and
-  `volumes/<mount>/` entries, zstd-compressed (CRIU has no released
-  compression), then age-encrypted to a per-migration X25519 key the target
-  generates and holds only in memory. The source reports the stream's SHA-256
-  and length; the leader commits them; the target refuses a stream that
-  doesn't match. The `age`, `tar` and `zstd` crates are already in
-  `Cargo.lock`.
-- **At rest.** CRIU writes plaintext image files, so the source dumps into a
-  private tmpfs sized from the instance's memory limit. If the node doesn't
-  have that much free memory, checkpoint and live modes are refused (see
-  below). The encrypted stream may spool to disk on either side;
-  plaintext only exists in tmpfs, during dump and during restore.
-- **Space.** The leader checks both nodes' reported free space against the
-  instance's volume usage plus memory limit plus a margin before starting.
-  Bun's disk-pressure monitor refuses to accept a payload that would push the
-  data directory over its threshold.
-- **Cleanup.** Every payload file and tmpfs is named by migration id. On
-  start, Bun removes any whose migration is terminal or unknown to Raft; the
-  source's tombstoned volumes go after the retention period.
-- **Expected downtime.** Stop-and-copy downtime is dump + transfer + restore,
-  and transfer dominates: roughly the anonymous memory plus the volume size
-  over the link. A 256 MiB in-memory Redis should be seconds; a 10 GiB
-  volume is 90 seconds or more on 1 Gbit/s. That's why live mode pre-syncs
-  volumes as well as memory: for most stateful apps the volume, not the
-  memory, sets the downtime.
-- **Not enough memory for the dump.** If the source can't hold the plaintext
-  dump in tmpfs (the instance's memory limit plus a margin, against what the
-  node reports free), checkpoint and live modes are refused (decision 6).
-  Plaintext never spills to disk.
+### 5.4 Runtime owners, stdio and restart interference
 
-### 5.6 Control plane
+Prove runc restore under the existing owner/intent lifecycle, including launcher
+parentage, cgroup attribution, init identity, adoption after Bun restart, current
+boot/start-tick checks, exit receipts and retirement. Source and target runtime
+generations are distinct even when the logical instance name stays stable.
 
-The leader orchestrates, as it does for everything else. A migration is a
-Raft record the leader advances; each node does its idempotent part when its
-placement poll shows an instruction, and reports back over a node route. The
-reporting frames are bincode and stay untouched.
+Regular-file captures are an integration gap: runc's descriptor reattachment
+primarily handles pipes. Try CRIU inherited descriptors through `org.criu.config`;
+if unavailable, use owner-managed pipes for migratable containers. Recreating
+source paths/pre-sizing files is not accepted without robust validation. Preserve
+capture offsets/ingestion identity and consume source tails before retirement;
+never recreate a log path and count old bytes as new output.
+
+Hold ordinary health-triggered restarts, pending deploys, exec/attach/probe
+process creation and placement reconciliation while the move owns the workload.
+A liveness timeout during freeze cannot authorise a second instance. Target
+"migrating in" assignments suppress normal cold creation, including after agent
+restart; source journals forbid resurrection of retired generations. App stop
+and delete cancel desired execution, but still wait for confirmed retirement.
+
+### 5.5 Payload security, reservations and resumability
+
+The target pulls authenticated node-to-node chunks. Manifest entries bind
+migration id, ownership generation, consistent cut, paths, image/spec digest,
+lengths and content digests. Validate and import into private staging paths with
+symlink/hardlink/path-traversal confinement. Publish a staged filesystem only
+when the complete required manifest is verified. Flush imported file data,
+directory entries, ownership journals and atomic publish/tombstone transitions
+before issuing durable receipts; a matching digest of buffered bytes is not
+evidence of persistence. Use the existing durable-write patterns and test crashes
+between each write, rename and acknowledgement. Range requests resume encrypted
+bytes/chunks, not arbitrary plaintext offsets in a single compressed tar.
+
+Keep process dumps out of Pickle/object registries. Metadata and frozen memory
+can be tar/zstd/age streams; pre-sync rounds, final filesystem deltas and lazy
+pages are separate authenticated streams bound to one manifest/cut. One fixed
+hash of an unfinished all-in-one stream cannot describe post-copy progress.
+
+Plaintext dump/restore pages use bounded **no-swap** memory. Tmpfs can swap by
+default: enforce `noswap` on qualified kernels or an equivalent verified host
+policy, and include all plaintext staging buffers. Respect the maintainer's
+no-plaintext-spill requirement; inability to enforce it refuses checkpoint/live.
+See [kernel tmpfs documentation](https://www.kernel.org/doc/html/latest/filesystems/tmpfs.html)
+(checked 5 October 2026). Concurrency and memory pressure must not OOM the source
+workload or control plane.
+
+A key lost on every Bun restart cannot be allowed to force cold fallback. A
+runtime owner can retain the key across Bun exec/restart; full owner/node loss
+needs a proven recovery path. Proposed recovery material wraps each transfer key
+with the target's protected node-local key, persisting only authenticated
+ciphertext with the journal. Bind recipient/node/generation and authorise unwrap
+against current ownership. This is a proposed replacement for the old memory-only
+transfer-key design, not a claim that this path already exists. Re-keying and
+retransmitting before activation is also safe when the source cut remains intact.
+After activation, key loss must not authorise replay of stale state. Spike S15
+settles the recovery mechanism and threat model before implementation.
+
+Reserve dump/restore RAM, disk, retained snapshots, quotas and concurrency before
+freeze. Disk-pressure/cleanup code uses the same reservations and ownership.
+Unknown migration files on startup are quarantined/reconciled, not deleted just
+because a leader or Raft lookup is temporarily unavailable. Terminal ownership
+and positive evidence permit cleanup. Report uncertain cleanup as failure.
+
+### 5.6 Activation, fencing and recovery
+
+Raft chooses ownership; node-local owners, journals and enforced runtime/storage
+fences make that choice effective. Every instruction/report carries migration
+id, cut, source/target generation, spec digest and an ownership epoch. Duplicate
+or late messages cannot authorise an older epoch. All writers in the move unit
+must stop, and ordinary reconciliation must be unable to resurrect them.
 
 ```text
-Requested ──► Prepared ──► SourceStopped ──► Transferred ──► Completed
-    │             │              │                 │
-    └──► Aborted ◄┘              └──► FellBack ◄───┘
+Requested -> Prepared -> SourceFenced -> StateReady -> ActivationAuthorised
+                                                          |
+                                                          v
+                                  Active -> SourceIndependent -> Completed
+
+Before ActivationAuthorised: abort/return to source only with proof target cannot run.
+At/after ActivationAuthorised: recover authoritative current execution; no stale replay.
+Any phase: unresolved ownership/state -> RecoveryRequired (not successful completion).
 ```
 
-- **Requested.** The leader checked eligibility and reserved the target's
-  resources. The migration holds the app: deploys, scaling and autoscale
-  wait.
-- **Prepared.** The target pulled the image, checked space and tmpfs, and
-  generated the transfer key. Its public half goes into the record.
-- **SourceStopped.** The one-way door. The source runs `runc checkpoint` (or
-  a plain stop in cold mode, or after a refused dump) under the instance's
-  owner, tombstones its volumes, and reports the intent generation as
-  `Retired` with the payload digest. The leader commits it and, *in the same
-  entry*, moves the placement from source to target. From here on the source
-  must never run the app again unless the record says so.
-- **Transferred.** The target has the whole payload and it matches the
-  digest.
-- **Completed.** The target restored (or cold-started) and passed its health
-  check. The leader updates `last_placed_nodes`, records the downtime, and
-  releases the app.
-- **FellBack.** Something failed after the one-way door. The record names
-  where the app ended up and why.
-- **Aborted.** Something failed before it. Nothing changed.
+- **Requested/Prepared:** reserve the target, pull images, establish capabilities,
+  secure keys and staging. Source still executes; abort leaves it unchanged.
+- **SourceFenced:** freeze/checkpoint or stop all source writers; persist a
+  retirement fence before reporting. Complete the consistent final filesystem
+  cut. Agent restart/reboot must not clear this fence. Network/external writes
+  need the enforced fence, not merely a renamed local volume.
+- **StateReady:** target has all required filesystem/runtime metadata and a
+  verified full-memory image, or a qualified lazy-page provider satisfying the
+  requested failure envelope. Placement/home and held incoming assignment are
+  committed consistently with the ownership transfer.
+- **ActivationAuthorised:** the one-way recovery boundary, committed **before**
+  invoking anything that may run the target. runc restore can resume the app
+  before returning or before a health check. Treat an error/timeout from that
+  invocation as potentially active, not permission to restore the source.
+- **Active:** target execution may make new writes or external actions. Target
+  current state is authoritative. Health/publication is recorded separately.
+- **SourceIndependent:** outstanding pages, routes, NAT/proxy dependencies and
+  ownership acknowledgements are resolved. Retained stale source snapshots do
+  not count as a dependency; source is unable to execute them.
+- **Completed:** requested guarantees were observed, target is healthy and all
+  required source dependencies are gone. Release locks/reservations according
+  to retention policy. Explicitly permitted degraded relocation has a distinct
+  outcome naming its actual mode and losses; it is not a continuity pass.
+- **RecoveryRequired:** ownership or current state cannot be established. Keep
+  the fence and authoritative-home evidence, expose reason and recovery action.
+  A deadline ends retries/alerts; it does not turn missing evidence into success.
 
-Crash handling, step by step:
+A counterexample fixes the rollback rule: source cut is 100, target acknowledges
+101, then becomes unreachable. Restoring the source cut loses acknowledged 101
+and might create two writers. No target timeout or command failure makes cut 100
+current again. Reverse migration after activation must transfer current target
+state and fence the target first. An operator choosing stale recovery is an
+explicit data-loss intervention outside the continuity contract.
 
-| What fails | When | Result |
+| Failure | Before activation authorisation | At/after activation authorisation |
 |---|---|---|
-| Target unreachable, dies, or can't prepare | before `SourceStopped` | `Aborted`; the source never stopped |
-| CRIU refuses the dump | during stop | The process is still running; the migration switches to cold and stops it normally |
-| Source Bun crashes during the dump | during stop | The owner outlives Bun; on restart Bun reads the intent journal: still running means the dump failed (retry cold), retired means report it |
-| Source node dies | before `SourceStopped` | `Aborted`; the app waits for its volume home, exactly as node loss does today |
-| Source node dies | after `SourceStopped`, before `Transferred` | The payload isn't complete and the data is on the dead node: wait for it until the deadline, then `FellBack` to the source (the app stays homed there) |
-| Transfer fails or digest mismatches | after `SourceStopped` | Retry with backoff; then `FellBack` to the source: un-tombstone the volumes, move the placement back, restore from the local CRIU image if there is one, else cold start |
-| Restore fails on the target | after `Transferred` | Cold start on the target with the moved volumes (the maintainer's fallback); `Completed` with `mode = cold` and the reason |
-| Target dies after `SourceStopped` | any later phase | `FellBack` to the source, as above. The source copy is intact because it was only renamed |
-| Target Bun restarts mid-transfer | after `SourceStopped` | The in-memory transfer key is gone, so the payload can't be decrypted: the target cold-starts from a fresh volume transfer, never from half a payload |
-| Leader changes | any | The new leader reads the record and continues after its learning period; every step is keyed by migration id and the source's intent generation, so repeats are no-ops |
-| Both nodes die | after `SourceStopped` | The app stays down; `relish migrate cancel` resolves it to whichever node comes back with the data |
+| Target prepare/transfer fails | Leave source running, or safely resume its retained cut only after proving target cannot run. | Recover target current state; missing evidence holds recovery. |
+| CRIU refuses dump | Establish source liveness/stop outcome positively. Abort strict mode; restart only if explicitly permitted. | Not a dump-time fallback case. |
+| Source Bun restarts | Owner/journal determine actual phase; uncertainty blocks. | Do not clear source retirement fence; reconcile current epoch. |
+| Source node disappears | Missing untransferred state means unavailable/recovery required, not a successful fallback to a dead home. | Complete from already independent state; missing lazy pages follow declared failure envelope. |
+| Target restore returns error or times out | Applicable only if no activation was authorised and no execution could occur. | Treat as potentially executed; require positive retirement/current-state evidence before any replacement. |
+| Target loses contact/crashes | Abort/return only after target cannot execute is established. | Never run old source snapshot; use current durable target data and declared recovery semantics, or hold. |
+| Transfer key/agent disappears | Recover wrapped key/owner or re-key retained cut; no implicit cold restart. | Key/agent loss cannot roll back execution history; reconcile authoritative state. |
+| Leader changes | Resume committed record after learning/recovery fences; duplicates are no-ops. | Same epoch and activation boundary; absence of a receipt is not absence of execution. |
+| Stop/delete/cancel | Abort/retire with positive evidence. | Stop desired execution, confirm current owner retirement, retain authoritative data; cancel does not mean rewind. |
+| Both nodes disappear | Hold missing state/ownership. | Hold current ownership and data; decommission is not proof of safe replay. |
 
-Every phase has a deadline in the record, so nothing waits forever.
+Fencing must work during partition: lease/epoch checks in Raft alone cannot halt
+a running isolated process. Specify durable source retirement, runtime launch
+prohibition and storage/network enforcement for the selected topology, with
+self-fencing/lease expiry where required. External side effects need their own
+resource fencing if the workload's contract depends on it. Prove this in S12;
+finite cluster observations support the invariant but do not mathematically prove
+it, so use state-machine/property tests and recovery-path inspection as well.
 
-**Interactions.**
+Drain cordons, respects availability budgets, selects migration intent, and waits
+for **Completed/SourceIndependent** for each moved workload. A singleton's
+qualified brief interruption needs an explicit availability budget; do not claim
+surge can eliminate it. Blocked or degraded moves are reported. A drain timeout
+leaves the node cordoned with unresolved work; it does not tear down required
+sessions. `--force` explicitly accepts stops/disconnections, and its result does
+not certify seamless evacuation. `decommission-node` preserves recovery fences
+and requires current authoritative state/retirement evidence.
 
-- *Deploys.* A deploy of a migrating app waits until the migration is
-  terminal. A migration of an app mid-rollout is refused.
-- *Stop and delete.* They win: before `SourceStopped` the migration aborts;
-  after it, the migration is cancelled to whichever node holds the data and
-  the stop applies there.
-- *The placement reconciler.* The target must not cold-start the replica it
-  was just assigned while the payload is in flight: its `NodeAssignments`
-  carry a "migrating in" instruction that holds the slot. The source gets
-  "migrating out", which turns its retirement into a checkpoint instead of a
-  plain stop. The applied-placements checkpoint records both, so an agent
-  restart doesn't mistake the held slot for a pending deploy (the #267
-  failure mode).
-- *Upgrades, leases, decommission.* No migration starts during a cluster
-  upgrade; `relish decommission-node` resolves any migration touching the
-  node; lease-owned apps can't be migrated.
+### 5.7 Live planning, post-copy and interruption budgets
 
-**How drain uses it.** `relish drain` commits a cordon, then works through
-the node's instances: stateless ones are rescheduled with surge, singletons
-with managed volumes become migrations (checkpoint if the app opted in, cold
-otherwise), running job attempts move the same way, and anything
-ineligible (host-path volumes, GPUs, runtimes that can't move) is listed as
-blocking with the reason. `relish drain --force` stops those instead, with
-their data left in place. The drain finishes when the node runs nothing but
-system services and no handoff window still routes through it.
+Select methods from measured capabilities and the requested contract, not a
+fixed architecture label. The September research found no soft-dirty pre-copy
+on mainline arm64; verify the actual kernel/CRIU combination. Qualify x86_64
+pre-copy and arm64 alternatives separately; cross-architecture restore is out.
+An unverified arm64 lazy-page demo is a spike target, not a shipping claim.
 
-### 5.7 Live mode
+Pre-copy stops when the dirty set converges within the remaining freeze budget,
+stops improving, or reaches a round/time limit. The old 64 MiB/5-round policy is
+a tuning candidate, not a latency guarantee. At 1 Gbit/s, 64 MiB alone takes
+about 0.54 seconds to transfer before filesystem delta, restore and route costs.
+Use observed throughput and workload dirty rates; cap total pre-sync work so it
+does not starve unrelated apps. If the budget cannot be met, abort before
+activation rather than dropping required preservation.
 
-Live mode is checkpoint mode with extra layers, each with its own
-precondition, each dropped on its own when the precondition fails:
+Measure freeze, final filesystem delta, transfer, restore, route convergence,
+client request pauses and recovery of throughput. Post-copy page faults can
+shift delay after resume; report maximum migration-window pause and recovery
+tail as well as percentiles. Bind every performance result to workload size,
+dirty rate, client rate, network/storage environment and budget. No global
+average hides the cutover event; preparation downloads are reported separately.
+The shipped demonstration/conformance profile supplies a small fixed workload,
+load and budget established by S7 and release qualification, so no practitioner
+tuning is needed to try it. Custom envelopes are reported separately and cannot
+silently loosen the versioned default conformance requirements.
 
-| Layer | What it does | Needs | Without it |
-|---|---|---|---|
-| Volume and rootfs pre-sync | Copy while running; send the last delta after the freeze | nothing new | always available |
-| Memory pre-dump iterations | `runc checkpoint --pre-dump` with `--parent-path`, repeated while the dirty set shrinks, then a final dump of the last dirty pages | soft-dirty tracking on the source (`criu check --feature mem_dirty_track`): x86_64 yes, arm64 mainline no | lazy pages alone |
-| Lazy pages (post-copy) | The source dumps and serves pages from a CRIU page server; the target restores at once and faults the rest in through `userfaultfd` | `userfaultfd` on the target (`criu check --feature uffd-noncoop`); CRIU's page server with TLS | a full dump before restore, as checkpoint mode |
-| TCP handoff | Section 5.3 | borrowed address free on the target; IPIP between the two nodes | connections dropped, fresh address |
+Lazy pages may lower frozen time but depend on the provider until complete.
+If the source/connection fails, missing pages can stall or terminate execution;
+prove detection and bounded handling instead of assuming an automatic clean
+process death. Strict mode does not respond with memory-losing cold restart.
+A stronger source-failure envelope needs another authenticated recoverable page
+copy, or complete transfer before activation. The ordinary planned-move profile
+may explicitly accept temporary dependence while both nodes remain up, but it
+cannot report completion/drain-safe before that dependence is gone. Source loss
+outside that envelope reports recovery-required, not successful continuity.
+Replaying an old checkpoint after external actions is forbidden even if all old
+pages were replicated; restoring current execution requires current state.
 
-**Pre-dump policy.** Stop iterating when the dirty set is under a threshold
-(default 64 MiB), stops shrinking by at least a quarter per round, or hits a
-maximum number of rounds (default 5); then freeze. A process that dirties
-memory faster than the link carries it never converges, and that's exactly
-when lazy pages are the better tool, so an x86_64 live move that hits the
-round limit finishes the remainder with lazy pages.
+## 6. Compatibility and cluster integration
 
-**arm64.** Soft-dirty patches for arm64 were posted in 2023-24 and not
-merged. Emulating it with repeated full dumps would cost more than it
-saves. So on arm64, live mode is volume pre-sync plus lazy pages plus TCP
-handoff: the freeze covers one dump of the process state *without* its
-pages, and the pages follow. That's the Apple-silicon quickstart's shape,
-and the demo works on it. Pre-dump is x86_64-only, reported per node and
-shown by `relish migrate --dry-run`; the release's x86_64 qualification
-(GitHub's hosted runners, cloud VMs or the Wyse 3040s from 0.3.0) covers it.
-If arm64 gains soft-dirty upstream, the capability check picks it up with
-no code change.
+Pre-1.0 policy remains: incompatible changes bump protocol/state from current
+main and require a fresh cluster. There is no dependency on PR #266's old gate.
+Do not use the superseded protocol 27/state 44 numbers. The reviewed main is
+40/58; implementation chooses the next values when it lands.
 
-**Lazy pages bring a new failure mode.** Until the last page arrives, the
-restored process depends on the source. If the source dies or the page
-server connection breaks, the process on the target faults on a missing page
-and dies. Volumes and the rootfs delta have already moved, so the fallback
-is a cold start on the target with the data, and the status says the memory
-was lost. The page server uses CRIU's TLS with a per-migration key pair
-whose fingerprints are in the Raft record, so pages are encrypted in transit
-like the rest of the payload. The migration isn't `Completed` until the last
-page has arrived and the source has let go.
+Changes include migration/cordon records and ownership epochs in Raft snapshots
+and requests; app/job preservation and fallback policy; held assignments; job
+execution ownership transitions; volume-home records; node capability evidence;
+node-local migration journals and encrypted recovery keys; network lease/route
+ownership; runtime/time namespace records; authz routes and lease ownership;
+and schema-versioned test manifests/results. Existing serde/bincode formats must
+be audited where those facts are carried. Progress may use authenticated node
+routes, but do not promise current reporting frames remain untouched until the
+placement/capability design is settled.
 
+Preparation, source fencing, activation and home changes respect current main's
+recovery fences, desired-state transaction rules, trusted batch spec digests and
+capacity reservations. Migration must not reintroduce uncertain-job retries,
+stale-worker writes, incomplete snapshot restores or address resurrection fixed
+on main. Refresh evidence after further main changes before implementing.
 
-## 6. Compatibility (pre-1.0: bump and start fresh)
+## 7. Security and credential continuity
 
-The first draft proposed riding PR #266's "finalise cluster features" gate.
-That question is moot: the maintainer decided on 28 September 2026 that
-there's no backwards compatibility before 1.0.0 (PR #254's `CLAUDE.md` and
-`docs/releasing.md`). 0.4.0 is a development release, so its incompatible
-changes bump `protocol` and `state` in `src/compatibility.rs`, nodes refuse
-older peers and older state, and upgrading from 0.3.x means a fresh cluster.
-No gate, no migration, no additive-field rules.
+Memory contains plaintext secrets, TLS/session keys, passwords and tokens.
+Use authenticated/encrypted transfer and protected no-swap staging; no registry
+publication. Bind every stream to migration/cut/recipient and enforce bounded
+extraction and digest validation. CRIU is new privileged attack surface even
+though Bun already runs rootful runc. Pin/qualify packaging, keep opt-in workload
+scope, and test sandbox/profile compatibility when profiles are added.
 
-What changes, so the bump is deliberate and the tests know where to look:
+`migrate` needs app-scoped deploy permission; both checkpoint **and live** require
+memory/exec-equivalent authority. Drain, node-state faults, force-stop and
+cancelling another principal's move require their current administrative grants.
+A test lease narrows ownership; it does not expand permission. Update the server
+authz matrix for every new route and for indirect live moves through drain.
 
-| Change | Encoding | Handling |
-|---|---|---|
-| `RaftRequest::MigrationStart`, `MigrationAdvance`, `MigrationFinish`, `NodeCordon`, `NodeUncordon` | JSON enum variants | protocol and state bump |
-| `CouncilResponse` variants for the above, if any | JSON | same bump; prefer reusing `Ok`/`Applied`/`Refused` |
-| `DesiredState.migrations`, `DesiredState.cordoned_nodes` | JSON snapshot | state bump |
-| `[app.<name>.migration]` and `[job.<name>.migration]` | TOML/JSON, `deny_unknown_fields` | protocol bump |
-| Batch tracker attempt records gain the migration id | JSON | state bump |
-| `NodeAssignments.migrations` ("migrating in/out" instructions) | JSON | protocol bump |
-| Node routes: prepare, payload, report, handoff | HTTP | new routes in the `authz.rs` matrix |
-| `OciSpec` time namespace and offsets | node-local JSON | covered by the state bump |
-| Node-local migration journal (payload, tombstones, transfer state, borrowed addresses) | new file | covered by the state bump |
-| `StateReport` and reporting frames | bincode | not touched; progress goes over the new node route |
-| CRIU image format | not ours | record the source's CRIU version; refuse when the target's is older |
+**Credential continuity remains a required design spike, not a documentation
+footnote.** A restored process can retain the old key/certificate in memory.
+Replacing a mounted file and immediately revoking that serial can break fresh
+handshakes. Qualify either:
 
-## 7. Security
+- authorised mobility of the logical workload credential, with fenced source
+  ownership, protected transfer and subsequent rotation; this explicitly changes
+  the "private key never leaves the node" invariant; or
+- application cooperation that reloads fresh credentials before the old serial
+  is revoked; require a tested reload hook and scope the transparency claim.
 
-- **A checkpoint is a memory dump.** It holds whatever the process holds:
-  decrypted `EnvValue::Encrypted` secrets, TLS private keys, database passwords,
-  session tokens. Treat the payload like a secret: tmpfs for plaintext,
-  age-encrypted to a per-migration key the target holds only in memory,
-  node-id mTLS in transit, a digest committed in Raft, wiped when the
-  migration is terminal. It never goes to Pickle or object storage.
-- **It breaks an existing invariant.** Workload identity says "the private
-  key never leaves the node" (`src/cluster/workload_identity.rs`). A
-  restored process has the source instance's key in memory. The target
-  instance gets its own certificate as usual, and on `Completed` the leader
-  revokes the source instance's serial through the existing CRL
-  (`RevokeCertificate`). Apps that cache their identity must reload it from
-  the mounted file; we document that. Cold mode doesn't have this problem.
-- **Who can trigger it.** `relish migrate` needs a `Deployer` token scoped to
-  the app, like deploy and stop. `--mode checkpoint` additionally needs the
-  `exec` permission for that app, because reading a process's memory is at
-  least as powerful as exec'ing into it. `relish drain`, `uncordon` and
-  cancelling someone else's migration need `Admin`. No new
-  `PermissionAction` variant: the existing `deploy` and `exec` cover it, which
-  also keeps permission specs compatible.
-- **CRIU runs as root on both nodes.** Bun already runs rootful runc as root,
-  so there's no new privilege, but there is new attack surface: Google's
-  audit found a malicious task could hijack a root CRIU (LPC 2018, slide 31).
-  runc's restore doesn't support unprivileged CRIU. So checkpoint mode stays
-  opt-in per app, for workloads the operator trusts, and we pin a minimum
-  CRIU version and surface it in `relish wtf`.
-- **Seccomp and AppArmor.** The generated spec has neither today. CRIU
-  restores seccomp filters, and `runc restore --lsm-profile` exists for when
-  we add AppArmor. Nothing to do in 0.4.0 beyond a test that keeps the
-  checkpoint path honest when a profile appears.
-- **CPU features.** Restore is refused on a CPU that lacks any feature the
-  source's CPU had (decision 9). Each node reports its feature set with
-  `criu cpuinfo dump`; the leader checks that the target's is a superset
-  before it starts, and the restore runs with `--cpu-cap=cpu` so CRIU checks
-  again on the target. glibc and JITs keep using whatever they detected at
-  start-up, so the model needn't match, but nothing may be missing.
-- **Borrowed addresses.** TCP handoff lends the source's container address
-  to the target for a window. It's reserved and released through the same
-  lease and withdrawal rules as any other address, and the tunnel carries
-  only the tuples read from the dump, so it can't reach anything else on the
-  source.
-- **Egress.** A restored process must not run, even briefly, without its
-  egress policy. Section 5.3's ordering (spike S4) is a security requirement,
-  not a nicety.
+Choose and specify the supported path in S14. Do not simultaneously retain a
+cached certificate on the target and revoke it as if it belonged only to the
+source. Existing sessions may not revalidate revocation; test fresh authenticated
+connections after completion too. There is no arbitrary safe memory rewriting
+of cached credentials. Target identity and host ownership evidence remain
+separate; a retired source must not mint replacement credentials.
 
-## 8. Observability and UX
+CPU superset checks (`criu cpuinfo dump`, restore `--cpu-cap=cpu`) are defence in
+depth, not complete portability. Qualify architecture, runtime/image format,
+kernel, namespace/cgroup features, page size and relevant filesystem/device
+support as a migration pool. Runtime feature probes determine optimisations.
 
-**Commands.**
+## 8. Operator UX and evidence
+
+Proposed commands (none implies an implemented migration verb today):
 
 ```text
-relish migrate default/cache --to node-3                 # the app's mode; cold if it has none
-relish migrate default/cache --to node-3 --mode checkpoint
+relish migrate default/cache --to node-3
 relish migrate default/cache --to node-3 --mode live
-relish migrate default/cache --to node-3 --dry-run        # eligibility per mode and layer
-relish migrate default/render --attempt 7 --to node-3     # a running job attempt
+relish migrate default/cache --to node-3 --dry-run
+relish migrate default/render --execution <id> --to node-3
 relish migrate status [<migration-id>]
 relish migrate cancel <migration-id>
 relish drain node-2 [--timeout 30m] [--force]
@@ -881,314 +803,474 @@ relish drain status node-2
 relish uncordon node-2
 ```
 
-The opt-in in the app file:
+Job selection must resolve main's exact namespace/execution/run generation,
+not just an ambiguous attempt number. CLI syntax is finalised with that binding.
+The following config shape is proposed; parser/schema work remains:
 
 ```toml
 [app.cache.migration]
-mode = "live"            # "cold" (what drain does without this), "checkpoint" or "live"
-handoff_window = "10m"   # live only: how long handed-off connections route via the source
+mode = "live"                     # cold | checkpoint | live
+fallback = "abort"                # default for checkpoint/live; restart is explicit
+max_interruption = "500ms"        # illustrative qualified budget, not a measurement
 ```
 
-**Status** shows the phase, the mode and which live layers ran (and whether
-it fell back, with CRIU's reason), pre-dump rounds and their dirty sizes,
-bytes moved per kind, lazy pages still outstanding, handed-off connections
-still routed through the source, and the frozen time so far.
+Live implies required memory/execution/filesystem/session continuity and source
+independence at completion. Checkpoint allows declared TCP closure. Cold is
+restart semantics. If weaker experimental forwarding is exposed, it uses an
+explicit weaker profile/outcome; do not make `mode = "live"` secretly select it.
+`fallback = "abort"` means abort before activation; after activation, unresolved
+state means held recovery, not replay. Restart policy does not waive fencing or
+permit acknowledged persistent-data loss. Jobs retain their retry semantics.
 
-**Events** (Bun's event log and `relish status`): requested, prepared, source
-stopped (dump duration, payload size), transferred, restored or cold-started,
-fell back (reason), aborted (reason), completed (downtime).
+Human status leads with the outcome: source/target, required guarantees, current
+phase, observed interruption, unresolved dependencies and action needed. Detailed
+status includes mechanism choices, frozen/transfer/restore/route times, bytes by
+kind, pre-copy rounds/dirty sizes, outstanding lazy pages, original/active epochs,
+retained sessions and explicit degradation. A healthy target is not "done" while
+the source is still a network/page dependency.
 
-**Metrics** (Mayo):
+Metrics/events include requested/admitted/refused, source fenced, state verified,
+activation authorised, target active, source independent, completed/degraded and
+recovery required; separate client-observed pause from source freeze duration.
+Bound metric cardinality; per-migration identifiers belong in events/status
+unless a bounded diagnostic series is needed. `wtf`/lint cover all modes,
+unsupported hosts, stale reservations, missing no-swap policy, unresolved epochs,
+credential reload requirements and orphaned owned resources. A matching CPU model
+alone neither establishes nor rejects full compatibility.
 
-- `reliaburger_migration_total{mode, outcome}`
-- `reliaburger_migration_downtime_seconds` (source frozen to target healthy)
-- `reliaburger_migration_payload_bytes{kind="memory|rootfs|volume"}`
-- `reliaburger_migration_phase_seconds{phase}`
-- `reliaburger_migration_fallback_total{reason}`
-- `reliaburger_migration_predump_rounds` and `reliaburger_migration_lazy_pages_outstanding`
-- `reliaburger_migration_handoff_connections{migration}`
+Document the contract and the test command in the manual, quickstart and website,
+and explain the implementation and assertions in the 0.4.0 book chapter. Product
+flows explain preservation and pauses; CRIU plumbing goes in detailed diagnostics.
 
-**`relish wtf` checks:** CRIU missing or below the minimum on a runc node
-(`criu check`); an app opted into checkpoint that uses a host-path volume, a
-GPU or rootless runc; nodes with different CPU models hosting a
-checkpoint-enabled app; a migration past its deadline; orphaned payloads or
-tombstoned volumes past retention; a cordoned node that's been cordoned for
-days.
+## 9. Built-in demonstration and cluster conformance
 
-**`relish lint`** rejects `mode = "checkpoint"` together with a host-path
-volume or a GPU.
+### 9.1 One command against the practitioner's cluster
 
-**Docs.** A manual chapter ("Moving workloads"), a `docs/design/` section in
-`deployments.md` (drain) and `agent-bun.md` (checkpoint and live), and a new
-book chapter for 0.4.0 (decision 10). The chapter should tell the honest
-story: why the volume move comes first, what CRIU refuses, why pre-dump is
-x86_64-only, why handed-off connections still route through the source, and
-why the fallback is the real feature.
-
-## 9. Demo
-
-We have no GPU hardware, so the GPU story stays out of the demo. It isn't
-needed: the thing a checkpoint saves that a volume doesn't is *memory*, and
-an in-memory cache shows that better than anything.
-
-**The workload.** Redis with persistence off (`save ""`, `appendonly no`),
-the same pinned image the runc tests already use
-(`runc_redis_persists_to_a_managed_volume_across_restarts` in
-`src/grill/runc.rs`), 256 MiB of keys, one replica, `mode = "checkpoint"`.
-Its data lives *only* in memory, so a cold start would lose all of it. That's
-the "stateful dev or game server" case in miniature, and nobody needs it
-explained.
-
-**The script** (three-node quickstart cluster):
+Proposed front door:
 
 ```sh
-relish apply examples/migration/container-redis-memory.toml
-# DEBUG POPULATE is disabled by default since Redis 7, so fill it with a script
-relish exec default/cache -- redis-cli EVAL \
-  "for i=1,1000000 do redis.call('SET','key:'..i,string.rep('x',256)) end" 0
-relish exec default/cache -- redis-cli DBSIZE          # 1000000
-relish migrate default/cache --to node-3 --mode checkpoint
-relish migrate status                                   # phase, bytes, frozen time
-relish exec default/cache -- redis-cli DBSIZE          # still 1000000, now on node-3
-relish exec default/cache -- redis-cli INFO server | grep uptime_in_seconds   # didn't reset
+relish test --filter migration
 ```
 
-Then the fallback, which is the part that makes it trustworthy:
+Reuse `src/testkit` rather than a second demonstration engine. Add a short
+`migration` group that checks fresh capabilities, chooses a compatible pair,
+stages a digest-pinned fixture through existing image infrastructure, leases an
+isolated namespace, creates state, opens real client traffic, moves A to B and
+back, observes the outcome and confirms cleanup. Serialise its moves and bound
+resource use; default execution does not cordon/drain real nodes, restart Bun or
+inject faults. Small bounded heap/disk data and a few minutes are targets to
+measure, not a promised runtime. No operator TOML, Redis scripts, SSH, image
+builder or external load generator is required.
+
+Only qualified nodes run the fixture. Known absence reports **not demonstrated**
+with actionable reasons; collection failure is unknown. An explicitly requested
+migration demonstration returns nonzero if it cannot exercise its core live
+case. Optional subcases in broader development runs may be typed skips, but
+never a headline migration pass. Preflight is observational and does not install
+CRIU/change host configuration on an existing cluster; managed appliance/guest
+packaging supplies prerequisites. Image staging and baseline checks happen
+before timed migration.
+
+Illustrative human output (these are not measurements):
+
+```text
+Testing migration on your cluster
+  Source: worker-2   Target: worker-3
+
+Created state in memory and on disk.
+Opened a connection that stays open throughout the move.
+
+Moving worker-2 -> worker-3...
+  State preserved
+  Connection preserved; no reconnection
+  Longest response pause: 184 ms
+
+Moving worker-3 -> worker-2...
+  State preserved
+  Connection preserved; no reconnection
+  Longest response pause: 201 ms
+
+PASS: both moves preserved state and connections.
+Cleanup confirmed.
+```
+
+The headline states the tested paths and budget. Correctness can pass while a
+configured latency contract fails; print both verdicts. Add a small latency
+trace if the terminal supports it, with the same underlying report in JSON.
+Do not infer a percentile/SLO from one or two cutovers. `relish bench` reuses
+the scenario machinery for repeated/larger performance envelopes.
+
+### 9.2 Fixture and independent observations
+
+Extend the existing test workload infrastructure with a small real OCI migration
+fixture, packaged and signed/pinned for arm64 and x86_64. Main's ordinary host
+`testapp` and BusyBox HTTP fixture are starting points, not proof of CRIU support.
+Use normal migration APIs, runtime owners and data paths; no fixture-specific
+migration implementation or restart reconstruction.
+
+The fixture provides:
+
+- Memory-only random data/challenge supplied **after startup**, never baked into
+  its image, startup args, env or disk. The observer retains expected hashes;
+  cold start cannot reconstruct the state automatically.
+- A fresh startup identifier and continuously advancing computation. Stable
+  logical identity or PID alone cannot distinguish replay of a stale checkpoint.
+- A managed-volume journal, writable-root files, renamed/deleted entries and
+  selected metadata; an open descriptor advances across a move.
+- A persistent raw TCP session, a separately exercised ingress/WebSocket session,
+  and an outbound session to an observer peer that is not on the moving source.
+  The short demo covers a bounded subset and labels it; conformance covers every
+  required path. New connections after cutover check publication/credentials.
+- Numbered operations with response/state hash-chain evidence. A separate observer
+  records requests, acknowledgements, unresolved responses and committed state.
+
+Keep client retries/reconnection/resumption off in continuity cases. Record socket
+opens, disconnects and session identities directly. A library silently reconnecting
+would invalidate the connection assertion. The observer inside `relish` retains
+an acknowledgement ledger; where cluster reachability requires a client peer,
+place it on an independent node and collect its ledger. The migrated workload
+cannot be the sole authority for whether progress was lost. Local API forwarding
+is for management; traffic assertions use the declared real data-plane path.
+
+Track acknowledged and unresolved operations separately; a reply lost in transit
+is not proof that the operation was uncommitted. Compare acknowledged effects
+with current state and an independent append sink; detect duplicate external
+submissions without hiding them behind automatic retries/idempotent replay.
+Some uncertain operations may require reconciliation. Measure maximum request
+pause in each migration window and throughput recovery using the observer
+monotonic clock, not cross-host wall-clock subtraction, a whole-run average or
+unrelated successful requests. Observe an unmodified session across
+both moves to reveal source-forwarding chains.
+
+Also test a **memory-only app with no managed volume**, so drain cannot silently
+classify it as stateless. Exercise additional kernel/fd metadata cases in the
+full suite. Retain pinned real-application checks (at least Redis memory-only,
+and a storage-backed application once qualified) in release validation; the
+custom fixture is precise evidence but cannot establish general compatibility.
+
+### 9.3 Leases, interruption and cleanup
+
+Migration of lease-owned fixtures is required. Authenticate the current owner,
+carry lease id and bounded lifetime across all migration records, reservations,
+source/target copies, images and routes, and renew only under existing policy.
+The source's administrative retirement fence survives lease expiry. Expiry or
+Ctrl-C cancels desired execution and retires whichever generation may be active;
+it never authorises rollback or drops a fence before stop evidence. Release
+must collect resources on both nodes after any cutover phase. Node loss leaves
+cleanup unknown/failed until confirmed; neither a vanished CLI nor missing
+leader data justifies deleting authoritative state.
+
+Do not evade this by deploying unleased fixtures. Existing server policy and
+roles still apply. Basic fixture moves use the least applicable workload grants;
+actual node drain/shutdown/fault injection requires administrative node-state
+authority and explicit acknowledgement. Test resources/cordons/faults are owned
+and reversed without clearing another owner's state. A cleanup failure makes
+the run nonzero even when migration assertions passed; retain an evidence report
+and resource identifiers without secrets for follow-up.
+
+### 9.4 Versioned migration conformance
+
+Proposed strict command:
 
 ```sh
-relish apply examples/migration/container-io-uring.toml   # a workload CRIU refuses
-relish migrate default/uring --to node-3 --mode checkpoint
-relish migrate status          # "fell back to cold: CRIU cannot dump io_uring"
+relish test --profile migration
+relish --output json test --profile migration
 ```
 
-Then the live move, with a client connection that has to survive it:
+Add a versioned **required-case manifest** and profile expansion, not just another
+`profile_requires_case` branch. `--profile migration` selects the complete required
+non-disruptive set. A filter excluding a required case either refuses the conformance
+request or produces an explicitly partial/non-conformant report; all selected cases
+passing is insufficient. The strict profile fails on required skips, unknown or
+inferred-only evidence, deadlines, unexpected restart/degradation, latency-budget
+violations and unconfirmed cleanup. Architecture-dependent optimisations are
+not mandatory when another proven method satisfies the same contract.
 
-```sh
-relish exec default/cache-client -- redis-cli -h cache -r -1 -i 0.1 INCR counter &
-relish migrate default/cache --to node-2 --mode live
-relish migrate status          # pre-dump rounds or lazy pages, frozen time, handed-off connections
-```
-
-And the drain, with the soak's append-only writer on a managed volume:
-
-```sh
-relish drain node-2            # writer moves cold, cache moves with its memory
-relish drain status node-2     # empty; nothing blocking
-```
-
-**Success criteria.**
-
-- `DBSIZE` and a sample of values match before and after; `uptime_in_seconds`
-  keeps counting.
-- Frozen time for the 256 MiB cache under 10 seconds in checkpoint mode on
-  the Apple-silicon quickstart, and under 1 second in live mode (to be
-  confirmed by spikes S7 and S10; targets, not measurements).
-- The `INCR` client's connection never resets during the live move, and
-  the counter never goes backwards.
-- The io_uring workload ends up running on the target with its volume data,
-  and the status names the reason.
-- The writer's sequence file has no gap and no repeated line (the PR #267
-  check), and no instance of it ever runs on two nodes at once.
-- No payload, tmpfs or tombstone is left behind after the retention period.
-
-## 10. Testing plan
-
-Tests first, as always, but the spikes come before the tests, because three
-of them can change the design. None of them can run until the release soak
-is over and the Lima VMs are free.
-
-**Spikes** (runc 1.5.x and CRIU 4.2.1, both architectures, our generated
-spec):
-
-| Spike | Question | If it fails |
-|---|---|---|
-| S1 | Does `runc checkpoint`/`restore` work on our spec: user namespace, external netns, private overlay root, bind-mounted volumes and `resolv.conf`? | Checkpoint mode waits; cold mode ships alone |
-| S2 | Can restored stdio reach the target's capture files (section 5.4)? | Pipes through the owner, or checkpoint mode waits |
-| S3 | Restore into a *new* bundle, container id, netns and address, with `tcp-close` from `org.criu.config` | Checkpoint mode waits |
-| S4 | Pre-create the cgroup, install egress policy for its id, restore into it | Checkpoint mode refuses apps with egress rules |
-| S5 | Does the restored init still pass `owned_workload_cgroup`'s identity check, and can a new Bun adopt a restored generation? | Adjust the check; likely small |
-| S6 | Time namespace keeps `CLOCK_MONOTONIC` continuous across two VMs | Refuse checkpoint mode for apps that care, document |
-| S7 | Payload size and frozen time for Redis at 256 MiB and 1 GiB | Tune targets |
-| S8 | io_uring, POSIX mqueues and a GPU-less `/dev/nvidia*` bind are refused cleanly and the process keeps running | Tighten eligibility |
-| S9 | `runc checkpoint --pre-dump` with `--parent-path` on our spec, on x86_64; dirty-set convergence for Redis under write load; `mem_dirty_track` reported false on arm64 | Pre-dump waits; live mode is lazy pages only everywhere |
-| S10 | Lazy pages: `runc checkpoint --lazy-pages` with a TLS page server, `runc restore` with `criu lazy-pages` on the target, on both architectures; what the process sees when the page server dies | Live mode is pre-dump only (x86_64); back to the maintainer |
-| S11 | TCP handoff: borrowed address in the target netns, IPIP tunnel, 4-tuple set from the image, `--tcp-established` restore, source conntrack reversing the NAT | Back to the maintainer before building the routable-address design |
-
-**Unit tests** (portable, written first):
-
-- The migration state machine: every valid and invalid transition, and a
-  proptest that interleaves node crashes, leader changes and repeated
-  reports and checks the invariants: never two writers, the placement moves
-  exactly once or not at all, every migration ends terminal before its
-  deadline.
-- The fallback table in section 5.6, one test per row.
-- Eligibility: each refusal reason, including the singleton-per-node rule.
-- The Raft apply: the `SourceStopped` entry moves the placement atomically;
-  `Completed` updates `last_placed_nodes`; `decommission-node` resolves a
-  migration.
-- The compatibility bump: fixtures take their pair from
-  `compatibility::CURRENT`, and a 0.3.x peer and 0.3.x state are refused.
-- Live-mode planning: layer selection from reported capabilities, pre-dump
-  convergence and round limits, and the fall-through to lazy pages.
-- Job attempts: a moved attempt keeps its number and spends no retry,
-  including across a crash at every phase.
-- CPU features: a target missing any source feature is refused.
-- Handoff: tuple sets from a sample image, borrowed-address collisions, and
-  the window's expiry.
-- Payload manifest, digest and encryption round-trip; a tampered stream is
-  refused.
-- The authz matrix gains the new routes (its existing test fails otherwise).
-
-**Portable integration** (`tests/suite/`): `MockGrill` gains fake checkpoint
-and restore, and the in-process cluster harness drives a migration through a
-leader change, a target crash after `SourceStopped` and a source crash
-mid-dump.
-
-**Gated Linux** (`make test-linux`, a new `tests/migration_runc.rs` next to
-`tests/owned_runc.rs`): real runc and CRIU on one host, restoring into a
-different bundle, instance id and namespace, which exercises everything but
-the network hop; kill Bun mid-dump and mid-restore and check adoption; the
-io_uring refusal path.
-
-**Gated cluster** (`make test-cluster` on three Lima VMs): a real cross-node
-migration with a managed volume in both modes; power off the source
-mid-dump; power off the target mid-restore; kill the leader mid-transfer;
-drain a node with a mix of stateless, cold, checkpoint and live apps and a
-running job; a live move with an open client connection; kill the source
-mid lazy-page transfer.
-
-**Gated x86_64** (GitHub's hosted runners if CRIU works there, otherwise
-cloud VMs or the Wyse 3040s): pre-dump iterations and their convergence,
-because the Apple-silicon Lima VMs can't run them.
-
-**Soak.** Add a migration loop to the V02 sustained qualification: every N
-minutes migrate the soak writer (cold) and a checkpoint-enabled in-memory
-counter between nodes, including across the existing power-off faults. The
-writer check catches a double writer; the counter must never go backwards;
-no orphaned payloads at the end.
-
-**CI.** Unit and portable tests run everywhere. CRIU needs root and a
-suitable kernel; GitHub's `ubuntu-latest` runners can install it from the
-upstream PPA, so we should *try* the gated Linux migration tests in the
-existing "privileged Linux" job, and keep them Lima-only if the runner
-refuses. Unverified until someone tries.
-
-**Packaging.** Add `criu` to `scripts/release/guest-images.json` from the
-upstream PPA (Ubuntu 24.04 has no archive package), pin the version, and make
-`relish wtf` report it.
-
-## 11. Effort and phasing
-
-Rough, for one engineer (or agent plus reviewer) working in this codebase's
-style: owners, fences, receipts, crash tests at every step. Revised for the
-full version the maintainer asked for.
-
-| Piece | Weeks |
+| Contract area | Required case/observation |
 |---|---|
-| Spikes S1-S11 (after the soak; S9 needs x86_64) | 2-2.5 |
-| Compatibility bump and its tests (no gate) | 0.25 |
-| Cordon, `relish drain` for stateless apps, `uncordon`, `--force`, status | 2 |
-| Cold move: Raft record and state machine, node instructions, payload route, volume tar and tombstones, crash recovery, drain integration | 4-5 |
-| Checkpoint mode: runc checkpoint/restore under owners, stdio, cgroup and egress ordering, tmpfs and encryption, time namespace, CPU feature check, CRIU packaging, certificate revocation | 3-4 |
-| Jobs: moving a running attempt without spending a retry, attempt ledger and batch tracker | 1.5-2 |
-| Live: volume and rootfs pre-sync (Btrfs send, rsync-style passes elsewhere) | 1.5-2 |
-| Live: memory pre-dump iterations, convergence policy, capability reporting (x86_64) | 1.5-2 |
-| Live: lazy pages, TLS page server, the source-loss fallback | 2-3 |
-| Live: TCP handoff through the source (section 5.3) | 3-4 |
-| Observability, `wtf`, lint, manual, design docs, the new book chapter, soak loop, qualification on both architectures | 2-2.5 |
-| **Total** | **23-29** |
+| Cold data relocation | Managed volumes move correctly; restart and fresh-root semantics are explicit. |
+| Checkpoint | Memory, computation, open-fd state and filesystem cut survive; declared TCP closure is tested, not confused with live. |
+| Live | Original computation and qualified inbound/outbound/ingress sessions survive A->B->A with no restart/reconnect. |
+| In-memory-only intent | No-volume checkpoint/live apps follow migration policy during actual drain qualification. |
+| Storage | Each claimed backend preserves content/deletions/metadata and quota enforcement; copied data is authoritative only after validated cutover. |
+| Identity | Logical replica/job execution is retained; fresh authenticated operations succeed after movement and rotation/reload. |
+| Jobs | Exact execution/run/retry ownership survives; completed work and observed external effects are not replayed. |
+| Admission/refusal | Unsupported modes/features, conflicts, resource reservations and real incompatible targets refuse without disrupting the source. |
+| Lifecycle | Duplicate requests, cancellation, disconnected CLI and lease expiry retire resources correctly; no forbidden old generation starts. |
+| Required observability | The report binds observed state/session/latency results to exact nodes, paths and contract; source independence is independently qualified. |
 
-That's roughly five and a half to seven months for one engineer, about
-twice the first draft. CRIU-specific work is now about half of it (checkpoint
-mode, pre-dump, lazy pages and most of the handoff), up from a quarter. The
-routable-address alternative for TCP handoff would add another 3-4 weeks on
-top of the handoff line and isn't in the total.
+Missing heterogeneous hardware is not a fake refusal-test pass. Core/model tests
+cover synthetic incompatible feature matrices; cluster reports state which actual
+incompatible targets were exercised. Capability claims are available/unavailable/
+unknown with fresh evidence, never inferred from a generic API error.
 
-**Phasing inside 0.4.0.** Each step lands on `main` behind its own tests and
-is usable on its own; the release waits for all of them.
+Conformance scopes migration pools by architecture, CPU/features, runtime, CRIU,
+kernel/page size, storage and network topology. Directed compatibility can be
+asymmetric. Record tested directions and paths: the short demo's one pair is not
+a certificate for every node. Full qualification covers every node with suitable
+incoming/outgoing evidence and representative directed capability-class/backend/
+network edges; where that cannot cover a declared pool, report it unqualified.
+Use bounded planning rather than automatically claiming all N*(N-1) pairs were
+tested. A pass is for the recorded contract/version/configuration/run, not an
+indefinite certificate after hosts, routes or binaries change.
 
-1. Spikes S1-S11. Any failure goes back to the maintainer.
-2. Cordon, drain and uncordon for stateless apps.
-3. Cold moves with volumes, and drain moving stateful apps.
-4. Checkpoint mode.
-5. Jobs, in all three modes.
-6. Live: pre-sync, then lazy pages, then pre-dump (x86_64).
-7. Live: TCP handoff.
-8. Observability, docs, the book chapter, the soak loop and qualification.
+Report schema additions: contract/manifest version and selection completeness;
+build and per-node runtime/CRIU/kernel/architecture fingerprints; node/pool/direction,
+image digest, storage backend, network/ingress/egress paths; workload state size,
+dirty/client rate and interruption budget; acknowledgement/state/session evidence;
+per-cutover maximum pause and recovery tail; methods used and outstanding source
+dependencies; refusal/recovery/degradation; and independent cleanup. Redact memory,
+credentials and sensitive payload contents. Bump the report schema intentionally.
 
-**Later, each its own design:** GPU warm starts (a snapshot store with
-invalidation rules, driver and CPU matching, and hardware to test on);
-cluster-routable instance addresses, if handoff through the source proves
-too limiting; automatic rebalancing and preemption-driven moves; rootless
-and non-runc runtimes.
+The normal migration profile establishes planned-move behaviour while the source
+is available and validates dependency receipts. **Full cluster migration conformance
+also requires the recovery/source-shutdown qualification below**; a normal-profile
+pass alone must say source shutdown was not exercised. Fold non-disruptive cases
+into 0.4.0's `full-runc` acceptance and include all tiers in the release gate.
 
-## 12. Where the initial analysis holds and where it doesn't
+### 9.5 Recovery conformance and the source-off test
 
-**Holds:**
+| Level | Purpose | Default execution |
+|---|---|---|
+| Demonstration | Small observable A->B->A move on the practitioner's nodes. | Only owned fixtures move. |
+| Planned-move conformance | Complete versioned cold/checkpoint/live apps/jobs checks. | Isolated workload operations; no node shutdown. |
+| Recovery/source-independence conformance | Ownership, current-state recovery, real drain and source loss. | Explicit acknowledged disruptive suite on suitable nodes. |
+| Release qualification/soak | Larger repeated moves, real applications, both architectures/backends and shutdown. | Disposable release clusters; retained artefacts. |
 
-- Stop-and-copy first, pre-dump later. Google ran Borg's CRIU migrations
-  that way for batch and called it good enough there.
-- Opt-in per workload, with a clean fallback when CRIU refuses. CRIU refuses
-  plenty (io_uring, mqueues, devices), and even Incus calls it fragile.
-- Don't sell it for stateless web apps; they should just be rescheduled.
-- GPU warm-start demand is real and shipping (GKE, Modal, Dynamo).
-- It's demo-able.
+Proposed recovery entry point:
 
-**Doesn't hold, or needs adjusting:**
+```sh
+relish test --chaos --profile migration-recovery --yes
+```
 
-- *"Checkpoint-on-drain"*: Reliaburger has no drain. `relish drain` is
-  still planned in the whitepaper; the only node drain in the code is a
-  chaos fault. Build it first.
-- *"Fall back to a normal restart"*: there's no normal restart elsewhere for
-  a stateful app. Managed volumes are node-local and the scheduler sends the
-  app back to them. The fallback is a volume-carrying move, and that move is
-  most of the work.
-- *"More than anyone else ships"*: true against core Kubernetes (KEP-2008 is
-  checkpoint-only; KEP-5823 makes cross-node restore a non-goal). Not true
-  against Podman's export/import, Incus, Borg in 2018, or Cast AI and Cedana
-  today.
-- *"youki uses rust-criu for its checkpoint support"*: for checkpoint only.
-  Restore has been an open PR since February. We should shell out to runc,
-  which already speaks CRIU for us.
-- *"Iterative pre-dump"*: pre-dump needs soft-dirty tracking, which arm64
-  mainline doesn't have, and our quickstart is Apple silicon. So it's
-  x86_64-only, with lazy pages covering arm64, and volume pre-sync matters
-  at least as much for downtime.
-- *GPU as a headline use*: every shipping LLM warm-start product we could
-  verify restores a pre-warmed snapshot on the same class of machine, mostly
-  via gVisor. That's a snapshot product, not migration, and we have no GPUs.
-  Lead with batch, where there's evidence; use a memory-only server for the
-  demo.
-- *Upgrades as a trigger*: they don't restart workloads. Reboots do.
-- *Effort*: the brief reads as a CRIU feature. It's a stateful-move feature
-  with CRIU on top, and with every layer in it's 23 to 29 weeks.
-- *Unmentioned*: a checkpoint carries workload private keys off the node,
-  which contradicts the workload-identity design and needs revocation.
+Extend the existing chaos catalogue with named migration scenarios and that
+versioned manifest. The profile expands to the complete required recovery and
+source-off selection. Existing chaos filters select scenario names, not integration
+group names; a filtered recovery run is partial and cannot certify the manifest.
+The ordinary `--profile migration` result and this recovery report are combined
+only when their contract/build/pool fingerprints match. Consent cannot widen
+server policy. Serialize faults and select node sets that preserve required quorum and independent observers. Never drain or shut
+down an arbitrary practitioner node as part of the short demo.
 
-## 13. Decisions (28 September 2026)
+Recovery cases include leader change, source/target Bun crash, uncertain restore,
+partition at each activation boundary, source loss during lazy-page service,
+target loss after acknowledged writes, repeated/late instructions, stop/delete,
+lease expiry and return of the old source. They assert the declared outcome:
+pre-activation safe abort, current-state recovery, or explicit held unavailability
+outside the failure envelope. A deliberately induced, observed recovery-required
+response can satisfy a recovery case only with evidence of the expected fences,
+refusal to replay and bounded reporting; an observer that cannot establish those
+facts yields unknown and fails the run. Never require a green memory-losing restart.
+At-most-one-writer checks combine external observations, generation receipts and
+model tests; finite sampling alone is not proof.
 
-The maintainer answered the ten open questions on 28 September 2026. The
-questions as asked are kept in the PR history; the answers are:
+**Decisive source-off scenario:**
 
-1. **Framing.** No to "move first, CRIU opt-in only". 0.4.0 implements the
-   whole thing: drain, cold moves with volumes, CRIU checkpoint and
-   restore, pre-dump iterations, lazy pages and TCP handoff.
-2. **Gate.** Moot. There's no backwards compatibility before 1.0.0, so
-   there's no finalisation gate to share: 0.4.0 bumps `protocol` and `state`
-   and needs a fresh cluster (section 6).
-3. **Jobs.** Both apps and jobs, in 0.4.0.
-4. **Opt-in shape.** `[app.<name>.migration] mode = "cold" | "checkpoint" |
-   "live"` (and the same for jobs). A drain moves anything that hasn't opted
-   in cold.
-5. **Host-path apps during drain.** They block the drain; `relish drain
-   --force` stops them.
-6. **Plaintext on disk.** Refuse checkpoint and live modes when memory can't
-   hold the plaintext dump. Never spill it to disk.
-7. **CRIU distribution.** From the upstream PPA, minimum version 4.2. (The
-   0.3.0 quickstart guest moves to Ubuntu 26.04; check the PPA publishes for
-   it before then.)
-8. **Identity.** Revoke the source instance's workload certificate when the
-   migration completes.
-9. **CPU policy.** Refuse restore on a CPU missing any feature the source
-   had (section 7).
-10. **Book.** A new chapter for 0.4.0.
+1. Allocate a disposable, authorised source node and fixture/observer topology.
+   Keep the CLI entry route and necessary quorum/observers off the stopped source,
+   except separately declared tests that cover moving those dependencies too.
+2. Populate memory/filesystem state, open inbound/outbound/ingress sessions and
+   record acknowledgements independently under continuous traffic.
+3. Run the actual `relish drain` path, including a no-volume memory workload and
+   a running job. Verify it reports source-independent completion.
+4. Immediately stop the source VM or use an equivalent proven loss of its complete
+   data plane. Do not replace this with Bun exit or `NodeTransportGate` quiescence;
+   those can leave NAT/tunnel/proxy dependencies alive.
+5. Continue the **same** sessions and check acknowledged state, active ownership
+   and interruption budget. Then restart the source and verify retired generations
+   cannot resurrect. Restore only the cordon/fault changes owned by this run.
+
+Managed laptop clusters use their existing VM lifecycle machinery with independent
+management routing and quorum safeguards. Other clusters need an authorised
+external shutdown adapter/equivalent demonstrably complete isolation. If unavailable,
+report source-off coverage untested and withhold full conformance; do not make an
+SSH/hypervisor setup prerequisite for the ordinary demonstration. A retained
+source-forwarding window cannot pass this scenario by sleeping until sessions end
+or resetting them before power-off. Recovery evidence continues beyond the shutdown.
+
+## 10. Spikes, tests and qualification
+
+None of the following are implementation results. Run them on the then-current
+main generated OCI spec, qualified runc/CRIU packages and real kernels. Do not
+assume the September soak still owns particular VMs; acquire suitable disposable
+resources. x86_64 pre-copy and arm64 methods need separate hardware evidence.
+
+| Spike | Question and consequence |
+|---|---|
+| S1 | Checkpoint/restore with rootful userns, external netns, private overlay, volume backends and resolv.conf. Unsupported combinations block their claimed mode. |
+| S2 | Inherited/file/pipe stdio and capture ingestion across restore. Resolve owner changes before checkpoint ships. |
+| S3 | Preserve logical ordinal/job execution with new runtime/host identity, time namespaces and declared checkpoint TCP closure. |
+| S4 | Enforce cgroup egress before any restored workload executes; reject unsupported ordering. |
+| S5 | Restored init parentage, boot/start-tick evidence, Bun adoption, stop/exit receipts and stale-generation rejection. |
+| S6 | Cross-host timers/monotonic time and remote timeout/lease behaviour within a declared budget. |
+| S7 | Memory/volume/rootfs payload and client-observed pause for realistic sizes/rates; set envelopes from results. |
+| S8 | Unsupported io_uring/devices/IPC/exec dependencies: establish source outcome positively and refuse strict migration without cold fallback. |
+| S9 | Actual dirty tracking/pre-copy and convergence on qualified x86_64/arm64 hosts; select from capabilities. |
+| S10 | Lazy-page TLS/manifest binding, source/provider loss, fault stalls, provider independence and optional redundant-page recovery. |
+| S11 | TCP_REPAIR with packet locking, borrowed-address prototype and source-independent address/NAT ownership, ingress and repeated moves. Prototype success alone cannot pass the release gate. |
+| S12 | Partition-safe source retirement and target activation with current main's runtime/storage/recovery fences; no timeout-authorised second writer or stale replay. |
+| S13 | Consistent frozen filesystem cut, metadata/whiteouts/unlinked files, same-size/mtime modifications, quota and loop/Btrfs provisioning. |
+| S14 | Credential mobility or tested reload/rotation, fresh authenticated sessions and source retirement authority. |
+| S15 | No-swap reservations, protected transfer-key recovery across Bun/owner/node loss, staged import confinement and interruption cleanup. |
+| S16 | Tiny signed/pinned multi-architecture fixture, independent acknowledgement ledger and real data-plane probes without reconnection/retry masking. |
+| S17 | Migration under authenticated test leases; expiry/stop/cleanup at every boundary on both nodes. |
+| S18 | Versioned profile completeness, directional pools and recorded evidence; partial/skip/unknown cannot certify conformance. |
+| S19 | Actual drain followed by source VM shutdown/restart under live traffic, with independent entry/observer topology and no resurrection. |
+
+**Portable/model tests first:** state transitions and epochs; delayed/duplicate
+messages; target activation uncertainty; stale source rollback forbidden;
+capability/policy refusal; job execution/retry binding; manifests/encryption/
+metadata import; reservation concurrency; lease expiry/cancel; profile completeness
+and verdict aggregation. A property test interleaves leader changes, partitions
+and crashes and checks exclusive ownership and acknowledged-state monotonicity.
+It must allow recovery-required unavailability: universal terminal success by a
+deadline is not an invariant.
+
+**Portable integration:** use the existing in-process cluster/public API harness
+in `tests/suite/` with mock runtime outcomes, including restore that executes then
+returns an error and an isolated target that is still running. These tests protect
+orchestration; they do not count as real CRIU or connection-preservation evidence.
+
+**Gated Linux/cluster:** real runc/CRIU with current owners on one host for runtime
+integration, then actual cross-node movement and data paths on both architectures.
+Match `make test-linux`/`make test-cluster` and add a migration gate only if ownership
+and discoverability need it. Once selected, missing prerequisites fail/refuse;
+never return early as a passing gated test. CI initially proves which hosted
+runners can support CRIU; unavailable hardware gets an explicit owner and release
+qualification lane, not a green mock substitute.
+
+**Built-in operator cases:** short demonstration and complete migration profile
+run the same fixture/scenario/assertions with different coverage/load. Recovery
+cases share observations but use explicit chaos selection and node-state authority.
+Wire catalogue, capabilities, lease/authz routes, reports and built-in manual
+consistently; verify the documented commands select real required cases.
+
+**Release/soak:** repeat A->B->A under load with the volume writer, memory-only
+counter and real application fixtures; exercise main's recovery faults and the
+source-off case. Cover both architectures, every claimed backend, ingress/egress
+paths, jobs and credential continuity. Retain acknowledgement/session ledgers,
+per-cutover latencies, generation transitions, fingerprints and cleanup outcomes.
+Retries must not erase first failures. No pass on an empty run or skipped-only lane.
+Main's release qualification scripts own hardware/soak execution and save records
+in `docs/qualification/`; reuse the versioned conformance manifest so release
+checks cannot drift into a separate weaker demonstration.
+
+**Packaging:** package pinned qualified CRIU/runc in the appliance/managed Linux
+guests, check Ubuntu 26.04 availability before depending on a PPA, and expose
+runtime capabilities in `wtf`/dry-run. No automatic PPA installation on an existing
+cluster from `relish test`. Verify signed fixture image availability before timing;
+support existing mirrors/local staging rather than depending on a mutable tag.
+
+## 11. Implementation order and effort
+
+The old **23-29 focused weeks** was for the source-forwarding/automatic-cold-fallback
+design. It is historical, not the estimate for this revised contract. Portable
+network/NAT/ingress ownership, partition-safe activation, key/credential recovery,
+lease integration and conformance add material work. Re-estimate after S1-S19
+resolve the architecture; do not mechanically add a few weeks to the old total.
+
+Work in dependency order, behind meaningful tests, while keeping the full 0.4.0
+release acceptance scope:
+
+1. Refresh main evidence; implement fixture/observer and ownership/policy/model
+   tests; run feasibility spikes before locking the transport/network design.
+2. Cordon/drain ownership and status, held assignments, exclusive source fencing,
+   activation and safe recovery. Cold managed-data moves provide the first path.
+3. Stable logical/storage/job identities, consistent copy and capacity reservations.
+4. Checkpoint runtime/stdio/time/egress, secure no-swap transfer and recoverable
+   journals/keys; credential continuity.
+5. Qualified memory/filesystem pre-copy and optional post-copy with honest failure
+   envelope; interruption measurements.
+6. Source-independent addresses, egress mapping and ingress ownership; actual
+   source-off acceptance and repeated moves.
+7. Demonstration/catalogue/lease ownership, versioned conformance, capability/pool
+   evidence, JSON reports and benchmark envelopes throughout the work, not bolted
+   on after the mechanisms.
+8. Real applications, recovery/soak on both architectures/backends, documentation
+   and the new 0.4.0 book chapter; final release qualification.
+
+Intermediate mechanisms can land with their actual weaker guarantees, but cannot
+be advertised as live-conformant or used to declare a seamless drain complete.
+GPU warm starts, non-runc/rootless migration and automatic rebalancing remain later
+projects. Source-independent network ownership is no longer deferred if needed
+to satisfy this release's continuity contract.
+
+## 12. Consistency review and unresolved feasibility
+
+Review completed 5 October against fetched main `ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`.
+This is a design/document review, not completed migration qualification.
+Validation on this refreshed checkout: `git diff --check`, section/fence/local-link
+checks, all 19 pinned-main source references and proposed TOML syntax passed.
+`make ci` passed (formatting, both Clippy configurations, portable tests,
+doctests, CI-policy tests and ignored-test ownership); localhost test servers
+required execution outside the sandbox. Source/test/build files match the
+reviewed main exactly. No real CRIU/migration or source-shutdown experiment was
+run, and the proposed migration commands/profiles remain unimplemented.
+
+| Old weakness | Revised rule and proving work |
+|---|---|
+| Automatic cold fallback can empty memory-only Redis or replay a job. | Required outcomes and explicit restart fallback; separate degraded result. Sections 1, 5.1, 5.6, 8-10. |
+| Target may run before a health/restore receipt, then stale source rollback loses writes. | Activation authorisation is the recovery boundary before restore; current-state recovery/fencing. S12 and recovery cases. |
+| Ten-minute source forwarding conflicts with shutdown/session continuity. | Prototype only; portable address plus egress/ingress ownership; S11/S19 release gates. |
+| Short freeze conceals lazy-page stalls and source-loss risk. | Client-window latency plus explicit provider/failure envelope; no implicit cold restart. S7/S10. |
+| No-volume apps treated as stateless during drain. | Migration intent takes precedence; dedicated memory-only drain case. |
+| Fresh instance identity assumes main still lacks ordinals. | Stable logical replica/job execution; fresh host generation. Main evidence and S3/S5. |
+| New certificate plus immediate old revocation breaks cached identity. | Credential mobility/reload design and fresh-handshake qualification. S14. |
+| Size/mtime/tar assumed complete filesystem consistency. | Verified final cut and metadata/import/quota semantics. S13. |
+| Tmpfs assumed never spills; lost transfer key forced restart. | Enforced no-swap reservations and recoverable protected keys; S15. |
+| Test fixture leases forbidden; source node fault mistaken for power-off. | Authenticated cross-node lease lifecycle; actual VM/data-plane loss. S17/S19. |
+| Selected green tests mistaken for whole-cluster conformance. | Versioned manifest completeness, pools/directions, observed evidence and tiers. S18. |
+| Every deadline assumed to yield terminal successful ownership. | Held recovery/unavailability when proof is missing; model tests permit it. |
+| Stale baseline/protocol and job attempt design. | Main 40/58 and existing job generations/spec digests/replay fences, refreshed before implementation. |
+
+Remaining design blockers: partition-enforced ownership in each topology;
+portable external NAT and proxy sessions; restore on the real userns/overlay/
+egress spec; consistent filesystem/kernel-fd restore; credential handling;
+protected key/no-swap recovery; and quantified interruption envelopes. The named
+spikes resolve them. No feasibility or performance result is invented here.
+If the selected network topology cannot move a required external address, or a
+workload cannot meet its timeout/credential contract, refuse that combination
+and state the scope. The full release promise waits for passing source-off and
+conformance evidence rather than rewriting the success criteria around a demo.
+
+## 13. Decisions and revisions
+
+### Original maintainer decisions, 28 September 2026
+
+1. Ship the full drain/cold/checkpoint/live stack in 0.4.0, for apps and jobs.
+2. Pre-1.0 has no backwards compatibility; bump formats and start fresh, without
+   PR #266's gate.
+3. App/job mode is `cold | checkpoint | live`; unspecified apps move cold.
+4. Host-path apps block drain; explicit force stops them with data left in place.
+5. Plaintext process dumps must fit in memory and never spill to disk.
+6. Use upstream CRIU packaging, minimum 4.2, after verifying the guest OS package.
+7. Revoke the source instance's workload certificate on completion.
+8. Refuse CPUs missing source features, with a leader check and restore check.
+9. Write a new 0.4.0 book chapter.
+
+### Review incorporated with maintainer authorisation, 5 October 2026
+
+The maintainer requested that the PR incorporate the continuity/recovery review,
+built-in demonstration and cluster conformance proposal, then be checked for
+consistency against current main. This revision keeps the full release intent
+and distinguishes historical choices from required new design work:
+
+- Checkpoint/live default to preserving state, with restart fallback only by
+  explicit policy. Jobs that cannot safely restart block a cold drain. Successful
+  resumed jobs retain their execution/retry identity; cold jobs do not claim it.
+- Source forwarding and layer dropping cannot satisfy required live continuity.
+  Source independence, including NAT/ingress, is a release acceptance gate.
+- Source snapshots become stale once activation is authorised; no timeout/error
+  authorises stale replay. Positive fences/current-state evidence govern recovery.
+- Original certificate decision 7 needs S14 revision: preserving a cached target
+  credential and revoking it immediately are incompatible. Authorised credential
+  mobility or a tested reload-before-revocation path must be selected; this is
+  unresolved design, not an assertion that the invariant has already changed.
+- Original CPU check is retained as defence in depth within qualified pools.
+- The former memory-only transfer-key choice is replaced by a proposed protected
+  recovery design in S15. No plaintext dump-on-disk exception is introduced.
+- `relish test` gains the one-command demonstration and versioned conformance;
+  lease-owned fixtures must migrate safely. Actual source shutdown and recovery
+  are separate acknowledged cases and mandatory full-conformance/release evidence.
+- The old effort estimate is superseded pending the expanded spikes. All code
+  assertions use fetched main, and the merge preserves the PR's existing history.
