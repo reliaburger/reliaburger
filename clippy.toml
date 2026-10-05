@@ -1,0 +1,12 @@
+# File locks go through crate::file_lock::FileLock, which unlocks in Drop so a
+# child process mid-spawn can't keep the lock (#613). src/file_lock.rs is the
+# only place allowed to call these.
+disallowed-methods = [
+    { path = "std::fs::File::lock", reason = "use reliaburger::file_lock::FileLock, which unlocks in Drop (#613)" },
+    { path = "std::fs::File::lock_shared", reason = "use reliaburger::file_lock::FileLock, which unlocks in Drop (#613)" },
+    { path = "std::fs::File::try_lock", reason = "use reliaburger::file_lock::FileLock, which unlocks in Drop (#613)" },
+    { path = "std::fs::File::try_lock_shared", reason = "use reliaburger::file_lock::FileLock, which unlocks in Drop (#613)" },
+    { path = "std::fs::File::unlock", reason = "use reliaburger::file_lock::FileLock, which unlocks in Drop (#613)" },
+    { path = "nix::fcntl::flock", reason = "use reliaburger::file_lock::FileLock, which unlocks in Drop (#613)" },
+    { path = "nix::fcntl::Flock::lock", reason = "use reliaburger::file_lock::FileLock, which unlocks in Drop (#613)" },
+]

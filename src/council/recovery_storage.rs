@@ -8,6 +8,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use super::{DesiredState, state_machine::CouncilStateMachine};
+use crate::file_lock::FileLock;
 
 fn io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
@@ -17,24 +18,10 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-/// The held `flock` that serialises storage opening with recovery. Dropping
-/// it unlocks before closing: a child another thread is spawning shares the
-/// open file description until it calls `exec`, so a lock that was only
-/// closed could outlive this guard and refuse the next opening (#606).
-#[derive(Debug)]
-pub(crate) struct RecoveryLock(File);
-
-impl Drop for RecoveryLock {
-    fn drop(&mut self) {
-        // Nothing useful can be done with a failed unlock: closing the
-        // descriptor straight after still releases the lock eventually.
-        let _ = self.0.unlock();
-    }
-}
-
 /// Serialise storage opening with recovery, including the gap between renames.
 /// Live stores keep their redb locks after the opening guard is released.
-pub(crate) fn lock(raft: &Path) -> io::Result<RecoveryLock> {
+/// The returned guard unlocks when dropped (#606).
+pub(crate) fn lock(raft: &Path) -> io::Result<FileLock> {
     let parent = raft
         .parent()
         .ok_or_else(|| io_error("Raft directory needs a parent"))?;
@@ -45,8 +32,7 @@ pub(crate) fn lock(raft: &Path) -> io::Result<RecoveryLock> {
         .create(true)
         .truncate(false)
         .open(raft.with_extension("recovery-lock"))?;
-    file.try_lock().map_err(io_error)?;
-    Ok(RecoveryLock(file))
+    FileLock::try_lock(file).map_err(io_error)
 }
 
 /// Hold every existing store's redb lock, refusing a store a live node has
@@ -236,7 +222,7 @@ mod tests {
         let held = lock(&raft).unwrap();
         assert!(lock(&raft).is_err());
         drop(held);
-        lock(&raft).unwrap();
+        let _retaken = lock(&raft).unwrap();
     }
 
     #[tokio::test]
