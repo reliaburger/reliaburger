@@ -1195,6 +1195,115 @@ async fn a_consumer_sync_journals_at_most_one_write_a_turn() {
     }
 }
 
+/// A consumer that published a view, then restarted: the new process has
+/// recovered its ownership from the journal the old one left, so the view
+/// it published is withdrawn and nothing routes until the leader answers.
+async fn restarted_consumer() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::catalog::EndpointCatalog,
+    Vec<crate::cluster::orchestrate::IngressAssignment>,
+) {
+    let (mut agent, root, catalog, ingress) = recovered_consumer().await;
+    let published = agent
+        .synchronise_consumer(1, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    assert!(published.published);
+    // The old process lets go of the journal's claim as it dies.
+    drop(agent);
+    let (mut agent, _, _) = test_cluster_fault_agent().await;
+    agent.set_records_dir(root.path().to_owned());
+    agent
+        .supervisor
+        .grill()
+        .set_launch_inventory(Vec::new())
+        .await;
+    let identity = crate::bun::consumer_owners::ConsumerIdentity {
+        node_id: crate::meat::NodeId::new("test"),
+        cluster_identity: [42; 32],
+    };
+    agent
+        .recover_consumer_ownership(&root.path().join("discovery"), identity)
+        .await
+        .unwrap();
+    (agent, root, catalog, ingress)
+}
+
+/// The 0.1.5 candidate's compressed soak (#603): a node's first consumer
+/// sync after its bun restarted took 1092 ms in its command turn, where
+/// that node's earlier syncs took 290 to 800 ms. The command turn built the
+/// candidate view, which reads the runtime's whole launch inventory from
+/// disk, and then journalled the view's first write: two slow awaits in one
+/// turn, on a disk a restart had just left cold.
+///
+/// Counting both per turn keeps the verdict independent of the disk. The
+/// first answer after a restart reads the inventory once and journals five
+/// writes (withdrawing, withdrawn, receipts proven, publishing, active),
+/// and no turn may take more than one of those six.
+#[tokio::test]
+async fn the_first_consumer_sync_after_a_restart_takes_one_slow_await_a_turn() {
+    let (mut agent, _root, catalog, ingress) = restarted_consumer().await;
+    let lease = agent.view_lease_handle();
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::from_millis(50));
+    agent
+        .supervisor
+        .grill()
+        .set_inventory_delay(Some(std::time::Duration::from_millis(50)));
+    let reached = |agent: &BunAgent<MockGrill>| {
+        (
+            agent.loop_stalls.reached(LoopStall::Persist),
+            agent.loop_stalls.reached(LoopStall::RuntimeInventory),
+        )
+    };
+    let mut per_turn = Vec::new();
+    let (response, mut reply) = oneshot::channel();
+    let before = reached(&agent);
+    agent
+        .handle_command(AgentCommand::SyncClusterConsumer {
+            generation: 1,
+            catalog: Box::new(catalog),
+            ingress,
+            withdrawals: vec![],
+            requested_at_ns: crate::onion::lease::boot_clock_ns(),
+            response,
+        })
+        .await;
+    let after = reached(&agent);
+    per_turn.push((after.0 - before.0, after.1 - before.1));
+    while !agent.consumer_syncs.is_idle() {
+        assert!(
+            reply.try_recv().is_err(),
+            "the sync was answered before its last step"
+        );
+        let before = reached(&agent);
+        agent.continue_consumer_sync().await;
+        let after = reached(&agent);
+        per_turn.push((after.0 - before.0, after.1 - before.1));
+    }
+    let update = reply.await.unwrap().unwrap();
+    assert!(update.published);
+    assert!(lease.is_valid());
+    assert_eq!(
+        agent.consumer_owner().unwrap().phase,
+        crate::bun::consumer_owners::ConsumerPhase::Active
+    );
+    let writes: usize = per_turn.iter().map(|(writes, _)| writes).sum();
+    let reads: usize = per_turn.iter().map(|(_, reads)| reads).sum();
+    assert_eq!(
+        (writes, reads),
+        (5, 1),
+        "(writes, inventory reads) per turn: {per_turn:?}"
+    );
+    assert!(
+        per_turn.iter().all(|(writes, reads)| writes + reads <= 1),
+        "a turn took more than one slow await; (writes, inventory reads) per turn: \
+         {per_turn:?}"
+    );
+}
+
 /// Between a recovery's withdrawal and its publication the journal says
 /// Withdrawn, and other turns run in between. The view about to be
 /// published was built before, so the local addresses it names stay held.

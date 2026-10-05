@@ -4601,6 +4601,56 @@ long) and `[1, 1, 1]` for a changed view, in the same order as before. The local
 health change takes the same steps, and a turn that took a step leaves it
 for the next one.
 
+One write a turn turned out not to be the whole rule. The 0.1.5 candidate's
+compressed soak failed on a single turn (#603):
+
+```
+21:38:28 node-1 bun: agent loop turn took 1092 ms in command (sync_cluster_consumer)
+```
+
+It was node 1's first sync after a leader-kill fault restarted its bun, on
+a loaded runner. That node's syncs before the restart took 290 to 800 ms.
+The steps were doing their job, so what was still in that command turn? The
+first step. It builds the candidate view, and to build it, it reads the
+runtime's whole launch inventory: for runc, the intent journal, one file per
+launch, from a disk the restart had just left cold, behind a reader that
+admits one read at a time. Then it journals `Withdrawing`. One slow read and one slow write, back to back.
+
+So the rule became one *slow await* a turn, and the read got a step of its
+own:
+
+```rust
+enum ConsumerStep {
+    Journal {
+        publication: ConsumerPublication,
+        withdrawals: Vec<EndpointWithdrawalInstruction>,
+    },
+    Withdraw(ConsumerPublication),
+    // ...
+}
+```
+
+`Journal` uses the other way a Rust enum variant can carry data: named
+fields, like a struct, instead of a tuple. The first step now only builds
+the candidate, and `Journal` does what came after it: it records the
+answer's withdrawal obligations and journals the first change, reading the
+journal afresh like every other step. A command turn doesn't even take the
+first step any more. `request_consumer_sync` queues the answer and returns,
+and the end-of-turn republication queues too, so neither adds an inventory
+read to a turn that may already have journalled something. The candidate
+counts in `own_view_names` from the moment it's built, for the same reason
+the view between `Withdrawn` and `Publish` does.
+
+The test counts the read as well as the writes. `LoopStall::RuntimeInventory`
+counts every inventory read without slowing it (`MockGrill`'s inventory
+delay does that), and `the_first_consumer_sync_after_a_restart_takes_one_slow_await_a_turn`
+publishes a view, drops the agent, recovers a new one from the same journal
+and sends the first answer. Before the change its turns were
+`[(1, 1), (1, 0), (1, 0), (1, 0), (1, 0), (0, 0)]`, as (writes, reads); the
+first one is the soak's 1092 ms. Now no turn has more than one of the six.
+The price is a turn or two of latency on each answer, which a two-second
+placement poll doesn't notice.
+
 #### Counting instead of timing
 
 The same day, the oldest slow-disk scenario,
