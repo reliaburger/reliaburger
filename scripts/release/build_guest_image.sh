@@ -110,6 +110,11 @@ in_guest() { chroot "$root" env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPE
 in_guest apt-get -o Acquire::Retries=3 update -qq >&2
 # shellcheck disable=SC2086
 in_guest apt-get -o Acquire::Retries=3 install -y -qq $packages >&2
+# One clock source: Lima's guest agent sets the guest clock to the host's
+# every 10 s and has no switch to stop it, so timesyncd beside it only
+# fights it (#608). Disabling only removes symlinks, which works offline in
+# the chroot. Quickstart provisioning disables it on stock images too.
+in_guest systemctl disable systemd-timesyncd.service >&2
 
 # SC2016: ${Package} is dpkg-query's format syntax, not a shell expansion.
 # shellcheck disable=SC2086,SC2016

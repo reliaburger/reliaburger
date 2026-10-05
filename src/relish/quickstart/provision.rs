@@ -39,19 +39,31 @@ pub fn vm_config(
         "networks":[{"lima":"user-v2"}],
         "portForwards":forwards,
         "provision":[{"mode":"system","script": format!(
-            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n{}{}{}",
+            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n{}{}{}{}",
             // Lima changes the user manager during first boot. Reconnect logind
             // after that transition so subsequent PAM sessions do not stall.
             // A graceful stop sometimes spins until systemd's 90 s stop
             // timeout kills it, stalling boot. Kill it straight away instead.
             "systemctl kill --signal=SIGKILL systemd-logind.service || true\n\
              systemctl restart systemd-logind.service\n",
+            ONE_CLOCK_SOURCE,
             install_missing_packages(&super::artifacts::guest_image_pins()?.packages)?,
             "install -d -m 700 /etc/reliaburger\n")
         }]
     });
     Ok(serde_yaml::to_string(&value)?)
 }
+
+/// Shell that leaves the guest's wall clock to Lima's guest agent alone.
+///
+/// Lima 2.1's host agent sets the guest clock to the host's every 10 s
+/// whenever they differ by more than 100 ms, and has no setting to turn
+/// that off. With systemd-timesyncd also running, the two fought: timesyncd
+/// slewed the clock forward at its +500 ppm limit and the agent stepped it
+/// back every 10 s (#608). The release image ships timesyncd disabled; this
+/// covers the stock Ubuntu image of development runs.
+const ONE_CLOCK_SOURCE: &str = "if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then\n  \
+     systemctl disable --now systemd-timesyncd.service\nfi\n";
 
 /// Shell that installs the node packages unless the image already has them.
 ///
@@ -221,24 +233,32 @@ mod tests {
         assert!(kill < restart, "{script}");
     }
 
-    /// Run the generated provision script with stub system tools and
-    /// return every `apt-get` invocation. `missing` is a package the stub
-    /// `dpkg-query` has never heard of.
+    /// What the generated provision script asked of `apt-get` and `systemctl`.
     #[cfg(unix)]
-    fn apt_calls_when_provisioning(missing: Option<&str>) -> Vec<String> {
+    struct Provisioned {
+        apt: Vec<String>,
+        systemctl: Vec<String>,
+    }
+
+    /// Run the generated provision script with stub system tools and
+    /// record every `apt-get` and `systemctl` invocation. `missing` is a
+    /// package the stub `dpkg-query` has never heard of.
+    #[cfg(unix)]
+    fn run_provisioning(missing: Option<&str>) -> Provisioned {
         use std::os::unix::fs::PermissionsExt;
         let yaml = vm_config("/private/cache/guest.qcow2", "aarch64", 19117, None, None).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let script = value["provision"][0]["script"].as_str().unwrap();
         let stubs = tempfile::tempdir().unwrap();
-        let log = stubs.path().join("apt.log");
+        let apt_log = stubs.path().join("apt.log");
+        let systemctl_log = stubs.path().join("systemctl.log");
         let tools = [
             (
                 "dpkg-query",
                 "for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done",
             ),
             ("apt-get", "echo \"$*\" >> \"$APT_LOG\""),
-            ("systemctl", "true"),
+            ("systemctl", "echo \"$*\" >> \"$SYSTEMCTL_LOG\""),
             ("install", "true"),
         ];
         for (name, body) in tools {
@@ -251,25 +271,32 @@ mod tests {
             .arg(script)
             .env("PATH", format!("{}:/usr/bin:/bin", stubs.path().display()))
             .env("MISSING", missing.unwrap_or(""))
-            .env("APT_LOG", &log)
+            .env("APT_LOG", &apt_log)
+            .env("SYSTEMCTL_LOG", &systemctl_log)
             .status()
             .unwrap();
         assert!(status.success());
-        std::fs::read_to_string(&log)
-            .map(|text| text.lines().map(str::to_string).collect())
-            .unwrap_or_default()
+        let lines = |path: &std::path::Path| {
+            std::fs::read_to_string(path)
+                .map(|text| text.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        Provisioned {
+            apt: lines(&apt_log),
+            systemctl: lines(&systemctl_log),
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn provisioning_a_baked_image_never_runs_apt() {
-        assert!(apt_calls_when_provisioning(None).is_empty());
+        assert!(run_provisioning(None).apt.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
     fn provisioning_a_stock_image_installs_every_node_package() {
-        let calls = apt_calls_when_provisioning(Some("uidmap"));
+        let calls = run_provisioning(Some("uidmap")).apt;
         let packages = crate::relish::quickstart::artifacts::guest_image_pins()
             .unwrap()
             .packages
@@ -280,6 +307,21 @@ mod tests {
                 "update -qq".to_string(),
                 format!("install -y -qq {packages}")
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_leaves_the_guest_clock_to_the_lima_guest_agent() {
+        // Lima's guest agent steps the clock to the host's every 10 s and
+        // can't be switched off; timesyncd slewing the other way made the
+        // two fight, stepping the clock back every 10 s (#608).
+        let calls = run_provisioning(None).systemctl;
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "disable --now systemd-timesyncd.service"),
+            "{calls:?}"
         );
     }
 
