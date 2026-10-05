@@ -26,6 +26,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         refuse: impl FnOnce(String) -> BunError,
     ) -> Result<Option<Vec<RuntimeLaunch>>, BunError> {
         let deadline = (tokio::time::Instant::now() + patience).min(self.turn_deadline());
+        #[cfg(test)]
+        self.loop_stalls
+            .hold(super::LoopStall::RuntimeInventory)
+            .await;
         match tokio::time::timeout_at(deadline, self.supervisor.grill().launch_inventory()).await {
             Ok(launches) => Ok(launches?),
             Err(_) => Err(refuse("runtime inventory timed out".into())),

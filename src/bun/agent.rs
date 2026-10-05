@@ -385,6 +385,10 @@ enum LoopStall {
     /// Validating and serialising the whole job inventory, off the loop
     /// but awaited by it.
     JobInventoryEncode,
+    /// Reading the runtime's launch inventory: the runc intent journal,
+    /// one file per launch, which after a restart comes off a cold disk.
+    /// Only counted; `MockGrill::set_inventory_delay` makes it slow.
+    RuntimeInventory,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
@@ -1490,9 +1494,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             };
             // Local changes only mark the consumer view stale, so a burst of
             // them costs one republication, and the old view serves meanwhile.
-            // The republication starts in the turn and its writes go on in
-            // turns of their own; a turn that took a step leaves it for the
-            // next, so no turn journals two of them.
+            // The republication is queued here, and its inventory read and
+            // writes go on in turns of their own (#603); a turn that took a
+            // step leaves it for the next, so no turn takes two of them.
             if !self.consumer_syncs.end_turn() {
                 self.start_consumer_refresh().await;
             }
