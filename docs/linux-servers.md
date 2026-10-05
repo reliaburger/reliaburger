@@ -173,7 +173,10 @@ This writes the following files under `/etc/reliaburger`:
 
 > **Important**: `relish init` prints two `Root CA:` lines to stderr. Copy the
 > one that starts with `sha256:`; that's the root CA fingerprint the joining
-> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together.
+> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together,
+> and make a copy of the root that only you can open with
+> `sudo relish ca backup --out prod-root-backup.age --dir /etc/reliaburger`
+> (see the manual's security chapter).
 
 ### 3.2 Write the Node 1 configuration
 

@@ -10,7 +10,7 @@ use age::secrecy::ExposeSecret;
 use base64::Engine as _;
 
 use super::crypto;
-use super::types::{AgeKeyScope, AgeKeypair};
+use super::types::{AgeKeyScope, AgeKeypair, ResealedSecret, SecurityState};
 
 /// Errors from secret operations.
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +170,67 @@ pub fn is_encrypted(s: &str) -> bool {
     s.starts_with(ENC_PREFIX) && s.ends_with(ENC_SUFFIX)
 }
 
+/// Every age identity that may decrypt a value stored in `namespace`,
+/// newest generation first.
+///
+/// A namespace with a key of its own gets only its own identities; one
+/// without gets the cluster-wide ones (see
+/// [`SecurityState::decryption_keypairs`]). A key that won't unwrap with
+/// `wrapping_ikm` is left out, so the caller fails closed on the value it
+/// can't open rather than on the whole set.
+pub fn namespace_identities(
+    state: &SecurityState,
+    namespace: &str,
+    wrapping_ikm: &[u8],
+) -> Vec<age::x25519::Identity> {
+    state
+        .decryption_keypairs(namespace)
+        .into_iter()
+        .filter_map(|kp| unwrap_age_identity(kp, wrapping_ikm).ok())
+        .collect()
+}
+
+/// Seal each encrypted environment value in `apps` again under
+/// `public_key`, the namespace's new key (F05 I4).
+///
+/// `identities` are the keys that opened the values until now: the
+/// cluster-wide ones. A value none of them opens is left alone, since it
+/// didn't decrypt before the namespace opted in either, and it still fails
+/// its deploy closed afterwards. Plaintext lives only inside this call.
+pub fn reseal_namespace_values<'a>(
+    apps: impl IntoIterator<
+        Item = (
+            &'a crate::meat::types::AppId,
+            &'a crate::config::app::AppSpec,
+        ),
+    >,
+    identities: &[age::x25519::Identity],
+    public_key: &str,
+) -> Result<Vec<ResealedSecret>, SecretError> {
+    let mut resealed = Vec::new();
+    for (app_id, spec) in apps {
+        for (env_key, value) in &spec.env {
+            if !value.is_encrypted() {
+                continue;
+            }
+            let previous = value.as_str();
+            let Some(plaintext) = identities
+                .iter()
+                .find_map(|id| decrypt_secret(previous, id).ok())
+            else {
+                continue;
+            };
+            resealed.push(ResealedSecret {
+                app_id: app_id.clone(),
+                env_key: env_key.clone(),
+                previous: previous.to_string(),
+                sealed: encrypt_secret(&plaintext, public_key)?,
+            });
+        }
+    }
+    Ok(resealed)
+}
+
 /// Seal data with an age public key (used for sealing the root CA backup).
 pub fn seal_with_age(data: &[u8], public_key: &str) -> Result<Vec<u8>, SecretError> {
     let recipient: age::x25519::Recipient = public_key
@@ -320,6 +381,90 @@ mod tests {
 
         let unsealed = unseal_with_age(&sealed, &identity).unwrap();
         assert_eq!(unsealed, data);
+    }
+
+    fn app_with_env(env: &[(&str, &str)]) -> crate::config::app::AppSpec {
+        let mut text = String::from("image = \"web:v1\"\n[env]\n");
+        for (key, value) in env {
+            text.push_str(&format!("{key} = \"{value}\"\n"));
+        }
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn resealing_moves_a_cluster_sealed_value_under_the_namespace_key() {
+        let ikm = b"test-wrapping-material";
+        let (cluster, cluster_id) = generate_age_keypair(AgeKeyScope::ClusterWide, ikm, 0).unwrap();
+        let (team_a, team_a_id) =
+            generate_age_keypair(AgeKeyScope::Namespace("team-a".into()), ikm, 0).unwrap();
+        let sealed = encrypt_secret("db-password", &cluster.public_key).unwrap();
+        let app_id = crate::meat::types::AppId::new("web", "team-a");
+        let spec = app_with_env(&[("DB_PASSWORD", &sealed), ("MODE", "plain")]);
+
+        let resealed = reseal_namespace_values(
+            [(&app_id, &spec)],
+            std::slice::from_ref(&cluster_id),
+            &team_a.public_key,
+        )
+        .unwrap();
+
+        assert_eq!(resealed.len(), 1, "plain values aren't touched");
+        assert_eq!(resealed[0].app_id, app_id);
+        assert_eq!(resealed[0].env_key, "DB_PASSWORD");
+        assert_eq!(resealed[0].previous, sealed);
+        assert_eq!(
+            decrypt_secret(&resealed[0].sealed, &team_a_id).unwrap(),
+            "db-password"
+        );
+        assert!(
+            decrypt_secret(&resealed[0].sealed, &cluster_id).is_err(),
+            "the cluster key no longer opens the re-sealed value"
+        );
+    }
+
+    #[test]
+    fn resealing_leaves_a_value_no_cluster_key_opens() {
+        let ikm = b"test-wrapping-material";
+        let (_, cluster_id) = generate_age_keypair(AgeKeyScope::ClusterWide, ikm, 0).unwrap();
+        let (team_a, _) =
+            generate_age_keypair(AgeKeyScope::Namespace("team-a".into()), ikm, 0).unwrap();
+        let (_, stranger) = test_keypair();
+        let foreign = encrypt_secret("not ours", &stranger).unwrap();
+        let app_id = crate::meat::types::AppId::new("web", "team-a");
+        let spec = app_with_env(&[("TOKEN", &foreign)]);
+
+        let resealed =
+            reseal_namespace_values([(&app_id, &spec)], &[cluster_id], &team_a.public_key).unwrap();
+
+        assert!(resealed.is_empty());
+    }
+
+    #[test]
+    fn namespace_identities_follow_the_namespaces_own_keys() {
+        let ikm = b"test-wrapping-material";
+        let (cluster, _) = generate_age_keypair(AgeKeyScope::ClusterWide, ikm, 0).unwrap();
+        let (team_a, team_a_id) =
+            generate_age_keypair(AgeKeyScope::Namespace("team-a".into()), ikm, 0).unwrap();
+        let state = SecurityState {
+            age_keypairs: vec![cluster.clone(), team_a],
+            ..SecurityState::default()
+        };
+        let cluster_sealed = encrypt_secret("shared", &cluster.public_key).unwrap();
+
+        let team_a_ids = namespace_identities(&state, "team-a", ikm);
+        assert_eq!(team_a_ids.len(), 1);
+        assert_eq!(
+            team_a_ids[0].to_public().to_string(),
+            team_a_id.to_public().to_string()
+        );
+        assert!(decrypt_secret(&cluster_sealed, &team_a_ids[0]).is_err());
+
+        let team_b_ids = namespace_identities(&state, "team-b", ikm);
+        assert_eq!(team_b_ids.len(), 1);
+        assert_eq!(
+            decrypt_secret(&cluster_sealed, &team_b_ids[0]).unwrap(),
+            "shared"
+        );
     }
 
     /// PKI8: a secret sealed under generation N must still decrypt after a

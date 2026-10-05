@@ -292,6 +292,7 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
                         gpu: None,
                         max_apps: None,
                         max_replicas: None,
+                        secret_key: false,
                     },
                 );
                 report.converted.push(format!("Namespace/{n}"));

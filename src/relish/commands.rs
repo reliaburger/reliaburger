@@ -1675,10 +1675,11 @@ fn format_memory(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// Rotate or finalise the cluster's secret encryption key.
-pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
+/// Rotate or finalise the cluster's secret encryption key, or one
+/// namespace's.
+pub async fn secret_rotate(finalize: bool, namespace: Option<&str>) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let result = client.secret_rotate(finalize).await?;
+    let result = client.secret_rotate(finalize, namespace).await?;
     println!("{result}");
     Ok(())
 }
@@ -1710,7 +1711,7 @@ pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
 /// `[images.trust_policy] keys` expects.
 pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
     let key = crate::pickle::signing::SigningKey::generate()?;
-    write_private_key(out, &key.to_pem())?;
+    write_private_key(out, key.to_pem().as_bytes())?;
     let public_key = key.public_key_base64();
     println!("wrote image signing key to {}", out.display());
     println!("public key: {public_key}");
@@ -1724,7 +1725,7 @@ pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
 }
 
 /// Write a private key, refusing to overwrite and keeping it owner-only.
-fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
+pub(crate) fn write_private_key(path: &Path, contents: &[u8]) -> Result<(), RelishError> {
     use std::io::Write as _;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1739,7 +1740,7 @@ fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
         },
         _ => RelishError::Io(e),
     })?;
-    file.write_all(pem.as_bytes())?;
+    file.write_all(contents)?;
     Ok(())
 }
 
@@ -2225,25 +2226,30 @@ async fn token_create_with_client(
     Ok(())
 }
 
-/// Print the cluster's age public key, for encrypting `ENC[AGE:...]` values.
+/// Print the cluster's age public key, or one namespace's, for encrypting
+/// `ENC[AGE:...]` values.
 ///
 /// With no directory, asks the configured cluster (`GET
 /// /v1/secret/public-key`) for its active key, so a quickstart user, or
 /// anyone after a rotation, gets the key that will actually decrypt. With
 /// a directory, reads the security bootstrap `relish init` wrote there,
-/// which works offline.
-pub async fn secret_pubkey(dir: Option<&Path>) -> Result<(), RelishError> {
+/// which works offline but only knows the cluster key. With a namespace,
+/// asks for that namespace's own key (F05 I4).
+pub async fn secret_pubkey(dir: Option<&Path>, namespace: Option<&str>) -> Result<(), RelishError> {
     let key = match dir {
         Some(dir) => resolve_secret_pubkey(dir)?,
-        None => fetch_secret_pubkey(&BunClient::default_local()).await?,
+        None => fetch_secret_pubkey(&BunClient::default_local(), namespace).await?,
     };
     println!("{key}");
     Ok(())
 }
 
-/// Ask the cluster for its active age public key.
-async fn fetch_secret_pubkey(client: &BunClient) -> Result<String, RelishError> {
-    Ok(client.secret_public_key().await?.public_key)
+/// Ask the cluster for its active age public key, or `namespace`'s.
+async fn fetch_secret_pubkey(
+    client: &BunClient,
+    namespace: Option<&str>,
+) -> Result<String, RelishError> {
+    Ok(client.secret_public_key(namespace).await?.public_key)
 }
 
 /// Find the `*-security-bootstrap.json` in `dir` and return its cluster-wide
@@ -2793,17 +2799,22 @@ mod tests {
     #[tokio::test]
     async fn secret_pubkey_fetches_active_key_from_cluster() {
         use axum::{Router, http::HeaderMap, routing::get};
+        type Params = axum::extract::Query<std::collections::HashMap<String, String>>;
         let app = Router::new().route(
             "/v1/secret/public-key",
-            get(|headers: HeaderMap| async move {
+            get(|headers: HeaderMap, params: Params| async move {
                 // The command must send the usual bearer token.
                 let authorised = headers.get("authorization").and_then(|v| v.to_str().ok())
                     == Some("Bearer rbt_test");
                 if !authorised {
                     return Err(axum::http::StatusCode::UNAUTHORIZED);
                 }
+                let public_key = match params.get("namespace") {
+                    Some(namespace) => format!("age1{namespace}key"),
+                    None => "age1quickstartkey".to_string(),
+                };
                 Ok(axum::Json(serde_json::json!({
-                    "public_key": "age1quickstartkey",
+                    "public_key": public_key,
                     "generation": 2,
                 })))
             }),
@@ -2812,16 +2823,19 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{address}");
-        let key = fetch_secret_pubkey(&BunClient::new_with_token(&base, Some("rbt_test"))).await;
-        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None)).await;
+        let client = BunClient::new_with_token(&base, Some("rbt_test"));
+        let key = fetch_secret_pubkey(&client, None).await;
+        let team_a = fetch_secret_pubkey(&client, Some("team-a")).await;
+        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None), None).await;
         server.abort();
         assert_eq!(key.unwrap(), "age1quickstartkey");
+        assert_eq!(team_a.unwrap(), "age1team-akey");
         assert!(anonymous.is_err(), "an HTTP 401 must surface as an error");
     }
 
     #[tokio::test]
     async fn secret_pubkey_errors_when_cluster_unreachable() {
-        assert!(fetch_secret_pubkey(&bogus_client()).await.is_err());
+        assert!(fetch_secret_pubkey(&bogus_client(), None).await.is_err());
     }
 
     #[test]

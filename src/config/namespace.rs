@@ -4,9 +4,10 @@
 /// The cluster uses a single default namespace unless others are created.
 use serde::{Deserialize, Serialize};
 
-/// Resource quotas for a namespace.
+/// Resource quotas and secret isolation for a namespace.
 ///
-/// All fields are optional — omitted fields mean no quota for that resource.
+/// All quota fields are optional — omitted fields mean no quota for that
+/// resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamespaceSpec {
@@ -20,6 +21,13 @@ pub struct NamespaceSpec {
     pub max_apps: Option<u32>,
     /// Maximum total replica count across all apps.
     pub max_replicas: Option<u32>,
+    /// Whether this namespace has its own secret encryption key (F05 I4).
+    ///
+    /// Once the leader has created the key, the namespace's `ENC[AGE:...]`
+    /// values decrypt only with it, never with the cluster-wide key.
+    /// Turning the flag off again doesn't remove the key.
+    #[serde(default)]
+    pub secret_key: bool,
 }
 
 #[cfg(test)]
@@ -52,5 +60,15 @@ mod tests {
         assert_eq!(ns.gpu, None);
         assert_eq!(ns.max_apps, None);
         assert_eq!(ns.max_replicas, None);
+        assert!(
+            !ns.secret_key,
+            "a namespace shares the cluster key by default"
+        );
+    }
+
+    #[test]
+    fn a_namespace_opts_in_to_its_own_secret_key() {
+        let ns: NamespaceSpec = toml::from_str("secret_key = true").unwrap();
+        assert!(ns.secret_key);
     }
 }
