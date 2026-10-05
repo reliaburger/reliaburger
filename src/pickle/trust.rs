@@ -71,6 +71,72 @@ pub fn check_upstream(policy: &TrustPolicySection, image: &str) -> Result<(), Up
     })
 }
 
+/// A cosign signature check an image owes before it deploys: the most
+/// specific rule matching it says `require_signatures = true` (F03 U3).
+///
+/// It's a value rather than a call because the check reads the network
+/// (the `.sig` image), and Bun runs it off its agent loop.
+#[derive(Clone)]
+pub struct CosignCheck {
+    image: String,
+    keys: Vec<String>,
+    source: Option<super::cosign::SignatureSource>,
+}
+
+impl CosignCheck {
+    /// The check `image` owes under `policy`, if any. `source` is where this
+    /// node reads signatures from; without one the check refuses.
+    pub fn for_image(
+        policy: &TrustPolicySection,
+        image: &str,
+        source: Option<&super::cosign::SignatureSource>,
+    ) -> Option<Self> {
+        let rule = matching_rule(policy, &upstream_repository(image))?;
+        rule.require_signatures.then(|| Self {
+            image: image.to_string(),
+            keys: rule.cosign_keys.clone(),
+            source: source.cloned(),
+        })
+    }
+
+    /// The image this check is for, as written.
+    pub fn image(&self) -> &str {
+        &self.image
+    }
+
+    /// Fetch the image's cosign signature and verify it over the digest the
+    /// image is bound to. Every refusal names the image.
+    pub async fn run(self) -> Result<(), String> {
+        let image = &self.image;
+        let refuse =
+            |reason: String| format!("image {image} is not allowed on this node: {reason}");
+        let reference = ImageReference::parse(image).map_err(|e| refuse(e.to_string()))?;
+        let digest = reference
+            .tag
+            .starts_with("sha256:")
+            .then(|| super::types::Digest::new(&reference.tag).ok())
+            .flatten()
+            .ok_or_else(|| {
+                refuse(
+                    "its rule requires a cosign signature, which covers a digest, and the image isn't bound to one; apply it again".into(),
+                )
+            })?;
+        let Some(source) = &self.source else {
+            return Err(refuse(
+                "its rule requires a cosign signature and this node has no registry client to fetch one".into(),
+            ));
+        };
+        let keys =
+            super::cosign::CosignKey::parse_all(&self.keys).map_err(|e| refuse(e.to_string()))?;
+        let payloads = source
+            .payloads(&reference, &digest)
+            .await
+            .map_err(|e| refuse(e.to_string()))?;
+        super::cosign::verify_signature(&digest, &payloads, &keys)
+            .map_err(|e| refuse(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +149,7 @@ mod tests {
                 .map(|pattern| UpstreamTrustRule {
                     pattern: pattern.to_string(),
                     require_signatures: false,
+                    cosign_keys: vec![],
                 })
                 .collect(),
             upstream_default: UpstreamDefault { allow },

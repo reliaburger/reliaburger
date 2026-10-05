@@ -880,9 +880,13 @@ pub struct UpstreamTrustRule {
     /// `docker.io/library/nginx`.
     #[serde(rename = "match")]
     pub pattern: String,
-    /// Require a cosign signature. Refused at startup until U3 can check one.
+    /// Require a key-based cosign signature over the bound digest, in the
+    /// classic `.sig` layout, from one of `cosign_keys` (F03 U3).
     #[serde(default)]
     pub require_signatures: bool,
+    /// PEM ECDSA P-256 public keys (`cosign.pub`) trusted for this rule.
+    #[serde(default)]
+    pub cosign_keys: Vec<String>,
 }
 
 /// `[images.trust_policy.upstream_default]`: upstream images no rule matches.
@@ -932,10 +936,21 @@ impl TrustPolicySection {
             if path.contains(':') || path.contains('@') {
                 return Err(bad("matches repositories, so it takes no tag or digest"));
             }
-            if rule.require_signatures {
-                return Err(bad(
-                    "signatures on upstream images can't be checked yet (cosign support is F03 U3, #361); set require_signatures = false",
-                ));
+            match (rule.require_signatures, rule.cosign_keys.is_empty()) {
+                (true, true) => {
+                    return Err(bad(
+                        "requires signatures, so it needs at least one cosign_keys entry",
+                    ));
+                }
+                // Keys without the requirement would look like a check
+                // that never runs.
+                (false, false) => {
+                    return Err(bad("lists cosign_keys without require_signatures = true"));
+                }
+                _ => {}
+            }
+            if let Err(error) = crate::pickle::cosign::CosignKey::parse_all(&rule.cosign_keys) {
+                return Err(bad(&error.to_string()));
             }
             if !seen.insert(rule.pattern.as_str()) {
                 return Err(bad("appears twice"));
@@ -1608,10 +1623,19 @@ mod tests {
     }
 
     fn upstream_rule_error(pattern: &str, require_signatures: bool) -> String {
+        signature_rule_error(pattern, require_signatures, vec![])
+    }
+
+    fn signature_rule_error(
+        pattern: &str,
+        require_signatures: bool,
+        cosign_keys: Vec<String>,
+    ) -> String {
         let policy = TrustPolicySection {
             upstream: vec![UpstreamTrustRule {
                 pattern: pattern.to_string(),
                 require_signatures,
+                cosign_keys,
             }],
             ..Default::default()
         };
@@ -1637,6 +1661,7 @@ mod tests {
                 upstream: vec![UpstreamTrustRule {
                     pattern: pattern.to_string(),
                     require_signatures: false,
+                    cosign_keys: vec![],
                 }],
                 ..Default::default()
             };
@@ -1644,12 +1669,26 @@ mod tests {
         }
     }
 
-    /// U2 ships before cosign verification (U3): a rule that asks for a
-    /// signature must not start a node that would silently skip the check.
+    /// A signature rule needs keys that parse, and keys need the rule to
+    /// require signatures: either half alone would be a check that never runs.
     #[test]
-    fn an_upstream_rule_requiring_signatures_is_refused_until_cosign_lands() {
-        let error = upstream_rule_error("ghcr.io/acme/*", true);
-        assert!(error.contains("U3"), "{error}");
+    fn a_signature_rule_needs_cosign_keys_that_parse() {
+        let key = crate::pickle::cosign::fixture::PUBLIC_KEY.to_string();
+        let error = signature_rule_error("ghcr.io/acme/*", true, vec![]);
+        assert!(error.contains("cosign_keys"), "{error}");
+        let error = signature_rule_error("ghcr.io/acme/*", false, vec![key.clone()]);
+        assert!(error.contains("without require_signatures"), "{error}");
+        let error = signature_rule_error("ghcr.io/acme/*", true, vec!["not pem".into()]);
+        assert!(error.contains("cosign public key"), "{error}");
+        let policy = TrustPolicySection {
+            upstream: vec![UpstreamTrustRule {
+                pattern: "ghcr.io/acme/*".to_string(),
+                require_signatures: true,
+                cosign_keys: vec![key],
+            }],
+            ..Default::default()
+        };
+        policy.validate().unwrap();
     }
 
     #[test]
@@ -1657,6 +1696,7 @@ mod tests {
         let rule = UpstreamTrustRule {
             pattern: "ghcr.io/acme/*".to_string(),
             require_signatures: false,
+            cosign_keys: vec![],
         };
         let policy = TrustPolicySection {
             upstream: vec![rule.clone(), rule],

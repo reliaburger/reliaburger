@@ -587,6 +587,7 @@ command = ["migrate"]
             upstream: vec![crate::config::node::UpstreamTrustRule {
                 pattern: "docker.io/library/*".to_string(),
                 require_signatures: false,
+                cosign_keys: vec![],
             }],
             upstream_default: crate::config::node::UpstreamDefault { allow: false },
             ..Default::default()

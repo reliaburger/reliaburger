@@ -518,8 +518,7 @@ before every deploy. The cluster's own images, and anything else Pickle holds,
 answer to `require_signatures` instead. Pinning an image by digest doesn't
 exempt it.
 
-A rule can't ask for a signature yet: `require_signatures = true` on an
-upstream rule stops the node at startup, until cosign verification lands.
+A rule can also require a cosign signature (see "Cosign signatures" below).
 Keep the rules the same on every node. A node with stricter rules refuses to
 deploy what the leader admitted, and the rules only apply where the runtime
 pulls images (not under the process runtime). On a single node without a
@@ -547,11 +546,28 @@ cosign sign --key cosign.key --new-bundle-format=false ghcr.io/acme/web@sha256:â
 ```
 
 Keyless signatures (a Fulcio certificate, as Chainguard and distroless images
-carry) aren't checked: there's no key to trust. Turning the check on for an upstream rule (`require_signatures` with
-`cosign_keys`) is still being built under
-[#361](https://github.com/reliaburger/reliaburger/issues/361); until it ships, a rule
-with `require_signatures = true` stops the node at startup, and upstream
-images are bound to digests but not signature-checked.
+carry) aren't checked: there's no key to trust.
+
+Turn the check on per upstream rule, with the public keys you trust:
+
+```toml
+[[images.trust_policy.upstream]]
+match = "ghcr.io/acme/*"
+require_signatures = true
+cosign_keys = ["""
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
+-----END PUBLIC KEY-----
+"""]
+```
+
+Bun checks the signature before every deploy of an image that rule matches,
+over the digest the apply bound it to, and refuses the deploy, naming the
+image, when no signature verifies under one of `cosign_keys`, when the `.sig`
+tag is missing, or when the image isn't bound to a digest. A rule with
+`require_signatures` and no keys, or keys without `require_signatures`, stops
+the node at startup. The check needs the runtime to pull images, like the rest
+of the upstream rules, and allows 60 seconds to fetch and verify a signature.
 
 ## Between nodes
 

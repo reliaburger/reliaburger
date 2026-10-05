@@ -17,9 +17,24 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+/// The held `flock` that serialises storage opening with recovery. Dropping
+/// it unlocks before closing: a child another thread is spawning shares the
+/// open file description until it calls `exec`, so a lock that was only
+/// closed could outlive this guard and refuse the next opening (#606).
+#[derive(Debug)]
+pub(crate) struct RecoveryLock(File);
+
+impl Drop for RecoveryLock {
+    fn drop(&mut self) {
+        // Nothing useful can be done with a failed unlock: closing the
+        // descriptor straight after still releases the lock eventually.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Serialise storage opening with recovery, including the gap between renames.
 /// Live stores keep their redb locks after the opening guard is released.
-pub(crate) fn lock(raft: &Path) -> io::Result<File> {
+pub(crate) fn lock(raft: &Path) -> io::Result<RecoveryLock> {
     let parent = raft
         .parent()
         .ok_or_else(|| io_error("Raft directory needs a parent"))?;
@@ -31,7 +46,7 @@ pub(crate) fn lock(raft: &Path) -> io::Result<File> {
         .truncate(false)
         .open(raft.with_extension("recovery-lock"))?;
     file.try_lock().map_err(io_error)?;
-    Ok(file)
+    Ok(RecoveryLock(file))
 }
 
 /// Hold every existing store's redb lock, refusing a store a live node has
@@ -181,6 +196,48 @@ pub(crate) fn replace(raft: &Path, state: DesiredState) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child another thread is spawning shares every open file description
+    /// until it calls `exec`, so a lock closed without unlocking can outlive
+    /// its guard and refuse the next opening (#606, the #285 class).
+    #[test]
+    fn a_dropped_guard_is_retaken_while_other_threads_spawn_processes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let raft = root.path().join("raft");
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawners: Vec<_> = (0..2)
+            .map(|_| {
+                let spawning = Arc::clone(&spawning);
+                std::thread::spawn(move || {
+                    while spawning.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let refused = (0..1000).filter(|_| lock(&raft).is_err()).count();
+        spawning.store(false, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(refused, 0, "openings refused by a lock nobody holds");
+    }
+
+    #[test]
+    fn a_held_guard_refuses_another_opening() {
+        let root = tempfile::tempdir().unwrap();
+        let raft = root.path().join("raft");
+        let held = lock(&raft).unwrap();
+        assert!(lock(&raft).is_err());
+        drop(held);
+        lock(&raft).unwrap();
+    }
 
     #[tokio::test]
     async fn audit_restart_finishes_each_recovery_rename_boundary() {

@@ -404,7 +404,7 @@ It's easy to write a verifier that agrees with your own signer and with nothing 
 
 The unit tests read those files with `include_bytes!`, a macro that embeds a file's bytes into the test binary at compile time, so the tests can't run against a missing fixture. Alongside the one that should pass, they cover the refusals: another key, a payload for another digest, a payload edited after signing, a missing `.sig` tag, no keys at all. Two tests in `tests/suite/pickle_cluster.rs` push the same bytes into an in-process Pickle standing in for the upstream registry and fetch them over the real OCI protocol, once directly and once through the pull-through cache. The cache test also counts requests, to show a second check doesn't touch upstream.
 
-What isn't done yet is the policy around it. The upstream rules (`[[images.trust_policy.upstream]]` with `require_signatures` and `cosign_keys`) are a separate change, and the verifier gets wired into the deploy gate when they land.
+The policy around it came later in this chapter: the upstream rules (`[[images.trust_policy.upstream]]`, "Saying which registries you trust") take `require_signatures` and `cosign_keys`, and Bun runs the verifier before every deploy ("A check that waits for the network").
 
 ## SecurityState in Raft
 
@@ -1920,7 +1920,21 @@ The check runs twice, like the signature check. At apply, `ImageBinder` judges e
 
 The refusal is a `thiserror` struct, `UpstreamRefused`, and the binder's error enum wraps it with `#[error(transparent)] NotAllowed(#[from] UpstreamRefused)`. `transparent` reuses the inner message unchanged; `#[from]` writes the `From` impl, so `check_upstream(...)?` inside `bind_slots` converts the error without a `map_err`. The apply route maps it to a 403, beside the 400 for a bad reference and the 502 for an unreachable registry.
 
-A rule can say `require_signatures = true`, and today that stops the node at startup. Checking cosign signatures is the next step (U3). Until it lands, a node that accepted the setting would skip the check it promised, which is the worst kind of security setting: one that's on and does nothing.
+For a while a rule that said `require_signatures = true` stopped the node at startup, because nothing could check it yet. A node that accepted the setting would have skipped the check it promised, which is the worst kind of security setting: one that's on and does nothing. The next section is the check.
+
+### A check that waits for the network
+
+With the cosign verifier and the rules both in place, wiring them together looked like one `if`. A rule matches, it says `require_signatures`, so fetch the `.sig` image and verify it. The catch is *where* that `if` runs.
+
+Bun's trust checks run on the agent loop: a deploy worker sends a `DeployOp::EnforceImageSignature` and the loop answers. Everything the loop did there so far was local (the council's catalogue, the root CA). Fetching a signature isn't. It's a registry round trip, or two, and a slow registry would stall every other command the agent serves while it waited. So the check is split in two. The loop decides, locally, whether an image owes a signature at all (`cosign_check`, which returns a `CosignCheck` value: the image, the rule's keys and where to read signatures from). Then `answer_after_cosign` spawns a task that runs the check with a 60-second deadline and answers the deploy worker, who was waiting on its `oneshot` reply anyway. The loop moves on. The deploy worker can't tell the difference, which is the point.
+
+Where signatures come from is a `SignatureSource`: the pull-through cache when there is one, or the registry directly. Bun builds the agent long before Pickle's cache exists, so the source holds the cache in an `Arc<OnceLock<…>>`. `OnceLock` is a cell you can fill exactly once, from any thread, and read without a lock afterwards; Bun fills it when it builds the cache, and every clone of the source sees it. (`std::sync::OnceLock` is standard library; before Rust 1.70 you'd have reached for the `once_cell` crate.)
+
+A signature covers a digest, never a tag. U1 is what makes this usable: the apply binds `ghcr.io/acme/web:1.2` to `ghcr.io/acme/web:1.2@sha256:5a90…`, and the deploy verifies that cosign's payload names exactly `sha256:5a90…`. An image that reaches a deploy without a digest is refused with "isn't bound to one; apply it again", rather than checked against whatever the tag says today.
+
+The config check changed too. `require_signatures` without `cosign_keys` would refuse everything, and `cosign_keys` without `require_signatures` would look like protection while checking nothing, so both stop the node at startup, as does a key that doesn't parse.
+
+The tests drive real deploys through the agent loop with the cosign fixture behind a stand-in registry: the signed fixture digest deploys; a digest with no `.sig`, the right signature under the wrong key, and an unbound tag are each refused, by name; and an image no signature rule matches deploys as before.
 
 ## What we deferred
 
