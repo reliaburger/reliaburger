@@ -496,7 +496,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.trust_policy.upstream_default.allow {
             return Ok(());
         }
-        let Some(image) = image else {
+        // A path is a root filesystem runc runs as it is; no registry holds it.
+        let Some(image) = image.filter(|image| crate::grill::image::looks_like_image_ref(image))
+        else {
             return Ok(());
         };
         if self.supervisor.grill().runtime_kind() == crate::grill::records::RuntimeKind::Process {

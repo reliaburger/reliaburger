@@ -258,6 +258,15 @@ impl ImageBinder {
         // Every image passes the upstream rules before any registry hears
         // about any of them. Pickle's own images (not the cache's copies)
         // answer to `require_signatures` instead.
+        // An absolute or relative path is a root filesystem runc runs as it
+        // is (`/empty-fixture`): no registry holds it, so skip it.
+        let slots: Vec<(String, &mut Option<String>)> = slots
+            .into_iter()
+            .filter(|(_, slot)| {
+                slot.as_deref()
+                    .is_none_or(crate::grill::image::looks_like_image_ref)
+            })
+            .collect();
         for image in slots.iter().filter_map(|(_, slot)| slot.as_deref()) {
             if crate::meat::scheduler::lookup_pickle_manifest(image, catalog).is_none() {
                 crate::pickle::trust::check_upstream(&self.policy, image)?;
@@ -502,6 +511,22 @@ command = ["migrate"]
             .unwrap();
         assert_eq!(heads(&registry), 1);
         assert_eq!(config.app["a"].image, config.app["b"].image);
+    }
+
+    /// runc runs an absolute path (`/empty-fixture`) as a ready-made root
+    /// filesystem; no registry holds it, so there's nothing to bind or judge.
+    #[tokio::test]
+    async fn a_local_root_filesystem_path_is_left_alone() {
+        let binder = ImageBinder::with_upstream(std::sync::Arc::new(Registry(None)))
+            .with_policy(official_images_only());
+        let mut config =
+            crate::config::Config::parse("[app.web]\nimage = \"/empty-fixture\"\n").unwrap();
+        let bindings = binder
+            .bind_config(&mut config, &ManifestCatalog::default())
+            .await
+            .unwrap();
+        assert!(bindings.is_empty());
+        assert_eq!(config.app["web"].image.as_deref(), Some("/empty-fixture"));
     }
 
     #[tokio::test]
