@@ -1,0 +1,1 @@
+{"critical":{"identity":{"docker-reference":"127.0.0.1:45123/reliaburger/cosign-fixture"},"image":{"docker-manifest-digest":"sha256:5a90fa845f2397b0d429dd19ae5f64aaf0007eaea308c935e7cab63a8c820cce"},"type":"cosign container image signature"},"optional":null}

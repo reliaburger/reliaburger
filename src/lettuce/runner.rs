@@ -666,6 +666,7 @@ mod tests {
             gpu: None,
             max_apps: None,
             max_replicas: None,
+            secret_key: false,
         };
         assert!(matches!(
             payload_to_request("namespace.prod", &ChangePayload::Namespace(Box::new(ns))),

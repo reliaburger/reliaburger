@@ -138,7 +138,7 @@ do only what the block lists:
 | `host-exec` | jobs and process workloads that run host commands |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
-| `secret-write` | `relish secret rotate` (needs `apps = ["*"]` and no `namespaces`) |
+| `secret-write` | `relish secret rotate`, for the cluster or one namespace (needs `apps = ["*"]` and no `namespaces`) |
 | `admin` | every action above, plus tokens, join tokens, upgrades, elections, node decommissioning, image signing, log export and `[permission]`/`[namespace]` declarations |
 | `secret-read` | nothing yet: no API route returns a decrypted secret |
 
@@ -206,6 +206,114 @@ sealed the root CA's private key to it, in `<cluster>-root-ca.age`, so that key
 stays (read-only, never used for new secrets) and the root backup keeps
 opening. Keep that file with the master key; together they're how you'd
 recover the root.
+
+### A key per namespace
+
+By default every namespace shares the cluster key, so a value encrypted for
+one namespace decrypts in any other: anyone who can deploy to namespace B and
+has a copy of namespace A's ciphertext can read it. Give a namespace its own
+key to stop that:
+
+```toml
+[namespace.team-a]
+secret_key = true
+```
+
+After you apply it, the leader creates team-a's key within a few seconds and
+re-seals every encrypted value team-a's apps already have, in the same step,
+so they keep starting. Each of those apps rolls once, because its stored
+spec changed. From then on:
+
+- team-a's values decrypt only with team-a's key. A value encrypted to the
+  cluster key, or to another namespace's key, no longer decrypts in team-a,
+  and the instance refuses to start.
+- other namespaces can't decrypt team-a's values.
+
+Re-encrypt the values in your own config (or GitOps repo) with the new key,
+or the next apply puts the old cluster-sealed values back and those apps stop
+starting:
+
+```sh
+relish secret pubkey --namespace team-a
+relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" 'the plaintext'
+```
+
+The re-seal covers apps only. Encrypt a job's values in an opted-in
+namespace with the namespace key from the start.
+
+Rotate and finalise a namespace's key the same way as the cluster key, with
+`--namespace`. It doesn't touch the cluster key or any other namespace's:
+
+```sh
+relish secret rotate --namespace team-a
+relish secret rotate --finalize --namespace team-a
+```
+
+Only an Admin token with no scope can rotate a namespace's key, even one
+scoped to that namespace can't. Rotating a namespace that hasn't set
+`secret_key = true` fails; opt in first. Turning `secret_key` off again
+doesn't remove the key, and its values keep needing it.
+
+What this doesn't do:
+
+- **It doesn't protect against a compromised node.** Until the master key is
+  split (F03b), every node holds the master key, and the master key unwraps
+  every namespace's key. The boundary is between tenants' tokens and
+  workloads, not between a tenant and someone with root on a node.
+- **It doesn't recall old copies.** A value encrypted to the cluster key still
+  decrypts in every namespace that hasn't opted in. If team-a's ciphertext
+  might have leaked, change the secret itself, or rotate and finalise the
+  cluster key.
+
+The leader records `secret.namespace_key_created` (with how many values it
+re-sealed, never the values), and every rotation or finalise records
+`secret.rotated` or `secret.rotation_finalised` with the namespace in its
+details. See them with `relish events`.
+
+## Backing up the root CA
+
+`<cluster>-root-ca.age` only opens with the master key and the cluster's own
+state, so it's a backup for the cluster rather than for you. Make your own
+copy of the root, one that opens with something only you hold. Run this on
+the node where `relish init` ran, since that's where the master key, the
+security state and the sealed root are:
+
+```sh
+relish ca backup --out prod-root-backup.age --dir /etc/reliaburger
+```
+
+It asks for a passphrase twice (at least 12 characters) and writes the root's
+private key and certificate, with the cluster, trust domain, fingerprint and
+expiry, into an ASCII-armoured age file. The file is created owner-only, and
+an existing file is never overwritten. If the directory holds more than one
+cluster, add `--cluster-name`. To seal it to your own age key instead of a
+passphrase:
+
+```sh
+relish ca backup --out prod-root-backup.age --recipient age1...
+```
+
+`--passphrase-file PATH` reads the passphrase from the first line of a file,
+for scripts. The backup is never sealed to a cluster key: those rotate, and
+this file has to outlive them. Store it off the cluster, away from the
+passphrase or identity that opens it. The root's key never goes into the
+council or onto another node; rotating an intermediate (coming in a later
+release) will ask for this file rather than keep the root on the cluster.
+
+Check a backup at any time, with no cluster running:
+
+```sh
+relish ca verify prod-root-backup.age --fingerprint sha256:...
+relish ca verify prod-root-backup.age --fingerprint sha256:... --identity ~/.age/operator.key
+```
+
+`--fingerprint` is the root CA fingerprint `relish init` printed and every
+joiner pinned. `verify` refuses a backup whose key doesn't match its
+certificate, whose root has expired, whose recorded fingerprint isn't its
+certificate's, or that belongs to another cluster. A wrong passphrase or
+identity doesn't open it at all. Since the file is a standard age file, the
+`age` tool opens it too, and inside is JSON with the certificate and key in
+PEM.
 
 ## Workload identity
 
@@ -301,6 +409,34 @@ Keep the rules the same on every node. A node with stricter rules refuses to
 deploy what the leader admitted, and the rules only apply where the runtime
 pulls images (not under the process runtime). On a single node without a
 cluster, the apply is the check.
+
+### Cosign signatures
+
+`relish sign` signatures aren't cosign signatures. They sign the digest
+string, not cosign's payload, and they live in the cluster's registry
+catalogue rather than in a `.sig` tag, so `cosign verify` can't check them and
+Reliaburger doesn't read them as cosign.
+
+For images outside the cluster's registry, Reliaburger reads key-based cosign
+signatures in cosign's classic layout: the `sha256-<hex>.sig` tag beside the
+image, made by `cosign sign --key` with an ECDSA P-256 key (cosign's default).
+A signature counts when it verifies under a trusted `cosign.pub` and names the
+exact digest being deployed. With the pull-through cache on, the `.sig` image
+is cached beside the image, so each signature is fetched from upstream once.
+
+cosign 3 writes the newer Sigstore bundle by default, which Reliaburger doesn't
+read yet. Ask for the classic layout when you sign:
+
+```bash
+cosign sign --key cosign.key --new-bundle-format=false ghcr.io/acme/web@sha256:…
+```
+
+Keyless signatures (a Fulcio certificate, as Chainguard and distroless images
+carry) aren't checked: there's no key to trust. Turning the check on for an upstream rule (`require_signatures` with
+`cosign_keys`) is still being built under
+[#361](https://github.com/reliaburger/reliaburger/issues/361); until it ships, a rule
+with `require_signatures = true` stops the node at startup, and upstream
+images are bound to digests but not signature-checked.
 
 ## Between nodes
 

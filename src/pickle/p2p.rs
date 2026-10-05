@@ -582,6 +582,76 @@ impl ClusterSource {
         .map(Some)
     }
 
+    /// The cosign signature payloads for `image` at `digest`, read through
+    /// the pull-through cache: the `sha256-<hex>.sig` image is cached under
+    /// `cache/<host>/<repo>` like any other tag, so the cluster asks upstream
+    /// once and every node after that reads the cluster's copy.
+    ///
+    /// `Ok(None)` means the cache is off; the caller fetches the signature
+    /// straight from the registry with [`super::cosign::fetch_signature`].
+    pub async fn cosign_signature(
+        &self,
+        image: &crate::grill::image::ImageReference,
+        digest: &Digest,
+    ) -> Result<Option<Vec<super::cosign::SignedPayload>>, super::cosign::CosignError> {
+        use super::cosign::{CosignError, signature_layers, signature_reference};
+
+        let reference = signature_reference(image, digest);
+        let unavailable = |reason: String| CosignError::SignatureUnavailable {
+            reference: reference.full_reference(),
+            reason,
+        };
+        let malformed = |reason: String| CosignError::Malformed {
+            reference: reference.full_reference(),
+            reason,
+        };
+        // The signature image's config says `"architecture": ""`, which no
+        // platform check would pass, but a single manifest isn't platform
+        // checked: only an index picks a platform.
+        if self
+            .ensure_external_image(&reference)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let cached_repo = super::upstream::cached_repository(&reference);
+        let catalog = self
+            .state
+            .catalog_snapshot(&cached_repo)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
+        let manifest_digest = catalog
+            .get_manifest_by_tag(&cached_repo, &reference.tag)
+            .map(|manifest| manifest.digest.clone())
+            .ok_or_else(|| unavailable("the cache lost the signature image".to_string()))?;
+
+        // `ensure_external_image` made every blob local, the manifest's own
+        // included, so these are disk reads.
+        let store = self.state.store.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let manifest = store.read_blob(&manifest_digest)?;
+            let layers = match signature_layers(&manifest) {
+                Ok(layers) => layers,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            let mut payloads = Vec::new();
+            for layer in layers {
+                let bytes = store.read_blob(&layer.digest)?;
+                match layer.with_payload(bytes) {
+                    Ok(payload) => payloads.push(payload),
+                    Err(reason) => return Ok(Err(reason)),
+                }
+            }
+            Ok::<_, PickleError>(Ok(payloads))
+        })
+        .await
+        .map_err(|e| unavailable(format!("reading the cached signature failed: {e}")))?
+        .map_err(|e| unavailable(e.to_string()))?;
+        read.map(Some).map_err(malformed)
+    }
+
     /// Cache what `image` names upstream under its tag: a single-platform
     /// image whole, or an index with its platform manifests but none of
     /// their configs or layers yet.

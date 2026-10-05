@@ -165,6 +165,9 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
   - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
+- `relish ca`: Back up and check the cluster's root CA, offline
+  - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
+  - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 

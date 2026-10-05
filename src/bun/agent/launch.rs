@@ -516,7 +516,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Every age identity that could decrypt this namespace's secrets, newest
-    /// generation first: the namespace-scoped keys then the cluster-wide keys.
+    /// generation first: the namespace's own keys once it has one, the
+    /// cluster-wide keys otherwise, never both (F05 I4).
     ///
     /// Returning all live generations (not just the active one) is what makes a
     /// secret survive a rotation window — a value encrypted under the retiring
@@ -534,17 +535,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
-
-        let ns_scope = crate::sesame::types::AgeKeyScope::Namespace(namespace.to_string());
-        security_state
-            .age_keypairs_for_scope(&ns_scope)
-            .into_iter()
-            .chain(
-                security_state
-                    .age_keypairs_for_scope(&crate::sesame::types::AgeKeyScope::ClusterWide),
-            )
-            .filter_map(|kp| crate::sesame::secret::unwrap_age_identity(kp, &ikm).ok())
-            .collect()
+        crate::sesame::secret::namespace_identities(&security_state, namespace, &ikm)
     }
 
     /// Build an OCI spec, decrypting `ENC[AGE:...]` env values with `identity`.

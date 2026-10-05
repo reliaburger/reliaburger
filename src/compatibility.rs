@@ -50,12 +50,15 @@ pub struct Compatibility {
 /// Replicated migration/job intent and original-generation settlement fences (#534).
 /// Authenticated webhook trigger admission and delivery receipts in durable Raft (#553).
 /// Owned metrics publication metadata and immutable log ingestion checkpoints (#555).
+/// Per-namespace secret keys: `NamespaceSpec::secret_key` and the values a
+/// namespace's first key re-seals (`RaftRequest::RotateSecretKey::resealed`)
+/// (F05 I4, #363).
 /// Image references bound to digests at apply (`nginx:1.27@sha256:…`) in app
 /// and job specs, deploy history and prerequisite claims, and the tag a bound
 /// pull records in the pull-through cache (F03 U1, #361).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 41,
-    state: 58,
+    protocol: 42,
+    state: 59,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

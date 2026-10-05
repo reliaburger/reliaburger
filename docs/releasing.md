@@ -230,6 +230,18 @@ directories aside (or `relish local destroy --yes` a laptop cluster), install
 0.1.5 and re-apply your apps. 0.1.4's leader refuses the upgrade before it records a run, with
 `found protocol 40, state 57; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
 
+### Upgrading from 0.1.5
+
+0.1.6 can't roll onto a 0.1.5 cluster. A namespace can have its own secret
+key (`secret_key = true` in `[namespace.X]`, F05 I4), which adds a field to
+every namespace in the council's state, and the Raft entry that creates a
+namespace's key carries the values it re-seals. So the protocol moved from 40
+to 41 and the state format from 57 to 58. Recreate the cluster the same way
+as [from 0.1.0](#upgrading-from-010): move the data directories aside (or
+`relish local destroy --yes` a laptop cluster), install 0.1.6 and re-apply
+your apps. 0.1.5's leader refuses the upgrade before it records a run, with
+`found protocol 41, state 58; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 57`.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
