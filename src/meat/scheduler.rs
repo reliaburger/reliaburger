@@ -407,7 +407,7 @@ pub fn verify_image_signature(
     image: Option<&str>,
     catalog: &crate::pickle::types::ManifestCatalog,
     trust_policy: &crate::config::node::TrustPolicySection,
-    root_ca_der: Option<&[u8]>,
+    trusted_roots: &[Vec<u8>],
     crl: Option<&crate::sesame::types::Crl>,
 ) -> Result<Option<crate::pickle::types::Digest>, ScheduleError> {
     if !trust_policy.require_signatures {
@@ -432,7 +432,7 @@ pub fn verify_image_signature(
         signature,
         &manifest.digest,
         trust_policy,
-        root_ca_der,
+        trusted_roots,
         crl,
     )
     .map_err(|e| ScheduleError::InvalidSignature {
@@ -1050,7 +1050,7 @@ mod tests {
         let catalog = catalog_with(None);
         let policy = TrustPolicySection::default();
         assert!(
-            super::verify_image_signature(Some("myapp:v1"), &catalog, &policy, None, None).is_ok()
+            super::verify_image_signature(Some("myapp:v1"), &catalog, &policy, &[], None).is_ok()
         );
     }
 
@@ -1061,7 +1061,7 @@ mod tests {
             Some("nginx:latest"),
             &catalog,
             &require_signatures(),
-            None,
+            &[],
             None,
         );
         assert!(result.is_ok());
@@ -1074,7 +1074,7 @@ mod tests {
             Some("myapp:v1"),
             &catalog,
             &require_signatures(),
-            None,
+            &[],
             None,
         );
         assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
@@ -1088,7 +1088,7 @@ mod tests {
             Some("myapp:v1"),
             &catalog,
             &require_signatures(),
-            Some(&root_ca),
+            std::slice::from_ref(&root_ca),
             None,
         );
         assert!(result.is_ok(), "valid signature should verify: {result:?}");
@@ -1104,7 +1104,7 @@ mod tests {
             Some("myapp:v1"),
             &catalog,
             &require_signatures(),
-            Some(&root_ca),
+            std::slice::from_ref(&root_ca),
             None,
         );
         assert!(matches!(
@@ -1157,7 +1157,7 @@ mod tests {
             Some("team/app:v1"),
             &catalog,
             &require_signatures(),
-            None,
+            &[],
             None,
         );
         assert!(
@@ -1175,7 +1175,7 @@ mod tests {
             Some("docker.io/library/app:v1"),
             &catalog,
             &require_signatures(),
-            None,
+            &[],
             None,
         );
         assert_eq!(
@@ -1194,7 +1194,7 @@ mod tests {
             Some("localhost:5050/myapp:v1"),
             &catalog,
             &require_signatures(),
-            None,
+            &[],
             None,
         );
         assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
@@ -1216,7 +1216,7 @@ mod tests {
                 Some(&image),
                 &catalog,
                 &require_signatures(),
-                None,
+                &[],
                 None,
             );
             assert!(
@@ -1235,7 +1235,7 @@ mod tests {
             Some("cache/docker.io/library/redis:v1"),
             &catalog,
             &require_signatures(),
-            None,
+            &[],
             None,
         );
         assert_eq!(result.unwrap(), None);
@@ -1255,7 +1255,7 @@ mod tests {
             Some("myapp:v1"),
             &catalog,
             &require_signatures(),
-            Some(&root_ca),
+            std::slice::from_ref(&root_ca),
             None,
         )
         .unwrap();
@@ -1267,7 +1267,7 @@ mod tests {
             Some(&super::pin_image_reference("myapp:v1", &expected)),
             &catalog,
             &require_signatures(),
-            Some(&root_ca),
+            std::slice::from_ref(&root_ca),
             None,
         )
         .unwrap();
@@ -1312,7 +1312,7 @@ mod tests {
             Some("myapp:v1"),
             &catalog,
             &require_signatures(),
-            Some(&root_ca),
+            std::slice::from_ref(&root_ca),
             Some(&crl),
         );
         assert!(

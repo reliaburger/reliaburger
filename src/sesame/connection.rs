@@ -593,6 +593,10 @@ mod tests {
             private_key_der,
             serial,
             ca_generation: 0,
+            trust: crate::sesame::trust::TrustSet::single(
+                hierarchy.node.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
             node_ca_der: hierarchy.node.ca.certificate_der.clone(),
             root_ca_der: hierarchy.root.ca.certificate_der.clone(),
             not_before: SystemTime::UNIX_EPOCH,
@@ -727,7 +731,8 @@ mod tests {
                 .get()
                 .expect("TLS lifetime clock was read after handshake");
             let renewed = node_identity(&hierarchy, "client", 12, Duration::from_secs(3600));
-            live.replace(renewed).await.unwrap();
+            let trust = renewed.trust.clone();
+            live.replace(renewed, &trust).await.unwrap();
             let finish = expires + Duration::from_secs(5);
             let mut observed_renewal = false;
             while tokio::time::Instant::now() < finish {

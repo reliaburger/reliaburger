@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod bootstrap;
 pub mod ca;
+pub mod ca_rotation;
 pub mod cert;
 pub mod connection;
 pub mod credentials;
@@ -25,4 +26,5 @@ pub mod root_backup;
 pub mod secret;
 pub mod session;
 pub mod token;
+pub mod trust;
 pub mod types;

@@ -53,12 +53,20 @@ pub struct Compatibility {
 /// Per-namespace secret keys: `NamespaceSpec::secret_key` and the values a
 /// namespace's first key re-seals (`RaftRequest::RotateSecretKey::resealed`)
 /// (F05 I4, #363).
+/// Several CAs per role: each CA's `CaState`, the node leaf records
+/// (`SecurityState::node_leaves`) and the `CaRotationBegin` and
+/// `CaRotationFinalize` Raft requests (F04 R1, #362).
+/// Trust bundles: the trusted Node CAs and roots in a join bundle
+/// (`JoinBundle::trusted_node_cas_b64`, `trusted_roots_b64`) and in
+/// `GET /v1/cluster/ca`, the workload CA bundle in a signing answer
+/// (`WorkloadCsrResponse::ca_bundle_der`), and the trust set in a node's
+/// identity snapshot (`node.bundle.json` schema 3) (F04 R2, #362).
 /// Image references bound to digests at apply (`nginx:1.27@sha256:…`) in app
 /// and job specs, deploy history and prerequisite claims, and the tag a bound
 /// pull records in the pull-through cache (F03 U1, #361).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 42,
-    state: 59,
+    protocol: 45,
+    state: 62,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

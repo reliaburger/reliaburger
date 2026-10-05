@@ -324,7 +324,7 @@ pub fn backup_from_init(
     master_key: &[u8],
     now: SystemTime,
 ) -> Result<RootBackup, RootBackupError> {
-    let root = state.get_ca(CaRole::Root).ok_or_else(|| {
+    let root = state.active_ca(CaRole::Root).ok_or_else(|| {
         RootBackupError::RootKeyUnavailable("the security state has no root CA".to_string())
     })?;
     let private_key_der = unseal_init_root_key(state, sealed_root, master_key)?;
@@ -583,7 +583,7 @@ mod tests {
         )
         .unwrap();
 
-        let root = init.security_state.get_ca(CaRole::Root).unwrap();
+        let root = init.security_state.active_ca(CaRole::Root).unwrap();
         let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&root.certificate_der);
         assert_eq!(backup.fingerprint, fingerprint);
         backup.verify(&fingerprint, SystemTime::now()).unwrap();

@@ -169,8 +169,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             signed.spiffe_uri,
             signed_workload.cert_der,
             signed.private_key_der,
-            &signed_workload.workload_ca_cert_der,
-            &signed_workload.root_ca_cert_der,
+            &signed_workload.ca_bundle_der,
             signed_workload.jwt_token.unwrap_or_default(),
         );
         // Write to the instance's own identity mount (PKI7). The directory was
@@ -229,6 +228,7 @@ impl SigningRequest {
                     cert_der: signed.cert_der,
                     workload_ca_cert_der: signed.workload_ca_cert_der,
                     root_ca_cert_der: signed.root_ca_cert_der,
+                    ca_bundle_der: signed.ca_bundle_der,
                     jwt_token: signed.jwt_token,
                 })
                 .map_err(|error| error.to_string());

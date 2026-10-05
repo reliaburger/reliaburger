@@ -90,7 +90,7 @@ pub(super) async fn local_capability_report(
         Some(council) => {
             let security = council.security_state().await;
             security
-                .get_ca(crate::sesame::types::CaRole::Root)
+                .active_ca(crate::sesame::types::CaRole::Root)
                 .map(|root| {
                     let digest = ring::digest::digest(&ring::digest::SHA256, &root.certificate_der);
                     format!("sha256:{}", hex::encode(digest.as_ref()))

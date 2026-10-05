@@ -267,8 +267,13 @@ impl NodeRenewalWorker {
         let replacement = bundle
             .into_identity(key)
             .map_err(|error| error.to_string())?;
+        // The leader's bundle carries the trust set it signed under. Accept a
+        // change only when this node's own replica of the council state
+        // agrees; if it lags, the next attempt will.
+        let council_trust = super::trust::TrustSet::from_state(&council.security_state().await)
+            .ok_or("the council state has no Node CA or root")?;
         self.identity
-            .replace(replacement)
+            .replace(replacement, &council_trust)
             .await
             .map_err(|error| error.to_string())
     }

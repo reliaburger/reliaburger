@@ -121,10 +121,10 @@ fn load(operation: &Operation, directory: &Path) -> Result<Bootstrap, RelishErro
     let state: SecurityState = serde_json::from_slice(&bytes)
         .map_err(|error| failed(&format!("invalid bootstrap state: {error}")))?;
     let node_ca = state
-        .get_ca(CaRole::Node)
+        .active_ca(CaRole::Node)
         .ok_or_else(|| failed("bootstrap node CA is missing"))?;
     let root_ca = state
-        .get_ca(CaRole::Root)
+        .active_ca(CaRole::Root)
         .ok_or_else(|| failed("bootstrap root CA is missing"))?;
     if node_ca.certificate_der != identity.node_ca_der
         || root_ca.certificate_der != identity.root_ca_der

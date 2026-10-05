@@ -256,6 +256,7 @@ async fn single_node_leader_with_security() -> Arc<CouncilNode> {
         oidc_signing_config: Some(oidc_config),
         crl: reliaburger::sesame::types::Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
+        node_leaves: std::collections::BTreeMap::new(),
     };
     node.write(reliaburger::council::types::RaftRequest::SecurityStateInit(
         Box::new(security_state),
@@ -979,7 +980,7 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
     let root_ca_der = council
         .security_state()
         .await
-        .get_ca(reliaburger::sesame::types::CaRole::Root)
+        .active_ca(reliaburger::sesame::types::CaRole::Root)
         .map(|ca| ca.certificate_der.clone())
         .expect("root CA present");
 
@@ -1063,7 +1064,7 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
                 keys: vec![],
                 ..Default::default()
             },
-            Some(&root_ca_der),
+            std::slice::from_ref(&root_ca_der),
             None,
         )
         .expect("the build signature must verify on deploy");
@@ -1301,6 +1302,7 @@ async fn bootstrap_security(leader: &CouncilNode) {
         oidc_signing_config: Some(oidc_config),
         crl: reliaburger::sesame::types::Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
+        node_leaves: std::collections::BTreeMap::new(),
     };
     leader
         .write(reliaburger::council::types::RaftRequest::SecurityStateInit(
@@ -1451,8 +1453,10 @@ async fn carries_a_verified_signature(
     };
     let security = council.security_state().await;
     let root = security
-        .get_ca(reliaburger::sesame::types::CaRole::Root)
-        .map(|ca| ca.certificate_der.clone());
+        .active_ca(reliaburger::sesame::types::CaRole::Root)
+        .map(|ca| ca.certificate_der.clone())
+        .into_iter()
+        .collect::<Vec<_>>();
     reliaburger::pickle::signing::verify_signature(
         &signature,
         digest,
@@ -1461,7 +1465,7 @@ async fn carries_a_verified_signature(
             keys: vec![],
             ..Default::default()
         },
-        root.as_deref(),
+        root.as_slice(),
         None,
     )
     .is_ok()
