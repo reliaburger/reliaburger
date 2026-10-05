@@ -101,8 +101,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 58. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 34, state 49; this binary (reliaburger v0.1.5 (465fdeb)) needs protocol 40, state 58. …
+incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 40, state 58; this binary (reliaburger v0.1.6 (465fdeb)) needs protocol 46, state 63. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -145,8 +145,8 @@ paused run, because no node moved.
 
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
-`start` fails with both format pairs. A 0.1.4 cluster refuses 0.1.5 like this:
-`refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+`start` fails with both format pairs. A 0.1.5 cluster refuses 0.1.6 like this:
+`refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -232,18 +232,54 @@ directories aside (or `relish local destroy --yes` a laptop cluster), install
 
 ### Upgrading from 0.1.5
 
-0.1.6 can't roll onto a 0.1.5 cluster. A namespace can have its own secret
-key (`secret_key = true` in `[namespace.X]`, F05 I4), which adds a field to
-every namespace in the council's state, and the Raft entry that creates a
-namespace's key carries the values it re-seals. API token rotation (F05 I3)
-adds a Raft entry and keeps a rotated token's old secret beside its new one.
-Intermediate CA rotation and trust bundles (F04 R1, R2) keep several CAs per
-role and send the trusted set in joins, signing answers and node snapshots.
+0.1.6 can't roll onto a 0.1.5 cluster. Most of what it adds lives in the
+council's state or crosses the wire between nodes:
+
+- apps and jobs store their image bound to a digest
+  (`nginx:1.27@sha256:…`), in their specs, deploy history and the
+  pull-through cache (F03a);
+- a council holds several CAs per role, with a record of every node's leaf,
+  and sends the trusted set in joins, signing answers and node snapshots
+  (F04 R1, R2);
+- rotating an intermediate adds Raft entries for the pending CSR and for each
+  node's trust acknowledgement, and a call a node makes to the leader
+  (F04 R4);
+- a rotated API token keeps its old secret beside the new one for the grace
+  period (F05 I3);
+- a namespace can have its own secret key, a new field on every namespace
+  (F05 I4).
+
 So the protocol moved from 40 to 46 and the state format from 58 to 63.
-Recreate the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data directories aside (or
-`relish local destroy --yes` a laptop cluster), install 0.1.6 and re-apply
-your apps. 0.1.5's leader refuses the upgrade before it records a run, with
+Recreate the cluster the same way as [from 0.1.0](#upgrading-from-010): move
+the data directories aside (or `relish local destroy --yes` a laptop
+cluster), install 0.1.6 and re-apply your apps. 0.1.5's leader refuses the
+upgrade before it records a run, with
 `found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58`.
+
+Four things behave differently once you're on 0.1.6:
+
+- **Images bind to a digest at apply.** `relish apply` resolves each tag and
+  stores `name:tag@sha256:…`, so every node and every restart runs the same
+  bytes. Applying again is how you pick up a tag that has moved. An apply
+  fails if the registry doesn't answer and the pull-through cache doesn't
+  hold the tag
+  ([images and volumes](manual/11_images-and-volumes.md)).
+- **`deployer` and `read-only` tokens expire after 90 days** unless you pass
+  `--ttl-days` or `--no-expiry` to `relish token create`, or change
+  `[security.tokens] default_ttl`. Admin tokens still get no default expiry.
+  Tokens you re-create after the upgrade pick up the default, so check what
+  your CI holds ([security](manual/10_security.md)).
+- **Back up the root CA yourself.** Run `relish ca backup` on the node where
+  `relish init` ran, as soon as the new cluster is up, and store the file off
+  the cluster. `relish ca rotate` asks for it to sign a new intermediate, and
+  the root's key never enters the council
+  ([security](manual/10_security.md)).
+- **Namespace secret keys are opt-in.** Every namespace keeps sharing the
+  cluster key until you set `secret_key = true` in its `[namespace.X]`
+  section, so values encrypted to the cluster key keep working. Opting in
+  re-seals the namespace's apps; re-encrypt the values in your own config
+  with `relish secret pubkey --namespace X`, or the next apply puts the
+  cluster-sealed ones back.
 
 ## Signing identity
 
