@@ -1372,5 +1372,11 @@
     "function": "runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http",
     "binary": "reliaburger::owned_runc",
     "test": "capacity_contract::runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt"
   }
 ]
