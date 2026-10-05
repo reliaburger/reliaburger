@@ -152,15 +152,100 @@ The following are source entry points, all pinned to the verified main revision:
 
 ## 3. CRIU, runc and ecosystem research
 
-This is the retained research snapshot from 28 September 2026, with the
-Kubernetes proposal corrected against its current text on 5 October. Version,
+The primer below was added and checked against upstream documentation and the
+v4.2.1 source on 6 October 2026. The subsequent research is the retained snapshot
+from 28 September, with the Kubernetes proposal corrected on 5 October. Version,
 architecture and support claims below are research inputs, not a qualification
 of our generated spec. Recheck upstream releases and actual node capabilities
 before packaging. "Unverified" means a spike must establish it. Sections 1 and
 5-10 define the revised contract and override the old research's suggestions
 about fallback, matching CPUs and dropping connections.
 
-### CRIU
+### CRIU for newcomers: what a checkpoint includes, and what it cannot capture
+
+**CRIU means Checkpoint/Restore In Userspace.** It pauses a Linux process tree,
+records its memory and execution state, together with supported kernel resources
+such as threads, open file descriptors and sockets, then reconstructs that state
+so the program can resume where it stopped. For example, a worker halfway through
+a computation can continue with its existing variables and call stack instead
+of running its startup code again. runc supplies the container integration; CRIU
+supplies the process checkpoint/restore mechanism
+([project introduction](https://github.com/checkpoint-restore/criu),
+[checkpoint/restore design](https://criu.org/Checkpoint/Restore)).
+
+The checkpoint boundary is a set of processes and supported resources. It does
+not include an entire machine or everything those processes interact with.
+Three different limitations matter to operators: a resource CRIU cannot dump,
+a supported resource requiring explicit integration, and external state that
+must be kept consistent separately. The tables below distinguish these; they
+are a starting compatibility checklist, not an exhaustive support catalogue.
+
+**Resources that block an ordinary checkpoint.** These apply to the researched
+upstream v4.2.1 release unless a qualified plugin is explicitly mentioned.
+
+| Resource or situation | What this means for a practitioner |
+|---|---|
+| An open `io_uring` instance | This asynchronous I/O interface keeps ring state in the kernel. v4.2.1 has no built-in dump handler for its descriptor; an application/runtime using it can block checkpointing even if it has no volumes. The older support proposal was closed without merging. A workload-supported alternative I/O backend must be selected and tested before starting it; Reliaburger cannot transparently switch a running process. [Released descriptor dispatch](https://github.com/checkpoint-restore/criu/blob/v4.2.1/criu/files.c#L524), [proposal #1597](https://github.com/checkpoint-restore/criu/pull/1597). |
+| Hardware or driver-owned state without a supported plugin | Opening or mapping a device does not make its internal state part of the process's RAM. GPU contexts/device memory, RDMA adapters and other device dependencies need specific support; creating the same `/dev` path is insufficient. Some virtual devices are supported. GPU plugins are a separate, constrained capability, not generic GPU portability; GPUs remain outside this release's migration scope (section 4). [Device limitations](https://criu.org/What_cannot_be_checkpointed), [GPU integration](https://criu.org/GPU_Checkpointing). |
+| A debugger or tracer attached through `ptrace` | An attached `gdb` or `strace` conflicts with CRIU's own use of the process tracing interface. Detach it before checkpointing and test any other tracing setup separately. [Upstream limitations](https://criu.org/What_cannot_be_checkpointed). |
+| Open files on a lazily unmounted filesystem | A file may remain usable by the running process after its filesystem disappears from the mount tree, but CRIU cannot checkpoint that case ordinarily. This differs from a deleted-but-still-open file, which has dedicated handling and needs its own qualification. [Upstream limitations](https://criu.org/What_cannot_be_checkpointed). |
+| Packet-mode pipes | Ordinary pipes have support; pipes created with `O_DIRECT` to retain packet boundaries are rejected, apart from a specific autofs exception. This is a pipe flag, not a blanket prohibition on direct I/O to regular files. [Released pipe handler](https://github.com/checkpoint-restore/criu/blob/v4.2.1/criu/pipes.c#L489). |
+| Corked UDP sockets | v4.2.1 rejects a UDP socket using `UDP_CORK`, which batches writes into a datagram. Ordinary UDP support does not imply this variant works. [Released socket handler](https://github.com/checkpoint-restore/criu/blob/v4.2.1/criu/sk-inet.c#L494). |
+| Other unsupported kernel objects or socket families | There is no generic handler for every Linux API. A new kernel feature can be usable by an application before CRIU supports its state. Qualify the actual objects and options used, rather than admitting an application solely because its language or container image is familiar. [Descriptor dispatch](https://github.com/checkpoint-restore/criu/blob/v4.2.1/criu/files.c#L524), [upstream limitations](https://criu.org/What_cannot_be_checkpointed). |
+
+The upstream limitations wiki is not a release-specific compatibility matrix.
+For example, it still lists file descriptors sent over UNIX sockets as unsupported,
+while v4.2.1 has `SCM_RIGHTS` queue dump/restore handling. That does not qualify
+every ancillary-message or external-peer case. Use pinned release code and real
+round trips to distinguish supported, unsupported and unknown, and refresh the
+matrix when upgrading ([released message handling](https://github.com/checkpoint-restore/criu/blob/v4.2.1/criu/sk-queue.c)).
+
+**Supported mechanisms that still require Reliaburger integration.**
+
+| Resource | Extra condition; why a flag alone is insufficient |
+|---|---|
+| Established TCP sessions | `--tcp-established` needs the original address available at restore and packet locking between dump and restore. CRIU restores the endpoint's TCP state; Reliaburger must preserve the route, external address/NAT and any proxy-owned sessions. Peer timeouts still run. `--tcp-close` deliberately closes connections and cannot count as live continuity. [TCP requirements](https://criu.org/TCP_connection), [released options](https://github.com/checkpoint-restore/criu/blob/v4.2.1/Documentation/criu.txt). |
+| File locks and shared IPC | `--file-locks` requires all relevant lock users within the checkpoint boundary; it cannot fence an outside writer. SysV shared-memory state requires the whole relevant IPC namespace. Shared resources spanning separately moved containers need a qualified group protocol or refusal. [Lock requirements](https://criu.org/Advanced_usage), [IPC boundary](https://criu.org/What_cannot_be_checkpointed). |
+| External mounts, namespaces, stdio and UNIX peers | The caller must provide mappings or inherited descriptors for supported external resources. Mapping an external block-device mount does not copy the device contents; reconnecting a UNIX socket does not reproduce a daemon's peer-side session state. Our external network namespace, capture files and active exec/attach paths need explicit integration. [External resources](https://criu.org/External_resources), [mount-device mapping](https://criu.org/External_mount_devices), [plugin boundaries](https://criu.org/Plugins). |
+| Destination CPU, kernel and security environment | A captured process still needs compatible instructions/register state and the required kernel features and privileges. A successful dump is not proof of restore on an arbitrary host; a matching CPU model is not the full check. Qualify direction, architecture, namespaces, seccomp/LSM and runtime configuration as a pool. [CPU checks](https://criu.org/CLI/cmd/cpuinfo), [kernel checks](https://criu.org/CLI/cmd/check). |
+
+**State CRIU does not turn into a portable, consistent snapshot.** The container's
+ordinary root filesystem and volume contents need their own consistent copy;
+checkpoint images refer to files and do not replace that copy
+([filesystem boundary](https://criu.org/index.php?title=FAQ)). By the same boundary,
+we cannot infer a cluster-wide transaction from a process checkpoint. A database
+commit, queued message, remote lock/lease, payment or response already delivered
+to a client remains an external effect. Restoring older process state cannot undo
+it or guarantee exactly-once replay. Remote peers keep running while the workload
+is paused; leases, deadlines and credentials may expire. These are application
+and orchestration constraints even when CRIU accepts every local resource.
+
+For example, a Redis process may have checkpointable memory and sockets, yet a
+move can still fail its contract through a missing filesystem cut, lost address,
+client timeout or revoked credential. A database using `io_uring` may instead
+fail before a usable process dump exists. Neither case is permission to discard
+state and report a successful live move.
+
+**How the built-in tests expose the boundary.** Host-level `criu check` establishes
+kernel prerequisites, not that a particular running workload can migrate
+([check semantics](https://criu.org/CLI/cmd/check)). The proposed Relish demo proves
+its pinned fixture and recorded source/target configuration. Workload qualification
+must also exercise the application's real resource use under load: a resource
+can appear only after startup, so an image digest or initial preflight cannot
+guarantee every future checkpoint. Recheck at the actual dump boundary and handle
+dump-time rejection under section 5.6's ownership rules.
+
+Add small refusal fixtures and supported-counterpart round trips to S8 and the
+versioned conformance manifest: `io_uring`, attached tracing, packet pipes, corked
+UDP, unsupported descriptors, and outside peers/shared-resource ownership. Report
+the blocking resource, exact instance, mode and qualified configuration, with
+a tested remediation where one exists. Before activation, refusal must establish
+source liveness and continued state/session correctness; after possible target
+execution, use held recovery and fencing. Required cases cannot pass by skipping
+unsupported fixtures or silently restarting them. This is proposed qualification
+work, not evidence that these behaviours are implemented today.
+
+### CRIU research snapshot
 
 - **Version.** The latest tag is v4.2.1 (21 July 2026, a bugfix release);
   4.2 came out on 13 November 2025, 4.1 on 25 March 2025, 4.0 (the CUDA
@@ -187,12 +272,12 @@ about fallback, matching CPUs and dropping connections.
   - inotify, fanotify, timerfd, signalfd and eventfd are listed as kernel
     requirements for CRIU's own test suite ([Linux kernel](https://criu.org/Linux_kernel))
     but we found no per-feature support page. Unverified; the spike covers it.
-- **What it refuses.** io_uring (the GSoC 2021 work was never finished,
-  [PR #1597](https://github.com/checkpoint-restore/criu/pull/1597)), POSIX
-  message queues, physical devices other than the null/zero/tun family,
-  ptraced tasks ([what cannot be checkpointed](https://criu.org/What_cannot_be_checkpointed),
-  [GSoC ideas](https://criu.org/Google_Summer_of_Code_Ideas)). io_uring is the
-  one that'll surprise people: recent runtimes and databases use it.
+- **Limits and conditional support.** See the primer above for release-checked
+  refusals, caller-supplied resources and external state. The older io_uring
+  proposal remains unmerged; the released descriptor handler is stronger
+  evidence than the proposal's age. POSIX message queues and other unqualified
+  IPC variants need explicit S8 evidence; this snapshot does not establish their
+  support. A device-specific plugin or special flag is not universal portability.
 - **Privileges.** CRIU wants root. `--unprivileged` (3.18) still needs
   `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` (Linux 5.9,
   [LWN](https://lwn.net/Articles/826546/)). Checkpointing *rootless*
@@ -431,9 +516,11 @@ Admission checks and reserves:
 4. Actual required preservation and latency envelope. Report incompatible layers
    and alternate explicitly permitted outcomes in dry-run. An address collision
    cannot quietly turn a required live move into a disconnecting move.
-5. Network, credentials and external lease/timeout requirements of the qualified
-   workload. Unsupported sessions or active exec/attach dependencies are refused
-   or explicitly excluded by the selected profile.
+5. Actual workload resources, network, credentials and external lease/timeout
+   requirements (section 3's CRIU primer). Unsupported sessions or active
+   exec/attach dependencies are refused or explicitly excluded by the selected
+   profile. Host checks and an image digest do not certify later resource use;
+   recheck at dump and preserve safe source/recovery outcomes on rejection.
 6. For test fixtures, authenticated lease ownership throughout source, target,
    payload, route and volume lifecycle (section 9). Ordinary test permission
    never authorises draining unrelated workloads.
@@ -995,7 +1082,7 @@ not mandatory when another proven method satisfies the same contract.
 | Storage | Each claimed backend preserves content/deletions/metadata and quota enforcement; copied data is authoritative only after validated cutover. |
 | Identity | Logical replica/job execution is retained; fresh authenticated operations succeed after movement and rotation/reload. |
 | Jobs | Exact execution/run/retry ownership survives; completed work and observed external effects are not replayed. |
-| Admission/refusal | Unsupported modes/features, conflicts, resource reservations and real incompatible targets refuse without disrupting the source. |
+| Admission/refusal | Unsupported modes/features, conflicts, resource reservations and real incompatible targets refuse safely. Named CRIU resource fixtures test refusal, source continuation and supported counterparts; a later dump-time rejection establishes source outcome under section 5.6. |
 | Lifecycle | Duplicate requests, cancellation, disconnected CLI and lease expiry retire resources correctly; no forbidden old generation starts. |
 | Required observability | The report binds observed state/session/latency results to exact nodes, paths and contract; source independence is independently qualified. |
 
@@ -1104,7 +1191,7 @@ resources. x86_64 pre-copy and arm64 methods need separate hardware evidence.
 | S5 | Restored init parentage, boot/start-tick evidence, Bun adoption, stop/exit receipts and stale-generation rejection. |
 | S6 | Cross-host timers/monotonic time and remote timeout/lease behaviour within a declared budget. |
 | S7 | Memory/volume/rootfs payload and client-observed pause for realistic sizes/rates; set envelopes from results. |
-| S8 | Unsupported io_uring/devices/IPC/exec dependencies: establish source outcome positively and refuse strict migration without cold fallback. |
+| S8 | Release-specific resource matrix and refusal fixtures for io_uring, devices, attached tracers, packet pipes, corked UDP and unsupported IPC/socket/exec dependencies; supported-counterpart round trips. Exercise late resource acquisition, actual dump rejection and source continuation/state/session correctness; no implicit cold fallback. |
 | S9 | Actual dirty tracking/pre-copy and convergence on qualified x86_64/arm64 hosts; select from capabilities. |
 | S10 | Lazy-page TLS/manifest binding, source/provider loss, fault stalls, provider independence and optional redundant-page recovery. |
 | S11 | TCP_REPAIR with packet locking, borrowed-address prototype and source-independent address/NAT ownership, ingress and repeated moves. Prototype success alone cannot pass the release gate. |
@@ -1198,6 +1285,8 @@ to satisfy this release's continuity contract.
 ## 12. Consistency review and unresolved feasibility
 
 Review completed 5 October against fetched main `ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`.
+CRIU primer and refusal coverage reviewed 6 October against the same freshly
+fetched main and upstream v4.2.1; main has not advanced since the preceding review.
 This is a design/document review, not completed migration qualification.
 Validation on this refreshed checkout: `git diff --check`, section/fence/local-link
 checks, all 19 pinned-main source references and proposed TOML syntax passed.
@@ -1220,6 +1309,7 @@ run, and the proposed migration commands/profiles remain unimplemented.
 | Tmpfs assumed never spills; lost transfer key forced restart. | Enforced no-swap reservations and recoverable protected keys; S15. |
 | Test fixture leases forbidden; source node fault mistaken for power-off. | Authenticated cross-node lease lifecycle; actual VM/data-plane loss. S17/S19. |
 | Selected green tests mistaken for whole-cluster conformance. | Versioned manifest completeness, pools/directions, observed evidence and tiers. S18. |
+| CRIU installation or a successful fixture implies arbitrary workloads can move. | Explain dump blockers, conditional resources and external-state boundaries; workload-specific and late-resource qualification with refusal fixtures. Section 3, S8 and strict conformance. |
 | Every deadline assumed to yield terminal successful ownership. | Held recovery/unavailability when proof is missing; model tests permit it. |
 | Stale baseline/protocol and job attempt design. | Main 40/58 and existing job generations/spec digests/replay fences, refreshed before implementation. |
 
