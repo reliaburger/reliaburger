@@ -1158,8 +1158,11 @@ apply checks it before contacting any registry, and Bun checks it again before
 every deploy where a council catalogue tells Pickle's images from upstream
 ones (F03 U2). It stays in `node.toml` for the same reason the keys do:
 nothing an API token can change should decide what the cluster trusts. A rule
-with `require_signatures = true` is refused at startup until cosign
-verification (F03 U3) can honour it.
+with `require_signatures = true` and `cosign_keys` (PEM P-256 keys) makes Bun
+verify a key-based cosign signature over the bound digest before every
+deploy, off the agent loop, reading the `.sig` image through the pull-through
+cache when it's on (F03 U3). Either half without the other is refused at
+startup.
 
 ---
 
