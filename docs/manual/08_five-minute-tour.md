@@ -6,7 +6,7 @@ own next to it, walk its network path, measure it, break it and watch it
 heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install fetches the signed 0.1.4 release.
+15 GiB of disk. The one-line install fetches the signed 0.1.5 release.
 
 ## Install and build the cluster
 
