@@ -162,6 +162,7 @@ fn router_for_council(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -812,6 +813,7 @@ fn shared_authority_router(
             ..Default::default()
         },
         reliaburger::bun::readiness::ReadinessTracker::new(),
+        None,
         None,
         None,
         None,

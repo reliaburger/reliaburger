@@ -128,6 +128,25 @@
                 <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
             </figcaption>
           </figure>
+          <figure id="jobs-recording" class="recording" data-cast="./assets/jobs.cast" data-poster="npt:114.196">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The development preview plays with JavaScript.
+              <a href="./assets/jobs.cast">Download the jobs recording</a> and play it with
+              <code>asciinema play jobs.cast</code>, or follow the batch step below.</p></noscript>
+            <figcaption>
+              <span>Development preview: 1,000 small and 64 larger image jobs beside the
+                burger service, using the public CLI on a real Linux node.
+                Requests decide what fits; summaries show accepted progress.
+                This uses the unreleased <a href="https://github.com/reliaburger/reliaburger/pull/266">0.2.0 implementation</a>
+                on 4 vCPU / 8 GiB, with debug binaries. Idle pauses are cut to two seconds;
+                the recording states the actual elapsed time. This correctness demo
+                does not qualify 100 million jobs/day.</span>
+              <span class="recording-speed" role="group" aria-label="Jobs playback speed" hidden>speed
+                <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                <button type="button" data-speed="2" aria-pressed="false">2×</button>
+                <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
+            </figcaption>
+          </figure>
           <!-- Only the commands fold away. Find-in-page opens a closed details element
                in Chromium and Safari, so Ctrl-F still reaches every command. -->
           <details class="tour-commands" id="tour-commands">
@@ -171,6 +190,22 @@
                   <code>linux/amd64</code> and <code>linux/arm64</code>: <code>images</code> lists
                   <code>burger:v1</code> once, with its platforms. Each order names the podinfo
                   backend that cooked it, found by its service name.</p>
+              </li>
+              <li>
+                <p><strong>Development preview (0.2.0 / PR #266):</strong> queue
+                  1,000 small and 64 larger jobs beside the burger service.</p>
+                <pre><code data-tour>relish --output json batch submit burger/jobs.toml</code>
+<code data-tour>relish batch watch 1</code>
+<code data-tour>relish batch results 2 --failed --limit 20</code>
+<code data-tour>relish manual batch</code></pre>
+                <p>Use the returned manifest ID instead of <code>1</code> and the
+                  small profile’s child ID instead of <code>2</code>. CPU and memory
+                  requests decide what fits; chunk size decides how much is queued.
+                  Watch rates, backlog and duration distributions, then inspect a
+                  bounded failure page. The executable tour includes this step with
+                  <code>--jobs</code> and checks that the app still serves orders.
+                  This step needs development binaries; the 0.1.4 recording above
+                  predates it. A short demo does not qualify 100 million jobs/day.</p>
               </li>
               <li>
                 <pre><code data-tour>relish path frontend --to redis</code></pre>

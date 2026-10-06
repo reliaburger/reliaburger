@@ -88,6 +88,27 @@ service calls `http://backend:9898/` by service name, exactly as it would in a
 Kubernetes pod. Run the `curl` a few times and the cashier changes as the
 ingress takes turns between the two replicas.
 
+## Development preview: queued jobs beside the app
+
+With the 0.2.0 development binaries and the matching burger source, the same
+image also runs resource-aware batch work. This step is unavailable in 0.1.4.
+Use `scripts/demo/tour.sh --jobs` to include it in an executable tour.
+
+```sh
+relish --output json batch submit burger/jobs.toml
+relish batch watch 1
+relish batch results 2 --failed --limit 20
+relish manual batch
+```
+
+Replace `1` with the returned manifest ID and `2` with the small profile's child
+ID shown by watch. There are 1,000 small and 64 larger hashing jobs. Existing
+apps retain their requests; each worker starts only the tasks that fit in its
+remaining CPU and memory. Watch shows summaries, rates and duration distributions
+instead of listing all jobs. The script checks the burger service during the
+batch and verifies all 1,064 outcomes before continuing. See `relish manual batch`
+for manifests, retries, cancellation, indexed pages and retention.
+
 ## See the whole path
 
 ```sh

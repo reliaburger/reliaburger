@@ -1174,9 +1174,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.signature_source = Some(source);
     }
 
+    /// Shared admission ledger for applications and delegated task attempts.
+    pub fn execution_budget(&self) -> Arc<super::execution_budget::ExecutionBudget> {
+        self.supervisor.execution_budget()
+    }
+
     /// Set the node's schedulable capacity (system totals minus the
     /// `[resources]` reservation). Reported in every StateReport.
     pub fn set_node_capacity(&mut self, cpu_millicores: u32, memory_mb: u32) {
+        self.supervisor
+            .execution_budget()
+            .set_capacity(crate::meat::Resources::new(
+                u64::from(cpu_millicores),
+                u64::from(memory_mb) * 1024 * 1024,
+                u32::MAX,
+            ));
         self.capacity_cpu_millicores = cpu_millicores;
         self.capacity_memory_mb = memory_mb;
     }
@@ -1258,6 +1270,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// shared host firewall (`with_cluster` enables it by default on Linux).
     pub fn set_perimeter_enabled(&mut self, enabled: bool) {
         self.perimeter_config.enabled = enabled;
+    }
+
+    /// Construct after startup retirement, sharing the agent's exact runtime.
+    pub fn delegated_task_runner(
+        &self,
+        data: &std::path::Path,
+    ) -> std::io::Result<super::task_runtime::OwnedRunner<G>> {
+        super::task_runtime::OwnedRunner::for_data_dir(self.supervisor.grill().clone(), data)
+    }
+    /// The same kernel owner used by apps, for delegated source ancestry.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub fn delegated_namespace_kernel(
+        &self,
+    ) -> Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>> {
+        self.supervisor
+            .grill()
+            .honours_cgroup_path()
+            .then(|| self.onion_ebpf.clone())
+            .flatten()
     }
 
     /// Attach a loaded eBPF handle so the agent can write fault and

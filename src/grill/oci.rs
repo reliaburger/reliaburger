@@ -79,6 +79,9 @@ pub struct OciRoot {
 /// The container's main process configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OciProcess {
+    /// Optional POSIX limits enforced by OCI runtimes before executing the task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rlimits: Vec<OciRlimit>,
     pub args: Vec<String>,
     pub env: Vec<String>,
     pub cwd: String,
@@ -95,6 +98,15 @@ pub struct OciProcess {
     /// before writing `config.json`. `None` means the process is final.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<ProcessOverrides>,
+}
+
+/// One standard OCI process limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciRlimit {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub hard: u64,
+    pub soft: u64,
 }
 
 /// The parts of a container's process an app may set, each replacing one
@@ -336,6 +348,7 @@ pub fn generate_oci_spec_with_decryptor(
             readonly: false,
         },
         process: OciProcess {
+            rlimits: Vec::new(),
             args,
             env,
             cwd: spec
@@ -700,6 +713,7 @@ pub fn generate_job_oci_spec(
             readonly: false,
         },
         process: OciProcess {
+            rlimits: Vec::new(),
             args,
             env,
             cwd: "/".to_string(),
@@ -749,6 +763,7 @@ pub fn generate_init_oci_spec(
             readonly: false,
         },
         process: OciProcess {
+            rlimits: Vec::new(),
             args: command.to_vec(),
             env: Vec::new(),
             cwd: "/".to_string(),

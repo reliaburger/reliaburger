@@ -624,3 +624,12 @@ pub(super) async fn app_env_handler(
             .into_response(),
     }
 }
+
+/// A summary table refreshes independently of the app/instance tables.
+pub(super) async fn fragment_batches_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    let rows = crate::bun::task_array_api::summaries(&state, auth.as_deref()).await;
+    html_response(crate::brioche::dashboard::render_batches(&rows))
+}

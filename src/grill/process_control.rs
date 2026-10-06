@@ -770,6 +770,7 @@ mod tests {
                 readonly: false,
             },
             process: OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sleep".into(), "60".into()],
                 env: vec![],
                 cwd: "/".into(),

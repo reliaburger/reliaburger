@@ -12,9 +12,14 @@ pub mod cluster_state;
 pub mod cron;
 pub mod deploy_types;
 pub mod filter;
+pub mod index_set;
+pub mod latency_histogram;
 pub mod quota;
 pub mod scheduler;
 pub mod score;
+pub mod task_array;
+pub mod task_array_state;
+pub mod task_array_store;
 pub mod types;
 
 pub use cluster_state::{ClusterStateCache, SchedulerNodeState};

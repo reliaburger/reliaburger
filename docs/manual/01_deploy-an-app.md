@@ -279,6 +279,32 @@ relish apply jobs.toml --rerun-jobs
 
 Cron doesn't catch up: firings missed while a node was down are skipped.
 
+## Task arrays
+
+Development preview for 0.2.0: use matching PR #266 binaries and a fresh cluster.
+When the same program needs to run thousands or millions of times, submit one
+template and a count, with `{index}` wherever the task's number goes.
+
+```sh
+relish run --batch render --count 100000 --image renderer:v1 --cpu 250m-500m --memory 256Mi-512Mi -- /renderer --frame {index}
+relish batch watch 12
+relish batch results 12 --failed --limit 20
+relish batch logs 12 --index 4071
+relish batch cancel 12
+```
+
+Use the ID returned by submission. Each task has its own retry, timeout and
+stable identity. Applications and actual batch attempts share CPU and memory
+requests; a queued chunk does not consume its full task count's resources.
+Image tasks use rootful Linux isolation and runtime limits. Host tasks require
+an allowlisted binary, disabled mount isolation and the owned process runtime;
+that backend refuses explicit resource limits it cannot enforce.
+
+Mixed-profile manifests, rates, duration distributions, indexed pages,
+retention and at-least-once effects are covered in `relish manual batch`.
+Only failed tasks retain bounded output. Detail stays on workers and can be
+lost with a worker's disk; accepted aggregate counts remain replicated.
+
 ## More shapes
 
 - Jobs: `examples/phase-1/proc-job-success.toml`,

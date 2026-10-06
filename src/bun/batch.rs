@@ -1387,6 +1387,7 @@ pub async fn batch_report_handler(
 pub async fn batch_status_handler(
     State(state): State<ApiState>,
     AxumPath(batch_id): AxumPath<u64>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
     if let Some(council) = &state.council
         && !council.is_leader().await
@@ -1404,11 +1405,54 @@ pub async fn batch_status_handler(
             ))
             .into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("batch {batch_id} not found") })),
-        )
-            .into_response(),
+        None => {
+            // Task arrays share the id space; the summary says `"kind": "array"`.
+            let arrays = super::task_array_leader::read_task_arrays(&state).await;
+            if let Some(record) = arrays.get(batch_id) {
+                if let Err(response) = crate::sesame::auth::authorize_scoped(
+                    auth.as_deref(),
+                    &record.name,
+                    &record.namespace,
+                ) {
+                    return response;
+                }
+                let nodes = state.task_arrays.node_views(batch_id).await;
+                let progress = record.state.summary();
+                let mut summary = super::task_array_api::array_summary(batch_id, record, &nodes);
+                summary["rates"] = serde_json::to_value(
+                    state
+                        .task_arrays
+                        .rates(batch_id, (progress.succeeded, progress.failed))
+                        .await,
+                )
+                .expect("finite rates");
+                return Json(summary).into_response();
+            }
+            if let Some(manifest) = arrays.manifest(batch_id) {
+                if let Err(response) = crate::sesame::auth::authorize_scoped(
+                    auth.as_deref(),
+                    &manifest.name,
+                    &manifest.namespace,
+                ) {
+                    return response;
+                }
+                return Json(
+                    super::task_array_api::manifest_summary(
+                        batch_id,
+                        manifest,
+                        &arrays,
+                        &state.task_arrays,
+                    )
+                    .await,
+                )
+                .into_response();
+            }
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("batch {batch_id} not found") })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1416,7 +1460,7 @@ pub async fn batch_status_handler(
 // Leader forwarding + addressing helpers
 // ---------------------------------------------------------------------------
 
-async fn forward_to_leader(
+pub(crate) async fn forward_to_leader(
     state: &ApiState,
     council: &crate::council::CouncilNode,
     path: &str,
@@ -1440,7 +1484,7 @@ async fn forward_to_leader(
     proxy_response(request.send().await).await
 }
 
-async fn forward_get_to_leader(
+pub(crate) async fn forward_get_to_leader(
     state: &ApiState,
     council: &crate::council::CouncilNode,
     path: &str,
@@ -1848,6 +1892,7 @@ mod tests {
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
             None,
             None,

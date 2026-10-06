@@ -152,6 +152,7 @@ async fn start_node_for_test(
         fault_injection: false,
         labels: Default::default(),
         keep_data_dir: false,
+        task_arrays: None,
     })
     .await
 }

@@ -316,6 +316,21 @@ pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::f
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Classify a reqwest send error as either a timeout or a connection failure.
+/// A successful response's JSON body, or the API error it carried.
+async fn json_or_api_error<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, RelishError> {
+    let status = response.status().as_u16();
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(RelishError::ApiError { status, body });
+    }
+    response.json().await.map_err(|e| RelishError::ApiError {
+        status: 0,
+        body: format!("failed to parse response: {e}"),
+    })
+}
+
 fn classify_error(e: reqwest::Error) -> RelishError {
     if e.is_timeout() {
         RelishError::RequestTimeout
@@ -2482,6 +2497,106 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })
+    }
+
+    /// Submit a task array (`POST /v1/batch/array`).
+    pub async fn submit_task_array(
+        &self,
+        request: &crate::bun::task_array_api::TaskArraySubmitRequest,
+    ) -> Result<crate::bun::task_array_api::TaskArraySubmitResponse, RelishError> {
+        let url = format!("{}/v1/batch/array", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .json(request)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
+    /// Cancel a task array (`POST /v1/batch/{id}/cancel`).
+    /// Admit all manifest profiles through one durable request.
+    pub async fn submit_task_manifest(
+        &self,
+        request: &crate::bun::task_array_api::TaskManifestRequest,
+    ) -> Result<serde_json::Value, RelishError> {
+        let response = self
+            .http()?
+            .post(format!("{}/v1/batch/manifest", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
+    pub async fn cancel_batch(&self, batch_id: u64) -> Result<(), RelishError> {
+        let url = format!("{}/v1/batch/{batch_id}/cancel", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
+    /// Per-task outcomes of a task array (`GET /v1/batch/{id}/results`).
+    pub async fn batch_results(
+        &self,
+        batch_id: u64,
+        failed_only: bool,
+        limit: usize,
+    ) -> Result<crate::bun::task_array_api::TaskResults, RelishError> {
+        self.batch_results_page(batch_id, failed_only, limit, None, None)
+            .await
+    }
+
+    /// Read a bounded cursor page, or address one stable task index.
+    pub async fn batch_results_page(
+        &self,
+        batch_id: u64,
+        failed_only: bool,
+        limit: usize,
+        after: Option<u32>,
+        index: Option<u32>,
+    ) -> Result<crate::bun::task_array_api::TaskResults, RelishError> {
+        let url = format!(
+            "{}/v1/batch/{batch_id}/results?failed={failed_only}&limit={limit}{}{}",
+            self.base_url,
+            after.map_or(String::new(), |a| format!("&after={a}")),
+            index.map_or(String::new(), |i| format!("&index={i}"))
+        );
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
+    /// A failed task's kept output (`GET /v1/batch/{id}/tasks/{index}/logs`).
+    pub async fn task_logs(&self, batch_id: u64, index: u32) -> Result<Vec<u8>, RelishError> {
+        let url = format!("{}/v1/batch/{batch_id}/tasks/{index}/logs", self.base_url);
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(response.bytes().await.map_err(classify_error)?.to_vec())
     }
 
     /// Progress of a submitted batch (`GET /v1/batch/{id}`).

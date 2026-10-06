@@ -71,9 +71,13 @@ pub struct Compatibility {
 /// each node's trust acknowledgement (`NodeLeafRecord::trust_generation`),
 /// the `CaRotationPrepare` and `AcknowledgeNodeTrust` Raft requests and the
 /// `POST /v1/cluster/trust-ack` body a node sends the leader (F04 R4, #362).
+/// and task arrays (`RaftRequest::TaskArray`, `DesiredState::task_arrays`
+/// and node ledgers under `task-arrays/`), including mixed-profile manifests,
+/// persistent recovery/term/index fences, 64-bit grant generations, accepted
+/// ownership ranges, duration buckets and indexed result pages (47/64).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 46,
-    state: 63,
+    protocol: 47,
+    state: 64,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -287,6 +291,28 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("identity")).unwrap();
         ensure_state_compatible(directory.path()).unwrap();
+    }
+
+    /// The generations before task arrays. There's no compatibility before
+    /// 1.0.0, so nodes and data from then are refused, not migrated.
+    const BEFORE_TASK_ARRAYS: Compatibility = Compatibility {
+        protocol: 46,
+        state: 63,
+    };
+
+    #[test]
+    fn peers_and_state_from_before_task_arrays_are_refused() {
+        assert!(BEFORE_TASK_ARRAYS.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_TASK_ARRAYS.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_TASK_ARRAYS.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }
 
     #[test]

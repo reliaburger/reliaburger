@@ -1366,6 +1366,7 @@ mod capacity_contract {
                 None,
                 None,
                 Some(status_reader),
+                None,
             );
             let server_shutdown = shutdown.clone();
             let server_task = tokio::spawn(async move {

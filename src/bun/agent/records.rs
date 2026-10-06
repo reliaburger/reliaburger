@@ -578,6 +578,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             };
             let identity_mount = identity.is_some().then(|| identity_dir.clone());
 
+            let request = record
+                .app_spec
+                .as_ref()
+                .map(|spec| {
+                    crate::meat::Resources::new(
+                        spec.cpu.map_or(0, |r| r.request),
+                        spec.memory.map_or(0, |r| r.request),
+                        spec.gpu.unwrap_or(0),
+                    )
+                })
+                .or_else(|| {
+                    recorded_job.map(|job| {
+                        crate::meat::Resources::new(
+                            job.spec.cpu.map_or(0, |r| r.request),
+                            job.spec.memory.map_or(0, |r| r.request),
+                            0,
+                        )
+                    })
+                })
+                .unwrap_or_default();
+            self.supervisor
+                .reserve_adopted_execution(instance_id.clone(), request);
             let key = (record.app_name.clone(), record.namespace.clone());
             let instance = WorkloadInstance {
                 id: instance_id.clone(),

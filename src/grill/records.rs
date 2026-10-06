@@ -356,6 +356,7 @@ mod tests {
                 readonly: false,
             },
             process: OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "60".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),

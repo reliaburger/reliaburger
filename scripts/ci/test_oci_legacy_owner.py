@@ -209,3 +209,19 @@ class LegacyOciOwner(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CurrentRepositoryBindings(unittest.TestCase):
+    def test_current_ignored_bindings_and_reviewed_oci_sources_are_complete(self):
+        import ignored_owners
+        root = Path(__file__).resolve().parents[2]
+        targets, scripts = ignored_owners.ci_owners(root)
+        required = {(case.path, case.name) for case in ignored_owners.find_ignored(root)
+                    if any((kind == 'make' and owner in targets) or
+                           (kind == 'script' and owner in scripts)
+                           for kind, owner in ignored_owners.owners(case))}
+        bindings = c.read_json(root / 'tests/contracts/ignored-bindings.json')
+        self.assertEqual(required, {(row['source'], row['function']) for row in bindings})
+        manifest = c.inventory(c.read_json(root / 'tests/contracts/manifest.json'), root)
+        bridge.reviewed_rows(root, c.read_json(root / 'scripts/ci/legacy-oci-aliases.json'),
+                             bindings, manifest)

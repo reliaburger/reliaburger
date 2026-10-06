@@ -49,7 +49,7 @@ test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp)'
+filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp) | binary(cluster_task_arrays)'
 test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
@@ -98,7 +98,7 @@ test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
-filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp)'
+filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp) | binary(cluster_task_arrays)'
 test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 

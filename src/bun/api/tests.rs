@@ -434,6 +434,7 @@ async fn setup_with_auth_leases_events_and_council(
         local_test_leases,
         None,
         None,
+        None,
     );
     (app, shutdown)
 }
@@ -1120,6 +1121,7 @@ async fn a_clear_answers_within_its_budget_when_the_agent_is_busy() {
         false,
         workload_fault_static_capabilities(),
         crate::bun::readiness::ReadinessTracker::new(),
+        None,
         None,
         None,
         None,
@@ -2094,6 +2096,7 @@ async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returne
             false,
             lease_static_capabilities(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
             None,
             None,
@@ -4796,6 +4799,7 @@ async fn setup_with_capabilities(
         None,
         None,
         None,
+        None,
     );
     (app, shutdown, mayo_dir)
 }
@@ -7213,6 +7217,7 @@ fn webhook_setup_for_council(
         None,
         None,
         None,
+        None,
     );
     (app, webhook_rx, shutdown)
 }
@@ -7525,6 +7530,7 @@ async fn webhook_fails_closed_without_a_configured_secret() {
         false,
         crate::bun::capabilities::StaticCapabilities::default(),
         crate::bun::readiness::ReadinessTracker::new(),
+        None,
         None,
         None,
         None,
@@ -9099,6 +9105,7 @@ fn webhook_boundary_setup(
         false,
         crate::bun::capabilities::StaticCapabilities::default(),
         crate::bun::readiness::ReadinessTracker::new(),
+        None,
         None,
         None,
         None,

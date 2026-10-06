@@ -122,6 +122,8 @@ pub struct WorkloadSupervisor<G: Grill> {
     process_manager: crate::grill::process_workload::ProcessManager,
     /// What this node can actually enforce (GPU, rootless limits).
     capabilities: PlatformCapabilities,
+    budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
+    resource_leases: HashMap<InstanceId, super::execution_budget::ResourceLease>,
 }
 
 impl<G: Grill> WorkloadSupervisor<G> {
@@ -154,7 +156,49 @@ impl<G: Grill> WorkloadSupervisor<G> {
             app_instances: HashMap::new(),
             process_manager: crate::grill::process_workload::ProcessManager::new(process_config),
             capabilities: PlatformCapabilities::default(),
+            budget: super::execution_budget::ExecutionBudget::new(crate::meat::Resources::new(
+                u64::MAX,
+                u64::MAX,
+                u32::MAX,
+            )),
+            resource_leases: HashMap::new(),
         }
+    }
+
+    /// The budget shared with node-local delegated task execution.
+    pub fn execution_budget(&self) -> std::sync::Arc<super::execution_budget::ExecutionBudget> {
+        self.budget.clone()
+    }
+
+    /// Reserve an adopted execution before enabling new task admission.
+    pub(crate) fn reserve_execution(
+        &mut self,
+        id: InstanceId,
+        resources: crate::meat::Resources,
+    ) -> Result<(), BunError> {
+        if self.resource_leases.contains_key(&id) {
+            return Ok(());
+        }
+        let lease = self
+            .budget
+            .try_acquire(resources)
+            .ok_or(BunError::Capacity {
+                requested: resources,
+                available: self.budget.available(),
+            })?;
+        self.resource_leases.insert(id, lease);
+        Ok(())
+    }
+
+    /// Recover already owned work before considering any fresh admission.
+    pub(crate) fn reserve_adopted_execution(
+        &mut self,
+        id: InstanceId,
+        resources: crate::meat::Resources,
+    ) {
+        self.resource_leases
+            .entry(id)
+            .or_insert_with(|| self.budget.adopt(resources));
     }
 
     /// Record what this node can enforce (detected GPUs, rootless mode).
@@ -510,6 +554,20 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // already inserted into `self.instances` and their ports allocated —
         // but `app_instances` was only written after the loop, so `remove_app`
         // couldn't find them and their ports leaked until agent restart.
+        let request = crate::meat::Resources::new(
+            spec.cpu.map_or(0, |r| r.request),
+            spec.memory.map_or(0, |r| r.request),
+            spec.gpu.unwrap_or(0),
+        );
+        let mut leases = HashMap::new();
+        for index in indices {
+            let id = crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
+            let lease = self.budget.try_acquire(request).ok_or(BunError::Capacity {
+                requested: request,
+                available: self.budget.available(),
+            })?;
+            leases.insert(id, lease);
+        }
         let mut prepared: Vec<WorkloadInstance> = Vec::with_capacity(indices.len());
         let mut allocated_ports: Vec<u16> = Vec::new();
         for &i in indices {
@@ -589,6 +647,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             instance_ids.push(instance_id);
         }
 
+        self.resource_leases.extend(leases);
         Ok(instance_ids)
     }
 
@@ -630,6 +689,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_job(job_name, namespace, spec)?;
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
 
+        let request = crate::meat::Resources::new(
+            spec.cpu.map_or(0, |r| r.request),
+            spec.memory.map_or(0, |r| r.request),
+            0,
+        );
+        self.reserve_execution(instance_id.clone(), request)?;
         let instance = WorkloadInstance {
             id: instance_id.clone(),
             app_name: job_name.to_string(),
@@ -708,6 +773,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             }
         }
         self.instances.remove(id);
+        self.resource_leases.remove(id);
     }
 
     /// Get a reference to an instance by ID.

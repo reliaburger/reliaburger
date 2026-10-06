@@ -65,8 +65,8 @@ mod test_leases;
 mod ui;
 mod upgrade;
 
-pub(crate) use apply::leader_api_url;
 use apply::{apply_handler, cluster_apply};
+pub(crate) use apply::{bind_images, leader_api_url};
 use apps::{delete_handler, exec_handler, stop_handler};
 use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
@@ -128,8 +128,9 @@ use test_leases::{
 };
 use ui::{
     app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
-    fragment_apps_handler, fragment_instances_handler, fragment_nodes_handler, gitops_handler,
-    login_handler, node_detail_handler, ui_logout_handler, ui_session_handler,
+    fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
+    fragment_nodes_handler, gitops_handler, login_handler, node_detail_handler, ui_logout_handler,
+    ui_session_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -419,6 +420,9 @@ pub struct ApiState {
     pub build_signers: Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, super::build_runner::BuildSigner>>,
     >,
+    /// Task arrays: this node's executor, the standalone store and the
+    /// leader's latest view of every node (0.2.0, million jobs).
+    pub task_arrays: Arc<super::task_array_leader::TaskArrayService>,
 }
 
 /// Build the API router.
@@ -470,6 +474,7 @@ pub fn router(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -510,6 +515,7 @@ pub fn router_with_upgrade(
     local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
     jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
     status: Option<super::agent::StatusReader>,
+    task_arrays: Option<Arc<super::task_array_leader::TaskArrayService>>,
 ) -> Router {
     let token_last_used = crate::sesame::auth::new_token_last_used();
     let state = ApiState {
@@ -553,9 +559,12 @@ pub fn router_with_upgrade(
         batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         active_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        task_arrays: task_arrays
+            .unwrap_or_else(|| Arc::new(super::task_array_leader::TaskArrayService::new(None))),
     };
 
     spawn_node_fault_reaper(state.clone());
+    super::task_array_leader::spawn_leader_loop(state.clone());
 
     let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
@@ -604,6 +613,7 @@ pub fn router_with_upgrade(
         .route("/ui/node/{name}", get(node_detail_handler))
         .route("/ui/gitops", get(gitops_handler))
         .route("/ui/fragment/apps", get(fragment_apps_handler))
+        .route("/ui/fragment/batches", get(fragment_batches_handler))
         .route("/ui/fragment/nodes", get(fragment_nodes_handler))
         .route("/ui/fragment/alerts", get(fragment_alerts_handler))
         .route(
@@ -754,12 +764,48 @@ pub fn router_with_upgrade(
         .route("/v1/test/leases/retired", post(test_lease_retired_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(super::batch::batch_submit_handler))
+        .route(
+            "/v1/batch/summaries",
+            get(super::task_array_api::summaries_handler),
+        )
         .route("/v1/batch/run", post(super::batch::batch_run_handler))
         .route(
             "/v1/batch/{id}/report",
             post(super::batch::batch_report_handler),
         )
         .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
+        .route(
+            "/v1/batch/manifest",
+            post(super::task_array_api::manifest_handler),
+        )
+        .route(
+            "/v1/batch/array",
+            post(super::task_array_api::submit_handler),
+        )
+        .route(
+            "/v1/batch/array/sync",
+            post(super::task_array_api::sync_handler),
+        )
+        .route(
+            "/v1/batch/array/{id}/local/results",
+            get(super::task_array_api::local_results_handler),
+        )
+        .route(
+            "/v1/batch/array/{id}/local/tasks/{index}/logs",
+            get(super::task_array_api::local_logs_handler),
+        )
+        .route(
+            "/v1/batch/{id}/cancel",
+            post(super::task_array_api::cancel_handler),
+        )
+        .route(
+            "/v1/batch/{id}/results",
+            get(super::task_array_api::results_handler),
+        )
+        .route(
+            "/v1/batch/{id}/tasks/{index}/logs",
+            get(super::task_array_api::logs_handler),
+        )
         .route("/v1/build", post(super::build_runner::build_submit_handler))
         .route(
             "/v1/build/run",

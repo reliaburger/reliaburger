@@ -104,6 +104,7 @@ impl TestHarness {
             None,
             None,
             Some(status_reader),
+            None,
         );
         let server_shutdown = shutdown.clone();
 

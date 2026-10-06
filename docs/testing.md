@@ -64,11 +64,11 @@ ignored by default and run by their own targets and CI jobs
 |---|---|---|---|
 | Linux runtime | runc, user namespaces, eBPF service discovery, nftables, Btrfs, rootless runc | [`tests/owned_runc.rs`](../tests/owned_runc.rs), [`tests/ebpf.rs`](../tests/ebpf.rs), [`tests/owned_network.rs`](../tests/owned_network.rs), [`tests/owned_rootless.rs`](../tests/owned_rootless.rs) | `make test-linux` |
 | Crash recovery | Bun killed at every awkward moment: before adoption, mid-rollout, with owners alive | [`tests/oci_crash.rs`](../tests/oci_crash.rs), [`tests/job_recovery.rs`](../tests/job_recovery.rs), [`tests/registry_recovery.rs`](../tests/registry_recovery.rs), [`qualify-oci-interruptions.sh`](../scripts/release/qualify-oci-interruptions.sh) | `make test-linux` |
-| Multi-node clusters | Leader failover, council self-healing and full-loss recovery, placement, gossip | [`tests/cluster_failover.rs`](../tests/cluster_failover.rs), [`tests/council_self_healing.rs`](../tests/council_self_healing.rs), [`tests/council_disaster_recovery.rs`](../tests/council_disaster_recovery.rs), [`tests/placement.rs`](../tests/placement.rs) | `make test-cluster` |
+| Multi-node clusters | Leader failover, council self-healing and full-loss recovery, placement, gossip | [`tests/cluster_failover.rs`](../tests/cluster_failover.rs), [`tests/council_self_healing.rs`](../tests/council_self_healing.rs), [`tests/council_disaster_recovery.rs`](../tests/council_disaster_recovery.rs), [`tests/placement.rs`](../tests/placement.rs), [`tests/cluster_task_arrays.rs`](../tests/cluster_task_arrays.rs) | `make test-cluster` |
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
 | Standard registry clients | `crane` logs in, pushes and pulls through Pickle's TLS listener | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (needs `crane`) |
-| Benchmarks | Gossip convergence from 5 to 1,000 nodes, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large` |
+| Benchmarks | Gossip convergence from 5 to 1,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` |
 
 ### Who runs an ignored test
 
@@ -98,6 +98,13 @@ failed whole command cannot supply that evidence. The exact twenty reviewed
 legacy OCI mappings retain their original `make test-linux` declarations and
 receive evidence through the owned interruption driver; no other case gets an
 alias by resemblance.
+
+The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
+run through `make test-linux`, where the warmed digest-pinned mirror remains
+reachable. They do not run in the OCI interruption driver's isolated network
+namespace. Their exact identities and the worker-loss cluster case are recorded
+in the finite inventory. A repository check verifies complete ignored-test
+bindings and current fingerprints for the retained OCI aliases.
 
 Gates CI can't run are manual, so the evidence check skips them:
 
