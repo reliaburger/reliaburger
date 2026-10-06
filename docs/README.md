@@ -544,6 +544,20 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.tom
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
+Then keep a copy of the root CA that only you can open, sealed to a passphrase
+(or `--recipient` for your age key), and check it offline against the
+fingerprint `init` printed:
+
+```sh
+target/debug/relish ca backup --out prod-root-backup.age --dir cluster
+target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
+```
+
+The same file is what replaces an intermediate CA later:
+`relish ca rotate --role node --root-backup prod-root-backup.age` signs the
+cluster's new Node CA on your machine, and `--finalize` retires the old one
+once every node has moved (see the manual's security chapter).
+
 This is a one-node Raft cluster: clustered code paths are live, but it cannot
 survive a node failure. The API listens at `https://127.0.0.1:9117`. On macOS, use the [managed Linux VM quickstart](quickstart.md) for containers.
 
@@ -940,7 +954,17 @@ parallel (rarest layer first). Direct external pulls and Pickle upstream reads r
 and temporary gateway/service/server errors, refused or interrupted connections and
 stalled reads up to four attempts. Each HEAD/manifest/config attempt may take 30 seconds
 within a 2-minute total, and each layer attempt 120 seconds within 6 minutes; authentication,
-malformed responses and digest failures still fail. Operational constraints:
+malformed responses and digest failures still fail.
+
+Where the leader's runtime pulls images, every apply (manual, GitOps or
+standalone) binds each image tag to the digest it names then, storing
+`nginx:1.27@sha256:…`; `relish apply` prints each binding, and history,
+inspect, status and rollback carry the digest. An unreachable registry fails
+the apply unless the pull-through cache holds the tag (F03 U1, #361).
+`[[images.trust_policy.upstream]]` rules in `node.toml` (most specific `match`
+wins) with `upstream_default.allow = false` turn upstream registries into an
+allow-list, checked at apply and in Bun before every deploy (F03 U2).
+Operational constraints:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each
   other's registry URLs from gossip IPs plus the local port setting.
@@ -1373,6 +1397,14 @@ follower may briefly report the previous generation during rotation; fetch
 again and re-encrypt if that generation has been finalised before deployment.
 `relish test --filter secrets-config` checks actual container decryption and
 config-file mounting on a cluster with a container runtime.
+
+A namespace with `secret_key = true` in `[namespace.X]` gets its own key, and
+its values then decrypt only with that key. Fetch it with
+`GET /v1/secret/public-key?namespace=X` (`relish secret pubkey --namespace X`);
+a token scoped to other namespaces gets 403. Rotate it with
+`relish secret rotate [--finalize] --namespace X`, which takes an unscoped
+Admin. Until the master key is split, every node can still unwrap every
+namespace's key.
 
 ### OCI release qualification
 

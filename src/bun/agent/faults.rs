@@ -40,6 +40,10 @@ pub(super) struct InstalledNetworkFaults {
     /// Whoever answers for the fault that landed them finishes them first:
     /// an injection before it replies, any other reconcile from a task.
     pub(super) late_cuts: crate::smoker::network::LateCuts,
+    /// Callers the last caller read couldn't name a cgroup for before its
+    /// turn's deadline. A fault keyed by caller cgroup doesn't reach them
+    /// yet, so an injection waits for them before it answers (#625).
+    pub(super) pending_callers: Vec<super::fault_coverage::PendingCaller>,
 }
 
 /// Run the cuts a reconcile left in [`InstalledNetworkFaults::late_cuts`].
@@ -1046,9 +1050,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .retain(|id, _| live.iter().any(|(live_id, ..)| live_id == id));
 
         let mut callers = Vec::with_capacity(live.len());
+        let mut pending = Vec::new();
         // A caller whose cgroup the runtime doesn't name within the turn is
         // left out until a later reconcile asks again; the tick reconciles
-        // network faults every second.
+        // network faults every second. It's remembered as pending, so an
+        // injection doesn't report a fault in place that skipped it (#625).
         let deadline = self.turn_deadline();
         for (id, app, namespace, restarts) in live {
             let named_as_source = self.fault_registry.iter().any(|rule| {
@@ -1074,7 +1080,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         eprintln!("smoker: caller {id} has no provable cgroup: {error}");
                         None
                     }
-                    Err(_) => None,
+                    Err(_) => {
+                        pending.push(super::fault_coverage::PendingCaller {
+                            id: id.clone(),
+                            app: app.clone(),
+                            namespace: namespace.clone(),
+                            restarts,
+                        });
+                        None
+                    }
                 },
             };
             callers.push(LocalCaller {
@@ -1084,6 +1098,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 cgroup_id,
             });
         }
+        self.network_faults.pending_callers = pending;
         callers
     }
 

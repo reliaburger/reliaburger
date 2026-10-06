@@ -411,6 +411,7 @@ mod tests {
             gpu: Some(2),
             max_apps: Some(50),
             max_replicas: Some(200),
+            secret_key: false,
         };
         let quota = quota_from_spec("team", &spec);
         assert_eq!(quota.namespace, "team");
@@ -429,6 +430,7 @@ mod tests {
             gpu: None,
             max_apps: None,
             max_replicas: None,
+            secret_key: false,
         };
         assert_eq!(
             quota_from_spec("team", &spec).max_cpu_millicores,
@@ -447,6 +449,7 @@ mod tests {
                 gpu: None,
                 max_apps: None,
                 max_replicas: None,
+                secret_key: false,
             },
         );
         let mut ledger = ledger_from_namespaces(&namespaces);

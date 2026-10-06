@@ -432,6 +432,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// root CA and returns the digest-pinned reference (`repo@sha256:…`) the
     /// deploy must use, so the runtime pulls exactly the verified bytes — a
     /// tag can move between verify and pull (IMG1).
+    ///
+    /// An image from outside Pickle must pass the node's
+    /// `[[images.trust_policy.upstream]]` rules first (F03 U2). That check
+    /// runs where the runtime pulls images and a council holds the catalogue
+    /// that tells Pickle's images from everyone else's. A standalone node
+    /// has no such catalogue here; its apply checked the same rules against
+    /// its own registry, on this node, before the deploy began.
     pub(super) async fn enforce_image_signature(
         &self,
         spec: &AppSpec,
@@ -444,6 +451,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         image: Option<&str>,
     ) -> Result<Option<String>, String> {
+        self.enforce_upstream_rules(image).await?;
         if !self.trust_policy.require_signatures {
             return Ok(None);
         }
@@ -461,14 +469,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let catalog = council.manifest_catalog().await;
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
-        let root_ca = security_state
-            .get_ca(crate::sesame::types::CaRole::Root)
-            .map(|ca| ca.certificate_der.clone());
+        // Every root the council trusts (F04 R2): an image signed under one
+        // that's still trusted keeps verifying.
+        let trusted_roots: Vec<Vec<u8>> = security_state
+            .trusted_cas(crate::sesame::types::CaRole::Root)
+            .into_iter()
+            .map(|ca| ca.certificate_der.clone())
+            .collect();
         let verified = crate::meat::scheduler::verify_image_signature(
             image,
             &catalog,
             &self.trust_policy,
-            root_ca.as_deref(),
+            &trusted_roots,
             Some(&security_state.crl),
         )
         .map_err(|e| e.to_string())?;
@@ -480,8 +492,73 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
+    /// Refuse an upstream image the node's upstream rules don't allow (see
+    /// [`Self::enforce_image_signature`] for where this applies).
+    async fn enforce_upstream_rules(&self, image: Option<&str>) -> Result<(), String> {
+        // With the default `allow = true` no rule can refuse anything, so
+        // skip the catalogue read.
+        if self.trust_policy.upstream_default.allow {
+            return Ok(());
+        }
+        // A path is a root filesystem runc runs as it is; no registry holds it.
+        let Some(image) = image.filter(|image| crate::grill::image::looks_like_image_ref(image))
+        else {
+            return Ok(());
+        };
+        if self.supervisor.grill().runtime_kind() == crate::grill::records::RuntimeKind::Process {
+            return Ok(());
+        }
+        let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+            return Ok(());
+        };
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
+        let catalog = council.manifest_catalog().await;
+        if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_some() {
+            return Ok(());
+        }
+        crate::pickle::trust::check_upstream(&self.trust_policy, image).map_err(|e| e.to_string())
+    }
+
+    /// The cosign signature check `image` owes before it deploys, if its
+    /// upstream rule requires one (F03 U3). The caller runs it off the agent
+    /// loop: it fetches the `.sig` image.
+    ///
+    /// Paths, images under the process runtime and Pickle's own images owe
+    /// nothing, as with [`Self::enforce_upstream_rules`]. A standalone node,
+    /// with no cluster catalogue, checks every image its rules name.
+    pub(super) async fn cosign_check(
+        &self,
+        image: Option<&str>,
+    ) -> Option<crate::pickle::trust::CosignCheck> {
+        if !self
+            .trust_policy
+            .upstream
+            .iter()
+            .any(|rule| rule.require_signatures)
+        {
+            return None;
+        }
+        let image = image.filter(|image| crate::grill::image::looks_like_image_ref(image))?;
+        if self.supervisor.grill().runtime_kind() == crate::grill::records::RuntimeKind::Process {
+            return None;
+        }
+        if let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) {
+            // LOOP-INLINE: reads the local council state machine; no quorum round trip
+            let catalog = council.manifest_catalog().await;
+            if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_some() {
+                return None;
+            }
+        }
+        crate::pickle::trust::CosignCheck::for_image(
+            &self.trust_policy,
+            image,
+            self.signature_source.as_ref(),
+        )
+    }
+
     /// Every age identity that could decrypt this namespace's secrets, newest
-    /// generation first: the namespace-scoped keys then the cluster-wide keys.
+    /// generation first: the namespace's own keys once it has one, the
+    /// cluster-wide keys otherwise, never both (F05 I4).
     ///
     /// Returning all live generations (not just the active one) is what makes a
     /// secret survive a rotation window — a value encrypted under the retiring
@@ -499,17 +576,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
-
-        let ns_scope = crate::sesame::types::AgeKeyScope::Namespace(namespace.to_string());
-        security_state
-            .age_keypairs_for_scope(&ns_scope)
-            .into_iter()
-            .chain(
-                security_state
-                    .age_keypairs_for_scope(&crate::sesame::types::AgeKeyScope::ClusterWide),
-            )
-            .filter_map(|kp| crate::sesame::secret::unwrap_age_identity(kp, &ikm).ok())
-            .collect()
+        crate::sesame::secret::namespace_identities(&security_state, namespace, &ikm)
     }
 
     /// Build an OCI spec, decrypting `ENC[AGE:...]` env values with `identity`.

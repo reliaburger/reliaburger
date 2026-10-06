@@ -904,6 +904,43 @@ async fn pull_through_caches_once_then_serves_peers() {
     );
 }
 
+/// F03 U1: once applies bind every image, pulls ask for `nginx:v1@sha256:…`
+/// and never for the bare tag. The cache must still remember the tag, or
+/// an apply with upstream down could never bind from it (decision 2).
+#[tokio::test]
+async fn a_bound_pull_through_remembers_the_tag_for_binding_offline() {
+    use reliaburger::grill::image::ImageReference;
+    use reliaburger::pickle::binding::{BindSource, Binding, bind_image};
+    use reliaburger::pickle::upstream::{OciUpstream, UpstreamRegistry};
+
+    let (upstream, _) = Registry::start_counted(9).await;
+    push_test_image(&upstream.base_url(), "nginx", "v1").await;
+    let tagged = format!("{}/nginx:v1", upstream.addr);
+    let digest = OciUpstream::insecure_http(Default::default())
+        .head_manifest_digest(&ImageReference::parse(&tagged).unwrap())
+        .await
+        .unwrap();
+    let bound = ImageReference::parse(&format!("{tagged}@{}", digest.as_str())).unwrap();
+
+    let node = Registry::start(1, false).await;
+    cluster_source_with_upstream(&node)
+        .ensure_external_image_with_peers(&bound, &[])
+        .await
+        .unwrap()
+        .expect("pull-through should serve the bound image");
+
+    // Upstream is now unreachable: the binder has no registry to ask.
+    let catalog = node.state.catalog.read().await.clone();
+    let binding = bind_image(&tagged, &catalog, None).await.unwrap();
+    assert!(
+        matches!(
+            &binding,
+            Binding::Bound { digest: cached, source: BindSource::Cache, .. } if *cached == digest
+        ),
+        "{binding:?}"
+    );
+}
+
 /// D2: `pull_through = false` is a clean fall-through, not an error.
 #[tokio::test]
 async fn pull_through_disabled_is_a_fall_through() {
@@ -1264,5 +1301,197 @@ async fn pull_through_caches_every_platform_of_a_multi_platform_image() {
         upstream_hits.load(Ordering::SeqCst),
         hits,
         "cached platforms must not touch upstream"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cosign signatures (F03 U3, #361)
+// ---------------------------------------------------------------------------
+
+/// The image `cosign sign --key` signed for `tests/fixtures/cosign/`.
+const COSIGN_SIGNED_DIGEST: &str =
+    "sha256:5a90fa845f2397b0d429dd19ae5f64aaf0007eaea308c935e7cab63a8c820cce";
+
+fn cosign_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cosign")
+            .join(name),
+    )
+    .unwrap()
+}
+
+fn cosign_key(name: &str) -> reliaburger::pickle::cosign::CosignKey {
+    reliaburger::pickle::cosign::CosignKey::from_pem(
+        &String::from_utf8(cosign_fixture(name)).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Push blobs and then a manifest byte for byte, so its digest is cosign's.
+async fn push_raw(base_url: &str, repo: &str, tag: &str, blobs: &[Vec<u8>], manifest: Vec<u8>) {
+    let client = reqwest::Client::new();
+    for bytes in blobs {
+        let response = client
+            .post(format!(
+                "{base_url}/v2/{repo}/blobs/uploads/?digest={}",
+                compute_sha256(bytes).as_str()
+            ))
+            .body(bytes.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 201, "blob upload failed");
+    }
+    let media_type = serde_json::from_slice::<serde_json::Value>(&manifest).unwrap()["mediaType"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = client
+        .put(format!("{base_url}/v2/{repo}/manifests/{tag}"))
+        .header("Content-Type", media_type)
+        .body(manifest)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201, "manifest put failed");
+}
+
+/// An upstream registry holding the fixture image, its `.sig`, and an
+/// unsigned image, all in the `fixture` repository.
+async fn signed_upstream() -> (Registry, Arc<std::sync::atomic::AtomicUsize>) {
+    let (upstream, hits) = Registry::start_counted(9).await;
+    let base = upstream.base_url();
+    push_raw(
+        &base,
+        "fixture",
+        "v1",
+        &[
+            cosign_fixture("image-config.json"),
+            cosign_fixture("image-layer.tar.gz"),
+        ],
+        cosign_fixture("image-manifest.json"),
+    )
+    .await;
+    push_raw(
+        &base,
+        "fixture",
+        &format!(
+            "sha256-{}.sig",
+            COSIGN_SIGNED_DIGEST.trim_start_matches("sha256:")
+        ),
+        &[
+            cosign_fixture("signature-config.json"),
+            cosign_fixture("payload.json"),
+        ],
+        cosign_fixture("signature-manifest.json"),
+    )
+    .await;
+    push_test_image(&base, "fixture", "unsigned").await;
+    (upstream, hits)
+}
+
+async fn digest_of(registry: &Registry, repo: &str, tag: &str) -> Digest {
+    let catalog = registry.state.catalog.read().await;
+    catalog
+        .get_manifest_by_tag(repo, tag)
+        .unwrap()
+        .digest
+        .clone()
+}
+
+/// Real cosign output, served by a real registry, read over the OCI
+/// protocol: the signed image verifies, another key and an unsigned image
+/// don't.
+#[tokio::test]
+async fn cosign_signature_verifies_straight_from_the_registry() {
+    use reliaburger::grill::image::ImageReference;
+    use reliaburger::pickle::cosign::{CosignError, fetch_signature, verify_signature};
+
+    let (upstream, _) = signed_upstream().await;
+    let signed = Digest::new(COSIGN_SIGNED_DIGEST).unwrap();
+    assert_eq!(digest_of(&upstream, "fixture", "v1").await, signed);
+    let image = ImageReference::parse(&format!("{}/fixture:v1", upstream.addr)).unwrap();
+    let client = reliaburger::pickle::upstream::OciUpstream::insecure_http(Default::default());
+
+    let payloads = fetch_signature(&client, &image, &signed).await.unwrap();
+    verify_signature(&signed, &payloads, &[cosign_key("cosign.pub")]).unwrap();
+    assert!(matches!(
+        verify_signature(&signed, &payloads, &[cosign_key("other.pub")]),
+        Err(CosignError::NotVerified { .. })
+    ));
+
+    let unsigned = digest_of(&upstream, "fixture", "unsigned").await;
+    assert!(matches!(
+        fetch_signature(&client, &image, &unsigned).await,
+        Err(CosignError::SignatureUnavailable { .. })
+    ));
+}
+
+/// With the pull-through cache on, the signature is cached beside the image
+/// it signs: the first check asks upstream, the next one doesn't.
+#[tokio::test]
+async fn cosign_signature_is_read_through_the_pull_through_cache() {
+    use reliaburger::grill::image::ImageReference;
+    use reliaburger::pickle::cosign::{CosignError, signature_tag, verify_signature};
+    use std::sync::atomic::Ordering;
+
+    let (upstream, hits) = signed_upstream().await;
+    let signed = Digest::new(COSIGN_SIGNED_DIGEST).unwrap();
+    let image = ImageReference::parse(&format!("{}/fixture@{COSIGN_SIGNED_DIGEST}", upstream.addr))
+        .unwrap();
+
+    let node = Registry::start(1, false).await;
+    let source = cluster_source_with_upstream(&node);
+    // The signed image itself pulls through the cache, pinned by digest.
+    source
+        .ensure_external_image_with_peers(&image, &[])
+        .await
+        .unwrap()
+        .expect("the signed image pulls through the cache");
+
+    let payloads = source
+        .cosign_signature(&image, &signed)
+        .await
+        .unwrap()
+        .expect("the cache is on");
+    verify_signature(&signed, &payloads, &[cosign_key("cosign.pub")]).unwrap();
+    let cached_repo = format!("cache/{}/fixture", upstream.addr);
+    assert!(
+        node.state
+            .catalog
+            .read()
+            .await
+            .get_manifest_by_tag(&cached_repo, &signature_tag(&signed))
+            .is_some(),
+        "the .sig image is cached under {cached_repo}"
+    );
+
+    let after_first = hits.load(Ordering::SeqCst);
+    let again = source
+        .cosign_signature(&image, &signed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again, payloads);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        after_first,
+        "a fresh cached signature must not touch upstream"
+    );
+
+    let unsigned = digest_of(&upstream, "fixture", "unsigned").await;
+    assert!(matches!(
+        source.cosign_signature(&image, &unsigned).await,
+        Err(CosignError::SignatureUnavailable { .. })
+    ));
+
+    let mut off = cluster_source_with_upstream(&node);
+    off.pull_through = false;
+    assert!(
+        off.cosign_signature(&image, &signed)
+            .await
+            .unwrap()
+            .is_none()
     );
 }

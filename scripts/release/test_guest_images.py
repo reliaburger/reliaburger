@@ -59,6 +59,15 @@ class BuildScriptTests(unittest.TestCase):
         # zstd qcow2 clusters are unreadable to Lima 2.1.0.
         self.assertRegex(text, r"qemu-img convert -c -O qcow2 -o compression_type=zlib")
 
+    def test_image_leaves_the_clock_to_the_lima_guest_agent(self):
+        # Lima's guest agent sets the clock to the host's every 10 s and can't
+        # be turned off; timesyncd running beside it fought it, and the agent
+        # stepped the clock back every 10 s (#608).
+        text = BUILD.read_text()
+        disable = text.index("in_guest systemctl disable systemd-timesyncd.service")
+        self.assertLess(text.index("in_guest apt-get"), disable)
+        self.assertLess(disable, text.index("qemu-img convert -c"))
+
     def test_script_refuses_to_run_without_root(self):
         if os.geteuid() == 0:
             self.skipTest("running as root")

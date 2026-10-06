@@ -139,9 +139,14 @@ pub enum RaftRequest {
     AllocateSerial,
     /// Start a secret key rotation: add a new age keypair, mark the
     /// current one as read-only.
+    ///
+    /// A namespace's first key (F05 I4) carries `resealed`: the namespace's
+    /// stored values sealed again under the new key, applied in the same
+    /// entry. Every other rotation leaves it empty.
     RotateSecretKey {
         scope: crate::sesame::types::AgeKeyScope,
         new_keypair: crate::sesame::types::AgeKeypair,
+        resealed: Vec<crate::sesame::types::ResealedSecret>,
     },
     /// Finalise a secret key rotation: remove old read-only keypairs.
     FinalizeSecretRotation {
@@ -359,6 +364,40 @@ pub enum RaftRequest {
     },
     /// Admit an authenticated webhook before returning 202 to its provider.
     GitOpsSyncRequested { delivery: [u8; 32] },
+    /// Begin rotating an intermediate CA (F04 R1): `ca` becomes the role's
+    /// active CA and the current one retires, still trusted. One rotation
+    /// per role at a time; a retry of the same generation is a no-op. The
+    /// rules live in [`crate::sesame::ca_rotation::begin`].
+    CaRotationBegin {
+        role: crate::sesame::types::CaRole,
+        ca: Box<crate::sesame::types::CertificateAuthority>,
+    },
+    /// Finish rotating an intermediate CA: drop the retiring one, refused
+    /// while a live leaf could still chain to it. `now_unix_ms` is the
+    /// proposer's clock, carried in the log so every replica judges the
+    /// retiring window against the same instant.
+    CaRotationFinalize {
+        role: crate::sesame::types::CaRole,
+        now_unix_ms: u64,
+    },
+    /// Give an API token a new secret under the same name; the old secret
+    /// keeps working until the rotation's grace end (F05 I3). Refused for a
+    /// name that doesn't exist or belongs to a test lease.
+    RotateApiToken(crate::sesame::types::TokenRotation),
+    /// Hold a key the leader made for the role's next intermediate, and its
+    /// CSR, until the operator signs it with the root (F04 R4). Allocates the
+    /// certificate's serial and answers `SerialAllocated`. The rules live in
+    /// [`crate::sesame::ca_rotation::prepare`].
+    CaRotationPrepare {
+        role: crate::sesame::types::CaRole,
+        generation: u64,
+        csr_der: Vec<u8>,
+        private_key_wrapped: crate::sesame::types::WrappedKey,
+    },
+    /// A node has installed the trust set that includes Node CA
+    /// `generation` (F04 R4). The leader proposes it for the node that
+    /// authenticated the request.
+    AcknowledgeNodeTrust { node_id: String, generation: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -729,10 +768,19 @@ mod tests {
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH,
+                previous_secret: None,
             }),
             RaftRequest::RevokeApiToken {
                 name: "ci-deploy".to_string(),
             },
+            RaftRequest::RotateApiToken(crate::sesame::types::TokenRotation {
+                name: "ci-deploy".to_string(),
+                token_hash: vec![7, 8, 9],
+                token_salt: vec![1, 1, 1],
+                rotated_at: std::time::SystemTime::UNIX_EPOCH,
+                expires_at: None,
+                previous_valid_until: Some(std::time::SystemTime::UNIX_EPOCH),
+            }),
             RaftRequest::AllocateSerial,
         ];
 
@@ -754,6 +802,7 @@ mod tests {
                     gpu: Some(2),
                     max_apps: Some(50),
                     max_replicas: Some(200),
+                    secret_key: false,
                 }),
             },
             RaftRequest::NamespaceDelete {

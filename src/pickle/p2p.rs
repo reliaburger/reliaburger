@@ -558,6 +558,18 @@ impl ClusterSource {
         else {
             return Ok(None);
         };
+        // A pull of a reference bound at apply asks for the digest, but the
+        // next apply binds the tag. Remember the tag beside the digest, so
+        // an apply while upstream is down can bind from the cache (F03 U1).
+        // Only on a fresh fill: a cached digest is an older binding, and
+        // re-pulling it (a rollback) mustn't move the tag back.
+        if !cached
+            && let Some(tag) = &image.bound_tag
+            && let Err(error) =
+                super::api::record_commit(&self.state, root.clone(), tag.clone()).await
+        {
+            eprintln!("warning: pull-through cache could not record {cached_repo}:{tag}: {error}");
+        }
         self.materialise_for_architecture(
             &cached_repo,
             root,
@@ -568,6 +580,76 @@ impl ClusterSource {
         )
         .await
         .map(Some)
+    }
+
+    /// The cosign signature payloads for `image` at `digest`, read through
+    /// the pull-through cache: the `sha256-<hex>.sig` image is cached under
+    /// `cache/<host>/<repo>` like any other tag, so the cluster asks upstream
+    /// once and every node after that reads the cluster's copy.
+    ///
+    /// `Ok(None)` means the cache is off; the caller fetches the signature
+    /// straight from the registry with [`super::cosign::fetch_signature`].
+    pub async fn cosign_signature(
+        &self,
+        image: &crate::grill::image::ImageReference,
+        digest: &Digest,
+    ) -> Result<Option<Vec<super::cosign::SignedPayload>>, super::cosign::CosignError> {
+        use super::cosign::{CosignError, signature_layers, signature_reference};
+
+        let reference = signature_reference(image, digest);
+        let unavailable = |reason: String| CosignError::SignatureUnavailable {
+            reference: reference.full_reference(),
+            reason,
+        };
+        let malformed = |reason: String| CosignError::Malformed {
+            reference: reference.full_reference(),
+            reason,
+        };
+        // The signature image's config says `"architecture": ""`, which no
+        // platform check would pass, but a single manifest isn't platform
+        // checked: only an index picks a platform.
+        if self
+            .ensure_external_image(&reference)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let cached_repo = super::upstream::cached_repository(&reference);
+        let catalog = self
+            .state
+            .catalog_snapshot(&cached_repo)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
+        let manifest_digest = catalog
+            .get_manifest_by_tag(&cached_repo, &reference.tag)
+            .map(|manifest| manifest.digest.clone())
+            .ok_or_else(|| unavailable("the cache lost the signature image".to_string()))?;
+
+        // `ensure_external_image` made every blob local, the manifest's own
+        // included, so these are disk reads.
+        let store = self.state.store.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let manifest = store.read_blob(&manifest_digest)?;
+            let layers = match signature_layers(&manifest) {
+                Ok(layers) => layers,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            let mut payloads = Vec::new();
+            for layer in layers {
+                let bytes = store.read_blob(&layer.digest)?;
+                match layer.with_payload(bytes) {
+                    Ok(payload) => payloads.push(payload),
+                    Err(reason) => return Ok(Err(reason)),
+                }
+            }
+            Ok::<_, PickleError>(Ok(payloads))
+        })
+        .await
+        .map_err(|e| unavailable(format!("reading the cached signature failed: {e}")))?
+        .map_err(|e| unavailable(e.to_string()))?;
+        read.map(Some).map_err(malformed)
     }
 
     /// Cache what `image` names upstream under its tag: a single-platform
@@ -631,6 +713,7 @@ impl ClusterSource {
             registry: image.registry.clone(),
             repository: image.repository.clone(),
             tag: platform.as_str().to_string(),
+            bound_tag: None,
         };
         let manifest = upstream.fetch_manifest(&pinned).await?;
         if manifest.digest != *platform {

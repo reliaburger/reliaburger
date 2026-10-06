@@ -11,7 +11,7 @@ use super::crypto;
 use super::oidc;
 use super::secret;
 use super::types::{
-    AgeKeyScope, CertificateAuthority, NodeCertificate, SecurityState, SerialNumber,
+    AgeKeyScope, CertificateAuthority, NodeCertificate, NodeLeafRecord, SecurityState, SerialNumber,
 };
 
 /// Errors from cluster initialisation.
@@ -127,6 +127,18 @@ pub fn initialize_cluster(
         oidc_signing_config: Some(oidc_config),
         crl: super::types::Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
+        // The first node's leaf is signed here rather than through the
+        // council, so record it the way an allocation would, or finalising
+        // a Node CA rotation couldn't see it.
+        node_leaves: std::collections::BTreeMap::from([(
+            node_id.to_string(),
+            NodeLeafRecord {
+                serial,
+                ca_generation: 0,
+                trust_generation: 0,
+            },
+        )]),
+        pending_intermediates: Vec::new(),
     };
 
     Ok(InitResult {
@@ -144,10 +156,10 @@ pub fn initialize_cluster(
 pub fn format_init_output(result: &InitResult) -> String {
     let state = &result.security_state;
 
-    let root = state.get_ca(super::types::CaRole::Root).unwrap();
-    let node_ca = state.get_ca(super::types::CaRole::Node).unwrap();
-    let workload_ca = state.get_ca(super::types::CaRole::Workload).unwrap();
-    let ingress_ca = state.get_ca(super::types::CaRole::Ingress).unwrap();
+    let root = state.active_ca(super::types::CaRole::Root).unwrap();
+    let node_ca = state.active_ca(super::types::CaRole::Node).unwrap();
+    let workload_ca = state.active_ca(super::types::CaRole::Workload).unwrap();
+    let ingress_ca = state.active_ca(super::types::CaRole::Ingress).unwrap();
 
     format!(
         "Cluster initialised.\n\
@@ -191,10 +203,26 @@ mod tests {
         assert_eq!(state.certificate_authorities.len(), 4);
 
         use super::super::types::CaRole;
-        assert!(state.get_ca(CaRole::Root).is_some());
-        assert!(state.get_ca(CaRole::Node).is_some());
-        assert!(state.get_ca(CaRole::Workload).is_some());
-        assert!(state.get_ca(CaRole::Ingress).is_some());
+        assert!(state.active_ca(CaRole::Root).is_some());
+        assert!(state.active_ca(CaRole::Node).is_some());
+        assert!(state.active_ca(CaRole::Workload).is_some());
+        assert!(state.active_ca(CaRole::Ingress).is_some());
+    }
+
+    /// The first node's leaf never goes through the council, so init records
+    /// it, or a Node CA rotation could finalise under that node's feet.
+    #[test]
+    fn initialize_cluster_records_the_first_node_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = initialize_cluster("test", "node-01", dir.path()).unwrap();
+        assert_eq!(
+            result.security_state.node_leaves["node-01"],
+            NodeLeafRecord {
+                serial: result.node_certificate.serial,
+                ca_generation: 0,
+                trust_generation: 0,
+            }
+        );
     }
 
     #[test]
@@ -204,7 +232,7 @@ mod tests {
 
         let root = result
             .security_state
-            .get_ca(super::super::types::CaRole::Root)
+            .active_ca(super::super::types::CaRole::Root)
             .unwrap();
         assert!(root.private_key_wrapped.is_none());
     }
@@ -244,7 +272,7 @@ mod tests {
         // Verify the node cert chains to the Node CA
         let node_ca = result
             .security_state
-            .get_ca(super::super::types::CaRole::Node)
+            .active_ca(super::super::types::CaRole::Node)
             .unwrap();
         super::super::cert::verify_signature(&cert.certificate_der, &node_ca.certificate_der)
             .unwrap();

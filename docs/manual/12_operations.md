@@ -94,7 +94,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.5: incompatible binary: found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49. …
+refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58. …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -131,9 +131,12 @@ it before recording a run, with the message above
 And 0.1.4: protocol 34, state format still 49. A 0.1.3 cluster's leader
 refuses it the same way
 ([upgrading from 0.1.3](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-013)).
-And 0.1.5: protocol 40 and state format 57. A 0.1.4 cluster's leader refuses
+And 0.1.5: protocol 40 and state format 58. A 0.1.4 cluster's leader refuses
 it the same way
 ([upgrading from 0.1.4](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-014)).
+And 0.1.6: protocol 46 and state format 63. A 0.1.5 cluster's leader refuses
+it the same way
+([upgrading from 0.1.5](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-015)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -150,7 +153,7 @@ line says what it found and what it needs, so even a truncated journal line
 carries it:
 
 ```text
-incompatible state format: found 49; this binary (reliaburger v0.1.5 (465fdeb)) needs 57. Pre-1.0 builds don't migrate state: …
+incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: …
 ```
 
 A join between mismatched binaries fails the same way, starting
@@ -252,7 +255,9 @@ retain = 24                         # default
 
 The leader writes one every `interval_secs`, encrypted with a key derived from
 the cluster's master key. Volumes aren't in it; snapshot those separately (see
-`images-and-volumes`).
+`images-and-volumes`). Nor is the root CA's private key, which never enters the
+council: back that up yourself with `relish ca backup`, sealed to a passphrase
+or your own age key, and check it with `relish ca verify` (see `security`).
 
 If every voter is gone, stop a surviving node and recover it:
 

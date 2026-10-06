@@ -5830,6 +5830,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-partition_answers_only_once_every_source_instance_is_covered",
+          "binary": "reliaburger::ebpf",
+          "test": "partition_answers_only_once_every_source_instance_is_covered",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-egress_denied_by_default_allowed_when_listed",
           "binary": "reliaburger::ebpf",
           "test": "egress_denied_by_default_allowed_when_listed",
@@ -6839,6 +6850,17 @@
           "id": "legacy-ci-reliaburger-cluster_gossip-node_renewal_retries_directly_after_leader_failure_and_persists_the_new_leaf",
           "binary": "reliaburger::cluster_gossip",
           "test": "node_renewal_retries_directly_after_leader_failure_and_persists_the_new_leaf",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_gossip.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_gossip-rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing",
+          "binary": "reliaburger::cluster_gossip",
+          "test": "rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing",
           "requires": [
             "cluster-tests"
           ],

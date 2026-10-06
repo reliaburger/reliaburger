@@ -419,6 +419,40 @@ where
     }
 }
 
+/// Answer a trust-policy question once any cosign check it owes has run.
+///
+/// The loop has already judged everything it can see locally (`verdict`).
+/// A cosign check reads the `.sig` image over the network, so it runs on its
+/// own task with a deadline, and the loop moves on; the deploy worker waiting
+/// on `reply` is the only one that waits for it.
+pub(super) fn answer_after_cosign(
+    verdict: Result<Option<String>, String>,
+    check: Option<crate::pickle::trust::CosignCheck>,
+    reply: oneshot::Sender<Result<Option<String>, String>>,
+) {
+    let (Ok(pinned), Some(check)) = (&verdict, check) else {
+        let _ = reply.send(verdict);
+        return;
+    };
+    let pinned = pinned.clone();
+    let image = check.image().to_string();
+    tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(COSIGN_CHECK_TIMEOUT, check.run()).await {
+            Ok(Ok(())) => Ok(pinned),
+            Ok(Err(reason)) => Err(reason),
+            Err(_) => Err(format!(
+                "image {image}: the cosign signature check did not finish within {}s",
+                COSIGN_CHECK_TIMEOUT.as_secs()
+            )),
+        };
+        let _ = reply.send(outcome);
+    });
+}
+
+/// How long a deploy waits for an image's cosign signature to be fetched
+/// and verified before it refuses the image.
+pub(super) const COSIGN_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A handle a deploy task uses to ask the command loop to perform its
 /// authoritative `&mut self` steps. Each method sends a `DeployOp` and awaits
 /// the reply, so the loop stays the single owner of supervisor state.
@@ -1160,7 +1194,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
             }
             DeployOp::EnforceImageSignature { spec, reply } => {
-                let _ = reply.send(self.enforce_image_signature(&spec).await);
+                let verdict = self.enforce_image_signature(&spec).await;
+                let check = self.cosign_check(spec.image.as_deref()).await;
+                answer_after_cosign(verdict, check, reply);
             }
             DeployOp::StoreDeployedSpec {
                 app_name,
@@ -1263,10 +1299,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(result);
             }
             DeployOp::EnforceImageReference { image, reply } => {
-                let _ = reply.send(
-                    self.enforce_image_reference_signature(image.as_deref())
-                        .await,
-                );
+                let verdict = self
+                    .enforce_image_reference_signature(image.as_deref())
+                    .await;
+                let check = self.cosign_check(image.as_deref()).await;
+                answer_after_cosign(verdict, check, reply);
             }
             DeployOp::ConfirmJobSuccess {
                 instance_id,

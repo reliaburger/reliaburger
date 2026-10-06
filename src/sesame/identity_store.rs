@@ -11,7 +11,7 @@
 //! node.crt      # this node's certificate (PEM)
 //! node.key      # this node's private key (PEM, owner-only)
 //! node-ca.crt   # the Node CA that signed node.crt (PEM)
-//! root-ca.crt   # the cluster root CA — the trust anchor (PEM)
+//! root-ca.crt   # every root the node trusts (PEM bundle; one outside a rotation)
 //! meta.json     # exported node_id, serial, ca_generation, validity window
 //! node.bundle.json # authoritative complete identity (owner-only)
 //! bundle.committed # layout version, written last on initial installation
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use super::cert;
 use super::identity::{atomic_write, atomic_write_mode};
+use super::trust::TrustSet;
 use super::types::SerialNumber;
 
 /// Errors from reading or writing the identity directory.
@@ -55,8 +56,13 @@ pub struct NodeIdentity {
     pub ca_generation: u64,
     /// DER-encoded Node CA certificate (presented as the chain intermediate).
     pub node_ca_der: Vec<u8>,
-    /// DER-encoded root CA certificate (the trust anchor for peer checks).
+    /// DER-encoded root CA certificate this node's chain ends at. Its
+    /// fingerprint names the cluster.
     pub root_ca_der: Vec<u8>,
+    /// Every Node CA and root this node accepts from peers (F04 R2). It always
+    /// holds `node_ca_der` and `root_ca_der`; during a CA rotation it holds
+    /// the retiring CA too.
+    pub trust: TrustSet,
     /// Certificate validity start.
     pub not_before: SystemTime,
     /// Certificate validity end.
@@ -85,12 +91,13 @@ struct IdentityBundle {
     private_key_der: Vec<u8>,
     node_ca_der: Vec<u8>,
     root_ca_der: Vec<u8>,
+    trust: TrustSet,
 }
 
 impl IdentityBundle {
     fn from_identity(identity: &NodeIdentity) -> Self {
         Self {
-            schema: 2,
+            schema: 3,
             meta: IdentityMeta {
                 node_id: identity.node_id.clone(),
                 serial: identity.serial,
@@ -102,11 +109,12 @@ impl IdentityBundle {
             private_key_der: identity.private_key_der.clone(),
             node_ca_der: identity.node_ca_der.clone(),
             root_ca_der: identity.root_ca_der.clone(),
+            trust: identity.trust.clone(),
         }
     }
 
     fn into_identity(self) -> Result<NodeIdentity, IdentityStoreError> {
-        if self.schema != 2 {
+        if self.schema != 3 {
             return Err(inconsistent("unsupported identity snapshot schema"));
         }
         validate_identity(NodeIdentity {
@@ -119,6 +127,7 @@ impl IdentityBundle {
             private_key_der: self.private_key_der,
             node_ca_der: self.node_ca_der,
             root_ca_der: self.root_ca_der,
+            trust: self.trust,
         })
     }
 }
@@ -179,7 +188,14 @@ pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreErro
     let cert_pem = cert::der_to_pem(&identity.certificate_der, "CERTIFICATE");
     let key_pem = cert::der_to_pem(&identity.private_key_der, "PRIVATE KEY");
     let node_ca_pem = cert::der_to_pem(&identity.node_ca_der, "CERTIFICATE");
-    let root_ca_pem = cert::der_to_pem(&identity.root_ca_der, "CERTIFICATE");
+    // Every trusted root, so a client pointed at this file keeps verifying
+    // this node's API through a rotation.
+    let root_ca_pem: String = identity
+        .trust
+        .roots
+        .iter()
+        .map(|root| cert::der_to_pem(root, "CERTIFICATE"))
+        .collect();
 
     let meta = IdentityMeta {
         node_id: identity.node_id.clone(),
@@ -292,6 +308,17 @@ pub(crate) fn validate_identity(
     cert::check_issuer_binding(&identity.certificate_der, &identity.node_ca_der)
         .and_then(|()| cert::check_issuer_binding(&identity.node_ca_der, &identity.root_ca_der))
         .map_err(|error| inconsistent(error.to_string()))?;
+    identity
+        .trust
+        .validate()
+        .map_err(|error| inconsistent(error.to_string()))?;
+    if !identity.trust.trusts_node_ca(&identity.node_ca_der)
+        || !identity.trust.trusts_root(&identity.root_ca_der)
+    {
+        return Err(inconsistent(
+            "the identity's own Node CA and root are not in its trust set",
+        ));
+    }
     let (_, leaf) = x509_parser::certificate::X509Certificate::from_der(&identity.certificate_der)
         .map_err(|_| inconsistent("invalid node certificate"))?;
     let san = leaf
@@ -378,6 +405,10 @@ mod tests {
             private_key_der: key_der,
             serial,
             ca_generation: 0,
+            trust: crate::sesame::trust::TrustSet::single(
+                hierarchy.node.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
             node_ca_der: hierarchy.node.ca.certificate_der.clone(),
             root_ca_der: hierarchy.root.ca.certificate_der.clone(),
             not_before: now,

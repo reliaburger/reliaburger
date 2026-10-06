@@ -195,6 +195,7 @@ async fn manual_apply_and_gitops_converge_identically() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let target = manual_state.clone();

@@ -679,10 +679,10 @@ pub(super) fn node_identity_from_init(
     use crate::sesame::types::CaRole;
 
     let state = &init_result.security_state;
-    let node_ca = state.get_ca(CaRole::Node).ok_or_else(|| {
+    let node_ca = state.active_ca(CaRole::Node).ok_or_else(|| {
         RelishError::InitFailed("security state is missing the Node CA".to_string())
     })?;
-    let root_ca = state.get_ca(CaRole::Root).ok_or_else(|| {
+    let root_ca = state.active_ca(CaRole::Root).ok_or_else(|| {
         RelishError::InitFailed("security state is missing the root CA".to_string())
     })?;
 
@@ -693,6 +693,10 @@ pub(super) fn node_identity_from_init(
         private_key_der: cert.private_key_der.clone(),
         serial: cert.serial,
         ca_generation: cert.ca_generation,
+        trust: crate::sesame::trust::TrustSet::single(
+            node_ca.certificate_der.clone(),
+            root_ca.certificate_der.clone(),
+        ),
         node_ca_der: node_ca.certificate_der.clone(),
         root_ca_der: root_ca.certificate_der.clone(),
         not_before: cert.not_before,
@@ -833,7 +837,7 @@ pub async fn join(
              refusing to send the join token"
         )));
     }
-    let (node_ca_der, root_ca_der) = ca
+    let trust = ca
         .decode()
         .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
 
@@ -843,7 +847,7 @@ pub async fn join(
     // key cannot present such a chain, so the handshake fails before the token
     // leaves this node. `request_join` re-checks the pinned fingerprint against
     // the returned bundle as defence in depth.
-    let pinned_client = crate::sesame::mtls::build_ca_pinned_client(node_ca_der, root_ca_der)
+    let pinned_client = crate::sesame::mtls::build_ca_pinned_client(trust)
         .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
 
     let identity = crate::sesame::join::request_join(
@@ -1671,10 +1675,11 @@ fn format_memory(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// Rotate or finalise the cluster's secret encryption key.
-pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
+/// Rotate or finalise the cluster's secret encryption key, or one
+/// namespace's.
+pub async fn secret_rotate(finalize: bool, namespace: Option<&str>) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let result = client.secret_rotate(finalize).await?;
+    let result = client.secret_rotate(finalize, namespace).await?;
     println!("{result}");
     Ok(())
 }
@@ -1706,7 +1711,7 @@ pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
 /// `[images.trust_policy] keys` expects.
 pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
     let key = crate::pickle::signing::SigningKey::generate()?;
-    write_private_key(out, &key.to_pem())?;
+    write_private_key(out, key.to_pem().as_bytes())?;
     let public_key = key.public_key_base64();
     println!("wrote image signing key to {}", out.display());
     println!("public key: {public_key}");
@@ -1720,7 +1725,7 @@ pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
 }
 
 /// Write a private key, refusing to overwrite and keeping it owner-only.
-fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
+pub(crate) fn write_private_key(path: &Path, contents: &[u8]) -> Result<(), RelishError> {
     use std::io::Write as _;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1735,7 +1740,7 @@ fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
         },
         _ => RelishError::Io(e),
     })?;
-    file.write_all(pem.as_bytes())?;
+    file.write_all(contents)?;
     Ok(())
 }
 
@@ -2167,22 +2172,8 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
 /// The agent mints the token, stores its Argon2id hash in Raft, and
 /// returns the plaintext once; this prints it to stdout and never stores
 /// it. Needs a reachable agent and an admin credential.
-pub async fn token_create(
-    name: &str,
-    role_str: &str,
-    apps: Option<&str>,
-    namespaces: Option<&str>,
-    ttl_days: Option<u64>,
-) -> Result<(), RelishError> {
-    token_create_with_client(
-        name,
-        role_str,
-        apps,
-        namespaces,
-        ttl_days,
-        &BunClient::default_local(),
-    )
-    .await
+pub async fn token_create(request: &super::client::TokenRequest) -> Result<(), RelishError> {
+    token_create_with_client(request, &BunClient::default_local()).await
 }
 
 /// Create a token via the agent so it's persisted in Raft. The token is minted
@@ -2190,56 +2181,83 @@ pub async fn token_create(
 /// stdout. An unreachable agent is an error (never a silent exit-0), and the
 /// role is validated server-side.
 async fn token_create_with_client(
-    name: &str,
-    role_str: &str,
-    apps: Option<&str>,
-    namespaces: Option<&str>,
-    ttl_days: Option<u64>,
+    request: &super::client::TokenRequest,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let apps_vec = apps.map(|a| a.split(',').map(|s| s.trim().to_string()).collect());
-    let namespaces_vec = namespaces.map(|n| n.split(',').map(|s| s.trim().to_string()).collect());
+    let issued = client.token_create(request).await?;
 
-    let plaintext = client
-        .token_create(name, role_str, apps_vec, namespaces_vec, ttl_days)
-        .await?;
-
-    eprintln!("Token created: {name}");
-    eprintln!("  Role: {role_str}");
-    if let Some(apps) = apps {
-        eprintln!("  Apps: {apps}");
+    eprintln!("Token created: {}", request.name);
+    eprintln!("  Role: {}", request.role);
+    if let Some(apps) = &request.apps {
+        eprintln!("  Apps: {}", apps.join(","));
     }
-    if let Some(namespaces) = namespaces {
-        eprintln!("  Namespaces: {namespaces}");
+    if let Some(namespaces) = &request.namespaces {
+        eprintln!("  Namespaces: {}", namespaces.join(","));
     }
-    if let Some(days) = ttl_days {
-        eprintln!("  TTL: {days} days");
+    match issued.expires_at {
+        Some(at) => eprintln!("  Expires: {}", format_utc(at)),
+        None => eprintln!("  Expires: never"),
     }
     eprintln!();
-    println!("{plaintext}");
+    println!("{}", issued.token);
 
     Ok(())
 }
 
-/// Print the cluster's age public key, for encrypting `ENC[AGE:...]` values.
+/// Give an API token a new secret through the agent.
+///
+/// The new secret is printed to stdout once. The old one keeps working
+/// until the time printed on stderr, so clients can move over first.
+pub async fn token_rotate(name: &str, grace_hours: Option<u64>) -> Result<(), RelishError> {
+    token_rotate_with_client(name, grace_hours, &BunClient::default_local()).await
+}
+
+async fn token_rotate_with_client(
+    name: &str,
+    grace_hours: Option<u64>,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let issued = client.token_rotate(name, grace_hours).await?;
+
+    eprintln!("Token rotated: {name}");
+    match issued.previous_valid_until {
+        Some(at) => eprintln!("  Old secret works until: {}", format_utc(at)),
+        None => eprintln!("  Old secret: stopped working"),
+    }
+    match issued.expires_at {
+        Some(at) => eprintln!("  Expires: {}", format_utc(at)),
+        None => eprintln!("  Expires: never"),
+    }
+    eprintln!();
+    println!("{}", issued.token);
+
+    Ok(())
+}
+
+/// Print the cluster's age public key, or one namespace's, for encrypting
+/// `ENC[AGE:...]` values.
 ///
 /// With no directory, asks the configured cluster (`GET
 /// /v1/secret/public-key`) for its active key, so a quickstart user, or
 /// anyone after a rotation, gets the key that will actually decrypt. With
 /// a directory, reads the security bootstrap `relish init` wrote there,
-/// which works offline.
-pub async fn secret_pubkey(dir: Option<&Path>) -> Result<(), RelishError> {
+/// which works offline but only knows the cluster key. With a namespace,
+/// asks for that namespace's own key (F05 I4).
+pub async fn secret_pubkey(dir: Option<&Path>, namespace: Option<&str>) -> Result<(), RelishError> {
     let key = match dir {
         Some(dir) => resolve_secret_pubkey(dir)?,
-        None => fetch_secret_pubkey(&BunClient::default_local()).await?,
+        None => fetch_secret_pubkey(&BunClient::default_local(), namespace).await?,
     };
     println!("{key}");
     Ok(())
 }
 
-/// Ask the cluster for its active age public key.
-async fn fetch_secret_pubkey(client: &BunClient) -> Result<String, RelishError> {
-    Ok(client.secret_public_key().await?.public_key)
+/// Ask the cluster for its active age public key, or `namespace`'s.
+async fn fetch_secret_pubkey(
+    client: &BunClient,
+    namespace: Option<&str>,
+) -> Result<String, RelishError> {
+    Ok(client.secret_public_key(namespace).await?.public_key)
 }
 
 /// Find the `*-security-bootstrap.json` in `dir` and return its cluster-wide
@@ -2295,19 +2313,20 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
 /// List API tokens via the agent, with every node's last use merged in.
 pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
     let listing = BunClient::default_local().token_list().await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     // A member that didn't answer may hold a more recent use; say so on
-    // stderr so `-o json` stays parseable.
+    // stderr so `-o json` stays parseable. Expiry warnings go there too.
     for warning in &listing.warnings {
         eprintln!("warning: last use incomplete: {warning}");
     }
+    for warning in token_expiry_warnings(&listing.tokens, now) {
+        eprintln!("warning: {warning}");
+    }
     match output {
-        OutputFormat::Human => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            print!("{}", render_token_list(&listing.tokens, now));
-        }
+        OutputFormat::Human => print!("{}", render_token_list(&listing.tokens, now)),
         OutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&listing).map_err(RelishError::SerialiseJson)?
@@ -2318,6 +2337,30 @@ pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
         ),
     }
     Ok(())
+}
+
+/// One line per token that has expired, or expires within
+/// [`crate::sesame::token::TOKEN_EXPIRY_WARNING`] of `now`, saying what to do.
+fn token_expiry_warnings(tokens: &[super::client::TokenSummary], now: u64) -> Vec<String> {
+    let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
+    tokens
+        .iter()
+        .filter_map(|token| {
+            let at = token.expires_at.filter(|at| *at <= horizon)?;
+            let name = &token.name;
+            Some(if at <= now {
+                format!(
+                    "token {name} has expired; create a replacement, or rotate it with \
+                     `relish token rotate {name}` before the expiry sweep removes it"
+                )
+            } else {
+                format!(
+                    "token {name} expires in {}; rotate it with `relish token rotate {name}`",
+                    format_duration(at - now)
+                )
+            })
+        })
+        .collect()
 }
 
 /// The `relish token list` table: UTC creation and expiry times, with how
@@ -2789,17 +2832,22 @@ mod tests {
     #[tokio::test]
     async fn secret_pubkey_fetches_active_key_from_cluster() {
         use axum::{Router, http::HeaderMap, routing::get};
+        type Params = axum::extract::Query<std::collections::HashMap<String, String>>;
         let app = Router::new().route(
             "/v1/secret/public-key",
-            get(|headers: HeaderMap| async move {
+            get(|headers: HeaderMap, params: Params| async move {
                 // The command must send the usual bearer token.
                 let authorised = headers.get("authorization").and_then(|v| v.to_str().ok())
                     == Some("Bearer rbt_test");
                 if !authorised {
                     return Err(axum::http::StatusCode::UNAUTHORIZED);
                 }
+                let public_key = match params.get("namespace") {
+                    Some(namespace) => format!("age1{namespace}key"),
+                    None => "age1quickstartkey".to_string(),
+                };
                 Ok(axum::Json(serde_json::json!({
-                    "public_key": "age1quickstartkey",
+                    "public_key": public_key,
                     "generation": 2,
                 })))
             }),
@@ -2808,16 +2856,19 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{address}");
-        let key = fetch_secret_pubkey(&BunClient::new_with_token(&base, Some("rbt_test"))).await;
-        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None)).await;
+        let client = BunClient::new_with_token(&base, Some("rbt_test"));
+        let key = fetch_secret_pubkey(&client, None).await;
+        let team_a = fetch_secret_pubkey(&client, Some("team-a")).await;
+        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None), None).await;
         server.abort();
         assert_eq!(key.unwrap(), "age1quickstartkey");
+        assert_eq!(team_a.unwrap(), "age1team-akey");
         assert!(anonymous.is_err(), "an HTTP 401 must surface as an error");
     }
 
     #[tokio::test]
     async fn secret_pubkey_errors_when_cluster_unreachable() {
-        assert!(fetch_secret_pubkey(&bogus_client()).await.is_err());
+        assert!(fetch_secret_pubkey(&bogus_client(), None).await.is_err());
     }
 
     #[test]
@@ -2899,10 +2950,53 @@ mod tests {
         assert_eq!(render_token_list(&[], 0), "no tokens\n");
     }
 
+    #[test]
+    fn token_list_warns_about_tokens_expiring_within_fourteen_days() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
+        let now = 1_790_337_600;
+        let summary = |name: &str, expires_at: Option<u64>| TokenSummary {
+            name: name.to_string(),
+            role: "deployer".to_string(),
+            scope: TokenScopeSummary::default(),
+            created_at: now - 80 * 86_400,
+            expires_at,
+            last_used: None,
+        };
+        let tokens = [
+            summary("soon", Some(now + 3 * 86_400)),
+            summary("edge", Some(now + 14 * 86_400)),
+            summary("later", Some(now + 15 * 86_400)),
+            summary("forever", None),
+            summary("gone", Some(now - 60)),
+        ];
+        assert_eq!(
+            token_expiry_warnings(&tokens, now),
+            [
+                "token soon expires in 3d; rotate it with `relish token rotate soon`",
+                "token edge expires in 14d; rotate it with `relish token rotate edge`",
+                "token gone has expired; create a replacement, or rotate it with \
+                 `relish token rotate gone` before the expiry sweep removes it",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn token_create_errors_when_agent_unreachable() {
-        let result =
-            token_create_with_client("ci-bot", "deployer", None, None, None, &bogus_client()).await;
+        let request = super::super::client::TokenRequest {
+            name: "ci-bot".to_string(),
+            role: "deployer".to_string(),
+            apps: None,
+            namespaces: None,
+            lifetime: super::super::client::TokenLifetime::Default,
+            inherit_permissions: false,
+        };
+        let result = token_create_with_client(&request, &bogus_client()).await;
+        assert!(result.is_err(), "unreachable agent must be an error");
+    }
+
+    #[tokio::test]
+    async fn token_rotate_errors_when_agent_unreachable() {
+        let result = token_rotate_with_client("ci-bot", None, &bogus_client()).await;
         assert!(result.is_err(), "unreachable agent must be an error");
     }
 

@@ -253,6 +253,12 @@
   },
   {
     "source": "tests/cluster_gossip.rs",
+    "function": "rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
     "function": "leased_token_cleanup_survives_leader_failure_without_revoking_operator_tokens",
     "binary": "reliaburger::cluster_gossip",
     "test": "leased_token_cleanup_survives_leader_failure_without_revoking_operator_tokens"
@@ -382,6 +388,12 @@
     "function": "partition_fault_blocks_its_source_cgroup_and_clears",
     "binary": "reliaburger::ebpf",
     "test": "partition_fault_blocks_its_source_cgroup_and_clears"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "partition_answers_only_once_every_source_instance_is_covered",
+    "binary": "reliaburger::ebpf",
+    "test": "partition_answers_only_once_every_source_instance_is_covered"
   },
   {
     "source": "tests/ebpf.rs",

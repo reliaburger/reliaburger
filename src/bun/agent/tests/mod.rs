@@ -7,8 +7,10 @@ use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, tra
 use super::*;
 use crate::grill::mock::MockGrill;
 
+mod fault_coverage;
 mod loop_harness;
 mod loop_rule;
+mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
 mod upgrade_answer;
@@ -3207,6 +3209,7 @@ fn require_signatures_policy() -> crate::config::node::TrustPolicySection {
     crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![],
+        ..Default::default()
     }
 }
 
@@ -3856,6 +3859,7 @@ async fn relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key() 
     agent.set_trust_policy(crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![operator.public_key_base64()],
+        ..Default::default()
     });
 
     // Signed with the trusted key: admitted, pinned to the signed digest.
@@ -3892,6 +3896,7 @@ async fn moving_a_tag_after_signing_leaves_the_new_digest_unsigned() {
     agent.set_trust_policy(crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![operator.public_key_base64()],
+        ..Default::default()
     });
 
     // Someone re-pushes v1 with different bytes: the signature covered
@@ -3914,6 +3919,173 @@ async fn signing_a_digest_the_catalogue_does_not_hold_is_refused() {
         matches!(&result, Err(BunError::SecurityError { reason }) if reason.contains("refused")),
         "got: {result:?}"
     );
+}
+
+// --- upstream trust rules at deploy (F03 U2, #361) ---
+
+/// `[images.trust_policy]` allowing only Docker Hub's official images.
+fn official_images_only() -> crate::config::node::TrustPolicySection {
+    crate::config::node::TrustPolicySection {
+        upstream: vec![crate::config::node::UpstreamTrustRule {
+            pattern: "docker.io/library/*".to_string(),
+            require_signatures: false,
+            cosign_keys: vec![],
+        }],
+        upstream_default: crate::config::node::UpstreamDefault { allow: false },
+        ..Default::default()
+    }
+}
+
+/// A council-backed agent whose runtime pulls images, under `policy`.
+async fn pulling_agent(
+    raft_port: u16,
+    policy: crate::config::node::TrustPolicySection,
+) -> (Arc<CouncilNode>, BunAgent<MockGrill>) {
+    let council = catalogue_council(raft_port).await;
+    let mut agent = agent_with_council(council.clone());
+    agent
+        .supervisor
+        .grill()
+        .set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    agent.set_trust_policy(policy);
+    (council, agent)
+}
+
+/// Bun is the enforcement: an image the apply never judged (a spec already
+/// in Raft, a node with a stricter policy) is refused at deploy, by name.
+#[tokio::test]
+async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
+    let (_council, agent) = pulling_agent(9310, official_images_only()).await;
+    let refused = agent
+        .enforce_image_signature(&app("ghcr.io/evil/miner:1"))
+        .await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|reason| reason.contains("ghcr.io/evil/miner:1")),
+        "{refused:?}"
+    );
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let allowed = agent
+        .enforce_image_signature(&app(&format!("nginx:1.27@{digest}")))
+        .await;
+    assert_eq!(allowed, Ok(None));
+}
+
+/// The rules are for images from outside Pickle.
+#[tokio::test]
+async fn a_deploy_leaves_pickle_images_to_require_signatures() {
+    let (council, agent) = pulling_agent(9311, official_images_only()).await;
+    push_manifest(&council, "team/web", "v1", &"5".repeat(64)).await;
+    let result = agent
+        .enforce_image_signature(&app("localhost:5050/team/web:v1"))
+        .await;
+    assert_eq!(result, Ok(None));
+}
+
+/// Under ProcessGrill an image is a placeholder nobody pulls, so there's
+/// nothing for the upstream rules to judge (decision 5).
+#[tokio::test]
+async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
+    let council = catalogue_council(9312).await;
+    let mut agent = agent_with_council(council);
+    agent.set_trust_policy(official_images_only());
+    let result = agent
+        .enforce_image_signature(&app("proc-grill:image-ignored"))
+        .await;
+    assert_eq!(result, Ok(None));
+}
+
+// --- cosign signatures on upstream images at deploy (F03 U3, #361) ---
+
+/// A standalone agent whose runtime pulls images, requiring a cosign
+/// signature by `key` on `ghcr.io/acme/*`, reading signatures from the
+/// fixture registry (which holds the `.sig` for the fixture digest only).
+fn cosign_agent(key: &str) -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    agent.set_trust_policy(crate::config::node::TrustPolicySection {
+        upstream: vec![crate::config::node::UpstreamTrustRule {
+            pattern: "ghcr.io/acme/*".to_string(),
+            require_signatures: true,
+            cosign_keys: vec![key.to_string()],
+        }],
+        ..Default::default()
+    });
+    let registry: Arc<dyn crate::pickle::upstream::UpstreamRegistry> =
+        Arc::new(crate::pickle::cosign::fixture::FixtureRegistry { signed: true });
+    agent.set_signature_source(crate::pickle::cosign::SignatureSource::new(
+        registry.clone(),
+        registry,
+    ));
+    (agent, tx, shutdown)
+}
+
+fn web_config(image: &str) -> Config {
+    Config::parse(&format!("[app.web]\nimage = \"{image}\"\n")).unwrap()
+}
+
+/// Deploy `image` through the agent loop; the error event's message, if any.
+async fn deploy_refusal(key: &str, image: &str) -> Option<String> {
+    let (agent, tx, shutdown) = cosign_agent(key);
+    let handle = tokio::spawn(async move {
+        let mut agent = agent;
+        agent.run().await;
+    });
+    let events = send_deploy(&tx, web_config(image)).await;
+    shutdown.cancel();
+    let _ = handle.await;
+    events.into_iter().find_map(|event| match event {
+        ApplyEvent::Error { message } => Some(message),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn an_image_signed_by_a_trusted_cosign_key_deploys() {
+    use crate::pickle::cosign::fixture::{PUBLIC_KEY, SIGNED_DIGEST};
+    let image = format!("ghcr.io/acme/web:1.2@{SIGNED_DIGEST}");
+    assert_eq!(deploy_refusal(PUBLIC_KEY, &image).await, None);
+}
+
+#[tokio::test]
+async fn an_unsigned_image_is_refused_at_deploy_by_name() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    let image = format!("ghcr.io/acme/web:1.2@sha256:{}", "1".repeat(64));
+    let refusal = deploy_refusal(PUBLIC_KEY, &image).await.expect("refused");
+    assert!(refusal.contains(&image), "{refusal}");
+    assert!(refusal.contains("no cosign signature"), "{refusal}");
+}
+
+#[tokio::test]
+async fn an_image_signed_by_another_key_is_refused_at_deploy_by_name() {
+    use crate::pickle::cosign::fixture::{OTHER_KEY, SIGNED_DIGEST};
+    let image = format!("ghcr.io/acme/web:1.2@{SIGNED_DIGEST}");
+    let refusal = deploy_refusal(OTHER_KEY, &image).await.expect("refused");
+    assert!(refusal.contains(&image), "{refusal}");
+    assert!(
+        refusal.contains("verifies under the trusted keys"),
+        "{refusal}"
+    );
+}
+
+/// A signature covers a digest, so a tag the apply didn't bind can't be
+/// checked; the deploy says so rather than guess.
+#[tokio::test]
+async fn an_unbound_image_under_a_signature_rule_is_refused() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    let refusal = deploy_refusal(PUBLIC_KEY, "ghcr.io/acme/web:1.2")
+        .await
+        .expect("refused");
+    assert!(refusal.contains("ghcr.io/acme/web:1.2"), "{refusal}");
+    assert!(refusal.contains("isn't bound"), "{refusal}");
+}
+
+/// Images no signature rule names deploy as before.
+#[tokio::test]
+async fn an_image_outside_the_signature_rules_needs_no_signature() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    assert_eq!(deploy_refusal(PUBLIC_KEY, "nginx:1.27").await, None);
 }
 
 #[tokio::test]
@@ -9623,8 +9795,10 @@ fn write_test_identity(
         uri,
         cert_der,
         private_key_der,
-        &hierarchy.workload.ca.certificate_der,
-        &hierarchy.root.ca.certificate_der,
+        &[
+            hierarchy.workload.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ],
         "adopted-jwt".to_string(),
     );
     let dir = crate::sesame::identity::instance_identity_dir(volumes, instance);
@@ -12524,6 +12698,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
                 cert_der: issued.certificate_der.clone(),
                 workload_ca_cert_der: vec![1],
                 root_ca_cert_der: vec![2],
+                ca_bundle_der: vec![vec![1], vec![2]],
                 jwt_token: Some("jwt".into()),
             }),
         )

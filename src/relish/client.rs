@@ -57,6 +57,49 @@ pub struct TokenListing {
     pub warnings: Vec<String>,
 }
 
+/// How long a token being created should live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenLifetime {
+    /// The answering node's `[security.tokens] default_ttl` (90 days unless
+    /// configured); Admin tokens are exempt.
+    Default,
+    /// This many days (`--ttl-days`).
+    Days(u64),
+    /// No expiry (`--no-expiry`).
+    Never,
+}
+
+/// A token for `relish token create` to ask for.
+#[derive(Debug, Clone)]
+pub struct TokenRequest {
+    /// Token name.
+    pub name: String,
+    /// `admin`, `deployer` or `read-only`.
+    pub role: String,
+    /// The apps it is confined to, if any.
+    pub apps: Option<Vec<String>>,
+    /// The namespaces it is confined to, if any.
+    pub namespaces: Option<Vec<String>>,
+    /// How long it lives.
+    pub lifetime: TokenLifetime,
+    /// Take over the `[permission]` spec already keyed by this name.
+    pub inherit_permissions: bool,
+}
+
+/// A secret the cluster just issued, shown once.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct IssuedToken {
+    /// The plaintext secret.
+    pub token: String,
+    /// When it expires, Unix seconds; `None` for never.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// After a rotation, until when the old secret keeps working, Unix
+    /// seconds; `None` when it stopped at once (or for a new token).
+    #[serde(default)]
+    pub previous_valid_until: Option<u64>,
+}
+
 /// The build a Bun agent reports on `/v1/version`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct AgentVersion {
@@ -2185,19 +2228,21 @@ impl BunClient {
     }
 
     /// Create an API token via the agent (persisted in Raft). Returns the
-    /// plaintext, shown once.
-    pub async fn token_create(
-        &self,
-        name: &str,
-        role: &str,
-        apps: Option<Vec<String>>,
-        namespaces: Option<Vec<String>>,
-        ttl_days: Option<u64>,
-    ) -> Result<String, RelishError> {
-        self.create_token_request(serde_json::json!({
-            "name": name, "role": role, "apps": apps,
-            "namespaces": namespaces, "ttl_days": ttl_days,
-        }))
+    /// plaintext, shown once, and when it expires.
+    pub async fn token_create(&self, request: &TokenRequest) -> Result<IssuedToken, RelishError> {
+        let (ttl_days, no_expiry) = match request.lifetime {
+            TokenLifetime::Default => (None, false),
+            TokenLifetime::Days(days) => (Some(days), false),
+            TokenLifetime::Never => (None, true),
+        };
+        self.issue_token(
+            "/v1/token/create",
+            serde_json::json!({
+                "name": request.name, "role": request.role, "apps": request.apps,
+                "namespaces": request.namespaces, "ttl_days": ttl_days,
+                "no_expiry": no_expiry, "inherit_permissions": request.inherit_permissions,
+            }),
+        )
         .await
     }
 
@@ -2208,14 +2253,39 @@ impl BunClient {
         namespace: &str,
         lease_id: &str,
     ) -> Result<String, RelishError> {
-        self.create_token_request(serde_json::json!({
-            "name": name, "role": "deployer", "namespaces": [namespace], "lease_id": lease_id,
-        }))
+        let issued = self
+            .issue_token(
+                "/v1/token/create",
+                serde_json::json!({
+                    "name": name, "role": "deployer", "namespaces": [namespace], "lease_id": lease_id,
+                }),
+            )
+            .await?;
+        Ok(issued.token)
+    }
+
+    /// Give an API token a new secret (`POST /v1/token/rotate`). The old
+    /// secret keeps working for `grace_hours` (the server's 24 unless
+    /// given; 0 ends it at once).
+    pub async fn token_rotate(
+        &self,
+        name: &str,
+        grace_hours: Option<u64>,
+    ) -> Result<IssuedToken, RelishError> {
+        self.issue_token(
+            "/v1/token/rotate",
+            serde_json::json!({ "name": name, "grace_hours": grace_hours }),
+        )
         .await
     }
 
-    async fn create_token_request(&self, body: serde_json::Value) -> Result<String, RelishError> {
-        let url = format!("{}/v1/token/create", self.base_url);
+    /// POST `body` to a route that answers with a freshly issued secret.
+    async fn issue_token(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<IssuedToken, RelishError> {
+        let url = format!("{}{path}", self.base_url);
         let response = self
             .http()?
             .post(&url)
@@ -2230,16 +2300,12 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-        json["token"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| RelishError::ApiError {
+        response
+            .json::<IssuedToken>()
+            .await
+            .map_err(|e| RelishError::ApiError {
                 status: 0,
-                body: "response missing token".to_string(),
+                body: format!("failed to parse response: {e}"),
             })
     }
 
@@ -2305,20 +2371,32 @@ impl BunClient {
             })
     }
 
-    /// Fetch the active public recipient without accessing cluster key files.
+    /// Fetch the active public recipient without accessing cluster key files:
+    /// the cluster's, or `namespace`'s own key (F05 I4).
     pub async fn secret_public_key(
         &self,
+        namespace: Option<&str>,
     ) -> Result<crate::sesame::types::SecretPublicKey, RelishError> {
-        self.get_typed_json("/v1/secret/public-key").await
+        self.get_typed_json(&secret_public_key_path(namespace))
+            .await
     }
 
-    /// Rotate or finalise the secret encryption key.
-    pub async fn secret_rotate(&self, finalize: bool) -> Result<String, RelishError> {
+    /// Rotate or finalise a secret encryption key: the cluster's, or
+    /// `namespace`'s own.
+    pub async fn secret_rotate(
+        &self,
+        finalize: bool,
+        namespace: Option<&str>,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/secret/rotate", self.base_url);
+        let mut body = serde_json::json!({ "finalize": finalize });
+        if let Some(namespace) = namespace {
+            body["namespace"] = serde_json::Value::from(namespace);
+        }
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "finalize": finalize }))
+            .json(&body)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2496,6 +2574,57 @@ impl BunClient {
         Ok(response["upgrade_id"].as_str().unwrap_or("?").to_string())
     }
 
+    /// Ask the council for a CSR for `role`'s next intermediate (F04 R4).
+    pub async fn ca_rotation_prepare(
+        &self,
+        role: crate::sesame::types::CaRole,
+    ) -> Result<crate::sesame::ca_rotation::PreparedRotation, RelishError> {
+        let body = serde_json::to_string(&crate::sesame::ca_rotation::RotationRole { role })
+            .map_err(|e| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to encode request: {e}"),
+            })?;
+        let response = self.post_json("/v1/ca/rotation/prepare", body).await?;
+        serde_json::from_value(response).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse the prepared rotation: {e}"),
+        })
+    }
+
+    /// Send the root-signed certificate and begin the rotation. Returns the
+    /// council's message.
+    pub async fn ca_rotation_begin(
+        &self,
+        signed: &crate::sesame::ca_rotation::SignedIntermediate,
+    ) -> Result<String, RelishError> {
+        let body = serde_json::to_string(signed).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to encode request: {e}"),
+        })?;
+        let response = self.post_json("/v1/ca/rotation/begin", body).await?;
+        Ok(response["message"]
+            .as_str()
+            .unwrap_or("rotation begun")
+            .to_string())
+    }
+
+    /// Retire the old CA of `role`. Returns the council's message.
+    pub async fn ca_rotation_finalize(
+        &self,
+        role: crate::sesame::types::CaRole,
+    ) -> Result<String, RelishError> {
+        let body = serde_json::to_string(&crate::sesame::ca_rotation::RotationRole { role })
+            .map_err(|e| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to encode request: {e}"),
+            })?;
+        let response = self.post_json("/v1/ca/rotation/finalize", body).await?;
+        Ok(response["message"]
+            .as_str()
+            .unwrap_or("rotation finalised")
+            .to_string())
+    }
+
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}{path}", self.base_url);
         let response = self
@@ -2537,10 +2666,36 @@ impl BunClient {
     }
 }
 
+/// The public-key route, for the cluster or one namespace. The namespace
+/// is encoded, so a name carrying `&` can't add a query parameter.
+fn secret_public_key_path(namespace: Option<&str>) -> String {
+    match namespace {
+        Some(namespace) => {
+            let value: String =
+                url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
+            format!("/v1/secret/public-key?namespace={value}")
+        }
+        None => "/v1/secret/public-key".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn the_public_key_path_names_an_encoded_namespace() {
+        assert_eq!(secret_public_key_path(None), "/v1/secret/public-key");
+        assert_eq!(
+            secret_public_key_path(Some("team-a")),
+            "/v1/secret/public-key?namespace=team-a"
+        );
+        assert_eq!(
+            secret_public_key_path(Some("a&b")),
+            "/v1/secret/public-key?namespace=a%26b"
+        );
+    }
 
     #[test]
     fn explicit_ca_constructor_refuses_invalid_trust_material() {
@@ -2920,6 +3075,10 @@ mod tests {
             private_key_der: key_der,
             serial,
             ca_generation: 0,
+            trust: crate::sesame::trust::TrustSet::single(
+                hierarchy.node.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
             node_ca_der: hierarchy.node.ca.certificate_der.clone(),
             root_ca_der: hierarchy.root.ca.certificate_der.clone(),
             not_before: now,

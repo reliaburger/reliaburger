@@ -28,6 +28,12 @@ permissions:
 # Caches: GitHub keeps 10 GB per repository. Jobs that build the same profile
 # share one key, and only pushes to main save, even when tests fail. PRs,
 # stacked or not, restore main's cache instead of evicting each other's.
+# Release trains don't save either. rust-cache keys on the toolchain, the
+# environment and Cargo.lock plus Cargo.toml (minus versions), so a train PR
+# whose dependencies match main's gets a full hit, and one that changed them
+# restores main's and rebuilds only the changed crates. The workspace crate
+# itself, most of each job's compile time, is never cached. Saving from trains
+# would need a push run per train merge and another ~5 GB of cache.
 # Debug builds keep line tables only: backtraces still name files and lines,
 # and each target cache is roughly half the size, so they all fit.
 # Artefacts: reports are kept 14 days; release candidates keep their 90.
@@ -539,8 +545,10 @@ jobs:
           cache-on-failure: true
       - name: Clear restored execution envelopes
         run: rm -rf -- target/contracts
-      - name: Lint every target, with all features and with none
-        run: make lint
+      # One pass, all features: the macOS-only code is in it, and the lint
+      # job runs the no-features pass on Linux (see lint-macos in Makefile).
+      - name: Lint every target, with all features
+        run: make lint-macos
       - name: Portable tests
         id: portable_darwin
         run: |

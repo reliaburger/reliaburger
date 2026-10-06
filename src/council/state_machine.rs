@@ -1006,8 +1006,14 @@ impl StateMachineInner {
                     });
                 }
                 token.consumed = true;
+                let node_id = token.node_id.clone();
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
+                crate::sesame::ca_rotation::record_node_leaf(
+                    &mut self.state.security_state,
+                    &node_id,
+                    serial,
+                );
                 return Some(CouncilResponse::JoinTokenConsumed { serial });
             }
             RaftRequest::CreateApiToken(token) => {
@@ -1053,6 +1059,29 @@ impl StateMachineInner {
                     .api_tokens
                     .retain(|t| t.name != *name);
             }
+            RaftRequest::RotateApiToken(rotation) => {
+                // A leased test token's cleanup matches it by its hash, so a
+                // rotation would orphan it; those stay with their lease.
+                // Unlike a revoke, a rotation may touch the last Admin: the
+                // store keeps the same Admin, only its secret changes.
+                if rotation.name.starts_with("rbtest-") {
+                    return Some(CouncilResponse::Refused {
+                        reason: "test-lease tokens can't be rotated".into(),
+                    });
+                }
+                let Some(token) = self
+                    .state
+                    .security_state
+                    .api_tokens
+                    .iter_mut()
+                    .find(|token| token.name == rotation.name)
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("no API token named {:?}", rotation.name),
+                    });
+                };
+                crate::sesame::token::apply_rotation(token, rotation);
+            }
             RaftRequest::SweepExpiredApiTokens { now_unix_ms } => {
                 // The entry carries the leader's clock, so replicas never
                 // consult their own: all of them remove the same tokens.
@@ -1074,7 +1103,11 @@ impl StateMachineInner {
                 self.state.security_state.next_serial += 1;
                 return Some(CouncilResponse::SerialAllocated { serial });
             }
-            RaftRequest::RotateSecretKey { scope, new_keypair } => {
+            RaftRequest::RotateSecretKey {
+                scope,
+                new_keypair,
+                resealed,
+            } => {
                 // Idempotent retry of the *same* rotation (deduped on the
                 // new generation number): keep the first-applied keypair,
                 // change nothing.
@@ -1104,6 +1137,17 @@ impl StateMachineInner {
                             .to_string(),
                     });
                 }
+                let first_key = !self
+                    .state
+                    .security_state
+                    .age_keypairs
+                    .iter()
+                    .any(|kp| kp.scope == *scope);
+                if !resealed.is_empty()
+                    && let Err(reason) = self.check_reseal(scope, first_key, resealed)
+                {
+                    return Some(CouncilResponse::Refused { reason });
+                }
                 // Mark existing keypairs with the same scope as read-only
                 for kp in &mut self.state.security_state.age_keypairs {
                     if kp.scope == *scope {
@@ -1115,6 +1159,9 @@ impl StateMachineInner {
                     .security_state
                     .age_keypairs
                     .push(new_keypair.clone());
+                if first_key && let AgeKeyScope::Namespace(namespace) = scope {
+                    self.adopt_namespace_key(namespace, resealed);
+                }
             }
             RaftRequest::FinalizeSecretRotation { scope } => {
                 // Retire the old (read-only) keys for this scope, but only if an
@@ -2051,7 +2098,74 @@ impl StateMachineInner {
                 }
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
+                crate::sesame::ca_rotation::record_node_leaf(
+                    &mut self.state.security_state,
+                    node_id,
+                    serial,
+                );
                 return Some(CouncilResponse::SerialAllocated { serial });
+            }
+            RaftRequest::CaRotationBegin { role, ca } => {
+                return match crate::sesame::ca_rotation::begin(
+                    &mut self.state.security_state,
+                    *role,
+                    ca,
+                ) {
+                    Ok(_) => None,
+                    Err(error) => Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    }),
+                };
+            }
+            RaftRequest::CaRotationPrepare {
+                role,
+                generation,
+                csr_der,
+                private_key_wrapped,
+            } => {
+                return Some(
+                    match crate::sesame::ca_rotation::prepare(
+                        &mut self.state.security_state,
+                        *role,
+                        *generation,
+                        csr_der.clone(),
+                        private_key_wrapped.clone(),
+                    ) {
+                        Ok(serial) => CouncilResponse::SerialAllocated { serial: serial.0 },
+                        Err(error) => CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        },
+                    },
+                );
+            }
+            RaftRequest::AcknowledgeNodeTrust {
+                node_id,
+                generation,
+            } => {
+                return match crate::sesame::ca_rotation::acknowledge_trust(
+                    &mut self.state.security_state,
+                    node_id,
+                    *generation,
+                ) {
+                    Ok(()) => None,
+                    Err(error) => Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    }),
+                };
+            }
+            RaftRequest::CaRotationFinalize { role, now_unix_ms } => {
+                let now = std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_millis(*now_unix_ms);
+                return match crate::sesame::ca_rotation::finalize(
+                    &mut self.state.security_state,
+                    *role,
+                    now,
+                ) {
+                    Ok(()) => None,
+                    Err(error) => Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    }),
+                };
             }
             RaftRequest::TestLeasePlacementRetired {
                 lease_id,
@@ -2227,6 +2341,81 @@ impl StateMachineInner {
             ns_scope
         } else {
             AgeKeyScope::ClusterWide
+        }
+    }
+
+    /// Whether `resealed` may ride on this rotation (F05 I4): only a
+    /// namespace's first key re-seals, only its own apps' values, and only
+    /// values still exactly as the leader read them. An apply that landed
+    /// in between makes the whole entry stale; the leader tries again.
+    fn check_reseal(
+        &self,
+        scope: &AgeKeyScope,
+        first_key: bool,
+        resealed: &[crate::sesame::types::ResealedSecret],
+    ) -> Result<(), String> {
+        let AgeKeyScope::Namespace(namespace) = scope else {
+            return Err("only a namespace's first secret key re-seals stored values".to_string());
+        };
+        if !first_key {
+            return Err(format!(
+                "namespace {namespace} already has a secret key; only its first key re-seals \
+                 stored values"
+            ));
+        }
+        for entry in resealed {
+            let name = format!("{}/{}", entry.app_id, entry.env_key);
+            if entry.app_id.namespace != *namespace {
+                return Err(format!(
+                    "cannot re-seal {name} under namespace {namespace}'s key: \
+                     it belongs to another namespace"
+                ));
+            }
+            if !crate::sesame::secret::is_encrypted(&entry.sealed) {
+                return Err(format!("re-sealed value for {name} is not ENC[AGE:...]"));
+            }
+            let current = self
+                .state
+                .apps
+                .get(&entry.app_id)
+                .and_then(|spec| spec.env.get(&entry.env_key));
+            let unchanged = current.is_some_and(|value| {
+                value.is_encrypted() && value.as_str() == entry.previous.as_str()
+            });
+            if !unchanged {
+                return Err(format!(
+                    "stale re-seal: {name} changed after the leader read it"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Switch `namespace` to its first key: write the re-sealed values and
+    /// record every app's seals under the namespace scope, which is now
+    /// its effective one (F05 I4).
+    fn adopt_namespace_key(
+        &mut self,
+        namespace: &str,
+        resealed: &[crate::sesame::types::ResealedSecret],
+    ) {
+        for entry in resealed {
+            if let Some(spec) = self.state.apps.get_mut(&entry.app_id) {
+                spec.env.insert(
+                    entry.env_key.clone(),
+                    crate::config::EnvValue::Encrypted(entry.sealed.clone()),
+                );
+            }
+        }
+        let in_namespace: Vec<(crate::meat::types::AppId, crate::config::app::AppSpec)> = self
+            .state
+            .apps
+            .iter()
+            .filter(|(app_id, _)| app_id.namespace == namespace)
+            .map(|(app_id, spec)| (app_id.clone(), spec.clone()))
+            .collect();
+        for (app_id, spec) in &in_namespace {
+            self.record_secret_seals(app_id, spec);
         }
     }
 
@@ -5336,6 +5525,7 @@ mod tests {
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH,
+                previous_secret: None,
             }],
             next_serial: 900,
             ..Default::default()
@@ -5406,6 +5596,191 @@ mod tests {
         assert_eq!(remaining, [(0, true), (2, false)]);
     }
 
+    /// F04 R1 through the log: a Node CA rotation begins, a second one is
+    /// refused, finalise is refused while a node still holds a leaf from the
+    /// retiring CA, and goes through once that node's renewal is allocated.
+    #[test]
+    fn ca_rotation_through_the_log_waits_for_every_node_leaf() {
+        use crate::sesame::types::{CaRole, CertificateAuthority, SerialNumber};
+        let mut inner = StateMachineInner::default();
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
+        inner.state.security_state = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![
+                CertificateAuthority {
+                    private_key_wrapped: None,
+                    ..hierarchy.root.ca.clone()
+                },
+                hierarchy.node.ca.clone(),
+            ],
+            next_serial: 10,
+            ..Default::default()
+        };
+        // node-a joins under generation 0.
+        inner
+            .state
+            .security_state
+            .join_tokens
+            .push(crate::sesame::types::JoinToken {
+                token_hash: [9; 32],
+                node_id: "node-a".into(),
+                expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+                consumed: false,
+                attestation_mode: crate::sesame::types::AttestationMode::None,
+            });
+        inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: [9; 32],
+        });
+        assert_eq!(
+            inner.state.security_state.node_leaves["node-a"].ca_generation,
+            0
+        );
+
+        let successor = |generation| {
+            let generated = crate::sesame::ca::generate_intermediate_ca(
+                CaRole::Node,
+                "rotate",
+                SerialNumber(50 + generation),
+                hierarchy.root.ca.serial,
+                &hierarchy.root.signing_keypair,
+                &hierarchy.root.certificate_params,
+                &[4; 32],
+            )
+            .unwrap();
+            Box::new(CertificateAuthority {
+                generation,
+                ..generated.ca
+            })
+        };
+        let new_ca = successor(1);
+        let begin = inner.apply_request(&RaftRequest::CaRotationBegin {
+            role: CaRole::Node,
+            ca: new_ca.clone(),
+        });
+        assert_eq!(begin, None);
+        assert_eq!(
+            inner
+                .state
+                .security_state
+                .active_ca(CaRole::Node)
+                .unwrap()
+                .generation,
+            1
+        );
+        let stacked = inner.apply_request(&RaftRequest::CaRotationBegin {
+            role: CaRole::Node,
+            ca: successor(2),
+        });
+        assert!(matches!(stacked, Some(CouncilResponse::Refused { .. })));
+
+        let now_unix_ms = new_ca
+            .not_before
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        let early = inner.apply_request(&RaftRequest::CaRotationFinalize {
+            role: CaRole::Node,
+            now_unix_ms,
+        });
+        let Some(CouncilResponse::Refused { reason }) = early else {
+            panic!("finalise must be refused while node-a holds an old leaf: {early:?}");
+        };
+        assert!(reason.contains("node-a"), "{reason}");
+
+        // F04 R4: node-a says it trusts the new CA, then renews onto it.
+        assert_eq!(
+            inner.apply_request(&RaftRequest::AcknowledgeNodeTrust {
+                node_id: "node-a".into(),
+                generation: 1,
+            }),
+            None
+        );
+        let still_old_leaf = inner.apply_request(&RaftRequest::CaRotationFinalize {
+            role: CaRole::Node,
+            now_unix_ms,
+        });
+        assert!(
+            matches!(&still_old_leaf, Some(CouncilResponse::Refused { reason }) if reason.contains("leaves from the retiring CA")),
+            "{still_old_leaf:?}"
+        );
+        inner.apply_request(&RaftRequest::AllocateNodeSerial {
+            node_id: "node-a".into(),
+        });
+        let done = inner.apply_request(&RaftRequest::CaRotationFinalize {
+            role: CaRole::Node,
+            now_unix_ms,
+        });
+        assert_eq!(done, None);
+        assert_eq!(
+            inner.state.security_state.trusted_cas(CaRole::Node).len(),
+            1
+        );
+    }
+
+    /// F04 R4 through the log: prepare allocates the serial the operator's
+    /// certificate must carry and answers with it, a prepare during a
+    /// rotation is refused, and so is an acknowledgement from a node the
+    /// council has no leaf for.
+    #[test]
+    fn ca_rotation_prepare_and_trust_acknowledgements_through_the_log() {
+        use crate::sesame::types::{CaRole, CertificateAuthority};
+        let mut inner = StateMachineInner::default();
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
+        inner.state.security_state = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![
+                CertificateAuthority {
+                    private_key_wrapped: None,
+                    ..hierarchy.root.ca.clone()
+                },
+                hierarchy.node.ca.clone(),
+            ],
+            next_serial: 10,
+            ..Default::default()
+        };
+        let (csr_der, private_key_wrapped) =
+            crate::sesame::ca::create_intermediate_csr(CaRole::Node, &[4; 32]).unwrap();
+        let prepare = RaftRequest::CaRotationPrepare {
+            role: CaRole::Node,
+            generation: 1,
+            csr_der,
+            private_key_wrapped,
+        };
+        assert_eq!(
+            inner.apply_request(&prepare),
+            Some(CouncilResponse::SerialAllocated { serial: 10 })
+        );
+        assert_eq!(inner.state.security_state.pending_intermediates.len(), 1);
+
+        let stranger = inner.apply_request(&RaftRequest::AcknowledgeNodeTrust {
+            node_id: "stranger".into(),
+            generation: 0,
+        });
+        assert!(matches!(stranger, Some(CouncilResponse::Refused { .. })));
+
+        let generated = crate::sesame::ca::generate_intermediate_ca(
+            CaRole::Node,
+            "rotate",
+            crate::sesame::types::SerialNumber(50),
+            hierarchy.root.ca.serial,
+            &hierarchy.root.signing_keypair,
+            &hierarchy.root.certificate_params,
+            &[4; 32],
+        )
+        .unwrap();
+        inner.apply_request(&RaftRequest::CaRotationBegin {
+            role: CaRole::Node,
+            ca: Box::new(CertificateAuthority {
+                generation: 1,
+                ..generated.ca
+            }),
+        });
+        assert!(inner.state.security_state.pending_intermediates.is_empty());
+        assert!(matches!(
+            inner.apply_request(&prepare),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
     /// Only the cluster-wide generation-0 key opens the root CA backup; a
     /// namespace's old keys are retired as before.
     #[test]
@@ -5433,6 +5808,236 @@ mod tests {
         assert_eq!(remaining, [1]);
     }
 
+    fn app_with_secret(value: &str) -> crate::config::app::AppSpec {
+        toml::from_str(&format!(
+            "image = \"web:v1\"\n[env]\nDB_PASSWORD = \"{value}\"\nMODE = \"plain\"\n"
+        ))
+        .unwrap()
+    }
+
+    fn reseal(app: &AppId, previous: &str, sealed: &str) -> crate::sesame::types::ResealedSecret {
+        crate::sesame::types::ResealedSecret {
+            app_id: app.clone(),
+            env_key: "DB_PASSWORD".to_string(),
+            previous: previous.to_string(),
+            sealed: sealed.to_string(),
+        }
+    }
+
+    /// A state with the cluster key at generation 0 and one app with a
+    /// cluster-sealed value in each of team-a and team-b.
+    fn two_tenant_state() -> (StateMachineInner, AppId, AppId) {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
+        let web = AppId::new("web", "team-a");
+        let api = AppId::new("api", "team-b");
+        for (app, value) in [(&web, "ENC[AGE:a-old]"), (&api, "ENC[AGE:b-old]")] {
+            inner.apply_request(&RaftRequest::AppSpec {
+                app_id: app.clone(),
+                spec: Box::new(app_with_secret(value)),
+            });
+        }
+        (inner, web, api)
+    }
+
+    #[test]
+    fn a_namespaces_first_key_reseals_its_values_in_the_same_entry() {
+        use crate::sesame::types::AgeKeyScope;
+        let (mut inner, web, api) = two_tenant_state();
+        let team_a = AgeKeyScope::Namespace("team-a".into());
+
+        let response = inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: team_a.clone(),
+            new_keypair: test_age_keypair(team_a.clone(), 0, false),
+            resealed: vec![reseal(&web, "ENC[AGE:a-old]", "ENC[AGE:a-new]")],
+        });
+
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert_eq!(
+            inner.state.apps[&web].env["DB_PASSWORD"].as_str(),
+            "ENC[AGE:a-new]"
+        );
+        assert_eq!(inner.state.apps[&web].env["MODE"].as_str(), "plain");
+        assert_eq!(
+            inner.state.apps[&api].env["DB_PASSWORD"].as_str(),
+            "ENC[AGE:b-old]",
+            "another namespace's values are untouched"
+        );
+        let seal = &inner.state.security_state.secret_seals["team-a/web/DB_PASSWORD"];
+        assert_eq!((&seal.scope, seal.generation), (&team_a, 0));
+        assert!(
+            inner
+                .state
+                .security_state
+                .age_keypairs
+                .iter()
+                .all(|kp| !kp.read_only),
+            "a namespace's first key starts no cluster rotation"
+        );
+    }
+
+    #[test]
+    fn a_stale_reseal_is_refused_and_creates_no_key() {
+        use crate::sesame::types::AgeKeyScope;
+        let (mut inner, web, _) = two_tenant_state();
+        // An apply landed after the leader read the value.
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(app_with_secret("ENC[AGE:a-reapplied]")),
+        });
+        let team_a = AgeKeyScope::Namespace("team-a".into());
+
+        let response = inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: team_a.clone(),
+            new_keypair: test_age_keypair(team_a, 0, false),
+            resealed: vec![reseal(&web, "ENC[AGE:a-old]", "ENC[AGE:a-new]")],
+        });
+
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { ref reason }) if reason.contains("stale")),
+            "{response:?}"
+        );
+        assert!(!inner.state.security_state.has_namespace_key("team-a"));
+        assert_eq!(
+            inner.state.apps[&web].env["DB_PASSWORD"].as_str(),
+            "ENC[AGE:a-reapplied]"
+        );
+    }
+
+    #[test]
+    fn a_namespace_key_cannot_reseal_another_namespaces_values() {
+        use crate::sesame::types::AgeKeyScope;
+        let (mut inner, _, api) = two_tenant_state();
+        let team_a = AgeKeyScope::Namespace("team-a".into());
+
+        let response = inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: team_a.clone(),
+            new_keypair: test_age_keypair(team_a, 0, false),
+            resealed: vec![reseal(&api, "ENC[AGE:b-old]", "ENC[AGE:stolen]")],
+        });
+
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert_eq!(
+            inner.state.apps[&api].env["DB_PASSWORD"].as_str(),
+            "ENC[AGE:b-old]"
+        );
+        assert!(!inner.state.security_state.has_namespace_key("team-a"));
+    }
+
+    #[test]
+    fn only_a_namespaces_first_key_reseals() {
+        use crate::sesame::types::AgeKeyScope;
+        let (mut inner, web, _) = two_tenant_state();
+        let team_a = AgeKeyScope::Namespace("team-a".into());
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: team_a.clone(),
+            new_keypair: test_age_keypair(team_a.clone(), 0, false),
+            resealed: Vec::new(),
+        });
+
+        for scope in [team_a.clone(), AgeKeyScope::ClusterWide] {
+            let response = inner.apply_request(&RaftRequest::RotateSecretKey {
+                scope: scope.clone(),
+                new_keypair: test_age_keypair(scope.clone(), 1, false),
+                resealed: vec![reseal(&web, "ENC[AGE:a-old]", "ENC[AGE:a-new]")],
+            });
+            assert!(
+                matches!(response, Some(CouncilResponse::Refused { .. })),
+                "{scope:?}: {response:?}"
+            );
+        }
+        assert_eq!(
+            inner.state.apps[&web].env["DB_PASSWORD"].as_str(),
+            "ENC[AGE:a-old]"
+        );
+    }
+
+    /// A namespace's rotation and finalise touch only its own keys: the
+    /// cluster scope neither rotates with it nor waits for its secrets.
+    #[test]
+    fn namespace_rotation_and_finalise_leave_the_cluster_scope_alone() {
+        use crate::sesame::types::AgeKeyScope;
+        let (mut inner, web, _) = two_tenant_state();
+        let team_a = AgeKeyScope::Namespace("team-a".into());
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: team_a.clone(),
+            new_keypair: test_age_keypair(team_a.clone(), 0, false),
+            resealed: vec![reseal(&web, "ENC[AGE:a-old]", "ENC[AGE:a-gen0]")],
+        });
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: team_a.clone(),
+            new_keypair: test_age_keypair(team_a.clone(), 1, false),
+            resealed: Vec::new(),
+        });
+        let cluster_read_only = |inner: &StateMachineInner| {
+            inner
+                .state
+                .security_state
+                .age_keypairs
+                .iter()
+                .filter(|kp| kp.scope == AgeKeyScope::ClusterWide)
+                .any(|kp| kp.read_only)
+        };
+        assert!(!cluster_read_only(&inner));
+
+        // team-a's value is still under generation 0: finalise waits.
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: team_a.clone(),
+        });
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { ref reason })
+                if reason.contains("team-a/web/DB_PASSWORD") && !reason.contains("team-b")),
+            "{response:?}"
+        );
+
+        // Re-applied under generation 1, it no longer blocks.
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(app_with_secret("ENC[AGE:a-gen1]")),
+        });
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: team_a.clone(),
+        });
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        let left: Vec<(AgeKeyScope, u64)> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| (kp.scope.clone(), kp.generation))
+            .collect();
+        assert_eq!(left, [(AgeKeyScope::ClusterWide, 0), (team_a, 1)]);
+
+        // A cluster rotation waits only for the cluster-sealed team-b value.
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+            resealed: Vec::new(),
+        });
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { ref reason })
+                if reason.contains("team-b/api/DB_PASSWORD") && !reason.contains("team-a")),
+            "{response:?}"
+        );
+    }
+
     /// F04 R0: `relish init` seals the root CA's private key to the cluster's
     /// generation-0 age key, in `<cluster>-root-ca.age`. Finalising a secret
     /// rotation used to drop that key, after which nothing the cluster holds
@@ -5455,6 +6060,7 @@ mod tests {
         inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: next,
+            resealed: Vec::new(),
         });
         let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
             scope: AgeKeyScope::ClusterWide,
@@ -5545,6 +6151,7 @@ mod tests {
         inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+            resealed: Vec::new(),
         });
 
         let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
@@ -5584,6 +6191,7 @@ mod tests {
         inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+            resealed: Vec::new(),
         });
 
         // The re-encrypt step: the spec is re-applied, which re-records
@@ -5624,11 +6232,13 @@ mod tests {
         inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+            resealed: Vec::new(),
         });
 
         let response = inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 2, false),
+            resealed: Vec::new(),
         });
 
         let Some(CouncilResponse::Refused { reason }) = response else {
@@ -5659,11 +6269,13 @@ mod tests {
         inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+            resealed: Vec::new(),
         });
 
         let response = inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+            resealed: Vec::new(),
         });
 
         assert!(
@@ -5698,6 +6310,7 @@ mod tests {
         inner.apply_request(&RaftRequest::RotateSecretKey {
             scope: AgeKeyScope::ClusterWide,
             new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+            resealed: Vec::new(),
         });
         let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
             scope: AgeKeyScope::ClusterWide,
@@ -5915,6 +6528,7 @@ mod tests {
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
+            previous_secret: None,
         };
         inner.apply_request(&RaftRequest::CreateApiToken(token));
         assert_eq!(inner.state.security_state.api_tokens.len(), 1);
@@ -5932,6 +6546,7 @@ mod tests {
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
+            previous_secret: None,
         };
         inner.apply_request(&RaftRequest::CreateApiToken(token));
         assert_eq!(inner.state.security_state.api_tokens.len(), 1);
@@ -5956,6 +6571,7 @@ mod tests {
             expires_at: expires_unix_ms
                 .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
             created_at: std::time::UNIX_EPOCH,
+            previous_secret: None,
         }
     }
 
@@ -6094,6 +6710,7 @@ mod tests {
             scope: TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
+            previous_secret: None,
         };
 
         let mut inner = StateMachineInner::default();
@@ -6152,6 +6769,90 @@ mod tests {
             .map(|t| t.name.clone())
             .collect();
         assert_eq!(admins, vec!["admin-b".to_string()]);
+    }
+
+    fn rotation_for(name: &str, hash: u8) -> crate::sesame::types::TokenRotation {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        crate::sesame::types::TokenRotation {
+            name: name.to_string(),
+            token_hash: vec![hash; 3],
+            token_salt: vec![hash; 3],
+            rotated_at: now,
+            expires_at: None,
+            previous_valid_until: Some(now + std::time::Duration::from_secs(3_600)),
+        }
+    }
+
+    #[test]
+    fn rotate_replaces_the_secret_and_keeps_the_name_role_and_scope() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        let scope = TokenScope {
+            apps: Some(vec!["web".into()]),
+            namespaces: None,
+        };
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
+            name: "ci".to_string(),
+            token_hash: vec![1, 2, 3],
+            token_salt: vec![4, 5, 6],
+            role: ApiRole::Deployer,
+            scope: scope.clone(),
+            expires_at: None,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        }));
+
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for("ci", 9)));
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        let token = &inner.state.security_state.api_tokens[0];
+        assert_eq!(token.name, "ci");
+        assert_eq!(token.role, ApiRole::Deployer);
+        assert_eq!(token.scope, scope);
+        assert_eq!(token.token_hash, vec![9; 3]);
+        let previous = token.previous_secret.as_ref().unwrap();
+        assert_eq!(previous.token_hash, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rotate_is_allowed_for_the_last_admin() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
+            name: "root".to_string(),
+            token_hash: vec![1, 2, 3],
+            token_salt: vec![4, 5, 6],
+            role: ApiRole::Admin,
+            scope: TokenScope::default(),
+            expires_at: None,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        }));
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for("root", 7)));
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        let tokens = &inner.state.security_state.api_tokens;
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].role, ApiRole::Admin);
+        assert_eq!(tokens[0].token_hash, vec![7; 3]);
+    }
+
+    #[test]
+    fn rotate_refuses_an_unknown_name_and_a_leased_test_token() {
+        let mut inner = StateMachineInner::default();
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for("ghost", 1)));
+        assert!(matches!(response, Some(CouncilResponse::Refused { .. })));
+
+        inner.state.security_state.api_tokens.push(leased_token());
+        let name = inner.state.security_state.api_tokens[0].name.clone();
+        let before = inner.state.security_state.api_tokens[0].clone();
+        let response = inner.apply_request(&RaftRequest::RotateApiToken(rotation_for(&name, 1)));
+        assert!(matches!(response, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(inner.state.security_state.api_tokens[0], before);
     }
 
     #[test]
@@ -6995,6 +7696,7 @@ mod tests {
                 std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(100),
             ),
             created_at: std::time::SystemTime::UNIX_EPOCH,
+            previous_secret: None,
         }
     }
 
@@ -7544,6 +8246,7 @@ mod tests {
                             gpu: None,
                             max_apps: Some(1),
                             max_replicas: None,
+                            secret_key: false,
                         }),
                     },
                 ),
@@ -7641,6 +8344,7 @@ mod tests {
                             gpu: None,
                             max_apps: Some(1),
                             max_replicas: None,
+                            secret_key: false,
                         }),
                     },
                 ),

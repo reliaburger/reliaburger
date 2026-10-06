@@ -161,10 +161,15 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish token create --name <NAME>`: Create a new API token
   - `relish token list`: List all API tokens with their scope, expiry and last use
   - `relish token revoke <NAME>`: Revoke an API token by name
+  - `relish token rotate <NAME>`: Give a token a new secret under the same name. The old secret keeps working for the grace period, then stops
 - `relish secret`: Manage secrets (encrypt values for use in app configs)
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
   - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
+- `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
+  - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
+  - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
+  - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 
@@ -241,6 +246,8 @@ Nodes join with single-use tokens and certificate signing requests.
 Certificates renew themselves. Secrets live in your config encrypted to the
 cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
+Every apply binds image tags to digests, so a moved tag can't change what runs,
+and node config can limit which upstream registries images may come from.
 
 **A registry on every node.** Pickle is an OCI registry built into the cluster.
 Push once and nodes pull layers from each other. It also caches upstream

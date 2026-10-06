@@ -111,6 +111,10 @@ council, so any node gives the same answer. Raise the budget, or shrink or
 delete other apps in the namespace, and the next scheduling pass (a few seconds
 later) places the app and clears the reason.
 
+A `[namespace]` block can also give the namespace its own secret key with
+`secret_key = true`, so its encrypted values don't decrypt anywhere else. See
+"A key per namespace" in the security chapter.
+
 ## The everyday loop
 
 ```sh

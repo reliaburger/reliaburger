@@ -25,8 +25,8 @@ pub(super) async fn cluster_ca_handler(State(state): State<ApiState>) -> Respons
     };
     let security = council.security_state().await;
     let (Some(node_ca), Some(root_ca)) = (
-        security.get_ca(crate::sesame::types::CaRole::Node),
-        security.get_ca(crate::sesame::types::CaRole::Root),
+        security.active_ca(crate::sesame::types::CaRole::Node),
+        security.active_ca(crate::sesame::types::CaRole::Root),
     ) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -35,10 +35,18 @@ pub(super) async fn cluster_ca_handler(State(state): State<ApiState>) -> Respons
             .into_response();
     };
     let encoder = base64::engine::general_purpose::STANDARD;
+    // During a Node CA rotation a member may still present a leaf from the
+    // retiring CA, so the joiner pins every trusted one (F04 R2).
+    let trusted_node_cas: Vec<String> = security
+        .trusted_cas(crate::sesame::types::CaRole::Node)
+        .iter()
+        .map(|ca| encoder.encode(&ca.certificate_der))
+        .collect();
     Json(serde_json::json!({
         "compatibility": crate::compatibility::CURRENT,
         "node_ca_b64": encoder.encode(&node_ca.certificate_der),
         "root_ca_b64": encoder.encode(&root_ca.certificate_der),
+        "trusted_node_cas_b64": trusted_node_cas,
     }))
     .into_response()
 }
@@ -89,6 +97,55 @@ pub(super) async fn node_renewal_handler(
                 .into_response()
         }
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "node renewal timed out").into_response(),
+    }
+}
+
+/// A node acknowledges the council's trust set (F04 R4). Node-to-node only,
+/// authenticated by the node's own TLS client certificate like renewal.
+pub(super) async fn node_trust_ack_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(request): Json<crate::sesame::renewal::TrustAcknowledgement>,
+) -> Response {
+    use crate::sesame::renewal::{RenewalError, acknowledge_trust};
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "a trust acknowledgement requires a TLS client certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        acknowledge_trust(council, &peer, &request),
+    )
+    .await
+    {
+        Ok(Ok(generation)) => Json(serde_json::json!({ "generation": generation })).into_response(),
+        Ok(Err(error)) => {
+            let status = match &error {
+                RenewalError::Identity(_) => StatusCode::FORBIDDEN,
+                RenewalError::Request(_) => StatusCode::CONFLICT,
+                RenewalError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "trust acknowledgement timed out",
+        )
+            .into_response(),
     }
 }
 

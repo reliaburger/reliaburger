@@ -54,6 +54,14 @@ image download time also depends on your connection. The VMs don't install
 anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
 `~/.reliaburger/lima`, isolated from your normal Lima configuration.
 
+Each VM takes its time from your Mac. Lima's guest agent sets the guest clock
+to the host's whenever the two drift more than 100 ms apart, checking every
+10 s, so the guests catch up within seconds after the laptop wakes from sleep
+and don't need to reach an NTP server. That makes Lima the guests' only clock
+source: the guest image ships with systemd-timesyncd disabled, and
+provisioning disables it on a stock Ubuntu image. With both running, they
+fought, and the guest clock jumped back about 0.1 s every 10 s.
+
 For a smaller single-node cluster:
 
 ```sh

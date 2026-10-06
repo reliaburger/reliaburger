@@ -23,6 +23,7 @@ mod api_tokens;
 mod app_metrics;
 mod batch;
 mod bun_auth_startup;
+mod ca_trust_rotation;
 mod compatibility;
 mod council_persistence;
 mod council_snapshot_install;

@@ -186,6 +186,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Cluster + upgrade.
     // Renewal additionally requires the existing node TLS peer certificate.
     route(Post, "/v1/cluster/renew", System),
+    // As does a trust acknowledgement (F04 R4).
+    route(Post, "/v1/cluster/trust-ack", System),
     route(Post, "/v1/cluster/workload-csr", System),
     route(Post, "/v1/registry/propose", System),
     route(Post, "/v1/registry/query", System),
@@ -298,9 +300,15 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // node fan-out asking a peer for its last-use times (F05 I2).
     gated(Get, "/v1/token/list", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/token/rotate", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
     route(Get, "/v1/secret/public-key", AnyToken),
     gated(Post, "/v1/secret/rotate", Admin, Cluster(SECRET_WRITE)),
+    // Rotating an intermediate CA (F04 R4): the operator's root signs, so
+    // only an unscoped Admin may start, submit or finalise one.
+    gated(Post, "/v1/ca/rotation/prepare", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/ca/rotation/begin", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/ca/rotation/finalize", Admin, Cluster(ADMIN)),
 ];
 
 /// Look up the principal a `(method, path)` requires, if the matrix
@@ -352,6 +360,7 @@ mod tests {
     fn node_to_node_routes_require_the_system_principal() {
         for path in [
             "/v1/cluster/renew",
+            "/v1/cluster/trust-ack",
             "/v1/batch/run",
             "/v1/batch/{id}/report",
             "/v1/build/run",
@@ -505,6 +514,7 @@ mod tests {
     const API_ROUTE_MODULES: &[&str] = &[
         include_str!("api/apply.rs"),
         include_str!("api/apps.rs"),
+        include_str!("api/ca.rs"),
         include_str!("api/deploys.rs"),
         include_str!("api/discovery.rs"),
         include_str!("api/faults.rs"),
@@ -871,6 +881,7 @@ mod tests {
         for handler in [
             "token_create_handler",
             "token_revoke_handler",
+            "token_rotate_handler",
             "join_token_create_handler",
             "secret_rotate_handler",
         ] {

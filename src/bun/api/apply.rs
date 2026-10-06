@@ -1,6 +1,44 @@
 //! The apply route, and its forwarding to the council leader.
 
 use super::*;
+use crate::pickle::binding::{AppliedBinding, BindError, ImageBinder};
+
+/// Bind `config`'s images before the request is answered, for the paths
+/// that must know the bound config before their stream starts (a
+/// standalone deploy, a cluster apply with jobs). A refusal is the HTTP
+/// response: 400 for a reference that doesn't parse, 403 for an image the
+/// node's upstream trust rules refuse, 502 when the registry couldn't name a
+/// digest and the cache doesn't hold the tag.
+#[allow(clippy::result_large_err)]
+pub(super) async fn bind_images(
+    state: &ApiState,
+    binder: &ImageBinder,
+    config: &mut Config,
+) -> Result<Vec<AppliedBinding>, Response> {
+    let catalog = binding_catalog(state).await;
+    binder.bind_config(config, &catalog).await.map_err(|error| {
+        let status = match error {
+            BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
+            BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
+            BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
+        };
+        (
+            status,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response()
+    })
+}
+
+/// The catalogue a binding resolves Pickle images against: the council's,
+/// which every node shares, or this node's own when it runs standalone.
+async fn binding_catalog(state: &ApiState) -> ManifestCatalog {
+    match (&state.council, &state.pickle_catalog) {
+        (Some(council), _) => council.manifest_catalog().await,
+        (None, Some(catalog)) => catalog.read().await.clone(),
+        (None, None) => ManifestCatalog::default(),
+    }
+}
 
 /// Deploy workloads, streaming progress via SSE.
 ///
@@ -12,6 +50,7 @@ pub(super) const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
 pub(super) async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
+    binder: Option<axum::Extension<ImageBinder>>,
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: String,
@@ -369,6 +408,7 @@ pub(super) async fn apply_handler(
             lease_id,
             headers,
             capacity_admission.map(|extension| extension.0),
+            binder.map(|extension| extension.0),
         )
         .await;
     }
@@ -379,6 +419,17 @@ pub(super) async fn apply_handler(
         )
             .into_response();
     }
+
+    // A standalone node binds here, before its agent deploys, so a single
+    // node gets the same guarantee as a cluster: restarts run the bytes the
+    // apply resolved.
+    let bindings = match &binder {
+        Some(axum::Extension(binder)) => match bind_images(&state, binder, &mut config).await {
+            Ok(bindings) => bindings,
+            Err(response) => return response,
+        },
+        None => Vec::new(),
+    };
 
     let lease_operation = if let (Some(lease_id), Some(owner_id)) =
         (&lease_id, lease_owner_id.as_deref())
@@ -417,7 +468,15 @@ pub(super) async fn apply_handler(
         None
     };
 
-    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32);
+    // Room for the binding lines, which go out before the agent's events.
+    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32 + bindings.len());
+    for binding in &bindings {
+        let _ = agent_event_tx
+            .send(ApplyEvent::Progress {
+                message: binding.to_string(),
+            })
+            .await;
+    }
     let command = if rerun_jobs {
         AgentCommand::RerunJobs {
             config,
@@ -487,6 +546,7 @@ pub(super) async fn apply_handler(
 /// (openraft does not forward client writes), streaming its SSE
 /// response back verbatim. Jobs in the same config still deploy on the
 /// receiving node after the specs commit.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn cluster_apply(
     state: ApiState,
     council: Arc<crate::council::CouncilNode>,
@@ -495,8 +555,10 @@ pub(super) async fn cluster_apply(
     lease_id: Option<String>,
     caller_headers: HeaderMap,
     capacity_admission: Option<crate::cluster::capacity::CapacityAdmission>,
+    binder: Option<ImageBinder>,
 ) -> Response {
-    // Follower? Forward to the leader rather than half-failing.
+    // Follower? Forward to the leader rather than half-failing. The leader
+    // binds images: a follower's binder (or lack of one) plays no part.
     if !council.is_leader().await {
         let Some(leader_url) = leader_api_url(&state, &council).await else {
             return (
@@ -584,7 +646,17 @@ pub(super) async fn cluster_apply(
             "cluster apply cannot safely own recurring schedules; use a standalone node for cron jobs").into_response();
     }
     if !config.job.is_empty() {
-        return cluster_prerequisite_apply(state, council, config, &caller_headers).await;
+        // The prerequisite claim records the config in Raft before its
+        // stream starts, so these images bind before the claim is written.
+        let mut config = config;
+        let bindings = match &binder {
+            Some(binder) => match bind_images(&state, binder, &mut config).await {
+                Ok(bindings) => bindings,
+                Err(response) => return response,
+            },
+            None => Vec::new(),
+        };
+        return cluster_prerequisite_apply(state, council, config, &caller_headers, bindings).await;
     }
 
     if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
@@ -628,6 +700,31 @@ pub(super) async fn cluster_apply(
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     let cmd_tx = state.cmd_tx.clone();
     tokio::spawn(async move {
+        let mut config = config;
+        // Bind inside the stream, so a slow registry shows as a wait in
+        // `relish apply` rather than as a follower's forward timing out.
+        if let Some(binder) = &binder {
+            let catalog = council.manifest_catalog().await;
+            match binder.bind_config(&mut config, &catalog).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        let _ = event_tx
+                            .send(ApplyEvent::Progress {
+                                message: binding.to_string(),
+                            })
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    let _ = event_tx
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
         let mut committed = 0usize;
         // The one shared path: namespaces, then permissions, then apps.
         // Lettuce writes the exact same set for the same config, so manual
@@ -749,6 +846,7 @@ async fn cluster_prerequisite_apply(
     council: Arc<crate::council::CouncilNode>,
     config: Config,
     caller_headers: &HeaderMap,
+    bindings: Vec<crate::pickle::binding::AppliedBinding>,
 ) -> Response {
     let rerun_jobs = caller_headers
         .get("x-reliaburger-rerun-jobs")
@@ -802,6 +900,13 @@ async fn cluster_prerequisite_apply(
     }
     let (events, event_rx) = mpsc::channel::<ApplyEvent>(32);
     tokio::spawn(async move {
+        for binding in bindings {
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    message: binding.to_string(),
+                })
+                .await;
+        }
         let result: Result<usize, String> = async {
             if !council.is_leader().await || council.current_term() != term {
                 return Err(

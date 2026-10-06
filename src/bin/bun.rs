@@ -539,6 +539,47 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Copy the CRL and the trust set from the council's state into the
+/// verifiers, the security refresh's job on every tick (F04 R2).
+///
+/// The CRL goes into the shared handle every verifier reads. The trust set
+/// goes into the live identity, which persists it and publishes it to every
+/// listener and client built from it. A failure keeps the old trust set and
+/// is logged once until it changes, not every five seconds.
+async fn refresh_crl_and_trust(
+    council: &reliaburger::council::CouncilNode,
+    crl: Option<&reliaburger::sesame::mtls::CrlHandle>,
+    identity: Option<&reliaburger::sesame::credentials::LiveNodeIdentity>,
+    last_error: &mut Option<String>,
+) {
+    let state = council.security_state().await;
+    if let Some(crl) = crl {
+        crl.update(state.crl.clone());
+    }
+    let Some(identity) = identity else {
+        return;
+    };
+    match identity.adopt_council_trust(&state).await {
+        Ok(true) => {
+            let trust = identity.snapshot();
+            println!(
+                "bun: installed the council's trust set: {} Node CA(s), {} root(s)",
+                trust.trust.node_cas.len(),
+                trust.trust.roots.len()
+            );
+            *last_error = None;
+        }
+        Ok(false) => *last_error = None,
+        Err(error) => {
+            let error = error.to_string();
+            if last_error.as_ref() != Some(&error) {
+                eprintln!("bun: WARNING: keeping the current trust set: {error}");
+                *last_error = Some(error);
+            }
+        }
+    }
+}
+
 /// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
 ///
 /// Returns `None` — falling back to a self-signed `localhost` cert — when the
@@ -558,7 +599,7 @@ async fn build_ingress_cert_resolver(
 
     let ikm = council.wrapping_ikm()?;
     let state = council.security_state().await;
-    let ingress_ca = state.get_ca(CaRole::Ingress)?;
+    let ingress_ca = state.active_ca(CaRole::Ingress)?;
     let (keypair, params) = match reliaburger::sesame::ca::ca_signing_material(ingress_ca, ikm) {
         Ok(material) => material,
         Err(e) => {
@@ -584,6 +625,45 @@ async fn build_ingress_cert_resolver(
         Err(e) => {
             eprintln!("bun: WARNING: could not build the ingress cert resolver ({e})");
             None
+        }
+    }
+}
+
+/// Rebuild the ingress resolver when the active Ingress CA changes, so
+/// `tls = "cluster"` routes mint their next leaf from the new CA without a
+/// restart (F04 R2). Checks on the security refresh's five-second cadence.
+async fn reload_ingress_resolver_on_ca_change(
+    council: std::sync::Arc<reliaburger::council::CouncilNode>,
+    routing_table: std::sync::Arc<tokio::sync::RwLock<reliaburger::wrapper::routing::RoutingTable>>,
+    lifetime: std::time::Duration,
+    resolver: std::sync::Arc<reliaburger::wrapper::tls::ReloadableCertResolver>,
+    mut serial: Option<reliaburger::sesame::types::SerialNumber>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let active = council
+            .security_state()
+            .await
+            .active_ca(reliaburger::sesame::types::CaRole::Ingress)
+            .map(|ca| ca.serial);
+        if active == serial {
+            continue;
+        }
+        // Remember the serial whether or not the rebuild works: a failure is
+        // logged by the builder, and retrying every tick would only repeat it.
+        serial = active;
+        if let Some(inner) =
+            build_ingress_cert_resolver(&council, routing_table.clone(), lifetime).await
+        {
+            resolver.replace(inner);
+            println!(
+                "bun: ingress now signs `tls = \"cluster\"` leaves with the rotated Ingress CA"
+            );
         }
     }
 }
@@ -979,6 +1059,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
+    // Under ProcessGrill an app's `image` is a placeholder nobody pulls, so
+    // there's nothing to bind to a digest at apply (F03 U1, decision 5).
+    let runtime_pulls_images = !matches!(runtime, AnyGrill::Process(_));
     let runtime_version = runtime_version(runtime_kind).await;
     let host_kernel = host_kernel().await;
     // Image-store handle for installing the cluster P2P image source
@@ -1592,13 +1675,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // saw `None` and skipped the check needed to contain that open router.
     if let Some(council) = &api_council {
         refresh_token_store(&api_token_store, council).await;
-        if let Some(crl) = &crl_refresh {
-            crl.update(council.security_state().await.crl);
-        }
+        let mut trust_error = None;
+        refresh_crl_and_trust(
+            council,
+            crl_refresh.as_ref(),
+            api_identity.as_ref(),
+            &mut trust_error,
+        )
+        .await;
 
         let refresh_store = Arc::clone(&api_token_store);
         let refresh_council = Arc::clone(council);
         let refresh_crl = crl_refresh.clone();
+        let refresh_identity = api_identity.clone();
         reliaburger::bun::readiness::spawn_reconstructible(
             "security-refresh",
             false,
@@ -1614,11 +1703,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 let refresh_store = Arc::clone(&refresh_store);
                 let refresh_council = Arc::clone(&refresh_council);
                 let refresh_crl = refresh_crl.clone();
+                let refresh_identity = refresh_identity.clone();
                 async move {
+                    let mut trust_error = None;
                     refresh_token_store(&refresh_store, &refresh_council).await;
-                    if let Some(crl) = &refresh_crl {
-                        crl.update(refresh_council.security_state().await.crl);
-                    }
+                    refresh_crl_and_trust(
+                        &refresh_council,
+                        refresh_crl.as_ref(),
+                        refresh_identity.as_ref(),
+                        &mut trust_error,
+                    )
+                    .await;
                     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                     ready.ready();
                     loop {
@@ -1627,10 +1722,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             _ = ticker.tick() => {
                                 refresh_token_store(&refresh_store, &refresh_council).await;
                                 // Same tick refreshes the CRL so a revoked peer is
-                                // refused on its next handshake (≤5 s lag).
-                                if let Some(crl) = &refresh_crl {
-                                    crl.update(refresh_council.security_state().await.crl);
-                                }
+                                // refused on its next handshake, and the trust set
+                                // so a rotated CA is accepted on it (≤5 s lag).
+                                refresh_crl_and_trust(
+                                    &refresh_council,
+                                    refresh_crl.as_ref(),
+                                    refresh_identity.as_ref(),
+                                    &mut trust_error,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1650,6 +1750,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // Leader-only: drop tokens a day past their expiry, never the last
         // Admin (F05 I2). Followers tick too, and do nothing.
         tokio::spawn(reliaburger::bun::token_sweep::run_token_sweep_loop(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        ));
+        // Leader-only: give each namespace that opted in with
+        // `secret_key = true` its first key, re-sealing its values (F05 I4).
+        tokio::spawn(reliaburger::bun::namespace_keys::run_namespace_key_loop(
             Arc::clone(council),
             Some(Arc::clone(&event_store)),
             node_name.clone(),
@@ -1692,6 +1800,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     agent.set_log_sink(log_tx, capture_offsets);
     agent.set_readiness_tracker(readiness.clone());
     agent.set_trust_policy(config.images.trust_policy.clone());
+    // F03 U3: an upstream rule with `require_signatures` needs the image's
+    // cosign `.sig`, read through the pull-through cache once it exists
+    // (below) or straight from the registry. Only where the runtime pulls
+    // images, like digest binding.
+    let signature_source = runtime_pulls_images.then(|| {
+        let credentials = reliaburger::pickle::upstream::resolve_credentials(
+            &config.images.external_registries,
+            |name| std::env::var(name).ok(),
+        );
+        reliaburger::pickle::cosign::SignatureSource::new(
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::new(
+                credentials.clone(),
+            )),
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::insecure_http(
+                credentials,
+            )),
+        )
+    });
+    if let Some(source) = &signature_source {
+        agent.set_signature_source(source.clone());
+    }
     agent.set_records_dir(instances_dir.clone());
     if durable_discovery {
         let directory = data_base.join("discovery");
@@ -1785,12 +1914,33 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
                 Some(council) => {
-                    build_ingress_cert_resolver(
-                        council,
-                        routing_table.clone(),
-                        config.security.ingress_leaf_lifetime(),
-                    )
-                    .await
+                    let lifetime = config.security.ingress_leaf_lifetime();
+                    let serial = council
+                        .security_state()
+                        .await
+                        .active_ca(reliaburger::sesame::types::CaRole::Ingress)
+                        .map(|ca| ca.serial);
+                    match build_ingress_cert_resolver(council, routing_table.clone(), lifetime)
+                        .await
+                    {
+                        Some(inner) => {
+                            // The listener keeps this one resolver; an Ingress
+                            // CA rotation swaps what's inside it (F04 R2).
+                            let reloadable = std::sync::Arc::new(
+                                reliaburger::wrapper::tls::ReloadableCertResolver::new(inner),
+                            );
+                            tokio::spawn(reload_ingress_resolver_on_ca_change(
+                                std::sync::Arc::clone(council),
+                                routing_table.clone(),
+                                lifetime,
+                                std::sync::Arc::clone(&reloadable),
+                                serial,
+                                shutdown.clone(),
+                            ));
+                            Some(reloadable)
+                        }
+                        None => None,
+                    }
                 }
                 None => None,
             };
@@ -2350,6 +2500,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Cloned for the GC task (asks the agent for actively deployed images).
     let gc_cmd_tx = cmd_tx.clone();
 
+    // F03 U1: an apply this node leads binds each image tag to the digest it
+    // names now, so every node, restart and replacement pulls the same
+    // bytes. Only when this node's own runtime pulls images; a cluster runs
+    // one runtime kind, so the leader's speaks for every node. Loopback
+    // registries are asked over plain HTTP, the way the runtime pulls them.
+    let image_binder = runtime_pulls_images.then(|| {
+        let credentials = reliaburger::pickle::upstream::resolve_credentials(
+            &config.images.external_registries,
+            |name| std::env::var(name).ok(),
+        );
+        reliaburger::pickle::binding::ImageBinder::new(
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::new(
+                credentials.clone(),
+            )),
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::insecure_http(
+                credentials,
+            )),
+        )
+        .with_policy(config.images.trust_policy.clone())
+    });
+
     // GitOps (L13): if [gitops] is configured on a cluster node, spawn
     // the leader-only sync loop and hand the API a webhook sender that
     // nudges it. The webhook endpoint returns 503 without this.
@@ -2374,6 +2545,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 webhook_rx,
                 config.storage.data.clone(),
                 shutdown.clone(),
+                image_binder.clone(),
             );
             println!("bun: gitops sync loop started");
             Some(webhook_tx)
@@ -2527,6 +2699,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             node_certificate: None,
         },
         test_policy: config.testing.clone(),
+        token_lifetime: config.security.token_lifetime(),
     };
 
     // Enable workload-JWT bearer authentication when the cluster has an OIDC
@@ -2622,6 +2795,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match capacity_admission {
         Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
+    };
+    let app = match image_binder {
+        Some(binder) => app.layer(axum::Extension(binder)),
         None => app,
     };
     let app = match api_known_members {
@@ -2855,23 +3032,25 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             &config.images.external_registries,
             |name| std::env::var(name).ok(),
         );
-        image_store.set_cluster_source(std::sync::Arc::new(
-            reliaburger::pickle::p2p::ClusterSource {
-                state: pickle_state.clone(),
-                members: replication_membership.clone(),
-                registry_port: config.images.registry_port,
-                peer_scheme: registry_scheme.to_string(),
-                concurrency: config.images.p2p_concurrency,
-                client: registry_client.clone(),
-                upstream: Some(std::sync::Arc::new(
-                    reliaburger::pickle::upstream::OciUpstream::new(credentials)
-                        .with_mirrors(config.images.mirrors.clone()),
-                )),
-                pull_through: config.images.pull_through,
-                cache_recheck_secs: config.images.cache_recheck_secs,
-                fill_lock: tokio::sync::Mutex::new(()),
-            },
-        ));
+        let cluster_source = std::sync::Arc::new(reliaburger::pickle::p2p::ClusterSource {
+            state: pickle_state.clone(),
+            members: replication_membership.clone(),
+            registry_port: config.images.registry_port,
+            peer_scheme: registry_scheme.to_string(),
+            concurrency: config.images.p2p_concurrency,
+            client: registry_client.clone(),
+            upstream: Some(std::sync::Arc::new(
+                reliaburger::pickle::upstream::OciUpstream::new(credentials)
+                    .with_mirrors(config.images.mirrors.clone()),
+            )),
+            pull_through: config.images.pull_through,
+            cache_recheck_secs: config.images.cache_recheck_secs,
+            fill_lock: tokio::sync::Mutex::new(()),
+        });
+        if let Some(source) = &signature_source {
+            source.use_cache(cluster_source.clone());
+        }
+        image_store.set_cluster_source(cluster_source);
     }
 
     let registry_lease_state = pickle_state.clone();
@@ -4042,6 +4221,10 @@ mod tests {
                 private_key_der,
                 serial,
                 ca_generation: 0,
+                trust: reliaburger::sesame::trust::TrustSet::single(
+                    hierarchy.node.ca.certificate_der.clone(),
+                    hierarchy.root.ca.certificate_der.clone(),
+                ),
                 node_ca_der: hierarchy.node.ca.certificate_der.clone(),
                 root_ca_der: hierarchy.root.ca.certificate_der.clone(),
                 not_before: std::time::SystemTime::UNIX_EPOCH,
@@ -4088,8 +4271,7 @@ mod tests {
                 .unwrap(),
             "11"
         );
-        let anonymous =
-            mtls::build_ca_pinned_client(server.node_ca_der, server.root_ca_der).unwrap();
+        let anonymous = mtls::build_ca_pinned_client(server.trust.clone()).unwrap();
         assert_eq!(
             anonymous
                 .get(&url)
@@ -4225,6 +4407,10 @@ mod tests {
                 private_key_der,
                 serial,
                 ca_generation: 0,
+                trust: reliaburger::sesame::trust::TrustSet::single(
+                    hierarchy.node.ca.certificate_der.clone(),
+                    hierarchy.root.ca.certificate_der.clone(),
+                ),
                 node_ca_der: hierarchy.node.ca.certificate_der.clone(),
                 root_ca_der: hierarchy.root.ca.certificate_der.clone(),
                 not_before: std::time::SystemTime::UNIX_EPOCH,

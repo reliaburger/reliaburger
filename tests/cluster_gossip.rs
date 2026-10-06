@@ -168,6 +168,10 @@ fn issued_node_identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> 
         private_key_der,
         serial,
         ca_generation: 0,
+        trust: reliaburger::sesame::trust::TrustSet::single(
+            hierarchy.node.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ),
         node_ca_der: hierarchy.node.ca.certificate_der.clone(),
         root_ca_der: hierarchy.root.ca.certificate_der.clone(),
         not_before: now,
@@ -489,7 +493,8 @@ async fn generated_security_model_protects_all_live_cluster_transports() {
     for (index, node) in nodes.iter().enumerate() {
         let replacement =
             issued_node_identity(&hierarchy, &format!("tls-{}", index + 1), 20 + index as u64);
-        node.2.replace(replacement).await.unwrap();
+        let trust = replacement.trust.clone();
+        node.2.replace(replacement, &trust).await.unwrap();
     }
     let revoked = reliaburger::sesame::types::Crl {
         retired_nodes: Default::default(),
@@ -971,7 +976,8 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
         .to_vec();
     due.private_key_der = key.serialize_der();
     due.serial = SerialNumber(20);
-    nodes[worker_index].2.replace(due).await.unwrap();
+    let trust = due.trust.clone();
+    nodes[worker_index].2.replace(due, &trust).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), entered.notified())
         .await
         .unwrap();
@@ -1078,6 +1084,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         scope: TokenScope::default(),
         expires_at: None,
         created_at: SystemTime::now(),
+        previous_secret: None,
     };
     council
         .write(RaftRequest::CreateApiToken(operator.clone()))
@@ -1108,6 +1115,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         },
         expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(lease.expires_at_unix_ms)),
         created_at: SystemTime::now(),
+        previous_secret: None,
     };
     let admitted = council
         .write(RaftRequest::TestLeaseApiToken {
@@ -1181,5 +1189,480 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
     shutdown.cancel();
     for reaper in reapers {
         reaper.await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F04 R4: rotating the Node CA under traffic
+// ---------------------------------------------------------------------------
+
+/// What the mTLS traffic between the nodes' app replicas has seen.
+#[derive(Default)]
+struct TrafficLog {
+    ok: u64,
+    failures: Vec<String>,
+    /// Every replica id each node's app has answered with.
+    replicas: std::collections::BTreeMap<String, BTreeSet<String>>,
+}
+
+/// One app replica per node: a required-mTLS listener on the node's live
+/// identity, answering with an id fixed when it started. If anything
+/// restarted it, the id would change.
+async fn spawn_app_replica(
+    identity: &reliaburger::sesame::credentials::LiveNodeIdentity,
+    replica_id: String,
+    shutdown: CancellationToken,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> SocketAddr {
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        reliaburger::sesame::mtls::build_live_mtls_server_config(identity, CrlHandle::default())
+            .unwrap(),
+    );
+    let router = axum::Router::new().route(
+        "/app",
+        axum::routing::get(move || {
+            let replica_id = replica_id.clone();
+            async move { replica_id }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(local(0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tasks.spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = connections.join_next(), if !connections.is_empty() => {},
+                accepted = listener.accept() => {
+                    let Ok((tcp, _)) = accepted else { continue };
+                    let acceptor = acceptor.clone();
+                    let router = router.clone();
+                    connections.spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        let service = hyper_util::service::TowerToHyperService::new(router);
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                        .await;
+                    });
+                }
+            }
+        }
+    });
+    address
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node Node CA rotation acceptance; run with make test-cluster"]
+async fn rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing() {
+    use base64::Engine as _;
+    use reliaburger::sesame::{
+        ca_rotation::{PreparedRotation, RotationRole, SignedIntermediate},
+        credentials::LiveNodeIdentity,
+        renewal_worker::NodeRenewalWorker,
+        types::{CaRole, CertificateAuthority, NodeLeafRecord, SecurityState},
+    };
+    let shutdown = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(shutdown.clone());
+    let hierarchy = ca::generate_ca_hierarchy("rotation-cluster", &[42; 32]).unwrap();
+    let names = ["rotate-1", "rotate-2", "rotate-3"];
+    let ports = [17981, 17983, 17985];
+    let mut nodes = Vec::new();
+    for index in 0..3 {
+        nodes.push(
+            start_mtls_node(
+                names[index],
+                ports[index],
+                if index == 0 {
+                    vec![]
+                } else {
+                    vec![local(ports[0])]
+                },
+                issued_node_identity(&hierarchy, names[index], 10 + index as u64),
+                &shutdown,
+            )
+            .await,
+        );
+    }
+    let voters: BTreeSet<_> = names.iter().map(|name| raft_id_from_name(name)).collect();
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            nodes.iter().all(|node| voter_ids(&node.0) == voters)
+                && nodes
+                    .iter()
+                    .filter(|node| thinks_it_is_leader(&node.0))
+                    .count()
+                    == 1
+        })
+        .await,
+        "the council did not converge"
+    );
+    let leader = nodes
+        .iter()
+        .position(|node| thinks_it_is_leader(&node.0))
+        .unwrap();
+    let leader_council = nodes[leader].0.council.as_ref().unwrap().clone();
+
+    // The council's state as `relish init` and three joins leave it: every
+    // CA (the root without its key) and a leaf record per node.
+    leader_council
+        .write(reliaburger::council::RaftRequest::SecurityStateInit(
+            Box::new(SecurityState {
+                certificate_authorities: vec![
+                    CertificateAuthority {
+                        private_key_wrapped: None,
+                        ..hierarchy.root.ca.clone()
+                    },
+                    hierarchy.node.ca.clone(),
+                    hierarchy.workload.ca.clone(),
+                    hierarchy.ingress.ca.clone(),
+                ],
+                next_serial: 100,
+                node_leaves: names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        (
+                            name.to_string(),
+                            NodeLeafRecord {
+                                serial: SerialNumber(10 + index as u64),
+                                ca_generation: 0,
+                                trust_generation: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        ))
+        .await
+        .unwrap();
+
+    // What Bun runs on every node: the API (renewal, trust acknowledgement
+    // and the rotation routes), the renewal worker, and the security refresh
+    // that installs the council's trust set.
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut members = Vec::new();
+    for index in 0..3 {
+        let address = renewal_api(
+            nodes[index].0.council.as_ref().unwrap().clone(),
+            nodes[index].2.clone(),
+            None,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown.clone(),
+            &mut tasks,
+        )
+        .await;
+        members.push(reliaburger::bun::api::NodeMembershipInfo {
+            node_id: reliaburger::meat::NodeId::new(names[index]),
+            address,
+            api_advertised: true,
+        });
+    }
+    let members_table = Arc::new(tokio::sync::RwLock::new(members.clone()));
+    for index in 0..3 {
+        let (worker, _monitor) = NodeRenewalWorker::new(
+            nodes[index].2.clone(),
+            nodes[index].0.crl_handle.clone(),
+            "renewal-test-token",
+        )
+        .unwrap();
+        let council = nodes[index].0.council.as_ref().unwrap().clone();
+        let membership = members_table.clone();
+        let local_api = members[index].address;
+        let stop = shutdown.clone();
+        tasks.spawn(async move { worker.run(council, membership, local_api, stop).await });
+
+        let council = nodes[index].0.council.as_ref().unwrap().clone();
+        let identity = nodes[index].2.clone();
+        let stop = shutdown.clone();
+        tasks.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
+                let _ = identity
+                    .adopt_council_trust(&council.security_state().await)
+                    .await;
+            }
+        });
+    }
+
+    // An app replica on every node, and traffic from every node to every
+    // other over mTLS, a fresh handshake per request so each one checks the
+    // leaves and trust sets in force at that moment.
+    let mut apps = Vec::new();
+    for index in 0..3 {
+        let address = spawn_app_replica(
+            &nodes[index].2,
+            format!("{}-replica", names[index]),
+            shutdown.clone(),
+            &mut tasks,
+        )
+        .await;
+        apps.push(address);
+    }
+    let traffic = Arc::new(std::sync::Mutex::new(TrafficLog::default()));
+    let traffic_stop = CancellationToken::new();
+    let mut traffic_tasks = tokio::task::JoinSet::new();
+    for source in 0..3 {
+        for target in 0..3 {
+            if source == target {
+                continue;
+            }
+            let tls = (*reliaburger::sesame::mtls::build_live_mtls_client_config(
+                &nodes[source].2,
+                CrlHandle::default(),
+                Some(names[target]),
+            )
+            .unwrap())
+            .clone();
+            let client = reqwest::Client::builder()
+                .use_preconfigured_tls(tls)
+                .pool_max_idle_per_host(0)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let url = format!("https://{}/app", apps[target]);
+            let traffic = traffic.clone();
+            let stop = traffic_stop.clone();
+            let label = format!("{} -> {}", names[source], names[target]);
+            let target_name = names[target].to_string();
+            traffic_tasks.spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(100));
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        _ = ticker.tick() => {}
+                    }
+                    let answer = match client.get(&url).send().await {
+                        Ok(response) if response.status().is_success() => {
+                            response.text().await.map_err(|error| error.to_string())
+                        }
+                        Ok(response) => Err(format!("status {}", response.status())),
+                        Err(error) => Err(format!("{error:?}")),
+                    };
+                    let mut log = traffic.lock().unwrap();
+                    match answer {
+                        Ok(replica) => {
+                            log.ok += 1;
+                            log.replicas
+                                .entry(target_name.clone())
+                                .or_default()
+                                .insert(replica);
+                        }
+                        Err(error) => log.failures.push(format!("{label}: {error}")),
+                    }
+                }
+            });
+        }
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || traffic.lock().unwrap().ok >= 30).await,
+        "traffic did not start flowing"
+    );
+
+    // Record the order the nodes move onto the new CA.
+    let order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let order = order.clone();
+        let identities: Vec<LiveNodeIdentity> = nodes.iter().map(|node| node.2.clone()).collect();
+        let stop = shutdown.clone();
+        tasks.spawn(async move {
+            loop {
+                for identity in &identities {
+                    let snapshot = identity.snapshot();
+                    let mut order = order.lock().unwrap();
+                    if snapshot.ca_generation >= 1 && !order.contains(&snapshot.node_id) {
+                        order.push(snapshot.node_id.clone());
+                    }
+                }
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        });
+    }
+
+    // The operator, through the leader's API: prepare, sign the CSR with the
+    // root key from their backup, begin.
+    let operator = reliaburger::sesame::mtls::build_live_cluster_http_client(
+        &nodes[leader].2,
+        CrlHandle::default(),
+        None,
+    )
+    .unwrap();
+    let api = |path: &str| format!("https://{}{path}", members[leader].address);
+    let finalize = || async {
+        operator
+            .post(api("/v1/ca/rotation/finalize"))
+            .json(&RotationRole { role: CaRole::Node })
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(
+        finalize().await,
+        reqwest::StatusCode::CONFLICT,
+        "nothing to finalise yet"
+    );
+    let prepared: PreparedRotation = operator
+        .post(api("/v1/ca/rotation/prepare"))
+        .json(&RotationRole { role: CaRole::Node })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prepared.generation, 1);
+    let backup = reliaburger::sesame::root_backup::RootBackup::new(
+        "rotation-cluster",
+        &hierarchy.root.ca.certificate_der,
+        &hierarchy.root.private_key_der,
+        SystemTime::now(),
+    )
+    .unwrap();
+    backup
+        .verify(&prepared.root_fingerprint, SystemTime::now())
+        .unwrap();
+    let certificate = ca::sign_intermediate_csr(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&prepared.csr_b64)
+            .unwrap(),
+        CaRole::Node,
+        &backup.cluster,
+        SerialNumber(prepared.serial),
+        &backup.private_key_der().unwrap(),
+        &backup.certificate_der().unwrap(),
+    )
+    .unwrap();
+    operator
+        .post(api("/v1/ca/rotation/begin"))
+        .json(&SignedIntermediate {
+            role: CaRole::Node,
+            certificate_b64: base64::engine::general_purpose::STANDARD.encode(&certificate),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Finalise is refused while any node lags.
+    assert_eq!(finalize().await, reqwest::StatusCode::CONFLICT);
+
+    // Every node acknowledges the new trust set, then renews onto the new
+    // CA, one at a time in node order.
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            nodes
+                .iter()
+                .all(|node| node.2.snapshot().ca_generation == 1)
+        })
+        .await,
+        "not every node renewed onto the new Node CA; moved so far: {:?}",
+        order.lock().unwrap()
+    );
+    // The watcher polls, so give it a moment to see the last node move.
+    assert!(
+        wait_until(Duration::from_secs(5), || order.lock().unwrap().len() == 3).await,
+        "the watcher missed a node"
+    );
+    assert_eq!(*order.lock().unwrap(), names.to_vec());
+    for node in &nodes {
+        let identity = node.2.snapshot();
+        assert_eq!(identity.node_ca_der, certificate, "{}", identity.node_id);
+        assert_eq!(identity.trust.node_cas.len(), 2, "both CAs are trusted");
+    }
+
+    // Then finalise retires the old CA, and the trust set shrinks to the new
+    // one on every node.
+    let mut finalised = false;
+    for _ in 0..50 {
+        if finalize().await == reqwest::StatusCode::OK {
+            finalised = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(finalised, "finalise stayed refused after every node moved");
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            nodes
+                .iter()
+                .all(|node| node.2.snapshot().trust.node_cas == vec![certificate.clone()])
+        })
+        .await,
+        "the retired CA is still trusted somewhere"
+    );
+
+    // A few more seconds of traffic under the new CA alone.
+    let ok_before = traffic.lock().unwrap().ok;
+    assert!(
+        wait_until(Duration::from_secs(10), || traffic.lock().unwrap().ok
+            >= ok_before + 30)
+        .await
+    );
+    traffic_stop.cancel();
+    while traffic_tasks.join_next().await.is_some() {}
+    {
+        let log = traffic.lock().unwrap();
+        assert!(
+            log.failures.is_empty(),
+            "mTLS traffic failed during the rotation ({} of {}): {:?}",
+            log.failures.len(),
+            log.ok + log.failures.len() as u64,
+            log.failures
+        );
+        for name in names {
+            assert_eq!(
+                log.replicas[name],
+                BTreeSet::from([format!("{name}-replica")]),
+                "the app replica on {name} restarted"
+            );
+        }
+    }
+
+    // Raft still replicates over the rotated mTLS transport.
+    let leader_council = nodes
+        .iter()
+        .find(|node| thinks_it_is_leader(&node.0))
+        .and_then(|node| node.0.council.clone())
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        leader_council.write(reliaburger::council::RaftRequest::AllocateSerial),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let committed = leader_council.raft().metrics().borrow().last_applied;
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            nodes.iter().all(|node| {
+                node.0
+                    .raft_metrics_rx
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .last_applied
+                    >= committed
+            })
+        })
+        .await,
+        "Raft stopped replicating after the rotation"
+    );
+
+    shutdown.cancel();
+    for node in &nodes {
+        node.0.council.as_ref().unwrap().shutdown().await.ok();
     }
 }

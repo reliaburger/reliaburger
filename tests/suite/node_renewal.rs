@@ -359,7 +359,12 @@ async fn renewal_refuses_revoked_node_and_root_issuers() {
     for role in [CaRole::Node, CaRole::Root] {
         let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
         let council = council(&hierarchy, true).await;
-        let issuer_serial = council.security_state().await.get_ca(role).unwrap().serial;
+        let issuer_serial = council
+            .security_state()
+            .await
+            .active_ca(role)
+            .unwrap()
+            .serial;
         council
             .write(RaftRequest::RevokeCertificate(CrlEntry {
                 serial: issuer_serial,
@@ -456,6 +461,10 @@ fn identity_from(
         private_key_der,
         serial: SerialNumber(serial),
         ca_generation: 0,
+        trust: reliaburger::sesame::trust::TrustSet::single(
+            hierarchy.node.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ),
         node_ca_der: hierarchy.node.ca.certificate_der.clone(),
         root_ca_der: hierarchy.root.ca.certificate_der.clone(),
         not_before: SystemTime::UNIX_EPOCH,
@@ -638,7 +647,13 @@ async fn worker_waits_until_midpoint_then_retries_failed_persistence_without_pub
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     fixture
         .live
-        .replace(worker_identity(&hierarchy, 20, true))
+        .replace(
+            worker_identity(&hierarchy, 20, true),
+            &reliaburger::sesame::trust::TrustSet::from_state(
+                &fixture.council.security_state().await,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     let key = fixture.directory.path().join("node.key");
@@ -720,7 +735,13 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
     // backdate), issued long enough ago that its midpoint is 3 s away.
     fixture
         .live
-        .replace(windowed_identity(&hierarchy, 20, -447, 453))
+        .replace(
+            windowed_identity(&hierarchy, 20, -447, 453),
+            &reliaburger::sesame::trust::TrustSet::from_state(
+                &fixture.council.security_state().await,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     let monitor = fixture.start_with_ceiling(Some(override_lifetime));
@@ -763,7 +784,13 @@ async fn worker_replaces_a_year_long_leaf_once_half_its_ceiling_has_passed() {
         WorkerFixture::with_leader_lifetime(&hierarchy, false, Some(override_lifetime)).await;
     fixture
         .live
-        .replace(windowed_identity(&hierarchy, 20, -2000, YEAR_SECS))
+        .replace(
+            windowed_identity(&hierarchy, 20, -2000, YEAR_SECS),
+            &reliaburger::sesame::trust::TrustSet::from_state(
+                &fixture.council.security_state().await,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     let monitor = fixture.start_with_ceiling(Some(override_lifetime));
@@ -790,7 +817,13 @@ async fn worker_does_not_spin_when_the_leader_signs_longer_than_its_ceiling() {
     let mut fixture = WorkerFixture::with_leader_lifetime(&hierarchy, false, None).await;
     fixture
         .live
-        .replace(windowed_identity(&hierarchy, 20, -2000, YEAR_SECS))
+        .replace(
+            windowed_identity(&hierarchy, 20, -2000, YEAR_SECS),
+            &reliaburger::sesame::trust::TrustSet::from_state(
+                &fixture.council.security_state().await,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     let monitor = fixture.start_with_ceiling(Some(Duration::from_secs(3600)));
@@ -1052,7 +1085,7 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
         bootstrap::load_master_key(node.security.master_key_path.as_ref().unwrap()).unwrap();
     let state =
         bootstrap::load_bootstrap_state(node.security.bootstrap_path.as_ref().unwrap()).unwrap();
-    let issuer = state.get_ca(CaRole::Node).unwrap();
+    let issuer = state.active_ca(CaRole::Node).unwrap();
     let ca_key = rustls::pki_types::PrivateKeyDer::try_from(
         crypto::unwrap_key(&master, issuer.private_key_wrapped.as_ref().unwrap()).unwrap(),
     )

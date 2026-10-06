@@ -239,15 +239,44 @@ migration and no feature gate
   [full](qualification/2026-10-05-v0.1.5-soak-full.md) soaks and the
   [8-hour final tier](qualification/2026-10-05-v0.1.5-sustained-v02-final.md),
   where the V02 gate passed.
-- [ ] **0.1.6: operations security**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/12)). The
-  rest of the 0.1.4 security scope: upstream image trust, binding images to a
-  digest at apply, the upstream policy and cosign (F03a,
-  [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA backup and intermediate rotation (F04 R1–R4,
-  [#362](https://github.com/reliaburger/reliaburger/issues/362)); token rotation and per-namespace secret keys (F05 I3–I4,
-  [#363](https://github.com/reliaburger/reliaburger/issues/363)). Worker key separation (F03b), root rotation and restore
-  (F04 R5–R7) and per-app audiences (F05 I5–I6) follow later. The security
-  work comes before real fleets in 0.3.0.
+- [ ] **0.1.6: operations security, ready for release, qualification to follow**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/12), merge
+  train [#616](https://github.com/reliaburger/reliaburger/pull/616)). The rest of the 0.1.4 security
+  scope. Every item below has landed on `release-0-1-6`, and the crate says
+  0.1.6:
+  - [x] images bound to a digest at apply, upstream trust rules, and cosign
+    signatures checked on upstream images before deploy (F03a,
+    [#361](https://github.com/reliaburger/reliaburger/issues/361), [#600](https://github.com/reliaburger/reliaburger/pull/600), [#597](https://github.com/reliaburger/reliaburger/pull/597),
+    [#611](https://github.com/reliaburger/reliaburger/pull/611));
+  - [x] several CAs per role rotated through Raft, every CA in the set
+    trusted by every verifier, `relish ca backup` and `ca verify` for a root
+    backup the operator holds, and intermediate rotation signed with that
+    backup (F04 R1–R4, [#362](https://github.com/reliaburger/reliaburger/issues/362),
+    [#596](https://github.com/reliaburger/reliaburger/pull/596), [#602](https://github.com/reliaburger/reliaburger/pull/602),
+    [#598](https://github.com/reliaburger/reliaburger/pull/598), [#610](https://github.com/reliaburger/reliaburger/pull/610));
+  - [x] token rotation with a grace period and a 90-day default lifetime, and
+    a secret key per namespace (F05 I3–I4,
+    [#363](https://github.com/reliaburger/reliaburger/issues/363), [#601](https://github.com/reliaburger/reliaburger/pull/601),
+    [#599](https://github.com/reliaburger/reliaburger/pull/599));
+  - [x] fixes: a consumer sync's inventory read gets a turn of its own
+    ([#603](https://github.com/reliaburger/reliaburger/issues/603), [#605](https://github.com/reliaburger/reliaburger/pull/605)), the Raft
+    recovery lock and every other file lock unlock before they close
+    ([#606](https://github.com/reliaburger/reliaburger/issues/606), [#613](https://github.com/reliaburger/reliaburger/issues/613),
+    [#612](https://github.com/reliaburger/reliaburger/pull/612), [#614](https://github.com/reliaburger/reliaburger/pull/614)), and the quickstart
+    guest leaves its clock to Lima's guest agent
+    ([#608](https://github.com/reliaburger/reliaburger/issues/608), [#617](https://github.com/reliaburger/reliaburger/pull/617));
+  - [x] CI lints macOS with one Clippy pass ([#595](https://github.com/reliaburger/reliaburger/pull/595)), and
+    the plan for keyless cosign and Sigstore bundles (F03c,
+    [#620](https://github.com/reliaburger/reliaburger/pull/620)).
+
+  Worker key separation (F03b), root rotation and restore (F04 R5–R7),
+  per-app audiences (F05 I5–I6) and keyless cosign (F03c,
+  [#619](https://github.com/reliaburger/reliaburger/issues/619)) follow later. 0.1.6
+  changes the protocol and state formats (40 and 58 in 0.1.5; 46 and 63 now,
+  for digest-bound images, the CA set and its rotation, token rotation and
+  namespace keys), so a 0.1.5 cluster can't roll to it:
+  recreate the cluster ([upgrading from 0.1.5](releasing.md#upgrading-from-015)).
+  The security work comes before real fleets in 0.3.0.
 - [ ] **0.2.0: "A million jobs"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays

@@ -43,6 +43,21 @@ pub fn applies_to_caller(rule: &FaultRule, app: &str, namespace: &str) -> bool {
     }
 }
 
+/// Whether `rule` reaches each caller through a key on that caller's own
+/// cgroup.
+///
+/// A partition from one app is keyed per instance of the app, so it reaches
+/// only the instances whose cgroup the runtime has named. Every other connect
+/// fault is keyed on the target alone and reaches every caller at once.
+pub fn keyed_by_caller_cgroup(rule: &FaultRule) -> bool {
+    matches!(
+        rule.fault_type,
+        FaultType::Partition {
+            source_app: Some(_)
+        }
+    )
+}
+
 /// What the connect hook does with a matching connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectFaultAction {
@@ -260,6 +275,13 @@ impl LateCuts {
         Fut: std::future::Future<Output = ()>,
     {
         futures_util::future::join_all(self.0.iter().map(cut)).await;
+    }
+}
+
+impl From<Vec<ConnectionCut>> for LateCuts {
+    /// Cuts that haven't started, to run before a fault answers.
+    fn from(cuts: Vec<ConnectionCut>) -> Self {
+        LateCuts(cuts)
     }
 }
 
@@ -815,6 +837,24 @@ mod tests {
             *finished.borrow(),
             ["default/frontend-quick", "default/frontend-slow"]
         );
+    }
+
+    #[test]
+    fn only_a_partition_from_one_app_is_keyed_by_caller_cgroup() {
+        assert!(keyed_by_caller_cgroup(&rule(
+            1,
+            FaultType::Partition {
+                source_app: Some("frontend".to_string()),
+            }
+        )));
+        assert!(!keyed_by_caller_cgroup(&rule(
+            2,
+            FaultType::Partition { source_app: None }
+        )));
+        assert!(!keyed_by_caller_cgroup(&rule(
+            3,
+            FaultType::Drop { probability: 100 }
+        )));
     }
 
     #[test]
