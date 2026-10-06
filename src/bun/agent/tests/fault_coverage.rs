@@ -59,9 +59,15 @@ fn pending_ids(agent: &TestAgent) -> Vec<String> {
 #[tokio::test]
 async fn a_caller_whose_cgroup_read_outlasts_the_turn_is_pending() {
     let (agent, _grill, _rule) = partition_after_a_slow_turn().await;
-    assert_eq!(
-        pending_ids(&agent),
-        ["default__frontend-1", "default__frontend-2"]
+    // The supervisor lists instances in no fixed order, so which frontend
+    // fits the turn varies; two of the three never do.
+    let pending = pending_ids(&agent);
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert!(
+        pending
+            .iter()
+            .all(|id| id.starts_with("default__frontend-")),
+        "{pending:?}"
     );
 }
 
