@@ -781,6 +781,133 @@ async fn partition_fault_blocks_its_source_cgroup_and_clears() {
     ebpf.detach().unwrap();
 }
 
+/// A partition from an app must cover every one of its instances before the
+/// agent says it's in place (#625). The runtime names each caller's cgroup
+/// slowly here, as runc's owner does on a loaded host: three reads of 300 ms
+/// don't fit the turn's 500 ms budget. A caller left without a cgroup gets
+/// no `fault_connect_map` key and no connection cut, so its pooled
+/// connections to the target kept working after the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn partition_answers_only_once_every_source_instance_is_covered() {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::{Grill, InstanceId};
+    use reliaburger::smoker::bpf_maps;
+    use reliaburger::smoker::bpf_types::partition_fault_key;
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
+        grill.clone(),
+        PortAllocator::new(42500, 42800),
+        cmd_rx,
+        shutdown.clone(),
+        volumes.path(),
+    );
+    let source = root_app_name("caller", volumes.path());
+    let target = root_app_name("cache", volumes.path());
+    let _source_cgroups = AppCgroups::new("default", &source);
+    let _target_cgroups = AppCgroups::new("default", &target);
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
+
+    let target_port: u16 = 6379;
+    let config = Config::parse(&format!(
+        r#"
+        [app.{source}]
+        image = "mock:image"
+        replicas = 3
+
+        [app.{target}]
+        image = "mock:image"
+        port = {target_port}
+    "#
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while let Some(event) = ev_rx.recv().await {
+        assert!(
+            !matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }),
+            "deployment failed: {event:?}"
+        );
+    }
+
+    grill.set_workload_cgroup_delay(Some(Duration::from_millis(300)));
+    let (response, answer) = oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::InjectFault {
+            reservation: None,
+            replica_evidence: None,
+            request: FaultRequest {
+                fault_type: FaultType::Partition {
+                    source_app: Some(source.clone()),
+                },
+                target_service: target.clone(),
+                namespace: Some("default".into()),
+                target_instance: None,
+                target_node: None,
+                duration: Duration::from_secs(60),
+                injected_by: "test".into(),
+                reason: None,
+                include_leader: false,
+                override_safety: false,
+                acknowledged: true,
+            },
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), answer)
+        .await
+        .expect("the partition was never answered")
+        .unwrap()
+        .expect("the partition should be accepted");
+
+    // Read what the kernel holds the moment the answer arrives.
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", target.as_str()));
+    let mut missing = Vec::new();
+    {
+        let mut e = ebpf.lock().await;
+        for replica in 0..3 {
+            let instance = InstanceId(format!("default__{source}-{replica}"));
+            let cgroup = Grill::workload_cgroup(&grill, &instance)
+                .await
+                .unwrap()
+                .expect("the mock names each caller's cgroup");
+            let key = partition_fault_key(vip.to_network_byte_order(), target_port.to_be(), cgroup);
+            if bpf_maps::read_connect_fault(&mut e.bpf, &key)
+                .unwrap()
+                .is_none()
+            {
+                missing.push(instance.0);
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the partition was reported in place before it covered {missing:?}"
+    );
+    shutdown.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2b: Egress allowlist (L16)
 // ---------------------------------------------------------------------------
