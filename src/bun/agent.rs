@@ -1172,7 +1172,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Set where this node reads cosign signatures from (F03 U3).
     pub fn set_signature_source(&mut self, source: crate::pickle::cosign::SignatureSource) {
         self.signature_source = Some(source);
-}
+    }
 
     /// Shared admission ledger for applications and delegated task attempts.
     pub fn execution_budget(&self) -> Arc<super::execution_budget::ExecutionBudget> {

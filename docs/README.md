@@ -1457,6 +1457,6 @@ manifests, app/job resource accounting, watch summaries, indexed detail, retries
 and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
 homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
 a service. Build matching development binaries and use a fresh cluster (protocol
-36 / state 51); the published 0.1.4 recording predates this step. The
+47 / state 64); the published 0.1.4 recording predates this step. The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.

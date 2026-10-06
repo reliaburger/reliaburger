@@ -327,6 +327,19 @@ impl BatchDurableState {
         self.execution_owners.get(&key)
     }
 
+    /// Reserve enough counter space for an entire registration without mutation.
+    pub fn preflight_ids(&self, count: usize) -> Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        let count = u64::try_from(count).map_err(|_| "batch id exhausted")?;
+        self.next_batch_id
+            .max(1)
+            .checked_add(count)
+            .ok_or("batch id exhausted")?;
+        Ok(())
+    }
+
     /// Take the shared ID after task-array registration has checked exhaustion.
     pub fn allocate_id(&mut self) -> u64 {
         let id = self.next_batch_id.max(1);
@@ -424,6 +437,10 @@ impl BatchTracker {
         execution_name: &str,
     ) -> Option<&BatchExecutionOwner> {
         self.state.execution_owner(namespace, execution_name)
+    }
+
+    pub fn preflight_ids(&self, count: usize) -> Result<(), String> {
+        self.state.preflight_ids(count)
     }
 
     /// Take the next batch id without registering a batch (a standalone

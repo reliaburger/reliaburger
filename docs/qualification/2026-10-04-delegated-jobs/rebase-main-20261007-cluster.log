@@ -1,0 +1,23 @@
+RELIABURGER_CLUSTER_TESTS=1 cargo nextest run --profile ci --no-tests=fail --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) '
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (bin "relish") generated 1 warning
+warning: `reliaburger` (test "placement") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_gossip") generated 1 warning (1 duplicate)
+warning: `reliaburger` (lib test) generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "suite") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "council_disaster_recovery") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_failover") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_task_arrays") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "build") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "mayo_memory") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "integration") generated 1 warning (1 duplicate)
+warning: `reliaburger` (bin "bun") generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+────────────
+ Nextest run ID ec07befb-8a5c-458c-9980-c25d8c990171 with nextest profile: ci
+    Starting 44 tests across 6 binaries (1 test and 32 binaries skipped)
+────────────
+     Summary [ 308.182s] 44 tests run: 44 passed, 1 skipped

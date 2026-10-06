@@ -9108,6 +9108,7 @@ fn webhook_boundary_setup(
         None,
         None,
         None,
+        None,
     );
     // Own canceled-request cleanup in this fixture. On an intended old-source
     // timeout, this layer drops the real handler before either held lock opens.

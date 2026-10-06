@@ -1368,6 +1368,9 @@ impl StateMachineInner {
                 // names one thing. Every rule lives in `TaskArrays::apply`;
                 // a refused write leaves the state untouched.
                 let batch_state = &mut self.state.batch_state;
+                if let Err(reason) = batch_state.preflight_ids(write.registration_ids()) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
                 match self
                     .state
                     .task_arrays
@@ -7472,14 +7475,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_array_id_exhaustion_refuses_without_partial_registration() {
+        use crate::meat::task_array_store::{ManifestCohort, TaskArrayWrite};
+        for manifest in [false, true] {
+            let mut sm = CouncilStateMachine::new();
+            sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX - u64::from(manifest);
+            let before = sm.desired_state().await.batch_state.next_batch_id;
+            let RaftRequest::TaskArray(array) = task_array_register(1) else {
+                unreachable!()
+            };
+            let write = if manifest {
+                let TaskArrayWrite::Register { template, spec, .. } = *array else {
+                    unreachable!()
+                };
+                TaskArrayWrite::RegisterManifest {
+                    name: "render".into(),
+                    namespace: "default".into(),
+                    cohorts: vec![ManifestCohort {
+                        name: "small".into(),
+                        template: *template,
+                        spec,
+                    }],
+                    submitted_at_epoch_secs: 1_000_000,
+                }
+            } else {
+                *array
+            };
+            let responses = sm
+                .apply(vec![normal_entry(
+                    1,
+                    1,
+                    RaftRequest::TaskArray(Box::new(write)),
+                )])
+                .await
+                .unwrap();
+            assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+            let state = sm.desired_state().await;
+            assert_eq!(state.batch_state.next_batch_id, before);
+            assert!(state.task_arrays.ids().is_empty());
+            assert_eq!(state.task_arrays.manifests().count(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn task_arrays_share_the_batch_id_counter() {
         let mut sm = CouncilStateMachine::new();
         let responses = sm
-            .apply(vec![
+            .apply_fixture(vec![
                 normal_entry(
                     1,
                     1,
                     RaftRequest::BatchRegister {
+                        expected_log_id: None,
                         batch: batch_record("j1", "n1"),
                     },
                 ),
@@ -7488,6 +7535,7 @@ mod tests {
                     1,
                     3,
                     RaftRequest::BatchRegister {
+                        expected_log_id: None,
                         batch: batch_record("j2", "n1"),
                     },
                 ),

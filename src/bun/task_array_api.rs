@@ -16,7 +16,7 @@
 
 use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +154,8 @@ async fn follower_council(state: &ApiState) -> Option<&crate::council::CouncilNo
 pub async fn submit_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     let auth = auth.as_deref();
@@ -174,10 +176,12 @@ pub async fn submit_handler(
         return response;
     }
     if let Some(council) = follower_council(&state).await {
-        return forward_to_leader(&state, council, "/v1/batch/array", body).await;
+        return forward_to_leader(&state, council, "/v1/batch/array", body, &headers).await;
     }
-    if let Err(reason) = pin_template_image(&state, &mut request.template).await {
-        return error(StatusCode::BAD_REQUEST, reason);
+    if let Err(response) =
+        admit_template_image(&state, binder.as_deref(), &mut request.template).await
+    {
+        return response;
     }
     let count = request.spec.count;
     let chunks = request.spec.chunk_count();
@@ -223,6 +227,8 @@ fn default_namespace() -> String {
 pub async fn manifest_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     let auth = auth.as_deref();
@@ -253,11 +259,13 @@ pub async fn manifest_handler(
         cohort.template = array.template;
     }
     if let Some(council) = follower_council(&state).await {
-        return forward_to_leader(&state, council, "/v1/batch/manifest", body).await;
+        return forward_to_leader(&state, council, "/v1/batch/manifest", body, &headers).await;
     }
     for cohort in &mut request.cohort {
-        if let Err(reason) = pin_template_image(&state, &mut cohort.template).await {
-            return error(StatusCode::BAD_REQUEST, reason);
+        if let Err(response) =
+            admit_template_image(&state, binder.as_deref(), &mut cohort.template).await
+        {
+            return response;
         }
     }
     let write = TaskArrayWrite::RegisterManifest {
@@ -280,6 +288,54 @@ pub async fn manifest_handler(
     }
 }
 
+// Preserve the shared API binder's HTTP refusal response.
+#[allow(clippy::result_large_err)]
+async fn admit_template_image(
+    state: &ApiState,
+    binder: Option<&crate::pickle::binding::ImageBinder>,
+    template: &mut JobSpec,
+) -> Result<(), Response> {
+    if let Some(binder) = binder {
+        let mut config = crate::config::Config::default();
+        config.job.insert("task".into(), template.clone());
+        super::api::bind_images(state, binder, &mut config).await?;
+        *template = config
+            .job
+            .remove("task")
+            .expect("binder retains job template");
+    }
+    pin_template_image(state, template)
+        .await
+        .map_err(|reason| error(StatusCode::BAD_REQUEST, reason))?;
+    let Some(image) = template
+        .image
+        .as_deref()
+        .filter(|image| crate::grill::image::looks_like_image_ref(image))
+    else {
+        return Ok(());
+    };
+    let catalog = match (&state.council, &state.pickle_catalog) {
+        (Some(council), _) => council.manifest_catalog().await,
+        (None, Some(catalog)) => catalog.read().await.clone(),
+        _ => Default::default(),
+    };
+    if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_none() {
+        crate::pickle::trust::check_upstream(&state.task_arrays.trust_policy, image)
+            .map_err(|reason| error(StatusCode::FORBIDDEN, reason.to_string()))?;
+        if let Some(check) = crate::pickle::trust::CosignCheck::for_image(
+            &state.task_arrays.trust_policy,
+            image,
+            state.task_arrays.signature_source.as_ref(),
+        ) {
+            check
+                .run()
+                .await
+                .map_err(|reason| error(StatusCode::FORBIDDEN, reason))?;
+        }
+    }
+    Ok(())
+}
+
 async fn pin_template_image(
     state: &ApiState,
     template: &mut crate::config::job::JobSpec,
@@ -291,14 +347,16 @@ async fn pin_template_image(
             .ok_or("signed image admission requires cluster trust state")?;
         let security = council.security_state().await;
         let catalog = council.manifest_catalog().await;
-        let root = security
-            .get_ca(crate::sesame::types::CaRole::Root)
-            .map(|ca| ca.certificate_der.as_slice());
+        let roots: Vec<Vec<u8>> = security
+            .trusted_cas(crate::sesame::types::CaRole::Root)
+            .into_iter()
+            .map(|ca| ca.certificate_der.clone())
+            .collect();
         if let Some(digest) = crate::meat::scheduler::verify_image_signature(
             template.image.as_deref(),
             &catalog,
             &state.task_arrays.trust_policy,
-            root,
+            &roots,
             Some(&security.crl),
         )
         .map_err(|e| e.to_string())?
@@ -318,6 +376,7 @@ pub async fn cancel_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     AxumPath(batch_id): AxumPath<u64>,
+    headers: HeaderMap,
 ) -> Response {
     let auth = auth.as_deref();
     if let Err(response) =
@@ -355,7 +414,7 @@ pub async fn cancel_handler(
     }
     if let Some(council) = follower_council(&state).await {
         let path = format!("/v1/batch/{batch_id}/cancel");
-        return forward_to_leader(&state, council, &path, String::new()).await;
+        return forward_to_leader(&state, council, &path, String::new(), &headers).await;
     }
     match write_task_array(&state, write).await {
         Ok(_) => (

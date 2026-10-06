@@ -803,6 +803,18 @@ The real-runc namespace regression connects successfully inside its namespace,
 refuses a cross-namespace service, removes the live binding during execution,
 and checks that the process tree has retired before recovery clears the journal.
 
+Rebasing this path onto the newer security work exposed a second admission
+boundary: arrays must bind tags and apply upstream trust rules before committing
+any definition, just as ordinary jobs do. Both array and mixed-profile submissions
+now use the API's shared image binder, verify required cosign signatures over the
+bound digest, and accept every still-trusted cluster root during CA rotation.
+Followers preserve caller authentication when forwarding admission and cancellation.
+The shared batch counter also checks space for the manifest parent and every
+profile before allocating anything. A refusal cannot leave half a manifest or
+panic a Raft replica when the counter is exhausted. Regression tests cover both
+submission forms, unavailable registries, refused upstream images, missing cosign
+verification, and exhausted IDs.
+
 ## Lessons from the phase
 
 **Optimisation is an audit with a deliverable.** The single most consistent finding of this phase wasn't a speed-up. It was library-not-wired: `add_port_mapping` with no production callers, `VolumeManager` with no production callers, an HTTPS-only pull client that made cluster images undeployable, a CLI that sent job names to a cluster that had never heard of the jobs. Well-tested libraries pass review; only tracing the live path from the user's artefact to the kernel finds the missing arrow. If you take one habit from this chapter: when you're asked to optimise something, first prove it runs.

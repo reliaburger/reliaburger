@@ -1,10 +1,10 @@
 # Batch jobs
 
 Development preview for 0.2.0. Build the PR #266 binaries and use a fresh
-cluster: protocol 36 and state 51 change the control messages, snapshots and
+cluster: protocol 47 and state 64 change the control messages, snapshots and
 worker ledgers. Production submissions require a council so definitions and
 identities survive restart; standalone in-memory execution is a test harness.
-The published 0.1.4 binaries do not have these commands.
+The published 0.1.5 binaries do not have these commands.
 
 ## Submit compact work
 
@@ -23,7 +23,8 @@ relish run --batch render --count 10000 --image renderer:v1 --cpu 250m-500m --me
 CPU and memory use the same request–limit syntax as apps. Requests govern local
 packing; rootful Linux containers enforce limits. Omitted values mean 1 CPU and
 64 MiB, including the limits. A profile that cannot run is shown as refused in
-status. An image must pass the cluster's signature policy.
+status. Images are bound to a digest at submission and must pass the cluster's Pickle
+and upstream trust policies, including required cosign signatures.
 
 Every task receives `RELIABURGER_TASK_INDEX`, `RELIABURGER_TASK_COUNT`, `RELIABURGER_BATCH_ID` and `RELIABURGER_TASK_ATTEMPT`.
 Its identity is the array ID and index; retries keep that identity. The job image and command apply to

@@ -36,6 +36,15 @@ fn router_with(
     history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
     binder: Option<ImageBinder>,
 ) -> (Router, CancellationToken) {
+    router_with_service(council, history, binder, None)
+}
+
+fn router_with_service(
+    council: Option<Arc<crate::council::CouncilNode>>,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    binder: Option<ImageBinder>,
+    service: Option<Arc<crate::bun::task_array_leader::TaskArrayService>>,
+) -> (Router, CancellationToken) {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let shutdown = CancellationToken::new();
     let mut agent = BunAgent::new(
@@ -45,8 +54,38 @@ fn router_with(
         shutdown.clone(),
     );
     tokio::spawn(async move { agent.run().await });
-    let app = router(
-        cmd_tx, None, None, history, None, None, council, None, None, None, None, None, 9117, None,
+    let app = router_with_upgrade(
+        cmd_tx,
+        None,
+        None,
+        history,
+        None,
+        None,
+        council,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+        None,
+        None,
+        "default".into(),
+        None,
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        crate::bun::capabilities::StaticCapabilities::default(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+        service,
     );
     let app = match binder {
         Some(binder) => app.layer(axum::Extension(binder)),
@@ -272,4 +311,136 @@ async fn a_rollback_restores_the_bound_digest_without_asking_the_registry() {
     assert_eq!(desired_image(&council, "web").await, Some(old));
     shutdown.cancel();
     council.raft().shutdown().await.unwrap();
+}
+
+/// Delegated entry points must honour the same binding policy as /v1/apply.
+#[tokio::test]
+async fn delegated_submissions_bind_before_registration_and_refuse_unresolved_images() {
+    for manifest in [false, true] {
+        for answer in [Some(7), None] {
+            let council = seeded_council("bind-delegated").await;
+            let (app, shutdown) = router_with(Some(council.clone()), None, Some(binder(answer)));
+            let template =
+                Config::parse("[job.render]\nimage = \"nginx:1.27\"\ncommand = [\"/bin/true\"]\n")
+                    .unwrap()
+                    .job
+                    .remove("render")
+                    .unwrap();
+            let profile = serde_json::json!({"name":"small", "count":1, "template":template});
+            let (uri, request) = if manifest {
+                (
+                    "/v1/batch/manifest",
+                    serde_json::json!({"name":"render", "cohort":[profile]}),
+                )
+            } else {
+                (
+                    "/v1/batch/array",
+                    serde_json::json!({"name":"render", "spec":{"count":1}, "template":template}),
+                )
+            };
+            let (status, body) = post(app, uri, &request.to_string()).await;
+            let desired = council.desired_state().await;
+            if answer.is_some() {
+                assert_eq!(status, StatusCode::ACCEPTED, "{uri}: {body}");
+                let record = desired.task_arrays.iter().next().unwrap().1;
+                assert_eq!(
+                    record.template.image.as_deref(),
+                    Some(format!("nginx:1.27@{}", digest(7).as_str()).as_str())
+                );
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}: {body}");
+                assert_eq!(desired.batch_state.next_batch_id, 1);
+                assert_eq!(desired.task_arrays.iter().count(), 0);
+            }
+            shutdown.cancel();
+            council.raft().shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn delegated_submissions_honour_upstream_allowlist_before_registration() {
+    for manifest in [false, true] {
+        let council = seeded_council("trust-delegated").await;
+        let restricted = binder(Some(7)).with_policy(crate::config::node::TrustPolicySection {
+            upstream_default: crate::config::node::UpstreamDefault { allow: false },
+            ..Default::default()
+        });
+        let (app, shutdown) = router_with(Some(council.clone()), None, Some(restricted));
+        let template = Config::parse(
+            "[job.render]\nimage = \"ghcr.io/evil/miner:1\"\ncommand = [\"/bin/true\"]\n",
+        )
+        .unwrap()
+        .job
+        .remove("render")
+        .unwrap();
+        let (uri, request) = if manifest {
+            (
+                "/v1/batch/manifest",
+                serde_json::json!({"name":"render", "cohort":[{"name":"small", "count":1, "template":template}]}),
+            )
+        } else {
+            (
+                "/v1/batch/array",
+                serde_json::json!({"name":"render", "spec":{"count":1}, "template":template}),
+            )
+        };
+        let (status, body) = post(app, uri, &request.to_string()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        let desired = council.desired_state().await;
+        assert_eq!(desired.batch_state.next_batch_id, 1);
+        assert_eq!(desired.task_arrays.iter().count(), 0);
+        shutdown.cancel();
+        council.raft().shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn delegated_submissions_refuse_a_required_cosign_check_without_a_signature_source() {
+    for manifest in [false, true] {
+        let council = seeded_council("cosign-delegated").await;
+        let policy = crate::config::node::TrustPolicySection {
+            upstream: vec![crate::config::node::UpstreamTrustRule {
+                pattern: "docker.io/library/nginx".into(),
+                require_signatures: true,
+                cosign_keys: vec![],
+            }],
+            ..Default::default()
+        };
+        let service = Arc::new(
+            crate::bun::task_array_leader::TaskArrayService::new(None)
+                .with_trust_policy(policy.clone()),
+        );
+        let (app, shutdown) = router_with_service(
+            Some(council.clone()),
+            None,
+            Some(binder(Some(7)).with_policy(policy)),
+            Some(service),
+        );
+        let template =
+            Config::parse("[job.render]\nimage = \"nginx:1.27\"\ncommand = [\"/bin/true\"]\n")
+                .unwrap()
+                .job
+                .remove("render")
+                .unwrap();
+        let (uri, request) = if manifest {
+            (
+                "/v1/batch/manifest",
+                serde_json::json!({"name":"render", "cohort":[{"name":"small", "count":1, "template":template}]}),
+            )
+        } else {
+            (
+                "/v1/batch/array",
+                serde_json::json!({"name":"render", "spec":{"count":1}, "template":template}),
+            )
+        };
+        let (status, body) = post(app, uri, &request.to_string()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        assert!(body.contains("cosign"), "{body}");
+        let desired = council.desired_state().await;
+        assert_eq!(desired.batch_state.next_batch_id, 1);
+        assert_eq!(desired.task_arrays.iter().count(), 0);
+        shutdown.cancel();
+        council.raft().shutdown().await.unwrap();
+    }
 }

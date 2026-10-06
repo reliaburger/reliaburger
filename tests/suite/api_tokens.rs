@@ -816,6 +816,7 @@ fn shared_authority_router(
         None,
         None,
         None,
+        None,
     )
 }
 

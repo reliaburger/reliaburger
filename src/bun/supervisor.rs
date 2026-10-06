@@ -689,7 +689,6 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_job(job_name, namespace, spec)?;
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
 
-
         let request = crate::meat::Resources::new(
             spec.cpu.map_or(0, |r| r.request),
             spec.memory.map_or(0, |r| r.request),

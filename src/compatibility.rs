@@ -296,8 +296,8 @@ mod tests {
     /// The generations before task arrays. There's no compatibility before
     /// 1.0.0, so nodes and data from then are refused, not migrated.
     const BEFORE_TASK_ARRAYS: Compatibility = Compatibility {
-        protocol: 34,
-        state: 49,
+        protocol: 46,
+        state: 63,
     };
 
     #[test]

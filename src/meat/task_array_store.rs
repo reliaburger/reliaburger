@@ -108,6 +108,17 @@ pub enum TaskArrayWrite {
     },
 }
 
+impl TaskArrayWrite {
+    /// IDs required by an atomic registration; progress writes allocate none.
+    pub fn registration_ids(&self) -> usize {
+        match self {
+            Self::Register { .. } => 1,
+            Self::RegisterManifest { cohorts, .. } => cohorts.len().saturating_add(1),
+            _ => 0,
+        }
+    }
+}
+
 /// What an applied write did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskArrayApplied {

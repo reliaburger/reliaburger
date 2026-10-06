@@ -65,8 +65,8 @@ mod test_leases;
 mod ui;
 mod upgrade;
 
-pub(crate) use apply::leader_api_url;
 use apply::{apply_handler, cluster_apply};
+pub(crate) use apply::{bind_images, leader_api_url};
 use apps::{delete_handler, exec_handler, stop_handler};
 use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{

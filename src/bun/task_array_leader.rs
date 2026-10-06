@@ -68,6 +68,8 @@ pub struct NodeView {
 pub struct TaskArrayService {
     /// Image signature policy applied before admission and dispatch.
     pub trust_policy: crate::config::node::TrustPolicySection,
+    /// Registry client shared with normal job admission for cosign checks.
+    pub signature_source: Option<crate::pickle::cosign::SignatureSource>,
     /// This node's executor; `None` means this node can't run tasks
     /// (it still coordinates when it leads).
     pub node: Option<Arc<TaskArrayNode>>,
@@ -98,6 +100,14 @@ impl TaskArrayService {
         self
     }
 
+    pub fn with_signature_source(
+        mut self,
+        source: Option<crate::pickle::cosign::SignatureSource>,
+    ) -> Self {
+        self.signature_source = source;
+        self
+    }
+
     /// Test harness service with explicit timings and volatile standalone state.
     /// Production uses `new`, which requires a council for durable definitions.
     pub fn with_timings(
@@ -107,6 +117,7 @@ impl TaskArrayService {
     ) -> Self {
         Self {
             trust_policy: Default::default(),
+            signature_source: None,
             require_council: false,
             node,
             sync_interval,
@@ -181,6 +192,9 @@ pub(crate) async fn write_task_array(
             ));
         }
         let mut tracker = state.batch_tracker.lock().await;
+        tracker
+            .preflight_ids(write.registration_ids())
+            .map_err(TaskArrayWriteError::Refused)?;
         let mut arrays = state.task_arrays.local.lock().await;
         return match arrays.apply(&write, || tracker.allocate_id()) {
             Ok(TaskArrayApplied::Registered { batch_id }) => Ok(Some(batch_id)),

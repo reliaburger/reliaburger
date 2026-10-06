@@ -2,7 +2,7 @@
 
 Status: in progress on `feat/million-jobs`, for **0.2.0** ("A million jobs").
 Task arrays are wired into Raft, the API and `relish` (M5). The wiring bumped
-the compatibility generations to protocol 36 and state 51, so 0.2.0 needs a
+the compatibility generations to protocol 47 and state 64, so 0.2.0 needs a
 fresh cluster: the maintainer decided on 28 September 2026 that there's no
 backwards compatibility before 1.0.0 (see [Compatibility](#compatibility)).
 

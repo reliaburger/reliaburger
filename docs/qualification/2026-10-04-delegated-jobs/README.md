@@ -152,3 +152,32 @@ launches children is the proposed command-job path; an explicit persistent
 worker protocol offers further savings with different isolation semantics.
 The [demo plan](../../plans/2026-10-04-plan-delegated-jobs.md#high-volume-container-jobs-on-the-landing-page)
 records the end-to-end acceptance gate. Executor reuse remains unimplemented.
+
+## 7 October rebase onto main
+
+The new base is `82fa78ee760b74303b4a6a2acf351f59ad67c2b0`, including the
+0.1.5 fixes and merged 0.1.6 security train. The rebased feature uses protocol
+47 / state 64; main uses 46 / 63. The measurements above describe the earlier
+build and do not qualify these rebased binaries.
+
+The integration preserves main's batch preflight/ownership rules, forwards
+caller credentials, binds delegated images at admission, applies upstream
+allowlists and required cosign checks, and verifies every still-trusted root
+during CA rotation. Array and manifest registration preflight the entire shared
+ID allocation before changing state. New regression tests reproduced the
+image-admission bypass and counter-exhaustion panic before these fixes.
+
+Local validation of the final source changes, before their integration commit:
+
+- `make ci NEXTEST_PROFILE=ci`: formatting, both all-target Clippy configurations,
+  6,073 portable tests, two doctests, 317 CI-script tests and ignored-test ownership
+  passed. [Portable CI log](rebase-main-20261007-ci.log).
+- `make test-cluster NEXTEST_PROFILE=ci`: 44 passed, one skipped.
+  [Cluster log](rebase-main-20261007-cluster.log).
+
+Both commands used `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_NET_OFFLINE=true` and an isolated
+`CARGO_TARGET_DIR` on the macOS host. Tests retain the repository's line-table
+profile. GitHub full CI supplies fresh Linux/runtime and other platform checks
+on the published commit; the earlier Linux and demo evidence above remains
+historical until those checks complete.
