@@ -7,6 +7,7 @@ use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, tra
 use super::*;
 use crate::grill::mock::MockGrill;
 
+mod fault_coverage;
 mod loop_harness;
 mod loop_rule;
 mod namespace_secrets;

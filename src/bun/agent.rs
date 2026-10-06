@@ -92,6 +92,7 @@ mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
 mod egress_resolution;
+mod fault_coverage;
 mod faults;
 mod follow_ups;
 mod health_checks;
