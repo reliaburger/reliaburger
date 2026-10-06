@@ -1,238 +1,34 @@
 name: CI
 
+# Throwaway loop for #625: run the partition coverage test and the podinfo
+# partition test repeatedly on the privileged runner, under CPU load, on the
+# test-only commit (red) and the fix (fix). Closed, not merged.
 on:
-  workflow_call:
-  push:
-    branches: [main]
   pull_request:
-    # fix/** covers review PRs stacked on each other rather than on main.
-    # release-* is each release's merge train: PRs into it get the whole of CI.
-    branches: [main, "codex/**", "fix/**", "release-*"]
-    # labeled lets a `full-ci` label start the heavy suites on a stacked PR.
-    types: [opened, synchronize, reopened, labeled]
-  schedule:
-    # Nightly full run on main, including the benchmarks.
-    - cron: "17 3 * * *"
-
-# PR updates supersede earlier checks. Main/tag runs each retain their own group.
-# Fixed prefixes also keep reusable source CI separate from its release caller,
-# and github.workflow (the caller's name when called) keeps a retarget run
-# (ci-retarget.yml) from cancelling the pull request's own run.
-concurrency:
-  group: source-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    branches: [release-0-1-6]
 
 permissions:
   contents: read
 
-# Caches: GitHub keeps 10 GB per repository. Jobs that build the same profile
-# share one key, and only pushes to main save, even when tests fail. PRs,
-# stacked or not, restore main's cache instead of evicting each other's.
-# Release trains don't save either. rust-cache keys on the toolchain, the
-# environment and Cargo.lock plus Cargo.toml (minus versions), so a train PR
-# whose dependencies match main's gets a full hit, and one that changed them
-# restores main's and rebuilds only the changed crates. The workspace crate
-# itself, most of each job's compile time, is never cached. Saving from trains
-# would need a push run per train merge and another ~5 GB of cache.
-# Debug builds keep line tables only: backtraces still name files and lines,
-# and each target cache is roughly half the size, so they all fit.
-# Artefacts: reports are kept 14 days; release candidates keep their 90.
-# Every owner retains current discovery, completion and JUnit together.
-# Aggregation binds them to successful current-run producer outputs.
-
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_PROFILE: ci
-  EXPECTED_CHECKOUT_COMMIT: ${{ github.sha }}
-  PYTHONDONTWRITEBYTECODE: '1'
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  changes:
-    # Which job groups this run needs; see scripts/ci/select-jobs.sh.
-    name: select jobs
+  loop:
+    name: loop ${{ matrix.variant }} ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    outputs:
-      code: ${{ steps.select.outputs.code }}
-      gossip: ${{ steps.select.outputs.gossip }}
-      heavy: ${{ steps.select.outputs.heavy }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, red]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - id: select
-        env:
-          EVENT: ${{ github.event_name }}
-          # The PR event names the branch it targets; github.base_ref reported
-          # main for a PR stacked on another branch (run 35921062344).
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
-        run: scripts/ci/select-jobs.sh
-
-  ci-policy:
-    # The CI scripts' own tests (job selection, ignored-test owners, JUnit
-    # keeping) and the rule that every #[ignore] names who runs it. Cheap,
-    # so it runs on every change, documentation included.
-    name: CI policy
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Test the CI scripts
-        run: make test-ci-scripts
-      - name: Every ignored test names its owner
-        run: make check-ignored
-
-  dependency-audit:
-    name: dependency advisory audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-audit
-      - run: make audit
-
-  lint:
-    # Formatting and Clippy report on their own, a few minutes in, instead of
-    # waiting behind the test suite.
-    name: lint
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: lint
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - name: Prepare portable build host
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang libbpf-dev llvm
-      - name: Format
-        run: make fmt-check
-      - name: Lint every target, with all features and with none
-        run: make lint
-
-  demo-app:
-    # The five-minute tour builds examples/demo/burger on a node. Its own Go
-    # tests take seconds, so they run on every code change.
-    name: demo app
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: examples/demo/burger/go.mod
-          cache: false
-      - name: Vet and test the demo app
-        working-directory: examples/demo/burger
-        run: |
-          go vet ./...
-          go test ./...
-
-  minimum-rust:
-    # The declared minimum compiler must build every target with and without
-    # default features. The stable jobs run the tests, so running them again
-    # on 1.97 would only repeat the same suite.
-    name: minimum Rust 1.97.0
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: minimum-rust
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - name: Prepare portable build host
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get remove -y -qq buildah
-          sudo apt-get install -y -qq clang libbpf-dev llvm
-      - name: Check every target and feature with the locked graph
-        run: cargo check --locked --all-targets --all-features
-      - name: Check every target without default features
-        run: cargo check --locked --all-targets --no-default-features
-
-  portable:
-    outputs:
-      portable_linux_sha256: ${{ steps.portable_linux.outputs.portable_linux_sha256 }}
-    # The Linux portable suite runs once, instrumented: the same run is the
-    # test gate, the coverage gate and the JUnit source.
-    name: portable Linux
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145,cargo-llvm-cov@0.9.1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: portable
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      # Cache cleanup may retain empty generated directories. Clear old
-      # envelopes once; each fresh owner remains exclusive within this job.
-      - name: Clear restored execution envelopes
-        run: rm -rf -- target/contracts
-      - name: Prepare portable build host
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get remove -y -qq buildah
-          sudo apt-get install -y -qq clang libbpf-dev llvm
-      - name: Portable tests with line coverage
-        id: portable_linux
-        run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain portable-linux current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-portable-linux
-          path: target/contracts/linux/portable-linux
-          if-no-files-found: error
-          retention-days: 14
-      - name: Doctests
-        run: make test-doc
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: target/coverage
-          if-no-files-found: warn
-          retention-days: 14
-
-  linux:
-    outputs:
-      rootless_linux_sha256: ${{ steps.rootless_linux.outputs.rootless_linux_sha256 }}
-      linux_root_storage_sha256: ${{ steps.linux_root_storage.outputs.linux_root_storage_sha256 }}
-      oci_interruptions_sha256: ${{ steps.oci_interruptions.outputs.oci_interruptions_sha256 }}
-    name: privileged Linux
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
+          ref: ${{ matrix.variant == 'red' && '4e61ffec9b7474692bdd966e5af2fe6ac05cfd2e' || '32ce1d3bb8b16cf8b14424435a0a9cc31e9fce3c' }}
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
@@ -240,350 +36,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-privileged
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - name: Clear restored execution envelopes
-        run: rm -rf -- target/contracts
+          save-if: false
       - name: Install runtime and kernel test dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq btrfs-progs buildah busybox-static gcc clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
-      - name: Mount persistent BPF storage for kernel recovery tests
+      - name: Mount persistent BPF storage
         run: mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
-      - name: Permit rootless runc on Ubuntu AppArmor hosts
-        run: |
-          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
       - name: Restore the pinned test images
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/test-images
           key: test-images-${{ runner.arch }}-${{ hashFiles('tests/fixtures/pinned-images.txt') }}
       - name: Warm the pinned test images
-        # One fetch with retries, before any timed test. The suites then pull
-        # from a loopback mirror of this digest-verified cache.
         run: make test-images TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
-      - name: Prove rootless port adoption
-        id: rootless_linux
+      - name: Build
+        run: cargo build --features ebpf --bin bun && cargo nextest list --features ebpf -E 'binary(kubernetes_demo) | binary(ebpf)' >/dev/null
+      - name: Loop the partition test under load
         run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate rootless-linux --host linux --directory target/contracts/linux/rootless-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain rootless-linux current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-rootless-linux
-          path: target/contracts/linux/rootless-linux
-          if-no-files-found: error
-          retention-days: 14
-      - name: Qualify actual Bun OCI interruptions
-        id: oci_interruptions
-        run: scripts/release/qualify-oci-interruptions.sh
-      - name: Retain oci-interruptions current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-oci-interruptions
-          path: target/contracts/linux/oci-interruptions
-          if-no-files-found: error
-          retention-days: 14
-      - name: Run only provisioned Linux tests
-        id: linux_root_storage
-        run: |
-          sudo -E env PATH="$PATH" python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate linux-root-storage --host linux --directory target/contracts/linux/linux-root-storage --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Restore root-storage evidence ownership
-        if: always()
-        run: |
-          if [ -d target/contracts/linux/linux-root-storage ]; then
-            sudo chown -R "$(id -u):$(id -g)" -- target/contracts/linux/linux-root-storage
-          fi
-      - name: Retain linux-root-storage current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-linux-root-storage
-          path: target/contracts/linux/linux-root-storage
-          if-no-files-found: error
-          retention-days: 14
-  build-tests:
-    outputs:
-      archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
-      archive_origin_sha256: ${{ steps.archive.outputs.archive_origin_sha256 }}
-      archive_runtime_sha256: ${{ steps.archive.outputs.archive_runtime_sha256 }}
-    # Compile the portable test binaries once. The acceptance jobs download
-    # this nextest archive instead of each rebuilding every test binary.
-    # Runners check out to the same path, so the archive's compiled-in binary
-    # paths still resolve after extraction.
-    name: build tests
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: linux-debug
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - id: archive
-        run: >-
-          python3 scripts/ci/workflow_adapter.py archive --root . --host linux
-          --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID"
-          --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nextest-archive
-          path: |
-            tests.tar.zst
-            archive-origin.json
-            archive-runtime.json
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-
-  cluster:
-    outputs:
-      cluster_tests_sha256: ${{ steps.cluster_tests.outputs.cluster_tests_sha256 }}
-    name: multi-node cluster
-    needs: [changes, build-tests]
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive
-      - name: Multi-node cluster suites
-        id: cluster_tests
-        run: |
-          mkdir -p target
-          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain cluster-tests current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-cluster-tests
-          path: target/contracts/linux/cluster-tests
-          if-no-files-found: error
-          retention-days: 14
-  acceptance:
-    outputs:
-      slow_tests_sha256: ${{ steps.slow_tests.outputs.slow_tests_sha256 }}
-      upgrade_node_sha256: ${{ steps.upgrade_node.outputs.upgrade_node_sha256 }}
-      upgrade_cluster_sha256: ${{ steps.upgrade_cluster.outputs.upgrade_cluster_sha256 }}
-      standard_clients_sha256: ${{ steps.standard_clients.outputs.standard_clients_sha256 }}
-    # Wall-clock, single-node upgrade and cluster upgrade suites, plus the
-    # crane interoperability test: each used to pay for its own test build.
-    name: acceptance
-    needs: [changes, build-tests]
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive
-      - name: Wall-clock acceptance
-        id: slow_tests
-        run: |
-          mkdir -p target
-          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain slow-tests current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-slow-tests
-          path: target/contracts/linux/slow-tests
-          if-no-files-found: error
-          retention-days: 14
-      - name: Single-node upgrade
-        id: upgrade_node
-        if: ${{ !cancelled() }}
-        run: |
-          mkdir -p target
-          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain upgrade-node current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-upgrade-node
-          path: target/contracts/linux/upgrade-node
-          if-no-files-found: error
-          retention-days: 14
-      - name: Cluster upgrade
-        id: upgrade_cluster
-        if: ${{ !cancelled() }}
-        run: |
-          mkdir -p target
-          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain upgrade-cluster current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-upgrade-cluster
-          path: target/contracts/linux/upgrade-cluster
-          if-no-files-found: error
-          retention-days: 14
-      - name: Install crane
-        # Pinned release, checked against the digest in its checksums.txt.
-        if: ${{ !cancelled() }}
-        env:
-          CRANE_VERSION: v0.22.1
-          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
-        run: |
-          curl -fsSLo "$RUNNER_TEMP/crane.tar.gz" "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
-          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum --check
-          mkdir -p "$RUNNER_TEMP/crane"
-          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane" crane
-          echo "$RUNNER_TEMP/crane" >> "$GITHUB_PATH"
-      - name: Standard registry clients
-        id: standard_clients
-        if: ${{ !cancelled() }}
-        run: |
-          mkdir -p target
-          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain standard-clients current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-standard-clients
-          path: target/contracts/linux/standard-clients
-          if-no-files-found: error
-          retention-days: 14
-  contract-boundaries:
-    name: optimized contract boundaries
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      optimized_cron_sha256: ${{ steps.optimized_cron.outputs.optimized_cron_sha256 }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - name: Actual-source optimized cron boundaries
-        id: optimized_cron
-        run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate optimized-cron --host linux --directory target/contracts/linux/optimized-cron --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain optimized-cron current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-linux-optimized-cron
-          path: target/contracts/linux/optimized-cron
-          if-no-files-found: error
-          retention-days: 14
-
-  ignored-evidence:
-    name: ignored-test evidence
-    needs: [changes, portable, macos, contract-boundaries, build-tests, linux, cluster, acceptance]
-    if: ${{ always() && needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: contract-*
-          path: incoming
-          merge-multiple: false
-      - name: Every selected owner and exact required case completed this run
-        run: |
-          mkdir -p target
-          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py aggregate --root . \
-            --manifest tests/contracts/manifest.json --directory incoming \
-            --ignored-bindings tests/contracts/ignored-bindings.json \
-            --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
-
-  macos:
-    outputs:
-      portable_darwin_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_sha256 }}
-    name: portable macOS
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          components: clippy
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.145
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: macos
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - name: Clear restored execution envelopes
-        run: rm -rf -- target/contracts
-      # One pass, all features: the macOS-only code is in it, and the lint
-      # job runs the no-features pass on Linux (see lint-macos in Makefile).
-      - name: Lint every target, with all features
-        run: make lint-macos
-      - name: Portable tests
-        id: portable_darwin
-        run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --host darwin --directory target/contracts/darwin/portable-darwin --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - name: Retain portable-darwin current execution envelope
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-darwin-portable-darwin
-          path: target/contracts/darwin/portable-darwin
-          if-no-files-found: error
-          retention-days: 14
-      - name: Doctests
-        run: make test-doc
-  benchmarks:
-    # Criterion output is uploaded, not gated, so pull requests only pay for
-    # the release build when they touch the gossip protocol or its benches.
-    name: benchmarks
-    needs: changes
-    if: needs.changes.outputs.gossip == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: bench
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - run: make bench
-      - run: make bench-large
-      - uses: actions/upload-artifact@v4
-        with:
-          name: criterion
-          path: target/criterion
-          if-no-files-found: error
-          retention-days: 14
+          for _ in 1 2 3; do (yes > /dev/null &); done
+          passed=0; failed=0; cover_failed=0; podinfo_failed=0
+          for i in $(seq 1 10); do
+            if sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux \
+                TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images" \
+                LINUX_EXCLUDE='& (test(podinfo_demo_feels_network_faults_between_frontend_and_redis) | test(partition_answers_only_once_every_source_instance_is_covered))' \
+                > "run-$i.log" 2>&1; then
+              passed=$((passed+1))
+            else
+              failed=$((failed+1))
+              echo "::warning::iteration $i failed"
+              grep -q "FAIL .*partition_answers_only_once" "run-$i.log" && cover_failed=$((cover_failed+1))
+              grep -q "FAIL .*podinfo_demo_feels_network_faults" "run-$i.log" && podinfo_failed=$((podinfo_failed+1))
+              grep -E "kept reaching|reported in place|panicked|inject_fault|FAIL" "run-$i.log" | head -20 || true
+            fi
+          done
+          line="RESULT ${{ matrix.variant }} shard ${{ matrix.shard }}: $passed of 10 iterations passed; coverage test failed $cover_failed, podinfo test failed $podinfo_failed"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          [ "$failed" -eq 0 ]
