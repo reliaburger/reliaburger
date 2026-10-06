@@ -75,11 +75,15 @@ impl Injection {
     }
 }
 
+/// One caller's cgroup read: `None` when it ran out of patience, otherwise
+/// the runtime's answer (an error rendered as text, since it crosses tasks).
+type CgroupRead = Option<Result<Option<u64>, String>>;
+
 /// What a task read for an injection's unnamed callers.
 pub(super) struct CallersRead {
     injection: Injection,
-    /// Each caller's read; `None` when it ran out of patience.
-    cgroups: Vec<(PendingCaller, Option<Result<Option<u64>, String>>)>,
+    /// Each caller and what its read found.
+    cgroups: Vec<(PendingCaller, CgroupRead)>,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
