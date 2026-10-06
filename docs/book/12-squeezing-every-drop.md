@@ -815,6 +815,13 @@ panic a Raft replica when the counter is exhausted. Regression tests cover both
 submission forms, unavailable registries, refused upstream images, missing cosign
 verification, and exhausted IDs.
 
+The image-backed acceptance tests have their own `owned_task_arrays` binary.
+The regular Linux gate keeps the warmed image mirror alive while they run;
+the OCI interruption driver isolates networking and cannot serve that role.
+Main's finite evidence registry now names both runtime cases and the cluster
+worker-loss case explicitly. A repository regression check catches missing
+bindings and stale reviewed OCI source fingerprints before aggregation.
+
 ## Lessons from the phase
 
 **Optimisation is an audit with a deliverable.** The single most consistent finding of this phase wasn't a speed-up. It was library-not-wired: `add_port_mapping` with no production callers, `VolumeManager` with no production callers, an HTTPS-only pull client that made cluster images undeployable, a CLI that sent job names to a cluster that had never heard of the jobs. Well-tested libraries pass review; only tracing the live path from the user's artefact to the kernel finds the missing arrow. If you take one habit from this chapter: when you're asked to optimise something, first prove it runs.

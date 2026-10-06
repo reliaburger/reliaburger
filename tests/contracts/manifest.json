@@ -7768,6 +7768,87 @@
           ]
         }
       ]
+    },
+    {
+      "id": "issue-588-a_task_array_survives_losing_a_node_mid_run",
+      "issue": 588,
+      "promise": "Delegated arrays retain unique accepted outcomes after worker loss.",
+      "supported_paths": [
+        "Multi-node councils and worker ledgers"
+      ],
+      "cases": [
+        {
+          "id": "delegated-a_task_array_survives_losing_a_node_mid_run",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "a_task_array_survives_losing_a_node_mid_run",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Duplicate accepted outcomes from a lost worker cannot count twice."
+      ],
+      "boundaries": [
+        "The real multi-node gate, including worker loss, must complete on this checkout."
+      ]
+    },
+    {
+      "id": "issue-588-runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_process_trees",
+      "issue": 588,
+      "promise": "Real image-backed task arrays enforce shared resources, lifecycle retirement and namespace isolation.",
+      "supported_paths": [
+        "Rootful Linux owned containers with warmed digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "delegated-runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_process_trees",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_process_trees",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Unreserved task capacity and unguarded cross-namespace connections cannot be accepted."
+      ],
+      "boundaries": [
+        "These image-backed cases require the warmed-image Linux gate; the network-isolated OCI interruption driver cannot substitute."
+      ]
+    },
+    {
+      "id": "issue-588-runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner",
+      "issue": 588,
+      "promise": "Real image-backed task arrays enforce shared resources, lifecycle retirement and namespace isolation.",
+      "supported_paths": [
+        "Rootful Linux owned containers with warmed digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "delegated-runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Unreserved task capacity and unguarded cross-namespace connections cannot be accepted."
+      ],
+      "boundaries": [
+        "These image-backed cases require the warmed-image Linux gate; the network-isolated OCI interruption driver cannot substitute."
+      ]
     }
   ]
 }

@@ -1390,5 +1390,23 @@
     "function": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
     "binary": "reliaburger::owned_runc",
     "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "a_task_array_survives_losing_a_node_mid_run",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "a_task_array_survives_losing_a_node_mid_run"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_process_trees",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_process_trees"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner"
   }
 ]

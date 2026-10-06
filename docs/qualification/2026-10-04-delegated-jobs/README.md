@@ -181,3 +181,15 @@ Both commands used `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`,
 profile. GitHub full CI supplies fresh Linux/runtime and other platform checks
 on the published commit; the earlier Linux and demo evidence above remains
 historical until those checks complete.
+
+The first published rebase (`96a3ecbe`) exposed a Linux-only API fixture argument
+and missing registrations in main's finite evidence inventory. The follow-up
+adds the optional task-array service argument to the retained capacity fixture,
+moves the two unchanged image-backed cases into `owned_task_arrays` under the
+warmed-image Linux owner, and registers their exact identities together with the
+worker-loss cluster case. The OCI aliases keep the same twenty identities; their
+source fingerprints reflect only the retained fixture's extra API argument.
+A new repository regression first failed for missing bindings and then stale
+fingerprints; all 318 CI-script tests and ignored-test ownership subsequently
+passed. [Registry validation](rebase-main-20261007-owner.log). Fresh Linux CI must
+validate the final published head; local macOS cannot compile these gated bodies.

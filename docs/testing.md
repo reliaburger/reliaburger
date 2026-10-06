@@ -99,6 +99,13 @@ legacy OCI mappings retain their original `make test-linux` declarations and
 receive evidence through the owned interruption driver; no other case gets an
 alias by resemblance.
 
+The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
+run through `make test-linux`, where the warmed digest-pinned mirror remains
+reachable. They do not run in the OCI interruption driver's isolated network
+namespace. Their exact identities and the worker-loss cluster case are recorded
+in the finite inventory. A repository check verifies complete ignored-test
+bindings and current fingerprints for the retained OCI aliases.
+
 Gates CI can't run are manual, so the evidence check skips them:
 
 | Gate | Needs |
