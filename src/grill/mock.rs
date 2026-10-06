@@ -74,6 +74,9 @@ pub struct MockGrill {
     /// Time each force-kill request takes, as `runc kill` does on a loaded host.
     kill_delay: Arc<Mutex<Option<std::time::Duration>>>,
     pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// Time each workload cgroup read takes, as runc's owner lock does on a
+    /// loaded host.
+    workload_cgroup_delay: Arc<Mutex<Option<std::time::Duration>>>,
     /// Per-instance pid delays, on top of `pid_delay`.
     instance_pid_delays: Arc<Mutex<HashMap<InstanceId, std::time::Duration>>>,
     /// Make pid reads fail, as an owner that doesn't answer does.
@@ -132,6 +135,7 @@ impl Default for MockGrill {
             inventory_delay: Arc::default(),
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
+            workload_cgroup_delay: Arc::default(),
             instance_pid_delays: Arc::default(),
             fail_pid: Arc::default(),
             fail_create: Arc::default(),
@@ -432,6 +436,11 @@ impl MockGrill {
         *self.pid_delay.lock().unwrap() = delay;
     }
 
+    /// Delay every workload cgroup read, as runc's owner does on a loaded host.
+    pub fn set_workload_cgroup_delay(&self, delay: Option<std::time::Duration>) {
+        *self.workload_cgroup_delay.lock().unwrap() = delay;
+    }
+
     /// Make every pid read fail, as a runtime that can't say does.
     pub fn set_fail_pid(&self, fail: bool) {
         self.fail_pid.store(fail, Ordering::SeqCst);
@@ -726,6 +735,10 @@ impl super::Grill for MockGrill {
     }
 
     async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
+        let delay = *self.workload_cgroup_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if !*self.honours_cgroup_path.lock().unwrap()
             || self.state_overrides.lock().unwrap().get(instance) == Some(&ContainerState::Stopped)
         {

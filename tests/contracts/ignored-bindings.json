@@ -391,6 +391,12 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "partition_answers_only_once_every_source_instance_is_covered",
+    "binary": "reliaburger::ebpf",
+    "test": "partition_answers_only_once_every_source_instance_is_covered"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "egress_denied_by_default_allowed_when_listed",
     "binary": "reliaburger::ebpf",
     "test": "egress_denied_by_default_allowed_when_listed"

@@ -30,6 +30,9 @@ pub(super) enum FollowUp {
     },
     /// A kill, pause or resume fault's signals were sent, or weren't.
     Signalled(super::signal_faults::Signalled),
+    /// The cgroups of the callers an injection couldn't name in its turn
+    /// were read, or ran out of time.
+    CallersRead(super::fault_coverage::CallersRead),
     /// A node-pressure helper started or stopped.
     NodePressure(super::node_pressure_work::PressureDone),
     /// The egress allowlists were re-resolved.
@@ -121,6 +124,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             Ok((_, FollowUp::Signalled(done))) => self.finish_signal_fault(done),
+            Ok((_, FollowUp::CallersRead(read))) => self.finish_callers_read(read).await,
             Ok((_, FollowUp::NodePressure(done))) => {
                 self.finish_node_pressure(done).await;
             }

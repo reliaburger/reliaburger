@@ -4213,6 +4213,34 @@ partition is really in place. A reconcile nobody is waiting on, such as a
 health tick picking up a restarted caller, still sends its late cuts off to
 finish on their own.
 
+Three releases later the same test failed the same way on the 0.1.6 gate
+(#625), with the same `agent loop turn took 501 ms in command (inject_fault)`.
+The late-cut code hadn't changed since 0.1.3. What had we missed? A cut
+needs a key, and a partition from `frontend` keys each frontend by its
+cgroup id, which the runtime names only when asked. The injecting turn asks
+under the same 500 ms budget, one frontend after another, and on a loaded
+runner runc's answer can take a few hundred milliseconds. A frontend the turn
+couldn't name was simply left out: no `fault_connect_map` key, so nothing to
+cut and nothing in `LateCuts` to wait for. `InjectFault` answered with one
+frontend partitioned, and the health tick a second later (it took 297 ms in
+the log) partitioned the other two. Meanwhile their pools served the test's
+cache calls.
+
+So the answer waits for the callers too. `local_callers` remembers the ones
+whose read ran out of time as pending, and when the fault is keyed by caller
+cgroup (`keyed_by_caller_cgroup`: a partition from one app) the injection
+hands those callers to a follow-up task, the pattern the kill and pause
+faults already use for pids. The task reads their cgroups with a 10-second
+patience while the turn's late cuts finish alongside, under `tokio::join!`.
+Back on the loop, the agent caches the cgroups, reconciles so they get their
+keys, and cuts their connections again. That second cut matters: a health
+tick may have keyed them while the task was reading and sent its own cut to
+a task nobody waits for. Only then does the caller hear. A caller the
+runtime still can't name after 10 seconds (or after three rounds of
+restarts) fails the injection, and the agent takes the rule back. A fault
+that reaches two frontends out of three isn't in place, and we'd rather say
+so than pretend.
+
 The helper that runs one cut has a signature worth a second look:
 
 ```rust
