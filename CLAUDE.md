@@ -37,7 +37,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): patch releases 0.1.5 (bug fixes, ready for release, qualification to follow) and 0.1.6 (operations security, ready for release, qualification to follow) next, then one headline feature per minor release. New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
+Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, and 0.1.5 on 6 October 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): patch release 0.1.6 (operations security, ready for release, qualification to follow) next, then one headline feature per minor release. New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
