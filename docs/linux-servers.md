@@ -106,8 +106,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.4 or vX.Y.Z)
-VERSION="v0.1.4"
+# Release version to install (e.g. v0.1.5 or vX.Y.Z)
+VERSION="v0.1.5"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -134,7 +134,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.1.4 (33a5c88)`. Every node should print the same commit.
+`bun 0.1.5 (ca2c33a)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `clang llvm libbpf-dev` and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
@@ -536,8 +536,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.4 or vX.Y.Z)
-VERSION="v0.1.4"
+# Release version to install (e.g. v0.1.5 or vX.Y.Z)
+VERSION="v0.1.5"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp

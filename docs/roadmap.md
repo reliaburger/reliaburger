@@ -184,10 +184,10 @@ migration and no feature gate
   ([#505](https://github.com/reliaburger/reliaburger/issues/505)), a pooled peer connection presenting an expired leaf
   ([#509](https://github.com/reliaburger/reliaburger/issues/509)), and the leader resigning for disk pressure over unexported logs
   ([#510](https://github.com/reliaburger/reliaburger/issues/510)).
-- [ ] **0.1.5: bug fixes, ready for release, qualification to follow**
+- [x] **0.1.5: bug fixes.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.5)
+  on 6 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/11), merge
-  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). Every
-  item below has landed on `release-1-1-5`, and the crate says 0.1.5:
+  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). 0.1.5 is the bug-fix release:
   - [x] token list with scope, expiry and last use, and an hourly sweep of
     expired tokens that never removes the last Admin (F05 I2,
     [#483](https://github.com/reliaburger/reliaburger/pull/483));
@@ -216,15 +216,29 @@ migration and no feature gate
     count persists, a spool quota independent of the host disk, warmed fake
     executables and closed scripted connections ([#497](https://github.com/reliaburger/reliaburger/issues/497), [#500](https://github.com/reliaburger/reliaburger/issues/500),
     [#508](https://github.com/reliaburger/reliaburger/issues/508), [#517](https://github.com/reliaburger/reliaburger/issues/517), [#519](https://github.com/reliaburger/reliaburger/issues/519)–[#521](https://github.com/reliaburger/reliaburger/issues/521), [#524](https://github.com/reliaburger/reliaburger/issues/524), [#585](https://github.com/reliaburger/reliaburger/issues/585), [#523](https://github.com/reliaburger/reliaburger/pull/523),
-    [#525](https://github.com/reliaburger/reliaburger/pull/525), [#557](https://github.com/reliaburger/reliaburger/pull/557), [#586](https://github.com/reliaburger/reliaburger/pull/586)).
+    [#525](https://github.com/reliaburger/reliaburger/pull/525), [#557](https://github.com/reliaburger/reliaburger/pull/557), [#586](https://github.com/reliaburger/reliaburger/pull/586));
+  - [x] adopted processes identified by boot-relative clock ticks, so a guest
+    clock step can't crash-loop a node, and stale runc records retired instead
+    of refused ([#607](https://github.com/reliaburger/reliaburger/issues/607), [#609](https://github.com/reliaburger/reliaburger/pull/609));
+  - [x] backported from 0.1.6: a node's first consumer sync after a restart
+    takes one slow wait a turn, and every file lock unlocks on drop
+    ([#603](https://github.com/reliaburger/reliaburger/issues/603), [#606](https://github.com/reliaburger/reliaburger/issues/606), [#613](https://github.com/reliaburger/reliaburger/issues/613), [#615](https://github.com/reliaburger/reliaburger/pull/615)).
 
   The self-upgrade fixes for the privileged Linux `oci_crash` flake are in
   too, but that flake isn't proven gone yet, so
   [#526](https://github.com/reliaburger/reliaburger/issues/526) stays open. 0.1.5
   changes the protocol and state formats (34 and 49 in 0.1.4; 40 and 58 now,
-  for the token sweep and the audit fixes), so a 0.1.4 cluster can't roll to
-  it: recreate the cluster
+  for the token sweep, the audit fixes and boot IDs on instance records), so a
+  0.1.4 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.4](releasing.md#upgrading-from-014)).
+  The first candidate's 8-hour final tier found a crash loop after a guest
+  clock step ([#607](https://github.com/reliaburger/reliaburger/issues/607)); [#609](https://github.com/reliaburger/reliaburger/pull/609) fixed it and the
+  release was re-cut. The re-cut passed the
+  [staged install](qualification/2026-10-05-v0.1.5-staged-install-apple-silicon.md),
+  the [compressed](qualification/2026-10-05-v0.1.5-soak-compressed.md) and
+  [full](qualification/2026-10-05-v0.1.5-soak-full.md) soaks and the
+  [8-hour final tier](qualification/2026-10-05-v0.1.5-sustained-v02-final.md),
+  where the V02 gate passed.
 - [ ] **0.1.6: operations security, ready for release, qualification to follow**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/12), merge
   train [#616](https://github.com/reliaburger/reliaburger/pull/616)). The rest of the 0.1.4 security
@@ -328,15 +342,17 @@ what's shipped and what's scheduled.
   [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
   [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F07 part 2
   and the first steps of F03–F05, landed),
-  [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11) (F05 I2),
+  [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11) (F05 I2, landed),
   [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
   F04 R1–R4, F05 I3–I4),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
   F06, F09, F11).
-- **Known bugs and flakes.** All of them are in
-  [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11); the open
+- **Known bugs and flakes.** The open ones, the guest clock steps
+  ([#608](https://github.com/reliaburger/reliaburger/issues/608)) and the `oci_crash` flake
+  ([#526](https://github.com/reliaburger/reliaburger/issues/526)), are in
+  [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12); the open
   flakes are also in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
 
