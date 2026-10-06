@@ -277,14 +277,20 @@ migration and no feature gate
   namespace keys), so a 0.1.5 cluster can't roll to it:
   recreate the cluster ([upgrading from 0.1.5](releasing.md#upgrading-from-015)).
   The security work comes before real fleets in 0.3.0.
-- [ ] **0.2.0: "A million jobs"**
+- [x] **0.2.0: "A million jobs", foundation ready to merge after 0.1.6**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
-  keep compact state in Raft and expand on each node. The development draft
+  keep compact state in Raft and expand on each node. The completed foundation
   adds mixed resource profiles, shared app/job admission, durable worker outcomes,
-  summaries and indexed detail ([implementation plan](plans/2026-10-04-plan-delegated-jobs.md)).
-  The million-task release gate and sustained 100m/day claim still require
-  real-runtime qualification ([evidence](qualification/2026-10-04-delegated-jobs/README.md)).
+  summaries and indexed detail, with the whitepaper, book, manual and independent
+  landing-page recording ([implementation plan](plans/2026-10-04-plan-delegated-jobs.md)).
+  The PR is rebased onto the merged 0.1.6 train, ready for review, and its full
+  CI and build validation pass. This tick records the foundation's readiness;
+  0.2.0 isn't released. The common singleton/batch/cron path, reusable executors
+  and high-volume demonstration remain in
+  [#588](https://github.com/reliaburger/reliaburger/issues/588). The million-task
+  release gate and sustained 100m/day claim still require real-runtime
+  qualification ([evidence](qualification/2026-10-04-delegated-jobs/README.md)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
