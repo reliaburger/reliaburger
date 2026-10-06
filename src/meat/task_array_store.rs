@@ -69,6 +69,8 @@ pub struct TaskManifest {
 /// A change to the set of task arrays. Carried by one Raft entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TaskArrayWrite {
+    /// Definition/run transaction using the same indexed execution state.
+    Job(Box<super::job::JobWrite>),
     /// Atomically register every profile before any work is dispatched.
     RegisterManifest {
         name: String,
@@ -112,7 +114,7 @@ impl TaskArrayWrite {
     /// IDs required by an atomic registration; progress writes allocate none.
     pub fn registration_ids(&self) -> usize {
         match self {
-            Self::Register { .. } => 1,
+            Self::Register { .. } | Self::Job(_) => 1,
             Self::RegisterManifest { cohorts, .. } => cohorts.len().saturating_add(1),
             _ => 0,
         }
@@ -122,6 +124,8 @@ impl TaskArrayWrite {
 /// What an applied write did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskArrayApplied {
+    /// A definition was recorded or an occurrence deliberately skipped.
+    JobRecorded,
     /// A new array exists under this id.
     Registered { batch_id: u64 },
     /// A sync went through. Refused items are stale (a lost node's late
@@ -142,6 +146,8 @@ pub enum TaskArrayApplied {
 /// Why a write was refused as a whole.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TaskArrayStoreError {
+    #[error("invalid job transaction: {0}")]
+    Job(String),
     #[error("invalid task manifest: {0}")]
     Manifest(String),
     #[error("task array {batch_id} not found")]
@@ -157,6 +163,7 @@ pub enum TaskArrayStoreError {
 /// The replicated set of task arrays, keyed by batch id.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskArrays {
+    jobs: super::job::JobCatalog,
     arrays: BTreeMap<u64, TaskArrayRecord>,
     manifests: BTreeMap<u64, TaskManifest>,
 }
@@ -170,6 +177,7 @@ impl TaskArrays {
         mut allocate_id: impl FnMut() -> u64,
     ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
         match write {
+            TaskArrayWrite::Job(write) => self.apply_job(write, allocate_id),
             TaskArrayWrite::RegisterManifest {
                 name,
                 namespace,
@@ -335,6 +343,77 @@ impl TaskArrays {
         }
     }
 
+    /// IDs needed by this exact transaction; idempotent replays and skipped
+    /// occurrences remain admissible even when the shared counter is exhausted.
+    pub fn registration_ids(&self, write: &TaskArrayWrite) -> Result<usize, TaskArrayStoreError> {
+        if let TaskArrayWrite::Job(write) = write {
+            let active = self.active().map(|(id, _)| id).collect();
+            let mut candidate = self.jobs.clone();
+            let plan = candidate
+                .prepare(write, &active)
+                .map_err(TaskArrayStoreError::Job)?;
+            return Ok(usize::from(matches!(
+                plan,
+                super::job::JobPlan::Register { .. }
+            )));
+        }
+        Ok(write.registration_ids())
+    }
+
+    /// Reusable definitions and immutable provenance accompanying execution runs.
+    pub fn jobs(&self) -> &super::job::JobCatalog {
+        &self.jobs
+    }
+
+    fn apply_job(
+        &mut self,
+        write: &super::job::JobWrite,
+        mut allocate_id: impl FnMut() -> u64,
+    ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
+        use super::job::JobPlan;
+        let active = self.active().map(|(id, _)| id).collect();
+        let mut jobs = self.jobs.clone();
+        let plan = jobs
+            .prepare(write, &active)
+            .map_err(TaskArrayStoreError::Job)?;
+        match plan {
+            JobPlan::Existing(batch_id) => Ok(TaskArrayApplied::Registered { batch_id }),
+            JobPlan::Recorded => {
+                self.jobs = jobs;
+                Ok(TaskArrayApplied::JobRecorded)
+            }
+            JobPlan::Register {
+                definition,
+                run,
+                now_epoch_secs,
+            } => {
+                let state = TaskArrayState::new(definition.tasks, now_epoch_secs)?;
+                let active = self.active().count();
+                if active >= MAX_ACTIVE_ARRAYS {
+                    return Err(TaskArrayStoreError::TooManyActive { active });
+                }
+                // Every fallible check completes before pruning, allocating or publishing.
+                self.prune(now_epoch_secs);
+                let batch_id = allocate_id();
+                self.arrays.insert(
+                    batch_id,
+                    TaskArrayRecord {
+                        name: run.name.clone(),
+                        namespace: run.namespace.clone(),
+                        template: definition.template,
+                        state,
+                        terminal_at_epoch_secs: None,
+                    },
+                );
+                jobs.record_run(batch_id, run);
+                let retained = self.arrays.keys().copied().collect();
+                jobs.retain_runs(&retained);
+                self.jobs = jobs;
+                Ok(TaskArrayApplied::Registered { batch_id })
+            }
+        }
+    }
+
     fn mark_terminal(&mut self, id: u64, now: u64) -> Result<(), TaskArrayStoreError> {
         let record = self.record_mut(id)?;
         if record.state.status().is_terminal() && record.terminal_at_epoch_secs.is_none() {
@@ -402,6 +481,8 @@ impl TaskArrays {
                 self.arrays.remove(&id);
             }
         }
+        self.jobs
+            .retain_runs(&self.arrays.keys().copied().collect());
     }
 
     /// Retained parent summaries, without enumerating any task.

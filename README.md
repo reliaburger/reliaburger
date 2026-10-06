@@ -334,6 +334,11 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
+The [common job lifecycle plan](docs/plans/2026-10-07-plan-common-job-lifecycle.md)
+tracks unifying singleton jobs, batches, cron and deployment hooks (#638).
+The definition/run model is the first step; public job and cron paths still
+use their existing implementations during this work.
+
 ## Limits in 0.1.6
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in

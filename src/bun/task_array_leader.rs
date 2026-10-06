@@ -192,10 +192,13 @@ pub(crate) async fn write_task_array(
             ));
         }
         let mut tracker = state.batch_tracker.lock().await;
-        tracker
-            .preflight_ids(write.registration_ids())
-            .map_err(TaskArrayWriteError::Refused)?;
         let mut arrays = state.task_arrays.local.lock().await;
+        let ids = arrays
+            .registration_ids(&write)
+            .map_err(|error| TaskArrayWriteError::Refused(error.to_string()))?;
+        tracker
+            .preflight_ids(ids)
+            .map_err(TaskArrayWriteError::Refused)?;
         return match arrays.apply(&write, || tracker.allocate_id()) {
             Ok(TaskArrayApplied::Registered { batch_id }) => Ok(Some(batch_id)),
             Ok(_) => Ok(None),

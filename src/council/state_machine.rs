@@ -1367,8 +1367,16 @@ impl StateMachineInner {
                 // Arrays share the batch id counter, so `batch-status ID`
                 // names one thing. Every rule lives in `TaskArrays::apply`;
                 // a refused write leaves the state untouched.
+                let ids = match self.state.task_arrays.registration_ids(write) {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
                 let batch_state = &mut self.state.batch_state;
-                if let Err(reason) = batch_state.preflight_ids(write.registration_ids()) {
+                if let Err(reason) = batch_state.preflight_ids(ids) {
                     return Some(CouncilResponse::Refused { reason });
                 }
                 match self
@@ -7515,6 +7523,79 @@ mod tests {
             assert!(state.task_arrays.ids().is_empty());
             assert_eq!(state.task_arrays.manifests().count(), 0);
         }
+    }
+
+    fn common_job_request(request_id: &str) -> RaftRequest {
+        use crate::meat::job::{JobDefinition, JobWrite, RunTrigger};
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let RaftRequest::TaskArray(array) = task_array_register(1) else {
+            unreachable!()
+        };
+        let TaskArrayWrite::Register { template, spec, .. } = *array else {
+            unreachable!()
+        };
+        RaftRequest::TaskArray(Box::new(TaskArrayWrite::Job(Box::new(JobWrite::Put {
+            name: "render".into(),
+            namespace: "default".into(),
+            definition: Box::new(JobDefinition {
+                template: *template,
+                tasks: spec,
+                cron: None,
+                replay_unknown: false,
+            }),
+            trigger: Some(RunTrigger::Manual {
+                request_id: request_id.into(),
+            }),
+            now_epoch_secs: 1_000_000,
+        }))))
+    }
+
+    #[tokio::test]
+    async fn a_common_run_replay_after_term_change_needs_no_new_ids() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply(vec![normal_entry(1, 1, common_job_request("original"))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[0],
+            CouncilResponse::TaskArrayRegistered { batch_id: 1 }
+        );
+        sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX;
+        let original = sm.desired_state().await.task_arrays;
+        let responses = sm
+            .apply(vec![normal_entry(2, 2, common_job_request("original"))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[0],
+            CouncilResponse::TaskArrayRegistered { batch_id: 1 }
+        );
+        let state = sm.desired_state().await;
+        assert_eq!(state.task_arrays, original);
+        assert_eq!(state.batch_state.next_batch_id, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn common_run_id_exhaustion_cannot_publish_a_definition_without_its_run() {
+        let mut sm = CouncilStateMachine::new();
+        sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX;
+        let original = sm.desired_state().await.task_arrays;
+        let responses = sm
+            .apply(vec![normal_entry(1, 1, common_job_request("fresh"))])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        let state = sm.desired_state().await;
+        assert_eq!(state.task_arrays, original);
+        assert!(
+            state
+                .task_arrays
+                .jobs()
+                .definition("default", "render")
+                .is_none()
+        );
+        assert_eq!(state.batch_state.next_batch_id, u64::MAX);
     }
 
     #[tokio::test]

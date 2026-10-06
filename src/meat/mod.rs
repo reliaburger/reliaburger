@@ -26,3 +26,6 @@ pub use cluster_state::{ClusterStateCache, SchedulerNodeState};
 pub use quota::{NamespaceQuota, NamespaceUsage, QuotaError, check_quota};
 pub use scheduler::{ScheduleError, Scheduler};
 pub use types::{AppId, NodeCapacity, NodeId, Placement, Resources, SchedulingDecision};
+
+/// Reusable job definitions and durable trigger provenance.
+pub mod job;

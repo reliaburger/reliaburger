@@ -1,7 +1,7 @@
 # Batch jobs
 
 Development preview for 0.2.0. Build the PR #266 binaries and use a fresh
-cluster: protocol 47 and state 64 change the control messages, snapshots and
+cluster: protocol 48 and state 65 change the control messages, snapshots and
 worker ledgers. Production submissions require a council so definitions and
 identities survive restart; standalone in-memory execution is a test harness.
 The published 0.1.5 binaries do not have these commands.

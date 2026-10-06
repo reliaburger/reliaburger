@@ -1457,6 +1457,12 @@ manifests, app/job resource accounting, watch summaries, indexed detail, retries
 and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
 homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
 a service. Build matching development binaries and use a fresh cluster (protocol
-47 / state 64); the published 0.1.4 recording predates this step. The
+48 / state 65); the published 0.1.4 recording predates this step. The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.
+
+The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
+tracks #638. Its replicated definition/run model is in development; ordinary
+jobs, cron and hooks still use their existing submission paths until that
+wiring is complete. Executor reuse (#639), sustained throughput/demo (#640)
+and resident model workers (#641) follow separately.

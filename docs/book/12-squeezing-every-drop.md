@@ -822,6 +822,51 @@ Main's finite evidence registry now names both runtime cases and the cluster
 worker-loss case explicitly. A repository regression check catches missing
 bindings and stale reviewed OCI source fingerprints before aggregation.
 
+### Definitions, runs and durable trigger identities
+
+A template and a count describe work, but not why it runs. A manually submitted
+cleanup, the same cleanup at 03:00 UTC, and a deployment migration need stable
+run identities. Replaying the admission transaction after a lost response must
+return the original run, rather than launch the command again.
+
+The first part of #638 adds `JobDefinition` and `JobCatalog` to the existing
+`TaskArrays` state machine. A definition fixes the template, task count and
+trigger policies. Each admitted `RunRecord` captures a revision, the complete
+definition's digest and its trigger. The execution snapshot remains in the
+ordinary task-array record. Updating the reusable definition cannot rewrite
+that snapshot or change an existing run's unknown-outcome policy. Count defaults
+to one when the task policy is omitted.
+
+`JobWrite` is an enum: its `Put` variant records a definition and optionally
+starts a manual or deployment-hook run; `Fire` claims a scheduled occurrence.
+Matching the enum forces each transaction to handle its own inputs. The store
+prepares metadata on a candidate clone, validates execution capacity, and only
+then allocates an ID and publishes both pieces. A refused transaction cannot
+advance the definition revision without creating its promised run. A duplicate
+manual or hook identity returns the existing run; changed work under the same
+identity is refused. This deduplication lasts while the run is retained.
+
+Cron identity uses the definition revision and UTC minute. The same transaction
+advances the occurrence cursor and creates the run. With overlap forbidden,
+it advances the cursor even when it deliberately skips a firing. The cursor
+survives result pruning and definition updates, so neither a new leader nor a
+backwards clock step can revive that occurrence. The initial missed-run policy
+is explicitly `skip`; there is no catch-up queue. An `allow` overlap policy
+still obeys the shared active-run bound.
+
+The catalogue caps reusable definitions and retained run provenance, validates
+its shape when deserialising, and bounds complete definition bytes, including
+schedule text. Before checking the shared counter, the store computes whether
+this exact write needs an ID. Replaying an accepted run or skipping an occurrence
+still works when the counter has no IDs left.
+
+These are replicated model transactions, not yet a replacement for the public
+job, cron or migration paths. Their wiring, secret/script contracts, durable
+standalone admission and operator views remain in #638. The portable tests
+exercise transaction replay, immutable snapshots, allowed and forbidden overlap,
+rollback, malformed state, capacity refusal and pruning independently of runtime
+timing. The new request and snapshot fields bump protocol/state to 48/65.
+
 ## Lessons from the phase
 
 **Optimisation is an audit with a deliverable.** The single most consistent finding of this phase wasn't a speed-up. It was library-not-wired: `add_port_mapping` with no production callers, `VolumeManager` with no production callers, an HTTPS-only pull client that made cluster images undeployable, a CLI that sent job names to a cluster that had never heard of the jobs. Well-tested libraries pass review; only tracing the live path from the user's artefact to the kernel finds the missing arrow. If you take one habit from this chapter: when you're asked to optimise something, first prove it runs.
