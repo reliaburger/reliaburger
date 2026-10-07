@@ -31,7 +31,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 - `tests/suite/` — the single portable integration binary; `tests/*.rs` — gated, heavy or process-isolated suites
 - `examples/` — `phase-1/` and `phase-8/` workload configs, `kubernetes/` YAML
 - `scripts/release/` — packaging, staging and `qualify-*.sh` release qualification
-- `image/` — the appliance OS (mkosi), its netboot installer, `image/tools/` (preview netboot and seeding scripts) and `image/lab/` (the QEMU lab)
+- `image/` — the appliance OS (mkosi), its netboot installer, its script tests (`image/tests/`) and `image/lab/` (the QEMU lab, the Wyse lab's Pi router and `fleet-measure.sh`)
 - `.github/workflows/` — `ci.yml`, `security.yml`, `build.yml`, `stage.yml`, `promote.yml`, `soak.yml`, `v02-loops.yml`, `static.yml`, `appliance.yml`
 
 ## How We Work

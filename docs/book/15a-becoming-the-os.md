@@ -831,6 +831,21 @@ Then the tour, the manual's five-minute walk through Reliaburger (`relish manual
 
 The Wyse 3040's Atom has SSE4.2 and AES-NI but no AVX. The virtual Wyse is x86_64 under TCG with `-cpu Westmere`, which matches that, so any accidental AVX dependency in our binaries shows up before the hardware stage. It goes through the whole real path: OVMF's firmware PXE, the ProxyDHCP, our iPXE, the installer. It installed in 29 s, and the same QEMU process then booted the disk and reached `bun healthy` at 62 s kernel time. No AVX problems.
 
+### Taking the scaffolding down
+
+Before relish could do any of this, shell scripts did. `image/tools/` held the bare-metal preview: `netboot-server.sh` glued dnsmasq to Python's `http.server`, `seed-fleet.sh` packed seeds, `node-toml.py` wrote each node's config, and `seed-admin`, a separate little Cargo project, hashed an admin token into the security bootstrap. Its first build took eight minutes. The lab had its own copies too: `seed-node1.sh` and `seed-joiner.sh`, which enrolled each joiner by hand from the server VM.
+
+Scaffolding is useful right up to the moment it disagrees with the building. Every one of those scripts now has a relish command that does the job and is tested in CI: `relish netboot` serves, `relish cluster create --bare-metal` and `relish image seed` write seeds, and `relish machines claim` sends them over the network. Two ways of doing the same thing would drift, and people would follow whichever one they found first. So the scripts went. The lab now forms its cluster with `seed-lab.sh`, which is little more than a `relish cluster create --bare-metal` naming each VM's MAC and reserved address. The joiners carry join tokens and enrol by themselves on their first boot, just as a Wyse does.
+
+Three things stayed, each for a reason we could write down:
+- `make-seed-stick.sh` turns the `stick/` directory relish writes into a FAT disk image for QEMU. relish writes the seeds, not filesystems, and on a real machine you'd just copy the folder onto a stick.
+- `fleet-measure.sh` samples memory, zram, eMMC writes and temperature over SSH for the Wyse lab's 24-hour run. No relish command reads those numbers yet, so it moved into `image/lab/`, without the code that read `seed-fleet.sh`'s old fleet list.
+- `os-stage` stages an OS update by hand. bun does it for real now, but the Wyse runbook's fallback test deliberately stages a broken image underneath bun, and that needs a tool that isn't bun.
+
+One idea went without ever being built: `relish netboot --node`, a node serving the netboot for the rest of the fleet. The lab doesn't need it, and a feature nobody needs is a feature nobody tests.
+
+Deleting code is easy; keeping it deleted takes a test. `image/tests/test_retired_tools.py` walks the repository and fails if anything but the history (this book, the plans and the qualification records) still names a retired script, so a stale README line or a lab script reaching for `image/tools/` breaks the build rather than a lab day.
+
 ## What bit us
 
 Most of the spike's time went into bugs that no amount of documentation would have predicted.

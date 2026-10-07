@@ -1,6 +1,6 @@
-"""Tests for image/tools/fleet-nodes.py, which tells fleet-measure.sh which
-nodes to sample: from a claim directory's fleet.json, a seed-fleet.sh
-directory's fleet file, or `relish nodes --output json`.
+"""Tests for image/lab/fleet-nodes.py, which tells fleet-measure.sh which
+nodes to sample: from a claim directory's fleet.json, or `relish nodes
+--output json`.
 
     python3 -m unittest discover -s image/tests -p 'test_fleet_nodes.py'
 """
@@ -15,8 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parents[1] / "tools/fleet-nodes.py"
-MEASURE = Path(__file__).resolve().parents[1] / "tools/fleet-measure.sh"
+SCRIPT = Path(__file__).resolve().parents[1] / "lab/fleet-nodes.py"
+MEASURE = Path(__file__).resolve().parents[1] / "lab/fleet-measure.sh"
 spec = importlib.util.spec_from_file_location("fleet_nodes", SCRIPT)
 fleet_nodes = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fleet_nodes)
@@ -61,19 +61,15 @@ class FleetNodes(unittest.TestCase):
         self.assertEqual(fleet_nodes.from_directory(self.dir),
                          [("wyse-1", "10.77.0.11"), ("wyse-2", "10.77.0.12")])
 
-    def test_a_seed_fleet_directory_keeps_its_old_names(self):
-        (self.dir / "fleet").write_text(
-            "1 6c:4b:90:00:00:01 10.77.0.11\n2 6c:4b:90:00:00:02 10.77.0.12\n")
-        self.assertEqual(fleet_nodes.from_directory(self.dir),
-                         [("node-01", "10.77.0.11"), ("node-02", "10.77.0.12")])
+    def test_a_retired_seed_fleet_directory_is_not_a_fleet(self):
+        # seed-fleet.sh's `fleet` file went with the script: relish writes
+        # fleet.json for every cluster it creates or claims.
+        (self.dir / "fleet").write_text("1 6c:4b:90:00:00:01 10.77.0.11\n")
+        with self.assertRaisesRegex(ValueError, "no fleet.json"):
+            fleet_nodes.from_directory(self.dir)
 
-    def test_a_claim_directory_wins_over_a_fleet_file(self):
-        (self.dir / "fleet.json").write_text(json.dumps(CLAIMED))
-        (self.dir / "fleet").write_text("1 6c:4b:90:00:00:09 10.0.0.9\n")
-        self.assertEqual(fleet_nodes.from_directory(self.dir)[0], ("wyse-1", "10.77.0.11"))
-
-    def test_a_directory_with_neither_says_so(self):
-        with self.assertRaisesRegex(ValueError, "no fleet.json or fleet file"):
+    def test_a_directory_without_fleet_json_says_so(self):
+        with self.assertRaisesRegex(ValueError, "no fleet.json"):
             fleet_nodes.from_directory(self.dir)
 
     def test_relish_nodes_drops_the_gossip_port(self):
@@ -103,7 +99,7 @@ class FleetNodes(unittest.TestCase):
         done = subprocess.run([sys.executable, str(SCRIPT), str(self.dir)],
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 1)
-        self.assertIn("no fleet.json or fleet file", done.stderr)
+        self.assertIn("no fleet.json", done.stderr)
 
 
 @unittest.skipUnless(shutil.which("ssh"), "needs ssh")
@@ -141,12 +137,6 @@ class FleetMeasure(unittest.TestCase):
         self.assertIn("wyse-2 (127.0.0.1): no answer", done.stderr)
         self.assert_gap_rows(["wyse-1", "wyse-2"])
 
-    def test_a_seed_fleet_directory(self):
-        (self.dir / "fleet").write_text("1 6c:4b:90:00:00:01 127.0.0.1\n")
-        done = self.measure()
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assert_gap_rows(["node-01"])
-
     def test_relish_nodes(self):
         relish = self.dir / "relish"
         nodes = [dict(RELISH_NODES[0], address="127.0.0.1:9443")]
@@ -159,7 +149,7 @@ class FleetMeasure(unittest.TestCase):
     def test_a_directory_without_a_fleet_fails_before_sampling(self):
         done = self.measure()
         self.assertNotEqual(done.returncode, 0)
-        self.assertIn("no fleet.json or fleet file", done.stderr)
+        self.assertIn("no fleet.json", done.stderr)
         self.assertFalse((self.dir / "measure").exists())
 
 

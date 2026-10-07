@@ -133,7 +133,7 @@ The [five-minute tour](../manual/08_five-minute-tour.md) from `relish apply`, wi
 ## 6. Measure for 24 hours (lab run)
 
 ```sh
-image/tools/fleet-measure.sh ~/wyse 300 288    # every 5 minutes, 24 hours
+image/lab/fleet-measure.sh ~/wyse 300 288    # every 5 minutes, 24 hours
 ```
 
 `~/wyse` is the claim directory, whose `fleet.json` names the nodes (`wyse-1` to `wyse-10`) and their addresses. `fleet-measure.sh --relish ~/wyse 300 288` takes them from `relish nodes --output json` instead. The script logs in as root over SSH, so it needs a lab image and the key from the claim's `--ssh-key`. Published images have no sshd, so the formal run doesn't repeat this.
