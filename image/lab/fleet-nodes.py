@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """The nodes fleet-measure.sh samples, one `<name> <address>` per line.
 
-    fleet-nodes.py <dir>                 # a claim or seed-fleet.sh directory
+    fleet-nodes.py <dir>                 # a cluster directory
     fleet-nodes.py --relish-json <file>  # `relish nodes --output json`; - for stdin
 
-A claim directory (`relish machines claim`, `relish cluster create
---bare-metal`) has fleet.json, whose nodes carry a name and an address. A
-seed-fleet.sh directory has a `fleet` file of `<n> <mac> <ip>` lines, and
-its nodes are node-01, node-02 and so on, as they always were. With both,
-fleet.json wins.
+A cluster directory (`relish machines claim`, `relish cluster create
+--bare-metal`) has fleet.json, whose nodes carry a name and an address.
 
 `relish nodes --output json` lists every node gossip knows, dead ones too
 (they get an empty row, so the gap shows). Its `address` is the gossip
@@ -26,15 +23,7 @@ def from_directory(directory):
     if claimed.is_file():
         fleet = json.loads(claimed.read_text())
         return [(node["name"], node["address"]) for node in fleet["nodes"]]
-    seeded = directory / "fleet"
-    if seeded.is_file():
-        nodes = []
-        for line in seeded.read_text().splitlines():
-            if line.strip():
-                index, _mac, address = line.split()
-                nodes.append((f"node-{int(index):02d}", address))
-        return nodes
-    raise ValueError(f"{directory} has no fleet.json or fleet file")
+    raise ValueError(f"{directory} has no fleet.json")
 
 
 def host(endpoint):
