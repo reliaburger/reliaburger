@@ -56,7 +56,7 @@ channel="http://10.42.0.1:8000/releases/download/os-channel/os-channel.json"
 
 export RELIABURGER_HOME="$work/home"
 mkdir -p "$RELIABURGER_HOME"
-"$relish" cluster create --bare-metal "$work/cluster" --name solo --operator 10.42.0.1 "$mac@$ip"
+"$relish" cluster create --bare-metal "$work/cluster" --name solo --operator 10.42.0.1 --yes "$mac@$ip"
 
 sudo ip tuntap add rbtap0 mode tap user "$(id -un)"
 sudo ip link set rbtap0 master rbbr0 up

@@ -658,6 +658,40 @@ From a *seed*: a small tarball with a `seed.toml` in it. Node 1's seed is a *cre
 
 The create seed carries one more thing: the council size. An appliance cluster grows its council to five voters rather than the usual seven (`--council-size` changes it), because the lab it was built for is ten 2 GB Wyses, and two more voters would buy one more tolerated failure at the price of two more machines doing council work. Node 1 commits the size to the council when it bootstraps, so every later leader reads the same number. Chapter 2's "Five voters, not seven" has the reconciler's side.
 
+### Waiting for the backup
+
+Born on the laptop also means the laptop holds the only copy. Lose it before node 1 boots and the cluster never existed; lose it later and `relish council recover`, which needs the master key, has nothing to work with. The first version of `relish cluster create --bare-metal` printed `Back up ~/home-cluster/secrets` between a list of seeds and the relish context, where nobody reads anything. So now it stops and waits. Both commands that make a cluster's keys, `cluster create --bare-metal` and `machines claim --create`, print what to back up and why, then ask `Type yes once it's backed up:` until the answer is yes. Nothing goes out (no stick instructions, no seed over the network) before that.
+
+A prompt that waits has an obvious failure mode: a script, or CI, with no one at the keyboard. Reading stdin there either hangs or reads end-of-file straight away, depending on what's attached. Neither is a good answer, and the first is worse. So the decision is made before anything is created, from two facts:
+
+```rust
+pub fn backup_check(yes: bool, terminal: bool, secrets: &Path) -> Result<BackupCheck, RelishError> {
+    match (yes, terminal) {
+        (true, _) => Ok(BackupCheck::Remind),
+        (false, true) => Ok(BackupCheck::Ask),
+        (false, false) => Err(RelishError::BackupConfirmationRequired {
+            secrets: secrets.to_path_buf(),
+        }),
+    }
+}
+```
+
+`--yes` prints the reminder and carries on, and the CI scripts that boot appliance VMs pass it. A terminal without `--yes` gets the question. No terminal and no `--yes` is refused with an error naming `--yes`, before a single key exists, so a script that forgot the flag leaves no half-made cluster behind. `terminal` comes from `std::io::stdin().is_terminal()`, a method of the standard library's `IsTerminal` trait. In Rust a trait's methods are only callable where the trait is in scope, so the caller needs `use std::io::IsTerminal;` first, even though `Stdin` already implements it.
+
+The question itself takes its input and output as parameters rather than reaching for stdin and stdout:
+
+```rust
+pub fn confirm_backup(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    secrets: &Path,
+) -> Result<(), RelishError> {
+```
+
+`impl BufRead` in argument position means "any type that implements `BufRead`". It's a generic parameter without the angle brackets, and the compiler makes a copy of the function for each type it's called with, much as a C++ template would. The real caller passes `std::io::stdin().lock()`; the tests pass a `std::io::Cursor` over a byte string, so `"\nno\nlater\nyes\n"` checks the loop asks four times, and `""` checks that end-of-file (Ctrl-D, or a pipe that closes) refuses with `BackupNotConfirmed` rather than spinning. `read_line` returns how many bytes it read, and zero is the only way Rust's standard library says end-of-file. Go's `bufio.Reader` returns `io.EOF` as an error instead; Rust treats it as a successful read of nothing.
+
+Three black-box tests in `tests/suite/bare_metal.rs` run the real binary with stdin from `/dev/null`: `cluster create --bare-metal` without `--yes` exits 1 and leaves no directory, with `--yes` it makes the cluster and prints the reminder, and `machines claim --create` without `--yes` fails before it tries to reach the machine. That last one points at an address in TEST-NET-1, where nothing answers, so a check in the wrong place shows up as a test that fails or hangs, not one that passes.
+
 ### A state machine that can lose power
 
 `bun appliance prepare` turns a seed into a node. It runs at every boot until there's a `node.toml`, and a machine can lose power at any point along the way. So rather than a script that does five things in order, it's a function that looks at what's on disk and says what to do next:

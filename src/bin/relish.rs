@@ -956,6 +956,10 @@ enum ClusterAction {
         /// How many voters the council grows to: an odd number from 1 to 7.
         #[arg(long, value_name = "N", default_value = "5")]
         council_size: reliaburger::council::CouncilSize,
+        /// Don't wait for confirmation that the master key is backed up
+        /// (required without a terminal).
+        #[arg(long)]
+        yes: bool,
         /// Each machine as MAC@IP, node 1 first.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
@@ -1070,6 +1074,10 @@ enum MachinesAction {
         /// Don't ask to compare claim keys with the machines' consoles.
         #[arg(long)]
         trust_lan: bool,
+        /// Don't wait for confirmation that the new cluster's master key is
+        /// backed up (with --create; required without a terminal).
+        #[arg(long, requires = "create")]
+        yes: bool,
         /// Each machine by MAC (found over mDNS) or address.
         #[arg(required = true)]
         machines: Vec<String>,
@@ -2403,6 +2411,7 @@ async fn main() -> ExitCode {
                     ttl,
                     external_signing_key,
                     council_size,
+                    yes,
                     machines,
                 },
         } => match ssh_key.as_deref().map(std::fs::read).transpose() {
@@ -2420,6 +2429,7 @@ async fn main() -> ExitCode {
                     external_signing_key,
                     council_size,
                 },
+                yes,
             ),
         },
         Command::Image { action } => match action {
@@ -2467,6 +2477,7 @@ async fn main() -> ExitCode {
                 ssh_key,
                 ttl,
                 trust_lan,
+                yes,
                 machines,
             }) => match ssh_key.as_deref().map(std::fs::read).transpose() {
                 Err(error) => Err(error.into()),
@@ -2483,6 +2494,7 @@ async fn main() -> ExitCode {
                                 external_signing_key,
                                 council_size: council_size
                                     .unwrap_or(reliaburger::council::CouncilSize::APPLIANCE),
+                                yes,
                             }),
                             token_ttl: std::time::Duration::from_secs(ttl),
                             ssh_key,
@@ -3128,6 +3140,55 @@ mod tests {
         assert!(
             claim(&["--council-size", "5"]).is_err(),
             "a council size only means something with --create"
+        );
+    }
+
+    #[test]
+    fn yes_skips_the_master_key_backup_question_and_needs_create_on_a_claim() {
+        let create = |extra: &[&str]| {
+            let mut args = vec![
+                "relish",
+                "cluster",
+                "create",
+                "--bare-metal",
+                "lab",
+                "--name",
+                "lab",
+                "--operator",
+                "10.42.0.1",
+            ];
+            args.extend_from_slice(extra);
+            args.push("d8:9e:f3:00:00:01@10.42.0.11");
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Cluster {
+                    action: ClusterAction::Create { yes, .. },
+                }) => yes,
+                _ => panic!("not cluster create"),
+            }
+        };
+        assert!(!create(&[]));
+        assert!(create(&["--yes"]));
+
+        let claim = |extra: &[&str]| {
+            let mut args = vec!["relish", "machines", "claim", "lab"];
+            args.extend_from_slice(extra);
+            args.push("10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Machines {
+                    action: Some(MachinesAction::Claim { yes, .. }),
+                    ..
+                }) => yes,
+                _ => panic!("not machines claim"),
+            })
+        };
+        let new = ["--create", "--name", "lab", "--operator", "10.42.0.1"];
+        assert!(!claim(&new).unwrap());
+        let mut confirmed = new.to_vec();
+        confirmed.push("--yes");
+        assert!(claim(&confirmed).unwrap());
+        assert!(
+            claim(&["--yes"]).is_err(),
+            "--yes only answers the backup question --create asks"
         );
     }
 
