@@ -5687,6 +5687,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-onion_objects_use_only_the_original_bpf_instruction_set",
+          "binary": "reliaburger::ebpf",
+          "test": "onion_objects_use_only_the_original_bpf_instruction_set",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-embedded_program_loads_without_an_object_directory",
           "binary": "reliaburger::ebpf",
           "test": "embedded_program_loads_without_an_object_directory",
