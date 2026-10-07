@@ -128,7 +128,7 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 | Check | `relish nodes`, `relish council`, `relish wtf` | Real |
 | Tour | `relish apply …`, ingress on port 80 of each node | Real |
 | Measure | `image/tools/fleet-measure.sh ~/wyse` | Preview script; reads a claim directory, a `seed-fleet.sh` directory or `relish nodes` (PR 6) |
-| OS update | `relish os upgrade <next> --channel http://10.77.0.2:8000/…/os-channel.json` | Real; needs a next version from the same run (PR 5) |
+| OS update | `relish os upgrade --channel http://10.77.0.2:8000/…/os-channel.json --key next/lab-signing-key.pub.pem` | Real; needs a next version from the same run (PR 5); `--key` reads the lab channel |
 
 The claim asks you to compare each machine's claim key with its monitor. With one DisplayPort monitor and ten machines, that's ten cable swaps; `--trust-lan` skips it, which is fine on an isolated switch with nothing else on it.
 

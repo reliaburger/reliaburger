@@ -454,7 +454,10 @@ pub fn context(
 /// `relish cluster create --bare-metal`: create the cluster, save its
 /// context (unless another cluster's context is in the way), and say what
 /// to do next.
-pub fn run_create(options: &CreateOptions) -> Result<(), RelishError> {
+pub fn run_create(options: &CreateOptions, yes: bool) -> Result<(), RelishError> {
+    use std::io::IsTerminal;
+    let secrets = options.directory.join("secrets");
+    let check = backup_check(yes, std::io::stdin().is_terminal(), &secrets)?;
     let created = create(options)?;
     let dir = options.directory.display();
     println!("cluster {} created in {dir}", created.fleet.cluster);
@@ -470,14 +473,88 @@ pub fn run_create(options: &CreateOptions) -> Result<(), RelishError> {
         );
     }
     println!();
+    back_up(check, &secrets)?;
     println!(
         "Copy {dir}/stick/seeds onto a USB stick labelled RBSEED (FAT32), then boot each machine with it."
     );
     adopt(&created, &options.directory)
 }
 
+/// How a new cluster's master-key backup gets confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupCheck {
+    /// `--yes`: say what to back up, but don't wait.
+    Remind,
+    /// Ask at the terminal, and wait for a yes.
+    Ask,
+}
+
+/// Settle, before anything is created, how the master-key backup will be
+/// confirmed. Without `--yes` there has to be a terminal to ask at, or a
+/// script would make a cluster and then wait for an answer that never comes.
+pub fn backup_check(yes: bool, terminal: bool, secrets: &Path) -> Result<BackupCheck, RelishError> {
+    match (yes, terminal) {
+        (true, _) => Ok(BackupCheck::Remind),
+        (false, true) => Ok(BackupCheck::Ask),
+        (false, false) => Err(RelishError::BackupConfirmationRequired {
+            secrets: secrets.to_path_buf(),
+        }),
+    }
+}
+
+/// Tell the operator what to back up and, unless `--yes` said not to,
+/// wait at the terminal until they've done it.
+pub fn back_up(check: BackupCheck, secrets: &Path) -> Result<(), RelishError> {
+    match check {
+        BackupCheck::Remind => {
+            println!("{}", backup_reminder(secrets));
+            println!("(--yes: not waiting for you to confirm the backup)");
+            Ok(())
+        }
+        BackupCheck::Ask => confirm_backup(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            secrets,
+        ),
+    }
+}
+
+fn backup_reminder(secrets: &Path) -> String {
+    format!(
+        "Back up {}: it holds the master key and the sealed root CA key, and \
+         `relish council recover` needs them if the cluster ever loses its quorum. \
+         Keep them somewhere safe off this machine, such as your password manager.",
+        secrets.display()
+    )
+}
+
+/// Show what to back up and ask until the operator answers yes. Input that
+/// ends first (Ctrl-D, or a closed pipe) refuses: the cluster isn't
+/// started with a master key nobody has confirmed a copy of.
+pub fn confirm_backup(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    secrets: &Path,
+) -> Result<(), RelishError> {
+    writeln!(output, "{}", backup_reminder(secrets))?;
+    loop {
+        write!(output, "Type yes once it's backed up: ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            writeln!(output)?;
+            return Err(RelishError::BackupNotConfirmed {
+                directory: secrets.parent().unwrap_or(secrets).to_path_buf(),
+            });
+        }
+        if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Ok(());
+        }
+    }
+}
+
 /// Point relish at a newly created cluster, unless another cluster's
-/// context is in the way, and remind the operator to back up its secrets.
+/// context is in the way.
 pub fn adopt(created: &Created, directory: &Path) -> Result<(), RelishError> {
     let context = context(&created.fleet, directory, &created.admin_token)?;
     let path = super::local_context::default_path()?;
@@ -489,7 +566,6 @@ pub fn adopt(created: &Created, directory: &Path) -> Result<(), RelishError> {
         _ => false,
     };
     let dir = directory.display();
-    println!("Back up {dir}/secrets: it holds the master key and the sealed root CA key.");
     if saved {
         println!(
             "relish now talks to this cluster (node 1, {}).",
@@ -785,5 +861,87 @@ mod tests {
                 .unwrap()
                 .starts_with("-----BEGIN CERTIFICATE-----")
         );
+    }
+
+    #[test]
+    fn yes_skips_the_backup_question_with_or_without_a_terminal() {
+        let secrets = Path::new("/home/me/home-cluster/secrets");
+        for terminal in [true, false] {
+            assert_eq!(
+                backup_check(true, terminal, secrets).unwrap(),
+                BackupCheck::Remind
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_without_yes_is_asked_about_the_backup() {
+        let secrets = Path::new("/home/me/home-cluster/secrets");
+        assert_eq!(
+            backup_check(false, true, secrets).unwrap(),
+            BackupCheck::Ask
+        );
+    }
+
+    #[test]
+    fn no_terminal_and_no_yes_is_refused_rather_than_left_waiting() {
+        let secrets = Path::new("/home/me/home-cluster/secrets");
+        let error = backup_check(false, false, secrets).unwrap_err();
+        assert!(matches!(
+            error,
+            RelishError::BackupConfirmationRequired { .. }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("--yes"), "{message}");
+        assert!(message.contains("master key"), "{message}");
+        assert!(
+            message.contains("/home/me/home-cluster/secrets"),
+            "{message}"
+        );
+        assert!(message.starts_with(char::is_lowercase), "{message}");
+    }
+
+    fn ask(answers: &str) -> (Result<(), RelishError>, String) {
+        let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
+        let mut output = Vec::new();
+        let result = confirm_backup(
+            &mut input,
+            &mut output,
+            Path::new("/home/me/home-cluster/secrets"),
+        );
+        (result, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn the_backup_prompt_names_what_to_back_up_and_takes_yes() {
+        for answer in ["yes\n", "y\n", "YES\n", "  Yes  \n"] {
+            let (result, shown) = ask(answer);
+            assert!(result.is_ok(), "{answer:?}");
+            assert!(shown.contains("/home/me/home-cluster/secrets"), "{shown}");
+            assert!(shown.contains("master key"), "{shown}");
+            assert!(shown.contains("relish council recover"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_backup_prompt_keeps_asking_until_yes() {
+        let (result, shown) = ask("\nno\nlater\nyes\n");
+        assert!(result.is_ok());
+        assert_eq!(shown.matches("Type yes").count(), 4, "{shown}");
+    }
+
+    #[test]
+    fn the_backup_prompt_refuses_when_input_ends_without_yes() {
+        for answers in ["", "no\n", "no\nnope"] {
+            let (result, _) = ask(answers);
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, RelishError::BackupNotConfirmed { .. }),
+                "{answers:?}: {error}"
+            );
+            let message = error.to_string();
+            assert!(message.starts_with(char::is_lowercase), "{message}");
+            assert!(message.contains("/home/me/home-cluster"), "{message}");
+        }
     }
 }

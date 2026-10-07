@@ -501,8 +501,9 @@ jobs:
 
       - name: Upload the next version
         # Ready to serve: `gh run download <run> -n appliance-x86_64-next -D
-        # next`, then any web server on next/, and `relish os upgrade <next
-        # version> --channel http://<server>/releases/download/os-channel/os-channel.json`.
+        # next`, then any web server on next/, and `relish os upgrade --channel
+        # http://<server>/releases/download/os-channel/os-channel.json --key
+        # next/lab-signing-key.pub.pem`.
         if: env.NEXT_VERSION != ''
         uses: actions/upload-artifact@v4
         with:
