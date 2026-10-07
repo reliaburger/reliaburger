@@ -160,6 +160,22 @@ pub enum RelishError {
     #[error("cluster initialisation failed: {0}")]
     InitFailed(String),
 
+    /// A new bare-metal cluster's master-key backup can't be confirmed:
+    /// no `--yes` and no terminal to ask at.
+    #[error(
+        "the master key in {} needs backing up before the cluster starts: run this in a terminal to confirm, or pass --yes once you've arranged its backup",
+        .secrets.display()
+    )]
+    BackupConfirmationRequired { secrets: std::path::PathBuf },
+
+    /// The operator's input ended before they confirmed the master-key
+    /// backup.
+    #[error(
+        "the master-key backup wasn't confirmed, so the cluster wasn't started: remove {} and create it again",
+        .directory.display()
+    )]
+    BackupNotConfirmed { directory: std::path::PathBuf },
+
     /// TOML formatting failed.
     #[error("format failed: {0}")]
     FormatFailed(String),

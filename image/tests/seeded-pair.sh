@@ -39,7 +39,7 @@ sudo dnsmasq --interface=rbbr0 --bind-interfaces --port=0 \
 
 export RELIABURGER_HOME="$work/home"
 mkdir -p "$RELIABURGER_HOME"
-"$relish" cluster create --bare-metal "$work/cluster" --name pair --operator 10.42.0.1 \
+"$relish" cluster create --bare-metal "$work/cluster" --name pair --operator 10.42.0.1 --yes \
     --network 10.42.0.0/24 "${macs[0]}@${ips[0]}" "${macs[1]}@${ips[1]}"
 
 pids=()

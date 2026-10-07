@@ -70,6 +70,8 @@ class RetiredTools(unittest.TestCase):
     def test_the_lab_seeds_with_relish(self):
         seed = (LAB / "seed-lab.sh").read_text()
         self.assertTrue("cluster create --bare-metal" in seed)
+        # Without --yes, relish waits for the master-key backup to be confirmed.
+        self.assertTrue("--yes" in seed)
         self.assertFalse("relish init" in seed)
 
     def test_lab_machines_boot_the_seeds_relish_writes(self):

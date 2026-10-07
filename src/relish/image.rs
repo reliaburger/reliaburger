@@ -3,7 +3,8 @@
 //! appliance-product.md, W3).
 //!
 //! `download` trusts nothing it hasn't checked: the channel's signature
-//! against the release keys this relish carries, each architecture's
+//! against the release keys this relish carries (or, with `--key`, only
+//! the operator's lab key: [`ChannelTrust`]), each architecture's
 //! `SHA256SUMS` against the channel, and every file against `SHA256SUMS`
 //! as it streams to disk (`crate::os`). The layout it writes is what a
 //! netboot server serves: `<dir>/<arch>/` with iPXE in `netboot/`.
@@ -14,9 +15,10 @@ use std::path::{Path, PathBuf};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
-use crate::os::{OsChannel, SumsEntry};
+use crate::os::{OsChannel, OsError, SumsEntry};
 use crate::relish::RelishError;
 use crate::relish::netboot::Arch;
+use crate::upgrade::signing::PublicKey;
 
 /// Where the newest OS release is named.
 pub const CHANNEL_URL: &str =
@@ -117,6 +119,82 @@ fn known_names() -> String {
     names.join(" or ")
 }
 
+/// The keys an OS channel's signature is checked against.
+///
+/// By default, the release keys this relish carries. `--key <PEM>` swaps
+/// them for one Ed25519 public key, such as the throwaway key a CI lab
+/// build signs its lab channel with. It replaces rather than adds, so a
+/// lab run reads only its own build's channel, and every command that
+/// uses it says so on stderr ([`ChannelTrust::warning`]).
+#[derive(Debug, Clone)]
+pub struct ChannelTrust {
+    keys: Vec<PublicKey>,
+    /// The `--key` file, when there is one.
+    operator_key: Option<PathBuf>,
+}
+
+impl ChannelTrust {
+    /// The release keys, or only the key in `key_file` when it's given.
+    pub fn from_key_file(key_file: Option<&Path>) -> Result<Self, RelishError> {
+        let Some(path) = key_file else {
+            let keys = crate::upgrade::keys::release_keys(&Default::default())
+                .map_err(|e| failed(&e.to_string()))?;
+            return Ok(Self {
+                keys,
+                operator_key: None,
+            });
+        };
+        let pem = std::fs::read_to_string(path)
+            .map_err(|e| failed(&format!("--key {}: {e}", path.display())))?;
+        let key = crate::upgrade::signing::parse_pem_public_key(&pem).map_err(|e| {
+            failed(&format!(
+                "--key {} isn't an Ed25519 public key in PEM ({e})",
+                path.display()
+            ))
+        })?;
+        Ok(Self {
+            keys: vec![key],
+            operator_key: Some(path.to_path_buf()),
+        })
+    }
+
+    /// What to print on stderr before trusting anything: `None` for the
+    /// release keys.
+    pub fn warning(&self) -> Option<String> {
+        self.operator_key.as_ref().map(|path| {
+            format!(
+                "warning: checking the OS channel against {} instead of the release keys; \
+                 use it only for builds you made yourself",
+                path.display()
+            )
+        })
+    }
+
+    /// Which key vouched for a channel, for the line that reports it.
+    pub fn checked_against(&self) -> String {
+        match &self.operator_key {
+            None => "the release key".to_string(),
+            Some(path) => format!("the key in {}, not a release key", path.display()),
+        }
+    }
+
+    /// Parse `bytes` only if `signature` is one of these keys' over them.
+    pub fn verify(&self, bytes: &[u8], signature: &[u8]) -> Result<OsChannel, RelishError> {
+        OsChannel::verified(bytes, signature, &self.keys).map_err(|error| {
+            match (&error, &self.operator_key) {
+                (OsError::ChannelSignature, Some(path)) => failed(&format!(
+                    "the OS channel's signature doesn't match the key in {}",
+                    path.display()
+                )),
+                (OsError::ChannelSignature, None) => failed(&format!(
+                    "{error} (a CI lab build's channel? pass --key with that build's signing key)"
+                )),
+                _ => failed(&error.to_string()),
+            }
+        })
+    }
+}
+
 /// `relish image download`: fetch and verify the newest build for each
 /// architecture in `requested`, or for every one the release offers when
 /// `requested` is empty.
@@ -125,21 +203,31 @@ pub async fn download(
     requested: &[Arch],
     directory: &Path,
     everything: bool,
+    trust: &ChannelTrust,
 ) -> Result<(), RelishError> {
-    let keys = crate::upgrade::keys::release_keys(&Default::default())
-        .map_err(|e| failed(&e.to_string()))?;
+    if let Some(warning) = trust.warning() {
+        eprintln!("relish image download: {warning}");
+    }
     let client = reqwest::Client::builder()
         .user_agent("relish")
         .build()
         .map_err(|e| failed(&e.to_string()))?;
     let channel_bytes = fetch(&client, channel_url).await?;
     let signature = fetch(&client, &format!("{channel_url}.sig")).await?;
-    let channel = OsChannel::verified(&channel_bytes, &signature, &keys)
-        .map_err(|e| failed(&e.to_string()))?;
+    let channel = trust.verify(&channel_bytes, &signature)?;
     let offered: Vec<String> = channel.architectures.keys().cloned().collect();
     let chosen = select_architectures(&offered, requested, &channel.version)?;
     for arch in &chosen {
-        download_arch(&client, channel_url, &channel, *arch, directory, everything).await?;
+        download_arch(
+            &client,
+            channel_url,
+            &channel,
+            *arch,
+            directory,
+            everything,
+            trust,
+        )
+        .await?;
     }
     println!("{}", saved_summary(directory, &chosen));
     Ok(())
@@ -153,6 +241,7 @@ async fn download_arch(
     arch: Arch,
     directory: &Path,
     everything: bool,
+    trust: &ChannelTrust,
 ) -> Result<(), RelishError> {
     let arch = arch.directory();
     let entry = channel
@@ -177,8 +266,10 @@ async fn download_arch(
         &sums_signature,
     )?;
     println!(
-        "OS {} for {arch} ({}), checked against the release key",
-        channel.version, entry.tag
+        "OS {} for {arch} ({}), checked against {}",
+        channel.version,
+        entry.tag,
+        trust.checked_against()
     );
     for name in wanted(&entries, &channel.version, everything) {
         let expected = entries
@@ -433,6 +524,115 @@ mod tests {
             saved_summary(Path::new("os"), &[Arch::X86_64]),
             "Saved x86_64 under os (os/x86_64/)"
         );
+    }
+
+    const LAB_CHANNEL: &[u8] = include_bytes!("../os/testdata/lab/os-channel.json");
+    const LAB_SIGNATURE: &[u8] = include_bytes!("../os/testdata/lab/os-channel.json.sig");
+    const LAB_KEY_PEM: &str = include_str!("../os/testdata/lab/lab-signing-key.pub.pem");
+
+    #[test]
+    fn by_default_a_channel_is_checked_against_the_release_keys_only() {
+        let trust = ChannelTrust::from_key_file(None).unwrap();
+        assert_eq!(
+            trust.keys,
+            crate::upgrade::keys::release_keys(&Default::default()).unwrap()
+        );
+        assert_eq!(trust.warning(), None);
+        assert_eq!(trust.checked_against(), "the release key");
+    }
+
+    #[test]
+    fn without_key_a_lab_channel_is_refused_with_a_pointer_to_key() {
+        let trust = ChannelTrust::from_key_file(None).unwrap();
+        let error = trust
+            .verify(LAB_CHANNEL, LAB_SIGNATURE)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("doesn't match a release key"), "{error}");
+        assert!(error.contains("--key"), "{error}");
+    }
+
+    #[test]
+    fn with_the_lab_builds_key_its_channel_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab-signing-key.pub.pem");
+        std::fs::write(&path, LAB_KEY_PEM).unwrap();
+        let trust = ChannelTrust::from_key_file(Some(&path)).unwrap();
+        let channel = trust.verify(LAB_CHANNEL, LAB_SIGNATURE).unwrap();
+        assert_eq!(channel.version, "2026.41.8");
+        assert_eq!(
+            trust.checked_against(),
+            format!("the key in {}, not a release key", path.display())
+        );
+    }
+
+    #[test]
+    fn key_replaces_the_release_keys_rather_than_adding_to_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.pem");
+        std::fs::write(&path, LAB_KEY_PEM).unwrap();
+        let trust = ChannelTrust::from_key_file(Some(&path)).unwrap();
+        let lab_key = crate::upgrade::signing::parse_pem_public_key(LAB_KEY_PEM).unwrap();
+        assert_eq!(trust.keys, [lab_key]);
+    }
+
+    #[test]
+    fn with_key_a_channel_signed_by_any_other_key_is_refused_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.pem");
+        // Not the key that signed the lab channel.
+        std::fs::write(
+            &path,
+            "-----BEGIN PUBLIC KEY-----\n\
+             MCowBQYDK2VwAyEAi3zTXySVFXL+z98nJjP9w9GZqgBsxFYI0PChdhNgzRc=\n\
+             -----END PUBLIC KEY-----\n",
+        )
+        .unwrap();
+        let trust = ChannelTrust::from_key_file(Some(&path)).unwrap();
+        let error = trust
+            .verify(LAB_CHANNEL, LAB_SIGNATURE)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.ends_with(&format!(
+                "the OS channel's signature doesn't match the key in {}",
+                path.display()
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn using_key_is_announced_with_a_warning_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.pem");
+        std::fs::write(&path, LAB_KEY_PEM).unwrap();
+        let trust = ChannelTrust::from_key_file(Some(&path)).unwrap();
+        assert_eq!(
+            trust.warning().unwrap(),
+            format!(
+                "warning: checking the OS channel against {} instead of the release keys; \
+                 use it only for builds you made yourself",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_key_file_that_is_missing_or_not_an_ed25519_public_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.pem");
+        let error = ChannelTrust::from_key_file(Some(&missing))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        let private = dir.path().join("private.pem");
+        std::fs::write(&private, LAB_KEY_PEM.replace("PUBLIC KEY", "PRIVATE KEY")).unwrap();
+        let error = ChannelTrust::from_key_file(Some(&private))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&private.display().to_string()), "{error}");
+        assert!(error.contains("Ed25519 public key"), "{error}");
     }
 
     #[test]

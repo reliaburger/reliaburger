@@ -20,8 +20,9 @@ done
 extra=()
 [ -n "${OPERATOR_KEY:-}" ] && extra+=(--external-signing-key "$OPERATOR_KEY")
 # RELIABURGER_HOME keeps the lab's relish context out of the Mac's own.
+# --yes skips the master-key backup prompt: a lab cluster is thrown away.
 RELIABURGER_HOME="$WORK/relish-home" "$WORK/relish" cluster create --bare-metal "$c" \
-    --name lab --operator 192.168.105.1 --network 192.168.105.0/24 \
+    --name lab --operator 192.168.105.1 --network 192.168.105.0/24 --yes \
     ${extra[@]+"${extra[@]}"} "${machines[@]}"
 "$LAB/ssh.sh" 'mkdir -p ~/lab; umask 077; cat > ~/lab/admin.token' < "$c/secrets/admin.token"
 "$LAB/ssh.sh" 'cat > ~/lab/root-ca.crt' < "$c/root-ca.crt"

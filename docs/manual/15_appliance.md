@@ -371,8 +371,20 @@ either a terminal to ask at or `--trust-lan`.
 
 The cluster's keys are made here, on your laptop, and never anywhere else
 until node 1's seed carries them. `~/home-cluster/secrets` holds the master
-key and the sealed root CA key: back them up, because `relish council
-recover` needs them if the cluster ever loses its quorum. Every other
+key and the sealed root CA key, and `relish council recover` needs them if
+the cluster ever loses its quorum. So before relish sends any seed, it stops
+and waits:
+
+```
+Back up /Users/you/home-cluster/secrets: it holds the master key and the sealed root CA key, and `relish council recover` needs them if the cluster ever loses its quorum. Keep them somewhere safe off this machine, such as your password manager.
+Type yes once it's backed up:
+```
+
+Copy the folder somewhere that isn't this laptop, then type `yes`. Anything
+else asks again; Ctrl-D stops without claiming anything, and you start again
+from an empty directory. In a script, `--yes` prints the reminder and carries
+on without waiting, so the backup is then your script's job. Without a
+terminal and without `--yes`, relish refuses before it makes anything. Every other
 machine's seed holds only a join token: single-use, bound to that machine's
 name, and good for an hour (`--ttl` to change). Each machine fetches its
 certificate and the master key from the cluster itself when it joins. relish
@@ -412,8 +424,10 @@ relish cluster create --bare-metal ~/home-cluster --name home \
   d8:9e:f3:12:34:58@192.168.1.53
 ```
 
-`--operator`, `--network` and `--council-size` mean what they mean for a
-claim, and the secrets land in `~/home-cluster/secrets` the same way. A
+`--operator`, `--network`, `--council-size` and `--yes` mean what they mean
+for a claim. The secrets land in `~/home-cluster/secrets` the same way, and
+relish waits for you to confirm you've backed them up before it tells you
+how to make the stick. A
 stick's join tokens are good for a week (`--ttl` to change), since a stick
 travels slower than a claim.
 
@@ -585,20 +599,36 @@ gh run download <run-id> -n appliance-x86_64-next -D next
 (cd next && python3 -m http.server 8000)
 ```
 
-Then name the version when you roll it out:
+The lab channel is signed with the run's throwaway key, not the release key,
+so relish refuses it unless you give it that key with `--key`. The run puts
+the public half beside the channel, as `next/lab-signing-key.pub.pem`:
 
 ```sh
-relish os upgrade 2026.41.8 \
-  --channel http://192.168.1.10:8000/releases/download/os-channel/os-channel.json
+channel=http://192.168.1.10:8000/releases/download/os-channel/os-channel.json
+relish os list --channel "$channel" --key next/lab-signing-key.pub.pem
+relish os upgrade --channel "$channel" --key next/lab-signing-key.pub.pem
 relish os status
 ```
 
-The nodes fetch the release from beside that channel and check it against
-the key their own image carries. relish itself trusts only the release key,
-so `relish os list --channel …` warns that it can't read this channel and
-shows the newest release as unknown, and `relish os upgrade` without a
-version refuses it. To check the channel by hand, it's signed like a
-published one:
+`relish os list` then shows the next version as the newest release, and
+`relish os upgrade` rolls it out. The nodes fetch the release from beside
+that channel and check it against the key their own image carries, which for
+a CI build is the same run's key.
+
+`--key` replaces the release keys rather than adding to them, and only for
+that one command: relish says so on stderr each time, and names the key file
+in the line that reports the check. It's never stored, and nothing on the
+nodes changes. Without it, relish checks a channel against the release keys
+it carries and nothing else, and refuses a lab channel with a pointer to
+`--key`. `relish image download` takes the same option. `relish os upgrade`
+refuses `--key` with a version you name, because it doesn't read the channel
+then:
+
+```sh
+relish os upgrade 2026.41.8 --channel "$channel"
+```
+
+To check the channel by hand, it's signed like a published one:
 
 ```sh
 openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \

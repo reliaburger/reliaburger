@@ -154,12 +154,13 @@ Leave the tour's apps running for the first 12 hours, then remove them. One CSV 
 
 ```sh
 (cd next && python3 -m http.server 8000)
-relish os upgrade <next version> \
-  --channel http://10.77.0.2:8000/releases/download/os-channel/os-channel.json
+channel=http://10.77.0.2:8000/releases/download/os-channel/os-channel.json
+relish os list --channel "$channel" --key next/lab-signing-key.pub.pem
+relish os upgrade --channel "$channel" --key next/lab-signing-key.pub.pem
 relish os status
 ```
 
-Name the version: relish checks a channel against the release keys only, so it can't read the lab channel (`relish os list` shows the newest release as unknown). Formal run: `relish os list`, then `relish os upgrade` with no version, if a release newer than the installed one exists by then. The leader takes one node at a time, workers first and itself last.
+The lab channel is signed with the run's key, so relish reads it only with `--key`, and warns that it's not checking against the release keys. `relish os list` must show the next version as the newest release; if it doesn't, the `next/` directory is from another run. Formal run: `relish os list`, then `relish os upgrade` with no version, if a release newer than the installed one exists by then. The leader takes one node at a time, workers first and itself last.
 
 **The fallback** (lab run only). The broken build can't go through `relish os upgrade`. It comes from another run, signed with that run's throwaway key, and the fleet trusts only its own run's key; that run makes no next version and no lab channel either. So stage it by hand on one worker, with the image's `os-stage`, which takes the key to check against. Pick a worker that isn't in the council (`relish council`), say wyse-9:
 
