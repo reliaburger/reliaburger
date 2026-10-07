@@ -812,3 +812,37 @@ fn running_check_reports_missing_log_for_an_exited_owned_child() {
 fn running_check_reports_invalid_utf8_log_for_an_exited_owned_child() {
     assert_owned_child_log_error_is_explicit(true, false);
 }
+
+#[test]
+fn offline_port_leases_exclude_overlapping_blocks_across_processes() {
+    const CHILD_BASE: &str = "RELIABURGER_PORT_LEASE_CHILD_BASE";
+    if let Ok(base) = std::env::var(CHILD_BASE) {
+        let base = base.parse().unwrap();
+        assert!(bun_process::PortBlockReservation::try_reserve(base, 2).is_none());
+        return;
+    }
+    let reservation = bun_process::reserve_port_block_lease(4);
+    let base = reservation.base;
+    // The network listeners are gone; only the lifetime lease protects restart.
+    for port in base..base + 4 {
+        let _tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let _udp = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "offline_port_leases_exclude_overlapping_blocks_across_processes",
+            "--nocapture",
+        ])
+        .env(CHILD_BASE, (base + 1).to_string())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(bun_process::PortBlockReservation::try_reserve(base + 1, 2).is_none());
+    drop(reservation);
+    assert!(bun_process::PortBlockReservation::try_reserve(base, 4).is_some());
+}

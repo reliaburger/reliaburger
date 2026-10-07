@@ -1591,6 +1591,16 @@ RELIABURGER_EBPF_TESTS=1 cargo test --features ebpf --test ebpf
 
 On a Mac, `relish dev test` runs them inside Lima. Process faults (signals) run on any Unix including macOS; resource faults (cgroups) are Linux-only and their config logic is unit-tested everywhere, returning `UnsupportedPlatform` off Linux.
 
+Killing Bun also frees its sockets. The registry recovery fixture waits for a
+lease to expire before restarting the same node, so another parallel test could
+take its API port during that interval. The shared allocator now checks a
+`FileLock` for each candidate port, and the crash fixture retains a
+`PortBlockReservation` across the outage. This Rust guard owns the lock files;
+dropping it releases them. The TCP and UDP probes still close before Bun starts,
+so the lease does not leave a fake network listener alive during the fault.
+A regression starts a second test process, proves that it cannot claim an
+overlapping block after the sockets close, then proves release on guard drop.
+
 ### Running them
 
 ```sh

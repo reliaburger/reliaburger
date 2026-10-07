@@ -32,13 +32,14 @@ all 11 selected cases run as the unprivileged VM user.
 
 | Gate | Result |
 |---|---|
-| Portable CI | Passed: formatting, both Clippy configurations, 6,131 portable tests, two doctests, 318 CI-script tests and ignored-test ownership |
+| Portable CI | Passed: formatting, both Clippy configurations, 6,132 portable tests, two doctests, 318 CI-script tests and ignored-test ownership |
 | Wall-clock acceptance | Passed: all four cases |
 | Real multi-node cluster | Passed: all 46 cases |
 | Real-binary upgrade | Passed: all 18 cases |
 | Provisioned Linux runtime | Passed: all 156 cases |
 | Rootless runc | Passed: all 11 cases |
 | Hook fixture repetition | Passed: all 30 cases in ten iterations |
+| Port lease and registry recovery | Passed: all four cases on both macOS and Linux |
 
 The cluster gate exercises an actual UTC cron firing, a real Raft election and
 accepted completion under the replacement leader, then replays the occurrence
@@ -85,6 +86,23 @@ The rootless gate initially passed 2/11: the VM still had
 this task's logs reclaimed 3.2 GiB. The complete unchanged selection passed
 11/11, and the original AppArmor setting was restored. No product behaviour,
 deadline or retry policy changed.
+
+The first published head (`72938dcf`, CI run `37576715922`) passed cluster,
+privileged runtime, benchmarks and builds. Portable Linux passed 6,190/6,191,
+but the registry crash fixture lost its API port during the deliberate offline
+interval. Per-port file leases now protect that interval without leaving fake
+listeners alive. The cross-process overlap regression failed before the fix and
+passed after; all three registry recovery cases then passed unchanged.
+
+The same head's macOS portable run passed 6,131/6,131, but its evidence collector
+refused 20 references to tests replaced by the common job path. The manifest now
+requires the actual common hook, worker-admission, resource-budget and ownership
+regressions. Both real CI discovery files contain all replacement cases. The
+collector's completion rules and coverage floor remain unchanged; the new port
+lease regression is mandatory in both portable gates. The repaired full local
+portable gate passed 6,132/6,132, both Clippy configurations, both doctests and
+all 318 CI-script checks. The focused lease and registry-recovery selection
+passed 4/4 on both macOS and Linux.
 
 Reusable executors (#639), throughput qualification and the landing-page demo
 (#640), resident model workers (#641) and GPU placement (#359) remain separate.
