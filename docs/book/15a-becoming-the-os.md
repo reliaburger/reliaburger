@@ -617,7 +617,26 @@ Two rollouts that restart nodes must never overlap, and neither must a rollout a
 
 CI runs the whole thing. A lab build makes the image twice, one version apart, and signs both with its throwaway key. It also writes a lab `os-channel.json` naming the second version, with the same `os_release.py` code and the same canonical bytes as the published channel, signed with that throwaway key instead of the release key. One node boots the first version and forms a cluster from its seed, the runner serves the second laid out like a GitHub release beside that channel, and `relish os upgrade` has to end with the node healthy on the new version. The run uploads exactly that tree as `appliance-x86_64-next`, so the Wyse lab updates from what CI tested.
 
-The lab channel is a stand-in, not a back door. relish checks a channel against the release keys compiled into it and nothing else, so it refuses a lab channel: `relish os list` says the newest release is unknown, and in the lab you name the version, `relish os upgrade <version>`, which never reads the channel. The node still checks the release's `SHA256SUMS` against the key its own image carries. A test in `src/os/channel.rs` pins both halves down with a lab channel from `os_release.py`: it passes every rule a published channel does with its run's key, and fails the signature check against the release keys.
+The lab channel is a stand-in, not a back door. relish checks a channel against the release keys compiled into it and nothing else, so it refuses a lab channel. At first that meant the lab had to name the version, `relish os upgrade <version>`, which never reads the channel, while `relish os list` called the newest release unknown. That's a different path from the one a user takes, in the one test that's meant to look like a user. So `relish image download`, `relish os list` and `relish os upgrade` grew a `--key <PEM>` option: check the channel against this public key instead of the release keys. The run already puts the key's public half beside the channel, so the lab passes `--key next/lab-signing-key.pub.pem` and then runs exactly what a user runs.
+
+How do you add a "trust this other key" switch without building a back door? We settled on four rules. The default doesn't move: no `--key`, release keys. `--key` replaces the release keys rather than adding to them, so a lab command reads only its own build's channel and can't quietly accept something else. relish says so out loud: a warning on stderr every time, and the line that reports the check names the key file instead of saying "the release key". And it stays on the operator's laptop. It changes what one relish command believes, for one run, and nothing else: no config file, no API, no Raft entry.
+
+That last rule matters because of the nodes. They never read the channel. The leader passes the version and the channel's URL, and each node fetches that version's `SHA256SUMS` from beside the channel and checks it against the release keys plus the key its own image carries (`os::slot`). A lab image carries its run's throwaway key in `/usr`, under dm-verity like the rest of `/usr`, so the trust root for a lab fleet is fixed when the image is built. We could have let `relish os upgrade --key` send the key to the nodes too. That's a remote way to swap a running cluster's trust root, which is the one thing an attacker with an operator's credentials would most like to have. So it doesn't.
+
+All three commands share one small type in `src/relish/image.rs`:
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ChannelTrust {
+    keys: Vec<PublicKey>,
+    /// The `--key` file, when there is one.
+    operator_key: Option<PathBuf>,
+}
+```
+
+`ChannelTrust::from_key_file(None)` gives the release keys, and `from_key_file(Some(path))` reads and parses one Ed25519 PEM key. The fields are private, so nothing outside the module can push a key in some other way. `verify` wraps `OsChannel::verified` and makes its errors say which key failed. Without `--key`, a failed check adds a pointer to `--key`, since a lab channel is by far the likeliest reason. With it, the error names the file. Rust's `match` on a tuple, `(&error, &self.operator_key)`, picks the message for each pair of cases, and the compiler makes sure no pair is left out.
+
+`relish os upgrade` takes `--key` only when it reads the channel, which is when you don't name a version. clap's `conflicts_with = "version"` turns the other case into an argument error, so a key that would silently do nothing is refused instead. The tests in `src/relish/image.rs` check the lab channel from `os_release.py` against each kind of trust: refused by the release keys with a pointer to `--key`, accepted with its run's key, refused with any other key, and the release keys gone once `--key` is given. CI's OS update test now runs `relish os list --key` and expects the next version to be the newest, then `relish os upgrade --key` without naming it. A test in `src/os/channel.rs` still pins down the channel itself: it passes every rule a published channel does with its run's key, and fails the signature check against the release keys.
 
 ### Keeping /etc in step
 
