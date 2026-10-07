@@ -33,6 +33,34 @@ pub struct OciSpec {
     pub port_mapping: Option<PortMapping>,
 }
 
+impl OciSpec {
+    /// The same spec with every environment entry cut down to its variable
+    /// name, so no value (decrypted secrets included) remains.
+    ///
+    /// A retired runtime intent keeps this copy instead of the original. A
+    /// launched entry is always `NAME=value`, so a scrubbed entry (no `=`)
+    /// can never be mistaken for a live one, and scrubbing twice changes
+    /// nothing.
+    pub fn without_environment_values(&self) -> OciSpec {
+        let mut scrubbed = self.clone();
+        for entry in &mut scrubbed.process.env {
+            if let Some((name, _value)) = entry.split_once('=') {
+                *entry = name.to_string();
+            }
+        }
+        scrubbed
+    }
+
+    /// Whether `journal`, a runtime intent's copy, records this spec.
+    ///
+    /// A live intent keeps the exact spec, so it must be equal. A retired
+    /// intent keeps [`OciSpec::without_environment_values`], so everything
+    /// except environment values must be equal.
+    pub fn matches_journal(&self, journal: &OciSpec) -> bool {
+        self == journal || self.without_environment_values() == *journal
+    }
+}
+
 /// A published port: traffic to `host_port` on the node reaches the
 /// workload's `container_port` inside its network namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +79,9 @@ pub struct OciRoot {
 /// The container's main process configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OciProcess {
+    /// Optional POSIX limits enforced by OCI runtimes before executing the task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rlimits: Vec<OciRlimit>,
     pub args: Vec<String>,
     pub env: Vec<String>,
     pub cwd: String,
@@ -67,6 +98,15 @@ pub struct OciProcess {
     /// before writing `config.json`. `None` means the process is final.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<ProcessOverrides>,
+}
+
+/// One standard OCI process limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciRlimit {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub hard: u64,
+    pub soft: u64,
 }
 
 /// The parts of a container's process an app may set, each replacing one
@@ -308,6 +348,7 @@ pub fn generate_oci_spec_with_decryptor(
             readonly: false,
         },
         process: OciProcess {
+            rlimits: Vec::new(),
             args,
             env,
             cwd: spec
@@ -672,6 +713,7 @@ pub fn generate_job_oci_spec(
             readonly: false,
         },
         process: OciProcess {
+            rlimits: Vec::new(),
             args,
             env,
             cwd: "/".to_string(),
@@ -721,6 +763,7 @@ pub fn generate_init_oci_spec(
             readonly: false,
         },
         process: OciProcess {
+            rlimits: Vec::new(),
             args: command.to_vec(),
             env: Vec::new(),
             cwd: "/".to_string(),
@@ -1677,6 +1720,57 @@ mod tests {
 
         let env = build_env_with_decryptor(&spec, None).unwrap();
         assert!(env.contains(&"SECRET=ENC[AGE:abc123]".to_string()));
+    }
+
+    // -- Journal copies of a retired spec -------------------------------------
+
+    fn spec_with_env(env: &[&str]) -> OciSpec {
+        let mut oci = generate_oci_spec(
+            "web",
+            "default",
+            &minimal_app(),
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
+        oci.process.env = env.iter().map(|entry| entry.to_string()).collect();
+        oci
+    }
+
+    #[test]
+    fn without_environment_values_keeps_only_variable_names() {
+        let oci = spec_with_env(&["SECRET=plaintext", "EMPTY=", "URL=a=b"]);
+        let scrubbed = oci.without_environment_values();
+        assert_eq!(scrubbed.process.env, vec!["SECRET", "EMPTY", "URL"]);
+        assert_eq!(scrubbed.process.args, oci.process.args);
+        assert_eq!(scrubbed.linux, oci.linux);
+        assert_eq!(scrubbed.without_environment_values(), scrubbed);
+    }
+
+    #[test]
+    fn a_spec_matches_its_live_and_its_scrubbed_journal_copy() {
+        let oci = spec_with_env(&["SECRET=plaintext", "PLAIN=visible"]);
+        assert!(oci.matches_journal(&oci));
+        assert!(oci.matches_journal(&oci.without_environment_values()));
+    }
+
+    #[test]
+    fn a_live_journal_copy_must_match_every_environment_value() {
+        let journal = spec_with_env(&["SECRET=plaintext"]);
+        assert!(!spec_with_env(&["SECRET=other"]).matches_journal(&journal));
+        assert!(!spec_with_env(&["SECRET"]).matches_journal(&journal));
+    }
+
+    #[test]
+    fn a_scrubbed_journal_copy_still_refuses_a_different_request() {
+        let journal = spec_with_env(&["SECRET=plaintext"]).without_environment_values();
+        assert!(!spec_with_env(&["OTHER=plaintext"]).matches_journal(&journal));
+        assert!(!spec_with_env(&[]).matches_journal(&journal));
+        let mut moved = spec_with_env(&["SECRET=plaintext"]);
+        moved.process.args = vec!["elsewhere".into()];
+        assert!(!moved.matches_journal(&journal));
     }
 
     #[test]

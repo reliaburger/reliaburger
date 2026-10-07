@@ -1,0 +1,13 @@
+Parent rerun of /tmp/reliaburger-runtime-repros/pure, 3 October 2026.
+The panic is deliberately caught to observe debug cron behavior.
+
+thread 'main' panicked at src/meat/cron.rs:180:13:
+attempt to add with overflow
+cron_overflow_panics=true
+target 0% validates: true
+target -20% validates: true
+target NaN validates: true
+target inf validates: true
+colliding_volumes_validate=true
+/data.a -> /data.img
+/data.b -> /data.img

@@ -21,6 +21,9 @@ pub struct CurrentResourceStatus {
     pub resource: String,
     /// Image currently deployed, when the resource kind has one.
     pub image: Option<String>,
+    /// Complete effective desired-spec evidence; absence means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// Status of a single workload instance.
@@ -348,7 +351,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         execution: launches
                             .as_ref()
                             .and_then(|known| known.get(&inst.id))
-                            .filter(|launch| inst.oci_spec.as_ref() == Some(&launch.spec))
+                            .filter(|launch| {
+                                inst.oci_spec
+                                    .as_ref()
+                                    .is_some_and(|spec| launch.launched(spec))
+                            })
                             .map(|launch| crate::grill::RuntimeExecution {
                                 instance_id: launch.instance_id.clone(),
                                 generation: launch.generation.clone(),
@@ -499,16 +506,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// What the loop knows about every instance, for a status snapshot.
     pub(super) fn status_entries(&self) -> Vec<status_snapshot::StatusEntry> {
         use status_snapshot::{EvidenceSource, StatusEntry};
-        self.supervisor
+        let mut entries: Vec<_> = self
+            .supervisor
             .list_instances()
             .into_iter()
             .map(|instance| {
-                let recorded_exit =
+                let recorded_exit = if let Some(job) = self.recorded_jobs.get(&instance.id.0)
+                    && job.batch_execution.is_some()
+                {
+                    // The public runtime snapshot may see an exit before the loop
+                    // commits it. Batch callbacks must wait for durable evidence
+                    // of this attempt so recovery preserves the reported result.
+                    Some(job.batch_terminal_exit())
+                } else {
                     match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
                         Some(crate::bun::jobs::JobPhase::Exited { code }) => Some(Some(*code)),
                         Some(crate::bun::jobs::JobPhase::Unknown) => Some(None),
                         _ => None,
-                    };
+                    }
+                };
                 let evidence = if instance.is_being_created() {
                     EvidenceSource::Creating {
                         exit_code: recorded_exit.flatten(),
@@ -527,7 +543,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 StatusEntry {
                     status: InstanceStatus {
                         id: instance.id.0.clone(),
-                        app_name: instance.app_name.clone(),
+                        app_name: self.logical_execution_name(&instance.id, &instance.app_name),
                         namespace: instance.namespace.clone(),
                         state: self.job_state_label(instance),
                         restart_count: instance.restart_count,
@@ -540,7 +556,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     evidence,
                 }
             })
-            .collect()
+            .collect();
+        for (id, job) in &self.recorded_jobs {
+            if self
+                .supervisor
+                .get_instance(&InstanceId(id.clone()))
+                .is_some()
+            {
+                continue;
+            }
+            entries.push(StatusEntry {
+                status: InstanceStatus {
+                    id: id.clone(),
+                    app_name: job.logical_name().into(),
+                    namespace: job.namespace.clone(),
+                    state: "unknown".into(),
+                    restart_count: job.restart_count,
+                    host_port: None,
+                    exit_code: None,
+                    pid: None,
+                    runtime_unknown: true,
+                    status_age_ms: None,
+                },
+                evidence: EvidenceSource::Creating { exit_code: None },
+            });
+        }
+        entries
     }
 
     /// Publish what the loop knows now, for status readers, and return it.
@@ -569,12 +610,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     pub(super) fn get_job_status(&self) -> Vec<JobStatus> {
-        self.supervisor
+        let mut jobs: Vec<_> = self
+            .supervisor
             .list_instances()
             .into_iter()
             .filter(|instance| instance.is_job)
             .map(|instance| JobStatus {
-                name: instance.app_name.clone(),
+                name: self.logical_execution_name(&instance.id, &instance.app_name),
                 namespace: instance.namespace.clone(),
                 instance_id: instance.id.0.clone(),
                 image: instance.image.clone(),
@@ -582,6 +624,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 restart_count: instance.restart_count,
                 age_seconds: instance.created_at.elapsed().as_secs(),
             })
-            .collect()
+            .collect();
+        for (id, job) in &self.recorded_jobs {
+            if self
+                .supervisor
+                .get_instance(&InstanceId(id.clone()))
+                .is_some()
+            {
+                continue;
+            }
+            jobs.push(JobStatus {
+                name: job.logical_name().into(),
+                namespace: job.namespace.clone(),
+                instance_id: id.clone(),
+                image: job.spec.image.clone().unwrap_or_default(),
+                state: "unknown".into(),
+                restart_count: job.restart_count,
+                age_seconds: 0,
+            });
+        }
+        jobs
     }
 }

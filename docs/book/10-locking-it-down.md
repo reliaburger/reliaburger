@@ -310,7 +310,7 @@ require_signatures = true
 keys = ["MFkwEwYHKoZIzj0CAQ..."]  # base64-encoded ECDSA P-256 public keys
 ```
 
-When `require_signatures` is `true`, the scheduler calls `check_image_schedulable()` before placement. If the image exists in Pickle's manifest catalog without a signature, scheduling is rejected. Images from external registries (Docker Hub, GHCR) are not checked -- they're not in the catalog.
+When `require_signatures` is `true`, Bun checks the image before every deploy (`enforce_image_signature` in `src/bun/agent/launch.rs`). The scheduler places the app regardless; the node that would run it refuses. (An earlier draft of this chapter said Meat refused to place it. `check_image_schedulable()` exists, but only its tests call it.) If the image exists in Pickle's manifest catalog without a valid signature, the deploy fails with the image named. Images from external registries (Docker Hub, GHCR) are not checked -- they're not in the catalog.
 
 This design means pushes never fail due to missing signatures. Your CI pipeline keeps working. But unsigned images sit in Pickle, waiting. They're visible in `relish images` but unschedulable until signed. The separation is clean: the registry accepts everything; the scheduler enforces trust.
 
@@ -328,6 +328,84 @@ RaftRequest::AttachSignature(attach) => {
 
 Once written to Raft, the signature is replicated to all council nodes. The scheduler reads it directly from `DesiredState` without re-verifying -- first-write wins.
 
+### Cosign, for images we didn't build
+
+Everything above covers images that live in Pickle. Most clusters also run images somebody else built: `nginx`, a Chainguard base, your company's images on GHCR. We can't sign those, and the people who did sign them didn't use our format. They used cosign.
+
+Before writing a line, we went and looked at what real images publish, with nothing but `curl` against the registry API. For each image we resolved a tag to its digest, then asked for the tag `sha256-<hex>.sig` (cosign's classic layout) and for the OCI referrers of that digest (where the newer Sigstore bundle lives):
+
+| Image | `.sig` tag | Referrers | Signed with |
+|-------|-----------|-----------|-------------|
+| `cgr.dev/chainguard/static` | yes | none | keyless (Fulcio certificate) |
+| `gcr.io/distroless/static-debian12` | yes | none | keyless |
+| `ghcr.io/sigstore/cosign/cosign` | yes | not supported | keyless |
+| `ghcr.io/fluxcd/source-controller` | yes | not supported | keyless |
+| `docker.io/library/nginx` | no | none | not signed with cosign |
+| `quay.io/prometheus/prometheus` | no | none | not signed with cosign |
+
+So the classic `.sig` tag is what's out there. Every one of those signatures is keyless, though: a short-lived Fulcio certificate rather than a key you could put in a config file. Checking those means trusting Sigstore's roots and their rotation, which is a bigger job and a separate one. What we built first is the part a team can use today: you sign your own images with `cosign sign --key`, list the public key, and a node only runs what that key signed.
+
+One more surprise. cosign 3 writes the new bundle format by default, as a referrer, and you have to ask for the old layout with `--new-bundle-format=false` (deprecated already). The bundle will be next, and the payload inside it is the same.
+
+#### What cosign actually signs
+
+For `ghcr.io/acme/web@sha256:5a90…`, cosign pushes a second image into the same repository, tagged `sha256-5a90….sig`. Each of its layers has the media type `application/vnd.dev.cosign.simplesigning.v1+json`, and the layer's bytes are a tiny JSON document:
+
+```json
+{"critical":{"identity":{"docker-reference":"ghcr.io/acme/web"},
+  "image":{"docker-manifest-digest":"sha256:5a90…"},
+  "type":"cosign container image signature"},"optional":null}
+```
+
+The signature isn't in the layer. It sits in the layer's `dev.cosignproject.cosign/signature` annotation in the manifest: base64 of an ASN.1 DER ECDSA P-256 signature over those exact payload bytes. That's the same curve and encoding `relish sign` uses, which is why `ring` covers it and we didn't add a crypto crate. Only the message differs: cosign signs the payload, we sign the digest string.
+
+#### The verifier
+
+`src/pickle/cosign.rs` has three steps: read the key, fetch the payloads, verify.
+
+A `cosign.pub` file is a PEM `PUBLIC KEY` block holding a DER SubjectPublicKeyInfo. `ring` wants the raw 65-byte point instead. For P-256 the DER wrapper is always the same 26 bytes, so we strip them rather than pull in an ASN.1 parser:
+
+```rust
+match der.strip_prefix(&P256_SPKI_PREFIX[..]) {
+    Some(point) if point.len() == P256_POINT_LEN && point[0] == 0x04 => Ok(Self {
+        point: point.to_vec(),
+    }),
+    _ => Err(CosignError::InvalidKey(/* … */)),
+}
+```
+
+`strip_prefix` on a slice returns `Option<&[u8]>`: `Some(rest)` when the slice starts with the prefix, `None` otherwise. The `if` after the pattern is a *match guard*. The arm only matches when the pattern fits and the condition holds, so a short key, a compressed point or an RSA key all fall through to the `_` arm. Python has nothing quite like it; in Go you'd write the `if` inside the `case`.
+
+Fetching goes through the `UpstreamRegistry` trait the pull-through cache already uses, so the verifier doesn't know or care whether it's talking to GHCR or a test registry. `fetch_root` reads the `.sig` manifest, and `fetch_blob` reads each payload. We hash every payload against its layer digest before we keep it. When the cache is on, `ClusterSource::cosign_signature` caches the `.sig` image under `cache/<host>/<repo>` like any other tag, so the cluster asks upstream once and every later check reads the cluster's copy.
+
+Verification is where the order matters:
+
+```rust
+if !keys
+    .iter()
+    .any(|key| key.verifies(&signed.payload, &signature))
+{
+    return Err("signature doesn't verify under any trusted key".to_string());
+}
+// Signed by a trusted key, so the bytes are the signer's; now read them.
+let payload: Payload = serde_json::from_slice(&signed.payload)
+    .map_err(|e| format!("signed payload isn't a cosign payload: {e}"))?;
+```
+
+We check the signature *before* we parse the JSON. Until a trusted key has vouched for those bytes they're attacker input, and there's no reason to hand attacker input to a parser when a byte comparison will do. Once the signature holds, the payload must name the digest the image was bound to. Without that check, a perfectly valid signature for last month's image would vouch for this month's.
+
+The payload's field names have hyphens in them, which Rust identifiers can't. `#[serde(rename = "docker-manifest-digest")]` maps the JSON name onto a normal field, and `#[serde(rename = "type")]` does the same for `type`, a reserved word in Rust. Serde ignores fields a struct doesn't declare, so `identity` and `optional` never get parsed at all.
+
+Any payload that verifies under any trusted key is enough. A repository signed by two teams, or re-signed after a key rotation, carries several layers, and one good one is all we need. When nothing verifies, the error lists why each payload failed, so "signed with the wrong key" and "signed, but for a different digest" read differently at 3 a.m.
+
+#### Testing against the real thing
+
+It's easy to write a verifier that agrees with your own signer and with nothing else. So the fixtures in `tests/fixtures/cosign/` come from cosign itself: we pushed a one-file image to a throwaway local registry (`crane registry serve`), ran `cosign sign --key cosign.key --tlog-upload=false --new-bundle-format=false`, checked it with `cosign verify`, and saved the image, the `.sig` manifest, the payload, the signature and both public keys. The private key wasn't kept.
+
+The unit tests read those files with `include_bytes!`, a macro that embeds a file's bytes into the test binary at compile time, so the tests can't run against a missing fixture. Alongside the one that should pass, they cover the refusals: another key, a payload for another digest, a payload edited after signing, a missing `.sig` tag, no keys at all. Two tests in `tests/suite/pickle_cluster.rs` push the same bytes into an in-process Pickle standing in for the upstream registry and fetch them over the real OCI protocol, once directly and once through the pull-through cache. The cache test also counts requests, to show a second check doesn't touch upstream.
+
+The policy around it came later in this chapter: the upstream rules (`[[images.trust_policy.upstream]]`, "Saying which registries you trust") take `require_signatures` and `cosign_keys`, and Bun runs the verifier before every deploy ("A check that waits for the network").
+
 ## SecurityState in Raft
 
 The CA hierarchy, API tokens, join tokens, age keypairs, and OIDC signing config all live in a single `SecurityState` struct. During `relish init`, this struct is generated alongside a 32-byte master secret. The master secret wraps all private keys using HKDF + AES-256-GCM. The struct itself (with its wrapped keys) is safe to replicate, but the master secret must stay off the wire.
@@ -341,9 +419,9 @@ mycluster-master.key              # hex-encoded 32-byte master secret (0o600)
 mycluster-security-bootstrap.json # full SecurityState as JSON
 ```
 
-The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file.
+The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file, and make an operator-held copy of the root itself with `relish ca backup` (Chapter 4 explains why the sealed file alone isn't enough).
 
-The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON, writes a `SecurityStateInit` command to Raft, and deletes the file. After that, SecurityState lives in Raft and replicates to every council node automatically.
+The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk: `relish ca backup` reads the root certificate and the cluster's `age` keys from it.
 
 ### Turning mTLS on: the mode matrix
 
@@ -414,11 +492,134 @@ When a node needs to sign a workload CSR or issue a join certificate, it reads t
 
 ## Token management
 
-API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (Argon2id-hashed before storage), `relish token list` shows active tokens via the `/v1/token/list` endpoint, and `relish token revoke` removes a token via `/v1/token/revoke`.
+API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (Argon2id-hashed before storage), `relish token list` shows active tokens via the `/v1/token/list` endpoint, `relish token rotate` gives one a new secret via `/v1/token/rotate`, and `relish token revoke` removes a token via `/v1/token/revoke`.
 
 `relish token list` used to print `created_at` exactly as the API sent it, Unix seconds, and ignored `expires_at` altogether, so the one thing you most want to know about a CI token (when does it stop working?) was missing. The client now deserialises the response into a typed `TokenSummary` with `expires_at: Option<u64>` instead of poking at a `serde_json::Value`, and the table shows UTC times plus `never`, `(in 30d)` or `(expired)`. The `time` crate, already a dependency for certificate validity windows, does the calendar arithmetic: `OffsetDateTime::from_unix_timestamp` returns a `Result`, because an `i64` of seconds can land outside the years it can represent. The rendering is a pure function of the token list and "now", so an `insta` inline snapshot pins the whole table, and a change in the output shows up as a diff in the test source rather than a vague assertion failure.
 
-Both list and revoke endpoints read from or write to the council's security state directly. The list endpoint formats each token's name, role, and creation timestamp. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
+Both list and revoke endpoints read from or write to the council's security state directly. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
+
+### When was this token last used?
+
+The question you ask before revoking a CI token is "is anything still using it?", and for a long time the list couldn't answer it. It now shows each token's scope and when it was last used. The obvious place to keep "last used" is next to the token, in `SecurityState`. We didn't, and it's worth saying why.
+
+`SecurityState` lives in Raft. Every change to it is a log entry: proposed to the leader, replicated to a majority, applied on every council member, and eventually written into a snapshot. Recording a use there would turn every authenticated request (including every `relish status`, every dashboard refresh) into a replicated write. Reads would cost as much as deploys, and a follower answering a request would have to forward a write to the leader just to say "I saw this". That's a lot of machinery for a timestamp nobody needs to be exact.
+
+So each node keeps its own, in memory:
+
+```rust
+pub type TokenLastUsed = Arc<RwLock<std::collections::HashMap<String, u64>>>;
+```
+
+`type` here declares an *alias*, not a new type: `TokenLastUsed` is just a shorter name for that nesting of `Arc` (shared ownership), `RwLock` (many readers or one writer) and `HashMap`. The map is keyed by the token's principal id, `token:<sha256 of its hash>`, not its name, because a name can be revoked and reused while the principal can't. When `auth_middleware` authenticates a token, it takes the write lock for one insert and lets go. `GET /v1/token/list` then does what the other cluster views do: it asks every live member for its share with `local=true` (so they don't fan out again), keeps the latest time per principal, and names any member that didn't answer. A node that restarts forgets what it saw, so the answer can under-report a token's last use but never invent one. For a question like "can I revoke this?", that's the safe direction to be wrong in.
+
+The peers ask each other with the cluster's internal service token, and the token routes refuse that principal outright (it exists for node-to-node fan-out, not user management). The list makes one exception: with `local=true`, the service principal may read a node's own answer. It still can't ask for the cluster-wide list, and it still can't mint or revoke anything.
+
+### Sweeping expired tokens, but never the last Admin
+
+An expired token gets a `401` the moment its expiry passes, so removing it from the store isn't about security. It's about not keeping dead credentials around forever. Every hour the leader proposes `SweepExpiredApiTokens { now_unix_ms }`, and the state machine removes tokens that expired more than a day ago (the day of grace means `token list` still shows *why* a client started failing).
+
+Notice that the request carries the time. The state machine doesn't read the clock, because each replica applies the entry at a slightly different moment, and a token right on the boundary could vanish on one member and survive on another. With `now` in the entry, `tokens_to_sweep(tokens, now)` is a pure function, so every replica removes exactly the same tokens. Ties (two tokens expiring in the same millisecond) are broken by name for the same reason.
+
+The rule that took the most thought is what the sweep must *not* remove. Remember the bootstrap window: an empty token store means "this cluster hasn't been set up yet", and the middleware lets everyone in. `RevokeApiToken` already refuses to remove the last Admin for that reason. A sweep that dutifully deleted every expired token would undo that protection on a timer. A cluster whose only tokens had all expired would wake up one night with an empty store and an open API.
+
+So the sweep keeps the last Admin, even an expired one (the one that expired most recently, if there are several), and it never empties the store, even if there's no Admin left at all. The token it keeps can't authenticate anyone, but its presence keeps the store non-empty, and a non-empty store means the API stays closed. A test pins that from the other side: a store whose every token has expired still answers an anonymous request with `401`.
+
+Each removal is audited like a revoke. The leader records a `token.expired_swept` event per token, with principal `system`, since no person asked for it.
+
+### Rotating a token without an outage
+
+Picture a CI token baked into forty pipelines. It leaked, or it's simply old, and you want a new one. Before rotation existed, the only way was revoke-and-recreate: revoke, and every pipeline fails until someone pastes the new secret into each one. Create the new one first under another name, and now `[permission]` specs, dashboards and runbooks all name the wrong token. Neither is great.
+
+`relish token rotate ci` gives the token a new secret under the same name, and the old secret keeps working for a grace period (24 hours unless you say otherwise). You roll the new secret out, and the old one quietly stops. A leaked secret gets `--grace-hours 0`, which ends it on the spot.
+
+Where does the old secret live for those 24 hours? We considered keeping it as a second token with a hidden name, and dropped the idea: names are unique in the store, revoke and the sweep reason about names, and a hidden twin would have to be taught to every one of them. Instead `ApiToken` grew one optional field:
+
+```rust
+pub struct ApiToken {
+    // ... name, token_hash, token_salt, role, scope, expires_at, created_at
+    #[serde(default)]
+    pub previous_secret: Option<PreviousSecret>,
+}
+
+pub struct PreviousSecret {
+    pub token_hash: Vec<u8>,
+    pub token_salt: Vec<u8>,
+    pub valid_until: SystemTime,
+}
+```
+
+Validation now checks the current hash and then, if there is one, the previous hash, and returns *which* matched:
+
+```rust
+pub enum MatchedSecret {
+    Current,
+    Previous,
+}
+```
+
+The answer matters because of the principal. Back in "When was this token last used?" a token's principal became `token:<sha256 of its hash>`, so that a reused name never inherits anything. Rotation changes the hash, so it changes the principal, and the old secret keeps its own. A dashboard session is keyed by the principal that logged in, so a session opened with the old secret checks the *old* secret's `valid_until` on every request and ends with it. We didn't write any session-ending code for rotation. The identity we chose earlier did the work.
+
+Like the sweep, the rotation is decided before it reaches Raft. The node that takes the request mints the secret, hashes it (on the blocking pool, Argon2 being slow on purpose), reads the clock once and proposes a `RotateApiToken(TokenRotation)` carrying the new hash, the new expiry and the old secret's grace end. The state machine just installs it:
+
+```rust
+pub fn apply_rotation(token: &mut ApiToken, rotation: &TokenRotation) {
+    let old_hash = std::mem::replace(&mut token.token_hash, rotation.token_hash.clone());
+    let old_salt = std::mem::replace(&mut token.token_salt, rotation.token_salt.clone());
+    token.previous_secret = rotation
+        .previous_valid_until
+        .map(|valid_until| PreviousSecret {
+            token_hash: old_hash,
+            token_salt: old_salt,
+            valid_until,
+        });
+    token.created_at = rotation.rotated_at;
+    token.expires_at = rotation.expires_at;
+}
+```
+
+`std::mem::replace` deserves a word if you come from C or Go. In C you'd copy the old pointer out and assign the new one; in Go you'd do the same with a slice header. Rust won't let you simply *move* a field out of a struct you only borrowed (`&mut token`), because for a moment the struct would have a hole in it. `mem::replace` does both halves as one operation: it puts the new value in and hands you the old one, so the struct is never incomplete and the old bytes move into `PreviousSecret` without a copy. Its sibling `mem::take` does the same with the type's default value.
+
+A second rotation replaces the previous secret, so at most two secrets ever work for one token. And unlike a revoke, a rotation may touch the last Admin. The store still has the same Admin afterwards, just with a new secret, so the bootstrap window stays shut.
+
+Two smaller decisions. The new secret gets the same lifetime *length* the old one had, so a 90-day token stays a 90-day token instead of quietly becoming permanent. And the old secret never outlives the old expiry: rotating a token that expires in an hour gives its old secret an hour, not a day. `Option::filter` keeps that tidy:
+
+```rust
+let previous_valid_until = now
+    .checked_add(grace)
+    .map(|until| stored.expires_at.map_or(until, |at| until.min(at)))
+    .filter(|until| *until > now);
+```
+
+`filter` turns `Some(x)` into `None` when the closure says no, so a zero grace, or a token already past its expiry, ends the old secret at once with no special case.
+
+The node that took the request also installs the rotation in its own token store straight away, so the new secret works on the very next request there. The other nodes catch up on their five-second refresh from Raft, and since the old secret keeps working meanwhile, nobody notices the gap.
+
+### A default lifetime, except for Admins
+
+Until now a token without `--ttl-days` lived forever, and forever is the default people actually get. Deployer and ReadOnly tokens now get 90 days unless you pass `--ttl-days` or, deliberately, `--no-expiry`. The node that answers reads the default from `[security.tokens] default_ttl`.
+
+Admin tokens are exempt, and the reason is the same trap the sweep avoids. If every Admin token expires, nobody can create the next one, and the bootstrap window doesn't reopen (the store isn't empty). A default lifetime on Admins would arm that trap for every cluster that forgot a calendar reminder. So Admins don't expire unless you say so, and `relish wtf` nags instead: it warns about an Admin token whose secret is more than 90 days old, and about any token that expires within 14 days. `relish token list` gives the 14-day warning too, on stderr so `-o json` stays parseable.
+
+The config value is a string like `"90d"`, `"12h"` or `"none"`, and we wanted a bad one to fail when the node loads its config, not on the first `token create` a month later. Serde can do that with a newtype:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TokenTtl(pub Option<std::time::Duration>);
+
+impl TryFrom<String> for TokenTtl {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> { /* "90d", "12h", "none" */ }
+}
+```
+
+`try_from = "String"` tells serde to deserialise a plain `String` first and then call our `TryFrom` impl. Its `Err` becomes a deserialisation error that names the field, so `default_ttl = "90"` (no unit) stops the node at startup with a message saying what it expected. The rest of the code only ever sees a parsed `Option<Duration>`.
+
+### A name isn't an identity
+
+`[permission.<name>]` specs are keyed by token name, and that bit us in a quiet way. Revoke `ci` and create a new `ci`, and the new token silently picks up the old spec. Maybe that's what you meant. Maybe it's a different team's token that happens to share a name, now carrying permissions nobody chose for it.
+
+We didn't change the key (specs are written by hand in TOML, and names are what people write). Instead `token create` refuses a name that has a spec and tells you how to proceed: remove or re-apply the spec, or pass `--inherit-permissions` to say "yes, that's what I want". Rotation doesn't ask, because rotation *is* the same token, and its spec following the name is the point.
 
 ## Enforcing what the tokens promise
 
@@ -694,9 +895,11 @@ Rotation happens in two steps:
 The Raft commands:
 
 ```rust
-RotateSecretKey { scope, new_keypair }   // mark old as read-only, add new
-FinalizeSecretRotation { scope }          // delete read-only keypairs
+RotateSecretKey { scope, new_keypair, resealed }  // mark old as read-only, add new
+FinalizeSecretRotation { scope }                   // delete read-only keypairs
 ```
+
+(`resealed` is empty for every rotation but one, a namespace's first key; we'll get to it in "One key per namespace" below.)
 
 This dual-key window means rotation is never a cliff. You start it, re-encrypt your secrets at your own pace, then finalise when ready.
 
@@ -797,7 +1000,393 @@ Why delete only the spec and not the whole bundle directory? Because the bundle 
 
 The tests come in two layers. The `grill::bundle` unit tests run on every development machine, including macOS where runc doesn't exist. They check the modes with `std::os::unix::fs::PermissionsExt` (an extension trait: importing it adds a `mode()` method to the standard `Permissions` type, which is how Rust exposes Unix-only details without putting them on every platform), and check that removal leaves the upper alone. The Linux runc tests then assert the same modes on a real bundle and that `config.json` is gone after `kill` and after a natural exit.
 
-We haven't closed every copy yet. The agent's adoption record and the runtime's own launch intent also hold the full spec, because a restarted agent must compare it with the running workload before adopting it. Both are 0600 inside owner-only directories, and the adoption record goes away with the instance. A retired intent, though, keeps its copy until the same instance id starts again. Scrubbing it means teaching every recovery comparison to ignore the environment, which is a bigger change than this fix.
+That wasn't every copy. The agent's adoption record and the runtime's own launch intent (`bundles/.intents/records/<instance>/intent.json`) also hold the full spec, because a restarted agent must compare it with the running workload before adopting it. Both are 0600 inside owner-only directories, and the adoption record goes away with the instance. The intent doesn't. Once its generation retires it stays on disk as the record that nothing owns any more, and until the same instance id started again (which may be never) it kept the decrypted `DB_PASSWORD` too.
+
+Could we stop writing the plaintext into the intent at all? Not while the instance runs: recovery after a crash compares the spec the agent asked for with the one the runtime recorded, field by field, and a secret that changed is a different request. Once the generation retires, though, nothing can adopt or relaunch it. So retirement now cuts every environment entry down to its name before it writes the record:
+
+```rust
+pub fn without_environment_values(&self) -> OciSpec {
+    let mut scrubbed = self.clone();
+    for entry in &mut scrubbed.process.env {
+        if let Some((name, _value)) = entry.split_once('=') {
+            *entry = name.to_string();
+        }
+    }
+    scrubbed
+}
+```
+
+`split_once` returns an `Option<(&str, &str)>`: `Some` with the parts either side of the first `=`, or `None` when there isn't one. The `if let` pattern destructures the tuple in one go, and the leading underscore in `_value` tells the compiler (and the reader) we're ignoring it on purpose. `&mut scrubbed.process.env` borrows the vector mutably, so `entry` is a `&mut String` we can overwrite through `*entry`. We work on a clone because the caller's spec is borrowed with `&self`, read-only.
+
+Why keep the names rather than empty the list? Because recovery still compares retired intents. Half a dozen places (adoption records, discovery, egress, startup cleanup, the status report) ask "was this generation launched from that spec?", and an empty environment would make an instance that set three variables indistinguishable from one that set none. Every one of those places now calls `OciSpec::matches_journal` instead of `==`:
+
+```rust
+pub fn matches_journal(&self, journal: &OciSpec) -> bool {
+    self == journal || self.without_environment_values() == *journal
+}
+```
+
+A live intent must be equal, as before. A retired one must be equal once the values are gone. The trick that keeps this honest is that a launched entry is always `NAME=value`. A scrubbed entry has no `=`, so a live intent can never pass for a scrubbed one, and scrubbing twice changes nothing (retiring an already retired intent is idempotent, so that matters).
+
+The test that pins it lives in `tests/runc_intent.rs`. It builds a spec from an app whose `API_TOKEN` is `ENC[AGE:...]`, decrypts it with a stand-in decryptor, publishes and retires the intent, then walks every file under the bundle base looking for the plaintext. Before the fix it found `intent.json`. The Linux runc tests now carry a fake decrypted secret in every workload and make the same check on each instance's bundle and intent once it has stopped.
+
+### One key per namespace
+
+Here's an awkward question. Team A and team B share a cluster, and every `ENC[AGE:...]` value in it is sealed to the one cluster key. Team B finds team A's database password in an old commit, still encrypted. Can they read it?
+
+Not directly. But they can paste the ciphertext into one of their own apps, deploy it, and print the environment. The node decrypts whatever it's handed with the cluster key, because that key opens every value in every namespace. Encryption kept the password out of git; it did nothing to keep it inside team A.
+
+`AgeKeyScope` has had a `Namespace(String)` variant since chapter 4, and the agent already tried a namespace's keys before the cluster's. Two things were missing. Nothing ever created a namespace key, and even if something had, the agent fell back to the cluster key whenever the namespace key didn't open a value. A boundary you can step around by sealing to the other key isn't one.
+
+So a namespace now opts in:
+
+```toml
+[namespace.team-a]
+secret_key = true
+```
+
+Why opt in rather than give every namespace its own key? Because switching changes what decrypts. Every value already sealed to the cluster key has to move, and a GitOps repo full of cluster-sealed values will fail its next deploy until someone re-encrypts them. That's a decision the operator should make on purpose, one namespace at a time.
+
+**Who makes the key.** The obvious place is the state machine: apply the `[namespace.team-a]` write, see `secret_key = true`, generate a keypair. That would be a bug. Every replica applies every entry, and each would roll its own random key, so three nodes would hold three different "team-a keys" and agree on nothing. Raft apply has to be deterministic; we met the same rule with the CRL's clock. So the randomness happens on the leader, before the entry exists. `bun::namespace_keys` runs a loop on every node (followers do nothing, like the token sweep) that asks the local state which namespaces are waiting:
+
+```rust
+pub fn namespaces_awaiting_a_key(state: &DesiredState) -> Vec<String> {
+    state
+        .namespaces
+        .iter()
+        .filter(|(name, spec)| {
+            spec.secret_key && !state.security_state.has_namespace_key(name.as_str())
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+```
+
+The loop ticks every five seconds, and it doesn't clone the desired state to ask. `CouncilNode::read_desired` takes a closure and runs it against the state under a read lock, so the check borrows: `council.read_desired(namespaces_awaiting_a_key)` passes the function itself as the closure, since a plain `fn(&DesiredState) -> Vec<String>` satisfies `impl FnOnce(&DesiredState) -> T`. A quiet cluster pays for one read lock and writes nothing.
+
+**Moving the values.** Creating the key is the easy half. The namespace's apps still carry values sealed to the cluster key, and the moment the namespace has a key of its own, those values stop opening there. The leader re-seals them: it unwraps the cluster identities, decrypts each of the namespace's `ENC[AGE:...]` values, and encrypts the same plaintext to the new public key. Age is quick, but it's still CPU work, so it runs under `spawn_blocking`, and the plaintext never leaves that call.
+
+Then comes the part that's easy to get wrong. If the key went into one Raft entry and the re-sealed values into another, there'd be a window between them in which the namespace had a key and none of its values opened, and a leader crash in that window would leave it there for good. So both ride in the same entry, the `resealed` field on `RotateSecretKey`:
+
+```rust
+pub struct ResealedSecret {
+    pub app_id: AppId,
+    pub env_key: String,
+    pub previous: String, // the ciphertext the leader read
+    pub sealed: String,   // the same plaintext, sealed to the namespace key
+}
+```
+
+Why carry `previous`? Because the leader read the apps a moment before it proposed the entry, and an apply could have landed in between. Overwriting that newer value with a re-sealed copy of the old one would silently undo someone's deploy. The state machine checks every entry before it applies any of them: the app must still hold exactly `previous`, it must live in that namespace (a namespace's key never rewrites another namespace's values), and only a namespace's *first* key may re-seal at all. Any mismatch refuses the whole entry, no key and no values, and the leader tries again on the next tick. It's optimistic concurrency, the same compare-and-swap idea as an etcd transaction, done with the data the entry already carries.
+
+The check uses a let chain with an `Err` pattern:
+
+```rust
+if !resealed.is_empty()
+    && let Err(reason) = self.check_reseal(scope, first_key, resealed)
+{
+    return Some(CouncilResponse::Refused { reason });
+}
+```
+
+and the apply that follows uses another, `if first_key && let AgeKeyScope::Namespace(namespace) = scope`, which only binds `namespace` when the scope really is a namespace. After writing the values, it re-records the seals of every app in the namespace under the new scope, so a later cluster finalise doesn't wait on values that no longer need the cluster key.
+
+**No fallback.** With the key in place, the decryption side gets simpler, not more complicated:
+
+```rust
+pub fn decryption_keypairs(&self, namespace: &str) -> Vec<&AgeKeypair> {
+    if self.has_namespace_key(namespace) {
+        self.age_keypairs_for_scope(&AgeKeyScope::Namespace(namespace.to_string()))
+    } else {
+        self.age_keypairs_for_scope(&AgeKeyScope::ClusterWide)
+    }
+}
+```
+
+One set or the other, never both. The return type is a vector of borrows, `Vec<&AgeKeypair>`: the keypairs stay where they are in `SecurityState`, and the caller can't keep the vector longer than it holds the state, which the borrow checker enforces without us writing a lifetime (elision ties the output borrows to `&self`). A value that no key in the set opens fails the deploy closed, exactly as an undecryptable cluster value always has.
+
+Does re-sealing disturb what the previous section built for runc intents? It changes the ciphertext, not the plaintext, so the launched spec is identical before and after, and a retired intent's scrubbed copy, names only, still matches it. `resealing_keeps_the_launched_spec_and_its_scrubbed_journal_copy` pins exactly that. The stored app spec does change, though, so each app with encrypted values rolls once when its namespace opts in.
+
+**Rotation per namespace.** `relish secret rotate --namespace team-a` and `--finalize --namespace team-a` run the same two-step dance as the cluster key, on that scope only; the state machine already scoped everything by `AgeKeyScope`, which is why it needed no change. Rotating a namespace that never opted in is a `409`, since a rotation can't do the re-seal that opting in does. `relish secret pubkey --namespace team-a` prints the key to encrypt with. The rotate body is now parsed with `#[serde(deny_unknown_fields)]`, because `{"namespcae": "team-a"}` used to parse as an empty request and would have rotated the *cluster* key.
+
+Who may rotate? The maintainer's answer was: only an Admin scoped to the whole cluster, for now. An Admin scoped to team-a can't rotate team-a's key. That's stricter than it needs to be, but loosening it later is easy, and tightening it after people rely on it isn't.
+
+**What it doesn't protect against.** Every node still holds the master key, which unwraps every namespace's private key. So the boundary stands between tenants' tokens and workloads, not between a tenant and a compromised node; a root shell on any node reads every namespace's secrets. Splitting the master key (F03b in the roadmap) is what changes that. Re-sealing also can't recall copies: a cluster-sealed value from an old commit still opens in any namespace that hasn't opted in, until you rotate and finalise the cluster key or change the secret itself. And job specs aren't stored desired state, so they're not re-sealed; a job in an opted-in namespace needs its values encrypted to the namespace key.
+
+The tests sit at four levels:
+
+- `sesame::types`: `a_namespace_with_its_own_key_never_falls_back_to_the_cluster_key` and its mirror for a namespace without one.
+- `council::state_machine`: `a_namespaces_first_key_reseals_its_values_in_the_same_entry`, `a_stale_reseal_is_refused_and_creates_no_key`, `a_namespace_key_cannot_reseal_another_namespaces_values`, `only_a_namespaces_first_key_reseals`, and `namespace_rotation_and_finalise_leave_the_cluster_scope_alone`.
+- the agent: `a_value_sealed_for_one_namespace_fails_closed_in_another`, `after_opting_in_a_cluster_sealed_value_fails_closed_in_that_namespace` (the test `security-sesame.md` §10 always listed), and the intent check above.
+- the leader loop and the API: `the_leader_creates_an_opted_in_namespaces_key_and_reseals_its_values` (including its `secret.namespace_key_created` audit event, with no plaintext in it), `namespace_rotation_and_finalise_are_per_namespace_and_audited`, `only_an_unscoped_admin_rotates_a_namespace_key`, and `secret_public_key_serves_a_namespaces_own_key`.
+
+We checked the fallback tests the cheap way: put the old "namespace keys, then cluster keys" order back and watch four of them fail.
+
+`RotateSecretKey` grew a field and `NamespaceSpec` a flag, both in the Raft log and the snapshot, so the protocol and state generations in `src/compatibility.rs` went up by one each.
+
+## Rotating a CA, part one: room for two
+
+Secret rotation had a head start. `age_keypairs` was always a vector, so holding two keys for a while was a matter of marking one read-only. The CAs weren't so lucky. `SecurityState` stored them in a `Vec` too, but every reader asked for "the" CA of a role:
+
+```rust
+pub fn get_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
+    self.certificate_authorities.iter().find(|ca| ca.role == role)
+}
+```
+
+Push a second Node CA into that vector and `find` returns whichever happens to come first. Which one signs a node's renewal? Whichever one `push` left in front. That's the bug secret rotation had in its first version, and we weren't going to write it twice.
+
+So a CA now knows where it stands:
+
+```rust
+pub enum CaState {
+    Active,
+    Retiring { until: SystemTime },
+}
+```
+
+`Retiring` is an enum variant that carries a named field, like a tagged union in C where the compiler checks the tag for you. You can't read `until` off a CA without first matching that it *is* retiring, so there's no "expiry time of an active CA" for a careless caller to misread. `get_ca` is gone. In its place are two questions with different answers:
+
+- `active_ca(role)` is the CA that signs: the newest `Active` one of the role.
+- `trusted_cas(role)` is every CA a verifier should accept, active first, then any that are retiring.
+
+```rust
+cas.sort_by_key(|ca| (ca.state != CaState::Active, std::cmp::Reverse(ca.generation)));
+```
+
+Rust compares tuples field by field and `false` sorts before `true`, so the active CA leads and the retiring ones follow, newest first. `Reverse` flips the ordering of the value it wraps (we met it in chapter 1, turning a max-heap into a min-heap).
+
+Removing `get_ca` was the point. Every caller had to choose, and the compiler listed all of them. A signer asks `active_ca`. A verifier will ask `trusted_cas`, once it can hold more than one (that's the next step, and the larger one).
+
+### Two log entries, same shape as secrets
+
+Rotation is two `RaftRequest`s, appended to the end of the enum like every new variant:
+
+```rust
+CaRotationBegin { role: CaRole, ca: Box<CertificateAuthority> },
+CaRotationFinalize { role: CaRole, now_unix_ms: u64 },
+```
+
+The rules sit in `src/sesame/ca_rotation.rs` as plain functions over `&mut SecurityState`, and the state machine turns their errors into `CouncilResponse::Refused`. Begin checks, in order:
+
+1. The role isn't the root. Rotating the root needs cross-signing and a new join fingerprint, and it's a later step of the plan.
+2. A CA of the same role and generation already exists? Then this is a retried proposal, and it changes nothing. That's the idempotence rule from `RotateSecretKey`: the first-applied entry wins.
+3. A retiring CA of the role already exists? Refused. One rotation per role at a time, because a third generation stacked on an unfinished second multiplies the ways to strand a node.
+4. The new CA is exactly one generation newer than the active one, carries its wrapped key (the council has to sign with it), and is signed by the active root. The state machine checks the signature itself, so a proposal can't slip in a CA that nothing would trust.
+
+Then the old CA becomes `Retiring { until }`. When is `until`? The longest a leaf it signed could live: a year for Node, 90 days for Ingress, an hour for Workload. We count from the new CA's `not_before` (plus the five-minute backdate every certificate gets), not from `SystemTime::now()`. A Raft entry is applied on every replica, at different moments, and a clock read inside apply would give each one a different `until`. The certificate travels in the log, so its timestamp is the same everywhere.
+
+The same reasoning is why finalise carries `now_unix_ms`. The plan wrote it as `CaRotationFinalize { role }`, but finalise has to ask "has the window ended?", and a state machine that answers that from its own clock diverges. The proposer reads the clock once and the log carries the answer, exactly as `SweepExpiredApiTokens` does.
+
+### Who still depends on the old CA?
+
+Finalise drops the retiring CA, so it has to know that nothing still chains to it. For secrets we recorded the sealing generation at write time, because that's the only moment it's knowable. The Node CA has the same problem with the same answer.
+
+Every node leaf gets its serial from a Raft entry, `ConsumeJoinTokenForIssue` on join or `AllocateNodeSerial` on renewal. So applying either now records the node's latest leaf:
+
+```rust
+pub struct NodeLeafRecord {
+    pub serial: SerialNumber,
+    pub ca_generation: u64,
+}
+```
+
+`ca_generation` is the Node CA that's active when the serial is allocated. The signer reads the council state *after* that commit, so it signs with that CA, or with a newer one if a rotation begins in between. The record can be too old, never too new, and too old only delays finalise. The first node's leaf is the exception: `relish init` signs it without a council, so init writes its record by hand.
+
+Finalise for the Node CA is then a filter: any node whose latest leaf has the retiring generation (or an older one) and isn't decommissioned blocks it, by name. Workload and ingress leaves aren't recorded one by one (a workload renews every half hour, and ingress serials are random), so for those roles finalise waits for `until`. Once `until` passes, it doesn't matter what the records say: every leaf the old CA could have signed has expired.
+
+Is a record proof that the node *installed* its new leaf? No. A renewal whose answer is lost leaves a record that's newer than the leaf on disk. The node retries, because it still needs the leaf, and the operator-facing rotation (the plan's R4) adds an acknowledgement from every node before it finalises.
+
+The tests in `ca_rotation.rs` pin each rule: the generation goes from 0 to 1, a retried begin is a no-op, a stacked rotation is refused and leaves the state untouched while another role rotates freely, a CA from a different root is refused, and finalise is refused while `node-b` still holds its old leaf, then passes once its renewal is allocated. `ca_rotation_through_the_log_waits_for_every_node_leaf` in the state machine drives the same story through real log entries.
+
+## Rotating a CA, part two: trusting both
+
+The council could now hold two Node CAs. Every node still trusted exactly one. The mTLS listener built its `RootCertStore` from `identity.node_ca_der` at startup, the client verifier pinned that same certificate, and `LiveNodeIdentity::replace` refused any renewal whose CA differed from the one it started with. Begin a rotation, renew one node onto the new CA, and that node would be locked out of its own cluster.
+
+So the trust became a list:
+
+```rust
+pub struct TrustSet {
+    pub node_cas: Vec<Vec<u8>>,
+    pub roots: Vec<Vec<u8>>,
+}
+```
+
+`TrustSet::from_state` builds it from `trusted_cas`, and `NodeIdentity` carries one (it's persisted in `node.bundle.json`, now schema 3). The identity still has its own `node_ca_der`, the issuer it presents in its chain, and `validate_identity` refuses an identity whose own issuer and root aren't in its set. A node that distrusts its own chain is a node nobody can talk to.
+
+Every node-identity check now goes through one function:
+
+```rust
+pub fn validate_node_leaf(&self, leaf: &[u8]) -> Result<TrustedChain<'_>, CertError>
+```
+
+It tries each Node CA (signature and issuer name), then each root for that CA, and returns the pair that vouched. `TrustedChain<'_>` holds two `&[u8]` slices borrowed from the set, and the `'_` is a lifetime: it tells the compiler the result can't outlive the `TrustSet` it points into. No copying, and no way to keep a dangling reference to a trust set that's been replaced. When nothing vouches, it returns the most specific error it saw, because "expired" is a lot more useful at 3am than "untrusted".
+
+### A trust set that changes under a running listener
+
+The CRL already had this problem and a solution: a shared handle every handshake re-reads. Trust follows the same idea, but the handle is the live identity itself:
+
+```rust
+pub enum TrustSource {
+    Fixed(Arc<TrustSet>),
+    Live(LiveNodeIdentity),
+}
+```
+
+A verifier built from a `LiveNodeIdentity` holds the `Live` variant and asks it for the current set on every handshake. On the client side that's easy: `PinnedChainServerVerifier` is our code, so it calls `trust.current()` and then `validate_node_leaf`. The server side used rustls's `WebPkiClientVerifier`, which takes its anchors once, at build time. So `RevocationCheckingClientVerifier` now builds a fresh one per handshake from the current Node CAs and delegates to it. Two anchors is a couple of parsed certificates, and cluster connections are few and long-lived, so we didn't bother caching it. The anchors are still the Node CAs and never the roots, for the reason PKI2 gave: a workload certificate also chains to the root and also carries ClientAuth.
+
+One wrinkle: the trait's `root_hint_subjects` returns `&[DistinguishedName]`, a slice borrowed from `self`. A set built per handshake can't lend a slice that outlives the call, so we send no hints. Our clients hold one node identity each and don't consult them.
+
+Who changes the set? Bun's security refresh, which already copied the CRL every five seconds. It now also calls `LiveNodeIdentity::adopt_council_trust(&state)`, which persists the new set and publishes it to every listener and client built from the identity. The next handshake uses it. No rebuild, no restart.
+
+### Only the council's word counts
+
+`replace` used to refuse any change to the CAs. Now it accepts a different trust set only when it equals the one it's handed as the council's:
+
+```rust
+pub async fn replace(&self, identity: NodeIdentity, council_trust: &TrustSet) -> Result<(), MtlsError>
+```
+
+The renewal worker reads `council_trust` from its own replica of the council state, not from the leader's response. A response that says "also trust this CA" isn't enough by itself; the node's replicated state has to agree. If the replica lags behind the leader, the replacement is refused and the next attempt, five seconds later, goes through. `adopt_trust` refuses a set that drops the node's own issuer too, and the refresh logs that once and keeps the old set.
+
+The cluster root stays fixed across a `replace`. Its fingerprint names the cluster, and changing it is root rotation, which comes later.
+
+### The rest of the verifiers
+
+- **Renewal and the internal routes.** `validate_peer` checks the presented leaf with `TrustSet::from_state`, so a node still holding an old-CA leaf can renew onto the new CA. That's the whole point of the window.
+- **Join.** The join bundle and `GET /v1/cluster/ca` carry every trusted Node CA. A joiner pins all of them for the second leg, because the member it's talking to may not have renewed yet.
+- **Images.** Keyless signature verification takes every trusted root and accepts the first that the chain reaches.
+- **Workloads.** `ca.pem` becomes a bundle: every trusted Workload CA, then the root. A workload rotates its identity every half hour, so within half an hour of a rotation beginning every workload trusts both.
+- **Ingress.** The listener is bound once, with one resolver. A `ReloadableCertResolver` wraps it, and a task watches the active Ingress CA's serial; when it changes, it builds a resolver over the new CA and swaps it in. The swap uses a `std::sync::RwLock`, not tokio's, because rustls calls `resolve` synchronously and the lock is held only long enough to clone an `Arc`.
+
+Can you see the gap in the workload story? The new Workload CA signs from the moment the rotation begins, but a peer only trusts it after its own next rotation, up to thirty minutes later. Nodes have the same gap, measured in seconds (the refresh interval). Closing it means trusting a new CA before anything signs with it, and that belongs to the operator-facing rotation flow, where the council can wait until every node has acknowledged the new set.
+
+### The tests
+
+`tests/suite/ca_trust_rotation.rs` runs real TLS handshakes over an in-memory pipe, through the same live builders Bun uses:
+
+- `nodes_on_the_old_and_new_node_ca_authenticate_each_other_both_ways` puts one node on an old-CA leaf and one on a new-CA leaf, both trusting both CAs, and checks every listener against every client, bound and unbound, in both directions.
+- `a_leaf_from_an_untrusted_node_ca_is_refused_both_ways` tries a leaf from a Node CA the cluster never announced and one from another cluster, as client and as server.
+- `a_new_trust_set_reaches_a_running_node_without_a_restart` builds a listener before the rotation, watches it refuse a renewed peer, installs the council's new set with `adopt_council_trust`, and watches the *same config object* accept it. Then it reloads the identity from disk to check the set survives a restart.
+- `replace_accepts_only_the_councils_trust_set` covers the rule above, including the refusal to drop the node's own issuer.
+
+The ingress swap has its own test in `wrapper::tls`, which handshakes against a listener, swaps the resolver, and sees the next handshake present the new certificate.
+
+## Rotating a CA, part three: the operator signs
+
+Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` sealed it away, and chapter 4's `relish ca backup` put it in a file the operator keeps. The maintainer's decision was to keep it there. So who signs the new intermediate?
+
+The answer is the oldest trick in PKI. The cluster makes the new key pair and sends a certificate signing request (a CSR: "here's my public key, please certify it"). The operator signs it on their own machine with the root key from the backup, and sends back only the certificate. The new private key never leaves the cluster. The root key never reaches it.
+
+```text
+relish ca rotate --role node --root-backup prod-root.age
+```
+
+### Prepare: a key that waits
+
+The first call is `POST /v1/ca/rotation/prepare`. The leader generates a P-256 key, wraps it with the master key exactly as `relish init` wraps an intermediate's, and builds a CSR for it:
+
+```rust
+pub fn create_intermediate_csr(
+    role: CaRole,
+    wrapping_ikm: &[u8],
+) -> Result<(Vec<u8>, WrappedKey), CaError>
+```
+
+Where does the key live while the operator types their passphrase? We could have kept it in the leader's memory. Then a leader election between prepare and begin loses it, and the operator's carefully signed certificate certifies a key nobody has. So it goes through Raft, in a third log entry:
+
+```rust
+CaRotationPrepare {
+    role: CaRole,
+    generation: u64,
+    csr_der: Vec<u8>,
+    private_key_wrapped: WrappedKey,
+},
+```
+
+Applying it stores a `PendingIntermediate` in `SecurityState`, one per role (asking again replaces it, in case the operator lost the CSR), and allocates a serial from `next_serial`. The serial matters more than it looks. `validate_peer` checks the CRL for the leaf, the Node CA *and* the root, by serial, so an intermediate whose serial collided with a revoked certificate would revoke itself. Letting the council pick it means it can't collide. The answer carries the serial, the CSR and the fingerprint of the root that must sign it. Prepare refuses the same things begin does: the root, a role that's already mid-rotation, and a generation that isn't the active one plus one.
+
+### Sign: only the public key counts
+
+On the operator's side, `relish` opens the backup with R3's code, which checks the root's fingerprint against the one the council just sent. Another cluster's backup is refused before its key is ever used. Then:
+
+```rust
+pub fn sign_intermediate_csr(
+    csr_der: &[u8],
+    role: CaRole,
+    cluster_name: &str,
+    serial: SerialNumber,
+    root_key_der: &[u8],
+    root_certificate_der: &[u8],
+) -> Result<Vec<u8>, CaError>
+```
+
+It takes the CSR's public key and nothing else. The name, the path length of zero, the key usages and the five-year lifetime are the ones every intermediate of that role gets, from the same `intermediate_ca_params` that `relish init` now uses. A CSR can't ask for more than an intermediate is allowed. The certificate is also clamped to the root's lifetime, by the same `bound_leaf_validity` that keeps a node leaf inside its issuer.
+
+### Begin: does the certificate answer the question?
+
+`POST /v1/ca/rotation/begin` carries the certificate back, and the leader checks it before proposing anything, in `intermediate_from_signed`. Is there a CSR waiting for this role? Does the certificate certify *that* key? Does it carry the allocated serial? Is it a CA certificate, signed by the active root?
+
+The key comparison is where we met a small Rust surprise:
+
+```rust
+use x509_parser::certification_request::X509CertificationRequest;
+use x509_parser::prelude::FromDer as _;
+
+let (_, request) = X509CertificationRequest::from_der(&pending.csr_der)?;
+```
+
+Without the second `use`, `from_der` doesn't exist. It's a method of the `FromDer` trait, and in Rust a trait's methods are only callable where the trait is in scope. Go has no equivalent (methods belong to the type), and in Python they'd just be there. The `as _` imports the trait without binding its name, which says "I want the methods, not the name". The compiler's error message even suggests the import, which is more than most languages manage.
+
+Once the certificate passes, it becomes a `CertificateAuthority` with the pending wrapped key and the pending generation, and the leader proposes part one's `CaRotationBegin`. Applying it clears the pending CSR. From that moment both CAs are trusted and new leaves come from the new one.
+
+### Closing the gap from part two
+
+Part two ended on a gap: the new CA signs from the moment the rotation begins, but a node only trusts it after its next security refresh. Renew a node in those few seconds and a peer that hasn't refreshed yet refuses its new leaf.
+
+The fix is to ask. Every node's renewal worker now checks its own replica of the council state every five seconds. Once its live identity holds exactly the trust set the state describes, it tells the leader:
+
+```rust
+pub struct TrustAcknowledgement {
+    pub compatibility: Compatibility,
+    pub node_ca_fingerprints: Vec<String>,
+}
+```
+
+`POST /v1/cluster/trust-ack` is a node-to-node route, authenticated by the node's TLS client certificate like renewal. The leader doesn't take the node's word for which generation it trusts: it refuses unless the list contains every Node CA the council trusts, and then records the active generation in the node's `NodeLeafRecord::trust_generation` through a fourth log entry, `AcknowledgeNodeTrust`. A late, older acknowledgement never moves the record backwards. A node seen for the first time (a join) starts out acknowledging the active CA, because its join bundle carried the whole set.
+
+### Renewing early, in order
+
+Node leaves live a year and renew at the midpoint. Waiting six months for the rotation to finish isn't a plan, so nodes renew early, and `early_renewal_due` decides when:
+
+1. Nobody moves until every live node has acknowledged the new trust set. That's the gap closed.
+2. Then the nodes go one at a time, in node-id order. Each waits until every node before it holds a leaf from the new CA.
+3. A node that's stuck mustn't hold the rest up forever, so each node also has a slot: `EARLY_RENEWAL_STAGGER` (a minute) per place in the order, counted from when the new CA was made. When its slot comes, it goes anyway.
+
+Why one at a time, when renewal swaps credentials without restarting anything? Because if something about the new CA is wrong, we'd rather find out on one node than on all of them at once. The order comes from the `BTreeMap` the council keeps the records in, which iterates sorted, so every node computes the same order from its own replica without asking anyone.
+
+The slot arithmetic has a small type puzzle in it. `Duration::saturating_mul` takes a `u32`, and a node's place is a `usize`:
+
+```rust
+let place = u32::try_from(earlier.len()).unwrap_or(u32::MAX);
+now >= started + EARLY_RENEWAL_STAGGER.saturating_mul(place)
+```
+
+Rust never converts between integer widths behind your back (C would truncate silently, Go makes you write a conversion that can still wrap). `try_from` returns a `Result`, and a cluster with more than four billion nodes earlier in the order gets the largest slot rather than a panic.
+
+### Finalise, for real
+
+Part one's finalise already refused while a node's latest leaf came from the retiring Node CA. It now also refuses, by name, every live node that hasn't acknowledged the new trust set, and tells the operator to decommission a node that's gone for good rather than wait for it. Workload leaves move by themselves within their hour (a workload renews every half hour), and part two's resolver reload re-mints ingress certificates from the new CA, so for those roles finalise keeps part one's rule and waits out the window. We didn't track workload and ingress leaves one by one to shorten that; an hour is short, and the ingress window is the honest one until R7 states the grace policy.
+
+### The tests
+
+Every refusal has a unit test in `ca_rotation.rs`: prepare refuses the root, a rotation in progress and a skipped generation, and allocates nothing when it refuses; a certificate is refused without a pending CSR, for another key, with another serial, from another root, and for another role; an acknowledgement is refused from an unknown node and for a generation the council doesn't have; finalise is refused until every node acknowledges. `nodes_renew_early_one_after_another_once_all_trust_the_new_ca` and `a_stuck_node_delays_the_next_one_only_by_its_slot` pin the ordering. In `ca.rs`, a CSR signed by the root chains to it and its certificate carries the key the cluster wrapped (we sign a node leaf with it to prove it), and a key that isn't the root's doesn't chain. `ca_cmd.rs` signs a real `relish init` cluster's CSR with its backup and refuses another cluster's backup by fingerprint.
+
+The test that matters most is in `tests/cluster_gossip.rs`, run by `make test-cluster`. `rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing` starts three nodes whose Raft and reporting run over mTLS, with the renewal worker, the renewal API and the trust refresh that Bun runs. Each node serves an app replica on a required-mTLS listener built from its live identity, and every node calls every other one ten times a second, with a fresh handshake each time. Then it rotates the Node CA through the real API, signing the CSR with a root backup. It checks that the nodes move in order, that finalise is refused until they have, that the trust set shrinks to the new CA on every node afterwards, that Raft still replicates, that every replica answers with the id it started with (nothing restarted), and that not one request failed.
+
+It failed three times in its first nine runs, and not because of the rotation. A watcher task recorded the order in which nodes moved by polling every 50 ms, and the test sometimes checked the order the instant the last node moved, before the watcher's next poll. The fix was to wait for the watcher too. A test that's flaky for its own reasons teaches you nothing about the code, so it's worth running a new cluster test in a loop before you trust it.
+
+Four things went into the Raft log, the snapshot and a node-to-node body (`PendingIntermediate`, `trust_generation`, two `RaftRequest` variants and the acknowledgement), so the protocol and state generations in `src/compatibility.rs` went up by one each.
 
 ## Certificate revocation
 
@@ -1059,6 +1648,8 @@ Image signing (`src/pickle/signing.rs`) is the clearest example of testing a sec
 
 The per-instance lifecycle has its own regression suite spread across the layers it touches: `identity_mount_source_is_per_instance_not_per_app` (OCI spec), `two_replicas_of_one_app_get_distinct_identity_dirs_and_keys` (the overwrite bug), `deploy_prepares_and_stop_removes_per_instance_identity_dirs` and `rolling_redeploy_leaves_only_live_instances_identity_dirs` (agent lifecycle), and `adoption_restores_identity_and_rotation_schedule_from_disk` plus `adoption_sweeps_orphaned_identity_dirs` (restart safety). The tmpfs backing itself only shows up under Linux as root, so `identity_dir_is_tmpfs_backed_under_root` self-skips elsewhere and runs in the Lima rig. On the rotation side, the state machine's verify-before-retire behaviour is pinned by `finalize_refused_while_a_secret_is_sealed_under_an_old_generation`, `finalize_succeeds_after_secrets_re_encrypted_under_the_new_generation`, `concurrent_second_rotation_refused_until_finalised`, `same_generation_rotation_retry_is_idempotent`, and the compatibility fixture `legacy_secret_without_generation_metadata_blocks_finalize`; the API tests assert the refusals surface as `409`s.
 
+Token rotation is tested at three layers, and the tests came first. In `sesame/token.rs`, `the_old_secret_works_inside_the_grace_period_and_stops_after_it` drives `validate_token_at` with an injected `now` either side of the grace end, so no test sleeps for a day; `a_second_rotation_ends_the_first_old_secret` and `the_old_secret_never_outlives_the_old_expiry` pin the edges, and `admin_tokens_are_exempt_from_the_default_lifetime` pins decision 6. In `sesame/auth.rs`, `a_session_opened_with_the_old_secret_ends_with_its_grace_period` shows the principal doing the session work. And `bun/api/token_tests.rs` goes through the real router and a one-node council: the old secret works and the new one works at once, a zero-grace rotation ends the old secret *and* its dashboard session, the `[permission]` spec still binds the rotated token, the last Admin can rotate itself, a `token.rotated` event names the caller without ever containing the new secret, a token created without a lifetime gets 90 days, and a name with a spec needs `--inherit-permissions`. On the `wtf` side, `a_token_expiring_within_fourteen_days_is_a_warning` and `an_admin_token_older_than_ninety_days_without_an_expiry_is_a_warning` feed the pure diagnosis engine a fixed snapshot.
+
 ### Integration tests — the lifecycles
 
 Two integration files drive whole features through the library, no running agent required:
@@ -1242,6 +1833,109 @@ The CLI shape needed a small clap trick. We wanted both `relish sign IMAGE --key
 
 The test that matters is the one the old code could never have passed. `relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key` stands up a single-node council, pushes three manifests, and does what `relish sign` does: resolve through the image listing, sign locally, submit. Then it turns on `require_signatures` with the operator's key and asks the real deploy gate about each image. The operator-signed one comes back pinned to its signed digest. The never-signed one is refused. The one signed by a different key is refused as "not in trust policy". A companion test re-pushes `myapp:v1` with new bytes after signing and checks the new content is refused, because the signature covered the old digest, not the tag. And an `openssl`-generated test key pins the documented `openssl pkey … | tail -c 65 | base64` pipeline to the exact string `keys` expects, so the manual can't drift from the code.
 
+### A tag is a promise nobody keeps
+
+Signatures cover Pickle's images. What about `nginx:1.27`?
+
+Until 0.1.6 the answer was "whatever Docker Hub says today". The spec in Raft kept the tag. A restart pulled it again, the pull-through cache re-checked it every hour, and a replica on a new node resolved it fresh. So one app could run two digests on two nodes, or change its bytes on a restart nobody asked for. Nothing recorded which digest had run, so you couldn't even tell afterwards.
+
+The fix is to resolve the tag once, when you apply, and store both halves: `nginx:1.27@sha256:3f2a…`. OCI references allow a tag and a digest together, and the digest wins. The parser already read that form (it shipped in 0.1.4, along with `pickle::binding::bind_image`, which resolves one tag from the catalogue, upstream or the cache). What was missing was anyone calling it.
+
+We call it in three places, all on the node that writes the spec:
+
+- `POST /v1/apply` on the leader, inside the SSE stream, before the Raft writes. A follower forwards the request and binds nothing itself.
+- The GitOps runner, as it turns each changed app into a `RaftRequest::AppSpec`.
+- A standalone node's apply and rollback, before the command reaches its agent.
+
+The binder is a small struct holding two registry clients as trait objects:
+
+```rust
+#[derive(Clone)]
+pub struct ImageBinder {
+    remote: Arc<dyn UpstreamRegistry>,
+    loopback: Arc<dyn UpstreamRegistry>,
+}
+```
+
+`dyn UpstreamRegistry` is a *trait object*: a pointer to some value that implements the trait, plus a table of its methods, picked at run time. It's Go's interface value, more or less, except Rust makes you say `dyn` so you know you're paying for the indirection. Production fills both slots with `OciUpstream` (HTTPS, and plain HTTP for `localhost:5000`-style registries, the way the runtime pulls them); tests fill them with a fixed answer. `Arc` (an atomically reference-counted pointer) lets every clone of the binder share the same clients.
+
+Bun hands the binder to the routes as an axum `Extension` layer, and only when its runtime actually pulls images. Under ProcessGrill an app's `image` is a placeholder like `proc-grill:image-ignored`; asking Docker Hub about it would fail every apply on a Mac dev cluster. The handler takes `Option<Extension<ImageBinder>>`, so "no layer" arrives as `None` and the image is stored as written. That was the maintainer's call for this question: bind only when the leader's own runtime pulls, and document that a cluster runs one runtime kind.
+
+What if the registry is down? The apply fails with the registry's error, unless the pull-through cache holds the tag, in which case it binds the cached copy and says so. Here we found a hole of our own making. Once every apply binds, every pull asks for `nginx:1.27@sha256:…`, and the cache filed what it fetched under the digest. Nobody ever pulled the bare tag again, so the cache never held "the tag" and the fallback could never fire. `ImageReference` now keeps the tag a bound reference carries (`bound_tag`), and a fresh fill records the image under it too. The suite test `a_bound_pull_through_remembers_the_tag_for_binding_offline` pulls a bound image through the cache, then binds the bare tag with no registry at all.
+
+GitOps needed one more thought. Git says `nginx:1.27`; Raft now says `nginx:1.27@sha256:…`. The diff compared them, saw drift, re-applied, re-bound, and did it again on the next poll, forever. `as_git_wrote_it` reads a bound image back as the tag Git names before comparing, so binding alone isn't drift. A tag that moves upstream gets picked up when the app changes in Git, the same way a manual apply picks it up when you run it.
+
+`relish apply` prints each binding (`web: nginx:1.27 → sha256:3f2a1b9c04d7... (from the registry)`), and because the spec carries the digest, deploy history, `relish inspect` and each instance's status all show it without any change of their own. Rollback came for free too: the spec it restores already names a digest, the binder leaves digests alone, and the rollback runs the bytes that ran before. `a_rollback_restores_the_bound_digest_without_asking_the_registry` proves it with the registry down.
+
+One compile error is worth a paragraph, because you'll meet it. `bind_config` first built a lazy iterator over the config's image slots (`&mut Option<String>`, from apps, their init containers and jobs) and passed it to an `async fn`. Fine on its own. Inside `tokio::spawn`, which needs the whole future to be `Send` for every lifetime, rustc gave up with "implementation of `FnOnce` is not general enough". The iterator's closures carried borrowed lifetimes across an `.await`, and the compiler couldn't prove the result `Send` for all of them. Collecting the slots into a `Vec<(String, &mut Option<String>)>` before the first `.await` fixed it: a `Vec` of references is a plain type with one lifetime, and its `Send`-ness is obvious. When an async function fights you about `Send`, look for a lazy iterator or a guard that lives across an `.await`, and make it concrete before the wait.
+
+Formats moved with it. A node without this code would store and pass around bound references it doesn't expect, so the protocol and state generations went up (`src/compatibility.rs`) and a 0.1.5 cluster refuses this release.
+
+### Saying which registries you trust
+
+Binding fixes *which* bytes run. It says nothing about *whose*. Should a cluster that runs `docker.io/library/*` also run `ghcr.io/someone-you-never-heard-of/miner`? Until now, yes, always. So `node.toml` grew rules for upstream images:
+
+```toml
+[[images.trust_policy.upstream]]
+match = "docker.io/library/*"
+
+[images.trust_policy.upstream_default]
+allow = false
+```
+
+They live in node config for the same reason the signing keys do ("Whose key is it, anyway?"): if an API token could edit the list, a stolen token could add its own registry to it.
+
+Two details of the config types are new Rust. `match` is a keyword, so the field can't be called that; serde's `#[serde(rename = "match")]` keeps the TOML key while the struct says `pattern`. And `upstream_default.allow` must default to `true` (today's behaviour), but `#[derive(Default)]` would give `bool`'s default, `false`. So `UpstreamDefault` writes its own:
+
+```rust
+impl Default for UpstreamDefault {
+    fn default() -> Self {
+        Self { allow: true }
+    }
+}
+```
+
+With `#[serde(default)]` on the struct, a `node.toml` that never mentions the section gets that impl, and so does the parent's derived `Default`. A derive would have quietly flipped every existing cluster to an empty allow-list. (A test, `parse_trust_policy_defaults`, now says `allow` is `true` out loud.)
+
+"The most specific rule wins" is one iterator chain in `pickle::trust::matching_rule`:
+
+```rust
+policy
+    .upstream
+    .iter()
+    .filter_map(|rule| {
+        let specificity = match rule.pattern.strip_suffix('*') {
+            Some(prefix) => repository.starts_with(prefix).then_some((0, prefix.len())),
+            None => (rule.pattern == repository).then_some((1, rule.pattern.len())),
+        }?;
+        Some((specificity, rule))
+    })
+    .max_by_key(|(specificity, _)| *specificity)
+    .map(|(_, rule)| rule)
+```
+
+Tuples compare field by field, left to right, so `(1, _)` (an exact name) beats any `(0, _)` (a prefix), and between two prefixes the longer one wins. `bool::then_some` turns a condition into an `Option`, and the `?` inside the closure skips a rule that doesn't match. In Go you'd write the loop and keep a running best; here `max_by_key` is that loop.
+
+The check runs twice, like the signature check. At apply, `ImageBinder` judges every image before asking any registry about any of them, so a refused apply names the image and costs no network round trip. Then Bun judges again before every deploy (`enforce_upstream_rules`), because a spec can reach a node without passing this apply: one committed before the rules changed, or a node whose `node.toml` is stricter than the leader's. Both checks skip Pickle's own images, which answer to `require_signatures`, and both skip ProcessGrill, where an image is a placeholder.
+
+The refusal is a `thiserror` struct, `UpstreamRefused`, and the binder's error enum wraps it with `#[error(transparent)] NotAllowed(#[from] UpstreamRefused)`. `transparent` reuses the inner message unchanged; `#[from]` writes the `From` impl, so `check_upstream(...)?` inside `bind_slots` converts the error without a `map_err`. The apply route maps it to a 403, beside the 400 for a bad reference and the 502 for an unreachable registry.
+
+For a while a rule that said `require_signatures = true` stopped the node at startup, because nothing could check it yet. A node that accepted the setting would have skipped the check it promised, which is the worst kind of security setting: one that's on and does nothing. The next section is the check.
+
+### A check that waits for the network
+
+With the cosign verifier and the rules both in place, wiring them together looked like one `if`. A rule matches, it says `require_signatures`, so fetch the `.sig` image and verify it. The catch is *where* that `if` runs.
+
+Bun's trust checks run on the agent loop: a deploy worker sends a `DeployOp::EnforceImageSignature` and the loop answers. Everything the loop did there so far was local (the council's catalogue, the root CA). Fetching a signature isn't. It's a registry round trip, or two, and a slow registry would stall every other command the agent serves while it waited. So the check is split in two. The loop decides, locally, whether an image owes a signature at all (`cosign_check`, which returns a `CosignCheck` value: the image, the rule's keys and where to read signatures from). Then `answer_after_cosign` spawns a task that runs the check with a 60-second deadline and answers the deploy worker, who was waiting on its `oneshot` reply anyway. The loop moves on. The deploy worker can't tell the difference, which is the point.
+
+Where signatures come from is a `SignatureSource`: the pull-through cache when there is one, or the registry directly. Bun builds the agent long before Pickle's cache exists, so the source holds the cache in an `Arc<OnceLock<…>>`. `OnceLock` is a cell you can fill exactly once, from any thread, and read without a lock afterwards; Bun fills it when it builds the cache, and every clone of the source sees it. (`std::sync::OnceLock` is standard library; before Rust 1.70 you'd have reached for the `once_cell` crate.)
+
+A signature covers a digest, never a tag. U1 is what makes this usable: the apply binds `ghcr.io/acme/web:1.2` to `ghcr.io/acme/web:1.2@sha256:5a90…`, and the deploy verifies that cosign's payload names exactly `sha256:5a90…`. An image that reaches a deploy without a digest is refused with "isn't bound to one; apply it again", rather than checked against whatever the tag says today.
+
+The config check changed too. `require_signatures` without `cosign_keys` would refuse everything, and `cosign_keys` without `require_signatures` would look like protection while checking nothing, so both stop the node at startup, as does a key that doesn't parse.
+
+The tests drive real deploys through the agent loop with the cosign fixture behind a stand-in registry: the signed fixture digest deploys; a digest with no `.sig`, the right signature under the wrong key, and an unbound tag are each refused, by name; and an image no signature rule matches deploys as before.
+
 ## What we deferred
 
 **TPM sealing** binds the master secret to specific hardware via the TPM chip's Platform Configuration Registers. If someone steals a disk, the master key is useless on different hardware. This is important for production hardening, but requires a TPM 2.0 device and the `tss-esapi` crate (Linux only). We've deferred it to v2.
@@ -1253,9 +1947,11 @@ Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
 - Every workload instance gets a SPIFFE X.509 certificate and OIDC JWT automatically, with exact validity windows and server-rebuilt SANs
 - Identity lives in a per-instance directory (tmpfs-backed on Linux root), created before start, removed with the instance, and restored — schedule and all — across agent restarts
 - Images are signed (keyless by the build signer, or with an operator key via `relish sign`) and verified before they deploy
+- Every apply binds image tags to digests, so every node and restart runs the bytes the apply resolved
+- Node-config rules decide which upstream registries a node will run images from, checked at apply and before every deploy
 - SecurityState (CAs, tokens, keypairs, CRL, secret seals) is replicated through Raft
 - The agent provisions identity during deploy and rotates certificates every 30 minutes
-- API tokens are managed via `relish token list/revoke`
+- API tokens are managed via `relish token create/list/rotate/revoke`; Deployer and ReadOnly tokens live 90 days by default, and a rotation keeps the old secret working for a grace period
 - Secret keys rotate with a dual-key transition window, one rotation at a time, and finalise verifies every stored secret is re-sealed before the old key is retired
 - The CRL tracks revoked certificates
 - Egress DNS re-resolves asynchronously
@@ -1280,3 +1976,33 @@ This remains an audit guard, not the authorisation mechanism. The existing
 request tests still prove that read-only users cannot mutate resources and
 scoped users cannot access another tenant. The new regression places a GET and
 a POST on one path and verifies that both are collected independently.
+
+
+### Build signatures need an artefact lifetime
+
+The build signer used to receive the same one-hour certificate as a running
+workload, then retain it in a namespace cache indefinitely. A later build failed
+its local signature check. An image that had already passed could also stop
+deploying after an hour: the deployment gate verifies the certificate chain at
+the current time.
+
+Code signing now gets a separate leaf lifetime of at most five years, capped by
+the Workload CA's expiry. Its validity starts no earlier than the CA's. The
+one-hour mTLS policy stays in place for running workloads. Each build checks the
+cached signing chain and renews the signer before its leaf expires, with a day's
+lead time or half the issued leaf's lifetime when the CA is nearly expired.
+The cache owns both the key and its certificate, so renewal replaces them together.
+
+The gate checks the leaf, every intermediate and the trusted root at the current
+time, and refuses expired or revoked authority. These signatures still have a
+finite lifetime. Renewing a build signer does not
+extend an existing image's certificate. Operators must re-sign retained images
+before their chain expires, and after revoking an authority they used. The stored
+signature's timestamp supplies no cryptographic proof of when it was made, so it
+cannot override expiry or revocation. Images signed under the old one-hour policy
+need re-signing too.
+
+The regressions verify an actual cluster signature two hours after issuance,
+shorten an issuer's lifetime to check the leaf's upper bound, and place an expired
+certificate in the live build cache before asking for the next signer. The
+existing expired-chain and revocation tests continue to refuse expired authority.

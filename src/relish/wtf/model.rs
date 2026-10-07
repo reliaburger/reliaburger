@@ -350,6 +350,21 @@ pub struct ClusterEvidence {
     pub certificates: Evidence<Vec<CertificateObservation>>,
     /// Per-node Pickle readiness and redundancy evidence.
     pub registry: Evidence<Vec<RegistryObservation>>,
+    /// API token lifetimes, never secrets.
+    pub tokens: Evidence<Vec<TokenObservation>>,
+}
+
+/// One API token's lifetime, as `GET /v1/token/list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenObservation {
+    /// Token name.
+    pub name: String,
+    /// `admin`, `deployer` or `read-only`.
+    pub role: String,
+    /// When its current secret was issued, Unix seconds.
+    pub created_at: u64,
+    /// When it expires, Unix seconds; `None` for never.
+    pub expires_at: Option<u64>,
 }
 
 /// Evidence used by application diagnostic checks.

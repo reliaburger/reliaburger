@@ -812,6 +812,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -871,6 +872,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sh".into()],
                 env: vec![],
                 cwd: "/".into(),
@@ -934,6 +936,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -1024,6 +1027,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
@@ -1181,6 +1185,7 @@ mod tests {
                     readonly: false,
                 },
                 process: crate::grill::oci::OciProcess {
+                    rlimits: Vec::new(),
                     args: vec![
                         "/bin/sh".to_string(),
                         "-c".to_string(),
@@ -1344,6 +1349,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -1401,6 +1407,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
@@ -1469,7 +1476,7 @@ mod tests {
         }
 
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: id.0.clone(),
             namespace: "payments".to_string(),
             app_name: "rootfs-adoption".to_string(),
@@ -1479,6 +1486,7 @@ mod tests {
             runtime: crate::grill::records::RuntimeKind::Runc,
             pid,
             pid_started_at: started_at,
+            boot_id: crate::grill::records::current_boot(),
             runc_container_id: Some(id.0.clone()),
             // Owned adoption checks the launcher's log identity too.
             log_stem: original.log_stem(&id).await,
@@ -1592,6 +1600,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),

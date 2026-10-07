@@ -341,8 +341,10 @@ async fn active_export_lock_refuses_another_writer_without_uploading() {
     let source = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
     std::fs::write(source.path().join("logs_000000.parquet"), b"bytes").unwrap();
-    let lock = std::fs::File::create(source.path().join("_export_checkpoint.lock")).unwrap();
-    lock.try_lock().unwrap();
+    let lock = reliaburger::file_lock::FileLock::try_lock(
+        std::fs::File::create(source.path().join("_export_checkpoint.lock")).unwrap(),
+    )
+    .unwrap();
     let mut checkpoint = ExportCheckpoint::default();
     let result = export_logs(
         source.path(),
@@ -354,6 +356,9 @@ async fn active_export_lock_refuses_another_writer_without_uploading() {
     assert!(result.is_err());
     assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
     assert!(checkpoint.exported_files.is_empty());
+    // The guard unlocks rather than only closing: a child another test is
+    // spawning holds a copy of the descriptor until its exec, and with it the
+    // lock (#519).
     drop(lock);
     export_logs(
         source.path(),

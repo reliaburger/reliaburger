@@ -674,6 +674,10 @@ for directory in data images logs metrics volumes soak-export; do
     echo "disk $directory $(du -sk /var/lib/reliaburger/$directory 2>/dev/null | cut -f1)"
 done
 echo "panics $(journalctl -u reliaburger --no-pager -q --cursor-file=/var/tmp/soak-journal.cursor 2>/dev/null | grep -c 'panicked at')"
+# One clock source (#608): Lima's guest agent owns the clock, and every step
+# it takes since the last report is counted.
+echo "timesyncd $(systemctl is-active systemd-timesyncd.service 2>/dev/null)"
+echo "clock_steps $(journalctl -u lima-guestagent --no-pager -q --cursor-file=/var/tmp/soak-clock.cursor 2>/dev/null | grep -c 'SyncTime: system time synchronized')"
 section ingress
 echo | timeout 5 openssl s_client -connect 127.0.0.1:443 -servername podinfo.localhost 2>/dev/null | openssl x509 -noout -serial -enddate 2>/dev/null
 section api

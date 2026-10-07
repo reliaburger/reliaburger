@@ -101,7 +101,7 @@ enum Command {
         #[arg(long)]
         instance: String,
     },
-    /// Appliance OS steps (docs/manual/14_appliance.md).
+    /// Appliance OS steps (docs/manual/15_appliance.md).
     #[command(subcommand)]
     Appliance(ApplianceCommand),
     /// Run the built-in test workload.
@@ -337,6 +337,66 @@ fn load_node_identity(
         .transpose()
 }
 
+/// Stable archive ownership must survive a node restart without depending on
+/// its human label or local path. Enrolled nodes use their cluster trust root
+/// and certificate node ID. Plaintext nodes persist an opaque owner alongside
+/// their state; restoring a remote archive also requires restoring this file.
+fn configured_metrics_archive_owner(config: &NodeConfig) -> anyhow::Result<String> {
+    if config.metrics.object_store_url.is_empty() {
+        return Ok(String::new());
+    }
+    metrics_archive_owner(config, &config.storage.data)
+}
+
+fn metrics_archive_owner(
+    config: &NodeConfig,
+    data_base: &std::path::Path,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    if let Some(live) = load_node_identity(config)? {
+        let identity = live.snapshot();
+        return Ok(format!(
+            "tls:{:x}:{}",
+            Sha256::digest(&identity.root_ca_der),
+            identity.node_id
+        ));
+    }
+    let path = data_base.join("metrics-archive-owner");
+    std::fs::create_dir_all(data_base)
+        .with_context(|| format!("create archive owner directory {}", data_base.display()))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            let owner = format!("{:032x}", rand::random::<u128>());
+            file.write_all(owner.as_bytes())?;
+            file.sync_all()?;
+            std::fs::File::open(data_base)?.sync_all()?;
+            Ok(format!("plain:{owner}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let owner = std::fs::read_to_string(&path)
+                .with_context(|| format!("read archive owner {}", path.display()))?;
+            if owner.len() != 32 || !owner.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                anyhow::bail!(
+                    "invalid metrics archive owner in {}; restore the node state backup",
+                    path.display()
+                );
+            }
+            std::fs::File::open(&path)?.sync_all()?;
+            std::fs::File::open(data_base)?.sync_all()?;
+            Ok(format!("plain:{owner}"))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("persist archive owner {}", path.display()))
+        }
+    }
+}
+
 /// Enforce the `require_mtls` mode matrix before the cluster starts.
 ///
 /// With `require_mtls` set and no identity on disk, the node cannot speak the
@@ -498,6 +558,47 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Copy the CRL and the trust set from the council's state into the
+/// verifiers, the security refresh's job on every tick (F04 R2).
+///
+/// The CRL goes into the shared handle every verifier reads. The trust set
+/// goes into the live identity, which persists it and publishes it to every
+/// listener and client built from it. A failure keeps the old trust set and
+/// is logged once until it changes, not every five seconds.
+async fn refresh_crl_and_trust(
+    council: &reliaburger::council::CouncilNode,
+    crl: Option<&reliaburger::sesame::mtls::CrlHandle>,
+    identity: Option<&reliaburger::sesame::credentials::LiveNodeIdentity>,
+    last_error: &mut Option<String>,
+) {
+    let state = council.security_state().await;
+    if let Some(crl) = crl {
+        crl.update(state.crl.clone());
+    }
+    let Some(identity) = identity else {
+        return;
+    };
+    match identity.adopt_council_trust(&state).await {
+        Ok(true) => {
+            let trust = identity.snapshot();
+            println!(
+                "bun: installed the council's trust set: {} Node CA(s), {} root(s)",
+                trust.trust.node_cas.len(),
+                trust.trust.roots.len()
+            );
+            *last_error = None;
+        }
+        Ok(false) => *last_error = None,
+        Err(error) => {
+            let error = error.to_string();
+            if last_error.as_ref() != Some(&error) {
+                eprintln!("bun: WARNING: keeping the current trust set: {error}");
+                *last_error = Some(error);
+            }
+        }
+    }
+}
+
 /// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
 ///
 /// Returns `None` — falling back to a self-signed `localhost` cert — when the
@@ -517,7 +618,7 @@ async fn build_ingress_cert_resolver(
 
     let ikm = council.wrapping_ikm()?;
     let state = council.security_state().await;
-    let ingress_ca = state.get_ca(CaRole::Ingress)?;
+    let ingress_ca = state.active_ca(CaRole::Ingress)?;
     let (keypair, params) = match reliaburger::sesame::ca::ca_signing_material(ingress_ca, ikm) {
         Ok(material) => material,
         Err(e) => {
@@ -543,6 +644,45 @@ async fn build_ingress_cert_resolver(
         Err(e) => {
             eprintln!("bun: WARNING: could not build the ingress cert resolver ({e})");
             None
+        }
+    }
+}
+
+/// Rebuild the ingress resolver when the active Ingress CA changes, so
+/// `tls = "cluster"` routes mint their next leaf from the new CA without a
+/// restart (F04 R2). Checks on the security refresh's five-second cadence.
+async fn reload_ingress_resolver_on_ca_change(
+    council: std::sync::Arc<reliaburger::council::CouncilNode>,
+    routing_table: std::sync::Arc<tokio::sync::RwLock<reliaburger::wrapper::routing::RoutingTable>>,
+    lifetime: std::time::Duration,
+    resolver: std::sync::Arc<reliaburger::wrapper::tls::ReloadableCertResolver>,
+    mut serial: Option<reliaburger::sesame::types::SerialNumber>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let active = council
+            .security_state()
+            .await
+            .active_ca(reliaburger::sesame::types::CaRole::Ingress)
+            .map(|ca| ca.serial);
+        if active == serial {
+            continue;
+        }
+        // Remember the serial whether or not the rebuild works: a failure is
+        // logged by the builder, and retrying every tick would only repeat it.
+        serial = active;
+        if let Some(inner) =
+            build_ingress_cert_resolver(&council, routing_table.clone(), lifetime).await
+        {
+            resolver.replace(inner);
+            println!(
+                "bun: ingress now signs `tls = \"cluster\"` leaves with the rotated Ingress CA"
+            );
         }
     }
 }
@@ -839,6 +979,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .claim_upload_directory()
         .await
         .context("cannot recover registry upload ownership")?;
+    blob_store
+        .configure_storage_limit(
+            reliaburger::config::types::parse_byte_size(&config.images.max_storage)
+                .context("invalid images.max_storage")?,
+        )
+        .await
+        .context("cannot account physical image storage")?;
 
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
@@ -944,6 +1091,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
+    // Under ProcessGrill an app's `image` is a placeholder nobody pulls, so
+    // there's nothing to bind to a digest at apply (F03 U1, decision 5).
+    let runtime_pulls_images = !matches!(runtime, AnyGrill::Process(_));
     let runtime_version = runtime_version(runtime_kind).await;
     let host_kernel = host_kernel().await;
     // Image-store handle for installing the cluster P2P image source
@@ -951,6 +1101,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // long before them, so the source is injected late via a OnceLock
     // slot shared by ImageStore clones.
     let cluster_image_store = runtime.image_store();
+    if let Some(store) = &cluster_image_store {
+        store
+            .set_blob_store(Arc::clone(&blob_store))
+            .map_err(anyhow::Error::msg)?;
+    }
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -978,10 +1133,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // With `[metrics] object_store_url` set, metrics are persisted to and
     // queried from an object store (s3://, gs://, file://) so they survive node
     // loss (H8); otherwise Parquet stays in the local metrics dir.
+    let archive_owner = configured_metrics_archive_owner(&config)?;
     let mayo_store = Arc::new(RwLock::new(
-        MayoStore::open(metrics_dir, Some(config.metrics.object_store_url.as_str()))
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to open metrics store: {e}"))?,
+        MayoStore::open_for_node(
+            metrics_dir,
+            Some(config.metrics.object_store_url.as_str()),
+            &archive_owner,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open metrics store: {e}"))?,
     ));
 
     // Create the agent (extract deploy history handle before spawning).
@@ -1010,6 +1170,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // into ClusterParams.
     let (disk_pressured_tx, disk_pressured_rx) = tokio::sync::watch::channel(false);
 
+    // Why the council's Raft core stopped, when it stops on its own (#480).
+    // Set once by the watchdog below; bun then shuts down and exits non-zero.
+    let raft_failure: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
     let _cluster_runtime;
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
@@ -1079,6 +1242,29 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         upgrade_rejoin_rx = Some(cluster_runtime.gossip_rejoined_rx.clone());
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         api_council = handle.council.clone();
+        // A Raft core that stops on a storage error never restarts in process
+        // (#480). Shut down and exit non-zero instead of serving as a voter
+        // that no longer applies: systemd restarts bun, and the new core
+        // catches up from the leader once the disk has room again.
+        if let Some(council) = &handle.council {
+            let metrics = council.raft().metrics();
+            let watchdog_shutdown = shutdown.clone();
+            let failure = Arc::clone(&raft_failure);
+            tokio::spawn(async move {
+                let stopped = reliaburger::cluster::runtime::raft_core_stopped(
+                    metrics,
+                    watchdog_shutdown.clone(),
+                )
+                .await;
+                if let Some(reason) = stopped {
+                    eprintln!(
+                        "bun: council Raft core stopped: {reason}; shutting down so the service manager restarts bun"
+                    );
+                    let _ = failure.set(reason);
+                    watchdog_shutdown.cancel();
+                }
+            });
+        }
         crl_refresh = Some(handle.crl_handle.clone());
         // Cloned before the handle moves into the agent: the pickle
         // replication loop derives its peer list from gossip.
@@ -1148,6 +1334,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // used to carry zeroes).
     let (capacity_cpu, capacity_memory) = node_capacity(&config);
     agent.set_node_capacity(capacity_cpu, capacity_memory);
+    let execution_budget = agent.execution_budget();
 
     // Thread the `[process_workloads]` policy into the supervisor (D17/H8).
     // Without this the supervisor keeps its deny-by-default constructor
@@ -1547,13 +1734,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // saw `None` and skipped the check needed to contain that open router.
     if let Some(council) = &api_council {
         refresh_token_store(&api_token_store, council).await;
-        if let Some(crl) = &crl_refresh {
-            crl.update(council.security_state().await.crl);
-        }
+        let mut trust_error = None;
+        refresh_crl_and_trust(
+            council,
+            crl_refresh.as_ref(),
+            api_identity.as_ref(),
+            &mut trust_error,
+        )
+        .await;
 
         let refresh_store = Arc::clone(&api_token_store);
         let refresh_council = Arc::clone(council);
         let refresh_crl = crl_refresh.clone();
+        let refresh_identity = api_identity.clone();
         reliaburger::bun::readiness::spawn_reconstructible(
             "security-refresh",
             false,
@@ -1569,11 +1762,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 let refresh_store = Arc::clone(&refresh_store);
                 let refresh_council = Arc::clone(&refresh_council);
                 let refresh_crl = refresh_crl.clone();
+                let refresh_identity = refresh_identity.clone();
                 async move {
+                    let mut trust_error = None;
                     refresh_token_store(&refresh_store, &refresh_council).await;
-                    if let Some(crl) = &refresh_crl {
-                        crl.update(refresh_council.security_state().await.crl);
-                    }
+                    refresh_crl_and_trust(
+                        &refresh_council,
+                        refresh_crl.as_ref(),
+                        refresh_identity.as_ref(),
+                        &mut trust_error,
+                    )
+                    .await;
                     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                     ready.ready();
                     loop {
@@ -1582,10 +1781,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             _ = ticker.tick() => {
                                 refresh_token_store(&refresh_store, &refresh_council).await;
                                 // Same tick refreshes the CRL so a revoked peer is
-                                // refused on its next handshake (≤5 s lag).
-                                if let Some(crl) = &refresh_crl {
-                                    crl.update(refresh_council.security_state().await.crl);
-                                }
+                                // refused on its next handshake, and the trust set
+                                // so a rotated CA is accepted on it (≤5 s lag).
+                                refresh_crl_and_trust(
+                                    &refresh_council,
+                                    refresh_crl.as_ref(),
+                                    refresh_identity.as_ref(),
+                                    &mut trust_error,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1601,6 +1805,23 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
         }
+
+        // Leader-only: drop tokens a day past their expiry, never the last
+        // Admin (F05 I2). Followers tick too, and do nothing.
+        tokio::spawn(reliaburger::bun::token_sweep::run_token_sweep_loop(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        ));
+        // Leader-only: give each namespace that opted in with
+        // `secret_key = true` its first key, re-sealing its values (F05 I4).
+        tokio::spawn(reliaburger::bun::namespace_keys::run_namespace_key_loop(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        ));
     }
     // Create the log store before the agent adopts anything: its checkpoint
     // tells each adopted instance's forwarder where to resume (#308). (The
@@ -1638,6 +1859,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     agent.set_log_sink(log_tx, capture_offsets);
     agent.set_readiness_tracker(readiness.clone());
     agent.set_trust_policy(config.images.trust_policy.clone());
+    // F03 U3: an upstream rule with `require_signatures` needs the image's
+    // cosign `.sig`, read through the pull-through cache once it exists
+    // (below) or straight from the registry. Only where the runtime pulls
+    // images, like digest binding.
+    let signature_source = runtime_pulls_images.then(|| {
+        let credentials = reliaburger::pickle::upstream::resolve_credentials(
+            &config.images.external_registries,
+            |name| std::env::var(name).ok(),
+        );
+        reliaburger::pickle::cosign::SignatureSource::new(
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::new(
+                credentials.clone(),
+            )),
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::insecure_http(
+                credentials,
+            )),
+        )
+    });
+    if let Some(source) = &signature_source {
+        agent.set_signature_source(source.clone());
+    }
     agent.set_records_dir(instances_dir.clone());
     if durable_discovery {
         let directory = data_base.join("discovery");
@@ -1670,6 +1912,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Adopt workloads that survived a previous bun process (restart or
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
     agent.adopt_recorded_instances().await?;
+    let task_runner = agent.delegated_task_runner(&data_base)?;
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    let task_runner = if let Some(kernel) = agent.delegated_namespace_kernel() {
+        task_runner.with_namespace_policy(
+            reliaburger::bun::task_namespace::TaskNamespacePolicy::recover(kernel, &data_base)
+                .await?,
+        )
+    } else {
+        task_runner
+    };
     let deploy_history = agent.deploy_history_handle();
 
     // Onion DNS: start the .internal responder when [dns] enables it,
@@ -1731,12 +1983,33 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
                 Some(council) => {
-                    build_ingress_cert_resolver(
-                        council,
-                        routing_table.clone(),
-                        config.security.ingress_leaf_lifetime(),
-                    )
-                    .await
+                    let lifetime = config.security.ingress_leaf_lifetime();
+                    let serial = council
+                        .security_state()
+                        .await
+                        .active_ca(reliaburger::sesame::types::CaRole::Ingress)
+                        .map(|ca| ca.serial);
+                    match build_ingress_cert_resolver(council, routing_table.clone(), lifetime)
+                        .await
+                    {
+                        Some(inner) => {
+                            // The listener keeps this one resolver; an Ingress
+                            // CA rotation swaps what's inside it (F04 R2).
+                            let reloadable = std::sync::Arc::new(
+                                reliaburger::wrapper::tls::ReloadableCertResolver::new(inner),
+                            );
+                            tokio::spawn(reload_ingress_resolver_on_ca_change(
+                                std::sync::Arc::clone(council),
+                                routing_table.clone(),
+                                lifetime,
+                                std::sync::Arc::clone(&reloadable),
+                                serial,
+                                shutdown.clone(),
+                            ));
+                            Some(reloadable)
+                        }
+                        None => None,
+                    }
                 }
                 None => None,
             };
@@ -2119,20 +2392,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| "local".to_string());
         let dp_pressured_tx = disk_pressured_tx.clone();
+        // Resignation follows the filesystem the Raft log lives on (#510).
+        let dp_raft_dir = config.storage.data.join("raft");
         // Rollup retention (E): expire aggregated rollups older than the
         // configured window. Only present in cluster mode; 0 hours = keep all.
         let dp_rollup_store = api_rollup_store.clone();
         let rollup_retention_hours = config.metrics.rollup_retention_hours;
         tokio::spawn(async move {
             use reliaburger::bun::disk_pressure::{
-                DiskPressureResignation, ResignationVerdict, check_and_relieve, dir_parquet_size,
+                DiskPressureResignation, FilesystemUsage, ResignationVerdict, check_and_relieve,
             };
             use reliaburger::ketchup::export::ExportCheckpoint;
             let tick_period = std::time::Duration::from_secs(300);
             let mut tick = tokio::time::interval(tick_period);
             // Council resignation waits for two sustained ticks (~10 min) over
-            // the threshold before advertising, so a transient spike between
-            // export and prune doesn't churn the council (12b.2 T3).
+            // the threshold before advertising, so a transient spike doesn't
+            // churn the council (12b.2 T3).
             let mut resignation = DiskPressureResignation::new(tick_period * 2);
             tick.tick().await; // skip first immediate tick
 
@@ -2211,22 +2486,35 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
 
-                        // Council resignation (12b.2 T3): if either store stays
-                        // over its threshold AFTER export-and-prune, the disk is
-                        // genuinely full, not just holding stale data. Sustained
-                        // long enough, advertise resignation so the leader
-                        // replaces this voter.
-                        let over_threshold = (log_max_bytes > 0
-                            && dir_parquet_size(&log_data_dir) > log_max_bytes)
-                            || (metrics_max_bytes > 0
-                                && dir_parquet_size(&mayo_data_dir) > metrics_max_bytes);
+                        // Council resignation (12b.2 T3): a voter resigns when
+                        // the filesystem under its Raft log is nearly full, the
+                        // point where appends start failing. The stores'
+                        // `max_storage_mb` caps are retention limits that
+                        // export-and-prune enforce above; a store over its cap
+                        // on a mostly empty disk is no reason to resign (#510).
+                        let council_disk = match FilesystemUsage::of(&dp_raft_dir) {
+                            Ok(usage) => Some(usage),
+                            Err(error) => {
+                                eprintln!(
+                                    "bun: could not measure disk usage under {}: {error}",
+                                    dp_raft_dir.display()
+                                );
+                                None
+                            }
+                        };
+                        let over_threshold = council_disk.is_some_and(|usage| usage.is_pressured());
                         let verdict = resignation.observe(over_threshold, std::time::Instant::now());
                         let should_resign = verdict == ResignationVerdict::Resign;
                         if *dp_pressured_tx.borrow() != should_resign {
-                            if should_resign {
+                            if let (true, Some(usage)) = (should_resign, council_disk) {
                                 println!(
-                                    "bun: sustained disk pressure — advertising council resignation"
+                                    "bun: sustained disk pressure on {} ({}% used, {} bytes free) — advertising council resignation",
+                                    dp_raft_dir.display(),
+                                    usage.used_percent(),
+                                    usage.available_bytes
                                 );
+                            } else {
+                                println!("bun: disk pressure cleared — withdrawing council resignation");
                             }
                             let _ = dp_pressured_tx.send(should_resign);
                         }
@@ -2281,6 +2569,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Cloned for the GC task (asks the agent for actively deployed images).
     let gc_cmd_tx = cmd_tx.clone();
 
+    // F03 U1: an apply this node leads binds each image tag to the digest it
+    // names now, so every node, restart and replacement pulls the same
+    // bytes. Only when this node's own runtime pulls images; a cluster runs
+    // one runtime kind, so the leader's speaks for every node. Loopback
+    // registries are asked over plain HTTP, the way the runtime pulls them.
+    let image_binder = runtime_pulls_images.then(|| {
+        let credentials = reliaburger::pickle::upstream::resolve_credentials(
+            &config.images.external_registries,
+            |name| std::env::var(name).ok(),
+        );
+        reliaburger::pickle::binding::ImageBinder::new(
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::new(
+                credentials.clone(),
+            )),
+            Arc::new(reliaburger::pickle::upstream::OciUpstream::insecure_http(
+                credentials,
+            )),
+        )
+        .with_policy(config.images.trust_policy.clone())
+    });
+
     // GitOps (L13): if [gitops] is configured on a cluster node, spawn
     // the leader-only sync loop and hand the API a webhook sender that
     // nudges it. The webhook endpoint returns 503 without this.
@@ -2305,6 +2614,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 webhook_rx,
                 config.storage.data.clone(),
                 shutdown.clone(),
+                image_binder.clone(),
             );
             println!("bun: gitops sync loop started");
             Some(webhook_tx)
@@ -2458,6 +2768,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             node_certificate: None,
         },
         test_policy: config.testing.clone(),
+        token_lifetime: config.security.token_lifetime(),
     };
 
     // Enable workload-JWT bearer authentication when the cluster has an OIDC
@@ -2541,6 +2852,24 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases.clone()),
         jwt_verifier,
         Some(status_reader),
+        // Delegated tasks share the agent runtime and resource commitments;
+        // detailed outcomes remain in durable worker ledgers.
+        Some(Arc::new(
+            reliaburger::bun::task_array_leader::TaskArrayService::new(Some(Arc::new(
+                reliaburger::bun::task_array_node::TaskArrayNode::new(
+                    reliaburger::bun::task_array_node::TaskArrayNodeConfig::for_data_dir(
+                        &data_base,
+                        config.process_workloads.clone(),
+                    ),
+                    reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
+                )
+                .with_budget(execution_budget),
+            )))
+            .with_trust_policy(config.images.trust_policy.clone())
+            .with_signature_source(signature_source.clone())
+            .with_storage(&data_base)
+            .await?,
+        )),
     );
     let app = match &registry_forwarder {
         Some(forwarder) => app.layer(axum::Extension(
@@ -2553,6 +2882,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match capacity_admission {
         Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
+    };
+    let app = match image_binder {
+        Some(binder) => app.layer(axum::Extension(binder)),
         None => app,
     };
     let app = match api_known_members {
@@ -2728,15 +3061,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Arc::clone(&api_token_store),
         service_token.clone(),
     ));
-    // Storage quotas (REG4): a per-repository ceiling derived from
-    // `[images] max_storage` divided across repositories is more than an
-    // operator asked for; we apply `max_storage` as the registry-wide cap
-    // and leave per-repository unlimited unless configured.
-    let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig {
-        per_repository_bytes: 0,
-        total_bytes: reliaburger::config::types::parse_byte_size(&config.images.max_storage)
-            .unwrap_or(0),
-    };
+    // Physical payloads, including temporary uploads and runtime pulls, share
+    // the configured BlobStore cap. Logical per-repository policy is separate.
+    let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig::default();
     let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
         reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
     );
@@ -2792,23 +3119,25 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             &config.images.external_registries,
             |name| std::env::var(name).ok(),
         );
-        image_store.set_cluster_source(std::sync::Arc::new(
-            reliaburger::pickle::p2p::ClusterSource {
-                state: pickle_state.clone(),
-                members: replication_membership.clone(),
-                registry_port: config.images.registry_port,
-                peer_scheme: registry_scheme.to_string(),
-                concurrency: config.images.p2p_concurrency,
-                client: registry_client.clone(),
-                upstream: Some(std::sync::Arc::new(
-                    reliaburger::pickle::upstream::OciUpstream::new(credentials)
-                        .with_mirrors(config.images.mirrors.clone()),
-                )),
-                pull_through: config.images.pull_through,
-                cache_recheck_secs: config.images.cache_recheck_secs,
-                fill_lock: tokio::sync::Mutex::new(()),
-            },
-        ));
+        let cluster_source = std::sync::Arc::new(reliaburger::pickle::p2p::ClusterSource {
+            state: pickle_state.clone(),
+            members: replication_membership.clone(),
+            registry_port: config.images.registry_port,
+            peer_scheme: registry_scheme.to_string(),
+            concurrency: config.images.p2p_concurrency,
+            client: registry_client.clone(),
+            upstream: Some(std::sync::Arc::new(
+                reliaburger::pickle::upstream::OciUpstream::new(credentials)
+                    .with_mirrors(config.images.mirrors.clone()),
+            )),
+            pull_through: config.images.pull_through,
+            cache_recheck_secs: config.images.cache_recheck_secs,
+            fill_lock: tokio::sync::Mutex::new(()),
+        });
+        if let Some(source) = &signature_source {
+            source.use_cache(cluster_source.clone());
+        }
+        image_store.set_cluster_source(cluster_source);
     }
 
     let registry_lease_state = pickle_state.clone();
@@ -3176,6 +3505,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         eprintln!("bun: final log flush error: {e}");
     }
     println!("bun: shutdown complete");
+    if let Some(reason) = raft_failure.get() {
+        anyhow::bail!("council Raft core stopped: {reason}");
+    }
 
     Ok(())
 }
@@ -3976,6 +4308,10 @@ mod tests {
                 private_key_der,
                 serial,
                 ca_generation: 0,
+                trust: reliaburger::sesame::trust::TrustSet::single(
+                    hierarchy.node.ca.certificate_der.clone(),
+                    hierarchy.root.ca.certificate_der.clone(),
+                ),
                 node_ca_der: hierarchy.node.ca.certificate_der.clone(),
                 root_ca_der: hierarchy.root.ca.certificate_der.clone(),
                 not_before: std::time::SystemTime::UNIX_EPOCH,
@@ -4022,8 +4358,7 @@ mod tests {
                 .unwrap(),
             "11"
         );
-        let anonymous =
-            mtls::build_ca_pinned_client(server.node_ca_der, server.root_ca_der).unwrap();
+        let anonymous = mtls::build_ca_pinned_client(server.trust.clone()).unwrap();
         assert_eq!(
             anonymous
                 .get(&url)
@@ -4038,5 +4373,156 @@ mod tests {
             "anonymous"
         );
         shutdown.cancel();
+    }
+    #[test]
+    fn metrics_archive_owners_survive_restarts_and_plaintext_label_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = root.path().to_path_buf();
+        config.node.name = Some("same-label".into());
+        let first = metrics_archive_owner(&config, &root.path().join("first")).unwrap();
+        let second = metrics_archive_owner(&config, &root.path().join("second")).unwrap();
+        assert_ne!(
+            first, second,
+            "duplicate human labels must not share archives"
+        );
+        config.node.name = Some("renamed-label".into());
+        assert_eq!(
+            metrics_archive_owner(&config, &root.path().join("first")).unwrap(),
+            first
+        );
+        let backup = root.path().join("recovered");
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::copy(
+            root.path().join("first/metrics-archive-owner"),
+            backup.join("metrics-archive-owner"),
+        )
+        .unwrap();
+        assert_eq!(metrics_archive_owner(&config, &backup).unwrap(), first);
+    }
+
+    #[test]
+    fn metrics_archive_owner_refuses_corruption_and_failed_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = root.path().to_path_buf();
+        std::fs::write(root.path().join("metrics-archive-owner"), "partial").unwrap();
+        assert!(
+            metrics_archive_owner(&config, root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("invalid metrics archive owner")
+        );
+        let blocked = root.path().join("regular-file");
+        std::fs::write(&blocked, "blocked").unwrap();
+        assert!(metrics_archive_owner(&config, &blocked).is_err());
+    }
+
+    #[test]
+    fn remote_plaintext_owners_refuse_configured_paths_that_would_share_a_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let shared_fallback = root.path().join("shared-user-fallback");
+        let mut first = NodeConfig::default();
+        first.node.name = Some("first-node".into());
+        // A valid, explicitly configured empty identity directory lets a
+        // plaintext node reach the storage fallback instead of failing an
+        // unrelated identity lookup under the blocked data path.
+        let identities = root.path().join("empty-identities");
+        std::fs::create_dir(&identities).unwrap();
+        first.security.identity_dir = Some(identities);
+        first.metrics.object_store_url = "s3://bucket/archive".into();
+        first.storage.data = root.path().join("blocked-first");
+        std::fs::write(&first.storage.data, "not a directory").unwrap();
+        let mut second = first.clone();
+        second.node.name = Some("second-node".into());
+        second.storage.data = root.path().join("blocked-second");
+        std::fs::write(&second.storage.data, "not a directory").unwrap();
+        // A per-user fallback would choose the same archive identity for two
+        // distinct nodes. Remote production startup refuses both configured paths.
+        assert_eq!(
+            metrics_archive_owner(&first, &shared_fallback).unwrap(),
+            metrics_archive_owner(&second, &shared_fallback).unwrap()
+        );
+        assert!(configured_metrics_archive_owner(&first).is_err());
+        assert!(configured_metrics_archive_owner(&second).is_err());
+        first.metrics.object_store_url.clear();
+        assert!(
+            configured_metrics_archive_owner(&first).unwrap().is_empty(),
+            "local metrics keep their existing fallback behavior"
+        );
+    }
+
+    #[test]
+    fn enrolled_metrics_archive_owner_uses_the_root_and_certificate_node_id() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        reliaburger::relish::commands::init(first.path(), "first-cluster", "shared-label").unwrap();
+        reliaburger::relish::commands::init(second.path(), "second-cluster", "shared-label")
+            .unwrap();
+        let config_one = NodeConfig::from_file(&first.path().join("reliaburger.toml")).unwrap();
+        let config_two = NodeConfig::from_file(&second.path().join("reliaburger.toml")).unwrap();
+        let one = metrics_archive_owner(&config_one, first.path()).unwrap();
+        let two = metrics_archive_owner(&config_two, second.path()).unwrap();
+        assert_ne!(one, two);
+        assert!(one.ends_with(":shared-label"));
+        assert_eq!(
+            metrics_archive_owner(&config_one, first.path()).unwrap(),
+            one
+        );
+        assert!(!first.path().join("metrics-archive-owner").exists());
+    }
+
+    #[test]
+    fn enrolled_metrics_archive_owner_survives_leaf_renewal_and_uses_certificate_node_id() {
+        use reliaburger::sesame::{ca, identity_store, types::SerialNumber};
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = directory.path().to_path_buf();
+        config.node.name = Some("first-human-label".into());
+        let hierarchy = ca::generate_ca_hierarchy("archive-owner", b"archive-owner-test").unwrap();
+        let issue = |node_id: &str, serial| {
+            let (certificate_der, private_key_der, serial) = ca::issue_node_cert(
+                node_id,
+                SerialNumber(serial),
+                &hierarchy.node.signing_keypair,
+                &hierarchy.node.certificate_params,
+            )
+            .unwrap();
+            identity_store::NodeIdentity {
+                node_id: node_id.into(),
+                certificate_der,
+                private_key_der,
+                serial,
+                ca_generation: 0,
+                trust: reliaburger::sesame::trust::TrustSet::single(
+                    hierarchy.node.ca.certificate_der.clone(),
+                    hierarchy.root.ca.certificate_der.clone(),
+                ),
+                node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+                root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+                not_before: std::time::SystemTime::UNIX_EPOCH,
+                not_after: std::time::SystemTime::UNIX_EPOCH,
+            }
+        };
+        let identity = node_identity_dir(&config);
+        let original = issue("certificate-node", 100);
+        identity_store::save(&identity, &original).unwrap();
+        let owner = metrics_archive_owner(&config, directory.path()).unwrap();
+        config.node.name = Some("renamed-human-label".into());
+        let renewed = issue("certificate-node", 101);
+        assert_ne!(renewed.certificate_der, original.certificate_der);
+        identity_store::save(&identity, &renewed).unwrap();
+        assert_eq!(
+            metrics_archive_owner(&config, directory.path()).unwrap(),
+            owner,
+            "renewing a leaf under the same root and NodeId must reopen its archive"
+        );
+        identity_store::save(&identity, &issue("another-certificate-node", 102)).unwrap();
+        assert_ne!(
+            metrics_archive_owner(&config, directory.path()).unwrap(),
+            owner,
+            "human labels must not select the archive for a different certificate NodeId"
+        );
+        assert!(!directory.path().join("metrics-archive-owner").exists());
     }
 }

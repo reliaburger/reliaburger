@@ -42,11 +42,11 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
         eprint!("{report}");
         eprintln!();
     }
-    loaded.config.validate()?;
+    loaded.config.validate_intrinsic()?;
     Ok(loaded.config)
 }
 
-/// Explicitly rerun a node-local job manifest, including unknown prior outcomes.
+/// Request another common run; unresolved ownership still requires grant-specific replay.
 pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), RelishError> {
     let config = load_manifest(source).await?;
     let result = BunClient::default_local()
@@ -86,7 +86,7 @@ async fn apply_with_client(
         // updates and unchanged resources render as such instead of every
         // resource claiming to be a create. No agent → the all-create plan.
         let current = match client.health().await {
-            Ok(()) => client.current_resources().await.ok(),
+            Ok(()) => Some(client.current_resources().await?),
             Err(_) => None,
         };
         let plan = generate_plan(&config, current.as_deref());
@@ -679,10 +679,10 @@ pub(super) fn node_identity_from_init(
     use crate::sesame::types::CaRole;
 
     let state = &init_result.security_state;
-    let node_ca = state.get_ca(CaRole::Node).ok_or_else(|| {
+    let node_ca = state.active_ca(CaRole::Node).ok_or_else(|| {
         RelishError::InitFailed("security state is missing the Node CA".to_string())
     })?;
-    let root_ca = state.get_ca(CaRole::Root).ok_or_else(|| {
+    let root_ca = state.active_ca(CaRole::Root).ok_or_else(|| {
         RelishError::InitFailed("security state is missing the root CA".to_string())
     })?;
 
@@ -693,6 +693,10 @@ pub(super) fn node_identity_from_init(
         private_key_der: cert.private_key_der.clone(),
         serial: cert.serial,
         ca_generation: cert.ca_generation,
+        trust: crate::sesame::trust::TrustSet::single(
+            node_ca.certificate_der.clone(),
+            root_ca.certificate_der.clone(),
+        ),
         node_ca_der: node_ca.certificate_der.clone(),
         root_ca_der: root_ca.certificate_der.clone(),
         not_before: cert.not_before,
@@ -929,8 +933,9 @@ fn print_standalone_council(
 /// Recover a cluster whose entire council was lost (12b.2 D21/CP12).
 ///
 /// Offline by design: run it against a STOPPED node. It restores the desired
-/// state (from a sealed backup or the node's own durable snapshot), wipes the
-/// dead cluster's Raft log, and stamps a fresh recovery epoch. The next start
+/// state (from a sealed backup or the node's own snapshot and committed
+/// log), retires the dead cluster's Raft log, and stamps a fresh recovery
+/// epoch. The next start
 /// re-bootstraps a single-voter council the reconciler regrows.
 pub async fn council_recover(
     data_dir: &std::path::Path,
@@ -961,18 +966,21 @@ pub async fn council_recover(
         );
     }
 
-    // Load the master key when a sealed backup is the source.
-    let master_key = if from.is_some() {
-        let path = master_key_path
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("/etc/reliaburger/master.key"));
-        Some(
-            crate::sesame::bootstrap::load_master_key(&path)
-                .map_err(|e| RelishError::Recovery(format!("load master key: {e}")))?,
-        )
-    } else {
-        None
+    // A sealed backup always needs the master key. The node's own Raft log
+    // needs it when the cluster encrypts the log, so use one given, or the
+    // default one if it exists; a keyless cluster has none.
+    let default_key = std::path::Path::new("/etc/reliaburger/master.key");
+    let key_path = match master_key_path {
+        Some(path) => Some(path),
+        None if from.is_some() || default_key.exists() => Some(default_key),
+        None => None,
     };
+    let master_key = key_path
+        .map(|path| {
+            crate::sesame::bootstrap::load_master_key(path)
+                .map_err(|e| RelishError::Recovery(format!("load master key: {e}")))
+        })
+        .transpose()?;
 
     let source = match from {
         Some(url) => RecoverySource::BackupUrl(url.to_string()),
@@ -983,12 +991,14 @@ pub async fn council_recover(
         .await
         .map_err(|e| RelishError::Recovery(e.to_string()))?;
     let app_count = state.apps.len();
+    let token_count = state.security_state.api_tokens.len();
     let prior_epoch = state.recovery_epoch;
 
     recover_data_dir(data_dir, state).map_err(|e| RelishError::Recovery(e.to_string()))?;
 
     println!("Council recovery complete.");
     println!("  Restored apps:   {app_count}");
+    println!("  API tokens:      {token_count}");
     println!("  Recovery epoch:  {} -> {}", prior_epoch, prior_epoch + 1);
     println!("  Data directory:  {}", data_dir.display());
     println!();
@@ -1111,7 +1121,7 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
 /// otherwise an unreachable agent is an error (X5).
 pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
-    config.validate()?;
+    config.validate_intrinsic()?;
 
     let client = BunClient::default_local();
 
@@ -1119,7 +1129,7 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
         // Same live diff as `apply --dry-run`: a reachable agent supplies
         // current state so the plan shows updates, not universal creates.
         let current = match client.health().await {
-            Ok(()) => client.current_resources().await.ok(),
+            Ok(()) => Some(client.current_resources().await?),
             Err(_) => None,
         };
         let plan = generate_plan(&config, current.as_deref());
@@ -1625,10 +1635,11 @@ fn format_memory(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// Rotate or finalise the cluster's secret encryption key.
-pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
+/// Rotate or finalise the cluster's secret encryption key, or one
+/// namespace's.
+pub async fn secret_rotate(finalize: bool, namespace: Option<&str>) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let result = client.secret_rotate(finalize).await?;
+    let result = client.secret_rotate(finalize, namespace).await?;
     println!("{result}");
     Ok(())
 }
@@ -1660,7 +1671,7 @@ pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
 /// `[images.trust_policy] keys` expects.
 pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
     let key = crate::pickle::signing::SigningKey::generate()?;
-    write_private_key(out, &key.to_pem())?;
+    write_private_key(out, key.to_pem().as_bytes())?;
     let public_key = key.public_key_base64();
     println!("wrote image signing key to {}", out.display());
     println!("public key: {public_key}");
@@ -1674,7 +1685,7 @@ pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
 }
 
 /// Write a private key, refusing to overwrite and keeping it owner-only.
-fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
+pub(crate) fn write_private_key(path: &Path, contents: &[u8]) -> Result<(), RelishError> {
     use std::io::Write as _;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1689,7 +1700,7 @@ fn write_private_key(path: &Path, pem: &str) -> Result<(), RelishError> {
         },
         _ => RelishError::Io(e),
     })?;
-    file.write_all(pem.as_bytes())?;
+    file.write_all(contents)?;
     Ok(())
 }
 
@@ -1896,6 +1907,14 @@ pub async fn wait_for_batch(
         if summary["done"].as_bool().unwrap_or(false) {
             return Ok(summary);
         }
+        if summary["status"] == "Unknown" {
+            return Err(RelishError::ApiError {
+                status: 409,
+                body: format!(
+                    "run {batch_id} needs an operator decision; inspect its unknown_owners before acknowledged replay"
+                ),
+            });
+        }
         let last_summary = summary;
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -2053,7 +2072,7 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.submit_batch(&config.job).await?;
     println!(
-        "batch {} submitted: {} assigned",
+        "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
         result["assigned"].as_u64().unwrap_or(0),
     );
@@ -2078,7 +2097,12 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
 
 /// Show a batch's progress; with `wait`, poll (bounded by `timeout`)
 /// until the batch reaches a terminal state.
-pub async fn batch_status(batch_id: u64, wait: bool, timeout_secs: u64) -> Result<(), RelishError> {
+pub async fn batch_status(
+    batch_id: u64,
+    wait: bool,
+    timeout_secs: u64,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let summary = if wait {
         wait_for_batch(
@@ -2090,11 +2114,19 @@ pub async fn batch_status(batch_id: u64, wait: bool, timeout_secs: u64) -> Resul
     } else {
         client.batch_status(batch_id).await?
     };
-    print_batch_summary(batch_id, &summary);
+    if matches!(output, OutputFormat::Human) {
+        print_batch_summary(batch_id, &summary);
+    } else {
+        println!("{}", format_output(&summary, output)?);
+    }
     Ok(())
 }
 
 fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
+    if summary["kind"] == "array" || summary["kind"] == "manifest" {
+        print!("{}", format_array_summary(batch_id, summary));
+        return;
+    }
     let unschedulable = summary["unschedulable"].as_u64().unwrap_or(0);
     println!(
         "batch {}: {} total, {} pending, {} completed, {} failed{}{}",
@@ -2116,27 +2148,468 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
     );
 }
 
+/// What `relish run --batch` submits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskArrayRun {
+    /// Durable UTC schedule; omitted means an immediate manual run.
+    pub schedule: Option<String>,
+    pub image: Option<String>,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    /// The array's name.
+    pub name: String,
+    /// Its namespace.
+    pub namespace: String,
+    /// Host binary every task runs.
+    pub exec: Option<std::path::PathBuf>,
+    /// Argument template with `{index}` placeholders.
+    pub args: Vec<String>,
+    /// `KEY=VALUE` pairs for every task's environment.
+    pub env: Vec<String>,
+    /// Count and policy.
+    pub spec: crate::meat::task_array::TaskArraySpec,
+}
+
+/// Turn `relish run --batch` flags into the API request, refusing bad
+/// `--env` pairs and a relative `--exec` before anything is sent.
+pub fn task_array_request(
+    run: TaskArrayRun,
+) -> Result<crate::bun::task_array_api::TaskArraySubmitRequest, RelishError> {
+    if run.exec.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err(RelishError::InvalidFlag {
+            flag: "exec".to_string(),
+            reason: format!(
+                "{} isn't an absolute path; nodes allow binaries by absolute path",
+                run.exec.as_ref().expect("checked").display()
+            ),
+        });
+    }
+    let mut env = std::collections::BTreeMap::new();
+    for pair in &run.env {
+        let Some((key, value)) = pair.split_once('=').filter(|(key, _)| !key.is_empty()) else {
+            return Err(RelishError::InvalidFlag {
+                flag: "env".to_string(),
+                reason: format!("{pair:?} isn't KEY=VALUE"),
+            });
+        };
+        env.insert(
+            key.to_string(),
+            crate::config::types::EnvValue::Plain(value.to_string()),
+        );
+    }
+    Ok(crate::bun::task_array_api::TaskArraySubmitRequest {
+        name: run.name,
+        namespace: Some(run.namespace),
+        template: crate::config::job::JobSpec {
+            image: run.image,
+            command: Some(run.args),
+            schedule: run.schedule,
+            run_before: Vec::new(),
+            memory: run
+                .memory
+                .as_deref()
+                .map(crate::config::types::ResourceRange::parse_memory)
+                .transpose()?,
+            cpu: run
+                .cpu
+                .as_deref()
+                .map(crate::config::types::ResourceRange::parse_cpu)
+                .transpose()?,
+            env,
+            namespace: None,
+            exec: run.exec,
+            script: None,
+        },
+        spec: run.spec,
+    })
+}
+
+/// Submit all resource profiles atomically from a compact TOML manifest.
+pub async fn submit_task_manifest(
+    path: &std::path::Path,
+    output: OutputFormat,
+    dry_run: bool,
+) -> Result<(), RelishError> {
+    let source = std::fs::read_to_string(path)?;
+    let request: crate::bun::task_array_api::TaskManifestRequest = toml::from_str(&source)
+        .map_err(|e| RelishError::InvalidFlag {
+            flag: "manifest".into(),
+            reason: e.to_string(),
+        })?;
+    let mut trial = crate::meat::task_array_store::TaskArrays::default();
+    let mut next = 0;
+    trial
+        .apply(
+            &crate::meat::task_array_store::TaskArrayWrite::RegisterManifest {
+                name: request.name.clone(),
+                namespace: request.namespace.clone(),
+                cohorts: request.cohort.clone(),
+                submitted_at_epoch_secs: 0,
+            },
+            || {
+                next += 1;
+                next
+            },
+        )
+        .map_err(|error| RelishError::InvalidFlag {
+            flag: "manifest".into(),
+            reason: error.to_string(),
+        })?;
+    if dry_run {
+        let tasks: u64 = request.cohort.iter().map(|c| u64::from(c.spec.count)).sum();
+        println!(
+            "valid manifest: {} profiles, {} tasks",
+            request.cohort.len(),
+            tasks
+        );
+        return Ok(());
+    }
+    let response = BunClient::default_local()
+        .submit_task_manifest(&request)
+        .await?;
+    if matches!(output, OutputFormat::Human) {
+        println!(
+            "manifest {} submitted; watch with: relish batch watch {}",
+            response["batch_id"], response["batch_id"]
+        );
+    } else {
+        println!("{}", format_output(&response, output)?);
+    }
+    Ok(())
+}
+
+/// Observe bounded summaries once a second; never enumerate the task list.
+pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let summary = client.batch_status(batch_id).await?;
+        println!("{}", format_batch_watch(&summary));
+        if summary["status"] == "Unknown" {
+            return Err(RelishError::ApiError {
+                status: 409,
+                body: format!(
+                    "run {batch_id} needs an operator decision; inspect its unknown_owners before acknowledged replay"
+                ),
+            });
+        }
+        if summary["done"].as_bool() == Some(true) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RelishError::RequestTimeout);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// A rate is unique accepted successes, while durations describe the final
+/// attempt. Quantiles merge bucket counts and report bucket upper bounds.
+pub fn format_batch_watch(summary: &serde_json::Value) -> String {
+    if summary["kind"] == "schedule" {
+        return format!(
+            "{}/{}: UTC schedule {}, {} tasks per occurrence; revision {}",
+            summary["namespace"].as_str().unwrap_or("default"),
+            summary["name"].as_str().unwrap_or("?"),
+            summary["cron"]["expression"].as_str().unwrap_or("?"),
+            summary["total"],
+            summary["revision"]
+        );
+    }
+
+    let rate = summary["rates"]["successes_per_second"]
+        .as_f64()
+        .map_or("unknown".to_string(), |r| format!("{r:.1}/s"));
+    let mut output = format!(
+        "batch {}: {} / {} succeeded, {} failed, {} not run, {} retries; {} | accepted successes {}",
+        summary["batch_id"],
+        summary["succeeded"],
+        summary["total"],
+        summary["failed"],
+        summary["not_run"],
+        summary["retried"],
+        summary["status"].as_str().unwrap_or("unknown"),
+        rate
+    );
+    output.push_str(&format!(
+        " | {} queued, {} held",
+        summary["queued"], summary["held"]
+    ));
+    let failure_rate = summary["rates"]["failures_per_second"]
+        .as_f64()
+        .map_or("unknown".into(), |r| format!("{r:.1}/s"));
+    output.push_str(&format!(" | terminal failures {failure_rate}"));
+    if let Some(counts) = summary["duration_final_attempt_ms"]["counts"].as_array() {
+        let counts: Vec<u64> = counts.iter().map(|c| c.as_u64().unwrap_or(0)).collect();
+        let total: u64 = counts.iter().sum();
+        for (label, percent) in [("p50", 50), ("p95", 95), ("p99", 99)] {
+            let mut cumulative = 0;
+            let bucket = counts.iter().position(|count| {
+                cumulative += count;
+                total > 0 && cumulative >= total.saturating_mul(percent).div_ceil(100)
+            });
+            let value = match bucket {
+                Some(b) if b < 15 => format!("<={}ms", 1u64 << b),
+                Some(_) => ">16384ms".into(),
+                None => "unknown".into(),
+            };
+            output.push_str(&format!(" | final attempt {label} {value}"));
+        }
+    }
+    for cohort in summary["cohorts"].as_array().into_iter().flatten() {
+        output.push_str(&format!(
+            "\n  {}: array {}, {} / {} succeeded; request {}m CPU, {}Mi memory",
+            cohort["profile"].as_str().unwrap_or("?"),
+            cohort["batch_id"],
+            cohort["succeeded"],
+            cohort["total"],
+            cohort["cpu_request_millicores"],
+            cohort["memory_request_bytes"].as_u64().unwrap_or(0) / (1024 * 1024)
+        ));
+    }
+    for profile in
+        std::iter::once(summary).chain(summary["cohorts"].as_array().into_iter().flatten())
+    {
+        for node in profile["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|node| node["refused"].is_string())
+            .take(3)
+        {
+            output.push_str(&format!(
+                "\n  array {} refused on {}: {}",
+                profile["batch_id"],
+                node["node"].as_str().unwrap_or("?"),
+                node["refused"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    output
+}
+
+/// Submit a task array (`relish run --batch`).
+pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
+    let request = task_array_request(run)?;
+    let client = BunClient::default_local();
+    let answer = client.submit_task_array(&request).await?;
+    if let Some(id) = answer["batch_id"].as_u64() {
+        println!(
+            "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
+            answer["count"], answer["chunks"]
+        );
+        println!("check progress with: relish batch-status {id}");
+    } else {
+        println!(
+            "schedule registered for {}/{}; UTC, forbid overlap, skip missed minutes; inspect with relish jobs --definitions",
+            request.namespace.as_deref().unwrap_or("default"),
+            request.name
+        );
+    }
+    Ok(())
+}
+
+/// List bounded runs and rates, or durable definitions, without listing task indices.
+pub async fn jobs(definitions: bool, output: OutputFormat) -> Result<(), RelishError> {
+    let rows = BunClient::default_local()
+        .job_summaries(definitions)
+        .await?;
+    if !matches!(output, OutputFormat::Human) {
+        println!("{}", format_output(&rows, output)?);
+        return Ok(());
+    }
+    if definitions {
+        for row in rows["definitions"].as_array().into_iter().flatten() {
+            println!(
+                "{}/{} revision {}: {} tasks, UTC schedule {}",
+                row["namespace"].as_str().unwrap_or("?"),
+                row["name"].as_str().unwrap_or("?"),
+                row["revision"],
+                row["count"],
+                row["cron"]["expression"].as_str().unwrap_or("disabled")
+            );
+        }
+    } else {
+        for row in rows["batches"].as_array().into_iter().flatten() {
+            println!("{}", format_batch_watch(row));
+        }
+    }
+    Ok(())
+}
+/// Explicitly accept repeating side effects from exactly the named unknown grants.
+pub async fn replay_job(id: u64, node: &str, digest: &str) -> Result<(), RelishError> {
+    BunClient::default_local()
+        .replay_job(id, node, digest)
+        .await?;
+    println!("run {id}: replay acknowledged for {node}; previous side effects may repeat");
+    Ok(())
+}
+
+/// Stop a task array (`relish batch cancel`).
+pub async fn batch_cancel(batch_id: u64) -> Result<(), RelishError> {
+    BunClient::default_local().cancel_batch(batch_id).await?;
+    println!("task array {batch_id} cancelled: running tasks are being stopped");
+    Ok(())
+}
+
+/// Show a task array's per-task outcomes (`relish batch results`).
+pub async fn batch_results(
+    batch_id: u64,
+    failed_only: bool,
+    limit: usize,
+    after: Option<u32>,
+    index: Option<u32>,
+    format: OutputFormat,
+) -> Result<(), RelishError> {
+    let results = BunClient::default_local()
+        .batch_results_page(batch_id, failed_only, limit, after, index)
+        .await?;
+    match format {
+        OutputFormat::Human => print!("{}", format_task_results(&results)),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&results).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&results).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    Ok(())
+}
+
+/// Print a failed task's kept output (`relish batch logs --index`).
+pub async fn batch_task_logs(batch_id: u64, index: u32) -> Result<(), RelishError> {
+    let bytes = BunClient::default_local()
+        .task_logs(batch_id, index)
+        .await?;
+    print!("{}", String::from_utf8_lossy(&bytes));
+    Ok(())
+}
+
+/// Render task results as a table.
+pub fn format_task_results(results: &crate::bun::task_array_api::TaskResults) -> String {
+    let mut out = String::new();
+    if results.rows.is_empty() {
+        out.push_str("no task results\n");
+    } else {
+        out.push_str(&format!(
+            "{:>10}  {:>8}  {:<9}  {:>6}  {:>9}\n",
+            "INDEX", "ATTEMPTS", "OUTCOME", "EXIT", "RUN MS"
+        ));
+    }
+    for row in &results.rows {
+        let exit = row
+            .exit_code
+            .map_or_else(|| "-".to_string(), |code| code.to_string());
+        let outcome = if row.not_run {
+            "not run"
+        } else if row.succeeded {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        out.push_str(&format!(
+            "{:>10}  {:>8}  {:<9}  {:>6}  {:>9}\n",
+            row.index, row.attempts, outcome, exit, row.run_ms
+        ));
+    }
+    if results.truncated {
+        if let Some(cursor) = results.next_after {
+            out.push_str(&format!(
+                "(next page: relish batch results {} --after {cursor}; repeat your filter)\n",
+                results.batch_id
+            ));
+        } else {
+            out.push_str("(more rows exist in this page)\n");
+        }
+    }
+    if !results.unreachable.is_empty() {
+        let nodes: Vec<&str> = results.unreachable.iter().map(|n| n.0.as_str()).collect();
+        out.push_str(&format!(
+            "(couldn't reach {}; their tasks are missing)\n",
+            nodes.join(", ")
+        ));
+    }
+    out
+}
+
+/// Render a task array's summary from `GET /v1/batch/{id}`.
+pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> String {
+    let count = |key: &str| summary[key].as_u64().unwrap_or(0);
+    let mut out = format!(
+        "task array {batch_id} ({} in {}): {}\n",
+        summary["name"].as_str().unwrap_or("?"),
+        summary["namespace"].as_str().unwrap_or("?"),
+        summary["status"].as_str().unwrap_or("?"),
+    );
+    out.push_str(&format!(
+        "  tasks: {} total, {} succeeded, {} failed, {} not run, {} retries\n",
+        count("total"),
+        count("succeeded"),
+        count("failed"),
+        count("not_run"),
+        count("retried"),
+    ));
+    out.push_str(&format!(
+        "  chunks: {} of {} done; {} tasks held by nodes, {} queued\n",
+        count("chunks_done"),
+        count("chunks"),
+        count("held"),
+        count("queued"),
+    ));
+    if let Some(ranges) = summary["failed_indices"].as_array()
+        && !ranges.is_empty()
+    {
+        let shown: Vec<String> = ranges
+            .iter()
+            .filter_map(|range| {
+                let start = range[0].as_u64()?;
+                let end = range[1].as_u64()?;
+                Some(if start == end {
+                    start.to_string()
+                } else {
+                    format!("{start}-{end}")
+                })
+            })
+            .collect();
+        let hidden = count("failed").saturating_sub(
+            ranges
+                .iter()
+                .filter_map(|r| Some(r[1].as_u64()? - r[0].as_u64()? + 1))
+                .sum(),
+        );
+        out.push_str(&format!("  failed indices: {}", shown.join(", ")));
+        if hidden > 0 {
+            out.push_str(&format!(" and {hidden} more"));
+        }
+        out.push_str(&format!(
+            " (see relish batch results {batch_id} --failed)\n"
+        ));
+    }
+    for node in summary["nodes"].as_array().into_iter().flatten() {
+        let name = node["node"].as_str().unwrap_or("?");
+        match node["refused"].as_str() {
+            Some(reason) => out.push_str(&format!("  {name}: can't run it: {reason}\n")),
+            None => out.push_str(&format!(
+                "  {name}: {} slots, {} running, {} succeeded, {} failed\n",
+                node["slots"].as_u64().unwrap_or(0),
+                node["counters"]["running"].as_u64().unwrap_or(0),
+                node["counters"]["succeeded"].as_u64().unwrap_or(0),
+                node["counters"]["failed"].as_u64().unwrap_or(0),
+            )),
+        }
+    }
+    out
+}
+
 /// Create a new API token through the agent.
 ///
 /// The agent mints the token, stores its Argon2id hash in Raft, and
 /// returns the plaintext once; this prints it to stdout and never stores
 /// it. Needs a reachable agent and an admin credential.
-pub async fn token_create(
-    name: &str,
-    role_str: &str,
-    apps: Option<&str>,
-    namespaces: Option<&str>,
-    ttl_days: Option<u64>,
-) -> Result<(), RelishError> {
-    token_create_with_client(
-        name,
-        role_str,
-        apps,
-        namespaces,
-        ttl_days,
-        &BunClient::default_local(),
-    )
-    .await
+pub async fn token_create(request: &super::client::TokenRequest) -> Result<(), RelishError> {
+    token_create_with_client(request, &BunClient::default_local()).await
 }
 
 /// Create a token via the agent so it's persisted in Raft. The token is minted
@@ -2144,56 +2617,83 @@ pub async fn token_create(
 /// stdout. An unreachable agent is an error (never a silent exit-0), and the
 /// role is validated server-side.
 async fn token_create_with_client(
-    name: &str,
-    role_str: &str,
-    apps: Option<&str>,
-    namespaces: Option<&str>,
-    ttl_days: Option<u64>,
+    request: &super::client::TokenRequest,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let apps_vec = apps.map(|a| a.split(',').map(|s| s.trim().to_string()).collect());
-    let namespaces_vec = namespaces.map(|n| n.split(',').map(|s| s.trim().to_string()).collect());
+    let issued = client.token_create(request).await?;
 
-    let plaintext = client
-        .token_create(name, role_str, apps_vec, namespaces_vec, ttl_days)
-        .await?;
-
-    eprintln!("Token created: {name}");
-    eprintln!("  Role: {role_str}");
-    if let Some(apps) = apps {
-        eprintln!("  Apps: {apps}");
+    eprintln!("Token created: {}", request.name);
+    eprintln!("  Role: {}", request.role);
+    if let Some(apps) = &request.apps {
+        eprintln!("  Apps: {}", apps.join(","));
     }
-    if let Some(namespaces) = namespaces {
-        eprintln!("  Namespaces: {namespaces}");
+    if let Some(namespaces) = &request.namespaces {
+        eprintln!("  Namespaces: {}", namespaces.join(","));
     }
-    if let Some(days) = ttl_days {
-        eprintln!("  TTL: {days} days");
+    match issued.expires_at {
+        Some(at) => eprintln!("  Expires: {}", format_utc(at)),
+        None => eprintln!("  Expires: never"),
     }
     eprintln!();
-    println!("{plaintext}");
+    println!("{}", issued.token);
 
     Ok(())
 }
 
-/// Print the cluster's age public key, for encrypting `ENC[AGE:...]` values.
+/// Give an API token a new secret through the agent.
+///
+/// The new secret is printed to stdout once. The old one keeps working
+/// until the time printed on stderr, so clients can move over first.
+pub async fn token_rotate(name: &str, grace_hours: Option<u64>) -> Result<(), RelishError> {
+    token_rotate_with_client(name, grace_hours, &BunClient::default_local()).await
+}
+
+async fn token_rotate_with_client(
+    name: &str,
+    grace_hours: Option<u64>,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let issued = client.token_rotate(name, grace_hours).await?;
+
+    eprintln!("Token rotated: {name}");
+    match issued.previous_valid_until {
+        Some(at) => eprintln!("  Old secret works until: {}", format_utc(at)),
+        None => eprintln!("  Old secret: stopped working"),
+    }
+    match issued.expires_at {
+        Some(at) => eprintln!("  Expires: {}", format_utc(at)),
+        None => eprintln!("  Expires: never"),
+    }
+    eprintln!();
+    println!("{}", issued.token);
+
+    Ok(())
+}
+
+/// Print the cluster's age public key, or one namespace's, for encrypting
+/// `ENC[AGE:...]` values.
 ///
 /// With no directory, asks the configured cluster (`GET
 /// /v1/secret/public-key`) for its active key, so a quickstart user, or
 /// anyone after a rotation, gets the key that will actually decrypt. With
 /// a directory, reads the security bootstrap `relish init` wrote there,
-/// which works offline.
-pub async fn secret_pubkey(dir: Option<&Path>) -> Result<(), RelishError> {
+/// which works offline but only knows the cluster key. With a namespace,
+/// asks for that namespace's own key (F05 I4).
+pub async fn secret_pubkey(dir: Option<&Path>, namespace: Option<&str>) -> Result<(), RelishError> {
     let key = match dir {
         Some(dir) => resolve_secret_pubkey(dir)?,
-        None => fetch_secret_pubkey(&BunClient::default_local()).await?,
+        None => fetch_secret_pubkey(&BunClient::default_local(), namespace).await?,
     };
     println!("{key}");
     Ok(())
 }
 
-/// Ask the cluster for its active age public key.
-async fn fetch_secret_pubkey(client: &BunClient) -> Result<String, RelishError> {
-    Ok(client.secret_public_key().await?.public_key)
+/// Ask the cluster for its active age public key, or `namespace`'s.
+async fn fetch_secret_pubkey(
+    client: &BunClient,
+    namespace: Option<&str>,
+) -> Result<String, RelishError> {
+    Ok(client.secret_public_key(namespace).await?.public_key)
 }
 
 /// Find the `*-security-bootstrap.json` in `dir` and return its cluster-wide
@@ -2246,27 +2746,72 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// List API tokens from SecurityState via the agent.
-pub async fn token_list() -> Result<(), RelishError> {
-    let tokens = BunClient::default_local().token_list().await?;
+/// List API tokens via the agent, with every node's last use merged in.
+pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
+    let listing = BunClient::default_local().token_list().await?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    print!("{}", render_token_list(&tokens, now));
+    // A member that didn't answer may hold a more recent use; say so on
+    // stderr so `-o json` stays parseable. Expiry warnings go there too.
+    for warning in &listing.warnings {
+        eprintln!("warning: last use incomplete: {warning}");
+    }
+    for warning in token_expiry_warnings(&listing.tokens, now) {
+        eprintln!("warning: {warning}");
+    }
+    match output {
+        OutputFormat::Human => print!("{}", render_token_list(&listing.tokens, now)),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&listing).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&listing).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
     Ok(())
 }
 
+/// One line per token that has expired, or expires within
+/// [`crate::sesame::token::TOKEN_EXPIRY_WARNING`] of `now`, saying what to do.
+fn token_expiry_warnings(tokens: &[super::client::TokenSummary], now: u64) -> Vec<String> {
+    let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
+    tokens
+        .iter()
+        .filter_map(|token| {
+            let at = token.expires_at.filter(|at| *at <= horizon)?;
+            let name = &token.name;
+            Some(if at <= now {
+                format!(
+                    "token {name} has expired; create a replacement, or rotate it with \
+                     `relish token rotate {name}` before the expiry sweep removes it"
+                )
+            } else {
+                format!(
+                    "token {name} expires in {}; rotate it with `relish token rotate {name}`",
+                    format_duration(at - now)
+                )
+            })
+        })
+        .collect()
+}
+
 /// The `relish token list` table: UTC creation and expiry times, with how
-/// long a live token has left.
+/// long a live token has left, when it was last used and its scope.
+///
+/// New columns go on the right, so a script that cuts the older ones out
+/// by position keeps working.
 fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String {
     use std::fmt::Write as _;
     if tokens.is_empty() {
         return "no tokens\n".to_string();
     }
     let mut out = format!(
-        "{:<20} {:<12} {:<21} {}\n",
-        "NAME", "ROLE", "CREATED", "EXPIRES"
+        "{:<20} {:<12} {:<21} {:<31} {:<21} {}\n",
+        "NAME", "ROLE", "CREATED", "EXPIRES", "LAST USED", "SCOPE"
     );
     for token in tokens {
         let expires = match token.expires_at {
@@ -2274,17 +2819,39 @@ fn render_token_list(tokens: &[super::client::TokenSummary], now: u64) -> String
             Some(at) if at <= now => format!("{} (expired)", format_utc(at)),
             Some(at) => format!("{} (in {})", format_utc(at), format_duration(at - now)),
         };
+        let last_used = token
+            .last_used
+            .map_or_else(|| "never".to_string(), format_utc);
         // Writing to a String can't fail.
         let _ = writeln!(
             out,
-            "{:<20} {:<12} {:<21} {}",
+            "{:<20} {:<12} {:<21} {:<31} {:<21} {}",
             token.name,
             token.role,
             format_utc(token.created_at),
-            expires
+            expires,
+            last_used,
+            render_token_scope(&token.scope),
         );
     }
     out
+}
+
+/// A token's scope for the table: `all`, or the apps and namespaces it's
+/// confined to.
+fn render_token_scope(scope: &super::client::TokenScopeSummary) -> String {
+    let mut parts = Vec::new();
+    if let Some(apps) = &scope.apps {
+        parts.push(format!("apps={}", apps.join(",")));
+    }
+    if let Some(namespaces) = &scope.namespaces {
+        parts.push(format!("namespaces={}", namespaces.join(",")));
+    }
+    if parts.is_empty() {
+        "all".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
@@ -2678,6 +3245,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_loading_defers_namespace_existence_to_live_admission() {
+        for manifest in [
+            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+        ] {
+            let file = write_temp_config(manifest);
+            let loaded = load_manifest(&source(file.path())).await;
+            assert!(
+                loaded.is_ok(),
+                "a live-context reference was rejected locally: {loaded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_loading_defers_build_namespace_existence_to_live_admission() {
+        let file = write_temp_config(
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+        );
+        let loaded = load_manifest(&source(file.path())).await;
+        assert!(
+            loaded.is_ok(),
+            "an existing live build namespace was rejected locally: {loaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intrinsic_manifest_validation_still_refuses_invalid_fields() {
+        for manifest in [
+            "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
+            "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
+            "[app.web]\nnamespace = 'existing'\n",
+        ] {
+            let file = write_temp_config(manifest);
+            assert!(
+                load_manifest(&source(file.path())).await.is_err(),
+                "accepted {manifest}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_dry_run_refuses_a_failed_live_comparison() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+            )
+            .route(
+                "/v1/apps",
+                axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        client
+            .health()
+            .await
+            .expect("fixture must be a live bun response");
+        let file = write_temp_config("[app.web]\nimage = 'web:v1'\n");
+        let result =
+            apply_with_client(&source(file.path()), OutputFormat::Json, true, &client).await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "a failed live comparison became an offline create plan"
+        );
+    }
+
+    #[tokio::test]
     async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token");
@@ -2724,17 +3365,22 @@ mod tests {
     #[tokio::test]
     async fn secret_pubkey_fetches_active_key_from_cluster() {
         use axum::{Router, http::HeaderMap, routing::get};
+        type Params = axum::extract::Query<std::collections::HashMap<String, String>>;
         let app = Router::new().route(
             "/v1/secret/public-key",
-            get(|headers: HeaderMap| async move {
+            get(|headers: HeaderMap, params: Params| async move {
                 // The command must send the usual bearer token.
                 let authorised = headers.get("authorization").and_then(|v| v.to_str().ok())
                     == Some("Bearer rbt_test");
                 if !authorised {
                     return Err(axum::http::StatusCode::UNAUTHORIZED);
                 }
+                let public_key = match params.get("namespace") {
+                    Some(namespace) => format!("age1{namespace}key"),
+                    None => "age1quickstartkey".to_string(),
+                };
                 Ok(axum::Json(serde_json::json!({
-                    "public_key": "age1quickstartkey",
+                    "public_key": public_key,
                     "generation": 2,
                 })))
             }),
@@ -2743,16 +3389,19 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{address}");
-        let key = fetch_secret_pubkey(&BunClient::new_with_token(&base, Some("rbt_test"))).await;
-        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None)).await;
+        let client = BunClient::new_with_token(&base, Some("rbt_test"));
+        let key = fetch_secret_pubkey(&client, None).await;
+        let team_a = fetch_secret_pubkey(&client, Some("team-a")).await;
+        let anonymous = fetch_secret_pubkey(&BunClient::new_with_token(&base, None), None).await;
         server.abort();
         assert_eq!(key.unwrap(), "age1quickstartkey");
+        assert_eq!(team_a.unwrap(), "age1team-akey");
         assert!(anonymous.is_err(), "an HTTP 401 must surface as an error");
     }
 
     #[tokio::test]
     async fn secret_pubkey_errors_when_cluster_unreachable() {
-        assert!(fetch_secret_pubkey(&bogus_client()).await.is_err());
+        assert!(fetch_secret_pubkey(&bogus_client(), None).await.is_err());
     }
 
     #[test]
@@ -2763,43 +3412,70 @@ mod tests {
     }
 
     #[test]
-    fn token_list_renders_human_times_and_expiry() {
-        use super::super::client::TokenSummary;
+    fn token_list_renders_human_times_expiry_last_use_and_scope() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
         // 2026-09-25 12:00:00 UTC.
         let now = 1_790_337_600;
         let tokens = vec![
             TokenSummary {
                 name: "ci-bot".to_string(),
                 role: "deployer".to_string(),
+                scope: TokenScopeSummary {
+                    apps: None,
+                    namespaces: Some(vec!["shop".to_string()]),
+                },
                 created_at: now - 86_400,
                 expires_at: Some(now + 30 * 86_400),
+                last_used: Some(now - 600),
             },
             TokenSummary {
                 name: "admin".to_string(),
                 role: "admin".to_string(),
+                scope: TokenScopeSummary::default(),
                 created_at: now - 3 * 86_400,
                 expires_at: None,
+                last_used: Some(now),
             },
             TokenSummary {
                 name: "old-reader".to_string(),
                 role: "read-only".to_string(),
+                scope: TokenScopeSummary {
+                    apps: Some(vec!["web".to_string(), "api".to_string()]),
+                    namespaces: Some(vec!["shop".to_string()]),
+                },
                 created_at: now - 90 * 86_400,
                 expires_at: Some(now - 3_600),
+                last_used: None,
             },
             TokenSummary {
                 name: "short".to_string(),
                 role: "read-only".to_string(),
+                scope: TokenScopeSummary::default(),
                 created_at: now,
                 expires_at: Some(now + 5_400),
+                last_used: None,
             },
         ];
         insta::assert_snapshot!(render_token_list(&tokens, now), @r"
-        NAME                 ROLE         CREATED               EXPIRES
-        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)
-        admin                admin        2026-09-22 12:00 UTC  never
-        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)
-        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)
+        NAME                 ROLE         CREATED               EXPIRES                         LAST USED             SCOPE
+        ci-bot               deployer     2026-09-24 12:00 UTC  2026-10-25 12:00 UTC (in 30d)   2026-09-25 11:50 UTC  namespaces=shop
+        admin                admin        2026-09-22 12:00 UTC  never                           2026-09-25 12:00 UTC  all
+        old-reader           read-only    2026-06-27 12:00 UTC  2026-09-25 11:00 UTC (expired)  never                 apps=web,api namespaces=shop
+        short                read-only    2026-09-25 12:00 UTC  2026-09-25 13:30 UTC (in 1h)    never                 all
         ");
+    }
+
+    /// An older agent's answer has no scope or last use; it still parses,
+    /// as unscoped and never used.
+    #[test]
+    fn token_listing_parses_an_answer_without_scope_or_last_use() {
+        let listing: super::super::client::TokenListing = serde_json::from_str(
+            r#"{"tokens":[{"name":"a","role":"admin","created_at":1,"expires_at":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listing.tokens[0].last_used, None);
+        assert_eq!(listing.tokens[0].scope, Default::default());
+        assert!(listing.warnings.is_empty());
     }
 
     #[test]
@@ -2807,10 +3483,53 @@ mod tests {
         assert_eq!(render_token_list(&[], 0), "no tokens\n");
     }
 
+    #[test]
+    fn token_list_warns_about_tokens_expiring_within_fourteen_days() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
+        let now = 1_790_337_600;
+        let summary = |name: &str, expires_at: Option<u64>| TokenSummary {
+            name: name.to_string(),
+            role: "deployer".to_string(),
+            scope: TokenScopeSummary::default(),
+            created_at: now - 80 * 86_400,
+            expires_at,
+            last_used: None,
+        };
+        let tokens = [
+            summary("soon", Some(now + 3 * 86_400)),
+            summary("edge", Some(now + 14 * 86_400)),
+            summary("later", Some(now + 15 * 86_400)),
+            summary("forever", None),
+            summary("gone", Some(now - 60)),
+        ];
+        assert_eq!(
+            token_expiry_warnings(&tokens, now),
+            [
+                "token soon expires in 3d; rotate it with `relish token rotate soon`",
+                "token edge expires in 14d; rotate it with `relish token rotate edge`",
+                "token gone has expired; create a replacement, or rotate it with \
+                 `relish token rotate gone` before the expiry sweep removes it",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn token_create_errors_when_agent_unreachable() {
-        let result =
-            token_create_with_client("ci-bot", "deployer", None, None, None, &bogus_client()).await;
+        let request = super::super::client::TokenRequest {
+            name: "ci-bot".to_string(),
+            role: "deployer".to_string(),
+            apps: None,
+            namespaces: None,
+            lifetime: super::super::client::TokenLifetime::Default,
+            inherit_permissions: false,
+        };
+        let result = token_create_with_client(&request, &bogus_client()).await;
+        assert!(result.is_err(), "unreachable agent must be an error");
+    }
+
+    #[tokio::test]
+    async fn token_rotate_errors_when_agent_unreachable() {
+        let result = token_rotate_with_client("ci-bot", None, &bogus_client()).await;
         assert!(result.is_err(), "unreachable agent must be an error");
     }
 
@@ -3078,6 +3797,7 @@ spec:
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            volume_homes: Vec::new(),
         }
     }
 
@@ -3532,5 +4252,134 @@ spec:
             sign_keygen(&path),
             Err(RelishError::FileExists { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod task_array_tests {
+    use super::*;
+    use crate::bun::task_array_api::TaskResults;
+    use crate::bun::task_array_node::TaskResultRow;
+    use crate::meat::task_array::TaskArraySpec;
+
+    fn run() -> TaskArrayRun {
+        TaskArrayRun {
+            schedule: None,
+            image: None,
+            cpu: None,
+            memory: None,
+            name: "render".to_string(),
+            namespace: "default".to_string(),
+            exec: Some(PathBuf::from("/usr/local/bin/rb-task")),
+            args: vec!["--frame".to_string(), "{index}".to_string()],
+            env: vec!["MODE=fast".to_string(), "EMPTY=".to_string()],
+            spec: TaskArraySpec::with_count(10),
+        }
+    }
+
+    #[test]
+    fn run_flags_become_a_task_array_request() {
+        let request = task_array_request(run()).unwrap();
+        assert_eq!(request.namespace.as_deref(), Some("default"));
+        assert_eq!(
+            request.template.exec,
+            Some(PathBuf::from("/usr/local/bin/rb-task"))
+        );
+        assert_eq!(
+            request.template.command,
+            Some(vec!["--frame".to_string(), "{index}".to_string()])
+        );
+        assert_eq!(
+            request.template.env["MODE"],
+            crate::config::types::EnvValue::Plain("fast".to_string())
+        );
+        assert_eq!(
+            request.template.env["EMPTY"],
+            crate::config::types::EnvValue::Plain(String::new())
+        );
+        assert_eq!(request.spec.count, 10);
+    }
+
+    #[test]
+    fn a_relative_exec_or_a_bad_env_pair_is_refused_before_sending() {
+        let mut relative = run();
+        relative.exec = Some(PathBuf::from("rb-task"));
+        assert!(matches!(
+            task_array_request(relative),
+            Err(RelishError::InvalidFlag { flag, .. }) if flag == "exec"
+        ));
+        for pair in ["NOEQUALS", "=value"] {
+            let mut bad = run();
+            bad.env = vec![pair.to_string()];
+            assert!(matches!(
+                task_array_request(bad),
+                Err(RelishError::InvalidFlag { flag, .. }) if flag == "env"
+            ));
+        }
+    }
+
+    #[test]
+    fn an_array_summary_reads_as_counts_chunks_failures_and_nodes() {
+        let summary = serde_json::json!({
+            "kind": "array", "name": "render", "namespace": "default",
+            "status": "Running", "total": 100000, "succeeded": 51200,
+            "failed": 5, "not_run": 0, "retried": 12, "queued": 40000,
+            "held": 8800, "chunks": 98, "chunks_done": 50,
+            "failed_indices": [[7, 7], [1000, 1002]],
+            "nodes": [
+                { "node": "node-1", "slots": 8,
+                  "counters": { "running": 8, "succeeded": 51200, "failed": 5 } },
+                { "node": "node-2", "slots": 0,
+                  "refused": "/x isn't in this node's [process_workloads] allowed_binaries" },
+            ],
+        });
+        assert_eq!(
+            format_array_summary(3, &summary),
+            "task array 3 (render in default): Running\n\
+             \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 12 retries\n\
+             \x20 chunks: 50 of 98 done; 8800 tasks held by nodes, 40000 queued\n\
+             \x20 failed indices: 7, 1000-1002 and 1 more (see relish batch results 3 --failed)\n\
+             \x20 node-1: 8 slots, 8 running, 51200 succeeded, 5 failed\n\
+             \x20 node-2: can't run it: /x isn't in this node's [process_workloads] allowed_binaries\n"
+        );
+    }
+
+    #[test]
+    fn task_results_render_as_a_table_with_caveats() {
+        let results = TaskResults {
+            batch_id: 3,
+            next_after: None,
+            retention_seconds: 3600,
+            rows: vec![
+                TaskResultRow {
+                    grant_attempt: 1,
+                    index: 7,
+                    attempts: 3,
+                    succeeded: false,
+                    not_run: false,
+                    exit_code: Some(2),
+                    run_ms: 15,
+                },
+                TaskResultRow {
+                    grant_attempt: 1,
+                    index: 8,
+                    attempts: 1,
+                    succeeded: false,
+                    not_run: false,
+                    exit_code: None,
+                    run_ms: 600000,
+                },
+            ],
+            truncated: true,
+            unreachable: vec![crate::meat::NodeId::new("node-3")],
+        };
+        assert_eq!(
+            format_task_results(&results),
+            "     INDEX  ATTEMPTS  OUTCOME      EXIT     RUN MS\n\
+             \x20        7         3  failed          2         15\n\
+             \x20        8         1  failed          -     600000\n\
+             (more rows exist in this page)\n\
+             (couldn't reach node-3; their tasks are missing)\n"
+        );
     }
 }

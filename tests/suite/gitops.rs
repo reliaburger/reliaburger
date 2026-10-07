@@ -142,6 +142,7 @@ async fn sync_loop_applies_repo_apps_to_raft() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     // The app from git should appear in Raft desired state.
@@ -191,6 +192,7 @@ async fn webhook_triggers_immediate_sync() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     // The runner always applies the first commit before waiting for a timer or
@@ -246,12 +248,12 @@ async fn webhook_triggers_immediate_sync() {
     council.shutdown().await.ok();
 }
 
-/// A repo with an app, a job, a namespace and a permission syncs every
+/// A repo with an app, a namespace and a permission syncs every supported
 /// declarative kind through to Raft desired state (12b.2 T6). Before this
 /// theme, `resource_change_to_request` returned `None` for anything but an
 /// app, so namespaces and permissions were silently dropped.
 #[tokio::test]
-async fn sync_loop_applies_every_declarative_kind() {
+async fn sync_loop_applies_every_supported_declarative_kind() {
     assert!(
         which_git().is_some(),
         "git is required for the GitOps suite"
@@ -273,8 +275,6 @@ async fn sync_loop_applies_every_declarative_kind() {
         image = "web:v1"
         namespace = "prod"
 
-        [job.migrate]
-        image = "migrate:v1"
     "#,
     );
 
@@ -290,6 +290,7 @@ async fn sync_loop_applies_every_declarative_kind() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let council_check = Arc::clone(&council);
@@ -358,7 +359,7 @@ async fn apply_changes_stops_and_reports_on_write_failure() {
         spec: ChangePayload::App(Box::new(spec)),
     }];
 
-    let result = apply_changes(&node, &changes).await;
+    let result = apply_changes(&node, &changes, None).await;
     assert!(
         matches!(result, Err(ref id) if id == "app.default/web"),
         "a failed write must be reported, not swallowed: {result:?}"
@@ -392,10 +393,114 @@ async fn apply_changes_reports_a_refused_write_as_a_failure() {
         spec: ChangePayload::App(Box::new(spec)),
     }];
 
-    let result = apply_changes(&council, &changes).await;
+    let result = apply_changes(&council, &changes, None).await;
     assert!(
         matches!(result, Err(ref id) if id == "app.rbtest-lease/web"),
         "a refused write must be reported as unapplied: {result:?}"
+    );
+    assert!(council.desired_state().await.apps.is_empty());
+    council.shutdown().await.ok();
+}
+
+/// An upstream registry that names one digest for every tag, or is down.
+struct FixedRegistry(Option<reliaburger::pickle::types::Digest>);
+
+impl reliaburger::pickle::upstream::UpstreamRegistry for FixedRegistry {
+    fn head_manifest_digest<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<'a, reliaburger::pickle::types::Digest> {
+        let answer = self.0.clone().ok_or_else(|| {
+            reliaburger::pickle::types::PickleError::ReplicationFailed("connection refused".into())
+        });
+        Box::pin(async move { answer })
+    }
+
+    fn fetch_manifest<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<
+        'a,
+        reliaburger::pickle::upstream::UpstreamManifest,
+    > {
+        unimplemented!("binding only asks for the digest")
+    }
+
+    fn fetch_root<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<
+        'a,
+        reliaburger::pickle::upstream::UpstreamRoot,
+    > {
+        unimplemented!("binding only asks for the digest")
+    }
+
+    fn fetch_blob<'a>(
+        &'a self,
+        _image: &'a reliaburger::grill::image::ImageReference,
+        _layer: &'a reliaburger::pickle::types::LayerDescriptor,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<'a, Vec<u8>> {
+        unimplemented!("binding only asks for the digest")
+    }
+}
+
+fn web_change(image: &str) -> reliaburger::lettuce::diff::ResourceChange {
+    let spec = reliaburger::config::Config::parse(&format!("[app.web]\nimage = \"{image}\"\n"))
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    reliaburger::lettuce::diff::ResourceChange::Add {
+        resource_id: "app.default/web".to_string(),
+        spec: reliaburger::lettuce::diff::ChangePayload::App(Box::new(spec)),
+    }
+}
+
+/// F03 U1: GitOps writes the same bound reference a manual apply does.
+#[tokio::test]
+async fn apply_changes_binds_an_apps_image_to_a_digest() {
+    use reliaburger::pickle::binding::ImageBinder;
+
+    let council = single_node_leader().await;
+    let digest =
+        reliaburger::pickle::types::Digest::new(&format!("sha256:{}", "7".repeat(64))).unwrap();
+    let binder = ImageBinder::with_upstream(Arc::new(FixedRegistry(Some(digest.clone()))));
+
+    let result = reliaburger::lettuce::runner::apply_changes(
+        &council,
+        &[web_change("nginx:1.27")],
+        Some(&binder),
+    )
+    .await;
+
+    assert_eq!(result.unwrap(), 1);
+    let image = council.desired_state().await.apps[&AppId::new("web", "default")]
+        .image
+        .clone();
+    assert_eq!(image, Some(format!("nginx:1.27@{}", digest.as_str())));
+    council.shutdown().await.ok();
+}
+
+/// With the registry down and nothing cached, the change fails and names
+/// the image, so the commit isn't advanced and the next poll retries.
+#[tokio::test]
+async fn apply_changes_fails_a_change_whose_image_cannot_be_bound() {
+    use reliaburger::pickle::binding::ImageBinder;
+
+    let council = single_node_leader().await;
+    let binder = ImageBinder::with_upstream(Arc::new(FixedRegistry(None)));
+
+    let result = reliaburger::lettuce::runner::apply_changes(
+        &council,
+        &[web_change("nginx:1.27")],
+        Some(&binder),
+    )
+    .await;
+
+    assert!(
+        matches!(&result, Err(message) if message.starts_with("app.default/web") && message.contains("nginx:1.27")),
+        "{result:?}"
     );
     assert!(council.desired_state().await.apps.is_empty());
     council.shutdown().await.ok();
@@ -454,6 +559,7 @@ async fn sync_deletes_the_namespaced_app_not_the_default_one() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let council_check = Arc::clone(&council);
@@ -499,6 +605,7 @@ async fn a_failed_sync_is_recorded_in_sync_state() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let council_check = Arc::clone(&council);
@@ -563,6 +670,7 @@ async fn an_unchanged_commit_still_repairs_manual_drift() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let web = AppId::new("web", "default");
@@ -695,6 +803,7 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let stuck = wait_for(Duration::from_secs(15), || {
@@ -754,4 +863,105 @@ fn which_git() -> Option<()> {
         .ok()
         .filter(|o| o.status.success())
         .map(|_| ())
+}
+
+#[tokio::test]
+async fn job_refusal_keeps_the_last_applied_commit_and_all_desired_resources() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_repo(repo_dir.path(), "[app.web]\nimage = 'web:v1'\n");
+    let council = single_node_leader().await;
+    let shutdown = CancellationToken::new();
+    let (webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let data_dir = tempfile::tempdir().unwrap();
+    spawn_gitops_sync(
+        Arc::clone(&council),
+        repo_config(&repo_dir.path().to_string_lossy(), 1),
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+        None,
+    );
+    let check = Arc::clone(&council);
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let c = Arc::clone(&check);
+            Box::pin(async move {
+                c.desired_state()
+                    .await
+                    .gitops_sync_state
+                    .is_some_and(|s| s.last_applied_commit.is_some())
+            })
+        })
+        .await,
+        "initial supported app sync did not finish"
+    );
+    let before = council.desired_state().await;
+    let applied = before
+        .gitops_sync_state
+        .as_ref()
+        .unwrap()
+        .last_applied_commit
+        .as_ref()
+        .unwrap()
+        .sha
+        .clone();
+    std::fs::write(repo_dir.path().join("apps.toml"), "[app.web]\nimage = 'web:v2'\n[job.migrate]\nimage = 'migrate:v1'\nrun_before = ['app.web']\n[namespace.new-team]\nmax_apps = 10\n[permission.new-deployer]\nactions = ['deploy']\nnamespaces = ['new-team']\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(
+        repo_dir.path(),
+        &["commit", "-q", "-m", "unsupported migration"],
+    );
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rejected = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    webhook_tx.send(()).await.unwrap();
+    let check = Arc::clone(&council);
+    let attempted = wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&check);
+        let rejected = rejected.clone();
+        Box::pin(async move {
+            c.desired_state().await.gitops_sync_state.is_some_and(|s| {
+                s.last_error.is_some()
+                    || s.last_applied_commit
+                        .is_some_and(|commit| commit.sha == rejected)
+            })
+        })
+    })
+    .await;
+    shutdown.cancel();
+    let after = council.desired_state().await;
+    council.shutdown().await.ok();
+    assert!(attempted, "candidate sync never completed or refused");
+    let state = after.gitops_sync_state.unwrap();
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("GitOps does not reconcile jobs")
+                && error.contains("job.migrate")),
+        "job refusal was not recorded: {:?}",
+        state.last_error
+    );
+    assert_eq!(state.last_applied_commit.unwrap().sha, applied);
+    assert_eq!(
+        after.apps, before.apps,
+        "app revision escaped before migration refusal"
+    );
+    assert_eq!(after.namespaces, before.namespaces);
+    assert_eq!(after.permissions, before.permissions);
+    assert!(
+        state
+            .history
+            .iter()
+            .any(|entry| entry.commit.sha == rejected
+                && matches!(
+                    entry.result,
+                    reliaburger::lettuce::types::SyncResult::Failure { .. }
+                )),
+        "refused commit missing from history"
+    );
 }

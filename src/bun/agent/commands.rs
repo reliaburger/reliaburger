@@ -37,8 +37,40 @@ pub struct FaultClearance {
     pub reservation: Option<u64>,
 }
 
+/// Trusted local resolution used before public status/log authorisation.
+#[derive(Debug)]
+pub struct LogExecutionSelection {
+    pub logical_name: String,
+    pub instances: Vec<String>,
+    pub selected_instance: Option<String>,
+}
+
 /// Commands sent to the agent over the command channel.
 pub enum AgentCommand {
+    ResolveExecutionLogs {
+        app_name: String,
+        namespace: String,
+        instance: Option<String>,
+        response: oneshot::Sender<Result<LogExecutionSelection, BunError>>,
+    },
+    LogCaptures {
+        instances: Vec<String>,
+        tail: Option<usize>,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Internal authenticated dispatch; admission must be durable before acknowledgement.
+    RunJobsWithLabels {
+        batch_id: u64,
+        config: Config,
+        execution_labels: BTreeMap<String, crate::bun::batch::BatchExecutionLabel>,
+        events: mpsc::Sender<ApplyEvent>,
+        response: oneshot::Sender<Result<BTreeMap<String, i32>, BunError>>,
+    },
+    /// Query explicit local ownership before enforcing first-launch allocation.
+    BatchOwnedExecutions {
+        identities: Vec<(String, String)>,
+        response: oneshot::Sender<std::collections::BTreeSet<String>>,
+    },
     /// Deploy workloads from a parsed Config.
     ///
     /// Progress events are streamed over the `events` channel so the
@@ -46,6 +78,29 @@ pub enum AgentCommand {
     Deploy {
         config: Config,
         events: mpsc::Sender<ApplyEvent>,
+    },
+    /// Admit and prepare migration images without launching any workload.
+    PreparePrerequisites {
+        config: Config,
+        response: oneshot::Sender<
+            Result<(Config, crate::bun::deploy_operations::DeployOperationHandle), String>,
+        >,
+    },
+    /// Execute the prepared migrations under the operation's existing ownership.
+    RunPrerequisites {
+        config: Config,
+        operation: crate::bun::deploy_operations::DeployOperationHandle,
+        response: oneshot::Sender<Result<(), super::launch::PrerequisiteFailure>>,
+    },
+    /// Bind startup acknowledgement to the actual ordinary job generations.
+    CaptureClusterJobs {
+        config: Config,
+        response: oneshot::Sender<Result<Arc<super::cluster_jobs::ClusterJobReceipt>, String>>,
+    },
+    /// Read positive completion or retirement evidence for that exact receipt.
+    ClusterJobsSettlement {
+        receipt: Arc<super::cluster_jobs::ClusterJobReceipt>,
+        response: oneshot::Sender<super::cluster_jobs::ClusterJobSettlement>,
     },
     /// Explicit operator authorisation to rerun unknown node-local jobs.
     RerunJobs {
@@ -322,6 +377,9 @@ pub enum AgentCommand {
     UpgradeApply {
         directive: crate::upgrade::types::UpgradeDirective,
         response: oneshot::Sender<Result<(), BunError>>,
+        /// Resolves once the answer has reached the caller; the exec waits
+        /// for it (bounded). `None` when no connection carries the answer.
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     },
     /// Node-level upgrade status.
     UpgradeStatus {
@@ -331,6 +389,8 @@ pub enum AgentCommand {
     UpgradeRollback {
         version: Option<crate::upgrade::BinaryVersion>,
         response: oneshot::Sender<Result<(), BunError>>,
+        /// As for [`AgentCommand::UpgradeApply`].
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     },
     /// Post-boot self-verification of a freshly swapped-in version.
     /// Commits on success; flags revert and exits on failure.
@@ -345,7 +405,15 @@ impl AgentCommand {
     /// The variant's name, for the loop meter's slow-turn log.
     pub(super) fn name(&self) -> &'static str {
         match self {
+            AgentCommand::RunJobsWithLabels { .. } => "run_jobs_with_labels",
+            AgentCommand::BatchOwnedExecutions { .. } => "batch_owned_executions",
+            AgentCommand::ResolveExecutionLogs { .. } => "resolve_execution_logs",
+            AgentCommand::LogCaptures { .. } => "log_captures",
             AgentCommand::Deploy { .. } => "deploy",
+            AgentCommand::PreparePrerequisites { .. } => "prepare_prerequisites",
+            AgentCommand::CaptureClusterJobs { .. } => "capture_cluster_jobs",
+            AgentCommand::ClusterJobsSettlement { .. } => "cluster_jobs_settlement",
+            AgentCommand::RunPrerequisites { .. } => "run_prerequisites",
             AgentCommand::RerunJobs { .. } => "rerun_jobs",
             AgentCommand::Stop { .. } => "stop",
             AgentCommand::Retire { .. } => "retire",
@@ -421,6 +489,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Handle a single command.
     pub(super) async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
+            AgentCommand::ResolveExecutionLogs {
+                app_name,
+                namespace,
+                instance,
+                response,
+            } => {
+                let _ = response.send(self.resolve_execution_logs(
+                    &app_name,
+                    &namespace,
+                    instance.as_deref(),
+                ));
+            }
+            AgentCommand::LogCaptures {
+                instances,
+                tail,
+                response,
+            } => {
+                self.spawn_selected_logs_read(
+                    instances.into_iter().map(InstanceId).collect(),
+                    tail,
+                    response,
+                );
+            }
+            AgentCommand::RunJobsWithLabels {
+                batch_id,
+                config,
+                execution_labels,
+                events,
+                response,
+            } => {
+                let result = self
+                    .begin_owned_batch(batch_id, config, execution_labels, events)
+                    .await;
+                let _ = response.send(result);
+            }
+            AgentCommand::BatchOwnedExecutions {
+                identities,
+                response,
+            } => {
+                let _ = response.send(self.batch_owned_identities(&identities));
+            }
+            AgentCommand::CaptureClusterJobs { config, response } => {
+                let _ = response.send(self.capture_cluster_jobs(&config));
+            }
+            AgentCommand::ClusterJobsSettlement { receipt, response } => {
+                let _ = response.send(self.cluster_jobs_settlement(&receipt));
+            }
+            AgentCommand::PreparePrerequisites { config, response } => {
+                self.prepare_prerequisites(config, response).await;
+            }
+            AgentCommand::RunPrerequisites {
+                config,
+                operation,
+                response,
+            } => {
+                self.run_prepared_prerequisites(config, operation, response);
+            }
             AgentCommand::Deploy { config, events } => {
                 self.begin_deploy(config, events, true, false).await;
             }
@@ -533,6 +658,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             service_port: spec.port,
                             blocked: None,
                             volume_home_away: None,
+                            volume_homes: Vec::new(),
                         },
                     )
                     .collect::<Vec<_>>();
@@ -545,19 +671,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let mut resources: Vec<CurrentResourceStatus> = self
                     .deployed_specs
                     .iter()
-                    .map(|((app, _namespace), spec)| CurrentResourceStatus {
-                        resource: format!("app.{app}"),
+                    .map(|((app, namespace), spec)| CurrentResourceStatus {
+                        resource: crate::config::fingerprint::app_resource_key(app, namespace),
                         image: spec.image.clone(),
+                        fingerprint: crate::config::fingerprint::app_fingerprint_in(
+                            spec, namespace,
+                        ),
                     })
                     .collect();
                 for job in self.get_job_status() {
                     resources.push(CurrentResourceStatus {
-                        resource: format!("job.{}", job.name),
+                        resource: crate::config::fingerprint::job_resource_key(
+                            &job.name,
+                            &job.namespace,
+                        ),
                         image: Some(job.image),
+                        fingerprint: self.recorded_jobs.get(&job.instance_id).and_then(|record| {
+                            crate::config::fingerprint::job_fingerprint(&record.spec)
+                        }),
                     });
                 }
                 resources.sort_by(|a, b| a.resource.cmp(&b.resource));
-                resources.dedup_by(|a, b| a.resource == b.resource);
+                resources.dedup_by(|a, b| {
+                    if a.resource != b.resource {
+                        return false;
+                    }
+                    if a.fingerprint != b.fingerprint || a.image != b.image {
+                        // Different executions of one logical job cannot prove
+                        // a single current specification.
+                        b.fingerprint = None;
+                        b.image = None;
+                    }
+                    true
+                });
                 let _ = response.send(resources);
             }
             AgentCommand::JobStatus { response } => {
@@ -936,18 +1082,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Ok(()) => {
                         let summary = crate::smoker::types::FaultSummary::from(&rule);
                         // A partition is applied once the connections it cut
-                        // are gone, not when its map key is written (#450).
+                        // are gone, not when its map key is written (#450),
+                        // and once every caller it acts on has a key (#625).
                         // Cuts that outlasted the turn finish in a task, and
-                        // the caller hears after them.
+                        // callers the turn couldn't name are read in one; the
+                        // caller hears after both.
                         let late = std::mem::take(&mut self.network_faults.late_cuts);
-                        if late.is_empty() {
-                            let _ = response.send(Ok(summary));
-                        } else {
-                            tokio::spawn(async move {
-                                faults::finish_late_cuts(late).await;
-                                let _ = response.send(Ok(summary));
-                            });
-                        }
+                        self.answer_fault_injection(fault_coverage::Injection::new(
+                            rule.id, summary, late, response,
+                        ))
+                        .await;
                     }
                     Err(reason) => {
                         self.fault_registry.remove(rule.id);
@@ -1094,31 +1238,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 requested_at_ns,
                 response,
             } => {
-                // An answer after a lapse replaces the view in place. The
-                // kernel and Wrapper route only locally until the lease is
-                // renewed below, and the answer is the current catalogue, so
-                // every remote address it names is live.
-                let result = self
-                    .synchronise_consumer(generation, *catalog, ingress, withdrawals)
-                    .await;
-                if matches!(&result, Ok(update) if update.published) {
-                    self.renew_view_lease(requested_at_ns).await;
-                }
-                let result = match result {
-                    Err(error) => {
-                        let retry = self.consumer_update(false);
-                        if retry.receipts.is_empty() {
-                            Err(error)
-                        } else {
-                            // Capacity or candidate refusal must not starve
-                            // already-proven receipts needed to free capacity.
-                            eprintln!("bun: consumer publication awaits retry: {error}");
-                            Ok(retry)
-                        }
-                    }
-                    success => success,
-                };
-                let _ = response.send(result);
+                // Each journal write is a step of its own turn (#505); the
+                // answer, and the lease renewal, come after the last one.
+                self.request_consumer_sync(super::consumer::ConsumerRequest {
+                    generation,
+                    catalog: *catalog,
+                    ingress,
+                    withdrawals,
+                    answer: Some(super::consumer::ConsumerAnswer {
+                        requested_at_ns,
+                        response,
+                    }),
+                })
+                .await;
             }
             AgentCommand::ConfirmConsumerReceipt {
                 generation,
@@ -1157,8 +1289,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::UpgradeApply {
                 directive,
                 response,
+                answer_delivered,
             } => {
-                self.begin_upgrade_apply(directive, response);
+                self.begin_upgrade_apply(directive, response, answer_delivered);
             }
             AgentCommand::UpgradeStatus { response } => {
                 let result = match &self.upgrade {
@@ -1167,8 +1300,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 let _ = response.send(result);
             }
-            AgentCommand::UpgradeRollback { version, response } => {
-                self.begin_upgrade_rollback(version, response);
+            AgentCommand::UpgradeRollback {
+                version,
+                response,
+                answer_delivered,
+            } => {
+                self.begin_upgrade_rollback(version, response, answer_delivered);
             }
             AgentCommand::UpgradeVerify {
                 marker,

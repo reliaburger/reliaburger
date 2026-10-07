@@ -129,6 +129,148 @@ Cluster initialised.
     relish join-token create --node-id <node-id>
 ```
 
+## A root backup you hold
+
+Look again at step 7. The root key is sealed to the cluster's own `age` key,
+and that key's private half is wrapped with the master key and stored in the
+security state. So `prod-root-ca.age` opens only for someone holding the
+master key *and* the cluster's state. That's a backup for the cluster. It
+isn't a backup for you. And the cluster's `age` keys rotate: the first
+version of `relish secret rotate --finalize` quietly threw away the very key
+this file was sealed to, and we had to make it keep that one (F04 R0). A
+backup that depends on a key the system rotates is a backup with an expiry
+date nobody wrote down.
+
+What does an operator actually want? The root key and its certificate, in a
+file they keep somewhere far from the cluster, that opens with something only
+they hold. That's `relish ca backup`:
+
+```bash
+$ relish ca backup --out prod-root-backup.age --dir /etc/reliaburger
+Passphrase for the root CA backup:
+Again:
+wrote the root CA backup to prod-root-backup.age
+  cluster:      prod
+  trust domain: prod
+  fingerprint:  sha256:0123...
+  expires:      2036-10-01 (2106475200 unix seconds)
+```
+
+It runs on the node where `relish init` ran, because that's where the three
+ingredients are: the master key, the security bootstrap state and the sealed
+root. It unwraps the cluster's `age` keys with the master key, opens the
+sealed root with whichever one fits, and reseals the key, together with the
+certificate and some metadata, to a passphrase. `--recipient age1...` seals
+it to the operator's own `age` key instead. The plan's open question was
+whether a passphrase is good enough as the default. The maintainer said yes,
+with the recipient as the option, so that's what we built.
+
+We also decided where the root key *lives* after init: with the operator.
+It never goes into Raft, and no node keeps it. When intermediate rotation
+arrives, the CLI will unseal this backup on the operator's machine and sign a
+request the cluster made, so the root key still never touches the cluster.
+That's why this backup has to be good. Some day it's the only copy anyone can
+use.
+
+### The file is just an age file
+
+The sealed file is ASCII-armoured `age`, so `age -d` opens it as well as
+`relish` does, and inside is plain JSON with the certificate and key in PEM.
+We could have invented our own envelope (we already have AES-GCM and Argon2id
+lying around), but a backup you may need in ten years should open with a
+standard tool. With a passphrase, `age` uses scrypt and calibrates its cost to
+about a second on the machine that seals it, and we refuse passphrases
+shorter than 12 characters.
+
+The JSON is a `RootBackup` (in `src/sesame/root_backup.rs`): format tag,
+cluster, trust domain (the cluster name, which is the SPIFFE trust domain),
+fingerprint, expiry, certificate and key. It doesn't `#[derive(Debug)]`. A
+derived `Debug` prints every field, and one stray `{backup:?}` in an error
+message would put the root key in a log. So we write the trait by hand:
+
+```rust
+impl std::fmt::Debug for RootBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootBackup")
+            .field("cluster", &self.cluster)
+            .field("fingerprint", &self.fingerprint)
+            // ...
+            .field("private_key_pem", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+```
+
+`impl Trait for Type` is how Rust attaches an interface to a type, roughly
+what Go does implicitly when a type has the right methods, except that Rust
+makes you say it. `#[derive(...)]` is the compiler writing that `impl` for
+you. Here we'd rather it didn't.
+
+Opening the file needs the right kind of key, and `age` tells you which kind
+from the header. We match on both at once:
+
+```rust
+let mut reader = match (decryptor, with) {
+    (age::Decryptor::Passphrase(d), BackupOpener::Passphrase(passphrase)) => {
+        d.decrypt(passphrase, None).map_err(|e| open_failed(&e))?
+    }
+    (age::Decryptor::Recipients(d), BackupOpener::Identity(identity)) => d
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .map_err(|e| open_failed(&e))?,
+    (age::Decryptor::Passphrase(_), BackupOpener::Identity(_)) => {
+        return Err(RootBackupError::NeedsPassphrase);
+    }
+    (age::Decryptor::Recipients(_), BackupOpener::Passphrase(_)) => {
+        return Err(RootBackupError::NeedsIdentity);
+    }
+};
+```
+
+Matching on a tuple lays out all four combinations as a table, and the
+compiler checks that the table has no holes. Add a third kind of seal and
+this stops compiling until you've said what happens.
+
+The passphrase itself travels as a `SecretString`, from the `secrecy` crate
+that `age` re-exports. It has no `Display`, its `Debug` prints nothing useful,
+and it wipes its memory when dropped. Reading the value takes an explicit
+`.expose_secret()`, which is easy to search for. At the terminal, `relish`
+turns echo off with `termios` before asking, and turns it back on whether or
+not the read worked.
+
+### Verifying without a cluster
+
+A backup you've never checked is a hope. `relish ca verify` opens one and
+checks it offline:
+
+```bash
+$ relish ca verify prod-root-backup.age --fingerprint sha256:0123...
+```
+
+`RootBackup::verify` refuses, in this order:
+
+- a key whose public half isn't the certificate's subject key, or a
+  certificate that its own key doesn't verify (that's an intermediate, not a
+  root);
+- a recorded fingerprint that isn't the certificate's, so the metadata can't
+  lie about what's inside;
+- a root whose fingerprint isn't the one you passed, the `sha256:` value
+  `relish init` printed and every joiner pinned. That's how a backup of
+  another cluster gets caught;
+- a root that has expired.
+
+`relish ca backup` runs the same checks before it writes anything, so it
+never produces a file that `verify` would refuse.
+
+The tests follow the plan's list. A passphrase round trip opens what it
+sealed and verifies. A wrong passphrase doesn't open the file. A key swapped
+in from another root fails with `KeyMismatch`. A root checked one second past
+its `notAfter` fails with `Expired` (we pass the clock in rather than forge a
+certificate from the past). A second cluster's backup, otherwise perfect,
+fails with `ForeignRoot`. Around those sit a few more: an intermediate passed
+off as a root, a tampered fingerprint, a recipient-sealed file that only its
+identity opens, a backup built straight from what `relish init` wrote (and
+not from a wrong master key), and `Debug` output with no key in it.
+
 ## Join tokens and node certificates
 
 New nodes join by presenting a join token:
@@ -383,6 +525,35 @@ Replacement writes the new snapshot to disk first and publishes it to the `watch
 
 **Who is asking?** `POST /v1/cluster/renew` needs the internal service token *and* the client certificate from the TLS connection itself. The service token proves the request came from cluster automation; it doesn't say which node sent it, so trusting a node name in the request body would let one compromised node renew itself as any other. The leader reads the caller's current leaf (Bun puts it in a typed Axum extension after the handshake, where no header can reach it), checks the chain and revocation list again because a long-lived connection can outlive a revocation, and signs a CSR that must name the same node. As with joining, only the CSR's public key reaches the new certificate. Followers refuse rather than forward, since forwarding would present the follower's certificate and change who's asking.
 
+**The connection that never hung up.** The resolver trick has a blind spot, and the 0.1.4 soak found it. A resolver runs at the handshake, and only at the handshake. Pickle forwards registry writes to the leader through a pooled `reqwest` connection, about one request a second, so that connection never sat idle long enough to close. Node 1 renewed its hour-long leaf at 15:38 and kept presenting the old one on that socket. At 16:11 the old leaf expired. The leader checks the caller's certificate on every proposal (that's the revocation check above), so it answered 403 to every one, about 130 of them in three minutes, and image pushes came back 503. Renewal had worked perfectly. The new leaf just never got a chance to be sent.
+
+We could have rebuilt every pooled client on renewal, but `reqwest::Client` gets cloned into dozens of places, and missing one would bring the bug back quietly. The server is the one place every peer connection passes through, and it already retires connections after an hour. Now it also retires one when the certificate its client presented expires:
+
+```rust
+pub fn tls_connection_lifetime(peer_certificate: Option<&[u8]>, now: SystemTime) -> Duration {
+    let Some(certificate_der) = peer_certificate else {
+        return MAX_TLS_CONNECTION_LIFETIME;
+    };
+    let Ok((_, leaf)) = x509_parser::parse_x509_certificate(certificate_der) else {
+        return Duration::ZERO;
+    };
+    let expires = u64::try_from(leaf.validity().not_after.timestamp())
+        .ok()
+        .and_then(|seconds| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+    let Some(expires) = expires else {
+        return Duration::ZERO;
+    };
+    expires
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_TLS_CONNECTION_LIFETIME)
+}
+```
+
+A client with no certificate (a browser, `relish`) keeps the full hour. Anything the parser can't read gets zero, because a certificate we can't date is one we can't trust. `u64::try_from` refuses a negative timestamp instead of wrapping it the way a C cast would, and `checked_add` returns `None` rather than panicking if the date doesn't fit in a `SystemTime`. `duration_since` returns an error when `now` is already past expiry, which `unwrap_or` turns into zero. Draining then starts 30 seconds before the limit, or halfway through a lifetime shorter than a minute, so in-flight requests finish and the client opens a fresh connection with whatever leaf is current. Renewal happens at mid-life, so in practice that's always the new one.
+
+The regression test, `a_connection_opened_before_renewal_never_presents_the_expired_leaf`, does what Pickle did. It issues a four-second leaf, sends one request, renews to a new serial, then keeps a pooled client busy every 200 milliseconds until the old leaf has expired. The server echoes the serial it saw, and any request sent after expiry must see the new one. Before the fix, the first request after expiry still came back with the old serial.
+
 **Who notices it's broken?** A renewal loop runs inside each Bun. Once the current leaf is past the middle of its life, it generates a fresh key locally, asks whoever is leader right now, and retries every five seconds on any failure while the old identity keeps working. An expired identity gets no bypass: the operator re-enrols the node. The loop reports its progress through another `watch` channel, and the reading side has a neat trick:
 
 ```rust
@@ -397,7 +568,7 @@ pub fn state(&self) -> RenewalState {
 
 `has_changed()` returns an error once the sending half has been dropped. If the renewal task exits or panics, Rust drops its sender, and diagnostics report `Stopped` even though the last value it wrote said `Valid`. A dead background task can't keep claiming it's healthy, and nobody had to remember to write a final status.
 
-The ingress proxy's certificates for your domains follow the same rules with shorter loops. Their serials are 20 random bytes with the top bits fixed (`(serial[0] & 0x3f) | 0x40` keeps the six low bits and sets the next, giving a positive number of full length), because a per-process counter gave two ingress nodes restarting on the same CA identical serials. The handshake sends the leaf *and* its intermediate, since a client that trusts only the root can't connect the two otherwise; a unit test proved the signature correct, and a real client still said `UnknownIssuer`. Cached leaves renew at mid-life, operator-supplied files hot-reload only once the certificate and key match, and API, registry and ingress TLS connections get a one-hour maximum lifetime, so even a WebSocket eventually reconnects to the current certificate.
+The ingress proxy's certificates for your domains follow the same rules with shorter loops. Their serials are 20 random bytes with the top bits fixed (`(serial[0] & 0x3f) | 0x40` keeps the six low bits and sets the next, giving a positive number of full length), because a per-process counter gave two ingress nodes restarting on the same CA identical serials. The handshake sends the leaf *and* its intermediate, since a client that trusts only the root can't connect the two otherwise; a unit test proved the signature correct, and a real client still said `UnknownIssuer`. Cached leaves renew at mid-life, operator-supplied files hot-reload only once the certificate and key match, and API, registry and ingress TLS connections get a one-hour maximum lifetime (shorter when the client's own certificate expires sooner, as Pickle taught us above), so even a WebSocket eventually reconnects to the current certificate.
 
 **How do you test a six-month timer?** A node leaf lives a year and renews at six months. Our unit tests fake the clock by signing certificates whose windows are already half over, but that doesn't tell you what happens to a real cluster when renewal collides with a leader election, a SIGKILL or a power cut. For that we run a multi-day soak, and a soak that renews each node zero times proves nothing. So there's exactly one knob, and it's deliberately awkward to reach:
 
@@ -464,6 +635,22 @@ An administrator scoped to namespace `team` could create an *unscoped* administr
 The apply handler checked a manifest's apps against the caller's scope and then passed its jobs along unchecked, so a token confined to namespace `a` could run a job in namespace `b`. Worse, the apps were committed before the jobs were looked at. Now apps and jobs feed one iterator of targets (`Iterator::chain` walks the first iterator, then the second, without copying either), and every target is checked before the first Raft write. Jobs that run host commands also need the host-exec permission. A manifest can't rewrite its own rules either: `[permission.*]` and namespace quota declarations need an unscoped administrator, otherwise `ci` could grant itself `host-exec` in the very manifest that's limited by its absence.
 
 Finally, the check has to survive a network hop. A follower that forwards an apply to the leader passes along the *user's* token or session cookie. Swapping in the node's own service token would erase the identity whose permissions the leader needs to check. Each fix got a test that looks at Raft state and the agent's command queue, not just the HTTP status, and a positive test next to it. A permission system that refuses everything is secure and useless.
+
+Apply and batch submission now use the same `authorize_workload` function for
+these target checks. Each handler passes the authenticated caller, workload
+name, effective namespace, whether `exec` or `script` requests host execution,
+and its replicated permission snapshot. The function checks scope first,
+`Deploy` next, and `HostExec` when needed. It returns `Result<(), Response>`;
+Rust's `?` operator passes an existing refusal straight back without replacing
+its status or message. Roles, lease ownership and administrator policy still
+belong to their existing handlers.
+
+A source control keeps both handlers on that path and detects a copied decision
+or a missing host-exec check. A separate transport regression uses one real
+scoped bearer for leader apply and follower batch requests. It checks allowed
+paths as well as refusals, unchanged Raft state and an acknowledged empty
+mutation queue. Its finite command actor records dispatch; actual child
+execution belongs to the ProcessGrill and owned-runc suites.
 
 ### Evaluating a policy isn't enforcing it
 
@@ -1022,3 +1209,20 @@ after startup begins and separately check the empty-store deadline. A shutdown
 guard cancels already spawned tasks when startup exits with an error; Rust drops
 the guard on both the success and error return paths.
 
+
+
+A renewal test needs two clocks. The real certificate must remain valid long
+enough for TLS to complete, while the connection lifetime calculation can use
+an injected time close to expiry. We use the ordinary TLS listener and pooled
+client, allow a request to lose its connection during retirement, and require
+the next successful connection to present the renewed certificate. A handler
+records old-identity requests after the test deadline even if no response reaches
+the client. Keeping retirement disabled in a negative control proves the test
+would catch the original bug. Production still uses the current system time.
+
+The route permission guardian follows the same shared workload rule. It parses
+the actual helper and credits Deploy only when that permission is checked
+unconditionally and its error is propagated. A handler must call the exact
+shared helper and return its refusal. Conditional host-execution permission
+does not satisfy an unconditional route gate. Source controls catch missing
+wiring; the paired HTTP tests still exercise the actual token and refusal.

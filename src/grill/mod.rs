@@ -305,11 +305,21 @@ pub struct RuntimeLaunch {
     pub generation: RuntimeGeneration,
     /// Canonical workload identity.
     pub instance_id: InstanceId,
-    /// Specification committed for this generation.
+    /// Specification committed for this generation. A retired Runc generation
+    /// keeps environment variable names only, so compare it with
+    /// [`RuntimeLaunch::launched`], never `==`.
     pub spec: OciSpec,
     /// Original address hold or release receipt from the same durable runtime intent.
     /// Process runtimes have no reusable container address and return None.
     pub network_reference: Option<runc_intent::NetworkReferenceState>,
+}
+
+impl RuntimeLaunch {
+    /// Whether this generation was launched from `spec`, even after its
+    /// retirement scrubbed the environment values from the journal.
+    pub fn launched(&self, spec: &OciSpec) -> bool {
+        spec.matches_journal(&self.spec)
+    }
 }
 
 /// The container runtime interface.
@@ -576,6 +586,17 @@ pub enum AnyGrill {
 }
 
 impl AnyGrill {
+    pub(crate) async fn tail_snapshot(&self, instance: &InstanceId) -> capture::TailSnapshot {
+        if let Self::Process(runtime) = self {
+            return runtime.tail_snapshot(instance).await;
+        }
+        if let Some(stem) = self.log_stem(instance).await {
+            capture::TailSnapshot::files(&stem).await
+        } else {
+            Default::default()
+        }
+    }
+
     /// The runtime's image-store handle, when the runtime pulls OCI
     /// images itself (runc). Lets the binary install the cluster P2P
     /// image source after the cluster subsystems start — the runtime

@@ -1,0 +1,1430 @@
+[
+  {
+    "source": "src/grill/image.rs",
+    "function": "owner_shift_maps_layer_owners_into_the_container_range",
+    "binary": "reliaburger",
+    "test": "grill::image::tests::owner_shift_maps_layer_owners_into_the_container_range"
+  },
+  {
+    "source": "src/grill/netns.rs",
+    "function": "setup_and_teardown_container_network",
+    "binary": "reliaburger",
+    "test": "grill::netns::tests::setup_and_teardown_container_network"
+  },
+  {
+    "source": "src/grill/netns.rs",
+    "function": "container_network_accepts_its_forwarded_traffic_in_iptables",
+    "binary": "reliaburger",
+    "test": "grill::netns::tests::container_network_accepts_its_forwarded_traffic_in_iptables"
+  },
+  {
+    "source": "src/grill/netns.rs",
+    "function": "port_mapping_nftables",
+    "binary": "reliaburger",
+    "test": "grill::netns::tests::port_mapping_nftables"
+  },
+  {
+    "source": "src/grill/netns.rs",
+    "function": "portmap_map_handles_1000_ports",
+    "binary": "reliaburger",
+    "test": "grill::netns::tests::portmap_map_handles_1000_ports"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_grill_creates_bundle_dir",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_grill_creates_bundle_dir"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_netns_resolves_internal_name_through_mounted_resolv_conf",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_netns_resolves_internal_name_through_mounted_resolv_conf"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_replicas_cannot_observe_each_others_rootfs_writes",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_replicas_cannot_observe_each_others_rootfs_writes"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_create_failure_rolls_back_private_rootfs_mount",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_create_failure_rolls_back_private_rootfs_mount"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_adoption_keeps_private_rootfs_and_releases_mount",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_adoption_keeps_private_rootfs_and_releases_mount"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_runs_pinned_multiarchitecture_test_workload",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_runs_pinned_multiarchitecture_test_workload"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_runs_an_image_by_its_own_entrypoint_env_and_working_dir",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_runs_an_image_by_its_own_entrypoint_env_and_working_dir"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_image_root_binds_port_80_without_being_host_root",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_image_root_binds_port_80_without_being_host_root"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_redis_persists_to_a_managed_volume_across_restarts",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_redis_persists_to_a_managed_volume_across_restarts"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
+    "function": "btrfs_snapshot_restore_recovers_corrupted_data",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_snapshot_restore_recovers_corrupted_data"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
+    "function": "btrfs_multi_volume_snapshots_are_addressed_by_volume",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_multi_volume_snapshots_are_addressed_by_volume"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
+    "function": "btrfs_restore_recovers_from_a_crash_at_every_step",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_restore_recovers_from_a_crash_at_every_step"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
+    "function": "btrfs_restore_keeps_the_volume_quota",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_restore_keeps_the_volume_quota"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
+    "function": "btrfs_volumes_with_formerly_colliding_slugs_stay_separate",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_volumes_with_formerly_colliding_slugs_stay_separate"
+  },
+  {
+    "source": "src/grill/volume.rs",
+    "function": "dotted_loop_volumes_keep_independent_data_after_remount",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::dotted_loop_volumes_keep_independent_data_after_remount"
+  },
+  {
+    "source": "src/grill/volume.rs",
+    "function": "rehoming_moves_only_the_previous_users_files_and_never_follows_symlinks",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::rehoming_moves_only_the_previous_users_files_and_never_follows_symlinks"
+  },
+  {
+    "source": "src/grill/volume.rs",
+    "function": "a_restored_btrfs_volume_keeps_its_container_ownership",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::a_restored_btrfs_volume_keeps_its_container_ownership"
+  },
+  {
+    "source": "src/grill/volume.rs",
+    "function": "loop_volume_is_mounted_again_after_a_reboot",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::loop_volume_is_mounted_again_after_a_reboot"
+  },
+  {
+    "source": "src/grill/volume.rs",
+    "function": "btrfs_quota_blocks_writes_beyond_limit",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::btrfs_quota_blocks_writes_beyond_limit"
+  },
+  {
+    "source": "src/sesame/identity.rs",
+    "function": "identity_dir_is_tmpfs_backed_under_root",
+    "binary": "reliaburger",
+    "test": "sesame::identity::tests::identity_dir_is_tmpfs_backed_under_root"
+  },
+  {
+    "source": "src/smoker/resource.rs",
+    "function": "cgroup_cpu_stress_applies_and_restores",
+    "binary": "reliaburger",
+    "test": "smoker::resource::tests::cgroup_cpu_stress_applies_and_restores"
+  },
+  {
+    "source": "src/smoker/resource.rs",
+    "function": "cgroup_memory_pressure_applies_and_restores",
+    "binary": "reliaburger",
+    "test": "smoker::resource::tests::cgroup_memory_pressure_applies_and_restores"
+  },
+  {
+    "source": "src/smoker/resource.rs",
+    "function": "cgroup_disk_io_throttle_applies_and_removes",
+    "binary": "reliaburger",
+    "test": "smoker::resource::tests::cgroup_disk_io_throttle_applies_and_removes"
+  },
+  {
+    "source": "tests/autoscale_memory.rs",
+    "function": "runc_autoscaler_scales_up_on_real_memory_growth",
+    "binary": "reliaburger::autoscale_memory",
+    "test": "runc_autoscaler_scales_up_on_real_memory_growth"
+  },
+  {
+    "source": "tests/build.rs",
+    "function": "buildah_build_lands_in_the_catalog",
+    "binary": "reliaburger::build",
+    "test": "buildah_build_lands_in_the_catalog"
+  },
+  {
+    "source": "tests/build.rs",
+    "function": "buildah_build_signs_and_the_signature_verifies_on_deploy",
+    "binary": "reliaburger::build",
+    "test": "buildah_build_signs_and_the_signature_verifies_on_deploy"
+  },
+  {
+    "source": "tests/build.rs",
+    "function": "a_two_platform_build_runs_the_nodes_own_platform_under_runc",
+    "binary": "reliaburger::build",
+    "test": "a_two_platform_build_runs_the_nodes_own_platform_under_runc"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "service_on_one_node_resolves_and_survives_leader_change_from_another",
+    "binary": "reliaburger::cluster_failover",
+    "test": "service_on_one_node_resolves_and_survives_leader_change_from_another"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "eight_plus_node_cluster_reconciles_and_reports_through_leader_failover",
+    "binary": "reliaburger::cluster_failover",
+    "test": "eight_plus_node_cluster_reconciles_and_reports_through_leader_failover"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "lease_retirement_waits_for_paused_worker_across_leader_change",
+    "binary": "reliaburger::cluster_failover",
+    "test": "lease_retirement_waits_for_paused_worker_across_leader_change"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change",
+    "binary": "reliaburger::cluster_failover",
+    "test": "decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "three_nodes_join_by_address_and_converge",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "three_nodes_join_by_address_and_converge"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "three_node_council_elects_leader_and_grows",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "three_node_council_elects_leader_and_grows"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "generated_security_model_protects_all_live_cluster_transports",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "generated_security_model_protects_all_live_cluster_transports"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "rollup_worker_delivers_node_rollups_to_the_leader",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "rollup_worker_delivers_node_rollups_to_the_leader"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "state_reports_carry_nonzero_capacity_and_usage",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "state_reports_carry_nonzero_capacity_and_usage"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "node_renewal_retries_directly_after_leader_failure_and_persists_the_new_leaf",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "node_renewal_retries_directly_after_leader_failure_and_persists_the_new_leaf"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "leased_token_cleanup_survives_leader_failure_without_revoking_operator_tokens",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "leased_token_cleanup_survives_leader_failure_without_revoking_operator_tokens"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "trigger_elect_advances_term_and_can_move_leadership",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "trigger_elect_advances_term_and_can_move_leadership"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "pressured_leader_resigns_and_leadership_moves",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "pressured_leader_resigns_and_leadership_moves"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "disk_pressure_advertised_over_gossip_drives_resignation",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "disk_pressure_advertised_over_gossip_drives_resignation"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "full_council_loss_recovers_from_backup",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "full_council_loss_recovers_from_backup"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "old_voters_returning_after_recovery_cannot_form_a_quorum",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "old_voters_returning_after_recovery_cannot_form_a_quorum"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "recovered_council_regrows_onto_a_fresh_node",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "recovered_council_regrows_onto_a_fresh_node"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "killed_voter_is_replaced_by_healthy_spare",
+    "binary": "reliaburger::council_self_healing",
+    "test": "killed_voter_is_replaced_by_healthy_spare"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "dead_learner_mid_catch_up_does_not_block_replacement",
+    "binary": "reliaburger::council_self_healing",
+    "test": "dead_learner_mid_catch_up_does_not_block_replacement"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "flapping_node_inside_window_causes_no_churn",
+    "binary": "reliaburger::council_self_healing",
+    "test": "flapping_node_inside_window_causes_no_churn"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "embedded_program_loads_without_an_object_directory",
+    "binary": "reliaburger::ebpf",
+    "test": "embedded_program_loads_without_an_object_directory"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "ebpf_load_and_attach",
+    "binary": "reliaburger::ebpf",
+    "test": "ebpf_load_and_attach"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "ebpf_backend_map_write_and_read",
+    "binary": "reliaburger::ebpf",
+    "test": "ebpf_backend_map_write_and_read"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "ebpf_backend_map_remove",
+    "binary": "reliaburger::ebpf",
+    "test": "ebpf_backend_map_remove"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "ebpf_service_map_sync_multiple",
+    "binary": "reliaburger::ebpf",
+    "test": "ebpf_service_map_sync_multiple"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "ebpf_connect_to_vip_rewrites_destination",
+    "binary": "reliaburger::ebpf",
+    "test": "ebpf_connect_to_vip_rewrites_destination"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "a_lapsed_view_lease_routes_only_to_local_backends",
+    "binary": "reliaburger::ebpf",
+    "test": "a_lapsed_view_lease_routes_only_to_local_backends"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "ebpf_connect_to_vip_no_backends_refused",
+    "binary": "reliaburger::ebpf",
+    "test": "ebpf_connect_to_vip_no_backends_refused"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "ebpf_connect_non_vip_passes_through",
+    "binary": "reliaburger::ebpf",
+    "test": "ebpf_connect_non_vip_passes_through"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_deploy_populates_backend_map",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_deploy_populates_backend_map"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_drop_fault_refuses_vip_with_eperm",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_drop_fault_refuses_vip_with_eperm"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "partition_fault_blocks_its_source_cgroup_and_clears",
+    "binary": "reliaburger::ebpf",
+    "test": "partition_fault_blocks_its_source_cgroup_and_clears"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "partition_answers_only_once_every_source_instance_is_covered",
+    "binary": "reliaburger::ebpf",
+    "test": "partition_answers_only_once_every_source_instance_is_covered"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_denied_by_default_allowed_when_listed",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_denied_by_default_allowed_when_listed"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_cleanup_deletes_destinations_not_just_the_flag",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_cleanup_deletes_destinations_not_just_the_flag"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "namespace_isolation_denies_cross_namespace_by_default",
+    "binary": "reliaburger::ebpf",
+    "test": "namespace_isolation_denies_cross_namespace_by_default"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "namespace_grant_cannot_authorise_a_same_named_destination",
+    "binary": "reliaburger::ebpf",
+    "test": "namespace_grant_cannot_authorise_a_same_named_destination"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "dns_responder_resolves_internal_name",
+    "binary": "reliaburger::ebpf",
+    "test": "dns_responder_resolves_internal_name"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "dns_responder_non_internal_times_out",
+    "binary": "reliaburger::ebpf",
+    "test": "dns_responder_non_internal_times_out"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "connect6_denies_unlisted_and_allows_listed_ipv6",
+    "binary": "reliaburger::ebpf",
+    "test": "connect6_denies_unlisted_and_allows_listed_ipv6"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "v4_only_allowlist_no_longer_bypassed_over_ipv6",
+    "binary": "reliaburger::ebpf",
+    "test": "v4_only_allowlist_no_longer_bypassed_over_ipv6"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "cidr_egress_allowed_via_lpm_trie",
+    "binary": "reliaburger::ebpf",
+    "test": "cidr_egress_allowed_via_lpm_trie"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "sweep_scrubs_orphaned_cgroup_state",
+    "binary": "reliaburger::ebpf",
+    "test": "sweep_scrubs_orphaned_cgroup_state"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_programmed_before_start_via_cgroup_path",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_programmed_before_start_via_cgroup_path"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "pre_start_programming_scrubs_recycled_cgroup_allows",
+    "binary": "reliaburger::ebpf",
+    "test": "pre_start_programming_scrubs_recycled_cgroup_allows"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "live_egress_hook_loss_stops_protected_workload",
+    "binary": "reliaburger::ebpf",
+    "test": "live_egress_hook_loss_stops_protected_workload"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "pre_start_programming_error_fails_deploy_with_no_running_process",
+    "binary": "reliaburger::ebpf",
+    "test": "pre_start_programming_error_fails_deploy_with_no_running_process"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_cleanup_refuses_a_frozen_enforcement_flag",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_cleanup_refuses_a_frozen_enforcement_flag"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_policy_survives_actual_loader_process_death",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_policy_survives_actual_loader_process_death"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_refuses_conflicting_owners_and_retired_state",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_refuses_conflicting_owners_and_retired_state"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_refuses_obsolete_destination_identity",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_refuses_obsolete_destination_identity"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_rebuilds_only_proven_prior_boot_empty_inventory",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_rebuilds_only_proven_prior_boot_empty_inventory"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_refuses_missing_or_malformed_boot_identity",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_refuses_missing_or_malformed_boot_identity"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_never_recreates_a_missing_live_claim",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_never_recreates_a_missing_live_claim"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_never_recreates_a_missing_manifest",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_never_recreates_a_missing_manifest"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_recovers_partial_startup_and_interrupted_retirement",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_recovers_partial_startup_and_interrupted_retirement"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "persistent_policy_refuses_wrong_map_layout_and_foreign_map_identity",
+    "binary": "reliaburger::ebpf",
+    "test": "persistent_policy_refuses_wrong_map_layout_and_foreign_map_identity"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_adoption_restores_durable_egress_ownership_before_live_checks",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_adoption_restores_durable_egress_ownership_before_live_checks"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "confirmed_egress_retirement_survives_interrupted_adoption_record_cleanup",
+    "binary": "reliaburger::ebpf",
+    "test": "confirmed_egress_retirement_survives_interrupted_adoption_record_cleanup"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "missing_policy_owner_refuses_even_a_stopped_recorded_runtime",
+    "binary": "reliaburger::ebpf",
+    "test": "missing_policy_owner_refuses_even_a_stopped_recorded_runtime"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "failed_policy_checkpoint_prevents_kernel_programming_and_workload_start",
+    "binary": "reliaburger::ebpf",
+    "test": "failed_policy_checkpoint_prevents_kernel_programming_and_workload_start"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_recovery_keeps_policy_ownership_when_kernel_retirement_is_refused",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_recovery_keeps_policy_ownership_when_kernel_retirement_is_refused"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "adoption_fences_missing_enforcement_before_publishing_the_workload",
+    "binary": "reliaburger::ebpf",
+    "test": "adoption_fences_missing_enforcement_before_publishing_the_workload"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launcher",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launcher"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "firewall_cleanup_refuses_frozen_maps_and_preserves_their_entries",
+    "binary": "reliaburger::ebpf",
+    "test": "firewall_cleanup_refuses_frozen_maps_and_preserves_their_entries"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "firewall_cleanup_confirms_removal_and_accepts_already_absent_entries",
+    "binary": "reliaburger::ebpf",
+    "test": "firewall_cleanup_confirms_removal_and_accepts_already_absent_entries"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts",
+    "binary": "reliaburger::ebpf",
+    "test": "firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "firewall_reconciliation_retains_partial_publication_and_unrelated_entries",
+    "binary": "reliaburger::ebpf",
+    "test": "firewall_reconciliation_retains_partial_publication_and_unrelated_entries"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "firewall_reconciliation_forgets_confirmed_removals_only",
+    "binary": "reliaburger::ebpf",
+    "test": "firewall_reconciliation_forgets_confirmed_removals_only"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_namespace_binding_includes_outbound_only_workloads",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_namespace_binding_includes_outbound_only_workloads"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_retirement_preserves_ownership_when_backend_removal_is_refused",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_retirement_preserves_ownership_when_backend_removal_is_refused"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "agent_retirement_confirms_backend_absence_before_forgetting_ownership",
+    "binary": "reliaburger::ebpf",
+    "test": "agent_retirement_confirms_backend_absence_before_forgetting_ownership"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "source_policy_precedes_portless_application_start",
+    "binary": "reliaburger::ebpf",
+    "test": "source_policy_precedes_portless_application_start"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "source_policy_precedes_job_start",
+    "binary": "reliaburger::ebpf",
+    "test": "source_policy_precedes_job_start"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "namespace_retirement_keeps_original_ownership_through_recovery",
+    "binary": "reliaburger::ebpf",
+    "test": "namespace_retirement_keeps_original_ownership_through_recovery"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "namespace_adoption_refuses_missing_original_enforcement",
+    "binary": "reliaburger::ebpf",
+    "test": "namespace_adoption_refuses_missing_original_enforcement"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "source_namespace_loss_fences_a_live_workload",
+    "binary": "reliaburger::ebpf",
+    "test": "source_namespace_loss_fences_a_live_workload"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "source_namespace_recovery_refuses_an_owner_with_erased_identity",
+    "binary": "reliaburger::ebpf",
+    "test": "source_namespace_recovery_refuses_an_owner_with_erased_identity"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "source_only_checkpoint_failure_prevents_execution",
+    "binary": "reliaburger::ebpf",
+    "test": "source_only_checkpoint_failure_prevents_execution"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "source_only_adoption_preserves_namespace_without_an_egress_allowlist",
+    "binary": "reliaburger::ebpf",
+    "test": "source_only_adoption_preserves_namespace_without_an_egress_allowlist"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "init_exit_preserves_policy_before_the_next_container_starts",
+    "binary": "reliaburger::ebpf",
+    "test": "init_exit_preserves_policy_before_the_next_container_starts"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "uncertain_initialiser_preserves_parent_policy_until_confirmed_retirement",
+    "binary": "reliaburger::ebpf",
+    "test": "uncertain_initialiser_preserves_parent_policy_until_confirmed_retirement"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "kernel_lookup_denial_is_not_reported_as_backend_absence",
+    "binary": "reliaburger::ebpf",
+    "test": "kernel_lookup_denial_is_not_reported_as_backend_absence"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload",
+    "binary": "reliaburger::ebpf",
+    "test": "refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "refused_rollout_withdrawal_cannot_retire_the_original_destination",
+    "binary": "reliaburger::ebpf",
+    "test": "refused_rollout_withdrawal_cannot_retire_the_original_destination"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "refused_blue_green_withdrawal_cannot_retire_the_original_destination",
+    "binary": "reliaburger::ebpf",
+    "test": "refused_blue_green_withdrawal_cannot_retire_the_original_destination"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "confirmed_rollout_withdrawal_keeps_the_replacement_reachable",
+    "binary": "reliaburger::ebpf",
+    "test": "confirmed_rollout_withdrawal_keeps_the_replacement_reachable"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "standalone_discovery_release_allows_confirmed_address_reuse",
+    "binary": "reliaburger::ebpf",
+    "test": "standalone_discovery_release_allows_confirmed_address_reuse"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "standalone_automatic_restart_replaces_the_original_address_owner",
+    "binary": "reliaburger::ebpf",
+    "test": "standalone_automatic_restart_replaces_the_original_address_owner"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "standalone_discovery_recovery_preserves_original_routing_and_cleanup",
+    "binary": "reliaburger::ebpf",
+    "test": "standalone_discovery_recovery_preserves_original_routing_and_cleanup"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "refused_backend_publication_cannot_report_a_completed_deployment",
+    "binary": "reliaburger::ebpf",
+    "test": "refused_backend_publication_cannot_report_a_completed_deployment"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "refused_destination_grant_removal_retains_the_original_service",
+    "binary": "reliaburger::ebpf",
+    "test": "refused_destination_grant_removal_retains_the_original_service"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "confirmed_destination_retirement_removes_only_its_own_grants",
+    "binary": "reliaburger::ebpf",
+    "test": "confirmed_destination_retirement_removes_only_its_own_grants"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it",
+    "binary": "reliaburger::ebpf",
+    "test": "natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "lost_enforcement_stops_execution_even_when_backend_withdrawal_refuses",
+    "binary": "reliaburger::ebpf",
+    "test": "lost_enforcement_stops_execution_even_when_backend_withdrawal_refuses"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "durable_discovery_retains_original_reference_after_controller_loss",
+    "binary": "reliaburger::ebpf",
+    "test": "durable_discovery_retains_original_reference_after_controller_loss"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "refused_health_publication_prevents_restart_and_preserves_ownership",
+    "binary": "reliaburger::ebpf",
+    "test": "refused_health_publication_prevents_restart_and_preserves_ownership"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "consumer_kernel_withdrawal_recovers_ready_receipt_without_republishing",
+    "binary": "reliaburger::ebpf",
+    "test": "consumer_kernel_withdrawal_recovers_ready_receipt_without_republishing"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "consumer_kernel_delete_refusal_retains_pending_receipt_across_restart",
+    "binary": "reliaburger::ebpf",
+    "test": "consumer_kernel_delete_refusal_retains_pending_receipt_across_restart"
+  },
+  {
+    "source": "tests/integration.rs",
+    "function": "health_check_failing_app_never_reaches_running",
+    "binary": "reliaburger::integration",
+    "test": "health_check_failing_app_never_reaches_running"
+  },
+  {
+    "source": "tests/integration.rs",
+    "function": "job_failed_retries_then_fails",
+    "binary": "reliaburger::integration",
+    "test": "job_failed_retries_then_fails"
+  },
+  {
+    "source": "tests/integration.rs",
+    "function": "health_check_hang_stays_in_health_wait",
+    "binary": "reliaburger::integration",
+    "test": "health_check_hang_stays_in_health_wait"
+  },
+  {
+    "source": "tests/integration.rs",
+    "function": "health_check_triggers_restart",
+    "binary": "reliaburger::integration",
+    "test": "health_check_triggers_restart"
+  },
+  {
+    "source": "tests/kubernetes_demo.rs",
+    "function": "podinfo_demo_frontend_reaches_backend_and_redis_by_name",
+    "binary": "reliaburger::kubernetes_demo",
+    "test": "podinfo_demo_frontend_reaches_backend_and_redis_by_name"
+  },
+  {
+    "source": "tests/kubernetes_demo.rs",
+    "function": "podinfo_demo_feels_network_faults_between_frontend_and_redis",
+    "binary": "reliaburger::kubernetes_demo",
+    "test": "podinfo_demo_feels_network_faults_between_frontend_and_redis"
+  },
+  {
+    "source": "tests/node_pressure.rs",
+    "function": "node_pressure_consumes_capacity_outside_bun_and_cleans_up",
+    "binary": "reliaburger::node_pressure",
+    "test": "node_pressure_consumes_capacity_outside_bun_and_cleans_up"
+  },
+  {
+    "source": "tests/node_pressure.rs",
+    "function": "disabling_pressure_still_reclaims_previous_helpers",
+    "binary": "reliaburger::node_pressure",
+    "test": "disabling_pressure_still_reclaims_previous_helpers"
+  },
+  {
+    "source": "tests/node_pressure.rs",
+    "function": "noisy_helpers_do_not_block_readiness_or_erase_failure_diagnostics",
+    "binary": "reliaburger::node_pressure",
+    "test": "noisy_helpers_do_not_block_readiness_or_erase_failure_diagnostics"
+  },
+  {
+    "source": "tests/node_pressure.rs",
+    "function": "helper_dies_with_creating_thread_or_parent_and_stale_cgroup_is_reclaimed",
+    "binary": "reliaburger::node_pressure",
+    "test": "helper_dies_with_creating_thread_or_parent_and_stale_cgroup_is_reclaimed"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_ownership",
+    "binary": "reliaburger::oci_crash",
+    "test": "actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_ownership"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "normal_standalone_bun_recovers_durable_kernel_and_discovery",
+    "binary": "reliaburger::oci_crash",
+    "test": "normal_standalone_bun_recovers_durable_kernel_and_discovery"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys",
+    "binary": "reliaburger::oci_crash",
+    "test": "service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor",
+    "binary": "reliaburger::oci_crash",
+    "test": "automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel",
+    "binary": "reliaburger::oci_crash",
+    "test": "normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "normal_rootless_bun_recovers_owned_forward_and_discovery",
+    "binary": "reliaburger::oci_crash",
+    "test": "normal_rootless_bun_recovers_owned_forward_and_discovery"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "normal_clustered_bun_recovers_enrolled_consumer_before_adoption",
+    "binary": "reliaburger::oci_crash",
+    "test": "normal_clustered_bun_recovers_enrolled_consumer_before_adoption"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollback",
+    "binary": "reliaburger::oci_crash",
+    "test": "three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollback"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "managed_guest_startup_establishes_bpffs_before_bun",
+    "binary": "reliaburger::oci_crash",
+    "test": "managed_guest_startup_establishes_bpffs_before_bun"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "owned_network_setup_and_forwarding_retire_through_the_generation",
+    "binary": "reliaburger::owned_network",
+    "test": "owned_network_setup_and_forwarding_retire_through_the_generation"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "killed_network_caller_cannot_publish_a_veth_after_recovered_retirement",
+    "binary": "reliaburger::owned_network",
+    "test": "killed_network_caller_cannot_publish_a_veth_after_recovered_retirement"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "same_node_containers_have_independent_host_and_peer_routes",
+    "binary": "reliaburger::owned_network",
+    "test": "same_node_containers_have_independent_host_and_peer_routes"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "operator_cidr_reaches_the_api_port_but_not_cluster_ports",
+    "binary": "reliaburger::owned_network",
+    "test": "operator_cidr_reaches_the_api_port_but_not_cluster_ports"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection",
+    "binary": "reliaburger::owned_rootless",
+    "test": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "rootless_short_job_has_network_before_its_first_instruction",
+    "binary": "reliaburger::owned_rootless",
+    "test": "rootless_short_job_has_network_before_its_first_instruction"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "rootless_port_and_launcher_survive_recovery_and_helper_replacement",
+    "binary": "reliaburger::owned_rootless",
+    "test": "rootless_port_and_launcher_survive_recovery_and_helper_replacement"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "rootless_helper_dying_while_its_readiness_is_probed_is_replaced",
+    "binary": "reliaburger::owned_rootless",
+    "test": "rootless_helper_dying_while_its_readiness_is_probed_is_replaced"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "rootless_helper_that_keeps_dying_is_reported_then_recovers",
+    "binary": "reliaburger::owned_rootless",
+    "test": "rootless_helper_that_keeps_dying_is_reported_then_recovers"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "rootless_pid_answers_while_state_reads_hold_the_instance",
+    "binary": "reliaburger::owned_rootless",
+    "test": "rootless_pid_answers_while_state_reads_hold_the_instance"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "rootless_caller_death_recovers_without_an_adoption_record",
+    "binary": "reliaburger::owned_rootless",
+    "test": "rootless_caller_death_recovers_without_an_adoption_record"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "caller_death_during_rootless_helper_startup_cannot_release_the_payload_later",
+    "binary": "reliaburger::owned_rootless",
+    "test": "caller_death_during_rootless_helper_startup_cannot_release_the_payload_later"
+  },
+  {
+    "source": "tests/owned_rootless.rs",
+    "function": "helper_refuses_a_container_belonging_to_a_different_live_owner",
+    "binary": "reliaburger::owned_rootless",
+    "test": "helper_refuses_a_container_belonging_to_a_different_live_owner"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_preparation_recovers_original_intent_and_retires_without_adoption",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_preparation_recovers_original_intent_and_retires_without_adoption"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_adoption_validates_generation_and_restores_live_network",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_adoption_validates_generation_and_restores_live_network"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_completed_log_reader_cannot_block_a_replacement_generation",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_completed_log_reader_cannot_block_a_replacement_generation"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "following_a_large_capture_after_a_restart_does_not_hold_the_runtime",
+    "binary": "reliaburger::owned_runc",
+    "test": "following_a_large_capture_after_a_restart_does_not_hold_the_runtime"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "generated_cgroup_path_matches_the_actual_container_before_its_first_instruction",
+    "binary": "reliaburger::owned_runc",
+    "test": "generated_cgroup_path_matches_the_actual_container_before_its_first_instruction"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "recovered_source_identity_belongs_to_the_container_not_its_launcher",
+    "binary": "reliaburger::owned_runc",
+    "test": "recovered_source_identity_belongs_to_the_container_not_its_launcher"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "source_identity_refuses_a_container_moved_out_of_its_original_cgroup",
+    "binary": "reliaburger::owned_runc",
+    "test": "source_identity_refuses_a_container_moved_out_of_its_original_cgroup"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "retiring_a_rollout_predecessor_preserves_its_live_successor",
+    "binary": "reliaburger::owned_runc",
+    "test": "retiring_a_rollout_predecessor_preserves_its_live_successor"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases",
+    "binary": "reliaburger::owned_runc",
+    "test": "retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "restart_recovers_a_retiring_generation_that_still_holds_its_address",
+    "binary": "reliaburger::owned_runc",
+    "test": "restart_recovers_a_retiring_generation_that_still_holds_its_address"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "previous_boot_intent_cannot_start_or_remove_conflicting_live_resources",
+    "binary": "reliaburger::owned_runc",
+    "test": "previous_boot_intent_cannot_start_or_remove_conflicting_live_resources"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "restart_after_unit_cgroup_stop_recovers_a_running_generation",
+    "binary": "reliaburger::owned_runc",
+    "test": "restart_after_unit_cgroup_stop_recovers_a_running_generation"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "restart_after_unit_cgroup_stop_recovers_a_retiring_generation",
+    "binary": "reliaburger::owned_runc",
+    "test": "restart_after_unit_cgroup_stop_recovers_a_retiring_generation"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "apply_on_any_node_places_across_the_cluster",
+    "binary": "reliaburger::placement",
+    "test": "apply_on_any_node_places_across_the_cluster"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
+    "binary": "reliaburger::placement",
+    "test": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume",
+    "binary": "reliaburger::placement",
+    "test": "a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "restarting_bun_on_a_volume_apps_node_never_moves_the_app",
+    "binary": "reliaburger::placement",
+    "test": "restarting_bun_on_a_volume_apps_node_never_moves_the_app"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "autoscaler_scales_up_on_high_metric",
+    "binary": "reliaburger::placement",
+    "test": "autoscaler_scales_up_on_high_metric"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "autoscaler_scales_up_from_real_collector_cpu",
+    "binary": "reliaburger::placement",
+    "test": "autoscaler_scales_up_from_real_collector_cpu"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "fault_injection_rejected_when_quorum_at_risk",
+    "binary": "reliaburger::placement",
+    "test": "fault_injection_rejected_when_quorum_at_risk"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "partition_isolates_a_node_for_real",
+    "binary": "reliaburger::placement",
+    "test": "partition_isolates_a_node_for_real"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "authenticated_node_kill_fails_and_restores_a_real_cluster_member",
+    "binary": "reliaburger::placement",
+    "test": "authenticated_node_kill_fails_and_restores_a_real_cluster_member"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "losing_the_leader_node_places_only_its_replica_on_the_survivors",
+    "binary": "reliaburger::placement",
+    "test": "losing_the_leader_node_places_only_its_replica_on_the_survivors"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "a_killed_worker_has_its_replica_rescheduled_on_the_survivors",
+    "binary": "reliaburger::placement",
+    "test": "a_killed_worker_has_its_replica_rescheduled_on_the_survivors"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "a_kill_sent_to_one_node_kills_a_replica_on_another",
+    "binary": "reliaburger::placement",
+    "test": "a_kill_sent_to_one_node_kills_a_replica_on_another"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs",
+    "binary": "reliaburger::placement",
+    "test": "a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "follow_and_top_cover_every_node_and_survive_one_leaving",
+    "binary": "reliaburger::placement",
+    "test": "follow_and_top_cover_every_node_and_survive_one_leaving"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "tui_logs_history_and_events_cover_every_node_and_name_a_missing_one",
+    "binary": "reliaburger::placement",
+    "test": "tui_logs_history_and_events_cover_every_node_and_name_a_missing_one"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "wtf_and_path_reach_every_node_through_the_entry_node",
+    "binary": "reliaburger::placement",
+    "test": "wtf_and_path_reach_every_node_through_the_entry_node"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "ingress_reaches_nodes_without_local_replicas",
+    "binary": "reliaburger::placement",
+    "test": "ingress_reaches_nodes_without_local_replicas"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "concurrent_node_kills_and_leader_change_preserve_reserved_capacity",
+    "binary": "reliaburger::placement",
+    "test": "concurrent_node_kills_and_leader_change_preserve_reserved_capacity"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "follower_apply_preserves_user_authority_for_administrative_manifests",
+    "binary": "reliaburger::placement",
+    "test": "follower_apply_preserves_user_authority_for_administrative_manifests"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "capacity_refusal_from_the_live_scheduler_forwards_without_committing_an_app",
+    "binary": "reliaburger::placement",
+    "test": "capacity_refusal_from_the_live_scheduler_forwards_without_committing_an_app"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "leased_storage_cleanup_waits_for_former_placements_and_failed_deletion",
+    "binary": "reliaburger::placement",
+    "test": "leased_storage_cleanup_waits_for_former_placements_and_failed_deletion"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale",
+    "binary": "reliaburger::placement",
+    "test": "rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale"
+  },
+  {
+    "source": "tests/relish_test_catalogue.rs",
+    "function": "runc_catalogue_decrypts_secrets_using_only_the_public_key_api",
+    "binary": "reliaburger::relish_test_catalogue",
+    "test": "runc_catalogue_decrypts_secrets_using_only_the_public_key_api"
+  },
+  {
+    "source": "tests/relish_test_catalogue.rs",
+    "function": "runc_catalogue_verifies_workload_spiffe_certificates",
+    "binary": "reliaburger::relish_test_catalogue",
+    "test": "runc_catalogue_verifies_workload_spiffe_certificates"
+  },
+  {
+    "source": "tests/relish_test_catalogue.rs",
+    "function": "runc_catalogue_deploys_the_exact_image_pushed_to_pickle",
+    "binary": "reliaburger::relish_test_catalogue",
+    "test": "runc_catalogue_deploys_the_exact_image_pushed_to_pickle"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "single_node_upgrade_preserves_running_containers",
+    "binary": "reliaburger::self_upgrade",
+    "test": "single_node_upgrade_preserves_running_containers"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "single_node_rollback_reverts_to_previous_version",
+    "binary": "reliaburger::self_upgrade",
+    "test": "single_node_rollback_reverts_to_previous_version"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "failed_upgrade_triggers_automatic_rollback",
+    "binary": "reliaburger::self_upgrade",
+    "test": "failed_upgrade_triggers_automatic_rollback"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "version_retention_gc_keeps_last_three",
+    "binary": "reliaburger::self_upgrade",
+    "test": "version_retention_gc_keeps_last_three"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "upgrade_rejects_bad_external_signature",
+    "binary": "reliaburger::self_upgrade",
+    "test": "upgrade_rejects_bad_external_signature"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "same_version_upgrade_never_swaps_silently",
+    "binary": "reliaburger::self_upgrade",
+    "test": "same_version_upgrade_never_swaps_silently"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "isolated_replacement_reverts_without_restarting_its_workload",
+    "binary": "reliaburger::self_upgrade",
+    "test": "isolated_replacement_reverts_without_restarting_its_workload"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "rolling_upgrade_walks_workers_council_then_leader",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "rolling_upgrade_walks_workers_council_then_leader"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_address",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_address"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "start_refuses_same_version_other_bytes_and_unrequested_downgrades",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "start_refuses_same_version_other_bytes_and_unrequested_downgrades"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "upgrade_failure_pauses_cluster_and_reverts_node",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "upgrade_failure_pauses_cluster_and_reverts_node"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "cluster_rollback_returns_every_node_to_previous_version",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "cluster_rollback_returns_every_node_to_previous_version"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "start_refuses_when_a_node_cannot_verify_network_upgrades",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "start_refuses_when_a_node_cannot_verify_network_upgrades"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "start_refuses_a_candidate_with_other_formats_before_recording_a_run",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "start_refuses_a_candidate_with_other_formats_before_recording_a_run"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "rollback_to_a_version_the_nodes_lack_is_refused_before_recording_a_run"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "paused_upgrade_can_be_aborted_or_replaced_by_a_rollback",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "paused_upgrade_can_be_aborted_or_replaced_by_a_rollback"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
+    "function": "a_registry_outage_at_directive_time_does_not_pause_the_upgrade",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "a_registry_outage_at_directive_time_does_not_pause_the_upgrade"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "crane_logs_in_pushes_and_pulls_over_tls",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::crane_logs_in_pushes_and_pulls_over_tls"
+  },
+  {
+    "source": "tests/test_storage.rs",
+    "function": "lease_loop_storage_keeps_busy_mount_then_retries_cleanup",
+    "binary": "reliaburger::test_storage",
+    "test": "lease_loop_storage_keeps_busy_mount_then_retries_cleanup"
+  },
+  {
+    "source": "tests/test_storage.rs",
+    "function": "lease_btrfs_storage_deletes_subvolume_and_preserves_other_namespace",
+    "binary": "reliaburger::test_storage",
+    "test": "lease_btrfs_storage_deletes_subvolume_and_preserves_other_namespace"
+  },
+  {
+    "source": "tests/test_storage.rs",
+    "function": "lease_unowned_nested_mount_keeps_storage_until_removed",
+    "binary": "reliaburger::test_storage",
+    "test": "lease_unowned_nested_mount_keeps_storage_until_removed"
+  },
+  {
+    "source": "tests/test_storage.rs",
+    "function": "lease_loop_storage_survives_owner_process_death",
+    "binary": "reliaburger::test_storage",
+    "test": "lease_loop_storage_survives_owner_process_death"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http",
+    "binary": "reliaburger::owned_runc",
+    "test": "capacity_contract::runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "a_task_array_survives_losing_a_node_mid_run",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "a_task_array_survives_losing_a_node_mid_run"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_process_trees",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_process_trees"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success"
+  }
+]

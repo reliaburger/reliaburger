@@ -101,8 +101,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 47; this binary (reliaburger v0.1.4 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 33, state 49; this binary (reliaburger v0.1.4 (465fdeb)) needs protocol 34, state 49. …
+incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 40, state 58; this binary (reliaburger v0.1.6 (465fdeb)) needs protocol 46, state 63. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -145,8 +145,8 @@ paused run, because no node moved.
 
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
-`start` fails with both format pairs. A 0.1.3 cluster refuses 0.1.4 like this:
-`refusing to upgrade to v0.1.4: incompatible binary: found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49`.
+`start` fails with both format pairs. A 0.1.5 cluster refuses 0.1.6 like this:
+`refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -214,6 +214,84 @@ directories aside (or `relish local destroy --yes` a laptop cluster), install
 0.1.4 and re-apply your apps. 0.1.3's leader refuses the upgrade before it
 records a run, with
 `found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49`.
+
+### Upgrading from 0.1.4
+
+0.1.5 can't roll onto a 0.1.4 cluster. The leader sweeps expired API tokens
+through a new Raft entry, and each peer answers the token list for itself
+with scope and last use (F05 I2). The codebase-audit fixes add more to the
+council's log and to what nodes exchange: per-blob upload receipts in
+Pickle, owned metrics and log archive prefixes, batch attempt identities
+and whole-pass admission, run-before migration fences, webhook trigger
+receipts, and complete spec fingerprints for `apply --dry-run`. So the
+protocol moved from 34 to 40 and the state format from 49 to 58. Recreate
+the cluster the same way as [from 0.1.0](#upgrading-from-010): move the data
+directories aside (or `relish local destroy --yes` a laptop cluster), install
+0.1.5 and re-apply your apps. 0.1.4's leader refuses the upgrade before it records a run, with
+`found protocol 40, state 58; this cluster (reliaburger v0.1.4 (…)) needs protocol 34, state 49`.
+
+### Upgrading from 0.1.5
+
+0.1.6 can't roll onto a 0.1.5 cluster. Most of what it adds lives in the
+council's state or crosses the wire between nodes:
+
+- apps and jobs store their image bound to a digest
+  (`nginx:1.27@sha256:…`), in their specs, deploy history and the
+  pull-through cache (F03a);
+- a council holds several CAs per role, with a record of every node's leaf,
+  and sends the trusted set in joins, signing answers and node snapshots
+  (F04 R1, R2);
+- rotating an intermediate adds Raft entries for the pending CSR and for each
+  node's trust acknowledgement, and a call a node makes to the leader
+  (F04 R4);
+- a rotated API token keeps its old secret beside the new one for the grace
+  period (F05 I3);
+- a namespace can have its own secret key, a new field on every namespace
+  (F05 I4).
+
+So the protocol moved from 40 to 46 and the state format from 58 to 63.
+Recreate the cluster the same way as [from 0.1.0](#upgrading-from-010): move
+the data directories aside (or `relish local destroy --yes` a laptop
+cluster), install 0.1.6 and re-apply your apps. 0.1.5's leader refuses the
+upgrade before it records a run, with
+`found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58`.
+
+Four things behave differently once you're on 0.1.6:
+
+- **Images bind to a digest at apply.** `relish apply` resolves each tag and
+  stores `name:tag@sha256:…`, so every node and every restart runs the same
+  bytes. Applying again is how you pick up a tag that has moved. An apply
+  fails if the registry doesn't answer and the pull-through cache doesn't
+  hold the tag
+  ([images and volumes](manual/11_images-and-volumes.md)).
+- **`deployer` and `read-only` tokens expire after 90 days** unless you pass
+  `--ttl-days` or `--no-expiry` to `relish token create`, or change
+  `[security.tokens] default_ttl`. Admin tokens still get no default expiry.
+  Tokens you re-create after the upgrade pick up the default, so check what
+  your CI holds ([security](manual/10_security.md)).
+- **Back up the root CA yourself.** Run `relish ca backup` on the node where
+  `relish init` ran, as soon as the new cluster is up, and store the file off
+  the cluster. `relish ca rotate` asks for it to sign a new intermediate, and
+  the root's key never enters the council
+  ([security](manual/10_security.md)).
+- **Namespace secret keys are opt-in.** Every namespace keeps sharing the
+  cluster key until you set `secret_key = true` in its `[namespace.X]`
+  section, so values encrypted to the cluster key keep working. Opting in
+  re-seals the namespace's apps; re-encrypt the values in your own config
+  with `relish secret pubkey --namespace X`, or the next apply puts the
+  cluster-sealed ones back.
+
+### Upgrading from 0.1.6
+
+0.1.6 is the latest release. The next two, 0.2.0 and the 0.3.0 appliance
+release, aren't out yet, and neither can roll onto a 0.1.6 cluster. 0.2.0's
+task arrays and job definitions moved main to protocol 48 and state format 65.
+The 0.3.0 train carries those plus the appliance OS rollout and the
+cluster-wide council size, both new Raft requests and new fields in council
+state, so its builds are at protocol 49 and state format 66. Recreate the
+cluster the same way as [from 0.1.0](#upgrading-from-010). A 0.1.6 leader
+offered a 0.3.0 development build refuses it before it records a run, with
+`found protocol 49, state 66; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63`.
 
 ## Signing identity
 
@@ -314,7 +392,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.2` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.1.6` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -399,8 +477,9 @@ the real `curl … | sh` install against it on every host we advertise.
    cluster, uninstalls, and writes a Markdown record with the timings. It never
    uses `~/.reliaburger` and fails if that directory's top level or
    `~/.local/bin/relish` changed. Pass `setup --quickstart` options after
-   `--`, for example `-- --api-port 29117 --ingress-port 28080` when another
-   cluster holds the default ports, and `--keep` to leave a failed run for
+   `--`, for example `-- --api-port 29117 --ingress-port 28080 --registry-port 25050`
+   when another cluster holds the default ports (the registry forward, 15050,
+   clashes too), and `--keep` to leave a failed run for
    debugging (then `relish local destroy --yes` and `relish uninstall --yes`
    with the same `RELIABURGER_HOME`).
 

@@ -7,10 +7,13 @@ use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, tra
 use super::*;
 use crate::grill::mock::MockGrill;
 
+mod fault_coverage;
 mod loop_harness;
 mod loop_rule;
+mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod upgrade_answer;
 
 #[test]
 fn trace_targets_are_positional_arguments_not_shell_source() {
@@ -561,6 +564,53 @@ async fn reporting_binds_execution_to_the_original_runtime_specification() {
             assert!(report.instances[0].execution.is_none());
         }
     }
+}
+
+/// #476: a retired Runc intent keeps environment names, not values. Its
+/// launch must still bind to the instance that started it.
+#[tokio::test]
+async fn reporting_binds_a_retired_launch_whose_environment_values_were_scrubbed() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let config = Config::parse(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\n[app.web.env]\nAPI_TOKEN = 'decrypted'\n",
+    )
+    .unwrap();
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    let id = InstanceId("default__web-0".into());
+    let spec = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    assert!(spec.process.env.contains(&"API_TOKEN=decrypted".into()));
+    let launch = crate::grill::RuntimeLaunch {
+        instance_id: id.clone(),
+        spec: spec.without_environment_values(),
+        generation: crate::grill::RuntimeGeneration::process("retired"),
+        network_reference: None,
+    };
+    let expected = crate::grill::RuntimeExecution {
+        instance_id: id.clone(),
+        generation: launch.generation.clone(),
+    };
+    grill.set_launch_inventory(vec![launch.clone()]).await;
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    assert_eq!(rx.await.unwrap().instances[0].execution, Some(expected));
+
+    // Dropping a variable is still a different request.
+    let mut other = launch;
+    other.spec.process.env.clear();
+    grill.set_launch_inventory(vec![other]).await;
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    assert!(rx.await.unwrap().instances[0].execution.is_none());
 }
 
 #[tokio::test]
@@ -2033,11 +2083,16 @@ async fn a_probe_that_lands_after_a_kill_keeps_the_restarted_instance_probed() {
 }
 
 #[tokio::test]
-async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
+async fn deployment_publishes_thirty_three_backends_and_retains_runtime_owners() {
     let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
     let mut config = basic_config();
-    config.app.get_mut("web").unwrap().replicas =
-        crate::config::Replicas::Fixed(crate::onion::types::MAX_BACKENDS as u32 + 1);
+    let app = config.app.get_mut("web").unwrap();
+    let replicas = crate::onion::types::MAX_BACKENDS + 1;
+    app.replicas = crate::config::Replicas::Fixed(replicas as u32);
+    app.ingress = Some(toml::from_str("host = 'large.web.test'\ntls = 'disabled'").unwrap());
+    let view = agent.service_map_watch();
+    let routes = agent.routing_table_handle();
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
     let events = drain_deploy(&mut agent, config).await;
     let owners: std::collections::HashSet<_> = agent
         .supervisor
@@ -2050,18 +2105,40 @@ async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
         .into_iter()
         .filter(|(call, id)| call == "create" && !owners.contains(id))
         .collect();
+    let published = view
+        .borrow()
+        .resolve(&service)
+        .map(|entry| entry.backends.len());
+    let routed = routes
+        .read()
+        .await
+        .lookup("large.web.test", "/")
+        .map(|route| route.backends.len());
     agent.retire_workload("web", "default").await.unwrap();
     assert!(
         unowned.is_empty(),
         "created runtimes lost their cleanup owner: {unowned:?}"
     );
+    assert_eq!(expect_complete(&events).0, replicas);
+    assert_eq!(owners.len(), replicas);
+    assert_eq!(published, Some(replicas), "DNS must see the full catalogue");
+    assert_eq!(
+        routed,
+        Some(replicas),
+        "Wrapper must see the full catalogue"
+    );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, ApplyEvent::Complete { .. })),
-        "deployment completed despite refusing an endpoint: {events:?}"
+            .any(|event| matches!(event, ApplyEvent::Error { .. }))
     );
-    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("cannot publish backend"))));
+    assert!(view.borrow().resolve(&service).is_none());
+    assert!(routes.read().await.lookup("large.web.test", "/").is_none());
+    assert!(
+        owners
+            .iter()
+            .all(|id| agent.supervisor.get_instance(id).is_none())
+    );
 }
 
 #[tokio::test]
@@ -2333,6 +2410,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rerun_unknown_jobs: bool,
     ) {
         let worker = DeployWorker {
+            prepared_batch_jobs: None,
             rerun_unknown_jobs,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
@@ -3131,6 +3209,7 @@ fn require_signatures_policy() -> crate::config::node::TrustPolicySection {
     crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![],
+        ..Default::default()
     }
 }
 
@@ -3172,6 +3251,29 @@ async fn deploy_creates_managed_volume_directories() {
 
     shutdown.cancel();
     let _ = handle.await;
+}
+
+/// The agent rechecks the full layout before creating the first directory.
+#[tokio::test]
+async fn overlapping_volume_layout_is_refused_before_any_directory_is_provisioned() {
+    let volumes = tempfile::tempdir().unwrap();
+    let (mut agent, tx, shutdown) = test_agent();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let handle = tokio::spawn(async move { agent.run().await });
+    let config = Config::parse(
+        "[app.web]\nimage='myapp:v1'\n[[app.web.volumes]]\npath='/data'\n[[app.web.volumes]]\npath='/data.img'\n",
+    ).unwrap();
+    // Direct agent dispatch deliberately bypasses HTTP configuration admission.
+    let events = send_deploy(&tx, config).await;
+    shutdown.cancel();
+    handle.await.unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, ApplyEvent::Error { message } if message.contains("overlap"))
+        ),
+        "{events:?}"
+    );
+    assert!(!volumes.path().join("default/web").exists());
 }
 
 /// Host-path volumes are the operator's responsibility — deploys
@@ -3757,6 +3859,7 @@ async fn relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key() 
     agent.set_trust_policy(crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![operator.public_key_base64()],
+        ..Default::default()
     });
 
     // Signed with the trusted key: admitted, pinned to the signed digest.
@@ -3793,6 +3896,7 @@ async fn moving_a_tag_after_signing_leaves_the_new_digest_unsigned() {
     agent.set_trust_policy(crate::config::node::TrustPolicySection {
         require_signatures: true,
         keys: vec![operator.public_key_base64()],
+        ..Default::default()
     });
 
     // Someone re-pushes v1 with different bytes: the signature covered
@@ -3815,6 +3919,173 @@ async fn signing_a_digest_the_catalogue_does_not_hold_is_refused() {
         matches!(&result, Err(BunError::SecurityError { reason }) if reason.contains("refused")),
         "got: {result:?}"
     );
+}
+
+// --- upstream trust rules at deploy (F03 U2, #361) ---
+
+/// `[images.trust_policy]` allowing only Docker Hub's official images.
+fn official_images_only() -> crate::config::node::TrustPolicySection {
+    crate::config::node::TrustPolicySection {
+        upstream: vec![crate::config::node::UpstreamTrustRule {
+            pattern: "docker.io/library/*".to_string(),
+            require_signatures: false,
+            cosign_keys: vec![],
+        }],
+        upstream_default: crate::config::node::UpstreamDefault { allow: false },
+        ..Default::default()
+    }
+}
+
+/// A council-backed agent whose runtime pulls images, under `policy`.
+async fn pulling_agent(
+    raft_port: u16,
+    policy: crate::config::node::TrustPolicySection,
+) -> (Arc<CouncilNode>, BunAgent<MockGrill>) {
+    let council = catalogue_council(raft_port).await;
+    let mut agent = agent_with_council(council.clone());
+    agent
+        .supervisor
+        .grill()
+        .set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    agent.set_trust_policy(policy);
+    (council, agent)
+}
+
+/// Bun is the enforcement: an image the apply never judged (a spec already
+/// in Raft, a node with a stricter policy) is refused at deploy, by name.
+#[tokio::test]
+async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
+    let (_council, agent) = pulling_agent(9310, official_images_only()).await;
+    let refused = agent
+        .enforce_image_signature(&app("ghcr.io/evil/miner:1"))
+        .await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|reason| reason.contains("ghcr.io/evil/miner:1")),
+        "{refused:?}"
+    );
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let allowed = agent
+        .enforce_image_signature(&app(&format!("nginx:1.27@{digest}")))
+        .await;
+    assert_eq!(allowed, Ok(None));
+}
+
+/// The rules are for images from outside Pickle.
+#[tokio::test]
+async fn a_deploy_leaves_pickle_images_to_require_signatures() {
+    let (council, agent) = pulling_agent(9311, official_images_only()).await;
+    push_manifest(&council, "team/web", "v1", &"5".repeat(64)).await;
+    let result = agent
+        .enforce_image_signature(&app("localhost:5050/team/web:v1"))
+        .await;
+    assert_eq!(result, Ok(None));
+}
+
+/// Under ProcessGrill an image is a placeholder nobody pulls, so there's
+/// nothing for the upstream rules to judge (decision 5).
+#[tokio::test]
+async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
+    let council = catalogue_council(9312).await;
+    let mut agent = agent_with_council(council);
+    agent.set_trust_policy(official_images_only());
+    let result = agent
+        .enforce_image_signature(&app("proc-grill:image-ignored"))
+        .await;
+    assert_eq!(result, Ok(None));
+}
+
+// --- cosign signatures on upstream images at deploy (F03 U3, #361) ---
+
+/// A standalone agent whose runtime pulls images, requiring a cosign
+/// signature by `key` on `ghcr.io/acme/*`, reading signatures from the
+/// fixture registry (which holds the `.sig` for the fixture digest only).
+fn cosign_agent(key: &str) -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    agent.set_trust_policy(crate::config::node::TrustPolicySection {
+        upstream: vec![crate::config::node::UpstreamTrustRule {
+            pattern: "ghcr.io/acme/*".to_string(),
+            require_signatures: true,
+            cosign_keys: vec![key.to_string()],
+        }],
+        ..Default::default()
+    });
+    let registry: Arc<dyn crate::pickle::upstream::UpstreamRegistry> =
+        Arc::new(crate::pickle::cosign::fixture::FixtureRegistry { signed: true });
+    agent.set_signature_source(crate::pickle::cosign::SignatureSource::new(
+        registry.clone(),
+        registry,
+    ));
+    (agent, tx, shutdown)
+}
+
+fn web_config(image: &str) -> Config {
+    Config::parse(&format!("[app.web]\nimage = \"{image}\"\n")).unwrap()
+}
+
+/// Deploy `image` through the agent loop; the error event's message, if any.
+async fn deploy_refusal(key: &str, image: &str) -> Option<String> {
+    let (agent, tx, shutdown) = cosign_agent(key);
+    let handle = tokio::spawn(async move {
+        let mut agent = agent;
+        agent.run().await;
+    });
+    let events = send_deploy(&tx, web_config(image)).await;
+    shutdown.cancel();
+    let _ = handle.await;
+    events.into_iter().find_map(|event| match event {
+        ApplyEvent::Error { message } => Some(message),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn an_image_signed_by_a_trusted_cosign_key_deploys() {
+    use crate::pickle::cosign::fixture::{PUBLIC_KEY, SIGNED_DIGEST};
+    let image = format!("ghcr.io/acme/web:1.2@{SIGNED_DIGEST}");
+    assert_eq!(deploy_refusal(PUBLIC_KEY, &image).await, None);
+}
+
+#[tokio::test]
+async fn an_unsigned_image_is_refused_at_deploy_by_name() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    let image = format!("ghcr.io/acme/web:1.2@sha256:{}", "1".repeat(64));
+    let refusal = deploy_refusal(PUBLIC_KEY, &image).await.expect("refused");
+    assert!(refusal.contains(&image), "{refusal}");
+    assert!(refusal.contains("no cosign signature"), "{refusal}");
+}
+
+#[tokio::test]
+async fn an_image_signed_by_another_key_is_refused_at_deploy_by_name() {
+    use crate::pickle::cosign::fixture::{OTHER_KEY, SIGNED_DIGEST};
+    let image = format!("ghcr.io/acme/web:1.2@{SIGNED_DIGEST}");
+    let refusal = deploy_refusal(OTHER_KEY, &image).await.expect("refused");
+    assert!(refusal.contains(&image), "{refusal}");
+    assert!(
+        refusal.contains("verifies under the trusted keys"),
+        "{refusal}"
+    );
+}
+
+/// A signature covers a digest, so a tag the apply didn't bind can't be
+/// checked; the deploy says so rather than guess.
+#[tokio::test]
+async fn an_unbound_image_under_a_signature_rule_is_refused() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    let refusal = deploy_refusal(PUBLIC_KEY, "ghcr.io/acme/web:1.2")
+        .await
+        .expect("refused");
+    assert!(refusal.contains("ghcr.io/acme/web:1.2"), "{refusal}");
+    assert!(refusal.contains("isn't bound"), "{refusal}");
+}
+
+/// Images no signature rule names deploy as before.
+#[tokio::test]
+async fn an_image_outside_the_signature_rules_needs_no_signature() {
+    use crate::pickle::cosign::fixture::PUBLIC_KEY;
+    assert_eq!(deploy_refusal(PUBLIC_KEY, "nginx:1.27").await, None);
 }
 
 #[tokio::test]
@@ -8780,7 +9051,7 @@ fn adoption_record(
     };
     let app_spec: AppSpec = toml::from_str(spec_toml).unwrap();
     crate::grill::records::InstanceRecord {
-        schema: 2,
+        schema: crate::grill::records::RECORD_SCHEMA,
         instance_id: instance.to_string(),
         namespace: "default".to_string(),
         app_name: app.to_string(),
@@ -8790,6 +9061,7 @@ fn adoption_record(
         runtime: crate::grill::records::RuntimeKind::Process,
         pid: 4242,
         pid_started_at: 1000,
+        boot_id: crate::grill::records::current_boot(),
         runc_container_id: None,
         log_stem: None,
         host_port: Some(30123),
@@ -8801,6 +9073,7 @@ fn adoption_record(
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "60".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -9229,7 +9502,8 @@ async fn started_rootless_instance_persists_network_recreation_state() {
 
     let persisted = crate::grill::records::load_records(records.path()).unwrap();
     assert_eq!(persisted.len(), 1);
-    assert_eq!(persisted[0].schema, 2);
+    assert_eq!(persisted[0].schema, crate::grill::records::RECORD_SCHEMA);
+    assert_eq!(persisted[0].boot_id, crate::grill::records::current_boot());
     assert_eq!(persisted[0].rootless_network, Some(rootless_network));
 }
 
@@ -9350,6 +9624,37 @@ async fn corrupt_adoption_record_never_sweeps_its_workload_identity() {
             .is_some(),
         "unreadable ownership was incorrectly treated as absence"
     );
+}
+
+#[tokio::test]
+async fn a_retired_stale_record_does_not_stop_the_other_instances_adopting() {
+    // #607: the runtime retires a generation whose record names another
+    // process; startup carries on with everything else on the node.
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let records = tempfile::tempdir().unwrap();
+    agent.set_records_dir(records.path().to_path_buf());
+    for (index, app) in ["frontend", "redis"].into_iter().enumerate() {
+        let mut record = adoption_record(&format!("default__{app}-0"), app, false);
+        record.host_port = Some(30123 + index as u16);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+    }
+    let stale = InstanceId("default__frontend-0".into());
+    let healthy = InstanceId("default__redis-0".into());
+    grill.set_adopt_result(&stale, false);
+    grill.set_adopt_result(&healthy, true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    assert!(agent.supervisor.get_instance(&stale).is_none());
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy).unwrap().state,
+        ContainerState::Running
+    );
+    let kept: Vec<_> = crate::grill::records::load_records(records.path())
+        .unwrap()
+        .into_iter()
+        .map(|record| record.instance_id)
+        .collect();
+    assert_eq!(kept, vec![healthy.0]);
 }
 
 #[tokio::test]
@@ -9491,8 +9796,10 @@ fn write_test_identity(
         uri,
         cert_der,
         private_key_der,
-        &hierarchy.workload.ca.certificate_der,
-        &hierarchy.root.ca.certificate_der,
+        &[
+            hierarchy.workload.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ],
         "adopted-jwt".to_string(),
     );
     let dir = crate::sesame::identity::instance_identity_dir(volumes, instance);
@@ -11091,6 +11398,7 @@ async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
     };
     let (response, reply) = oneshot::channel();
     agent.handle_command(answer(1, response)).await;
+    agent.finish_consumer_syncs().await;
     assert!(reply.await.unwrap().unwrap().published);
     assert!(lease.is_valid(), "publishing the leader's answer renews it");
     assert_eq!(backends(&agent, "web"), Some(vec![own.clone()]));
@@ -11130,6 +11438,7 @@ async fn a_lapsed_view_lease_keeps_local_backends_until_the_leader_answers() {
     // The next answer, even for the same catalogue, restores the rest.
     let (response, reply) = oneshot::channel();
     agent.handle_command(answer(1, response)).await;
+    agent.finish_consumer_syncs().await;
     assert!(reply.await.unwrap().unwrap().published);
     assert!(lease.is_valid());
     assert_eq!(agent.consumer_owner().unwrap().phase, ConsumerPhase::Active);
@@ -11250,6 +11559,7 @@ async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_rec
             response,
         })
         .await;
+    recovered.finish_consumer_syncs().await;
     let retry = reply.await.unwrap().unwrap();
     assert!(!retry.published);
     assert_eq!(retry.receipts, vec![1]);
@@ -11377,6 +11687,42 @@ async fn durable_consumer_catalogue_change_keeps_captured_requests_and_view() {
         backend
     );
     agent.drains.decrement_connections(&backend).await;
+}
+
+/// #478: a council recovered from a backup restores the catalogue
+/// generation the backup holds, older than what the dead council went on to
+/// publish. The node must follow the recovered council's new epoch, and
+/// still refuse a leader of the council it replaced.
+#[tokio::test]
+async fn durable_consumer_follows_a_recovered_council_and_still_refuses_the_replaced_one() {
+    let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+    let (_, ingress) = cluster_publication_fixture();
+    // The last backup was taken at generation 2; the old council published
+    // generation 3 before every voter died.
+    agent
+        .synchronise_consumer(3, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    let mut backup = crate::council::types::DesiredState::default();
+    backup.endpoint_withdrawals.generation = 2;
+    let recovered =
+        crate::council::state_machine::CouncilStateMachine::from_recovered_state(backup)
+            .desired_state()
+            .await
+            .endpoint_withdrawals
+            .generation;
+    let result = agent
+        .synchronise_consumer(recovered, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .expect("the recovered council's publication was refused");
+    assert!(result.published);
+    assert!(
+        agent
+            .synchronise_consumer(4, catalog, ingress, vec![])
+            .await
+            .is_err(),
+        "a leader of the replaced council was accepted after recovery"
+    );
 }
 
 #[tokio::test]
@@ -11762,6 +12108,176 @@ async fn deploy_before_its_committed_allocation_leaves_nothing_for_the_retry() {
     let events = drain_deploy(&mut agent, basic_config()).await;
     let (_, instances) = expect_complete(&events);
     assert_eq!(instances, ["default__web-0".to_string()]);
+}
+
+/// A consumer node running `web-0`, whose published view of `web` also
+/// names a replica on another node. Returns the agent, its records and
+/// `web`'s VIP.
+async fn consumer_web_fixture() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::vip::VirtualIP,
+) {
+    use crate::onion::catalog::CatalogBackend;
+    use crate::onion::service_id::ServiceId;
+    let (mut agent, root, catalog) = clustered_allocation_fixture().await;
+    agent.supervisor.grill().set_pid(std::process::id());
+    let (_, ingress) = cluster_publication_fixture();
+    let web = ServiceId::new("default", "web");
+    let remote = catalog.services["default__remote"].clone();
+    let elsewhere = CatalogBackend {
+        execution: None,
+        node_id: "other-node".into(),
+        node_ip: "192.168.1.2".parse().unwrap(),
+        host_port: 30003,
+        healthy: true,
+    };
+    let with_web = |backends: Vec<CatalogBackend>| {
+        catalog
+            .reconcile([
+                (
+                    ServiceId::new("default", "remote"),
+                    remote.port,
+                    remote.backends.clone(),
+                ),
+                (web.clone(), 8080, backends),
+            ])
+            .unwrap()
+    };
+    agent
+        .synchronise_consumer(
+            2,
+            with_web(vec![elsewhere.clone()]),
+            ingress.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+
+    // The leader learns of the local replica and publishes both.
+    let local = InstanceId("default__web-0".into());
+    let execution = crate::grill::RuntimeExecution {
+        instance_id: local.clone(),
+        generation: crate::grill::RuntimeGeneration::process("original"),
+    };
+    let spec: crate::grill::OciSpec = serde_json::from_value(serde_json::json!({
+        "root": {"path": "/fixture", "readonly": true},
+        "process": {"args": ["/app"], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+        "mounts": [], "linux": {"namespaces": []},
+    }))
+    .unwrap();
+    agent
+        .supervisor
+        .grill()
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: local.clone(),
+            generation: execution.generation.clone(),
+            spec,
+            network_reference: None,
+        }])
+        .await;
+    let here = CatalogBackend {
+        execution: Some(execution),
+        node_id: "test".into(),
+        node_ip: "192.168.1.1".parse().unwrap(),
+        host_port: 30002,
+        healthy: true,
+    };
+    let committed = with_web(vec![here, elsewhere]);
+    let vip = committed.resolve(&web).unwrap().vip;
+    agent
+        .synchronise_consumer(3, committed, ingress, vec![])
+        .await
+        .unwrap();
+    let view = consumer_web_view(&agent);
+    assert_eq!(view.len(), 2, "the view should name both replicas");
+    assert!(view.iter().any(|backend| backend.local));
+    (agent, root, vip)
+}
+
+/// The backends the installed consumer view names for `web`.
+fn consumer_web_view(agent: &BunAgent<MockGrill>) -> Vec<crate::onion::types::BackendInstance> {
+    agent
+        .service_map_tx
+        .borrow()
+        .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
+        .map(|entry| entry.backends.clone())
+        .unwrap_or_default()
+}
+
+/// Whether an agent on this thread withdrew `vip`'s whole kernel entry
+/// since the last call. Unit tests have no eBPF data path, so the agent
+/// records the withdrawal instead.
+fn withdrew_whole_entry(vip: crate::onion::vip::VirtualIP) -> bool {
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    let withdrew = super::routing::take_whole_entry_withdrawals().contains(&vip);
+    // With the data path compiled in, an agent without a loaded handle
+    // withdraws nothing, whole or not.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    let withdrew = {
+        let _ = vip;
+        false
+    };
+    withdrew
+}
+
+/// #481: stopping this node's last replica of a service that still runs
+/// on other nodes withdrew the whole VIP from the kernel, so local clients
+/// got `EPERM` until the next catalogue arrived. The stop must take only
+/// this node's backends out of the installed view; the kernel entry is
+/// written from that same view, so it keeps the remote backends too.
+#[tokio::test]
+async fn stopping_the_last_local_replica_keeps_routing_to_other_nodes() {
+    let (mut agent, _root, vip) = consumer_web_fixture().await;
+    let before = consumer_web_view(&agent);
+    let _ = withdrew_whole_entry(vip);
+
+    agent.begin_app_stop("web", "default").await.unwrap();
+    assert!(
+        !withdrew_whole_entry(vip),
+        "the stop deleted the kernel entry, other nodes' backends included"
+    );
+    assert_eq!(
+        consumer_web_view(&agent),
+        before
+            .into_iter()
+            .filter(|backend| !backend.local)
+            .collect::<Vec<_>>(),
+        "the stop must withdraw only this node's backend, not the whole VIP"
+    );
+    assert!(agent.consumer_view_stale, "the next tick rebuilds the view");
+}
+
+/// #481, the rollout half: finishing a local rolling deploy withdrew the
+/// whole kernel entry the same way, the other node's backend and the new
+/// local replica included, until the next view refresh put it back.
+#[tokio::test]
+async fn a_local_rollout_keeps_routing_to_other_nodes() {
+    let (mut agent, _root, vip) = consumer_web_fixture().await;
+    let _ = withdrew_whole_entry(vip);
+
+    let mut changed = basic_config();
+    changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    expect_complete(&drain_deploy(&mut agent, changed).await);
+    assert!(
+        !withdrew_whole_entry(vip),
+        "the rollout deleted the kernel entry, other nodes' backends included"
+    );
+    let view = consumer_web_view(&agent);
+    assert!(
+        view.iter().any(|backend| !backend.local),
+        "the other node's backend left the view: {view:?}"
+    );
+    assert!(
+        !view
+            .iter()
+            .any(|backend| backend.local && backend.instance_id == "default__web-0"),
+        "the replaced replica is still routed: {view:?}"
+    );
 }
 
 /// A discovery-owning agent with a Pending `web` instance whose runtime
@@ -12183,6 +12699,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
                 cert_der: issued.certificate_der.clone(),
                 workload_ca_cert_der: vec![1],
                 root_ca_cert_der: vec![2],
+                ca_bundle_der: vec![vec![1], vec![2]],
                 jwt_token: Some("jwt".into()),
             }),
         )
@@ -12407,4 +12924,466 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
     );
     shutdown.cancel();
     task.await.unwrap();
+}
+
+async fn recovered_owned_exit_preserves_retirement_provenance(
+    runtime: crate::grill::records::RuntimeKind,
+) {
+    use crate::bun::jobs::{BatchExecutionOwnership, JobInventory, JobPhase, RecordedJob};
+    let records = tempfile::tempdir().unwrap();
+    let volumes = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(runtime);
+    let id = InstanceId("default__batch-retained-object-0".into());
+    let name = "batch-retained-object";
+    let spec = Config::parse(&format!("[job.{name}]\nimage='myapp:v1'\n"))
+        .unwrap()
+        .job
+        .remove(name)
+        .unwrap();
+    let job = RecordedJob {
+        name: name.into(),
+        namespace: "default".into(),
+        batch_execution: Some(BatchExecutionOwnership {
+            batch_id: 42,
+            logical_name: "migration".into(),
+            spec_digest: crate::meat::batch_execution::spec_digest("default", "migration", &spec)
+                .unwrap(),
+            observed_exit_code: Some(0),
+            observed_restart_count: Some(0),
+        }),
+        spec,
+        runtime,
+        generation: 1,
+        restart_count: 0,
+        phase: JobPhase::Exited { code: 0 },
+        runtime_absent: false,
+    };
+    crate::bun::jobs::persist_inventory(
+        records.path(),
+        JobInventory {
+            jobs: BTreeMap::from([(id.0.clone(), job)]),
+            retired: BTreeMap::new(),
+        },
+    )
+    .unwrap();
+    let mut record = adoption_record(&id.0, name, false);
+    record.is_job = true;
+    record.app_spec = None;
+    record.runtime = runtime;
+    record.runc_container_id =
+        (runtime == crate::grill::records::RuntimeKind::Runc).then(|| id.0.clone());
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_adopt_result(&id, false);
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+    assert_eq!(agent.recorded_jobs[&id.0].batch_terminal_exit(), Some(0));
+    // A confirmed process stop must retain the same object-absence distinction.
+    agent
+        .finish_app_stop(
+            name,
+            "default",
+            app_stop::AppStop {
+                instances: vec![id.clone()],
+                owns_job: true,
+                taken_restarts: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let compact = agent.release_retired_workload(name, "default").await;
+    if runtime == crate::grill::records::RuntimeKind::Process {
+        compact.unwrap();
+        assert_eq!(
+            agent.retired_batch_executions[&id.0].terminal_exit(),
+            Some(0)
+        );
+    } else {
+        assert!(
+            compact.is_err(),
+            "a retained stopped OCI object was compacted as absent"
+        );
+        assert!(
+            !agent.recorded_jobs[&id.0].runtime_absent,
+            "process exit became object-absence provenance"
+        );
+        assert!(agent.retired_batch_executions.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recovered_owned_process_exit_allows_positive_compact_retirement() {
+    recovered_owned_exit_preserves_retirement_provenance(
+        crate::grill::records::RuntimeKind::Process,
+    )
+    .await;
+}
+#[tokio::test]
+async fn recovered_owned_apple_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Apple)
+        .await;
+}
+#[tokio::test]
+async fn recovered_owned_runc_exit_keeps_retained_object_fenced() {
+    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Runc)
+        .await;
+}
+
+#[tokio::test]
+async fn admitting_a_batch_execution_encodes_the_job_inventory_once() {
+    // Each encoding validates and serialises the whole inventory, so with a
+    // nearly full checkpoint every extra pass cost seconds in a debug build
+    // and pushed publication past its bound (#592).
+    let records = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    let name = "batch-encoded-once";
+    let config = Config::parse(&format!(
+        "[job.{name}]\nimage='myapp:v1'\ncommand=['true']\n"
+    ))
+    .unwrap();
+    let labels = BTreeMap::from([(
+        name.to_string(),
+        crate::bun::batch::BatchExecutionLabel {
+            name: "migration".into(),
+            namespace: "default".into(),
+        },
+    )]);
+    let (events, _received) = mpsc::channel(64);
+    let before = agent.loop_stalls.reached(LoopStall::JobInventoryEncode);
+    agent
+        .begin_owned_batch(7, config, labels, events)
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::JobInventoryEncode) - before,
+        1,
+        "admission encoded the job inventory more than once"
+    );
+    assert!(
+        crate::bun::jobs::load(records.path())
+            .unwrap()
+            .contains_key("default__batch-encoded-once-0"),
+        "the admitted execution was not published"
+    );
+}
+
+#[tokio::test]
+async fn prerequisite_failure_is_durably_settled_before_the_gate_reports_failure() {
+    let records = tempfile::tempdir().unwrap();
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(1));
+    let events = drain_deploy(&mut agent, run_before_config()).await;
+    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+    assert_eq!(
+        agent.recorded_jobs[&id.0].phase,
+        crate::bun::jobs::JobPhase::Exited { code: 1 }
+    );
+    assert!(!agent.supervisor.get_instance(&id).unwrap().retry_pending);
+}
+
+#[tokio::test]
+async fn prerequisite_failed_attempt_cannot_claim_an_automatic_retry() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(1));
+    let _ = drain_deploy(&mut agent, run_before_config()).await;
+    agent.observe_job_exit(&id, Some(1)).await;
+    agent
+        .supervisor
+        .get_instance_mut(&id)
+        .unwrap()
+        .restart_count = 1;
+    assert!(
+        agent.claim_job_retry(&id).await.is_err(),
+        "a failed prerequisite must not restart outside its apply gate"
+    );
+}
+
+#[tokio::test]
+async fn prerequisite_trust_preflight_refuses_before_any_migration_launch() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    agent.trust_policy.require_signatures = true;
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(0));
+    let events = drain_deploy(&mut agent, run_before_config()).await;
+    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(operation, _)| operation == "create" || operation == "start"),
+        "unverified apply launched its migration: {:?}",
+        grill.calls()
+    );
+}
+
+#[tokio::test]
+async fn ordinary_cluster_job_receipt_requires_current_positive_terminal_evidence() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let config = job_config();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config).unwrap();
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Pending,
+        "startup Complete cannot release a still-running ordinary job reservation"
+    );
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(0));
+    agent.observe_job_exit(&id, Some(0)).await;
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Terminal
+    );
+}
+
+#[tokio::test]
+async fn ordinary_cluster_job_receipt_cannot_reuse_a_previous_generation_or_uncertain_publication()
+{
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = job_config();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config).unwrap();
+    agent
+        .recorded_jobs
+        .get_mut("default__migrate-0")
+        .unwrap()
+        .generation += 1;
+    assert!(
+        matches!(
+            agent.cluster_jobs_settlement(&receipt),
+            ClusterJobSettlement::Unknown(_)
+        ),
+        "a replacement generation cannot settle its predecessor's reservation"
+    );
+    agent
+        .recorded_jobs
+        .get_mut("default__migrate-0")
+        .unwrap()
+        .generation -= 1;
+    agent.job_store_uncertain = true;
+    assert!(matches!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Unknown(_)
+    ));
+}
+
+#[tokio::test]
+async fn ordinary_cluster_job_receipt_retains_retrying_failure_and_unconfirmed_stop() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = job_config();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config).unwrap();
+    let record = agent.recorded_jobs.get_mut("default__migrate-0").unwrap();
+    record.phase = crate::bun::jobs::JobPhase::Exited { code: 1 };
+    record.restart_count = 1;
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Pending
+    );
+    let record = agent.recorded_jobs.get_mut("default__migrate-0").unwrap();
+    record.phase = crate::bun::jobs::JobPhase::Stopped;
+    record.runtime_absent = false;
+    assert!(matches!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Unknown(_)
+    ));
+    agent
+        .recorded_jobs
+        .get_mut("default__migrate-0")
+        .unwrap()
+        .runtime_absent = true;
+    assert_eq!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Terminal
+    );
+}
+
+#[tokio::test]
+async fn cluster_cron_registration_ack_is_not_a_terminal_execution_receipt() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
+    agent.register_scheduled_jobs(&config).await.unwrap();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    assert!(
+        agent
+            .scheduled_jobs
+            .contains_key(&("tick".into(), "default".into()))
+    );
+    assert!(agent.recorded_jobs.is_empty());
+    let receipt = agent.capture_cluster_jobs(&config);
+    assert!(
+        match &receipt {
+            Err(_) => true,
+            Ok(receipt) => agent.cluster_jobs_settlement(receipt) != ClusterJobSettlement::Terminal,
+        },
+        "registration ACK cannot retire recurring ownership as an exited execution"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_ordinary_job_does_not_make_its_registered_cron_peer_terminal() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let mut config = job_config();
+    let schedule = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
+    config.job.extend(schedule.job);
+    agent.register_scheduled_jobs(&config).await.unwrap();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = agent.capture_cluster_jobs(&config);
+    let id = InstanceId("default__migrate-0".into());
+    grill.set_state(&id, ContainerState::Stopped);
+    grill.set_exit_code(&id, Some(0));
+    agent.observe_job_exit(&id, Some(0)).await;
+    assert!(
+        match &receipt {
+            Err(_) => true,
+            Ok(receipt) => agent.cluster_jobs_settlement(receipt) != ClusterJobSettlement::Terminal,
+        },
+        "ordinary exit must not silently erase registered scheduled ownership"
+    );
+}
+
+#[tokio::test]
+async fn scheduled_receipt_does_not_prove_retirement_when_schedule_publication_is_uncertain() {
+    use super::cluster_jobs::ClusterJobSettlement;
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let config = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
+    agent.register_scheduled_jobs(&config).await.unwrap();
+    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+    let receipt = super::cluster_jobs::ClusterJobReceipt {
+        executions: BTreeMap::new(),
+    };
+    agent.scheduled_jobs_store_uncertain = true;
+    assert!(matches!(
+        agent.cluster_jobs_settlement(&receipt),
+        ClusterJobSettlement::Unknown(_)
+    ));
+}
+
+#[tokio::test]
+async fn prerequisite_cannot_launch_under_a_still_registered_cron_identity() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let cron = Config::parse("[job.migrate]\nimage='test:v1'\nschedule='0 0 30 2 *'\n").unwrap();
+    agent.register_scheduled_jobs(&cron).await.unwrap();
+    let running = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    let (response, answer) = oneshot::channel();
+    tx.send(AgentCommand::PreparePrerequisites {
+        config: run_before_config(),
+        response,
+    })
+    .await
+    .unwrap();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+        .await
+        .expect("actual prerequisite preparation did not settle")
+        .unwrap();
+    if let Ok((_, operation)) = &prepared {
+        operation
+            .finish(
+                crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                "test-owned unlaunched preparation completed",
+            )
+            .await;
+    }
+    shutdown.cancel();
+    let agent = running.await.unwrap();
+    assert!(
+        prepared.is_err(),
+        "a migration was prepared under a registered recurring identity"
+    );
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(op, _)| op == "create" || op == "start")
+    );
+    assert!(
+        agent
+            .scheduled_jobs
+            .contains_key(&("migrate".into(), "default".into()))
+    );
+}
+
+async fn assert_preparation_refuses_predictable_job_policy(config: Config, process: bool) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    if process {
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Process);
+    }
+    let running = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    let (response, answer) = oneshot::channel();
+    tx.send(AgentCommand::PreparePrerequisites { config, response })
+        .await
+        .unwrap();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+        .await
+        .expect("job policy preparation did not settle")
+        .unwrap();
+    if let Ok((_, operation)) = &prepared {
+        operation
+            .finish(
+                crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                "test-owned unlaunched preparation completed",
+            )
+            .await;
+    }
+    shutdown.cancel();
+    let agent = running.await.unwrap();
+    assert!(
+        prepared.is_err(),
+        "predictable job policy refusal admitted a prepared cluster operation"
+    );
+    assert!(
+        agent.recorded_jobs.is_empty(),
+        "preparation persisted execution intent"
+    );
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(op, _)| op == "create" || op == "start")
+    );
+}
+
+#[tokio::test]
+async fn prerequisite_preparation_refuses_denied_host_job_before_claiming_migration() {
+    let mut config = run_before_config();
+    let mut denied = Config::parse("[job.denied]\nexec='/bin/sh'\n").unwrap();
+    config.job.append(&mut denied.job);
+    assert_preparation_refuses_predictable_job_policy(config, false).await;
+}
+
+#[tokio::test]
+async fn prerequisite_preparation_refuses_unenforceable_ordinary_tail_limits() {
+    let mut config = run_before_config();
+    let mut denied = Config::parse("[job.denied]\nimage='test:v1'\ncpu='100m'\n").unwrap();
+    config.job.append(&mut denied.job);
+    assert_preparation_refuses_predictable_job_policy(config, true).await;
+}
+
+#[tokio::test]
+async fn prerequisite_preparation_refuses_unenforceable_migration_limits() {
+    let mut config = run_before_config();
+    let limited = Config::parse("[job.migrate]\nimage='myapp:v1'\ncommand=['echo', 'migrating']\nrun_before=['app.web']\ncpu='100m'\n").unwrap();
+    config.job = limited.job;
+    assert_preparation_refuses_predictable_job_policy(config, true).await;
 }

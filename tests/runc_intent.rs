@@ -413,7 +413,11 @@ async fn invalid_publication_and_conflicting_exit_evidence_preserve_the_previous
         records[0].phase,
         IntentPhase::Retired { exit_code: Some(3) }
     );
-    assert_eq!(records[0].spec, spec("original"));
+    // Retirement scrubbed the environment values, nothing else (#476).
+    assert_eq!(
+        records[0].spec,
+        spec("original").without_environment_values()
+    );
 }
 
 #[tokio::test]
@@ -539,4 +543,98 @@ async fn missing_or_conflicting_network_references_cannot_be_released() {
         journal.inventory().await.unwrap()[0].network_reference,
         Some(NetworkReferenceState::Held(_))
     ));
+}
+
+/// Every regular file below `directory` whose bytes contain `needle`.
+fn files_containing(directory: &Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(files_containing(&path, needle));
+        } else if String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(needle) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn a_retired_intent_keeps_no_decrypted_secret_on_disk() {
+    let app: reliaburger::config::app::AppSpec = toml::from_str(
+        r#"
+        image = "registry.example/test:latest"
+        [env]
+        API_TOKEN = "ENC[AGE:ciphertext]"
+        PLAIN = "visible-value"
+        "#,
+    )
+    .unwrap();
+    let decryptor: reliaburger::grill::oci::SecretDecryptor =
+        Box::new(|_| Ok("hunter2-decrypted".to_string()));
+    let original = reliaburger::grill::oci::generate_oci_spec_with_decryptor(
+        "worker",
+        "default",
+        &app,
+        "default__worker-0",
+        None,
+        "/reliaburger/default/worker/default__worker-0",
+        None,
+        None,
+        Some(&decryptor),
+    )
+    .unwrap();
+    assert!(
+        original
+            .process
+            .env
+            .contains(&"API_TOKEN=hunter2-decrypted".to_string())
+    );
+    let root = tempfile::tempdir().unwrap();
+    let bundles = root.path().join("bundles");
+    std::fs::create_dir(&bundles).unwrap();
+    let journal = IntentJournal::new(bundles.join(".intents"), configuration(root.path()));
+    let id = InstanceId("default__worker-0".into());
+    let claim = journal
+        .claim(&id, None)
+        .await
+        .unwrap()
+        .publish(&original)
+        .await
+        .unwrap();
+    // A live generation still records the spec it was launched with.
+    assert_eq!(journal.inventory().await.unwrap()[0].spec, original);
+    let generation = claim.record().unwrap().generation.clone();
+    drop(claim.retire(Some(0)).await.unwrap());
+
+    assert_eq!(
+        files_containing(&bundles, "hunter2-decrypted"),
+        Vec::<std::path::PathBuf>::new(),
+        "a retired intent kept a decrypted secret"
+    );
+    assert_eq!(
+        files_containing(&bundles, "visible-value"),
+        Vec::<std::path::PathBuf>::new(),
+        "a retired intent kept an environment value"
+    );
+    let inventory = journal.inventory().await.unwrap();
+    assert_eq!(inventory[0].generation, generation);
+    assert!(matches!(
+        inventory[0].phase,
+        IntentPhase::Retired { exit_code: Some(0) }
+    ));
+    // The variable names survive, so recovery can still tell this generation
+    // apart from a different request.
+    let mut names = inventory[0].spec.process.env.clone();
+    names.sort();
+    assert_eq!(names, vec!["API_TOKEN".to_string(), "PLAIN".to_string()]);
+    assert!(original.matches_journal(&inventory[0].spec));
+    let mut other = original.clone();
+    other.process.env.push("EXTRA=1".into());
+    assert!(!other.matches_journal(&inventory[0].spec));
+
+    // Retiring again with the same evidence is still idempotent.
+    let claim = journal.claim(&id, Some(generation)).await.unwrap();
+    drop(claim.retire(Some(0)).await.unwrap());
+    assert!(original.matches_journal(&journal.inventory().await.unwrap()[0].spec));
 }

@@ -5,11 +5,11 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.1.2 was released on 1 October 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.2),
+0.1.6 was released on 7 October 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.1.2 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.1.6 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 ## Scope and limits
@@ -120,8 +120,38 @@ firings until it restarts and reloads its state.
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations; keep using the same node endpoint for a
 lease's lifetime. Creation needs an unscoped credential and the server's
-isolated-workload test grant. Ordinary jobs stay node-local; there's no cluster
-job scheduling.
+isolated-workload test grant. Ordinary cluster apply forwards jobs to the
+leader and reserves their identities until positive terminal settlement;
+there is no ordinary job placement across workers. Leased test work stays on
+the receiving node. Cluster apply refuses recurring schedules; register cron
+on a standalone node.
+
+Apply `run_before` migrations and their dependent apps together in the same
+namespace. The cluster records ownership before execution and publishes app
+revisions only after positive zero exit and durable success confirmation. A
+known failed migration can be corrected explicitly; an unknown outcome,
+leadership change or recovery keeps its claim held without automatic replay.
+
+`relish batch` gives each accepted job a distinct execution identity. Repeated
+logical labels retain their original namespace for scoped status and logs;
+select an explicit instance to read a particular run. Internal dispatch retries
+reuse the durably owned attempt and cannot launch it twice. Batch submission
+rejects `schedule` and `run_before`; use ordinary apply for those declarations.
+
+Replay history is finite and never pruned into identity reuse. The council keeps
+at most 131,072 ownership entries or 32 MiB of encoded history, and each runner's
+job checkpoint is limited to 16 MiB with room reserved for active transitions.
+Full history refuses new admission while preserving existing executions. Further
+admission then requires a fresh cluster. See [batch execution ownership](book/08-breaking-things-on-purpose.md)
+for acknowledgement uncertainty, retry and retirement semantics.
+
+Apps and batches share committed capacity reservations across leader changes.
+Clustered batch admission requires a live capacity publisher, reports from the
+current Raft term and unexpired local receive deadlines. Missing evidence returns
+503. Planning and registration have a five-second budget; a late committed
+reservation stays held and that timed-out request dispatches no work. Unknown
+runtime outcomes retain capacity. Durably retired nodes are excluded even while
+gossip still advertises them as alive.
 
 ### Registry behaviour
 
@@ -224,7 +254,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.1.2, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.1.6, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -263,7 +293,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.1.2, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.1.6, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -274,7 +304,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.1.2 runtime profile.
+work; they are outside the 0.1.6 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -294,7 +324,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.1.2 contract: foreground workloads only.** The main process stays under Bun's
+**0.1.6 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -381,6 +411,7 @@ Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statis
 ```sh
 make bench         # reproducible transport and 5-250 node measurements
 make bench-large   # reproducible 500 and 1,000 node measurements
+make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
 
 CI runs both on pushes to `main`, nightly, and on pull requests that touch
@@ -514,6 +545,20 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.tom
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
+Then keep a copy of the root CA that only you can open, sealed to a passphrase
+(or `--recipient` for your age key), and check it offline against the
+fingerprint `init` printed:
+
+```sh
+target/debug/relish ca backup --out prod-root-backup.age --dir cluster
+target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
+```
+
+The same file is what replaces an intermediate CA later:
+`relish ca rotate --role node --root-backup prod-root-backup.age` signs the
+cluster's new Node CA on your machine, and `--finalize` retires the old one
+once every node has moved (see the manual's security chapter).
+
 This is a one-node Raft cluster: clustered code paths are live, but it cannot
 survive a node failure. The API listens at `https://127.0.0.1:9117`. On macOS, use the [managed Linux VM quickstart](quickstart.md) for containers.
 
@@ -550,7 +595,7 @@ already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
 To turn spare mini PCs or thin clients into appliance nodes over the network
 instead, with no distro to install, see the preview in
-[Bare metal: the appliance and netboot](manual/14_appliance.md).
+[Bare metal: the appliance and netboot](manual/15_appliance.md).
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -913,7 +958,17 @@ parallel (rarest layer first). Direct external pulls and Pickle upstream reads r
 and temporary gateway/service/server errors, refused or interrupted connections and
 stalled reads up to four attempts. Each HEAD/manifest/config attempt may take 30 seconds
 within a 2-minute total, and each layer attempt 120 seconds within 6 minutes; authentication,
-malformed responses and digest failures still fail. Operational constraints:
+malformed responses and digest failures still fail.
+
+Where the leader's runtime pulls images, every apply (manual, GitOps or
+standalone) binds each image tag to the digest it names then, storing
+`nginx:1.27@sha256:…`; `relish apply` prints each binding, and history,
+inspect, status and rollback carry the digest. An unreachable registry fails
+the apply unless the pull-through cache holds the tag (F03 U1, #361).
+`[[images.trust_policy.upstream]]` rules in `node.toml` (most specific `match`
+wins) with `upstream_default.allow = false` turn upstream registries into an
+allow-list, checked at apply and in Bun before every deploy (F03 U2).
+Operational constraints:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each
   other's registry URLs from gossip IPs plus the local port setting.
@@ -1318,7 +1373,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.1.2 while interrupted daemon-command
+Direct Apple Container is disabled for 0.1.6 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide
@@ -1347,6 +1402,14 @@ again and re-encrypt if that generation has been finalised before deployment.
 `relish test --filter secrets-config` checks actual container decryption and
 config-file mounting on a cluster with a container runtime.
 
+A namespace with `secret_key = true` in `[namespace.X]` gets its own key, and
+its values then decrypt only with that key. Fetch it with
+`GET /v1/secret/public-key?namespace=X` (`relish secret pubkey --namespace X`);
+a token scoped to other namespaces gets 403. Rotate it with
+`relish secret rotate [--finalize] --namespace X`, which takes an unscoped
+Admin. Until the master key is split, every node can still unwrap every
+namespace's key.
+
 ### OCI release qualification
 
 These scripts exercise crash and reboot recovery on real hosts. They're manual:
@@ -1356,7 +1419,15 @@ machines.
 - `scripts/release/qualify-oci-interruptions.sh` needs a Linux host with Runc,
   static BusyBox, `ip`, `nft`, a C compiler and sudo. It kills Bun and cancels
   callers at each Runc lifecycle boundary, inside private network and mount
-  namespaces, and keeps logs and test-binary checksums.
+  namespaces, and keeps logs and test-binary checksums. The ordinary command
+  observes the operator and creates a fresh `manual:<uuid>` session bound to
+  the current checkout. Supply `--manual-session manual:RELEASE_REVIEW --owner
+  OPERATOR` to record explicit identity. Receipts and the complete driver log
+  live in a fresh directory under `target/contracts/manual-oci/`. Manual
+  receipts never satisfy GitHub CI aggregation. With `GITHUB_ACTIONS=true`,
+  the command requires trusted current checkout/run/attempt/output inputs
+  and refuses manual options. The same build and isolated groups run once in
+  both modes; compiler overrides require a separate audit.
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
   after the new kernel boot, including address retention until explicit
@@ -1379,3 +1450,23 @@ machines.
 
 They're one part of a release's acceptance, not all of it; the
 [release runbook](releasing.md) lists the gates a candidate has to pass.
+
+Held cluster jobs conservatively reserve their CPU/memory requests on every app or batch placement candidate until positive settlement. This can over-reserve; it does not add initial node-local job capacity admission.
+
+### Delegated jobs (0.2.0 development preview)
+
+[Batch jobs](manual/14_batch-jobs.md) explains compact arrays, atomic mixed-profile
+manifests, app/job resource accounting, watch summaries, indexed detail, retries
+and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
+homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
+a service. Build matching development binaries and use a fresh cluster (protocol
+48 / state 65); the published 0.1.4 recording predates this step. The
+[implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
+and the still-unqualified 100m/day sustained throughput target.
+
+The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
+describes #638: ordinary singleton jobs, arrays, durable UTC cron and deployment
+hooks share the definition/run/task/attempt lifecycle, resource admission and
+accepted-result machinery. Standalone admission persists before acknowledgement;
+conservative jobs retain unknown ownership until acknowledged replay. Executor reuse (#639), sustained throughput/demo (#640)
+and resident model workers (#641) follow separately.

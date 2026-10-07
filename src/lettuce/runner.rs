@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::council::node::CouncilNode;
 use crate::council::types::{CouncilResponse, DesiredState, RaftRequest};
+use crate::pickle::binding::ImageBinder;
 
 use super::diff::{ChangePayload, ResourceChange};
 use super::git::GitRepo;
@@ -38,17 +39,23 @@ const MAX_SYNC_HISTORY: usize = 100;
 /// moved, so a manual change is repaired on the next tick (B16). The
 /// returned handle finishes once `shutdown` is cancelled; a `git` child
 /// running at that moment is killed rather than waited for (B19).
+///
+/// With a `binder` (the leader's runtime pulls images), each app's images
+/// bind to digests as they're written, as a manual apply binds them.
 pub fn spawn_gitops_sync(
     council: Arc<CouncilNode>,
     config: GitOpsConfig,
     mut webhook_rx: mpsc::Receiver<()>,
     data_dir: PathBuf,
     shutdown: CancellationToken,
+    binder: Option<ImageBinder>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let repo_dir = data_dir.join("gitops-repo");
         let poll = Duration::from_secs(config.poll_interval_secs.max(1));
         let mut ticker = tokio::time::interval(poll);
+        let mut triggers = council.gitops_trigger_updates();
+        let mut leadership = council.metrics();
 
         // Tracked locally so a run of failures backs off (GIT4): the delay
         // is `poll * 2^failures`, capped, and is also mirrored into the
@@ -56,9 +63,11 @@ pub fn spawn_gitops_sync(
         let mut consecutive_failures: u32 = 0;
 
         loop {
-            tokio::select! {
+            let durable_wake = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => false,
+                change = triggers.changed() => { if change.is_err() { break } true },
+                change = leadership.changed() => { if change.is_err() { break } true },
                 signal = webhook_rx.recv() => {
                     if signal.is_none() {
                         break; // sender dropped
@@ -66,14 +75,23 @@ pub fn spawn_gitops_sync(
                     // Drain any queued webhook signals so a burst
                     // collapses into a single sync.
                     while webhook_rx.try_recv().is_ok() {}
+                    false
                 }
-            }
+            };
 
             if !council.is_leader().await {
                 continue;
             }
 
             let desired = council.desired_state().await;
+            if durable_wake
+                && !desired
+                    .gitops_sync_state
+                    .as_ref()
+                    .is_some_and(|sync| sync.requested_generation > sync.completed_generation)
+            {
+                continue;
+            }
             let current_apps = desired.apps.clone();
             let current_namespaces = desired.namespaces.clone();
             let current_permissions = desired.permissions.clone();
@@ -155,7 +173,17 @@ pub fn spawn_gitops_sync(
 
             // Hard failures: nothing to apply.
             match &outcome.result {
-                SyncResult::Skipped { .. } => continue,
+                SyncResult::Skipped { .. } => {
+                    let mut state = desired.gitops_sync_state.clone().unwrap_or_default();
+                    state.completed_generation = state.requested_generation;
+                    if let Err(error) = council
+                        .write(RaftRequest::GitOpsSyncUpdate(Box::new(state)))
+                        .await
+                    {
+                        eprintln!("gitops: could not acknowledge unchanged sync: {error}");
+                    }
+                    continue;
+                }
                 SyncResult::Failure { error } => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     record_failure(
@@ -173,10 +201,9 @@ pub fn spawn_gitops_sync(
             }
 
             // Apply each change through the SAME desired-state writes a
-            // manual `relish apply` makes (12b.2 T6). Every kind now maps
-            // to a request — apps, namespaces, permissions — so nothing is
-            // silently skipped the way a `None` used to drop jobs and
-            // namespaces on the floor.
+            // manual `relish apply` makes (12b.2 T6). Every supported kind
+            // maps to a request: apps, namespaces and permissions. Trees
+            // containing jobs were explicitly refused by `execute_sync`.
             //
             // Atomicity (D12): `last_applied_commit` advances only if
             // EVERY write in the sync succeeds. The old code advanced the
@@ -187,7 +214,7 @@ pub fn spawn_gitops_sync(
             // the whole set. Writes are idempotent (spec upsert / delete),
             // so re-applying an already-committed change is a harmless
             // no-op.
-            let applied = match apply_changes(&council, &outcome.changes).await {
+            let applied = match apply_changes(&council, &outcome.changes, binder.as_ref()).await {
                 Ok(applied) => applied,
                 Err(unapplied) => {
                     let sha = outcome
@@ -243,10 +270,11 @@ pub fn spawn_gitops_sync(
 
 /// Whether the recorded sync state has no error left to clear.
 fn sync_state_is_clean(desired: &DesiredState) -> bool {
-    desired
-        .gitops_sync_state
-        .as_ref()
-        .is_some_and(|state| state.last_error.is_none() && state.consecutive_failures == 0)
+    desired.gitops_sync_state.as_ref().is_some_and(|state| {
+        state.last_error.is_none()
+            && state.consecutive_failures == 0
+            && state.requested_generation == state.completed_generation
+    })
 }
 
 /// Sleep for the back-off delay, waking early on shutdown.
@@ -330,6 +358,7 @@ async fn record_success(
     };
     let now = now_millis();
     let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
+    sync_state.completed_generation = sync_state.requested_generation;
     sync_state.last_applied_commit = Some(commit.clone());
     sync_state.last_fetched_commit = Some(commit.clone());
     sync_state.phase = SyncPhase::Idle;
@@ -426,15 +455,34 @@ fn now_millis() -> u64 {
 /// that the state machine refused. The caller must advance `last_applied_commit` only on `Ok` — that's
 /// the D12 atomicity guarantee: a half-applied sync leaves the commit
 /// unadvanced so the next tick re-applies the whole (idempotent) set.
+///
+/// With a `binder`, an app's images bind to digests before its write; an
+/// image that can't be bound fails the change like a refused write, and
+/// the error names the image.
 pub async fn apply_changes(
     council: &CouncilNode,
     changes: &[ResourceChange],
+    binder: Option<&ImageBinder>,
 ) -> Result<usize, String> {
     let mut applied = 0usize;
     for change in changes {
-        let Some(request) = change_to_request(change) else {
+        let Some(mut request) = change_to_request(change) else {
             continue; // jobs/builds: not reconciled desired state
         };
+        if let (Some(binder), RaftRequest::AppSpec { app_id, spec }) = (binder, &mut request) {
+            let catalog = council.manifest_catalog().await;
+            match binder.bind_app(&app_id.name, spec, &catalog).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        println!("gitops: {binding}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("gitops: failed to apply {}: {error}", change_id(change));
+                    return Err(format!("{} ({error})", change_id(change)));
+                }
+            }
+        }
         // A committed entry the state machine refused left desired state
         // unchanged, so it's as unapplied as a failed write (B15).
         match council.write(request).await {
@@ -618,6 +666,7 @@ mod tests {
             gpu: None,
             max_apps: None,
             max_replicas: None,
+            secret_key: false,
         };
         assert!(matches!(
             payload_to_request("namespace.prod", &ChangePayload::Namespace(Box::new(ns))),
@@ -661,5 +710,23 @@ mod tests {
             })
             .is_none()
         );
+    }
+    #[test]
+    fn an_unchanged_commit_still_records_completion_of_a_pending_generation() {
+        let mut desired = DesiredState {
+            gitops_sync_state: Some(SyncState {
+                requested_generation: 1,
+                completed_generation: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!sync_state_is_clean(&desired));
+        desired
+            .gitops_sync_state
+            .as_mut()
+            .unwrap()
+            .completed_generation = 1;
+        assert!(sync_state_is_clean(&desired));
     }
 }

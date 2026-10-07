@@ -94,7 +94,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: instance_id.0.clone(),
             namespace: instance.namespace.clone(),
             app_name: instance.app_name.clone(),
@@ -104,6 +104,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             runtime,
             pid,
             pid_started_at,
+            boot_id: crate::grill::records::current_boot(),
             // RunC uses the instance id as the container id (see runc.rs).
             runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
                 .then(|| instance_id.0.clone()),
@@ -155,7 +156,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let identity = crate::grill::InstanceIdentity::parse(&instance.instance_id.0)
             .ok_or_else(|| fail("replacement has an invalid instance identity".into()))?;
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: instance.instance_id.0.clone(),
             namespace: instance.namespace.clone(),
             app_name: instance.app_name.clone(),
@@ -165,6 +166,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             runtime,
             pid,
             pid_started_at,
+            boot_id: crate::grill::records::current_boot(),
             runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
                 .then(|| instance.instance_id.0.clone()),
             log_stem: instance.launch.log_stem.clone(),
@@ -211,7 +213,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     record.instance_id
                 ))
             })?;
-            if launch.spec != record.oci_spec
+            if !launch.launched(&record.oci_spec)
                 || jobs
                     .get(&record.instance_id)
                     .is_some_and(|job| job.phase == JobPhase::Preparing)
@@ -261,8 +263,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await?;
             }
             if let Some(job) = jobs.get_mut(&id.0) {
-                job.runtime_absent = true;
-                job.phase = match job.phase {
+                // Legacy adoption establishes process absence. Owned OCI replay
+                // proof also needs object/resource absence, which Stopped or
+                // adopt(false) cannot establish for a retained container.
+                job.runtime_absent = job.batch_execution.is_none()
+                    || job.runtime == crate::grill::records::RuntimeKind::Process;
+                let recovered_phase = match job.phase {
                     JobPhase::Launching if state == ContainerState::Stopped => {
                         match self.supervisor.grill().exit_code(id).await? {
                             Some(code) => JobPhase::Exited { code },
@@ -273,6 +279,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     JobPhase::Stopping => JobPhase::Stopped,
                     ref phase => phase.clone(),
                 };
+                job.observe_phase(recovered_phase);
                 self.commit_jobs(jobs.clone()).await?;
             }
             retired.push(id.clone());
@@ -289,7 +296,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // A complete mandatory intent inventory plus the pre-execution
                 // phase proves no runtime was activated for this preparation.
                 job.phase = JobPhase::Unknown;
-                job.runtime_absent = true;
+                // Legacy adoption establishes process absence. Owned OCI replay
+                // proof also needs object/resource absence, which Stopped or
+                // adopt(false) cannot establish for a retained container.
+                job.runtime_absent = job.batch_execution.is_none()
+                    || job.runtime == crate::grill::records::RuntimeKind::Process;
             }
         }
         self.commit_jobs(jobs.clone()).await
@@ -314,15 +325,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut adopted_count = 0;
 
         let records_dir = dir.clone();
-        let (records, schedules, jobs) = tokio::task::spawn_blocking(move || {
+        let (records, schedules, inventory) = tokio::task::spawn_blocking(move || {
             let records = crate::grill::records::load_records(&records_dir)?;
             let schedules = crate::bun::schedules::load(&records_dir)?;
-            let jobs = crate::bun::jobs::load(&records_dir)?;
-            Ok::<_, std::io::Error>((records, schedules, jobs))
+            let inventory = crate::bun::jobs::load_inventory(&records_dir)?;
+            Ok::<_, std::io::Error>((records, schedules, inventory))
         })
         .await
         .map_err(|error| BunError::AdoptionState(error.to_string()))?
         .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        let jobs = inventory.jobs;
+        self.retired_batch_executions = inventory.retired;
         self.require_discovery_recovery(!records.is_empty(), false)?;
         for job in jobs.values() {
             if job.runtime != self.supervisor.grill().runtime_kind() {
@@ -475,13 +488,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })??;
             if !adopted {
                 if let Some(job) = recovered_jobs.get_mut(&runtime_id.0) {
-                    job.runtime_absent = true;
+                    // Legacy adoption establishes process absence. Owned OCI replay
+                    // proof also needs object/resource absence, which Stopped or
+                    // adopt(false) cannot establish for a retained container.
+                    job.runtime_absent = job.batch_execution.is_none()
+                        || job.runtime == crate::grill::records::RuntimeKind::Process;
                     if matches!(
                         job.phase,
                         crate::bun::jobs::JobPhase::Preparing
                             | crate::bun::jobs::JobPhase::Launching
                     ) {
-                        job.phase = if launch_inventory.is_some()
+                        let recovered_phase = if launch_inventory.is_some()
                             && job.phase == crate::bun::jobs::JobPhase::Launching
                         {
                             match self.supervisor.grill().exit_code(&runtime_id).await? {
@@ -491,6 +508,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         } else {
                             crate::bun::jobs::JobPhase::Unknown
                         };
+                        job.observe_phase(recovered_phase);
                     }
                     // Preserve the positive observation before deleting the
                     // only record that let this runtime prove absence.
@@ -560,6 +578,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             };
             let identity_mount = identity.is_some().then(|| identity_dir.clone());
 
+            let request = record
+                .app_spec
+                .as_ref()
+                .map(|spec| {
+                    crate::meat::Resources::new(
+                        spec.cpu.map_or(0, |r| r.request),
+                        spec.memory.map_or(0, |r| r.request),
+                        spec.gpu.unwrap_or(0),
+                    )
+                })
+                .or_else(|| {
+                    recorded_job.map(|job| {
+                        crate::meat::Resources::new(
+                            job.spec.cpu.map_or(0, |r| r.request),
+                            job.spec.memory.map_or(0, |r| r.request),
+                            0,
+                        )
+                    })
+                })
+                .unwrap_or_default();
+            self.supervisor
+                .reserve_adopted_execution(instance_id.clone(), request);
             let key = (record.app_name.clone(), record.namespace.clone());
             let instance = WorkloadInstance {
                 id: instance_id.clone(),
@@ -634,7 +674,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::bun::jobs::JobPhase::Preparing | crate::bun::jobs::JobPhase::Launching
                 )
             {
-                job.phase = crate::bun::jobs::JobPhase::Unknown;
+                job.observe_phase(crate::bun::jobs::JobPhase::Unknown);
             }
         }
         self.commit_jobs(recovered_jobs).await?;
@@ -674,7 +714,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     _ => ContainerState::Stopped,
                 };
                 instance.retry_pending = matches!(job.phase, crate::bun::jobs::JobPhase::Exited { code } if code != 0)
-                    && job.restart_count < crate::bun::jobs::MAX_RETRIES;
+                    && job.restart_count < crate::bun::jobs::MAX_RETRIES
+                    && job.spec.run_before.is_empty();
                 instance.oci_spec = Some(spec);
                 instance.last_restart = Some(now);
             }

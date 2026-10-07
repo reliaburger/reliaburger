@@ -685,14 +685,25 @@ relish secret pubkey [dir]          # Print the cluster age public key (API, or 
 relish secret encrypt --pubkey <key> <value> # Encrypt a value for ENC[AGE:...] fields
 relish secret rotate                # Start secret-key rotation
 relish secret rotate --finalize     # Finalise rotation (drop the old read-only keypair)
+relish secret pubkey --namespace <ns>               # A namespace's own key (secret_key = true)
+relish secret rotate [--finalize] --namespace <ns>  # Rotate one namespace's key (unscoped Admin)
+
+# Root CA backup (offline) and intermediate rotation
+relish ca backup --out <file> [--dir <init-dir>] [--cluster-name <name>] [--recipient <age1...> | --passphrase-file <path>]
+relish ca verify <file> --fingerprint sha256:... [--passphrase-file <path> | --identity <path>]
+relish ca rotate --role <node|workload|ingress> --root-backup <file> [--passphrase-file <path> | --identity <path>]
+relish ca rotate --role <node|workload|ingress> --finalize   # Retire the old CA once nothing depends on it
 
 # Tokens
 relish token create --name <name>   # Create an API token (default role: read-only)
 relish token create --name <name> --role <admin|deployer|read-only>
-relish token create --name <name> --ttl-days <days>
+relish token create --name <name> --ttl-days <days>  # Default: 90 days (admins: none)
+relish token create --name <name> --no-expiry
+relish token create --name <name> --inherit-permissions # Accept an existing [permission.<name>]
 relish token create --name <name> --apps <list>       # Scope to specific apps
 relish token create --name <name> --namespaces <list> # Scope to namespaces
-relish token list                   # List all API tokens
+relish token list                   # List all API tokens (warns about expiry within 14 days)
+relish token rotate <name> [--grace-hours 24]          # New secret; old one works for the grace
 relish token revoke <name>          # Revoke a token by name
 relish join-token create --node-id <id> [--ttl 15m]   # One single-use node-enrolment token
 

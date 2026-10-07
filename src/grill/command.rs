@@ -126,6 +126,7 @@ impl OwnedCommands {
                 readonly: false,
             },
             process: OciProcess {
+                rlimits: Vec::new(),
                 args: std::iter::once(program.to_owned())
                     .chain(arguments.iter().cloned())
                     .collect(),

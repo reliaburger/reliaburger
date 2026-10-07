@@ -22,7 +22,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 1. **Zero-configuration security (target).** A fresh cluster should have mTLS between all nodes, workload identity for all apps, namespace isolation, deny-by-default egress, and encrypted Raft logs. The current egress implementation is narrower: a declared `[app.NAME.egress]` allowlist is deny-by-default and fail-closed, but an app with no block still has unrestricted egress. A cluster-wide default policy remains planned.
 2. **Separation of privilege (target — see the note below).** The intended model is that worker nodes never hold CA private keys and can only obtain certificates for workloads they are scheduled to run. **The current implementation does not yet enforce this key split:** every clustered node loads the same cluster master key and its bootstrap security state, from which it can locally unwrap the age private key, the intermediate CA private keys, and the OIDC signing key (see §3.2). A genuine council/worker key separation is planned, not shipped.
 3. **Data plane survives control plane failures.** Existing certificates, firewall rules, and secrets continue working during council outages. Grace period extensions prevent hard cliffs.
-4. **Short-lived credentials by default (workloads).** Workload certificates live 1 hour, rotated every 30 minutes — this is shipped. **API tokens are the exception:** `relish token create --ttl-days` is optional and has **no default**, so a token created without it **never expires**. A built-in 90-day default and a `token rotate` command are planned, not shipped (see §5.4). Short lifetimes reduce the blast radius of credential theft.
+4. **Short-lived credentials by default.** Workload certificates live 1 hour, rotated every 30 minutes. Deployer and ReadOnly API tokens live 90 days unless created with `--ttl-days` or `--no-expiry`, and `relish token rotate` replaces a secret with a 24-hour overlap (§5.4). Admin tokens are the exception: they get no default expiry, so the cluster can't lock itself out, and `relish wtf` warns about old ones. Short lifetimes reduce the blast radius of credential theft.
 
 ---
 
@@ -58,7 +58,7 @@ Root CA (offline after init, signs only intermediate CAs)
                        Lifetime: 5 years. Stored encrypted in Raft.
 ```
 
-The root CA private key is used **only** during `relish init` (and, once it ships, `relish ca rotate --root` — CA rotation is planned, see §5.8). After signing the three intermediates, the root private key is encrypted with the cluster's age public key, written to a sealed backup file on the admin's machine, and deleted from all cluster nodes. No cluster node holds the root CA private key during normal operation.
+The root CA private key is used **only** during `relish init` and on the operator's own machine, when `relish ca rotate` signs a new intermediate from the operator's backup (and, once it ships, `relish ca rotate --root`; see §5.8). After signing the three intermediates, the root private key is encrypted with the cluster's age public key, written to a sealed backup file on the admin's machine, and deleted from all cluster nodes. No cluster node holds the root CA private key during normal operation.
 
 All three intermediate CAs chain to the same root, so a single trust anchor (the root CA certificate) is sufficient for any verifier.
 
@@ -232,10 +232,13 @@ pub struct CertificateAuthority {
     /// The parent CA's serial (None for the root CA).
     pub issuer_serial: Option<SerialNumber>,
 
-    /// Generation counter, intended to increment on `relish ca rotate`.
-    /// CA rotation is not implemented yet (§5.8), so this stays at its
-    /// initial value in practice.
+    /// Generation counter: 0 at init, one more per rotation of the role
+    /// (`RaftRequest::CaRotationBegin`, §5.8).
     pub generation: u64,
+
+    /// `Active` signs and is trusted; `Retiring { until }` is only trusted,
+    /// until the rotation is finalised.
+    pub state: CaState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -396,23 +399,26 @@ pub struct ApiToken {
     /// Optional scope restrictions.
     pub scope: TokenScope,
 
-    /// When the token expires. In the shipped store this is
-    /// `Option<SystemTime>`: `None` means the token never expires. There is
-    /// no default TTL applied at creation (§5.4) — the "90 days" is planned.
+    /// When the token expires; `None` means never. A Deployer or ReadOnly
+    /// token created without `--ttl-days` or `--no-expiry` gets the node's
+    /// `[security.tokens] default_ttl` (90 days); Admin tokens get none (§5.4).
     pub expires_at: Option<SystemTime>,
 
-    /// When the token was created.
+    /// When the token's current secret was issued (creation, then each
+    /// rotation).
     pub created_at: SystemTime,
 
-    /// Last time the token was used (updated on each API request).
+    /// Last time the token was used. Shipped, but *not* stored here: each
+    /// node keeps it in memory (`sesame::auth::TokenLastUsed`, keyed by the
+    /// token's principal id) and `GET /v1/token/list` merges every node's
+    /// answer, the latest per token (§5.4).
     pub last_used: Option<SystemTime>,
 
     /// Per-token rate limit (requests per second). Default: 100.
     pub rate_limit_rps: u32,
 
-    /// If this token is being rotated, the old token hash that is still
-    /// valid during the grace period. (Planned — there is no `token rotate`
-    /// command or rotation-grace flow yet; see §5.4.)
+    /// After `relish token rotate`, the old secret while it is still
+    /// accepted (shipped as `previous_secret: Option<PreviousSecret>`, §5.4).
     pub rotation_grace: Option<RotationGrace>,
 }
 
@@ -436,7 +442,8 @@ pub struct TokenScope {
     pub actions: Option<Vec<String>>,
 }
 
-/// Grace period state during token rotation.
+/// Grace period state during token rotation (shipped as
+/// `sesame::types::PreviousSecret { token_hash, token_salt, valid_until }`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationGrace {
     /// Hash of the old token that is still accepted.
@@ -863,20 +870,31 @@ Bun on each worker node maintains a rotation schedule for every running workload
 
 ```bash
 $ relish token create --name ci-deploy --role deployer \
-    --apps "web,api" --namespaces "production" --ttl-days 90
+    --apps "web,api" --namespaces "production" --ttl-days 30
 ```
 
 1. Generate a 256-bit cryptographically random token secret.
 2. Hash the secret with Argon2id (salt generated per-token).
 3. Store the hash, salt, role, scope, and expiry in Raft.
-4. Return the plaintext token to the user. It is never stored in plaintext.
+4. Return the plaintext token to the user, with its expiry. It is never stored
+   in plaintext.
 
-**Expiry is opt-in, with no default.** `--ttl-days` is optional; the stored
-`expires_at` is `Option<SystemTime>`, and when it is `None` the token **never
-expires**. Authentication only rejects a token once a *set* expiry has passed.
-A built-in default TTL (the "90 days" the config sketch mentions) is planned but
-not applied today, so a token created without `--ttl-days` is effectively
-permanent until explicitly revoked.
+**Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
+ReadOnly token expires after the answering node's `[security.tokens]
+default_ttl` (`"90d"` by default; `"12h"`-style hours and `"none"` are
+accepted, and a bad value fails config load). `--no-expiry` opts out
+explicitly and conflicts with `--ttl-days`. Admin tokens get no default
+expiry (maintainer decision 6): if every Admin expired, nobody could create
+the next one, and a non-empty store keeps the bootstrap window shut.
+`relish wtf` warns about an Admin token whose secret is older than 90 days,
+and `relish wtf` and `relish token list` warn about any token that has
+expired or expires within 14 days (`sesame::token::TOKEN_EXPIRY_WARNING`).
+
+**Names with a `[permission]` spec (shipped, decision 3).** Specs are keyed by
+token name, so a token created under a name that already has one would
+inherit it silently, for example after a revoke and re-create. `POST
+/v1/token/create` answers `409` in that case unless the request sets
+`inherit_permissions` (`relish token create --inherit-permissions`).
 
 **Scope enforcement (shipped):** `--apps` and `--namespaces` restrict a token
 on every route that names an app and namespace (`authorize_scoped`), filter
@@ -923,22 +941,37 @@ the same explicit token store in standalone and clustered modes, so standalone
 can't bypass the listener check by omitting council state. The check runs before
 runtime, storage or observability startup in standalone mode.
 
-**Rotation (planned — not implemented):**
-
-> There is no `relish token rotate` command. The `TokenAction` CLI enum exposes
-> only `create`, `list`, and `revoke`, and there is no rotation-grace machinery
-> wired to a rotate flow. The design below (dual-accept grace window) is planned.
+**Rotation (shipped, F05 I3):**
 
 ```bash
-$ relish token rotate ci-deploy    # planned
+$ relish token rotate ci-deploy [--grace-hours 24]
 ```
 
-1. Generate a new token secret and hash.
-2. Store the new hash alongside the old hash with a grace period expiry (default 24 hours).
-3. During the grace period, both old and new tokens are accepted.
-4. After the grace period, the old hash is deleted.
+1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
+   new secret and hash, and reads the clock once.
+2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
+   hash and salt, `rotated_at`, the new expiry (the token's previous lifetime
+   length from now, or none) and `previous_valid_until` (now plus the grace,
+   24 hours by default, capped at the old expiry; `None` for a zero grace).
+3. The state machine (`sesame::token::apply_rotation`) moves the old hash into
+   `ApiToken::previous_secret` and installs the new one. A second rotation
+   replaces the previous secret, so at most two secrets work. Unknown names
+   and `rbtest-` lease tokens are refused; the last Admin may rotate.
+4. Validation tries the current secret, then the previous one until its
+   `valid_until`; past that it answers `401 token rotated`. The old secret
+   authenticates as its own principal (the digest of its hash), so last use,
+   audit events and browser sessions opened with it stay separate, and those
+   sessions end when it does.
+5. The answering node installs the rotation in its own token store at once;
+   the others pick it up on their five-second refresh. The handler records a
+   `token.rotated` audit event with the caller and the grace end, never the
+   secret. Role, scope and the `[permission]` spec stay with the name.
 
-**Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`. A background sweep that proactively deletes expired tokens from Raft state is planned; today expiry is enforced at check time, not by a sweep.
+**Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
+
+**Expiry sweep (shipped, F05 I2):** every hour (`bun::token_sweep::TOKEN_SWEEP_INTERVAL`) the leader proposes `RaftRequest::SweepExpiredApiTokens { now_unix_ms }`, but only when its own copy of the store has something due, so a quiet cluster writes nothing. The state machine decides what to remove from the entry's `now_unix_ms` alone (`sesame::token::tokens_to_sweep`), so every replica removes the same tokens: those whose `expires_at` plus a 24-hour grace (`EXPIRED_TOKEN_GRACE`) is past. Two rules override that, because an empty store is the bootstrap window in `auth_middleware`: the last Admin is never removed (if every Admin is due, the one that expired most recently stays, ties to the greater name), and the store is never emptied (with no Admin, the most recently expired token stays). The reply, `CouncilResponse::ApiTokensSwept { removed }`, lets the leader record one `token.expired_swept` audit event per token with principal `system`. A store whose every token has expired is not empty, so it still refuses anonymous requests (tested).
+
+**Last use and the listing (shipped, F05 I2):** when `auth_middleware` authenticates a bearer token or a session cookie, it records "now" against the token's principal id in a node-local map. Nothing goes through Raft: a write per request would turn reads into log entries. `GET /v1/token/list` returns each token's name, principal id, role, scope, `created_at`, `expires_at` and `last_used`; the node asked fans out to every live member with `local=true` (allowed to the system principal only in that form; every other caller still needs an unscoped Admin), keeps the latest `last_used` per principal and names silent members in `warnings`. A restarted node forgets its share, so `last_used` can only under-report.
 
 **Rate limiting:** Each API request checks the token's `rate_limit_rps`. A token-keyed sliding window counter (in-memory on the API-serving node) tracks request counts. Exceeding the limit returns HTTP 429 with a `Retry-After` header.
 
@@ -951,7 +984,7 @@ $ relish secret encrypt --pubkey age1qy8m5kz... "my-secret-value"
 ENC[AGE:YWdlLWVuY3J5cHRpb24...]
 ```
 
-> **Status:** `relish secret pubkey`, `relish secret encrypt` and `relish secret rotate` (start and `--finalize`) are all implemented. Rotation drives `RaftRequest::RotateSecretKey` / `FinalizeSecretRotation` through the council state machine. It currently rotates the **cluster-wide** age key only; per-namespace key rotation is planned (see the namespace-scoped keys note below).
+> **Status:** `relish secret pubkey`, `relish secret encrypt` and `relish secret rotate` (start and `--finalize`) are all implemented. Rotation drives `RaftRequest::RotateSecretKey` / `FinalizeSecretRotation` through the council state machine. `--namespace` rotates and finalises one namespace's own key instead of the cluster-wide one (F05 I4, see the namespace-scoped keys note below).
 
 The `relish` CLI uses the age public key to encrypt. No cluster access required. The ciphertext is embedded in the TOML app configuration and checked into git.
 
@@ -961,10 +994,10 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 2. For each env var value matching `ENC[AGE:...]`, Bun requests decryption from the council.
 3. The council decrypts using the age private key (cluster-wide or namespace-scoped).
 4. The plaintext is returned over the mTLS channel.
-5. Bun injects the plaintext as an environment variable. The runtime needs the full launch spec on disk to start and adopt the instance, so plaintext reaches disk only in root-only files (mode 0600, in owner-only directories): the runc bundle's `config.json`, deleted when the instance retires; the agent's adoption record, removed with the instance; and the runtime's own launch intent. A retired intent keeps its copy until the same instance id starts again, which is a known gap.
+5. Bun injects the plaintext as an environment variable. The runtime needs the full launch spec on disk to start and adopt the instance, so plaintext reaches disk only in root-only files (mode 0600, in owner-only directories): the runc bundle's `config.json`, deleted when the instance retires; the agent's adoption record, removed with the instance; and the runtime's own launch intent. Retiring the intent cuts every environment entry down to its variable name, so a retired intent keeps no value (`OciSpec::without_environment_values`); recovery compares a spec with an intent's copy through `OciSpec::matches_journal`, which accepts the scrubbed form.
 6. A decryption audit event is logged: which secret, which app, which node, timestamp.
 
-**Namespace-scoped keys (planned — not yet generated):** The intended design is that setting `secret_key = true` for a namespace makes `relish init` (or `relish namespace create`) generate a separate age keypair for it, stored in Raft wrapped with HKDF, so compromise of one namespace's key does not expose another's. **This is not shipped:** there is no `secret_key` config field, and no code path generates a namespace-scoped age keypair — the cluster runs on a single cluster-wide age key. The decryption and re-seal paths already *prefer* a namespace key when one exists and fall back to the cluster-wide key, so the consuming side is ready; only the key-creation side is missing.
+**Namespace-scoped keys (F05 I4, opt-in):** `secret_key = true` in `[namespace.X]` gives the namespace its own age keypair, wrapped with HKDF like the cluster key. Raft apply must be deterministic, so the state machine can't generate it: the leader's `bun::namespace_keys` loop finds opted-in namespaces with no key, generates generation 0, decrypts the namespace's stored `ENC[AGE:...]` app values with the cluster-wide keys, seals them again to the new key, and proposes key and values as one `RaftRequest::RotateSecretKey { scope: Namespace(X), resealed, .. }`. Each `ResealedSecret` carries the ciphertext the leader read; the state machine refuses the whole entry if any value changed since, belongs to another namespace, or the scope already has a key, and the leader retries on its next tick. Once a namespace has a key, its values decrypt **only** with that namespace's keys (`SecurityState::decryption_keypairs`): there is no fallback to the cluster-wide key, or a cluster-sealed value would still open there. A namespace without a key uses the cluster-wide keys only. Rotation and finalise are per namespace (`relish secret rotate [--finalize] --namespace X`, `POST /v1/secret/rotate {"namespace": "X"}`), refused for a namespace with no key, and limited to unscoped Admins; `GET /v1/secret/public-key?namespace=X` serves its active public key. Job specs aren't stored desired state, so they aren't re-sealed. **Limitation:** until the master key is split (F03b), every node holds the master key and can unwrap every namespace's key, so the boundary is against other tenants' tokens and workloads, not against a compromised node.
 
 **Key rotation (`relish secret rotate`):**
 
@@ -1011,22 +1044,52 @@ On each council node (intended design):
 
 ### 5.8 CA Rotation
 
-> **Status: planned — not yet implemented.** There is no `relish ca` command
-> family (no `ca rotate`, `ca rotate --root`, or generation bump). CA rotation,
-> the dual-signing transition, and root cross-signing below are design, not
-> shipped code. (Certificate *revocation* via the CRL — §5.7,
-> `RaftRequest::RevokeCertificate` — is separate and does ship.) The
-> `CertificateAuthority.generation` counter exists but is never incremented,
-> because nothing rotates a CA yet.
+> **Status: intermediates implemented (F04 R1–R4, #362); root rotation planned.** The council state can hold
+> several CAs per role. Each has a `CaState` (`Active` or `Retiring { until }`);
+> `SecurityState::active_ca(role)` is the one that signs and
+> `trusted_cas(role)` is every one a verifier accepts. Two Raft requests drive
+> a rotation, the same shape as secret rotation:
+>
+> - `CaRotationBegin { role, ca }` adds `ca` as the active CA (generation + 1,
+>   signed by the active root, wrapped key present) and marks the old one
+>   `Retiring` until the longest leaf it could have signed expires. A second
+>   rotation of the same role is refused until the first is finalised; a retry
+>   of the same generation changes nothing. Root rotation is refused for now.
+> - `CaRotationFinalize { role, now_unix_ms }` drops the retiring CA. For the
+>   Node CA it's refused while any node's latest leaf
+>   (`SecurityState::node_leaves`, recorded when the council allocates the
+>   serial) came from the retiring CA; workload and ingress leaves aren't
+>   tracked one by one, so for those it's refused until the window ends.
+>
+> Every verifier trusts the whole set (F04 R2). A node's identity carries a
+> `TrustSet` (every trusted Node CA and root); the mTLS server and client
+> verifiers, renewal's `validate_peer`, the join bundle and `GET
+> /v1/cluster/ca`, keyless image signatures and the workload `ca.pem` all try
+> each trusted CA. Bun's security refresh installs the council's trust set
+> every five seconds through `LiveNodeIdentity::adopt_trust`, which persists
+> it and refuses any set that isn't the council's or that drops the node's own
+> issuer; listeners read it on every handshake, so it applies without a
+> restart. The ingress resolver rebuilds when the active Ingress CA changes.
+>
+> The `relish ca` family has `ca backup` and `ca verify` (F04 R3): an
+> operator-held root backup sealed to a passphrase or an age recipient, checked
+> offline for key match, expiry and fingerprint. `ca rotate` rotates an
+> intermediate (F04 R4, below). There is no `ca rotate --root` yet (R5).
+> (Certificate *revocation* via the CRL — §5.7, `RaftRequest::RevokeCertificate`
+> — is separate and does ship.)
 
-**Intermediate CA rotation (`relish ca rotate`) — planned:**
+**Intermediate CA rotation (`relish ca rotate --role node|workload|ingress --root-backup <file>`, F04 R4):**
 
-1. Generate a new intermediate CA keypair (for whichever CA is being rotated, or all three).
-2. Sign the new intermediate with the root CA. (The root CA private key is needed only for this step; it is decrypted from the sealed backup provided by the operator.)
-3. Store the new intermediate CA in Raft alongside the old one.
-4. **Dual-signing period begins:** both old and new intermediate CAs are trusted. The new intermediate is used for all new certificate issuance.
-5. Over time, all existing certificates expire and are re-issued under the new intermediate.
-6. Once all certificates issued by the old intermediate have expired (or been re-issued), the old intermediate is revoked and removed.
+1. **Prepare** (`POST /v1/ca/rotation/prepare {role}`). The leader generates the new P-256 key, wraps it with the master key and proposes `RaftRequest::CaRotationPrepare { role, generation, csr_der, private_key_wrapped }`. Applying it stores a `PendingIntermediate` (one per role; a second prepare replaces the first) and allocates the certificate's serial from `next_serial`, so it can't collide with a revoked serial. Refused for the root, for a role mid-rotation and for a generation other than the active one's plus one. The answer carries the CSR, generation, serial and the active root's fingerprint.
+2. **Sign** (on the operator's machine). `relish` opens the R3 backup, checks its fingerprint against the one the council sent, and signs the CSR with `ca::sign_intermediate_csr`: only the CSR's public key is used; name, path length 0, key usages and five-year lifetime are fixed per role and clamped to the root's validity. The root key never reaches the cluster.
+3. **Begin** (`POST /v1/ca/rotation/begin {role, certificate_b64}`). The leader checks the certificate with `ca_rotation::intermediate_from_signed` (pending CSR for the role, same public key, allocated serial, CA certificate, signed by the active root), builds the `CertificateAuthority` with the pending wrapped key and proposes `CaRotationBegin`, which clears the pending CSR. Both CAs are trusted; new leaves come from the new one.
+4. **Re-issue.**
+   - *Node:* each node's renewal worker checks its replica every 5 s. Once its live identity holds exactly the council's trust set it sends `POST /v1/cluster/trust-ack {node_ca_fingerprints}` (node-to-node, TLS-peer authenticated); the leader refuses unless every trusted Node CA is listed, then proposes `AcknowledgeNodeTrust { node_id, generation }`, which raises `NodeLeafRecord::trust_generation` (never lowers it; a join starts at the active generation). When every live node has acknowledged, nodes renew early (`ca_rotation::early_renewal_due`) one at a time in node-id order, each after every earlier node holds a new-CA leaf, or after its slot (`EARLY_RENEWAL_STAGGER`, 60 s per place from the new CA's issue time) if one is stuck.
+   - *Workload:* leaves renew every 30 minutes, so they move within the hour.
+   - *Ingress:* the resolver reload (R2) re-mints route certificates from the new CA within 5 s.
+5. **Finalise** (`POST /v1/ca/rotation/finalize {role}`, `relish ca rotate --role R --finalize`). For the Node CA, refused while any live (not decommissioned) node hasn't acknowledged the active generation or still has a latest leaf from the retiring CA, naming the nodes. For Workload and Ingress, refused until the retiring window ends (an hour, 90 days). Then the retiring CA is removed.
+
+All three admin routes need an unscoped Admin user (never the service principal) with the cluster-wide `admin` permission, and must reach the leader: a follower answers 421 naming it. Each step records an audit event (`ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`).
 
 **Root CA rotation (`relish ca rotate --root`):**
 
@@ -1086,6 +1149,24 @@ per call and discarded, so no policy could ever list it; that path is gone.)
 The manifest carries a single signature slot, so a later `relish sign`
 replaces an earlier signature (including a build signer's). Signatures bind
 digests, never tags: re-pushing a tag leaves the new digest unsigned.
+
+The signature format is Pickle's own (P-256 over the digest string), not
+cosign's. Images from outside Pickle carry no signature Pickle checks yet,
+but every apply binds their tags to digests (`nginx:1.27@sha256:…`), so the
+bytes that run are the bytes the apply resolved (F03 U1, #361). Which
+upstream registries a node runs images from is a third trust root,
+`[[images.trust_policy.upstream]]` (`match` a repository or a `*` prefix; the
+most specific rule wins) with `[images.trust_policy.upstream_default] allow`
+(default `true`; `false` makes the rules an allow-list). The node handling an
+apply checks it before contacting any registry, and Bun checks it again before
+every deploy where a council catalogue tells Pickle's images from upstream
+ones (F03 U2). It stays in `node.toml` for the same reason the keys do:
+nothing an API token can change should decide what the cluster trusts. A rule
+with `require_signatures = true` and `cosign_keys` (PEM P-256 keys) makes Bun
+verify a key-based cosign signature over the bound digest before every
+deploy, off the agent loop, reading the `.sig` image through the pull-through
+cache when it's on (F03 U3). Either half without the other is refused at
+startup.
 
 ---
 
@@ -1201,32 +1282,24 @@ external_ca_path = ""
 ### 6.3 API Tokens
 
 ```toml
-# PLANNED — this [security.tokens] block is not parsed today. Token TTL is
-# set per-token via `relish token create --ttl-days` and defaults to no expiry
-# when omitted (§5.4); there is no cluster-wide default TTL, no configurable
-# default rate limit, and no token-rotation grace period (no `token rotate`).
 [security.tokens]
-# Default TTL for new tokens. Default: 90 days.
+# Default lifetime of new Deployer and ReadOnly tokens: "<n>d", "<n>h" or
+# "none". Admin tokens never get one. Default: "90d".
 default_ttl = "90d"
-
-# Default rate limit (requests per second) for new tokens. Default: 100.
-default_rate_limit = 100
-
-# Grace period during token rotation. Default: 24 hours.
-rotation_grace_period = "24h"
 ```
+
+Only `default_ttl` is parsed. The rotation grace is per call
+(`relish token rotate --grace-hours`, 24 by default) rather than a node
+setting, and per-token rate limiting is not part of F05.
 
 ### 6.4 Secret Encryption
 
 ```toml
-# Namespace-scoped secret keys (opt-in per namespace).
-# PLANNED — not parsed or acted on today. There is no `secret_key` config
-# field, and nothing generates a per-namespace age keypair (§5.5): init and
-# join create a single cluster-wide age key. The decrypt/seal paths already
-# look up a namespace key and fall back to the cluster-wide one, so the
-# lookup side is ready, but no namespace key is ever created.
+# Namespace-scoped secret keys (opt-in per namespace, F05 I4).
+# The leader creates the namespace's key and re-seals its stored app values
+# (§5.5). From then on its values decrypt only with its own key.
 [namespace.team-payments]
-secret_key = true    # generate a separate age keypair for this namespace (planned)
+secret_key = true    # a separate age keypair for this namespace
 ```
 
 ### 6.5 Network Security
@@ -1431,7 +1504,7 @@ The threat model assumes:
 
 - Obtain certificates for workloads on other nodes (CSR validation checks Meat's scheduling state — this *is* enforced).
 - Forge certificates for arbitrary workloads — **not yet guaranteed:** CA private keys are currently derivable on every node.
-- Decrypt secrets for other namespaces — **not yet guaranteed:** there is a single cluster-wide age key today (§5.5), and it is derivable on every node.
+- Decrypt secrets for other namespaces — **not yet guaranteed:** a namespace with `secret_key = true` has its own age key (§5.5), but every node can still unwrap every namespace's key until the master key is split (F03b).
 - Access the age private key, CA private keys, or OIDC signing key — **not yet guaranteed** (see the note above).
 - Modify the Raft log or cluster state (requires council consensus — this *is* enforced).
 - Bypass nftables perimeter rules on other nodes.
@@ -1609,7 +1682,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 ### 10.5 Secret Encryption Round-Trip
 
 - **Encrypt/decrypt test:** Encrypt a value with the cluster's public key. Deploy an app referencing the encrypted value. Verify that the workload receives the correct plaintext as an env var.
-- **Namespace isolation test:** Encrypt a value with namespace A's public key. Attempt to use it in namespace B's app. Verify decryption failure.
+- **Namespace isolation test:** Encrypt a value with namespace A's public key. Attempt to use it in namespace B's app. Verify decryption failure. Implemented as `a_value_sealed_for_one_namespace_fails_closed_in_another` and `after_opting_in_a_cluster_sealed_value_fails_closed_in_that_namespace` (`src/bun/agent/tests/namespace_secrets.rs`).
 - **Key rotation test:** Encrypt values with key generation N. Run `relish secret rotate`. Verify that old ciphertexts still decrypt (old key is read-only). Encrypt new values with generation N+1. Run `relish secret rotate --finalize`. Verify that old ciphertexts no longer decrypt.
 
 ### 10.6 CRL Distribution

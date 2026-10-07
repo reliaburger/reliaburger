@@ -18,7 +18,7 @@ it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.1.2 was released on 1 October 2026, and the one-line installer fetches
+0.1.6 was released on 7 October 2026, and the one-line installer fetches
 its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
 8 GiB of free memory and 15 GiB of disk.
 
@@ -28,7 +28,8 @@ curl -fsSL https://reliaburger.com/install.sh | sh
 
 # Run a real Kubernetes app: podinfo's frontend, backend and Redis
 relish apply -f https://reliaburger.com/demo/podinfo.yaml
-relish status                        # three frontends, spread across the nodes
+relish status                        # frontend-0, -1 and -2, one on each node
+relish council status                # every node's view of the council
 open http://podinfo.localhost:18080  # through the built-in ingress
 
 # Build a small Go app on the cluster (Buildah on a node, into the built-in
@@ -76,7 +77,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
-- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/14_appliance.md)
+- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md)
   - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick
 - `relish image`: Appliance OS images: download, write to a disk, and seed machines
   - `relish image download`: Download the newest OS build for every architecture and check it against the release key
@@ -116,8 +117,16 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
-- `relish batch <PATH>`: Submit a batch of jobs for high-throughput scheduling
+- `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
+  - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
+  - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
+  - `relish batch watch <ID>`: Watch rates, bounded profile summaries and duration distributions
+  - `relish batch cancel <ID>`: Cancel an array or mixed manifest and retire its active attempts
+  - `relish batch results <ID>`: Read a bounded indexed page of accepted task outcomes
+  - `relish batch logs --index <INDEX> <ID>`: Print a failed task's output (the first and last 2 KiB)
+- `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
 - `relish batch-status <ID>`: Show the progress of a submitted batch
+- `relish jobs`: List bounded job run summaries and rates, or durable schedule definitions
 
 **Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
 
@@ -175,12 +184,17 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 - `relish token`: Manage API tokens
   - `relish token create --name <NAME>`: Create a new API token
-  - `relish token list`: List all API tokens
+  - `relish token list`: List all API tokens with their scope, expiry and last use
   - `relish token revoke <NAME>`: Revoke an API token by name
+  - `relish token rotate <NAME>`: Give a token a new secret under the same name. The old secret keeps working for the grace period, then stops
 - `relish secret`: Manage secrets (encrypt values for use in app configs)
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
   - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
+- `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
+  - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
+  - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
+  - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 
@@ -257,6 +271,8 @@ Nodes join with single-use tokens and certificate signing requests.
 Certificates renew themselves. Secrets live in your config encrypted to the
 cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
+Every apply binds image tags to digests, so a moved tag can't change what runs,
+and node config can limit which upstream registries images may come from.
 
 **A registry on every node.** Pickle is an OCI registry built into the cluster.
 Push once and nodes pull layers from each other. It also caches upstream
@@ -277,9 +293,18 @@ it would take out every replica or put the council's quorum at risk.
 `relish test --chaos` runs scripted recovery scenarios.
 
 **Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
-blue-green switches, autoscaling on metrics, jobs, cron and batch. Point the
-cluster at a Git repository and the leader keeps it in sync, verifying commit
-signatures if you ask it to.
+blue-green switches, autoscaling on metrics, jobs, cron and batch. Task arrays
+(`relish run --batch`, 0.2.0 development preview) keep repeated image or host
+tasks compact, pack CPU and memory beside apps, and report grouped outcomes
+through Raft. Mixed-profile manifests, rates and indexed detail are described
+in [the batch manual](docs/manual/14_batch-jobs.md). Point the cluster at a Git
+repository and the leader keeps it in sync, verifying commit signatures if you
+ask it to.
+
+Batch jobs retain distinct execution identities and their original scoped
+labels across retries and recovery. Finite durable history keeps replay fences;
+see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and job attempts share node CPU/memory admission. Committed grants and
+accepted outcomes survive leader changes; retired nodes receive no new work.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
@@ -327,7 +352,15 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.1.2
+The [common job lifecycle plan](docs/plans/2026-10-07-plan-common-job-lifecycle.md)
+describes the common definition/run/task/attempt path for singleton jobs,
+arrays, durable UTC cron and deployment hooks (#638). The development API,
+CLI and dashboard show bounded summaries and accepted rates. Ordinary jobs and
+hooks require acknowledged replay after an unknown outcome; standalone admission
+is durable. See the [job manual](docs/manual/14_batch-jobs.md) for policies and
+runtime limits.
+
+## Limits in 0.1.6
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

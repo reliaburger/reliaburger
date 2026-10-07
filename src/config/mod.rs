@@ -8,7 +8,9 @@
 /// Both parse from TOML and validate in a separate pass.
 pub mod app;
 pub mod build;
+pub(crate) mod defaults;
 pub mod error;
+pub mod fingerprint;
 pub mod job;
 pub mod namespace;
 pub mod node;
@@ -16,7 +18,7 @@ pub mod permission;
 pub mod process_workloads;
 pub mod types;
 mod validate;
-pub(crate) use validate::valid_workload_label;
+pub(crate) use validate::{valid_workload_label, validate_job};
 
 use std::collections::BTreeMap;
 use std::path::Path;

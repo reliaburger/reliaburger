@@ -75,9 +75,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             if let Some(launches) = launches
                 && owner.phase == PolicyPhase::Owned
-                && !launches
-                    .iter()
-                    .any(|launch| launch.instance_id == *id && launch.spec == owner.original_spec)
+                && !launches.iter().any(|launch| {
+                    launch.instance_id == *id && launch.launched(&owner.original_spec)
+                })
             {
                 return Err(BunError::AdoptionState(format!(
                     "egress owner {id} conflicts with original runtime intent"

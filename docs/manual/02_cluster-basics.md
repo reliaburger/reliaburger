@@ -98,8 +98,15 @@ leaders. A cluster created with a council size shows it on a `Size:` line
 status` opens with a one-line summary of it.
 
 The council heals itself: lose a voter and the reconciler promotes a caught-up
-node in its place. If every voter is lost, `relish council recover` rebuilds
-the council from a stopped survivor's snapshot or a sealed backup (see
+node in its place. A voter whose disk is at least 95% full for ten minutes
+(measured on the filesystem holding `<data>/raft`) asks to be replaced the same
+way, and a leader hands over first. The `max_storage_mb` caps on logs and
+metrics only decide what gets pruned; they never move a council seat. If a
+voter's disk fills before it's replaced, its Raft log stops accepting writes:
+bun logs `council Raft core stopped`, exits non-zero, and the service manager
+restarts it. Once there's space again, it catches up from the leader. If every
+voter is lost, `relish council recover` rebuilds the council from a stopped
+voter's own snapshot and committed log, or from a sealed backup (see
 `operations`). Read its `--help` first: writes after the last backup are lost.
 
 ## When a node is gone for good

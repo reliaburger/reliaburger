@@ -115,6 +115,13 @@ fn compute_desired(current: u32, metric: f64, config: &AutoscaleConfig) -> u32 {
 
 ### Hysteresis and cooldown
 
+The target must be positive and finite. Parsing a Rust `f64` accepts `NaN`
+and infinity as well as ordinary numbers, so parsing alone isn't validation.
+We reject those values, zero and negative targets before apply. A finite
+target above 100% remains useful: requests aren't limits, and a replica may
+legitimately use more than it requested. If a collected sample isn't finite,
+the controller leaves the replica count alone for that evaluation.
+
 Without hysteresis, the autoscaler oscillates. CPU drops to 60% (below the 70% target), it scales down, load per instance jumps back to 90%, it scales up, and you're stuck in a loop.
 
 The fix: a scale-down threshold. The default is 0.8, meaning the metric must drop below `target * 0.8 = 56%` before scaling down. At 60%? No change. At 50%? Scale down. The gap between the scale-up trigger (> 70%) and the scale-down trigger (< 56%) prevents oscillation.
@@ -431,7 +438,7 @@ The sync loop:
 1. **Trigger.** Poll timer (default 30s) or webhook
 2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
 3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
-4. **TOML parse.** All `.toml` files under the configured path. Parse errors are per-file, not global
+4. **Configuration tree.** Read the verified commit under the configured watch root. Resolve `_defaults.toml` inheritance and directory namespaces through the same resolver as CLI compilation. A malformed or ambiguous tree refuses the whole sync
 5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
 6. **Selective apply.** Only changed resources written to Raft
 
@@ -545,7 +552,7 @@ Changing what you persist changes what your equality checks mean. If some code c
 
 All of the above — `execute_sync`, the diff engine, signature verification, the webhook validator — was a library nobody ran. The July 2026 review found `execute_sync` had no caller, `/v1/gitops/webhook` returned 503 unconditionally (`gitops_webhook_tx` was hardcoded `None`), and the `[gitops]` config section was parsed and never read. A GitOps engine that never touches git.
 
-The runner (`spawn_gitops_sync`) is the missing piece: a leader-only task that clones the configured repo, then on each poll tick or webhook nudge reads the current apps and last-applied sha from Raft, runs `execute_sync` in `spawn_blocking` (git shells out; never on the async runtime), and applies the resulting changes — `Add`/`Update` become `AppSpec` writes to Raft, `Remove` becomes `AppDelete`. Exactly the desired-state writes a manual `relish apply` makes, which means the scheduler and reconcilers from Chapter 2 pick them up for free. Git becomes just another writer of desired state. The webhook endpoint now has a channel to nudge, so a `git push` hook triggers a sync in milliseconds instead of waiting for the poll.
+The runner (`spawn_gitops_sync`) is the missing piece: a leader-only task that clones the configured repo, then on each poll tick or webhook nudge reads the current apps and last-applied sha from Raft, runs `execute_sync` in `spawn_blocking` (git shells out; never on the async runtime), and applies the resulting changes — `Add`/`Update` become `AppSpec` writes to Raft, `Remove` becomes `AppDelete`. These cover apps, namespaces and permissions; a tree containing jobs is refused before writes. These are the supported desired-state writes a manual `relish apply` makes, which means the scheduler and reconcilers from Chapter 2 pick them up for free. Git becomes just another writer of desired state. The webhook endpoint now has a channel to nudge, so a `git push` hook triggers a sync in milliseconds instead of waiting for the poll.
 
 Wiring it flushed out a bug that only a real repo could surface. `execute_sync` starts by fetching, and treats "fetch found no new commit" as "nothing to do". But the *first* sync after cloning has nothing new to fetch — the clone already contains the commit — yet the desired state has never been applied. The result: a freshly-configured GitOps repo synced *nothing* until someone pushed a second commit. The fix distinguishes "no new commit since last fetch" from "current HEAD not yet applied": when the repo's HEAD differs from the last-*applied* sha, sync it regardless of whether the fetch pulled anything. The unit tests never caught this because they drove `execute_sync` with a mock repo whose `fetch` returned a commit on demand; only a real bare clone, where the first fetch is genuinely a no-op, exposed it.
 
@@ -925,7 +932,7 @@ that drops an operation and reopens it straight away was refused every so
 often with "another operation is using cluster". A loop of 100 reopens with two
 threads spawning `true` in the background was refused 69 times.
 
-So the lock is now a small type of its own whose `Drop` (the destructor we met
+So the lock became a small type of its own whose `Drop` (the destructor we met
 in Chapter 1) unlocks before the file closes:
 
 ```rust
@@ -945,6 +952,83 @@ lock anyway. `flock(LOCK_UN)` acts on the description, so it frees the lock
 for every copy at once, including the one in a half-spawned child. The
 relish CLI never reopens an operation in the same process, so users never saw
 this, but the fix makes "dropping releases the lock" true without a caveat.
+
+We fixed that lock and missed its neighbours. Five days later the same
+refusal turned up in three more places that take an `flock` and let a plain
+`File` close it: the local context's `context.lock` (#500), Pickle's upload
+directory owner (#497, in Chapter 5) and the log export checkpoint (#519, in
+Chapter 6). Each got a small type of its own whose `Drop` unlocks first:
+`ContextLock`, `UploadDirectoryOwner` and `ExportLock`. Each got the
+same test as the operation lock: a hundred or more lock-and-drop rounds beside
+two threads spawning `true`. Before the fix the upload owner's version was refused
+75 times out of 100. The lesson is a boring one. When you fix a class of bug,
+grep for the class, not just the line in the stack trace.
+
+We didn't, not properly. Two days later the Raft recovery lock failed the
+same way (#606, in Chapter 2), and while fixing it we found three more locks
+that returned a plain `File`: the quickstart's `setup.lock`, the discovery
+journal's claim and `process_control`'s operation lock. Auditing for #613
+turned up a fourth, the process owner lock that `process_control` takes to
+fence a dead owner. The operation lock is the worrying one. Bun takes it to prepare, start and signal a process
+workload, and Bun spawns processes all day. It retries for two seconds, so a
+user would have seen a slow operation rather than a refusal, but a loop of a
+thousand take-and-drop rounds beside two spawning threads found the lock still
+held straight after the drop 5 to 20 times a run, in ten runs out of ten.
+
+Eight small guard types, each with the same three-line `Drop`, plus four
+locks with none, is how the class kept coming back: every new lock was a chance to forget it. So now there
+is one, `file_lock::FileLock`, and every file lock in `src/` goes through it:
+
+```rust
+pub struct FileLock {
+    file: File,
+}
+
+impl FileLock {
+    pub fn try_lock(file: File) -> Result<Self, FileLockError> {
+        close_on_exec(&file)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(FileLockError::Busy),
+            Err(std::fs::TryLockError::Error(error)) => Err(FileLockError::Io(error)),
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+```
+
+`try_lock` takes the `File` by value, so once you've asked for a lock the only
+way to the file is through the guard (its `file()` method lends it out for a
+`sync_all` or a `metadata` call). There's no window between locking and
+wrapping in which an early `return` could close a locked file: the guard
+exists the moment the lock does. A sibling, `lock_within`, polls a busy lock
+until a timeout, which is what the operation lock needed. `close_on_exec`
+makes sure the descriptor has `FD_CLOEXEC` set, so a child drops its copy at
+`exec`. The standard library already opens every file that way, so this is a
+belt to go with the braces, for a `File` built from a raw descriptor.
+
+The existing guards kept their names where they carry more than the lock
+(`UploadDirectoryOwner` holds a `FileLock` now) and disappeared where they
+didn't (`ContextLock`, `ExportLock`, the quickstart's `OperationLock` and
+`RecoveryLock` are all plain `FileLock`s).
+
+Then we made forgetting impossible to merge. A unit test,
+`file_lock::source_rule`, parses every file under `src/` with `syn` (the
+parser procedural macros use) and fails on anything that looks like a file
+lock outside `src/file_lock.rs`: an `flock`, a `Flock`, a `LOCK_EX`, a
+`TryLockError`, an `.unlock()`, or a `.try_lock()` on a local variable.
+Syntax can't see types, though, and every `Mutex` has a `try_lock` and a
+`lock` too. The test lets a `.try_lock()` on a struct field through, because
+that's where all our in-memory mutexes live. For the gaps, `clippy.toml` lists
+`File`'s lock methods under `disallowed-methods`, and Clippy *does* know the
+types: `file.try_lock()` anywhere except inside `FileLock` is a lint error, and
+CI treats warnings as errors. Two checks, one syntactic and one type-aware,
+for a bug we'd otherwise keep fixing one lock at a time.
 
 ### Download before you trust, verify before you replace
 
@@ -1258,6 +1342,16 @@ daemon it came up with has gone. The stops take 0, 0.3 and 0.6 seconds, so
 without the gate VM 1's start fails every time with the error from the Mac.
 With the gate, all three end up `Running`.
 
+These watchdog tests then turned flaky on their own (#517). Alone they
+passed; two in one test process failed nine runs in ten. The culprit was
+macOS, not our code: it checks a new executable file the first time anything
+runs it, the check costs over 100 ms, and two first runs of different new
+files wait for each other. Each test wrote a fresh fake `limactl` and started
+it under a 200 ms watchdog, so the second one routinely missed its deadline
+before its script printed a byte. The fix runs each fake once, right after
+writing it and before the clock starts. A file that has been checked starts
+in a few milliseconds from then on.
+
 ### Bake the image, don't install at boot
 
 The measurements had one more thing to say. The kernel reached a login prompt
@@ -1418,6 +1512,81 @@ architecture and checks downloaded content. This remains a network dependency,
 so the signed cold-install gate must exercise it too.
 
 The context also records the other loopback forwards, HTTP ingress on 18080 and the authenticated registry on 15050, so tools don't have to guess guest ports. And the guest's systemd unit mounts bpffs at `/sys/fs/bpf` in an `ExecStartPre` step if the base image didn't, so Bun never starts without the filesystem that holds its eBPF pins.
+
+### One clock, not two
+
+The 0.1.5 soak turned up a bug that wasn't in our code at all. On every node,
+every 10 seconds, the guest journal said the same thing:
+
+```text
+SyncTime: system time synchronized with host (drift was ~140ms)
+systemd-resolved: Clock change detected. Flushing caches.
+```
+
+Two programs owned the guest's clock. Lima 2.1's host agent sends the Mac's
+time to its guest agent every 10 s, and the guest agent sets the wall clock to
+it whenever the two differ by more than 100 ms. Ubuntu also runs
+systemd-timesyncd, which asks an NTP server and nudges the clock's frequency
+rather than stepping it. `timedatectl timesync-status` showed timesyncd at
++500 ppm, the fastest it will slew. So timesyncd sped the clock up, the guest
+agent stepped it back, and round they went: 142 steps and 18.2 s of wall clock
+thrown away on one node over a night. Anything that turns the kernel's
+boot-relative times into wall-clock times moved with it. That's how Bun's
+process adoption ended up crash-looping (#607), and certificates, log
+timestamps and lease timers all saw a clock that went backwards.
+
+Which one should go? Lima gives us no say over its half. The host agent
+starts time sync for every Linux guest that has a guest agent, with no
+setting to turn it off, and dropping the guest agent would drop the port
+forwards the whole quickstart rides on. Chrony would have been a third
+contestant, not a replacement. That left timesyncd, and Lima's is the better
+clock for a laptop anyway:
+
+- **Sleep and wake.** A guest's clock stops while the Mac sleeps. Lima's
+  agent fixes that within 10 s of waking. timesyncd polls every 34 minutes or
+  so once it has settled, and needs the internet to do it.
+- **Offline.** On a train with no Wi-Fi, NTP has nobody to ask. The host
+  always answers.
+- **Network faults.** The guest agent talks to the host over a virtio channel
+  (a vsock on Apple's Virtualization.framework), not over the guest's
+  network. A `netem` delay from `relish test` can't skew it. NTP packets do go
+  through the guest's network. Nodes 2 and 3 started stepping 30 s after a
+  chaos fault loaded `netem` on node 3, though node 1 had started five minutes
+  earlier without one, so `netem` was at most the trigger there.
+
+So the guest image ships with timesyncd switched off. `build_guest_image.sh`
+runs `systemctl disable systemd-timesyncd.service` in the chroot, which only
+removes symlinks and so works without a running systemd. The VM's
+provisioning script does the same for the stock Ubuntu image of development
+runs:
+
+```rust
+const ONE_CLOCK_SOURCE: &str =
+    "if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then\n  \
+     systemctl disable --now systemd-timesyncd.service\nfi\n";
+```
+
+A `const` is a value the compiler bakes in. `&str` is a borrowed string, and
+for a literal the borrow lasts for the whole program (its full type is
+`&'static str`), so it needs no allocation and no owner. The trailing `\` in a
+Rust string literal swallows the line break and the next line's leading
+spaces, which is why the shell's indentation is written out as two spaces
+before it.
+
+The trade-off is that we inherit Lima's bugs. Its agent compares its own
+clock with the host's timestamp after the message has crossed into the VM, so
+on a heavily loaded Mac it mistakes a slow delivery for drift and steps the
+clock back by the delay ([lima#5543](https://github.com/lima-vm/lima/issues/5543),
+with a fix proposed upstream). Without timesyncd pushing the other way that
+happens only under load, not every 10 seconds for the rest of the night.
+
+How do we know it stays fixed? The provisioning test runs the script against
+a stub `systemctl` that logs its arguments and expects `disable --now
+systemd-timesyncd.service` among them, and the guest image test checks the
+build script disables the unit before it seals the image. On real VMs, the
+soak's guest report now prints whether timesyncd is active, which fails the
+check outright, and counts the `SyncTime` steps the guest agent logged since
+the last report. The record lists the total per node.
 
 ### Status from any node
 
@@ -1626,3 +1795,11 @@ Here's what a real run found that thousands of unit and integration tests hadn't
 Every one of those has its own test now. The deeper lesson is about where the bugs were: not in any one component, but between them. The lock was correct, and so was the agent loop. So were the ledger and the catalogue, each on its own terms. Only a whole cluster, with real images, real timings and a leader that dies, puts them in the same room.
 
 Two things still weren't pretty. While a node is down, nothing can release an address it might still route to, so a survivor that gains a replica keeps retrying its rolling replacement until the node returns (traffic is fine; the survivor already runs the new replicas). And a replica-count change was still a rolling redeploy on that node rather than "start one more". The 0.1.1 recording showed where that leads: node-1 rolled twice, node-2's healthy frontend was moved as well, and `relish inspect` listed five stopped leftovers. In 0.1.2 the agent starts only the added replicas, a suspect node keeps its placements, and the replacement goes to the survivor with the fewest replicas (Chapter 2, "Losing a node shouldn't move the survivors").
+
+### Refusing jobs before their dependent apps
+
+A migration declared with `run_before = ['app.web']` must run before the app is deployed. Lettuce used to parse the job, omit it from its desired-state diff, and report success after publishing the app. The missing piece is a durable identity connecting a Git revision to a job run, plus dispatch and recovery. Until those exist, the safe supported behaviour is an explicit refusal.
+
+After validating the full configuration, `execute_sync` checks `git_config.job.is_empty()`. Any job, including a cron registration or a job-only tree, returns `SyncResult::Failure` before diffing or producing writes. Its error names the jobs and points to `relish apply` or `relish batch`. Apply the migration and dependent app together through the manual path so that `run_before` keeps its meaning.
+
+The runner already records a failure without advancing `last_applied_commit`. The regression first syncs a real Git repository into a single-node Raft council, then commits an app revision, migration, namespace and permission together. It checks the failed history entry and the unchanged app, namespace, permission and applied SHA. Signed commits and repeated reconciliation are covered separately: trusted authorship does not make an unsupported job executable.

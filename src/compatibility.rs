@@ -38,13 +38,53 @@ pub struct Compatibility {
 /// each placement's `Placement::ordinal` in council state, the ordinals a
 /// placement poll hands a node (`NodeAssignment::ordinals`) and the
 /// instance ids named after them (#398), and the `token`, `secret` and
-/// `identity` event kinds a peer's `/v1/events` answer can carry (F05 I1).
-/// The appliance OS rollout bumps both again: a new Raft request and a new
-/// field in council state. So does the cluster-wide council size
-/// (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
+/// `identity` event kinds a peer's `/v1/events` answer can carry (F05 I1),
+/// and the API token expiry sweep (`RaftRequest::SweepExpiredApiTokens`,
+/// `CouncilResponse::ApiTokensSwept`) with the token list each peer answers
+/// on `local=true`, carrying scope and last use (F05 I2), and the per-blob
+/// repository upload receipts, keyed by repository and exact lease generation
+/// before scoped publication can reuse shared CAS content (#531).
+/// Complete desired-spec fingerprints and namespace-qualified preview keys (#550).
+/// Node-owned remote metrics prefixes and persisted plaintext archive ownership (#533).
+/// Batch execution identities, current-attempt reports and trusted label maps (#535).
+/// Durable owned attempts, compact retired proofs and retained execution ownership (#535).
+/// Shared batch requests and whole-pass placement admission revisions (#543).
+/// Replicated migration/job intent and original-generation settlement fences (#534).
+/// Authenticated webhook trigger admission and delivery receipts in durable Raft (#553).
+/// Owned metrics publication metadata and immutable log ingestion checkpoints (#555).
+/// Instance adoption records name their kernel boot and, on Linux, a process start in clock ticks since boot (#607).
+/// Per-namespace secret keys: `NamespaceSpec::secret_key` and the values a
+/// namespace's first key re-seals (`RaftRequest::RotateSecretKey::resealed`)
+/// (F05 I4, #363).
+/// Several CAs per role: each CA's `CaState`, the node leaf records
+/// (`SecurityState::node_leaves`) and the `CaRotationBegin` and
+/// `CaRotationFinalize` Raft requests (F04 R1, #362).
+/// Trust bundles: the trusted Node CAs and roots in a join bundle
+/// (`JoinBundle::trusted_node_cas_b64`, `trusted_roots_b64`) and in
+/// `GET /v1/cluster/ca`, the workload CA bundle in a signing answer
+/// (`WorkloadCsrResponse::ca_bundle_der`), and the trust set in a node's
+/// identity snapshot (`node.bundle.json` schema 3) (F04 R2, #362).
+/// API token rotation: `RaftRequest::RotateApiToken` and each stored token's
+/// `ApiToken::previous_secret`, the old secret during its grace period (F05 I3).
+/// Image references bound to digests at apply (`nginx:1.27@sha256:…`) in app
+/// and job specs, deploy history and prerequisite claims, and the tag a bound
+/// pull records in the pull-through cache (F03 U1, #361).
+/// Intermediate rotation: the pending CSRs (`SecurityState::pending_intermediates`),
+/// each node's trust acknowledgement (`NodeLeafRecord::trust_generation`),
+/// the `CaRotationPrepare` and `AcknowledgeNodeTrust` Raft requests and the
+/// `POST /v1/cluster/trust-ack` body a node sends the leader (F04 R4, #362).
+/// and task arrays (`RaftRequest::TaskArray`, `DesiredState::task_arrays`
+/// and node ledgers under `task-arrays/`), including mixed-profile manifests,
+/// persistent recovery/term/index fences, 64-bit grant generations, accepted
+/// ownership ranges, duration buckets and indexed result pages (47/64).
+/// Reusable job definitions, immutable run provenance and atomic schedule
+/// occurrence claims in the common execution store (48/65, #638).
+/// The appliance OS rollout (a new Raft request and a new field in council
+/// state) and the cluster-wide council size (`RaftRequest::CouncilSize` and
+/// `DesiredState::council_size`) on the 0.3.0 train (49/66).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 36,
-    state: 51,
+    protocol: 49,
+    state: 66,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -258,6 +298,50 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("identity")).unwrap();
         ensure_state_compatible(directory.path()).unwrap();
+    }
+
+    /// The generations before task arrays. There's no compatibility before
+    /// 1.0.0, so nodes and data from then are refused, not migrated.
+    const BEFORE_TASK_ARRAYS: Compatibility = Compatibility {
+        protocol: 46,
+        state: 63,
+    };
+
+    #[test]
+    fn peers_and_state_from_before_task_arrays_are_refused() {
+        assert!(BEFORE_TASK_ARRAYS.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_TASK_ARRAYS.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_TASK_ARRAYS.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
+    }
+
+    /// The generations before the appliance OS rollout and the cluster-wide
+    /// council size: main's job definitions (#638).
+    const BEFORE_APPLIANCE: Compatibility = Compatibility {
+        protocol: 48,
+        state: 65,
+    };
+
+    #[test]
+    fn peers_and_state_from_before_the_appliance_train_are_refused() {
+        assert!(BEFORE_APPLIANCE.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_APPLIANCE.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_APPLIANCE.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }
 
     #[test]

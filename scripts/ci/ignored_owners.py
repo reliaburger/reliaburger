@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import sys
+import os
+sys.dont_write_bytecode = True
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 import xml.etree.ElementTree as ElementTree
 
 SOURCE_DIRS = ("src", "tests", "benches")
@@ -99,6 +102,14 @@ def make_gates(root):
 def ci_owners(root):
     """The make targets and scripts that CI runs."""
     workflow = (Path(root) / ".github" / "workflows" / "ci.yml").read_text()
+    if 'scripts/ci/workflow_adapter.py' in workflow:
+        # The finite workflow adapter executes these exact original owners.
+        # This declaration does not treat arbitrary report gate names as owners.
+        import workflow_assembly
+        commands = workflow_assembly.OWNERS.values()
+        targets = {command[1] for command in commands if command[0] == 'make'}
+        scripts = {command[0] for command in commands if command[0].startswith('scripts/')}
+        return targets, scripts
     targets = {m.group("target") for m in MAKE_OWNER.finditer(workflow)}
     scripts = {m.group("path") for m in SCRIPT_OWNER.finditer(workflow)}
     return targets, scripts
@@ -141,51 +152,69 @@ def owner_problems(root):
 
 
 def executed(reports):
-    """(binary id, test name) for every test in the JUnit reports and libtest logs."""
+    """Success-only diagnostic parser; NOT owner/context qualification.
+
+    Authoritative evidence_problems() consumes verified gate envelopes below.
+    Raw libtest logs cannot prove subprocess status or current build identity.
+    """
+    import contracts as strict
     seen, problems = set(), []
     reports = Path(reports)
-    xml_files = sorted(reports.rglob("*.xml"))
-    if not xml_files:
-        problems.append(f"no JUnit reports under {reports}")
-    for path in xml_files:
+    for path in sorted(reports.rglob("*.xml")):
         try:
-            tree = ElementTree.parse(path)
-        except ElementTree.ParseError as error:
-            problems.append(f"{path.relative_to(reports)}: not a JUnit report ({error})")
-            continue
-        for suite in tree.iter("testsuite"):
-            for case in suite.iter("testcase"):
-                seen.add((suite.get("name"), case.get("name")))
+            seen.update(strict.passed_junit(path))
+        except strict.Invalid as error:
+            problems.append(f"{path.relative_to(reports)}: {error}")
     for path in sorted(reports.rglob("*.log")):
-        # Cargo names test executables <target>-<hash>.
-        binary = "reliaburger::" + re.sub(r"-[0-9a-f]+$", "", path.stem)
-        for match in LIBTEST_STARTED.finditer(path.read_text(errors="replace")):
-            seen.add((binary, match.group("name")))
+        problems.append(f"{path.relative_to(reports)}: raw libtest log needs actual completion/exit/build-origin envelope")
     return seen, problems
 
 
-def ran(test, seen):
-    binary = test.binary()
-    return any(suite == binary and (case == test.name or case.endswith("::" + test.name))
-               for suite, case in seen)
+def evidence_problems(root, reports, bindings=None, verified_gates=None):
+    """All current CI-owned ignored cases require exact, owned completion.
 
-
-def evidence_problems(root, reports):
-    """CI-owned ignored tests that no report shows running."""
+    bindings is the reviewed current candidate's exact source/binary/full-name
+    table. verified_gates is INTERNAL output of current-run strict nextest/OCI
+    envelope consumers, keyed by documented (kind, owner), never raw JSON cases.
+    Neither report filenames nor a similarly named case in another gate counts.
+    """
+    root = Path(root)
     targets, scripts = ci_owners(root)
-    seen, problems = executed(reports)
-    for test in find_ignored(root):
-        ci = [owner for kind, owner in owners(test)
-              if (kind == "make" and owner in targets) or (kind == "script" and owner in scripts)]
-        if ci and not ran(test, seen):
-            names = ", ".join(f"make {o}" if not o.startswith("scripts/") else o for o in ci)
-            problems.append(f"{test}: owned by {names}, but no CI report shows it running")
+    applicable = { (test.path, test.name): test for test in find_ignored(root)
+        if any((kind == "make" and owner in targets) or
+               (kind == "script" and owner in scripts) for kind, owner in owners(test)) }
+    if bindings is None or verified_gates is None:
+        return ["ignored evidence requires current exact owner bindings and verified gate/context envelopes"]
+    problems, bound = [], set()
+    for row in bindings:
+        if not isinstance(row, dict) or set(row) != {"source", "function", "binary", "test"}:
+            problems.append("invalid ignored source identity binding"); continue
+        identity = row["source"], row["function"]
+        if identity not in applicable or identity in bound:
+            problems.append(f"unexpected or duplicate ignored source binding: {identity}"); continue
+        bound.add(identity); test = applicable[identity]
+        # Exact full name is committed/reviewed from final discovery. This check
+        # prevents even its leaf or Cargo binary identity silently changing.
+        if row["binary"] != test.binary() or not (row["test"] == test.name or row["test"].endswith("::" + test.name)):
+            problems.append(f"{test}: source/binary binding changed"); continue
+        owned = [(kind, owner) for kind, owner in owners(test)
+            if (kind == "make" and owner in targets) or (kind == "script" and owner in scripts)]
+        identity = row["binary"], row["test"]
+        if not any(identity in verified_gates.get(owner, set()) for owner in owned):
+            command = " or ".join(f"make {owner}" if kind == "make" else owner for kind, owner in owned)
+            problems.append(f"{test}: exact case absent from successful current completion of {command}")
+    for source in applicable.keys() - bound:
+        problems.append(f"{applicable[source]}: missing exact current owner binding")
     return problems
 
 
 def main(argv):
     if argv[1:2] == ["reasons"] and len(argv) == 2:
         problems = owner_problems(Path.cwd())
+    elif argv[1:2] == ["evidence"] and len(argv) > 3:
+        import workflow_adapter
+        # Supply explicit workflow context and trusted needs through its parser.
+        return workflow_adapter.main(['aggregate'] + argv[2:])
     elif argv[1:2] == ["evidence"] and len(argv) == 3:
         problems = evidence_problems(Path.cwd(), Path(argv[2]))
     else:

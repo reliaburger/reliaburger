@@ -94,7 +94,7 @@ Joiners enrol from the server: `relish join-token create`, then `relish join` pi
 
 ### Or seed from a USB stick, as on real machines
 
-The manual's bare-metal chapter (`docs/manual/14_appliance.md`) seeds real
+The manual's bare-metal chapter (`docs/manual/15_appliance.md`) seeds real
 machines from a stick labelled `RBSEED`. To try that path here, make seeds
 with `image/tools/seed-fleet.sh` (it runs on the Mac for `init`, and on the
 server for `join`, since only the server reaches the nodes), build a stick

@@ -32,7 +32,9 @@ fn every_example_config_passes_a_dry_run() {
     for config in &configs {
         let contents = std::fs::read_to_string(config).unwrap();
         let path = config.to_str().unwrap();
-        let arguments: &[&str] = if contents.lines().any(|line| line.trim() == "[[step]]") {
+        let arguments: &[&str] = if contents.lines().any(|line| line.trim() == "[[cohort]]") {
+            &["batch", "submit", path, "--dry-run"]
+        } else if contents.lines().any(|line| line.trim() == "[[step]]") {
             &["fault", "scenario", path, "--dry-run"]
         } else {
             &["apply", path, "--dry-run"]

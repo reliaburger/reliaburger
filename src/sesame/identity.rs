@@ -20,6 +20,9 @@ use super::types::{SerialNumber, SpiffeUri, WorkloadIdentity};
 /// Workload certificate lifetime: 1 hour.
 pub const WORKLOAD_CERT_LIFETIME: Duration = Duration::from_secs(3600);
 
+/// Artifact signing authority lasts at most five years and never outlives its CA.
+pub const CODE_SIGNING_CERT_LIFETIME: Duration = Duration::from_secs(5 * 365 * 24 * 3600);
+
 /// Rotation interval: 30 minutes (half of certificate lifetime).
 pub const ROTATION_INTERVAL: Duration = Duration::from_secs(1800);
 
@@ -179,10 +182,21 @@ pub fn validate_and_sign_csr(
         )?)];
     params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
 
-    // Exact validity window: a one-hour certificate is valid for one hour
-    // (plus the skew backdate), not until midnight.
     params.not_before = time::OffsetDateTime::from(now - CLOCK_SKEW_BACKDATE);
-    params.not_after = time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME);
+    params.not_after = match usage {
+        CertUsage::Mtls => time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME),
+        CertUsage::CodeSigning => {
+            let at = time::OffsetDateTime::from(now);
+            if at < workload_ca_params.not_before || at >= workload_ca_params.not_after {
+                return Err(IdentityError::SignFailed(
+                    "code-signing CA is not currently valid".into(),
+                ));
+            }
+            params.not_before = params.not_before.max(workload_ca_params.not_before);
+            time::OffsetDateTime::from(now + CODE_SIGNING_CERT_LIFETIME)
+                .min(workload_ca_params.not_after)
+        }
+    };
 
     // Reconstruct the CA certificate object for signing
     let ca_cert = workload_ca_params
@@ -202,17 +216,22 @@ pub fn validate_and_sign_csr(
 // ---------------------------------------------------------------------------
 
 /// Build a complete workload identity bundle from a signed certificate.
+///
+/// `ca_bundle` is every CA the workload should trust, in order: the trusted
+/// Workload CAs, then the roots ([`super::trust::workload_ca_bundle`]). It
+/// becomes `ca.pem`, so during a Workload CA rotation a workload accepts
+/// peers whose certificates came from either CA.
 pub fn build_identity_bundle(
     spiffe_uri: SpiffeUri,
     certificate_der: Vec<u8>,
     private_key_der: Vec<u8>,
-    workload_ca_cert_der: &[u8],
-    root_ca_cert_der: &[u8],
+    ca_bundle: &[Vec<u8>],
     jwt_token: String,
 ) -> WorkloadIdentity {
-    let workload_ca_pem = cert::der_to_pem(workload_ca_cert_der, "CERTIFICATE");
-    let root_ca_pem = cert::der_to_pem(root_ca_cert_der, "CERTIFICATE");
-    let ca_chain_pem = format!("{workload_ca_pem}{root_ca_pem}");
+    let ca_chain_pem: String = ca_bundle
+        .iter()
+        .map(|der| cert::der_to_pem(der, "CERTIFICATE"))
+        .collect();
 
     let now = SystemTime::now();
     WorkloadIdentity {
@@ -828,6 +847,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn code_signing_certificate_never_outlives_its_issuing_ca() {
+        let uri = test_spiffe_uri();
+        let (csr, _) = create_workload_csr(&uri).unwrap();
+        let (key, mut issuer, _, _) = test_workload_ca();
+        let now = SystemTime::now();
+        issuer.not_after = time::OffsetDateTime::from(now + Duration::from_secs(120));
+        let leaf = validate_and_sign_csr(
+            &csr,
+            &uri,
+            SerialNumber(9),
+            CertUsage::CodeSigning,
+            &key,
+            &issuer,
+            now,
+        )
+        .unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+        assert_eq!(
+            parsed.validity().not_after.timestamp(),
+            issuer.not_after.unix_timestamp()
+        );
+    }
+
     /// PKI6: `check_validity` accepts a fresh certificate and rejects the
     /// same certificate once its exact window has passed (injected clock).
     #[test]
@@ -963,8 +1006,7 @@ mod tests {
             uri.clone(),
             cert_der,
             private_key_der,
-            &workload_ca_cert_der,
-            &root_ca_cert_der,
+            &[workload_ca_cert_der.clone(), root_ca_cert_der.clone()],
             "test-jwt-token".to_string(),
         );
 
@@ -998,8 +1040,7 @@ mod tests {
             uri,
             cert_der,
             private_key_der,
-            &workload_ca_cert_der,
-            &root_ca_cert_der,
+            &[workload_ca_cert_der, root_ca_cert_der],
             jwt.to_string(),
         )
     }

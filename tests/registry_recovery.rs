@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 #[path = "support/bun_process.rs"]
 mod bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_address, reserve_port_block, run_relish,
+    BunProcess, WAIT, assert_success, reserve_address, reserve_port_block_lease, run_relish,
     spawn_bun_with_port_retry, wait_for_relish, write_portable_node_config,
 };
 
@@ -143,8 +143,13 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
     node.testing
         .allowed_operations
         .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    // Keep every node's block claimed through the intentional offline interval.
+    let mut port_reservations = Vec::new();
     let (mut bun, mut address) = spawn_bun_with_port_retry(true, || {
-        let [gossip, raft, reporting, api] = reserve_cluster_port_block();
+        let reservation = reserve_port_block_lease(4);
+        let base = reservation.base;
+        port_reservations.push(reservation);
+        let [gossip, raft, reporting, api] = [base, base + 1, base + 2, base + 3];
         node.cluster.gossip_port = gossip;
         node.cluster.raft_port = raft;
         node.cluster.reporting_port = reporting;
@@ -251,7 +256,10 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
             follower_node.storage.volumes = follower_root.join("volumes");
             let follower_config = follower_root.join("node.toml");
             let (mut process, address) = spawn_bun_with_port_retry(true, || {
-                let [gossip, raft, reporting, api] = reserve_cluster_port_block();
+                let reservation = reserve_port_block_lease(4);
+                let base = reservation.base;
+                port_reservations.push(reservation);
+                let [gossip, raft, reporting, api] = [base, base + 1, base + 2, base + 3];
                 follower_node.cluster.gossip_port = gossip;
                 follower_node.cluster.raft_port = raft;
                 follower_node.cluster.reporting_port = reporting;
@@ -621,11 +629,4 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
             .iter()
             .any(|(_, manifest)| manifest.repository == "ordinary")
     );
-}
-
-/// Gossip derives peer transport addresses using cluster-uniform offsets,
-/// so every node takes a consecutive gossip, Raft, reporting and API block.
-fn reserve_cluster_port_block() -> [u16; 4] {
-    let base = reserve_port_block(4);
-    [base, base + 1, base + 2, base + 3]
 }

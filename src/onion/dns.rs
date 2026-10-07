@@ -84,7 +84,7 @@ impl DnsFaultState {
 const MAX_PACKET: usize = 1232;
 
 /// Upstream replies can be larger than what we advertise; oversized
-/// relays get the TC bit so clients retry over TCP with the upstream.
+/// relays get the TC bit so clients retry through our TCP listener.
 const UPSTREAM_BUFFER: usize = 4096;
 
 /// Maximum concurrent upstream forwards. Bounds the number of spawned
@@ -517,10 +517,8 @@ pub async fn serve(
 ///
 /// TCP exists for answers larger than a UDP datagram: a client that gets a
 /// truncated (TC-bit) UDP reply retries the whole query over TCP. Each DNS
-/// message is length-prefixed with a 2-byte big-endian length. We only
-/// answer `.internal` names here; a non-internal name over TCP gets
-/// SERVFAIL rather than a forwarded relay (upstream TCP relaying isn't
-/// needed for the internal zone this responder is authoritative for).
+/// message is length-prefixed with a 2-byte big-endian length. Internal names
+/// stay authoritative and local; external questions relay over upstream TCP.
 async fn serve_tcp(
     config: Arc<DnsConfig>,
     listener: TcpListener,
@@ -540,13 +538,16 @@ async fn serve_tcp(
                 let config = Arc::clone(&config);
                 let service_map = service_map.clone();
                 let dns_faults = dns_faults.clone();
+                let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = tokio::time::timeout(
-                        TCP_QUERY_TIMEOUT,
-                        answer_tcp_query(stream, peer, config, service_map, dns_faults),
-                    )
-                    .await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {}
+                        _ = tokio::time::timeout(
+                            TCP_QUERY_TIMEOUT,
+                            answer_tcp_query(stream, peer, config, service_map, dns_faults),
+                        ) => {}
+                    }
                 });
             }
         }
@@ -589,7 +590,9 @@ async fn answer_tcp_query(
                 qtype,
                 peer.ip(),
             ),
-            None => build_status_response(&query, RCODE_SERVFAIL),
+            None => forward_upstream_tcp(&query, config.upstream, config.upstream_timeout)
+                .await
+                .unwrap_or_else(|| build_status_response(&query, RCODE_SERVFAIL)),
         }
     };
     let mut framed = Vec::with_capacity(response.len() + 2);
@@ -739,6 +742,45 @@ async fn forward_upstream(
             return Some(reply);
         }
     }
+}
+
+/// Relay one validated external question over a deadline-bounded TCP exchange.
+async fn forward_upstream_tcp(
+    query: &[u8],
+    upstream: SocketAddr,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let expected = decode_query(query)?;
+    tokio::time::timeout(timeout, async {
+        let mut stream = tokio::net::TcpStream::connect(upstream).await.ok()?;
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .ok()?;
+        stream.write_all(query).await.ok()?;
+        loop {
+            let length = stream.read_u16().await.ok()? as usize;
+            if length < 12 {
+                return None;
+            }
+            // TCP DNS has a 16-bit frame length. Don't apply the UDP buffer
+            // cap: recovering a larger answer is why the client chose TCP.
+            let mut reply = vec![0; length];
+            stream.read_exact(&mut reply).await.ok()?;
+            let mut decoder = BinDecoder::new(&reply);
+            let response = Message::read(&mut decoder).ok()?;
+            if decoder.is_empty()
+                && response.metadata.message_type == MessageType::Response
+                && response.metadata.op_code == expected.metadata.op_code
+                && response.metadata.id == expected.metadata.id
+                && response.queries == expected.queries
+            {
+                return Some(reply);
+            }
+        }
+    })
+    .await
+    .ok()?
 }
 
 /// Parse the query name and QTYPE from a DNS packet.
@@ -1424,5 +1466,138 @@ mod tests {
         let query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
         let reply = forward_upstream(&query, upstream_addr, Duration::from_secs(2)).await;
         assert_eq!(reply.as_deref(), Some(query.as_slice()));
+    }
+    async fn tcp_lookup(address: SocketAddr, query: &[u8]) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(query).await.unwrap();
+        let length = stream.read_u16().await.unwrap() as usize;
+        let mut response = vec![0; length];
+        stream.read_exact(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn external_tcp_dns_relays_direct_queries_and_truncated_udp_retries() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let udp = UdpSocket::bind(address).await.unwrap();
+        let query = build_dns_query("example.com");
+        let mut expected = Message::from_vec(&build_a_response(
+            &query,
+            VirtualIP(Ipv4Addr::new(1, 2, 3, 4)),
+        ))
+        .unwrap();
+        expected.answers = vec![expected.answers[0].clone(); 400];
+        let expected = expected.to_vec().unwrap();
+        assert!(expected.len() > UPSTREAM_BUFFER);
+        let sent = expected.clone();
+        let udp_task = tokio::spawn(async move {
+            let mut packet = [0; MAX_PACKET];
+            let (length, client) = udp.recv_from(&mut packet).await.unwrap();
+            let mut response = build_status_response(&packet[..length], 0);
+            response[2] |= 0x02;
+            udp.send_to(&response, client).await.unwrap();
+        });
+        let upstream_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let length = stream.read_u16().await.unwrap() as usize;
+                let mut query = vec![0; length];
+                stream.read_exact(&mut query).await.unwrap();
+                let mut wrong_id = sent.clone();
+                wrong_id[0] ^= 1;
+                let wrong_question = build_a_response(
+                    &build_dns_query("different.com"),
+                    VirtualIP(Ipv4Addr::LOCALHOST),
+                );
+                for response in [&wrong_id, &wrong_question, &sent] {
+                    stream
+                        .write_all(&(response.len() as u16).to_be_bytes())
+                        .await
+                        .unwrap();
+                    stream.write_all(response).await.unwrap();
+                }
+            }
+        });
+        let bound = BoundDnsResponder::bind(DnsConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            upstream: address,
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        let address = bound.config.listen_addr;
+        let (_map_tx, map_rx) = watch::channel(ServiceMap::new());
+        let shutdown = CancellationToken::new();
+        let responder = tokio::spawn(bound.run(map_rx, no_dns_faults(), shutdown.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&query, address).await.unwrap();
+        let mut response = [0; MAX_PACKET];
+        let length = client.recv(&mut response).await.unwrap();
+        assert_ne!(response[2] & 0x02, 0);
+        assert_eq!(response[3] & 15, 0);
+        assert!(length >= 12);
+        for _ in 0..2 {
+            let response = tcp_lookup(address, &query).await;
+            assert_eq!(response[3] & 15, 0);
+            assert_eq!(response.len(), expected.len());
+            assert_eq!(response, expected);
+        }
+        shutdown.cancel();
+        responder.await.unwrap();
+        udp_task.await.unwrap();
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_tcp_dns_times_out_with_servfail_and_internal_names_stay_local() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let bound = BoundDnsResponder::bind(DnsConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            upstream: upstream_address,
+            upstream_timeout: Duration::from_millis(30),
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        let address = bound.config.listen_addr;
+        let (_map_tx, map_rx) = watch::channel(map);
+        let shutdown = CancellationToken::new();
+        let responder = tokio::spawn(bound.run(map_rx, no_dns_faults(), shutdown.clone()));
+        assert_eq!(
+            tcp_lookup(address, &build_dns_query("redis.default.internal")).await[3] & 15,
+            0
+        );
+        assert_eq!(
+            tcp_lookup(address, &build_dns_query("missing.default.internal")).await[3] & 15,
+            RCODE_NXDOMAIN
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), upstream.accept())
+                .await
+                .is_err()
+        );
+        let response = tokio::time::timeout(
+            Duration::from_millis(300),
+            tcp_lookup(address, &build_dns_query("example.com")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response[3] & 15, RCODE_SERVFAIL);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), upstream.accept())
+                .await
+                .is_ok(),
+            "external name never reached upstream"
+        );
+        shutdown.cancel();
+        responder.await.unwrap();
     }
 }

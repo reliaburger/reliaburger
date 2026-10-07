@@ -30,6 +30,9 @@ pub struct CsrSignResult {
     pub workload_ca_cert_der: Vec<u8>,
     /// DER-encoded Root CA certificate.
     pub root_ca_cert_der: Vec<u8>,
+    /// Every trusted Workload CA and root, for the workload's `ca.pem`
+    /// (F04 R2).
+    pub ca_bundle_der: Vec<Vec<u8>>,
     /// OIDC JWT token (if OIDC config is present).
     pub jwt_token: Option<String>,
     /// Allocated serial number.
@@ -269,9 +272,20 @@ impl CouncilNode {
         }
     }
 
+    /// Observe committed requested and completed GitOps trigger generations.
+    pub fn gitops_trigger_updates(&self) -> watch::Receiver<(u64, u64)> {
+        self.state_machine.gitops_trigger_updates()
+    }
+
     /// Read the current desired state from the state machine.
     pub async fn desired_state(&self) -> DesiredState {
         self.state_machine.desired_state().await
+    }
+
+    /// Borrow the local desired state for `read`, without cloning all of
+    /// it. Follower-local, like [`Self::desired_state`].
+    pub async fn read_desired<T>(&self, read: impl FnOnce(&DesiredState) -> T) -> T {
+        self.state_machine.read_desired(read).await
     }
 
     /// Establish an applied log barrier before inspecting fault ownership.
@@ -482,14 +496,15 @@ impl CouncilNode {
 
         // Get Workload CA
         let workload_ca = security_state
-            .get_ca(CaRole::Workload)
+            .active_ca(CaRole::Workload)
             .ok_or_else(|| CouncilError::SecurityError("no Workload CA in state".to_string()))?;
         let root_ca = security_state
-            .get_ca(CaRole::Root)
+            .active_ca(CaRole::Root)
             .ok_or_else(|| CouncilError::SecurityError("no Root CA in state".to_string()))?;
 
         let workload_ca_cert_der = workload_ca.certificate_der.clone();
         let root_ca_cert_der = root_ca.certificate_der.clone();
+        let ca_bundle_der = crate::sesame::trust::workload_ca_bundle(&security_state);
 
         // Unwrap CA private key
         let wrapped = workload_ca.private_key_wrapped.as_ref().ok_or_else(|| {
@@ -571,6 +586,7 @@ impl CouncilNode {
             cert_der,
             workload_ca_cert_der,
             root_ca_cert_der,
+            ca_bundle_der,
             jwt_token,
             serial,
         })
@@ -789,6 +805,25 @@ mod tests {
         }
     }
 
+    async fn write_admission_fixture(
+        council: &crate::council::CouncilNode,
+        mut request: crate::council::RaftRequest,
+    ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
+        let previous = council.desired_state().await.last_applied_log;
+        match &mut request {
+            crate::council::RaftRequest::BatchRegister {
+                expected_log_id, ..
+            } => *expected_log_id = previous,
+            crate::council::RaftRequest::SchedulingDecision(decision) => {
+                request = crate::council::RaftRequest::SchedulingDecisions {
+                    expected_log_id: previous,
+                    decisions: vec![decision.clone()],
+                }
+            }
+            _ => {}
+        }
+        council.write(request).await
+    }
     // -----------------------------------------------------------------------
     // Bootstrap tests
     // -----------------------------------------------------------------------
@@ -1027,8 +1062,7 @@ mod tests {
                 ordinal: 0,
             }],
         };
-        leader
-            .write(RaftRequest::SchedulingDecision(decision))
+        write_admission_fixture(leader, RaftRequest::SchedulingDecision(decision))
             .await
             .unwrap();
 
@@ -1592,6 +1626,8 @@ mod tests {
             oidc_signing_config: Some(oidc_config),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
+            node_leaves: std::collections::BTreeMap::new(),
+            pending_intermediates: Vec::new(),
         };
         node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
             .await

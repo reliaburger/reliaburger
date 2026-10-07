@@ -247,9 +247,30 @@ image = "cleanup:latest"
 schedule = "0 3 * * *"
 ```
 
-**High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions. The bin-packing allocator ships; the full delegated dispatch-and-completion pipeline is a Phase 12 deliverable (see [design/scheduler-meat.md](design/scheduler-meat.md) §5.2). On-demand and scheduled Jobs run today.
+**Common execution lifecycle (0.2.0 development):** A definition describes work;
+a run fixes its revision and trigger. A singleton is an indexed run with count
+one. Manual jobs, arrays, cron and deployment hooks share placement, node-local
+CPU/memory admission, owned attempts, cancellation and durable results. The
+leader grants chunks of indexes; workers start each attempt when its actual
+request fits beside applications. A chunk of 1,000 isn't 1,000 simultaneously
+reserved jobs. Mixed manifests group distinct resource profiles.
 
-**Build jobs:** Jobs can build container images and push them to the Pickle registry via the `pickle://` scheme. Build jobs require a `destination` field (a `pickle://` reference) that scopes registry access. Lettuce injects `${GIT_SHA}` for tag synchronisation.
+Cron claims a UTC minute and creates its run in one durable transaction. Default
+overlap is forbidden and missed minutes are skipped; clock rollback and leader
+changes can't replay claimed occurrences. Deployment intent pins hook results
+and gates app publication on accepted success. Standalone operation persists
+the same state before acknowledging work.
+
+Known failures follow the run's attempt policy. Ordinary jobs and hooks keep an
+unknown outcome owned until a user acknowledges replay; bulk work can opt into
+at-least-once retry. Neither policy promises exactly-once external effects.
+Encrypted templates and authorised scripts retain namespace and host-execution
+checks. Bounded summaries, accepted rates, backlog, duration histograms and
+selected result pages replace listing millions of jobs. The daily throughput
+claim still needs sustained qualification, including container launch cost,
+resource demand, storage and service quality. See the [job manual](manual/14_batch-jobs.md).
+
+**Image builds:** `relish build` builds container images from `[build.*]` declarations and pushes them to Pickle. A `destination` field (a `pickle://` reference) scopes registry access. This is a manual build path; Lettuce does not dispatch build jobs or inject `${GIT_SHA}` into their tags.
 
 > For batch scheduling and build job details, see [design/scheduler-meat.md](design/scheduler-meat.md) and [design/registry-pickle.md](design/registry-pickle.md).
 
@@ -499,7 +520,7 @@ There are three cases, and they behave differently.
 - **A majority of voters fails, but some survive.** There's no quorum, so nothing can be elected, scheduled or written; apps keep running. If the lost voters come back, quorum returns and the cluster carries on where it left off. If they're gone for good, the survivors can't regrow the council on their own (changing Raft membership needs a quorum too), so this becomes the operator-triggered recovery below. `relish council recover` refuses while it can still see a live voter, so here you pass `--force` on one stopped survivor after making sure the dead voters won't return. The recovered node carries a new recovery epoch. An old voter that later hears of it, from a Raft refusal or from gossip, fences itself: it serves no Raft and refuses writes until you re-enrol it with `relish council re-enrol`. A restarted voter checks its peers' gossiped epochs before it serves Raft, so old voters that can reach the recovered side never re-form their council. Old voters that can reach only each other have nothing to learn the new epoch from, so re-enrol them before starting them; `relish council status` and `relish wtf` compare every node's view and show a fence or a split as critical.
 - **Every voter fails at once.** There's nothing left to elect from.
 
-Recovery from the last two cases is deliberately operator-triggered rather than automatic, because it discards the dead cluster's Raft history. A surviving node restores the desired state from the last sealed backup (or from its own durable snapshot if it was a voter), re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council. The cost is honest: anything written after the last backup is lost. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, so a minority side simply has no quorum. Nodes on the minority side operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
+Recovery from the last two cases is deliberately operator-triggered rather than automatic, because it discards the dead cluster's Raft history. A surviving node restores the desired state from the last sealed backup (or, if it was a voter, from its own snapshot and committed log), re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council. The cost is honest: anything written after the last backup is lost. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, so a minority side simply has no quorum. Nodes on the minority side operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
 
 > **Design note (fully-automatic recovery).** The original design called for *pre-seeded* recovery candidates chosen for zone diversity, gossiped as an encrypted list, so the highest-priority survivor could assume leadership with no operator in the loop. That remains an architecture proposal, not shipped behaviour: the operator-triggered restore above is what the binary does today (`relish council recover`, [design/gossip-mustard.md](design/gossip-mustard.md)). We chose to ship the operator-in-the-loop path first because full-council loss is the one failure where discarding history is unavoidable, and a human confirming *which* backup to restore is cheaper than getting an automated tie-break wrong.
 
@@ -649,7 +670,7 @@ auto_rollback = true       # revert on health check failure
 
 Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the new leader resumes the rolling update from the last committed step after the learning period. If you submit a new deploy while a rollout is in progress, it supersedes the in-progress rollout: in-flight instances are drained and replaced with the newest version directly, skipping the intermediate target.
 
-**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start.
+**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start. The target app must be in the same apply and namespace. Cluster apply records ownership before execution and publishes dependent app revisions only after positive zero exit and durable confirmation; uncertainty or leader replacement retains the fence. Recurring schedules are supported on standalone nodes and are refused by cluster apply.
 
 > For the deploy state machine, connection draining protocol, and autoscaling, see [design/deployments.md](design/deployments.md).
 
@@ -660,6 +681,10 @@ Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the n
 ### 14.1 Built-In Sync Engine (Lettuce)
 
 Lettuce is Reliaburger's built-in GitOps engine, replacing ArgoCD and Flux with a sync loop compiled directly into the Bun binary.
+
+CLI compilation and Lettuce share the resolver for inherited `_defaults.toml` values and directory-derived namespaces. Lettuce resolves the configured watch directory from the verified Git commit; defaults outside that directory are not inherited. Malformed input or an unrepresentable namespace collision refuses the whole sync before desired-state changes. GitOps refuses duplicate resource definitions, while CLI compilation reports deterministic overrides within a namespace.
+
+Lettuce reconciles apps, namespaces and permissions. Any job declaration, including a scheduled job or a `run_before` migration, refuses the entire validated commit before desired-state changes. The failed sync leaves the previous applied SHA intact. Execute migration jobs and their dependent apps together through `relish apply`, or submit batch work through `relish batch`. GitOps job execution awaits a durable revision-to-run identity and dispatch path.
 
 **Configuration:**
 
@@ -875,7 +900,7 @@ Brioche provides a franchise overview page: all peered clusters, their health st
 
 ### 21.4 Cross-Cluster Image Pull and GitOps
 
-Peered clusters can pull images from one another's Pickle registries on demand (lazy, not eagerly replicated) using the existing OCI Distribution API over the trust relationship. For GitOps, Lettuce supports shared repositories with per-cluster directories: a `_defaults.toml` provides shared configuration, and per-cluster directories override as needed. Each cluster's Lettuce independently syncs its own directory.
+Peered clusters can pull images from one another's Pickle registries on demand (lazy, not eagerly replicated) using the existing OCI Distribution API over the trust relationship. For GitOps, Lettuce supports shared repositories with per-cluster watch directories. A `_defaults.toml` inside the watched tree provides shared values, and child directories can override them. Each cluster independently resolves its watched tree; defaults outside its watch root are not inherited.
 
 ### 21.5 Trust Model
 
@@ -935,7 +960,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 
 ## 23. Comparison Matrix
 
-The Reliaburger column describes 0.1.2. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
+The Reliaburger column describes 0.1.6. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
 
 | | Kubernetes | k3s / k0s | Nomad | Docker Compose | **Reliaburger** |
 |---|---|---|---|---|---|
@@ -1035,11 +1060,94 @@ They would be, without constraints. The constraint that ships today is a policy 
 
 Durability is eventual, not guaranteed at push time. A push commits the image locally and returns immediately with an `oci-replication: pending` header, so the client never mistakes acceptance for full redundancy. A leader-only heal loop (running roughly every 60 seconds) then replicates layers towards a redundancy target of 2 total copies by default: the node that received the push plus one peer. There is no synchronous mode and no `push_sync` config key. This keeps push latency low and independent of cluster size, at the cost of a short window after a push where the image exists on only one node. In clusters too small to reach the target, the heal loop records that full redundancy can't be met rather than silently claiming success.
 
+### Resource-aware delegated execution
+
+A thousand queued jobs don't need a thousand simultaneous allocations. Suppose
+an otherwise available node has eight cores and 16 GiB of memory. It can run
+32 tasks requesting 250 millicores and 256 MiB each, four tasks requesting two
+cores and 4 GiB each, or a mixture. Existing applications and system reservations
+come out of that capacity first. A task count alone cannot describe this budget.
+
+The delegated pipeline separates resource allocation from task selection, an
+idea also used by Mesos's two-level scheduling. Meat selects eligible nodes and
+records bounded chunk grants in Raft. Bun accounts for application commitments,
+packs individual tasks within its shared node budget and reuses execution
+machinery and cached artifacts. A chunk is a queue of work;
+its size amortises dispatch and bookkeeping, not the resource footprint of
+concurrent execution. Arrays encode repeated templates compactly. Mixed-profile
+manifests preserve individual identities while grouping compatible work.
+
+Workers record terminal outcomes as tasks finish, using bounded group commit,
+and resend completion batches until the leader accepts them. Grant generations
+and reconciliation fence stale requests and resolve uncertain ownership after
+failover. Restoring older council state can rewind grant identities; workers
+with existing array data persist a refusal until re-enrolled with fresh data,
+preserving old results for investigation. At-least-once execution requires
+business idempotency keys that survive cluster recovery. Detailed outcome
+availability and retention are explicit; a missing worker isn't a zero count.
+
+At this volume, the default operator view is a workload summary: unique success
+and terminal-failure rates, retries, backlog and submission age, final-attempt
+duration distributions, resource requests and refusal reasons.
+Individual tasks remain addressable for diagnosis, with bounded detail queries
+and exports. Histograms merge before percentiles are calculated, and metric
+labels never use individual task IDs. Local FIFO admission prevents small tasks
+continually overtaking a large waiting request, at the cost of idle capacity
+behind that request. Namespace app quotas currently govern ordinary placement,
+not delegated array resource usage. Tenant allocation, DRF and service pre-emption
+remain future work;
+new app deployments still require free capacity and rollout headroom.
+
+**Implementation status:** this is the architecture implemented in
+[#266](https://github.com/reliaburger/reliaburger/pull/266), following the
+[resource-aware jobs plan](plans/2026-10-04-plan-delegated-jobs.md). The daily
+throughput target remains unqualified until real workloads sustain at least
+1,158 unique successful completions per second with headroom, concurrent apps,
+failure recovery and bounded memory and storage. A short simulated burst doesn't
+establish that result.
+
+### AI workloads: resident models and coordinated training
+
+Preparing a million dataset records, running a hundred training experiments
+and serving inference requests require different execution contracts. The
+same batch foundation can provide stable task identities, resource profiles,
+bounded queues, retries and durable outcomes. Data, models and checkpoints
+should remain in artifact storage, with small immutable references in the
+control plane. Job throughput alone does not describe model throughput or
+accelerator utilisation.
+
+For inference, a container pool that starts a new model process for every task
+would still repeat model initialisation. The proposed AI path keeps model
+workers resident and feeds separately tracked requests through a built-in
+engine adapter. Reliaburger would allocate and own the workers; engines such
+as [vLLM](https://docs.vllm.ai/en/stable/) would manage continuous batching and
+attention memory. The worker holds its resource reservation while requests
+share bounded engine capacity. Scheduler chunks and model batches are separate
+units. Interactive inference remains a long-lived application with latency
+protection from background batches.
+
+Independent training experiments fit the task model. Distributed training
+requires group allocation, rendezvous and coordinated recovery; its workers
+cannot be retried as unrelated array elements. For example,
+[PyTorch's elastic launcher](https://docs.pytorch.org/docs/main/elastic/run.html#failure-modes)
+can restart a worker group after failure. Reliaburger would need an explicit
+group contract and application checkpoint references before supporting those
+runs. Accelerator placement must consider device identity, memory and topology,
+with exclusive whole-device allocation before any supported sharing scheme.
+
+These are design extensions. Current delegated jobs refuse GPU requests, and
+resident model adapters and distributed training groups are not implemented.
+GPU cluster placement and container device assignment remain tracked in F01
+([#359](https://github.com/reliaburger/reliaburger/issues/359)). Their validation
+must measure useful records/tokens or training samples per second, queue and
+serving latency, accelerator utilisation and recovery, as well as task counts.
+See the [AI implementation sequence](plans/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
+
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
-Not yet, and nobody has measured it. 100M jobs a day is a design target (§2). In 0.1.0 the batch allocator exists, but the delegated pipeline below isn't wired end to end, so on-demand and cron jobs go through the ordinary per-job path. Task arrays, which keep a large batch as compact state in Raft and expand it on each node, are the headline of 0.2.0 ([roadmap](roadmap.md#releases-after-010)). Here's the design they build on.
+100M jobs a day remains an unqualified design target (§2). The 0.2.0 development implementation keeps arrays compact in Raft and expands them on workers. Singleton jobs, cron and hooks create runs through the same indexed path as arrays. High-volume callers compress repeated work into arrays or mixed-profile manifests.
 
-The leader doesn't schedule individual jobs. For batch workloads, Meat allocates job batches to nodes: "Node 7, here are your next 200 jobs." Nodes execute their assigned jobs and report completions asynchronously via the hierarchical reporting tree. The Raft log records only batch-level decisions, not individual job lifecycle events. The leader's hot path focuses on Apps (which change infrequently) and batch-level allocation decisions. The Meat scheduler runs on a dedicated async task with its own CPU budget, isolated from API serving, Brioche UI, and metrics queries.
+The leader grants chunks: "Node 7, here are your next 200 indexes." Workers execute within their shared CPU/memory budget. A leader-driven HTTP sync accepts durable aggregate completions and retransmits grants; per-task ledgers and indexes stay on workers. This removes global placement and Raft writes per task. Runtime startup, resource demand, storage, result retention and application service quality still determine whether a particular cluster can sustain the daily target. The [qualification report](qualification/2026-10-04-delegated-jobs/README.md) records the evidence and the remaining sustained gate.
 
 ### Q9: Local-only volumes with no distributed storage. How do teams not lose data?
 
@@ -1047,7 +1155,7 @@ Three layers of mitigation. First, Reliaburger recommends managed databases for 
 
 ### Q10: Will TOML configuration get unwieldy at 50+ apps?
 
-Reliaburger supports directory-mode configuration where each app lives in its own file, merged at deploy time. A `_defaults.toml` file provides shared values (common env vars, memory limits, deploy strategy) inherited by all apps unless overridden. `relish fmt` formats files; `relish lint` validates configuration and catches common errors. The GitOps engine (Lettuce) works with directory trees natively.
+Reliaburger supports directory-mode configuration where each app lives in its own file, merged at deploy time. A `_defaults.toml` file provides shared values (common env vars, memory limits, deploy strategy) inherited by all apps unless overridden. `relish fmt` formats files; `relish lint` validates configuration and catches common errors. The GitOps engine (Lettuce) uses the same tree resolver for defaults and directory namespaces, with its configured watch directory as the root. It refuses malformed or ambiguous trees before applying changes.
 
 ### Q11: Doesn't the eBPF approach require a modern kernel? What about older systems?
 

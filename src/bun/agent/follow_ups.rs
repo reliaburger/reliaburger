@@ -30,6 +30,9 @@ pub(super) enum FollowUp {
     },
     /// A kill, pause or resume fault's signals were sent, or weren't.
     Signalled(super::signal_faults::Signalled),
+    /// The cgroups of the callers an injection couldn't name in its turn
+    /// were read, or ran out of time.
+    CallersRead(super::fault_coverage::CallersRead),
     /// A node-pressure helper started or stopped.
     NodePressure(super::node_pressure_work::PressureDone),
     /// The egress allowlists were re-resolved.
@@ -56,7 +59,16 @@ pub(super) struct UpgradePreparation {
     prepared:
         Result<Option<crate::upgrade::manager::PreparedUpgrade>, crate::upgrade::UpgradeError>,
     response: oneshot::Sender<Result<(), BunError>>,
+    /// Resolves once the answer has reached the caller.
+    answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
 }
+
+/// How long the exec waits for the "upgrading" answer to reach the caller.
+///
+/// Writing a short answer to a local socket takes milliseconds; the bound
+/// only matters when the caller stops reading, and then the node upgrades
+/// anyway rather than stay on the old version.
+const ANSWER_DELIVERY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A running workload the upgrade marker must find alive after the swap,
 /// before its pid is known.
@@ -106,6 +118,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             Ok((_, FollowUp::Signalled(done))) => self.finish_signal_fault(done),
+            Ok((_, FollowUp::CallersRead(read))) => self.finish_callers_read(read).await,
             Ok((_, FollowUp::NodePressure(done))) => {
                 self.finish_node_pressure(done).await;
             }
@@ -191,7 +204,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         directive: crate::upgrade::types::UpgradeDirective,
         response: oneshot::Sender<Result<(), BunError>>,
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     ) {
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=agent-command-received");
         let Some(manager) = self.upgrade.clone() else {
             let _ = response.send(Err(BunError::UpgradesUnavailable));
             return;
@@ -210,12 +226,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let grill = self.supervisor.grill().clone();
         let preparing = kind.clone();
         let task = self.follow_ups.spawn(async move {
+            #[cfg(test)]
+            let fixture_started = std::time::Instant::now();
+            #[cfg(test)]
+            eprintln!("upgrade-fixture phase=inventory-begin");
             let inventory = read_inventory(&grill, entries).await;
+            #[cfg(test)]
+            eprintln!(
+                "upgrade-fixture phase=inventory-end-prepare-begin elapsed={:?}",
+                fixture_started.elapsed()
+            );
             let prepared = manager.prepare(&directive, inventory).await;
+            #[cfg(test)]
+            eprintln!(
+                "upgrade-fixture phase=prepare-end elapsed={:?} successful={}",
+                fixture_started.elapsed(),
+                prepared.is_ok()
+            );
             FollowUp::UpgradePrepared(UpgradePreparation {
                 kind,
                 prepared,
                 response,
+                answer_delivered,
             })
         });
         self.upgrade_preparing = Some((preparing, task.id()));
@@ -228,6 +260,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         version: Option<crate::upgrade::BinaryVersion>,
         response: oneshot::Sender<Result<(), BunError>>,
+        answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
     ) {
         let Some(manager) = self.upgrade.clone() else {
             let _ = response.send(Err(BunError::UpgradesUnavailable));
@@ -244,24 +277,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let preparing = kind.clone();
         let task = self.follow_ups.spawn(async move {
             let inventory = read_inventory(&grill, entries).await;
-            let prepared = manager.prepare_rollback(version, inventory).await.map(Some);
+            let prepared = manager.prepare_rollback(version, inventory).await;
             FollowUp::UpgradePrepared(UpgradePreparation {
                 kind,
                 prepared,
                 response,
+                answer_delivered,
             })
         });
         self.upgrade_preparing = Some((preparing, task.id()));
     }
 
     /// Answer the caller, then exec the staged binary. Only the exec, and
-    /// the moment before it that lets the answer flush, stay on the loop.
+    /// the wait before it for the answer to reach the caller, stay on the
+    /// loop.
     async fn finish_upgrade_preparation(&mut self, preparation: UpgradePreparation) {
         self.upgrade_preparing = None;
         let UpgradePreparation {
             kind,
             prepared,
             response,
+            answer_delivered,
         } = preparation;
         let Some(manager) = self.upgrade.clone() else {
             let _ = response.send(Err(BunError::UpgradesUnavailable));
@@ -270,7 +306,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let prepared = match prepared {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
-                // Same upgrade already in flight: idempotent OK.
+                // Same upgrade already in flight: idempotent OK. Nothing
+                // new starts, so the node takes work again; a re-delivery to
+                // a node that has already exec'd must not leave it draining.
+                self.draining
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 let _ = response.send(Ok(()));
                 return;
             }
@@ -291,13 +331,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 println!("bun: rolling back to {}", prepared.target_version())
             }
         }
-        // Respond before the point of no return, and give the HTTP layer a
-        // moment to flush the response: exec closes every socket.
+        // Respond before the point of no return, and wait until the answer
+        // has reached the caller: exec closes every socket. A fixed 200 ms
+        // pause used to stand in for that wait, and on a loaded host the
+        // exec sometimes won, so the caller saw a dropped connection for an
+        // upgrade that went ahead (#526).
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=answer-send");
         let _ = response.send(Ok(()));
-        // LOOP-INLINE: 200 ms on purpose, so the answer flushes before exec replaces the process
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(delivered) = answer_delivered {
+            // LOOP-INLINE: the exec must follow the delivered answer, and ANSWER_DELIVERY_BOUND caps the wait
+            let _ = tokio::time::timeout(ANSWER_DELIVERY_BOUND, delivered.wait()).await;
+        }
 
         // Only returns on failure (the symlink is already reverted then).
+        #[cfg(test)]
+        eprintln!("upgrade-fixture phase=answer-wait-ended-exec-begin");
         let error = manager.execute(prepared);
         self.draining
             .store(false, std::sync::atomic::Ordering::Relaxed);

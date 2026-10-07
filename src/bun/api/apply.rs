@@ -1,6 +1,44 @@
 //! The apply route, and its forwarding to the council leader.
 
 use super::*;
+use crate::pickle::binding::{AppliedBinding, BindError, ImageBinder};
+
+/// Bind `config`'s images before the request is answered, for the paths
+/// that must know the bound config before their stream starts (a
+/// standalone deploy, a cluster apply with jobs). A refusal is the HTTP
+/// response: 400 for a reference that doesn't parse, 403 for an image the
+/// node's upstream trust rules refuse, 502 when the registry couldn't name a
+/// digest and the cache doesn't hold the tag.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn bind_images(
+    state: &ApiState,
+    binder: &ImageBinder,
+    config: &mut Config,
+) -> Result<Vec<AppliedBinding>, Response> {
+    let catalog = binding_catalog(state).await;
+    binder.bind_config(config, &catalog).await.map_err(|error| {
+        let status = match error {
+            BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
+            BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
+            BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
+        };
+        (
+            status,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response()
+    })
+}
+
+/// The catalogue a binding resolves Pickle images against: the council's,
+/// which every node shares, or this node's own when it runs standalone.
+async fn binding_catalog(state: &ApiState) -> ManifestCatalog {
+    match (&state.council, &state.pickle_catalog) {
+        (Some(council), _) => council.manifest_catalog().await,
+        (None, Some(catalog)) => catalog.read().await.clone(),
+        (None, None) => ManifestCatalog::default(),
+    }
+}
 
 /// Deploy workloads, streaming progress via SSE.
 ///
@@ -12,6 +50,7 @@ pub(super) const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
 pub(super) async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
+    binder: Option<axum::Extension<ImageBinder>>,
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: String,
@@ -32,7 +71,12 @@ pub(super) async fn apply_handler(
         }
     };
 
-    if let Err(e) = config.validate() {
+    let validation = if state.council.is_some() {
+        config.validate_intrinsic()
+    } else {
+        config.validate()
+    };
+    if let Err(e) = validation {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -271,30 +315,107 @@ pub(super) async fn apply_handler(
             )
         }));
     for (app_name, namespace, host_execution) in targets {
-        if let Err(resp) =
-            crate::sesame::auth::authorize_scoped(auth.as_deref(), app_name, namespace)
-        {
-            return resp;
-        }
-        if let Err(resp) = crate::sesame::auth::authorize_permission(
+        if let Err(response) = crate::sesame::auth::authorize_workload(
             auth.as_deref(),
-            crate::config::PermissionAction::Deploy,
             app_name,
             namespace,
+            host_execution,
             &permissions,
         ) {
-            return resp;
+            return response;
         }
-        if host_execution
-            && let Err(resp) = crate::sesame::auth::authorize_permission(
-                auth.as_deref(),
-                crate::config::PermissionAction::HostExec,
-                app_name,
-                namespace,
-                &permissions,
+    }
+
+    let identities: Vec<(String, String)> = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.clone(),
+                spec.namespace.clone().unwrap_or_else(|| "default".into()),
             )
-        {
-            return resp;
+        })
+        .chain(config.job.iter().map(|(name, spec)| {
+            (
+                name.clone(),
+                spec.namespace.clone().unwrap_or_else(|| "default".into()),
+            )
+        }))
+        .collect();
+
+    if lease_id.is_none() && !config.job.is_empty() {
+        return crate::bun::job_apply::apply(
+            state,
+            auth.as_deref(),
+            binder.as_deref(),
+            config,
+            &headers,
+            body,
+            rerun_jobs,
+        )
+        .await;
+    }
+    let _standalone_gate = if state.council.is_none() {
+        Some(state.task_arrays.apply_gate.clone().lock_owned().await)
+    } else {
+        None
+    };
+    let common = crate::bun::task_array_leader::read_task_arrays(&state).await;
+    if config.app.iter().any(|(name, spec)| {
+        common
+            .deployment_owner(name, spec.namespace.as_deref().unwrap_or("default"))
+            .is_some()
+            || common.job_identity_reserved(spec.namespace.as_deref().unwrap_or("default"), name)
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            "app identity belongs to an unsettled deployment, job definition or retained run",
+        )
+            .into_response();
+    }
+
+    if !identities.is_empty() {
+        let ownership = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if let Some(council) = &state.council {
+                let desired = council.desired_state().await;
+                if identities.iter().any(|(name, namespace)| {
+                    desired
+                        .batch_state
+                        .execution_owner(namespace, name)
+                        .is_some()
+                }) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "workload identity belongs to a retained batch execution",
+                    )
+                        .into_response());
+                }
+            }
+            let owned = match ask_agent_bounded(&state.cmd_tx, |response| {
+                AgentCommand::BatchOwnedExecutions {
+                    identities,
+                    response,
+                }
+            })
+            .await
+            {
+                Ok(owned) => owned,
+                Err(response) => return Err(response),
+            };
+            if !owned.is_empty() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "workload identity belongs to a retained local batch execution",
+                )
+                    .into_response());
+            }
+            Ok(())
+        })
+        .await;
+        match ownership {
+            Ok(Ok(())) => {}
+            Ok(Err(response)) => return response,
+            Err(_) => return agent_unavailable(),
         }
     }
 
@@ -302,9 +423,14 @@ pub(super) async fn apply_handler(
     // state in Raft; the leader schedules apps and every node's reconciler
     // converges. Jobs stay on the receiving node (cluster-wide job
     // scheduling is later work). A namespace/permission-only config still
-    // routes through the cluster path so its resources are committed.
+    // routes through the cluster path so its resources are committed. Build-only
+    // manifests also need the leader's namespace context before acceptance.
     if let Some(council) = &state.council
-        && (!config.app.is_empty() || !config.namespace.is_empty() || !config.permission.is_empty())
+        && (!config.app.is_empty()
+            || !config.namespace.is_empty()
+            || !config.permission.is_empty()
+            || !config.build.is_empty()
+            || (lease_id.is_none() && !config.job.is_empty()))
     {
         return cluster_apply(
             state.clone(),
@@ -314,6 +440,7 @@ pub(super) async fn apply_handler(
             lease_id,
             headers,
             capacity_admission.map(|extension| extension.0),
+            binder.map(|extension| extension.0),
         )
         .await;
     }
@@ -324,6 +451,17 @@ pub(super) async fn apply_handler(
         )
             .into_response();
     }
+
+    // A standalone node binds here, before its agent deploys, so a single
+    // node gets the same guarantee as a cluster: restarts run the bytes the
+    // apply resolved.
+    let bindings = match &binder {
+        Some(axum::Extension(binder)) => match bind_images(&state, binder, &mut config).await {
+            Ok(bindings) => bindings,
+            Err(response) => return response,
+        },
+        None => Vec::new(),
+    };
 
     let lease_operation = if let (Some(lease_id), Some(owner_id)) =
         (&lease_id, lease_owner_id.as_deref())
@@ -362,7 +500,15 @@ pub(super) async fn apply_handler(
         None
     };
 
-    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32);
+    // Room for the binding lines, which go out before the agent's events.
+    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32 + bindings.len());
+    for binding in &bindings {
+        let _ = agent_event_tx
+            .send(ApplyEvent::Progress {
+                message: binding.to_string(),
+            })
+            .await;
+    }
     let command = if rerun_jobs {
         AgentCommand::RerunJobs {
             config,
@@ -382,13 +528,14 @@ pub(super) async fn apply_handler(
             .into_response();
     }
 
-    let event_rx = if let Some(operation) = lease_operation {
+    let event_rx = {
         let (client_event_tx, client_event_rx) = mpsc::channel::<ApplyEvent>(32);
         // Keep consuming agent progress even when the HTTP client disconnects.
         // The per-lease guard prevents expiry cleanup from overtaking a deploy
         // which the agent has accepted but not completed yet.
         tokio::spawn(async move {
-            let mut operation = Some(operation);
+            let mut operation = lease_operation;
+            let _gate = _standalone_gate;
             while let Some(event) = agent_event_rx.recv().await {
                 let terminal = matches!(
                     event,
@@ -414,8 +561,6 @@ pub(super) async fn apply_handler(
             }
         });
         client_event_rx
-    } else {
-        agent_event_rx
     };
 
     let stream = ReceiverStream::new(event_rx).map(|apply_event| {
@@ -432,6 +577,7 @@ pub(super) async fn apply_handler(
 /// (openraft does not forward client writes), streaming its SSE
 /// response back verbatim. Jobs in the same config still deploy on the
 /// receiving node after the specs commit.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn cluster_apply(
     state: ApiState,
     council: Arc<crate::council::CouncilNode>,
@@ -440,8 +586,10 @@ pub(super) async fn cluster_apply(
     lease_id: Option<String>,
     caller_headers: HeaderMap,
     capacity_admission: Option<crate::cluster::capacity::CapacityAdmission>,
+    binder: Option<ImageBinder>,
 ) -> Response {
-    // Follower? Forward to the leader rather than half-failing.
+    // Follower? Forward to the leader rather than half-failing. The leader
+    // binds images: a follower's binder (or lack of one) plays no part.
     if !council.is_leader().await {
         let Some(leader_url) = leader_api_url(&state, &council).await else {
             return (
@@ -466,6 +614,9 @@ pub(super) async fn cluster_apply(
         // The leader must evaluate the user's current grants, not the
         // follower's internal service identity. ClusterHttp has no default
         // bearer; node-to-node requests attach theirs explicitly.
+        if let Some(value) = caller_headers.get("x-reliaburger-rerun-jobs") {
+            request = request.header("x-reliaburger-rerun-jobs", value.as_bytes());
+        }
         request = copy_forwarded_auth(request, &caller_headers);
         let response =
             tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await;
@@ -515,6 +666,30 @@ pub(super) async fn cluster_apply(
             .into_response();
     }
 
+    let desired = council.desired_state().await;
+    if let Some(owner) =
+        crate::council::prerequisites::conflict(&desired.prerequisite_claims, &config)
+    {
+        return (StatusCode::CONFLICT, format!("prerequisite operation {owner} still owns a workload; its outcome must be established before another apply")).into_response();
+    }
+    if config.job.values().any(|job| job.schedule.is_some()) {
+        return (StatusCode::UNPROCESSABLE_ENTITY,
+            "cluster apply cannot safely own recurring schedules; use a standalone node for cron jobs").into_response();
+    }
+    if !config.job.is_empty() {
+        // The prerequisite claim records the config in Raft before its
+        // stream starts, so these images bind before the claim is written.
+        let mut config = config;
+        let bindings = match &binder {
+            Some(binder) => match bind_images(&state, binder, &mut config).await {
+                Ok(bindings) => bindings,
+                Err(response) => return response,
+            },
+            None => Vec::new(),
+        };
+        return cluster_prerequisite_apply(state, council, config, &caller_headers, bindings).await;
+    }
+
     if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
         use crate::cluster::capacity::{CapacityAdmissionError, SchedulingRefusal};
         let Some(admission) = capacity_admission else {
@@ -556,6 +731,31 @@ pub(super) async fn cluster_apply(
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     let cmd_tx = state.cmd_tx.clone();
     tokio::spawn(async move {
+        let mut config = config;
+        // Bind inside the stream, so a slow registry shows as a wait in
+        // `relish apply` rather than as a follower's forward timing out.
+        if let Some(binder) = &binder {
+            let catalog = council.manifest_catalog().await;
+            match binder.bind_config(&mut config, &catalog).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        let _ = event_tx
+                            .send(ApplyEvent::Progress {
+                                message: binding.to_string(),
+                            })
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    let _ = event_tx
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
         let mut committed = 0usize;
         // The one shared path: namespaces, then permissions, then apps.
         // Lettuce writes the exact same set for the same config, so manual
@@ -653,6 +853,322 @@ pub(super) async fn cluster_apply(
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
     Sse::new(stream).into_response()
+}
+
+/// A proposal deadline bounds the caller, never proves that Raft did not commit.
+/// Uncertain admission cannot dispatch work or release a replicated ownership fence.
+async fn write_job_claim(
+    council: &crate::council::CouncilNode,
+    request: crate::council::RaftRequest,
+) -> Result<crate::council::CouncilResponse, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), council.write(request))
+        .await
+        .map_err(|_| {
+            "job ownership write timed out; outcome unknown and ownership may remain held"
+                .to_string()
+        })?
+        .map_err(|error| error.to_string())
+}
+
+/// Acquire durable intent before spawning the worker; conflicts are HTTP 409,
+/// while execution errors are terminal SSE events under the retained claim.
+async fn cluster_prerequisite_apply(
+    state: ApiState,
+    council: Arc<crate::council::CouncilNode>,
+    config: Config,
+    caller_headers: &HeaderMap,
+    bindings: Vec<crate::pickle::binding::AppliedBinding>,
+) -> Response {
+    let rerun_jobs = caller_headers
+        .get("x-reliaburger-rerun-jobs")
+        .is_some_and(|value| value.as_bytes() == b"acknowledged");
+    use crate::bun::deploy_operations::DeployOperationOutcome;
+    use crate::council::{CouncilResponse, RaftRequest};
+    let term = council.current_term();
+    let (response, answer) = oneshot::channel();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        state
+            .cmd_tx
+            .send(AgentCommand::PreparePrerequisites { config, response })
+            .await
+            .map_err(|_| "agent unavailable during prerequisite preparation".to_string())?;
+        answer
+            .await
+            .map_err(|_| "prerequisite preparation disappeared".to_string())?
+    })
+    .await;
+    let (config, operation) = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(message)) => return (StatusCode::CONFLICT, message).into_response(),
+        Err(_) => {
+            return unavailable_response("prerequisite preparation timed out before launch".into());
+        }
+    };
+    let operation_id = hex::encode(rand::random::<[u8; 16]>());
+    match write_job_claim(
+        &council,
+        RaftRequest::PrerequisiteBegin {
+            operation_id: operation_id.clone(),
+            term,
+            config: Box::new(config.clone()),
+        },
+    )
+    .await
+    {
+        Ok(CouncilResponse::Refused { reason }) => {
+            operation
+                .finish(DeployOperationOutcome::Failed, reason.clone())
+                .await;
+            return (StatusCode::CONFLICT, reason).into_response();
+        }
+        Err(error) => {
+            operation
+                .finish(DeployOperationOutcome::Unknown, error.to_string())
+                .await;
+            return unavailable_response(error.to_string());
+        }
+        Ok(_) => {}
+    }
+    let (events, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    tokio::spawn(async move {
+        for binding in bindings {
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    message: binding.to_string(),
+                })
+                .await;
+        }
+        let result: Result<usize, String> = async {
+            if !council.is_leader().await || council.current_term() != term {
+                return Err(
+                    "leadership changed before prerequisite dispatch; ownership remains held"
+                        .into(),
+                );
+            }
+            if config.job.values().any(|job| !job.run_before.is_empty()) {
+                let (response, answer) = oneshot::channel();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state.cmd_tx.send(AgentCommand::RunPrerequisites {
+                        config: config.clone(),
+                        operation: operation.clone(),
+                        response,
+                    }),
+                )
+                .await
+                .map_err(|_| "agent prerequisite queue timed out; ownership remains held")?
+                .map_err(
+                    |_| "agent stopped before prerequisite dispatch; ownership remains held",
+                )?;
+                match answer
+                    .await
+                    .map_err(|_| "prerequisite worker disappeared; ownership remains held")?
+                {
+                    Ok(()) => {}
+                    Err(failure) => {
+                        if failure.settled {
+                            // A positively observed and persisted nonzero exit may
+                            // release intent. A different term cannot release it.
+                            match write_job_claim(
+                                &council,
+                                RaftRequest::PrerequisiteFailed {
+                                    operation_id: operation_id.clone(),
+                                },
+                            )
+                            .await
+                            {
+                                Ok(CouncilResponse::Refused { reason }) => {
+                                    return Err(format!(
+                                        "{}; ownership remains held: {reason}",
+                                        failure.message
+                                    ));
+                                }
+                                Err(error) => return Err(format!("{}; {error}", failure.message)),
+                                Ok(_) => {}
+                            }
+                        }
+                        return Err(failure.message);
+                    }
+                }
+            }
+            // Cancellation may arrive after the actor's success response.
+            // Once submitted, a Raft transaction cannot be undone by cancellation.
+            if operation.cancellation_requested() {
+                return Err(
+                    "prerequisite cancelled before app publication; ownership remains held".into(),
+                );
+            }
+            match write_job_claim(
+                &council,
+                RaftRequest::PrerequisiteCommit {
+                    operation_id: operation_id.clone(),
+                },
+            )
+            .await
+            {
+                Ok(CouncilResponse::Refused { reason }) => Err(reason),
+                Err(error) => Err(error.to_string()),
+                Ok(_) => Ok(crate::council::config_to_desired_writes(&config).len()),
+            }
+        }
+        .await;
+        operation
+            .finish(
+                if result.is_ok() {
+                    DeployOperationOutcome::Completed
+                } else {
+                    DeployOperationOutcome::Unknown
+                },
+                "prerequisite execution and desired-state transaction settled",
+            )
+            .await;
+        match result {
+            Err(message) => {
+                let _ = events.send(ApplyEvent::Error { message }).await;
+            }
+            Ok(created) => {
+                let remaining: std::collections::BTreeMap<_, _> = config
+                    .job
+                    .into_iter()
+                    .filter(|(_, spec)| spec.run_before.is_empty())
+                    .collect();
+                if remaining.is_empty() {
+                    let _ = events
+                        .send(ApplyEvent::Complete {
+                            created,
+                            instances: vec![],
+                        })
+                        .await;
+                } else {
+                    let config = Config {
+                        job: remaining,
+                        ..Config::default()
+                    };
+                    let (launch_events, mut launch_rx) = mpsc::channel(32);
+                    let command = if rerun_jobs {
+                        AgentCommand::RerunJobs {
+                            config: config.clone(),
+                            events: launch_events,
+                        }
+                    } else {
+                        AgentCommand::Deploy {
+                            config: config.clone(),
+                            events: launch_events,
+                        }
+                    };
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("{} job(s) deploying on this node", config.job.len()),
+                        })
+                        .await;
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        state.cmd_tx.send(command),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        _ => {
+                            let _ = events.send(ApplyEvent::Error { message: "agent unavailable after app commitment; job ownership remains held".into() }).await;
+                            return;
+                        }
+                    }
+                    while let Some(event) = launch_rx.recv().await {
+                        if matches!(event, ApplyEvent::Complete { .. }) {
+                            // Capture before exposing startup completion. The separate
+                            // watcher retains intent until a positive terminal outcome.
+                            let (response, answer) = oneshot::channel();
+                            let receipt =
+                                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                                    state
+                                        .cmd_tx
+                                        .send(AgentCommand::CaptureClusterJobs {
+                                            config: config.clone(),
+                                            response,
+                                        })
+                                        .await
+                                        .ok()?;
+                                    answer.await.ok()?.ok()
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                            if let Some(receipt) = receipt {
+                                spawn_job_apply_settlement(
+                                    state.cmd_tx.clone(),
+                                    council.clone(),
+                                    operation_id.clone(),
+                                    receipt,
+                                );
+                            }
+                            let _ = events.send(event).await;
+                            return;
+                        }
+                        if matches!(event, ApplyEvent::Error { .. }) {
+                            let _ = events.send(event).await;
+                            return;
+                        }
+                        // Slow clients may coalesce progress, while terminal
+                        // outcomes retain their delivery and ownership guarantees.
+                        let _ = events.try_send(event);
+                    }
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: "job worker disappeared; ownership remains held".into(),
+                        })
+                        .await;
+                }
+            }
+        }
+    });
+    let stream = ReceiverStream::new(event_rx).map(|event| {
+        Ok::<_, std::convert::Infallible>(
+            Event::default().data(serde_json::to_string(&event).unwrap_or_default()),
+        )
+    });
+    Sse::new(stream).into_response()
+}
+
+/// One bounded metadata request per tick, at most one watcher per held claim.
+/// A missing actor, uncertain receipt or different leader retains the fence.
+pub(super) fn spawn_job_apply_settlement(
+    commands: mpsc::Sender<AgentCommand>,
+    council: Arc<crate::council::CouncilNode>,
+    operation_id: String,
+    receipt: Arc<crate::bun::agent::ClusterJobReceipt>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (response, answer) = oneshot::channel();
+            let observation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                commands
+                    .send(AgentCommand::ClusterJobsSettlement {
+                        receipt: receipt.clone(),
+                        response,
+                    })
+                    .await
+                    .ok()?;
+                answer.await.ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            match observation {
+                Some(crate::bun::agent::ClusterJobSettlement::Terminal) => {
+                    let _ = write_job_claim(
+                        &council,
+                        crate::council::RaftRequest::JobApplyComplete { operation_id },
+                    )
+                    .await;
+                    return;
+                }
+                Some(crate::bun::agent::ClusterJobSettlement::Pending) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                _ => return,
+            }
+        }
+    })
 }
 
 /// A short human-readable label for an apply progress message.

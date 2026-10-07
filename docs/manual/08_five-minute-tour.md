@@ -6,7 +6,7 @@ own next to it, walk its network path, measure it, break it and watch it
 heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install fetches the signed 0.1.2 release.
+15 GiB of disk. The one-line install fetches the signed 0.1.6 release.
 
 ## Install and build the cluster
 
@@ -34,11 +34,15 @@ to change. The same manifest is `examples/kubernetes/podinfo.yaml` in
 
 ```sh
 relish status
+relish council status
 ```
 
 Give it half a minute for the images to arrive. Three frontend replicas, one on
 each node, named `default__frontend-0`, `-1` and `-2`. The scheduler spread
-them and numbered them, not you.
+them and numbered them across the cluster, not you. `status` opens with a line
+on the council, the Raft group that holds the cluster's state, and `council
+status` asks every node for its own view of it: its role, term and log
+position, with the leader and quorum above the table.
 
 Now open <http://podinfo.localhost:18080> in a browser. The request comes in
 through the built-in ingress; reload and the hostname changes as each replica
@@ -83,6 +87,27 @@ signatures. Each order names the podinfo backend that "cooked" it: the burger
 service calls `http://backend:9898/` by service name, exactly as it would in a
 Kubernetes pod. Run the `curl` a few times and the cashier changes as the
 ingress takes turns between the two replicas.
+
+## Development preview: queued jobs beside the app
+
+With the 0.2.0 development binaries and the matching burger source, the same
+image also runs resource-aware batch work. This step is unavailable in 0.1.4.
+Use `scripts/demo/tour.sh --jobs` to include it in an executable tour.
+
+```sh
+relish --output json batch submit burger/jobs.toml
+relish batch watch 1
+relish batch results 2 --failed --limit 20
+relish manual batch
+```
+
+Replace `1` with the returned manifest ID and `2` with the small profile's child
+ID shown by watch. There are 1,000 small and 64 larger hashing jobs. Existing
+apps retain their requests; each worker starts only the tasks that fit in its
+remaining CPU and memory. Watch shows summaries, rates and duration distributions
+instead of listing all jobs. The script checks the burger service during the
+batch and verifies all 1,064 outcomes before continuing. See `relish manual batch`
+for manifests, retries, cancellation, indexed pages and retention.
 
 ## See the whole path
 

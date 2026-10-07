@@ -6,8 +6,8 @@ simulations and Criterion benchmarks into one reassuring number. A green line co
 "the behaviour worked" or "this laptop didn't have the prerequisite". Those aren't the
 same thing.
 
-This document defines the suites, their contracts and the evidence collected during the
-July 2026 audit.
+This document retains the July 2026 audit history and defines the current suite,
+ownership and evidence contracts. Historical counts and timings remain historical.
 
 ## What the audit found
 
@@ -86,12 +86,12 @@ Documentation-only pull requests skip the Rust jobs entirely, except for the man
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
 holds a fixture for each of these rules.
 
-Every nextest suite in CI keeps its own JUnit report (`scripts/ci/keep-junit.sh`
-moves `target/nextest/ci/junit.xml` to `target/junit/<suite>.xml`, with a
-`.meta.txt` naming the command, commit, run and host) and each job uploads them as
-`junit-<job>` for 14 days, even on failure. The `ignored-test evidence` job fails
-when an ignored test owned by a gate CI runs is missing from every report; see
-[who runs an ignored test](../testing.md#who-runs-an-ignored-test).
+CI retains each owner's discovery, completion, receipt and logs in a separate
+platform/gate envelope. It still keeps JUnit on failure for diagnosis. The final
+`ignored-test evidence` job requires successful current-owner completion of every
+applicable exact identity; presence in a union of reports is insufficient. See
+[who runs an ignored test](../testing.md#who-runs-an-ignored-test) and the
+[generated finite matrix](../testing/qualification-matrix.md).
 
 ### Tests no CI job runs
 
@@ -226,6 +226,79 @@ artefacts. On Linux that run is also the test gate and the portable JUnit source
 compiled and run a second time uninstrumented. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
 one percentage point lower. Raise it when coverage improves; do not lower it to land
 unrelated work.
+
+## Finite inventory and authority
+
+`tests/contracts/manifest.json` names concrete contracts and exact
+`(gate, binary, full test name)` assignments. Duplicate assignments are refused.
+Case IDs stay stable across source refreshes. The source emitter records current
+tracked regular files, test bodies, source attributes and hashes; all discovery
+and execution flags remain false until the real producer supplies evidence.
+Host and feature conditions must be reconciled with actual Cargo/nextest lists.
+An absent Linux-only case on macOS isn't a successful skip.
+
+The original ignored bindings retain their reason-derived Make/script owners.
+A case already assigned by an audit family is reused with both references;
+the strengthened defaults are references to existing cases too. Twenty exact
+legacy OCI aliases are the entire reviewed bridge between original Linux owner
+claims and the interruption driver. The direct held-capacity OCI control has its
+own script declaration. No prefix matching or generic alias can widen the bridge.
+The seventeen original manual/subprocess classifications remain outside CI
+inventory, with the original policy visible in the generated matrix.
+
+`workflow_assembly.py` defines eleven literal owners and derives portable/full
+selection from trusted current workflow inputs. `workflow_adapter.py` preserves
+those commands and their complete selections. Ordinary nextest producers retain
+discovery and JUnit under one selector/environment plan. `completion.py` retains
+libtest discovery, selected-case completion and the actual child exit for owned
+OCI binaries. Required cases must be selected and pass; missing, skipped,
+incomplete, wrong-owner or failed-command evidence is refused. Manual owner
+context cannot qualify CI.
+
+The archive builder publishes current successful archive/runtime digests before
+archived jobs execute. Aggregation requires those builder outputs, successful
+selected jobs and each producer's sealed output digest. Commit, run ID, attempt,
+host, owner command, inputs and payload bytes all belong to that context. Do not
+reconstruct authority from artifact filenames or let a late report choose which
+owners should have run. Always retain whole-command failure as failure, even if
+all finite required assertions passed before the command failed elsewhere.
+
+The Linux coverage owner intercepts the five operations of the unchanged
+`make coverage` recipe. It binds discovery to the actual instrumented nextest
+run, captures compiler/Cargo/nextest/LLVM identity and checks the unchanged line
+floor after report generation. The current schema and guards check the owning
+parent as well as its child. A fresh ordinary JUnit file or synthetic receipt
+cannot stand in for this run.
+
+### Sensitivity and lifetime controls
+
+A behaviour-breaking variant must fail the intended oracle. Keep its precise
+source delta and actual selected execution alongside the baseline and repaired
+receipts. A build error or missing preflight proves only setup failure. Static
+source inspection and Python model fixtures stay useful, but report them under
+that scope rather than as Rust or runtime execution.
+
+Writer controls use explicit entry/release notifications or owned operation
+faults, rather than guessing when a sleep has crossed a publication boundary.
+Cancellation drops a caller's future; it does not necessarily stop a blocking
+writer or undo a remote PUT. The store must keep pending rows, immutable bytes,
+publication identity and the writer guard until acknowledgement is complete.
+Queries must retain those rows once while publication/listing races and retries
+are unresolved. Local controls also revisit owned directory entries after an
+uncertain earlier attempt, including a fresh store, before acknowledging work.
+
+Ketchup's restart controls recover the frozen capture identity and checkpoint
+from the same publication as its rows. Replacing a path must not associate old
+read offsets with a newly opened file. These checks cover the specified
+append-only capture/restart contract. They don't promise arbitrary file rotation
+or preservation of unflushed memory after process loss. Temporary I/O faults and
+controlled object stores cannot establish power-cut or cloud durability.
+
+A fixture timeout with no established phase stays unknown. Record the exact
+failure and one separately labelled diagnostic without retries or increased
+production deadlines. Subprocess readiness/capture controls should name the
+bounded phase, observe the owned child and distinguish an empty readable log
+from a log read/decode error. Never include secrets to improve a diagnostic.
 
 ## Adding a test
 

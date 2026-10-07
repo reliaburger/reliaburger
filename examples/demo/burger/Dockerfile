@@ -11,7 +11,7 @@
 FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 ARG TARGETARCH
 WORKDIR /src
-COPY go.mod main.go ./
+COPY go.mod main.go batch.go ./
 # Standard library only: nothing to download, so no network during the build.
 RUN --network=none CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOTOOLCHAIN=local \
     go build -trimpath -ldflags="-s -w" -o /out/burger .

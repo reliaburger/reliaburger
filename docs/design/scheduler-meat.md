@@ -1509,3 +1509,44 @@ The autoscaler supports exactly `cpu` and `memory`; config validation rejects an
 ### 13.7 Scheduling Latency SLO Enforcement
 
 Should Meat provide a hard guarantee that scheduling decisions complete within a latency bound (e.g., 50ms)? Currently, latency is best-effort and depends on cluster size and Raft commit speed. An SLO enforcement mode could shed load (reject submissions) when latency exceeds the bound. **Current decision: under consideration for v2.**
+
+## Delegated task-array implementation (0.2.0)
+
+PR #266 implements compact homogeneous arrays and atomic manifests of up to
+sixteen profiles. The council grants chunks and accepts aggregate terminal
+outcomes. It does not place or replicate a `JobInstance` per index. Eligible
+workers report how many requests fit; a node-wide `ExecutionBudget` reserves
+CPU and memory for apps and actual batch attempts. Chunk size is queue depth,
+not simultaneous resource use. App creation, rolling replacements and recovery
+must use the same budget; stopped owners retain requests until retirement.
+
+Batch requests wait FIFO without partial CPU or memory reservations. This
+prevents starvation by repeated small requests, with a head-of-line utilisation
+trade-off. It is not tenant DRF, and running jobs do not automatically yield to
+a new app deployment. Provision service/rollout headroom. A profile larger than
+a node's allocatable capacity is refused; temporary fullness queues work.
+
+Workers persist control provenance (recovery epoch, leadership term, committed
+log index) and highest chunk generation. Task outcomes stream into checksummed
+ledgers and derived indexes; chunk acceptance follows durable acknowledgements.
+Accepted owner/generation ranges select detail and failure output. Disk failure
+stops local admission; uncertain runtime retirement retains the slot and request.
+Execution remains at least once, so external effects require business idempotency
+keys. A new recovery epoch refuses workers with existing array directories,
+cancels their attempts and preserves old outcomes behind a durable refusal.
+Archive old worker data and re-enrol with fresh data after disaster recovery;
+this avoids reusing grant generations from a rolled-back council snapshot.
+
+Rootful Linux images use the existing owned runtime, cached layers, reusable
+instance slots and fresh attempt generations. Reuse bounds retained metadata per
+namespace; it does not eliminate per-attempt runc launch cost. With eBPF enabled,
+image executors inherit a journalled namespace binding before launch, without
+rewriting the app firewall journal for every task. Exact app bindings take
+precedence. Cross-namespace batch service access is refused; binding loss retires
+the original owner, and startup cleans cached bindings only after old executors
+retire. Summary APIs,
+watch and the dashboard avoid task enumeration; indexed pages bound inspected
+indexes and returned rows and contact at most eight workers per page. Terminal
+retention begins at completion. See the
+[manual](../manual/14_batch-jobs.md) and [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md)
+for limits and qualification requirements.

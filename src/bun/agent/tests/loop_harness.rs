@@ -58,6 +58,7 @@ impl RunningAgent {
     /// Forget the turns setup took, so the verdict covers the slow work only.
     fn measure_from_here(&self) {
         self.meter.reset_worst_turn();
+        self.stalls.reset_most_in_a_turn();
     }
 
     /// Queue a status command now and time its answer.
@@ -630,6 +631,7 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
     tx.send(AgentCommand::UpgradeApply {
         directive,
         response,
+        answer_delivered: None,
     })
     .await
     .unwrap();
@@ -648,9 +650,20 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
 
 // ---- disk, kernel and subprocesses -------------------------------------------
 
+/// The most fsync'd persists one turn may make. Two writes at the 250 ms a
+/// loaded coverage runner measured (#421) leave half the budget; four would
+/// pass it, which is why a startup retirement splits its four (#422).
+const MOST_PERSISTS_IN_A_TURN: usize = 2;
+
 /// fsync'd persists may stay inline (#351, decision 2), as long as a slow disk
-/// can't stretch a turn past the budget. At 150 ms a persist, a deploy of
-/// three replicas, a job and a restart must still keep every turn short.
+/// can't stretch a turn past the budget. With every persist slowed to 150 ms,
+/// a deploy of three replicas, a job and a restart must make no more than
+/// [`MOST_PERSISTS_IN_A_TURN`] in any one turn, and status must still answer.
+///
+/// The verdict counts persists instead of timing turns. A turn also pays for
+/// the host's real fsyncs, which the slowed persist stands in for and the
+/// test can't control: on a hosted macOS runner, one restart turn with a
+/// single persist in it took 1109 ms (#508).
 #[tokio::test]
 async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
@@ -664,6 +677,7 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
         .stalls
         .set(LoopStall::Persist, std::time::Duration::from_millis(150));
     running.measure_from_here();
+    let persists_before = running.stalls.reached(LoopStall::Persist);
 
     let deploy = Config::parse(
         "[app.api]\nimage = 'api:v1'\nport = 9090\nreplicas = 3\n\n\
@@ -678,6 +692,7 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
     })
     .await
     .unwrap();
+    let crashed_at = std::time::SystemTime::now();
     crash(&grill);
     let mid_deploy = running.status_latency().await;
     let last_event = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -698,13 +713,39 @@ async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
             "{id} was never persisted"
         );
     }
+    // The restart records its replacement in the turn after the start call.
+    let restarted = crate::grill::records::record_path(records.path(), "default__web-0");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !std::fs::metadata(&restarted)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified > crashed_at)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("web's restart was never persisted");
+    let after_deploy = running.status_latency().await;
+    let persists = running.stalls.reached(LoopStall::Persist) - persists_before;
+    let most_in_a_turn = running.stalls.most_in_a_turn(LoopStall::Persist);
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(mid_deploy.is_some(), "status went unanswered mid-deploy");
     assert!(
-        mid_deploy.is_some_and(|latency| latency < TURN_BUDGET),
-        "status took {mid_deploy:?} mid-deploy on a slow disk"
+        after_deploy.is_some(),
+        "status went unanswered after the deploy"
     );
-    running
-        .assert_responsive("a deploy, a job and a restart persisted state to a slow disk")
-        .await;
+    // Three api records, the job's ledger and web's restart record at least.
+    assert!(
+        persists >= 5,
+        "only {persists} persists reached the slow disk"
+    );
+    assert!(
+        most_in_a_turn <= MOST_PERSISTS_IN_A_TURN,
+        "one turn made {most_in_a_turn} persists to a slow disk (the worst turn was \
+         {worst:?}); a turn may make {MOST_PERSISTS_IN_A_TURN}"
+    );
 }
 
 /// Retiring an instance removes its identity directory and record inline.
@@ -971,6 +1012,334 @@ async fn status_answers_while_a_large_catalogue_is_published() {
     running
         .assert_responsive("a two-thousand-service catalogue was published three times")
         .await;
+}
+
+// ---- consumer synchronisation (#505) ------------------------------------------
+
+/// How long one discovery-journal write takes in the consumer scenarios.
+/// The 0.1.4 candidate's compressed soak logged consumer syncs of 1.0 to
+/// 1.2 s that journalled three writes each, so about 400 ms a write.
+const SOAK_JOURNAL_WRITE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// An agent enrolled as a cluster consumer that has just recovered its
+/// ownership, so its view is withdrawn and nothing routes yet. Returns the
+/// agent, its state directory, and a leader answer to publish.
+async fn recovered_consumer() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::catalog::EndpointCatalog,
+    Vec<crate::cluster::orchestrate::IngressAssignment>,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let (mut agent, _, _) = test_cluster_fault_agent().await;
+    agent.set_records_dir(root.path().to_owned());
+    agent
+        .supervisor
+        .grill()
+        .set_launch_inventory(Vec::new())
+        .await;
+    let identity = crate::bun::consumer_owners::ConsumerIdentity {
+        node_id: crate::meat::NodeId::new("test"),
+        cluster_identity: [42; 32],
+    };
+    agent
+        .recover_consumer_ownership(&root.path().join("discovery"), identity)
+        .await
+        .unwrap();
+    let (catalog, ingress) = cluster_publication_fixture();
+    (agent, root, catalog, ingress)
+}
+
+/// The fixture's catalogue with its one remote backend moved to another
+/// port: a new view, replaced in place.
+fn moved_remote_backend() -> crate::onion::catalog::EndpointCatalog {
+    crate::onion::catalog::EndpointCatalog::rebuild([(
+        crate::onion::service_id::ServiceId::new("default", "remote"),
+        8080,
+        vec![crate::onion::catalog::CatalogBackend {
+            execution: None,
+            node_id: "other-node".into(),
+            node_ip: "192.168.1.2".parse().unwrap(),
+            host_port: 30011,
+            healthy: true,
+        }],
+    )])
+    .unwrap()
+}
+
+/// Send one leader answer, as the placement poll does.
+async fn sync_consumer(
+    tx: &mpsc::Sender<AgentCommand>,
+    generation: u64,
+    catalog: crate::onion::catalog::EndpointCatalog,
+    ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+) -> oneshot::Receiver<Result<ConsumerUpdate, BunError>> {
+    let (response, reply) = oneshot::channel();
+    tx.send(AgentCommand::SyncClusterConsumer {
+        generation,
+        catalog: Box::new(catalog),
+        ingress,
+        withdrawals: vec![],
+        requested_at_ns: crate::onion::lease::boot_clock_ns(),
+        response,
+    })
+    .await
+    .unwrap();
+    reply
+}
+
+/// The 0.1.4 candidate's compressed soak (#505): every slow command turn
+/// was `sync_cluster_consumer`, 300 to 700 ms through setup and 1.0 to
+/// 1.2 s after a leader kill. A sync that changes the view journals it
+/// before installing it, then marks it active, then forgets the views it
+/// replaced: three fsync'd writes in one turn, and five when the first
+/// answer after a recovery withdraws everything first. At the soak's
+/// 400 ms a write, either sync must journal at most one write in any turn,
+/// and a status queued behind it must still be answered.
+///
+/// The verdict counts writes per turn instead of timing the status. A
+/// status may wait two turns of one slowed write each, which leaves about
+/// 200 ms of the budget for the host's real fsyncs, and on a loaded hosted
+/// macOS runner `F_FULLFSYNC` took about 570 ms (#585), the #508 class.
+#[tokio::test]
+async fn status_answers_while_a_consumer_sync_journals_to_a_slow_disk() {
+    let (agent, _root, catalog, ingress) = recovered_consumer().await;
+    let lease = agent.view_lease_handle();
+    let running = run_restarted(agent);
+    running.stalls.set(LoopStall::Persist, SOAK_JOURNAL_WRITE);
+    running.measure_from_here();
+    for (generation, catalog, view) in [
+        (1, catalog, "the first answer after a recovery"),
+        (2, moved_remote_backend(), "a changed view"),
+    ] {
+        let reply = sync_consumer(&running.tx, generation, catalog, ingress.clone()).await;
+        let mid_sync = running.status_latency().await;
+        assert!(
+            mid_sync.is_some(),
+            "status went unanswered while {view} journalled to a slow disk"
+        );
+        let update = tokio::time::timeout(std::time::Duration::from_secs(10), reply)
+            .await
+            .expect("the sync was never answered")
+            .unwrap()
+            .unwrap();
+        assert!(update.published, "{view} was not published");
+        assert!(lease.is_valid(), "{view} did not renew the view lease");
+    }
+    let after_syncs = running.status_latency().await;
+    let most_in_a_turn = running.stalls.most_in_a_turn(LoopStall::Persist);
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(
+        after_syncs.is_some(),
+        "status went unanswered after the consumer syncs"
+    );
+    assert!(
+        most_in_a_turn <= 1,
+        "one turn journalled {most_in_a_turn} writes to a slow disk (the worst turn \
+         was {worst:?}); a consumer sync step may journal one"
+    );
+}
+
+/// Counting the writes makes the split independent of the disk: whatever a
+/// write costs, no consumer step pays for two. A recovery's first answer
+/// journals five (withdrawing, withdrawn, receipts proven, publishing,
+/// active) and a changed view three (publishing, active, compacted), in
+/// that order, as they did in one turn before (#505).
+#[tokio::test]
+async fn a_consumer_sync_journals_at_most_one_write_a_turn() {
+    let (mut agent, _root, catalog, ingress) = recovered_consumer().await;
+    let lease = agent.view_lease_handle();
+    for (generation, catalog, total) in [(1, catalog, 5), (2, moved_remote_backend(), 3)] {
+        let (response, mut reply) = oneshot::channel();
+        let mut writes_per_turn = Vec::new();
+        let before = agent.loop_stalls.reached(LoopStall::Persist);
+        agent
+            .handle_command(AgentCommand::SyncClusterConsumer {
+                generation,
+                catalog: Box::new(catalog),
+                ingress: ingress.clone(),
+                withdrawals: vec![],
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            })
+            .await;
+        writes_per_turn.push(agent.loop_stalls.reached(LoopStall::Persist) - before);
+        while !agent.consumer_syncs.is_idle() {
+            assert!(
+                reply.try_recv().is_err(),
+                "generation {generation} was answered before its last step"
+            );
+            let before = agent.loop_stalls.reached(LoopStall::Persist);
+            agent.continue_consumer_sync().await;
+            writes_per_turn.push(agent.loop_stalls.reached(LoopStall::Persist) - before);
+        }
+        let update = reply.await.unwrap().unwrap();
+        assert!(update.published);
+        assert!(lease.is_valid());
+        assert_eq!(
+            agent.consumer_owner().unwrap().phase,
+            crate::bun::consumer_owners::ConsumerPhase::Active
+        );
+        assert_eq!(
+            writes_per_turn.iter().sum::<usize>(),
+            total,
+            "generation {generation}'s writes per turn: {writes_per_turn:?}"
+        );
+        assert!(
+            writes_per_turn.iter().all(|writes| *writes <= 1),
+            "a turn of generation {generation} journalled more than one write: \
+             {writes_per_turn:?}"
+        );
+    }
+}
+
+/// A consumer that published a view, then restarted: the new process has
+/// recovered its ownership from the journal the old one left, so the view
+/// it published is withdrawn and nothing routes until the leader answers.
+async fn restarted_consumer() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::catalog::EndpointCatalog,
+    Vec<crate::cluster::orchestrate::IngressAssignment>,
+) {
+    let (mut agent, root, catalog, ingress) = recovered_consumer().await;
+    let published = agent
+        .synchronise_consumer(1, catalog.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    assert!(published.published);
+    // The old process lets go of the journal's claim as it dies.
+    drop(agent);
+    let (mut agent, _, _) = test_cluster_fault_agent().await;
+    agent.set_records_dir(root.path().to_owned());
+    agent
+        .supervisor
+        .grill()
+        .set_launch_inventory(Vec::new())
+        .await;
+    let identity = crate::bun::consumer_owners::ConsumerIdentity {
+        node_id: crate::meat::NodeId::new("test"),
+        cluster_identity: [42; 32],
+    };
+    agent
+        .recover_consumer_ownership(&root.path().join("discovery"), identity)
+        .await
+        .unwrap();
+    (agent, root, catalog, ingress)
+}
+
+/// The 0.1.5 candidate's compressed soak (#603): a node's first consumer
+/// sync after its bun restarted took 1092 ms in its command turn, where
+/// that node's earlier syncs took 290 to 800 ms. The command turn built the
+/// candidate view, which reads the runtime's whole launch inventory from
+/// disk, and then journalled the view's first write: two slow awaits in one
+/// turn, on a disk a restart had just left cold.
+///
+/// Counting both per turn keeps the verdict independent of the disk. The
+/// first answer after a restart reads the inventory once and journals five
+/// writes (withdrawing, withdrawn, receipts proven, publishing, active),
+/// and no turn may take more than one of those six.
+#[tokio::test]
+async fn the_first_consumer_sync_after_a_restart_takes_one_slow_await_a_turn() {
+    let (mut agent, _root, catalog, ingress) = restarted_consumer().await;
+    let lease = agent.view_lease_handle();
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::from_millis(50));
+    agent
+        .supervisor
+        .grill()
+        .set_inventory_delay(Some(std::time::Duration::from_millis(50)));
+    let reached = |agent: &BunAgent<MockGrill>| {
+        (
+            agent.loop_stalls.reached(LoopStall::Persist),
+            agent.loop_stalls.reached(LoopStall::RuntimeInventory),
+        )
+    };
+    let mut per_turn = Vec::new();
+    let (response, mut reply) = oneshot::channel();
+    let before = reached(&agent);
+    agent
+        .handle_command(AgentCommand::SyncClusterConsumer {
+            generation: 1,
+            catalog: Box::new(catalog),
+            ingress,
+            withdrawals: vec![],
+            requested_at_ns: crate::onion::lease::boot_clock_ns(),
+            response,
+        })
+        .await;
+    let after = reached(&agent);
+    per_turn.push((after.0 - before.0, after.1 - before.1));
+    while !agent.consumer_syncs.is_idle() {
+        assert!(
+            reply.try_recv().is_err(),
+            "the sync was answered before its last step"
+        );
+        let before = reached(&agent);
+        agent.continue_consumer_sync().await;
+        let after = reached(&agent);
+        per_turn.push((after.0 - before.0, after.1 - before.1));
+    }
+    let update = reply.await.unwrap().unwrap();
+    assert!(update.published);
+    assert!(lease.is_valid());
+    assert_eq!(
+        agent.consumer_owner().unwrap().phase,
+        crate::bun::consumer_owners::ConsumerPhase::Active
+    );
+    let writes: usize = per_turn.iter().map(|(writes, _)| writes).sum();
+    let reads: usize = per_turn.iter().map(|(_, reads)| reads).sum();
+    assert_eq!(
+        (writes, reads),
+        (5, 1),
+        "(writes, inventory reads) per turn: {per_turn:?}"
+    );
+    assert!(
+        per_turn.iter().all(|(writes, reads)| writes + reads <= 1),
+        "a turn took more than one slow await; (writes, inventory reads) per turn: \
+         {per_turn:?}"
+    );
+}
+
+/// Between a recovery's withdrawal and its publication the journal says
+/// Withdrawn, and other turns run in between. The view about to be
+/// published was built before, so the local addresses it names stay held.
+#[tokio::test]
+async fn a_local_address_stays_held_between_a_withdrawal_and_its_publication() {
+    let (mut agent, _root, _catalog, _ingress) = recovered_consumer().await;
+    let local = InstanceId("default__web-0".into());
+    let backend = agent.local_backend(
+        &local,
+        &crate::onion::service_id::ServiceId::new("default", "web"),
+        Some("10.0.2.2".parse().unwrap()),
+        30002,
+        true,
+    );
+    let vip = crate::onion::vip::VirtualIP(std::net::Ipv4Addr::new(127, 128, 0, 1));
+    let publication = crate::bun::consumer_owners::ConsumerPublication {
+        generation: 1,
+        catalog: Default::default(),
+        effective_services: vec![crate::onion::types::ServiceEntry {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            namespace_id: crate::onion::vip::name_to_id("default"),
+            app_id: u32::from(vip.0),
+            vip,
+            port: 8080,
+            backends: vec![backend],
+            firewall_allow_from: None,
+        }],
+        ingress: vec![],
+    };
+    assert!(
+        !agent.own_view_names(&local),
+        "a withdrawn view names nothing"
+    );
+    agent.consumer_syncs.hold_for_test(publication);
+    assert!(agent.own_view_names(&local));
 }
 
 // ---- callers that can hold a turn ---------------------------------------------

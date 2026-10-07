@@ -1,13 +1,11 @@
 //! Acceptance test for 12b.2 T6 — "Complete declarative resources".
 //!
-//! One config containing every resource kind (app, job, namespace,
-//! permission, build) must converge to the SAME Raft desired state
-//! whether it's applied by hand (`relish apply`) or through a Lettuce
-//! GitOps sync. Both paths funnel through
-//! `council::config_to_desired_writes`, so this asserts byte-identical
-//! desired state for the declarative kinds (apps, namespaces,
-//! permissions). Jobs and builds aren't reconciled desired state and are
-//! validated but not written.
+//! One config containing the supported reconciled resource kinds (apps,
+//! namespaces and permissions) must converge to the SAME Raft desired state
+//! through manual desired-state writes and Lettuce GitOps. Jobs execute through
+//! manual submission and are explicitly refused by GitOps before writes; builds
+//! use the manual image-build path. Those execution contracts are tested apart
+//! from desired-state convergence.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -26,9 +24,9 @@ use reliaburger::lettuce::types::GitOpsConfig;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// The one config every kind lives in. The namespace budget (8 CPUs)
+/// One config containing each supported desired-state kind. The namespace budget (8 CPUs)
 /// comfortably fits the app (1 replica of the default request).
-const EVERY_KIND: &str = r#"
+const DESIRED_KINDS: &str = r#"
 [namespace.prod]
 cpu = "8000m"
 memory = "16Gi"
@@ -45,13 +43,6 @@ image = "web:v1"
 namespace = "prod"
 replicas = 1
 
-[job.migrate]
-image = "migrate:v1"
-
-[build.img]
-context = "."
-destination = "pickle://prod/img:v1"
-namespace = "prod"
 "#;
 
 fn fast_config() -> CouncilConfig {
@@ -162,10 +153,10 @@ async fn manual_apply_and_gitops_converge_identically() {
     );
 
     // The config parses and validates (the same gate both paths run).
-    let config = Config::parse(EVERY_KIND).unwrap();
+    let config = Config::parse(DESIRED_KINDS).unwrap();
     config
         .validate()
-        .expect("the every-kind config must validate");
+        .expect("the supported-kind config must validate");
 
     // --- Manual apply path ---------------------------------------------
     // `cluster_apply` writes exactly `config_to_desired_writes(&config)`;
@@ -180,7 +171,7 @@ async fn manual_apply_and_gitops_converge_identically() {
     // --- GitOps path ---------------------------------------------------
     let repo_dir = tempfile::tempdir().unwrap();
     git(repo_dir.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(repo_dir.path().join("cluster.toml"), EVERY_KIND).unwrap();
+    std::fs::write(repo_dir.path().join("cluster.toml"), DESIRED_KINDS).unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-q", "-m", "initial"]);
 
@@ -204,6 +195,7 @@ async fn manual_apply_and_gitops_converge_identically() {
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
+        None,
     );
 
     let target = manual_state.clone();

@@ -47,6 +47,61 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+## Tags bind to digests at apply
+
+A tag moves. `nginx:1.27` today needn't be `nginx:1.27` next week, so the
+node that handles your apply (the leader, on a cluster) asks which manifest
+the tag names right now and stores both:
+
+```text
+$ relish apply web.toml
+  web: nginx:1.27 → sha256:3f2a1b9c04d7... (from the registry)
+  app web: committed to the cluster
+```
+
+The app's image is now `nginx:1.27@sha256:3f2a…`. The digest decides what
+every pull fetches, so every node, every restart and every replacement runs
+the same bytes, and you still read the tag. Because a pinned pull may use a
+mirror, `mirrors` now covers every image you apply.
+
+- **Apply again to move.** Applying the same file re-resolves the tag, which
+  is how you pick up a new `nginx:1.27` on purpose. The binding line shows it.
+- **Already pinned?** An image you write as `name@sha256:…` or
+  `name:tag@sha256:…` is stored as written.
+- **Registry down?** The apply fails with the registry's error and stores
+  nothing, unless the pull-through cache holds the tag: then the apply binds
+  the cached copy and says so (`from the pull-through cache; the registry did
+  not answer`). The registry gets 20 seconds to answer.
+- **Pickle images** bind to the digest the cluster's registry holds for the
+  tag, without asking anyone else.
+- **Where you see it:** `relish history` and `relish inspect` show the bound
+  reference, as does each instance's image in `relish status`. `relish rollback`
+  restores the bound reference of the version before, so it runs the bytes
+  that ran then, even if the tag has moved since.
+- **GitOps** binds the same way when it writes an app. Git keeps the tag, and
+  a bound image isn't drift; the tag re-resolves when the app changes in Git.
+
+Binding happens only where the leader's own runtime pulls images (runc, or
+Apple containers on a Mac). Under the process runtime an app's `image` is a
+placeholder nobody pulls, so it's stored as written. A cluster runs one
+runtime kind, so the leader's speaks for every node.
+
+## Storage ceiling
+
+`[images] max_storage` bounds each node's compressed CAS blob, temporary upload
+and repository authority receipt payload bytes. The store also allows at most
+65,536 payload files, including empty uploads and receipts. Registry pushes, peer replication,
+upstream cache fills and runtime image pulls share this ceiling. An upload chunk
+that would exceed it is refused before writing, with HTTP 413 from the registry. Completed uploads remain charged
+without a manifest; deleting confirmed payloads returns their space to the budget.
+The accounting is rebuilt from disk at startup.
+
+Unpacked root filesystems, catalogue files and filesystem overhead need
+additional disk capacity. This cap measures payload bytes, not filesystem
+block allocation. Reusing an existing verified blob does not charge its bytes
+twice, but uploading another physical copy needs room for that temporary copy
+until completion.
+
 ## Building images
 
 `relish build` builds images from your config straight into Pickle:
@@ -219,6 +274,15 @@ relish apply db.toml     # start it again
 Restore overwrites the live volume, so stop the app first. On other
 filesystems, snapshot commands fail with an error saying so.
 
+A managed volume lives on the node that runs its app, and snapshot commands
+act there whichever node you send them to: the node that receives one asks the
+council where the app's volume lives and forwards the request, with your own
+credential, to that node. A stopped app's volume is wherever it last ran. A
+copy of the volume that an app left behind on another node is never
+snapshotted or restored by mistake. When an app with several replicas keeps a
+volume on each of several nodes, send the command to one of those nodes; any
+other node refuses it with a 409 that names them.
+
 While a restore runs it owns the app's volumes: `relish apply` for that app,
 automatic restarts, and any other snapshot command for it get a "retry
 shortly" refusal (a 409) until the restore finishes. The restored volume keeps
@@ -266,7 +330,9 @@ which destinations hold each one.
 
 Archives are streamed to a spool file in `<volumes>/.snapshot-spool` and
 uploaded in 8 MiB parts, so a large volume doesn't need its size in memory.
-The spool never takes the volumes filesystem below 5% free. Objects land under
+The spool always leaves 5% of the volumes filesystem free, or 10 GiB on a
+filesystem larger than 200 GiB; an archive that would cut into that reserve
+fails and is retried on the next sweep. Objects land under
 `<prefix>/<namespace>/<app>/<node>/<volume>/`: the archive is
 `archives/sha256-<digest>.tar.gz`, and a JSON manifest in `manifests/` names
 the snapshot, its volume, node and creation time. Two nodes running the same

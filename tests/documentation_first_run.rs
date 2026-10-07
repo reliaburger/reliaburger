@@ -22,13 +22,15 @@ use std::time::{Duration, Instant};
 #[path = "support/bun_process.rs"]
 mod bun_process;
 use bun_process::{
-    WAIT, assert_success, reserve_address, reserve_ports, run_relish, spawn_bun_with_port_retry,
-    wait_for_relish, wait_for_relish_output, write_portable_node_config,
-    write_portable_node_config_with_ports,
+    WAIT, assert_success, enable_phase_diagnostics, fixture_phase, reserve_address, reserve_ports,
+    run_relish, spawn_bun_with_port_retry, wait_for_relish, wait_for_relish_output,
+    write_portable_node_config, write_portable_node_config_with_ports,
 };
 
 #[test]
 fn standalone_first_run_reaches_a_running_workload() {
+    enable_phase_diagnostics();
+    let _test_phase = fixture_phase("standalone-first-run");
     let root = tempfile::tempdir().unwrap();
     let (mut bun, address) = spawn_bun_with_port_retry(false, || {
         (
@@ -131,6 +133,8 @@ fn spawn_retries_after_a_lost_port_race() {
 
 #[test]
 fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
+    enable_phase_diagnostics();
+    let _test_phase = fixture_phase("secure-first-run");
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     let init = run_relish(&[
@@ -260,6 +264,8 @@ command = [{testapp:?}, "--port", "0"]
 
 #[test]
 fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
+    enable_phase_diagnostics();
+    let _test_phase = fixture_phase("secure-enrolment-first-run");
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     let init = run_relish(&[
@@ -343,6 +349,7 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     // Bun refreshes the middleware's replicated token snapshot on a short
     // interval. Wait on a read-only Admin route so we don't mint anything in
     // the loopback bootstrap window while that first snapshot catches up.
+    let replication_phase = fixture_phase("replicated-token-refusal-readiness");
     let auth_deadline = Instant::now() + WAIT;
     loop {
         let probe = run_relish(&[
@@ -365,6 +372,8 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    drop(replication_phase);
+    let denied_phase = fixture_phase("non-admin-join-token-refusal");
     let denied = run_relish(&[
         "--endpoint",
         &endpoint,
@@ -380,8 +389,14 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     assert_eq!(denied.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&denied.stderr).contains("403"));
 
+    drop(denied_phase);
     let mut issued = Vec::new();
     for index in 0..2 {
+        let _phase = fixture_phase(if index == 0 {
+            "mint-node-02"
+        } else {
+            "mint-node-03"
+        });
         let node_id = format!("node-{:02}", index + 2);
         let output = run_relish(&[
             "--endpoint",
@@ -411,6 +426,11 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     let fingerprint = reliaburger::sesame::identity_store::root_ca_fingerprint(&root_ca_der);
 
     for (index, token) in issued.iter().enumerate() {
+        let _phase = fixture_phase(if index == 0 {
+            "enrol-node-02"
+        } else {
+            "enrol-node-03"
+        });
         let node_id = format!("node-{:02}", index + 2);
         let identity_dir = root.path().join(&node_id);
         let join = run_relish(&[
@@ -434,6 +454,7 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
 
     // issued[0] is bound to node-02 and was already consumed by it, so
     // re-enrolling node-02 is refused as consumed (single-use).
+    let reuse_phase = fixture_phase("consumed-join-token-refusal");
     let reused = run_relish(&[
         "join",
         "--token",
@@ -447,6 +468,8 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     assert_eq!(reused.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&reused.stderr).contains("consumed"));
 
+    drop(reuse_phase);
+    let expiry_phase = fixture_phase("expired-join-token-refusal");
     let expiring = run_relish(&[
         "--endpoint",
         &endpoint,
@@ -480,8 +503,14 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     // Provision the two enrolled identities as real Bun nodes. Each joiner
     // gets its own ports and state paths, shares the cluster wrapping key,
     // and discovers node-01 through its gossip address.
+    drop(expiry_phase);
     let mut joiners = Vec::new();
     for node_id in ["node-02", "node-03"] {
+        let _phase = fixture_phase(if node_id == "node-02" {
+            "launch-node-02"
+        } else {
+            "launch-node-03"
+        });
         let mut joiner = node.clone();
         joiner.node.name = Some(node_id.to_string());
         joiner.cluster.join = vec![format!("127.0.0.1:{gossip_port}")];
@@ -509,6 +538,7 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         joiners.push(joiner_bun);
     }
 
+    let _phase = fixture_phase("three-voter-membership-convergence");
     let convergence_deadline = Instant::now() + WAIT;
     loop {
         bun.assert_running();
@@ -708,4 +738,111 @@ command = ["true"]
     ]);
     assert_eq!(join.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&join.stderr).contains("join failed"));
+}
+
+// These controls own and reap a real short-lived Bun child before invoking the
+// same public harness methods as first-run. They do not invent API readiness.
+fn exited_bun_for_log_diagnostic(log_path: std::path::PathBuf) -> bun_process::BunProcess {
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_bun"))
+        .arg("--compatibility")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut bun = bun_process::BunProcess { child, log_path };
+    assert!(bun.child.wait().unwrap().success());
+    bun
+}
+
+fn assert_owned_child_log_error_is_explicit(invalid_utf8: bool, listener_readiness: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let log_path = root.path().join("sensitive-path-sentinel.log");
+    if invalid_utf8 {
+        std::fs::write(&log_path, b"\xfflog-content-sentinel").unwrap();
+    }
+    let mut bun = exited_bun_for_log_diagnostic(log_path);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if listener_readiness {
+            let _ = bun_process::wait_for_bind(&mut bun, "127.0.0.1:0".parse().unwrap());
+        } else {
+            bun.assert_running();
+        }
+    }))
+    .expect_err("an exited owned Bun must not satisfy readiness");
+    let message = failed
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failed.downcast_ref::<&str>().copied())
+        .expect("harness panic must carry its diagnostic");
+    let expected = if invalid_utf8 {
+        "bun log-read-error kind=InvalidData"
+    } else {
+        "bun log-read-error kind=NotFound"
+    };
+    assert!(
+        message.contains(expected),
+        "owned child log error kind was hidden"
+    );
+    assert!(!message.contains("sensitive-path-sentinel"));
+    assert!(!message.contains("log-content-sentinel"));
+    assert!(message.contains(if listener_readiness {
+        "bun exited before binding its listeners"
+    } else {
+        "bun exited before the first-run command"
+    }));
+}
+
+#[test]
+fn listener_readiness_reports_missing_log_for_an_exited_owned_child() {
+    assert_owned_child_log_error_is_explicit(false, true);
+}
+
+#[test]
+fn listener_readiness_reports_invalid_utf8_log_for_an_exited_owned_child() {
+    assert_owned_child_log_error_is_explicit(true, true);
+}
+
+#[test]
+fn running_check_reports_missing_log_for_an_exited_owned_child() {
+    assert_owned_child_log_error_is_explicit(false, false);
+}
+
+#[test]
+fn running_check_reports_invalid_utf8_log_for_an_exited_owned_child() {
+    assert_owned_child_log_error_is_explicit(true, false);
+}
+
+#[test]
+fn offline_port_leases_exclude_overlapping_blocks_across_processes() {
+    const CHILD_BASE: &str = "RELIABURGER_PORT_LEASE_CHILD_BASE";
+    if let Ok(base) = std::env::var(CHILD_BASE) {
+        let base = base.parse().unwrap();
+        assert!(bun_process::PortBlockReservation::try_reserve(base, 2).is_none());
+        return;
+    }
+    let reservation = bun_process::reserve_port_block_lease(4);
+    let base = reservation.base;
+    // The network listeners are gone; only the lifetime lease protects restart.
+    for port in base..base + 4 {
+        let _tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let _udp = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "offline_port_leases_exclude_overlapping_blocks_across_processes",
+            "--nocapture",
+        ])
+        .env(CHILD_BASE, (base + 1).to_string())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(bun_process::PortBlockReservation::try_reserve(base + 1, 2).is_none());
+    drop(reservation);
+    assert!(bun_process::PortBlockReservation::try_reserve(base, 4).is_some());
 }

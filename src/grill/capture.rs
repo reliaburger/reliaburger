@@ -10,7 +10,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::ketchup::types::{CaptureOffsets, CapturePosition, CapturedLine, LogStream};
+use crate::ketchup::types::{
+    CaptureFileIdentity, CaptureOffsets, CapturePosition, CapturedLine, LogStream,
+};
 
 /// The most a follower reads from a capture file in one step.
 ///
@@ -40,6 +42,70 @@ pub async fn read_capture_chunk(path: &Path, offset: u64) -> io::Result<Vec<u8>>
     Ok(chunk)
 }
 
+/// A bounded tail and the exact complete-line positions from the same snapshot.
+/// Resume after these positions so a live follower never duplicates the tail.
+#[derive(Default)]
+pub(crate) struct TailSnapshot {
+    pub text: String,
+    pub offsets: CaptureOffsets,
+}
+
+impl TailSnapshot {
+    pub fn add(
+        &mut self,
+        path: PathBuf,
+        bytes: &[u8],
+        start: u64,
+        identity: Option<CaptureFileIdentity>,
+    ) {
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+        let first = if start == 0 {
+            0
+        } else {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(complete, |at| at + 1)
+        };
+        self.text
+            .push_str(&String::from_utf8_lossy(&bytes[first..complete]));
+        self.offsets.0.insert(path.clone(), start + complete as u64);
+        if let Some(identity) = identity {
+            self.offsets.1.insert(path, identity);
+        }
+    }
+    pub async fn files(stem: &Path) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut snapshot = Self::default();
+        for suffix in ["stdout", "stderr"] {
+            let path = stem.with_extension(suffix);
+            let Ok(mut file) = tokio::fs::File::open(&path).await else {
+                continue;
+            };
+            let Ok(meta) = file.metadata().await else {
+                continue;
+            };
+            let start = meta.len().saturating_sub(1024 * 1024);
+            if file.seek(io::SeekFrom::Start(start)).await.is_err() {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if file
+                .take(meta.len() - start)
+                .read_to_end(&mut bytes)
+                .await
+                .is_ok()
+            {
+                snapshot.add(path, &bytes, start, Some(CaptureFileIdentity::of(&meta)));
+            }
+        }
+        snapshot
+    }
+}
+
 /// Turns chunks of one captured stream into [`CapturedLine`]s.
 #[derive(Debug)]
 pub struct CaptureReader {
@@ -50,6 +116,9 @@ pub struct CaptureReader {
     consumed: u64,
     /// Bytes read past the last newline, waiting for the rest of their line.
     partial: Vec<u8>,
+    identity: Option<CaptureFileIdentity>,
+    #[cfg(test)]
+    read_test_gate: Option<std::sync::Arc<CaptureReadGate>>,
 }
 
 impl CaptureReader {
@@ -61,7 +130,18 @@ impl CaptureReader {
             file,
             consumed: 0,
             partial: Vec::new(),
+            identity: None,
+            #[cfg(test)]
+            read_test_gate: None,
         }
+    }
+
+    /// Resume an in-memory stream at a snapshot position. No file checkpoint
+    /// or persistent identity is implied by this process-local byte offset.
+    pub(crate) fn memory_at(stream: LogStream, offset: u64) -> Self {
+        let mut reader = Self::new(stream, None);
+        reader.consumed = offset;
+        reader
     }
 
     /// A reader for the capture `file` of `stream`, positioned where the log
@@ -69,23 +149,66 @@ impl CaptureReader {
     ///
     /// Falls back to byte 0 when the store holds nothing from `file`, or when
     /// the file is now shorter than the checkpointed offset: it was truncated
-    /// (or replaced), so the offset no longer names a line in it. The store
-    /// forgets offsets of replaced files when it loads its checkpoint.
+    /// (or replaced), so the offset no longer names a line in it. Resume also
+    /// checks the offset's identity, and read_chunk checks the opened descriptor
+    /// again so replacement after checkpoint loading cannot inherit that offset.
     pub async fn resume(stream: LogStream, file: PathBuf, offsets: &CaptureOffsets) -> Self {
-        let length = tokio::fs::metadata(&file)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let metadata = tokio::fs::metadata(&file).await.ok();
+        let identity = metadata.as_ref().map(CaptureFileIdentity::of);
         let consumed = offsets
             .get(&file)
-            .filter(|offset| *offset <= length)
+            .filter(|offset| {
+                metadata.as_ref().is_some_and(|meta| *offset <= meta.len())
+                    && identity.is_some()
+                    && offsets.identity(&file) == identity
+            })
             .unwrap_or(0);
         Self {
             stream,
             file: Some(file),
             consumed,
             partial: Vec::new(),
+            identity,
+            #[cfg(test)]
+            read_test_gate: None,
         }
+    }
+
+    /// Read bounded bytes and their identity from one opened descriptor.
+    ///
+    /// No reader state changes until every await has completed. Cancellation
+    /// cannot discard a partial line or bind it to an unrelated replacement.
+    pub async fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let Some(path) = self.file.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata().await?;
+        let identity = CaptureFileIdentity::of(&metadata);
+        let replaced = self.identity.is_some_and(|old| old != identity);
+        let reset = replaced || metadata.len() < self.read_offset();
+        let offset = if reset { 0 } else { self.read_offset() };
+        #[cfg(test)]
+        if let Some(gate) = &self.read_test_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        file.seek(io::SeekFrom::Start(offset)).await?;
+        let mut chunk = Vec::with_capacity(CAPTURE_CHUNK_BYTES);
+        file.take(CAPTURE_CHUNK_BYTES as u64)
+            .read_to_end(&mut chunk)
+            .await?;
+        if reset {
+            self.consumed = 0;
+            self.partial.clear();
+        }
+        self.identity = Some(identity);
+        Ok(chunk)
     }
 
     /// The capture file this reader follows, if any.
@@ -143,9 +266,17 @@ impl CaptureReader {
             position: self.file.as_ref().map(|file| CapturePosition {
                 file: file.clone(),
                 end_offset: self.consumed,
+                identity: self.identity,
             }),
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CaptureReadGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -274,7 +405,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("web.stdout");
         std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
-        let offsets = CaptureOffsets([(path.clone(), 8)].into_iter().collect());
+        let offsets = CaptureOffsets(
+            [(path.clone(), 8)].into_iter().collect(),
+            [(
+                path.clone(),
+                CaptureFileIdentity::of(&std::fs::metadata(&path).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        );
 
         let mut reader = CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets).await;
         assert_eq!(reader.read_offset(), 8);
@@ -304,7 +443,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("web.stdout");
         std::fs::write(&path, b"new\n").unwrap();
-        let offsets = CaptureOffsets([(path.clone(), 14)].into_iter().collect());
+        let offsets = CaptureOffsets(
+            [(path.clone(), 14)].into_iter().collect(),
+            [(
+                path.clone(),
+                CaptureFileIdentity::of(&std::fs::metadata(&path).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        );
         let reader = CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets).await;
         assert_eq!(reader.read_offset(), 0);
 
@@ -319,5 +466,87 @@ mod tests {
         let lines = reader.push(b"oops\n");
         assert_eq!(lines[0].stream, LogStream::Stderr);
         assert!(lines[0].position.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_identity_is_observed_on_the_descriptor_that_supplied_the_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("writer.stdout");
+        std::fs::write(&file, b"old-line\n").unwrap();
+        let held_old_inode = std::fs::File::open(&file).unwrap();
+        let old_identity = CaptureFileIdentity::of(&held_old_inode.metadata().unwrap());
+        let mut reader =
+            CaptureReader::resume(LogStream::Stdout, file.clone(), &CaptureOffsets::default())
+                .await;
+        let gate = std::sync::Arc::new(CaptureReadGate::default());
+        reader.read_test_gate = Some(gate.clone());
+        let read = tokio::spawn(async move {
+            let bytes = reader.read_chunk().await.unwrap();
+            reader.push(&bytes)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+            .await
+            .unwrap();
+        let replacement = directory.path().join("replacement.stdout");
+        std::fs::write(&replacement, b"new-line\n").unwrap();
+        std::fs::rename(replacement, &file).unwrap();
+        gate.release.notify_one();
+        let lines = tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lines[0].line, "old-line");
+        assert_eq!(
+            lines[0].position.as_ref().unwrap().identity,
+            Some(old_identity)
+        );
+        assert_ne!(
+            old_identity,
+            CaptureFileIdentity::of(&std::fs::metadata(file).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn canceling_a_capture_read_preserves_partial_bytes_and_identity_until_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("writer.stdout");
+        std::fs::write(&file, b"one\npartial").unwrap();
+        let held_old_inode = std::fs::File::open(&file).unwrap();
+        let mut reader =
+            CaptureReader::resume(LogStream::Stdout, file.clone(), &CaptureOffsets::default())
+                .await;
+        let first = reader.read_chunk().await.unwrap();
+        assert_eq!(reader.push(&first)[0].line, "one");
+        let original_identity = reader.identity;
+        let original_partial = reader.partial.clone();
+        let original_offset = reader.read_offset();
+        let reader = std::sync::Arc::new(tokio::sync::Mutex::new(reader));
+        let gate = std::sync::Arc::new(CaptureReadGate::default());
+        reader.lock().await.read_test_gate = Some(gate.clone());
+        let replacement = directory.path().join("replacement.stdout");
+        std::fs::write(&replacement, b"new-line\n").unwrap();
+        std::fs::rename(replacement, &file).unwrap();
+        let owned_reader = reader.clone();
+        let reading = tokio::spawn(async move { owned_reader.lock().await.read_chunk().await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+            .await
+            .unwrap();
+        reading.abort();
+        assert!(reading.await.unwrap_err().is_cancelled());
+        let mut reader = reader.lock().await;
+        assert_eq!(reader.identity, original_identity);
+        assert_eq!(reader.partial, original_partial);
+        assert_eq!(reader.read_offset(), original_offset);
+        reader.read_test_gate = None;
+        let bytes = reader.read_chunk().await.unwrap();
+        let lines = reader.push(&bytes);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "new-line");
+        assert_eq!(lines[0].position.as_ref().unwrap().end_offset, 9);
+        assert_eq!(
+            lines[0].position.as_ref().unwrap().identity,
+            Some(CaptureFileIdentity::of(&std::fs::metadata(&file).unwrap()))
+        );
+        drop(held_old_inode);
     }
 }

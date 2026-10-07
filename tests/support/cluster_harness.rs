@@ -46,7 +46,12 @@ impl TestHarness {
         let grill = ProcessGrill::new();
         let port_allocator = PortAllocator::new(40000, 41000);
         let agent_shutdown = shutdown.clone();
-        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let mut agent = BunAgent::new(
+            reliaburger::grill::AnyGrill::Process(grill),
+            port_allocator,
+            cmd_rx,
+            agent_shutdown,
+        );
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
         let deploy_history = agent.deploy_history_handle();
@@ -54,6 +59,32 @@ impl TestHarness {
         let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
         agent.set_event_store(Arc::clone(&event_store));
 
+        let jobs = tempfile::tempdir().unwrap();
+        let runner = agent.delegated_task_runner(jobs.path()).unwrap();
+        let node = reliaburger::bun::task_array_node::TaskArrayNode::new(
+            reliaburger::bun::task_array_node::TaskArrayNodeConfig {
+                root: jobs.path().join("tasks"),
+                policy: reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                    mount_isolation: false,
+                    ..Default::default()
+                },
+                default_concurrency: 8,
+                backoff: (Duration::from_millis(1), Duration::from_millis(5)),
+                group_commit: Default::default(),
+            },
+            reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(runner)),
+        )
+        .with_budget(agent.execution_budget());
+        let service = Arc::new(
+            reliaburger::bun::task_array_leader::TaskArrayService::with_timings(
+                Some(Arc::new(node)),
+                Duration::from_millis(20),
+                Duration::from_secs(30),
+            )
+            .with_storage(jobs.path())
+            .await
+            .unwrap(),
+        );
         let agent_task = tokio::spawn(async move {
             agent.run().await;
             drop(agent);
@@ -104,10 +135,12 @@ impl TestHarness {
             None,
             None,
             Some(status_reader),
+            Some(service),
         );
         let server_shutdown = shutdown.clone();
 
         let server_task = tokio::spawn(async move {
+            let _jobs = jobs;
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     server_shutdown.cancelled().await;

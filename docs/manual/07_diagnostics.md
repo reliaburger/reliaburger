@@ -53,8 +53,11 @@ fenced out of a council `relish council recover` replaced, when nodes serve
 different recovery epochs, or when more than one node is named leader. Each
 finding names the nodes and the way back (`relish council re-enrol`, see
 `operations`). A voter that doesn't answer is a warning while quorum holds,
-naming the missing voter, and CRITICAL once quorum is gone. `relish council
-status` shows the same comparison as a table.
+naming the missing voter, and CRITICAL once quorum is gone. A voter that
+answers but has applied more than 100 log entries fewer than the others is a
+warning too: it counts towards quorum but isn't applying the log, which is
+what a voter whose disk filled up looks like. `relish council status` shows
+the same comparison as a table.
 
 `relish inspect <app>` uses the same relay to list every instance of an app on
 every node, with the node it runs on, under a `desired` vs `running` replica
@@ -134,7 +137,9 @@ overall verdict, then `DEGRADED`, then `UNKNOWN`.
 service discovery, deployments, health checks, secrets and config, firewall,
 workload identity, ingress, volumes, process workloads, jobs, the image
 registry and cluster coordination. Each case runs in its own leased `rbtest-*`
-namespace and cleans up after itself.
+namespace and cleans up after itself. While the council changes leader, the
+server refuses new leases with a 503 "retry shortly"; the runner asks again
+for up to 30 seconds before it gives up on the case.
 
 ```sh
 relish test                                  # every group, four at a time

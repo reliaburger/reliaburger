@@ -126,6 +126,25 @@ async fn wait_job(client: &BunClient, expected_state: &str, restarts: u32) {
     }
 }
 
+async fn wait_app_state(client: &BunClient, expected: &str) {
+    tokio::time::timeout(STATE_DEADLINE, async {
+        loop {
+            if client
+                .status()
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.app_name == "work" && row.state == expected)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 /// The job's pid, from the first status whose runtime evidence is complete.
 ///
 /// Status reads each pid from the process owner and marks an answer it
@@ -157,7 +176,7 @@ async fn job_pid(client: &BunClient) -> u32 {
 }
 
 #[tokio::test]
-async fn killed_bun_preserves_job_budget_and_requires_explicit_rerun() {
+async fn killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay() {
     let root = tempfile::tempdir().unwrap();
     let config_path = root.path().join("node.toml");
     let log = root.path().join("bun.log");
@@ -208,7 +227,7 @@ registry_port = 0
     let client = &node.client;
     client.apply(&config).await.unwrap();
     wait_job(client, "running", 1).await;
-    let pid = job_pid(client).await;
+    let _pid = job_pid(client).await;
     // Running proves spawn succeeded, not that the child has executed printf.
     // The gate deliberately exercises that scheduling gap before the crash.
     std::fs::write(&start_retry, "start").unwrap();
@@ -228,33 +247,40 @@ registry_port = 0
 
     let mut node = Node::start(&config_path, &log).await;
     let client = &node.client;
-    wait_job(client, "running", 1).await;
-    assert_eq!(job_pid(client).await, pid);
+    wait_job(client, "unknown", 0).await;
     std::fs::write(&release, "release").unwrap();
-    wait_job(client, "unknown", 1).await;
-    let error = client.apply(&config).await.unwrap_err();
-    assert!(error.to_string().contains("rerun"), "{error}");
+    // Repeating the same admission returns the existing run, never a new attempt.
+    client.apply(&config).await.unwrap();
     assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
+    let summary = client.job_summaries(false).await.unwrap();
+    let row = summary["batches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "work")
+        .unwrap();
+    let id = row["batch_id"].as_u64().unwrap();
     node.crash().await;
 
     let mut node = Node::start(&config_path, &log).await;
     let client = &node.client;
-    wait_job(client, "unknown", 1).await;
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
-        .args(["--endpoint", &node.endpoint, "apply"])
-        .arg(&manifest)
-        .arg("--rerun-jobs")
-        .env_remove("RELIABURGER_TOKEN")
-        .env_remove("RELIABURGER_CA_CERT")
-        .kill_on_drop(true)
-        .output()
-        .await
+    wait_job(client, "unknown", 0).await;
+    let summary = client.batch_status(id).await.unwrap();
+    let owner = summary["unknown_owners"]
+        .as_array()
+        .unwrap()
+        .first()
         .unwrap();
+    let worker = owner["node"].as_str().unwrap();
+    let digest = owner["grant_digest"].as_str().unwrap();
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        client
+            .replay_job(id, worker, &"0".repeat(64))
+            .await
+            .is_err()
     );
+    assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
+    client.replay_job(id, worker, digest).await.unwrap();
     wait_job(client, "stopped", 0).await;
     assert_eq!(client.status().await.unwrap()[0].exit_code, Some(0));
     assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 3);
@@ -301,28 +327,26 @@ registry_port = 0
         let mut node = Node::start(&config_path, &log).await;
         node.client.apply(&config).await.unwrap();
         wait_job(&node.client, "running", 0).await;
+        std::fs::write(&release, "release").unwrap();
+        wait_job(&node.client, "stopped", 0).await;
+        let run_id = node.client.status().await.unwrap()[0].id.clone();
         node.crash().await;
         if remove_adoption_record {
-            // Inject missing agent metadata after physical Bun death. The
-            // runtime intent remains; this does not claim a timed pre-write kill.
-            std::fs::remove_file(data.join("instances/default__work-0.json")).unwrap();
-        }
-        std::fs::write(&release, "release").unwrap();
-        let grill = reliaburger::grill::process::ProcessGrill::with_owner(
-            data.join("instances"),
-            env!("CARGO_BIN_EXE_bun").into(),
-        );
-        let id = reliaburger::grill::InstanceId("default__work-0".into());
-        use reliaburger::grill::Grill;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while grill.state(&id).await.unwrap() != reliaburger::grill::ContainerState::Stopped {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            // Accepted outcomes belong to the durable run, independent of runtime records.
+            for entry in std::fs::read_dir(data.join("instances")).unwrap() {
+                let path = entry.unwrap().path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    std::fs::remove_file(path).unwrap();
+                }
             }
-        })
-        .await
-        .unwrap();
+        }
         let mut recovered = Node::start(&config_path, &log).await;
         wait_job(&recovered.client, "stopped", 0).await;
+        recovered.client.apply(&config).await.unwrap();
+        assert_eq!(recovered.client.status().await.unwrap()[0].id, run_id);
         assert_eq!(
             recovered.client.status().await.unwrap()[0].exit_code,
             Some(0)
@@ -358,18 +382,18 @@ registry_port = 0
     .unwrap();
     let release = root.path().join("release");
     let _release = ReleaseJob(release.clone());
-    let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
-    config.job.get_mut("work").unwrap().command = Some(vec![
+    let mut config = Config::parse("[app.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    config.app.get_mut("work").unwrap().command = vec![
         "/bin/sh".into(),
         "-c".into(),
         format!(
             "n=0; while [ ! -f '{}' ] && [ $n -lt 2400 ]; do sleep 0.05; n=$((n+1)); done",
             release.display()
         ),
-    ]);
+    ];
     let mut node = Node::start(&config_path, &log).await;
     node.client.apply(&config).await.unwrap();
-    wait_job(&node.client, "running", 0).await;
+    wait_app_state(&node.client, "running").await;
     let main_pid = job_pid(&node.client).await;
     let marker = root.path().join("exec-pid");
     let client = BunClient::new(&node.endpoint);
@@ -402,10 +426,11 @@ registry_port = 0
     request.abort();
     let _ = request.await;
     let mut recovered = Node::start(&config_path, &log).await;
-    wait_job(&recovered.client, "running", 0).await;
+    wait_app_state(&recovered.client, "running").await;
     assert_eq!(job_pid(&recovered.client).await, main_pid);
     std::fs::write(release, "release").unwrap();
-    wait_job(&recovered.client, "stopped", 0).await;
+    recovered.client.stop("work", "default").await.unwrap();
+    wait_app_state(&recovered.client, "stopped").await;
     recovered.client.stop("work", "default").await.unwrap();
     recovered.crash().await;
 }
@@ -608,11 +633,11 @@ fn cron_registration_and_retirement_survive_bun_sigkill() {
         &run_relish(&["--endpoint", &endpoint, "stop", "keep"]),
         "retire recovered cron registration",
     );
+    let jobs = run_relish(&["--endpoint", &endpoint, "jobs"]);
+    assert_success(&jobs, "inspect retained schedule retirement");
     assert!(
-        !run_relish(&["--endpoint", &endpoint, "stop", "remove"])
-            .status
-            .success(),
-        "retired schedule returned after Bun was killed"
+        !String::from_utf8_lossy(&jobs.stdout).contains("scheduled"),
+        "a retired schedule returned after Bun was killed"
     );
 }
 

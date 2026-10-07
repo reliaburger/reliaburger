@@ -319,6 +319,14 @@ no_fault:
     struct cgroup_ns_value *src_ns = bpf_map_lookup_elem(
         &cgroup_namespace_map, &ns_key);
 
+    /* Delegated executors inherit a bound /reliaburger/<namespace> ancestor.
+     * App-specific source bindings take precedence. The namespace binding is
+     * installed before any delegated descendant can start. */
+    if (!src_ns) {
+        ns_key.cgroup_id = bpf_get_current_ancestor_cgroup_id(2);
+        src_ns = bpf_map_lookup_elem(&cgroup_namespace_map, &ns_key);
+    }
+
     if (src_ns && src_ns->namespace_id != val->namespace_id) {
         /* Cross-namespace connection. Check firewall_map for allow. */
         struct firewall_key fw_key = {

@@ -37,6 +37,8 @@ pub struct AppleContainerGrill {
     container_program: std::path::PathBuf,
     /// Deadline for one `container inspect`, after which the CLI is reaped.
     inspection_timeout: std::time::Duration,
+    #[cfg(test)]
+    inspection_spawn_observer: Option<tokio::sync::watch::Sender<Option<u32>>>,
 }
 
 impl AppleContainerGrill {
@@ -46,6 +48,8 @@ impl AppleContainerGrill {
             entries: Arc::new(Mutex::new(HashMap::new())),
             container_program: "container".into(),
             inspection_timeout: std::time::Duration::from_secs(10),
+            #[cfg(test)]
+            inspection_spawn_observer: None,
         }
     }
 
@@ -176,14 +180,36 @@ impl AppleContainerGrill {
         args: &[&str],
         instance: &InstanceId,
     ) -> Result<std::process::Output, GrillError> {
-        tokio::process::Command::new(&self.container_program)
-            .args(args)
-            .kill_on_drop(true)
+        let mut command = tokio::process::Command::new(&self.container_program);
+        command.args(args).kill_on_drop(true);
+        #[cfg(test)]
+        if args.first() == Some(&"inspect")
+            && let Some(observer) = &self.inspection_spawn_observer
+        {
+            // Command::output uses these pipes internally. Observe the child
+            // immediately after the same spawn, before awaiting any output.
+            command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = command.spawn().map_err(|error| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("failed to run container CLI: {error}"),
+            })?;
+            observer.send_replace(child.id());
+            return child
+                .wait_with_output()
+                .await
+                .map_err(|error| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("failed to run container CLI: {error}"),
+                });
+        }
+        command
             .output()
             .await
-            .map_err(|e| GrillError::StartFailed {
+            .map_err(|error| GrillError::StartFailed {
                 instance: instance.clone(),
-                reason: format!("failed to run container CLI: {e}"),
+                reason: format!("failed to run container CLI: {error}"),
             })
     }
 
@@ -576,7 +602,7 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let id = InstanceId("apple-evidence".into());
         let record = serde_json::from_value(serde_json::json!({
-            "schema": 2, "instance_id": id.0, "namespace": "default",
+            "schema": crate::grill::records::RECORD_SCHEMA, "instance_id": id.0, "namespace": "default",
             "app_name": "apple-evidence", "replica_index": 0,
             "is_job": false, "image": "unused", "runtime": "Apple",
             "pid": 0, "pid_started_at": 0,
@@ -648,17 +674,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("container-fixture");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\ndir=${0%/*}\necho $$ > \"$dir/pid\"\nexec sleep 60\n",
-        )
-        .unwrap();
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut grill = AppleContainerGrill::new();
         grill.container_program = program;
-        // The fixture never answers, so two seconds proves the same bound as
-        // the production ten while leaving the shell time to record its pid.
+        // Observe the real child even if its first shell instruction has not
+        // run. Keep the existing two-second bound and production ten seconds.
         grill.inspection_timeout = std::time::Duration::from_secs(2);
+        let (observed, pid_receiver) = tokio::sync::watch::channel(None);
+        grill.inspection_spawn_observer = Some(observed);
         let started = tokio::time::Instant::now();
         let error = grill
             .state(&InstanceId("stalled-inspection".into()))
@@ -669,11 +693,7 @@ mod tests {
             "{error}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
-        let pid = std::fs::read_to_string(directory.path().join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = (*pid_receiver.borrow()).expect("inspection timed out before an owned CLI spawn");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while super::super::records::process_start_time(pid).is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -929,6 +949,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec!["TEST=1".to_string()],
                 cwd: "/".to_string(),
@@ -999,6 +1020,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "300".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
@@ -1029,7 +1051,7 @@ mod tests {
         starter.start(&id).await.expect("start");
 
         let record = crate::grill::records::InstanceRecord {
-            schema: 2,
+            schema: crate::grill::records::RECORD_SCHEMA,
             instance_id: id.0.clone(),
             namespace: "default".to_string(),
             app_name: "apple-adopt".to_string(),
@@ -1039,6 +1061,7 @@ mod tests {
             runtime: crate::grill::records::RuntimeKind::Apple,
             pid: 0,
             pid_started_at: 0,
+            boot_id: None,
             runc_container_id: None,
             log_stem: None,
             host_port: None,

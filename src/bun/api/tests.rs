@@ -55,6 +55,7 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         service_port: Some(8080),
         blocked: None,
         volume_home_away: None,
+        volume_homes: Vec::new(),
     };
 
     let visible = filter_desired_apps_for_scope(
@@ -166,6 +167,13 @@ async fn current_apps_feeds_the_dry_run_diff() {
     let plan = crate::relish::plan::generate_plan(&same, Some(&current));
     assert_eq!((plan.to_update, plan.unchanged), (0, 1), "{plan:?}");
 
+    let changed = crate::config::Config::parse(
+        "[app.web]\nimage = \"myapp:v1\"\nreplicas = 3\nport = 8081\n",
+    )
+    .unwrap();
+    let plan = crate::relish::plan::generate_plan(&changed, Some(&current));
+    assert_eq!(plan.to_update, 1, "same-image change was missed: {plan:?}");
+
     let bumped = crate::config::Config::parse("[app.web]\nimage = \"myapp:v2\"\n").unwrap();
     let plan = crate::relish::plan::generate_plan(&bumped, Some(&current));
     assert_eq!((plan.to_create, plan.to_update), (0, 1), "{plan:?}");
@@ -229,7 +237,7 @@ async fn test_setup_with_timed_metrics(
 
 /// Build a single-node council, initialised as leader and seeded with a
 /// real `SecurityState` (four CAs, an age keypair, an OIDC config). `tag`
-/// disambiguates the temp dir so concurrent tests don't collide.
+/// labels a private temp dir; repeated tags cannot collide across processes.
 pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
     use std::collections::BTreeMap;
 
@@ -261,10 +269,12 @@ pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode
     );
     node.initialize(members).await.unwrap();
 
-    let dir = std::env::temp_dir().join(format!("rb-api-seeded-{tag}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", &dir).unwrap();
-    std::fs::remove_dir_all(&dir).ok();
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("rb-api-seeded-{tag}-"))
+        .tempdir()
+        .unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    drop(dir);
 
     // Retry while leadership settles after initialize.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -426,6 +436,7 @@ async fn setup_with_auth_leases_events_and_council(
         local_test_leases,
         None,
         None,
+        None,
     );
     (app, shutdown)
 }
@@ -452,6 +463,54 @@ fn named_user_token(
 async fn router_stays_open_when_no_user_tokens_exist() {
     let (app, shutdown) = setup_with_auth(vec![], None).await;
     assert_eq!(get_status(app, "/v1/status", None).await, StatusCode::OK);
+    shutdown.cancel();
+}
+
+/// The bootstrap window opens only when the store is *empty*. A store whose
+/// every token has expired is not empty, so it still refuses a caller with
+/// no token: expiry must never quietly reopen the API (F05 I2).
+#[tokio::test]
+async fn a_store_whose_every_token_has_expired_still_refuses_an_anonymous_request() {
+    let expired_at = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    let tokens = [
+        ("admin", crate::sesame::types::ApiRole::Admin),
+        ("ci", crate::sesame::types::ApiRole::Deployer),
+    ]
+    .into_iter()
+    .map(|(name, role)| {
+        crate::sesame::token::create_token(
+            name,
+            role,
+            crate::sesame::types::TokenScope::default(),
+            Some(expired_at),
+        )
+        .unwrap()
+        .token
+    })
+    .collect();
+    let (app, shutdown) = setup_with_auth(tokens, None).await;
+    assert_eq!(
+        get_status(app, "/v1/status", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn an_expired_token_gets_401() {
+    let (live, _) = named_user_token("admin", crate::sesame::types::ApiRole::Admin);
+    let expired = crate::sesame::token::create_token(
+        "old-ci",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope::default(),
+        Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60)),
+    )
+    .unwrap();
+    let (app, shutdown) = setup_with_auth(vec![live, expired.token], None).await;
+    assert_eq!(
+        get_status(app, "/v1/status", Some(&expired.plaintext)).await,
+        StatusCode::UNAUTHORIZED
+    );
     shutdown.cancel();
 }
 
@@ -1064,6 +1123,7 @@ async fn a_clear_answers_within_its_budget_when_the_agent_is_busy() {
         false,
         workload_fault_static_capabilities(),
         crate::bun::readiness::ReadinessTracker::new(),
+        None,
         None,
         None,
         None,
@@ -2047,6 +2107,7 @@ async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returne
             None,
             None,
             None,
+            None,
         );
         let stop = CancellationToken::new();
         routers.push(router.clone());
@@ -2524,7 +2585,7 @@ async fn cluster_lease_delete_waits_for_system_retirement_acknowledgements() {
         }),
     ] {
         assert!(!matches!(
-            council.write(request).await.unwrap(),
+            write_admission_fixture(&council, request).await.unwrap(),
             CouncilResponse::Refused { .. }
         ));
     }
@@ -3173,10 +3234,12 @@ async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> 
     use crate::council::state_machine::CouncilStateMachine;
     use crate::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
 
-    let dir = std::env::temp_dir().join(format!("rb-api-seeded-{tag}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", &dir).unwrap();
-    std::fs::remove_dir_all(&dir).ok();
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("rb-api-seeded-{tag}-"))
+        .tempdir()
+        .unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    drop(dir);
 
     let raft_router = InMemoryRaftRouter::new();
     let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
@@ -3298,6 +3361,7 @@ async fn secret_public_key_exposes_only_current_public_material_to_scoped_reader
                 .write(crate::council::RaftRequest::RotateSecretKey {
                     scope: crate::sesame::types::AgeKeyScope::ClusterWide,
                     new_keypair: key,
+                    resealed: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -3418,6 +3482,326 @@ async fn secret_rotate_second_rotation_surfaces_as_conflict() {
         "a rotation is already in flight"
     );
     shutdown.cancel();
+}
+
+/// Give `namespace` its first key directly, as the leader's opt-in loop
+/// would, and return it.
+async fn give_namespace_a_key(
+    council: &crate::council::CouncilNode,
+    namespace: &str,
+) -> crate::sesame::types::AgeKeypair {
+    let scope = crate::sesame::types::AgeKeyScope::Namespace(namespace.to_string());
+    let (key, _) = crate::sesame::secret::generate_age_keypair(
+        scope.clone(),
+        council.wrapping_ikm().unwrap(),
+        0,
+    )
+    .unwrap();
+    council
+        .write(crate::council::RaftRequest::RotateSecretKey {
+            scope,
+            new_keypair: key.clone(),
+            resealed: Vec::new(),
+        })
+        .await
+        .unwrap();
+    key
+}
+
+/// F05 I4: `?namespace=` names a namespace's own public key, a namespace
+/// without one is a 404 that says what to do, and a token scoped to other
+/// namespaces can't ask.
+#[tokio::test]
+async fn secret_public_key_serves_a_namespaces_own_key() {
+    let council = seeded_council_with_ikm("public-key-namespace").await;
+    let team_a = give_namespace_a_key(&council, "team-a").await;
+    let (admin, admin_secret) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let team_b_reader = crate::sesame::token::create_token(
+        "team-b-reader",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-b".into()]),
+        },
+        None,
+    )
+    .unwrap();
+    let store = crate::sesame::auth::new_token_store();
+    *store.write().await = vec![admin, team_b_reader.token];
+    let (tx, _rx) = mpsc::channel(1);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let ask = |uri: &'static str, token: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+
+    let (status, body) = ask(
+        "/v1/secret/public-key?namespace=team-a",
+        admin_secret.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["public_key"], team_a.public_key);
+    assert_eq!(json["generation"], 0);
+    let cluster = council.security_state().await;
+    assert_ne!(
+        json["public_key"],
+        cluster.cluster_age_keypair().unwrap().public_key
+    );
+
+    let (status, body) = ask(
+        "/v1/secret/public-key?namespace=team-b",
+        admin_secret.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("secret_key = true"), "{body}");
+
+    let (status, _) = ask(
+        "/v1/secret/public-key?namespace=team-a",
+        team_b_reader.plaintext.clone(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "team-b's token asks about team-a"
+    );
+    let (status, _) = ask("/v1/secret/public-key", team_b_reader.plaintext).await;
+    assert_eq!(status, StatusCode::OK, "the cluster key is still public");
+}
+
+/// F05 I4: a namespace's key rotates and finalises on its own, without
+/// touching the cluster key or another namespace's, and both steps are
+/// audited with the namespace named.
+#[tokio::test]
+async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
+    let (admin, plaintext) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let council = seeded_council_with_ikm("rotate-namespace").await;
+    give_namespace_a_key(&council, "team-a").await;
+    give_namespace_a_key(&council, "team-b").await;
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+
+    let (status, body) = post_authenticated(
+        app.clone(),
+        "/v1/secret/rotate",
+        &plaintext,
+        r#"{"namespace":"team-a"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let generations = |security: &crate::sesame::types::SecurityState| {
+        let mut keys: Vec<(String, u64, bool)> = security
+            .age_keypairs
+            .iter()
+            .map(|kp| {
+                let scope = match &kp.scope {
+                    crate::sesame::types::AgeKeyScope::ClusterWide => "cluster".to_string(),
+                    crate::sesame::types::AgeKeyScope::Namespace(ns) => ns.clone(),
+                };
+                (scope, kp.generation, kp.read_only)
+            })
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        generations(&council.security_state().await),
+        [
+            ("cluster".to_string(), 0, false),
+            ("team-a".to_string(), 0, true),
+            ("team-a".to_string(), 1, false),
+            ("team-b".to_string(), 0, false),
+        ]
+    );
+
+    let (status, body) = post_authenticated(
+        app.clone(),
+        "/v1/secret/rotate",
+        &plaintext,
+        r#"{"namespace":"team-a","finalize":true}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        generations(&council.security_state().await),
+        [
+            ("cluster".to_string(), 0, false),
+            ("team-a".to_string(), 1, false),
+            ("team-b".to_string(), 0, false),
+        ]
+    );
+
+    let recorded = events.read().await.recent(20, None, None);
+    let audited: Vec<(Option<&str>, Option<&str>, Option<&str>)> = recorded
+        .iter()
+        .map(|event| {
+            (
+                event.action.as_deref(),
+                event.details.get("scope").map(String::as_str),
+                event.details.get("namespace").map(String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        audited,
+        [
+            (Some("secret.rotated"), Some("namespace"), Some("team-a")),
+            (
+                Some("secret.rotation_finalised"),
+                Some("namespace"),
+                Some("team-a")
+            ),
+        ]
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|event| event.details.get("token_name").map(String::as_str) == Some("root-op"))
+    );
+}
+
+/// F05 I4, decision 4: only an Admin scoped to the whole cluster rotates a
+/// namespace's key. An Admin scoped to that very namespace can't, and a
+/// namespace without a key can't be rotated into having one.
+#[tokio::test]
+async fn only_an_unscoped_admin_rotates_a_namespace_key() {
+    let council = seeded_council_with_ikm("rotate-namespace-who").await;
+    give_namespace_a_key(&council, "team-a").await;
+    let (admin, admin_secret) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let mut tokens = vec![admin];
+    let mut refused = Vec::new();
+    for (name, role) in [
+        ("team-a-admin", crate::sesame::types::ApiRole::Admin),
+        ("team-a-deployer", crate::sesame::types::ApiRole::Deployer),
+    ] {
+        let scoped = crate::sesame::token::create_token(
+            name,
+            role,
+            crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        tokens.push(scoped.token);
+        refused.push(scoped.plaintext);
+    }
+    let store = crate::sesame::auth::new_token_store();
+    *store.write().await = tokens;
+    let (tx, _rx) = mpsc::channel(1);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let body = r#"{"namespace":"team-a"}"#;
+
+    for secret in &refused {
+        assert_eq!(
+            post_status(app.clone(), "/v1/secret/rotate", secret, body).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert!(
+        !council
+            .security_state()
+            .await
+            .age_keypairs
+            .iter()
+            .any(|kp| kp.read_only),
+        "a refused rotation changes no key"
+    );
+    assert_eq!(
+        post_status(
+            app.clone(),
+            "/v1/secret/rotate",
+            &admin_secret,
+            r#"{"namespace":"team-b"}"#
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "team-b never opted in"
+    );
+    assert!(!council.security_state().await.has_namespace_key("team-b"));
+    assert_eq!(
+        post_status(
+            app.clone(),
+            "/v1/secret/rotate",
+            &admin_secret,
+            r#"{"namespcae":"team-a"}"#
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "a misspelt field must not rotate the cluster key instead"
+    );
+    assert_eq!(
+        post_status(app, "/v1/secret/rotate", &admin_secret, body).await,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -3759,16 +4143,54 @@ async fn apply_as_context(
     app.clone().oneshot(request).await.unwrap().status()
 }
 
+/// Actor commands are visible, but common jobs execute through a fake indexed worker.
+/// Real ProcessGrill and runc tests separately qualify runtime effects.
+type WorkloadAdmissionTrace = AgentCommand;
+
 async fn workload_admission_fixture(
     tag: &str,
 ) -> (
     Router,
     Arc<crate::council::CouncilNode>,
-    mpsc::Receiver<AgentCommand>,
+    mpsc::Receiver<WorkloadAdmissionTrace>,
 ) {
     let council = seeded_council(tag).await;
-    let (tx, rx) = mpsc::channel(16);
-    let app = router(
+    let (tx, mut incoming) = mpsc::channel(16);
+    let (mutations, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        while let Some(command) = incoming.recv().await {
+            if let AgentCommand::BatchOwnedExecutions { response, .. } = command {
+                let _ = response.send(Default::default());
+            } else if mutations.send(command).await.is_err() {
+                break;
+            }
+        }
+    });
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let node = crate::bun::task_array_node::TaskArrayNode::new(
+        crate::bun::task_array_node::TaskArrayNodeConfig {
+            root: directory.path().join("tasks"),
+            policy: crate::config::process_workloads::ProcessWorkloadsConfig {
+                mount_isolation: false,
+                allowed_binaries: vec!["/bin/sh".into(), "/bin/true".into()],
+                ..Default::default()
+            },
+            default_concurrency: 8,
+            backoff: (std::time::Duration::ZERO, std::time::Duration::ZERO),
+            group_commit: Default::default(),
+        },
+        crate::bun::task_array_node::NodeRunner::Fake(
+            crate::bun::task_executor::FakeRunner::always_succeeds(),
+        ),
+    );
+    let service = Arc::new(
+        crate::bun::task_array_leader::TaskArrayService::with_timings(
+            Some(Arc::new(node)),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(30),
+        ),
+    );
+    let app = router_with_upgrade(
         tx,
         None,
         None,
@@ -3781,10 +4203,88 @@ async fn workload_admission_fixture(
         None,
         None,
         None,
+        None,
         0,
         None,
-    );
+        None,
+        None,
+        "default".into(),
+        Some("local".into()),
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        crate::bun::capabilities::StaticCapabilities::default(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+        Some(service),
+    )
+    .layer(axum::Extension(directory));
     (app, council, rx)
+}
+
+async fn assert_authorised_job_dispatch_and_settlement(
+    commands: &mut mpsc::Receiver<WorkloadAdmissionTrace>,
+    council: &crate::council::CouncilNode,
+    expected: &crate::config::Config,
+    _rerun: bool,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let desired = council.desired_state().await;
+            if expected.job.iter().all(|(name, spec)| {
+                let namespace = spec.namespace.as_deref().unwrap_or("default");
+                desired.task_arrays.jobs().runs().any(|(id, run)| {
+                    run.name == *name
+                        && run.namespace == namespace
+                        && desired.task_arrays.get(id).is_some_and(|record| {
+                            record.state.summary().status
+                                == crate::meat::task_array_state::TaskArrayStatus::Succeeded
+                                && record.template.image == spec.image
+                                && record.template.exec == spec.exec
+                                && record.template.script == spec.script
+                        })
+                })
+            }) {
+                if desired
+                    .task_arrays
+                    .deployments()
+                    .any(|(_, record)| !record.completed)
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authorised work did not complete through the common executor");
+    let desired = council.desired_state().await;
+    assert!(desired.prerequisite_claims.is_empty());
+    for (name, spec) in &expected.job {
+        let namespace = spec.namespace.as_deref().unwrap_or("default");
+        let definition = &desired
+            .task_arrays
+            .jobs()
+            .definition(namespace, name)
+            .unwrap()
+            .definition;
+        assert_eq!(definition.tasks.count, 1);
+        assert!(!definition.replay_unknown);
+        assert_eq!(definition.template.image, spec.image);
+        assert_eq!(definition.template.exec, spec.exec);
+        assert_eq!(definition.template.script, spec.script);
+    }
+    assert!(
+        commands.try_recv().is_err(),
+        "common jobs dispatched through the supervisor"
+    );
 }
 
 #[tokio::test]
@@ -3909,9 +4409,13 @@ async fn explicit_job_rerun_preserves_authority_and_refuses_mixed_manifests() {
         .unwrap();
     request.extensions_mut().insert(deployer_context());
     assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
-    assert!(
-        matches!(commands.recv().await, Some(AgentCommand::RerunJobs { config, .. }) if config.job.len() == 1)
-    );
+    assert_authorised_job_dispatch_and_settlement(
+        &mut commands,
+        &council,
+        &crate::config::Config::parse(manifest).unwrap(),
+        true,
+    )
+    .await;
     assert!(council.desired_state().await.apps.is_empty());
     council.shutdown().await.unwrap();
 }
@@ -3952,10 +4456,16 @@ async fn job_apply_checks_namespace_and_app_scope_before_enqueuing_work() {
         .await,
         StatusCode::OK
     );
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(AgentCommand::Deploy { .. })
-    ));
+    assert_authorised_job_dispatch_and_settlement(
+        &mut commands,
+        &council,
+        &crate::config::Config::parse(
+            "[job.allowed]\nimage = \"test:v1\"\nnamespace = \"allowed\"\n",
+        )
+        .unwrap(),
+        false,
+    )
+    .await;
     council.shutdown().await.unwrap();
 }
 
@@ -4046,10 +4556,13 @@ async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and
                     "{manifest}"
                 );
                 if expected == StatusCode::OK {
-                    assert!(matches!(
-                        commands.try_recv(),
-                        Ok(AgentCommand::Deploy { .. })
-                    ));
+                    assert_authorised_job_dispatch_and_settlement(
+                        &mut commands,
+                        &council,
+                        &crate::config::Config::parse(&manifest).unwrap(),
+                        false,
+                    )
+                    .await;
                 } else {
                     assert!(matches!(
                         commands.try_recv(),
@@ -4184,6 +4697,7 @@ async fn setup_with_capabilities(
         false,
         statics,
         crate::bun::readiness::ReadinessTracker::new(),
+        None,
         None,
         None,
         None,
@@ -5718,6 +6232,73 @@ fn council_app_evidence_names_the_volume_home_an_app_waits_for() {
     assert_eq!(away(&retired), None);
 }
 
+/// #482: desired-app evidence names every node holding an app's managed
+/// volume, so a snapshot request can reach it from any node: the placements,
+/// a stopped app's last homes, never a decommissioned node, and nothing for
+/// an app without a managed volume.
+#[test]
+fn council_app_evidence_names_the_nodes_holding_an_apps_volume() {
+    let mut desired = crate::council::types::DesiredState::default();
+    let db = crate::meat::types::AppId::new("db", "prod");
+    let web = crate::meat::types::AppId::new("web", "prod");
+    let volume_spec: crate::config::app::AppSpec =
+        toml::from_str("image = \"x:1\"\nreplicas = 2\n[[volumes]]\npath = \"/data\"\n").unwrap();
+    let plain_spec: crate::config::app::AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+    desired.apps.insert(db.clone(), volume_spec);
+    desired.apps.insert(web.clone(), plain_spec);
+    let placement = |node: &str, ordinal| crate::meat::types::Placement {
+        node_id: crate::meat::NodeId::new(node),
+        resources: crate::meat::Resources::new(100, 0, 0),
+        ordinal,
+    };
+    desired.scheduling.insert(
+        db.clone(),
+        vec![placement("node-3", 0), placement("node-1", 1)],
+    );
+    desired.scheduling.insert(web, vec![placement("node-2", 0)]);
+
+    let homes = |desired: &crate::council::types::DesiredState| {
+        council_app_evidence(desired, None)
+            .into_iter()
+            .map(|app| (app.app, app.volume_homes))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        homes(&desired),
+        [
+            (
+                "db".to_string(),
+                vec!["node-3".to_string(), "node-1".to_string()]
+            ),
+            ("web".to_string(), Vec::new()),
+        ]
+    );
+
+    let mut stopped = desired.clone();
+    stopped.stopped_apps.insert(db.clone());
+    stopped.scheduling.insert(db.clone(), Vec::new());
+    stopped
+        .last_placed_nodes
+        .insert(db.clone(), vec![crate::meat::NodeId::new("node-3")]);
+    assert_eq!(homes(&stopped)[0].1, ["node-3".to_string()]);
+
+    let mut retired = desired.clone();
+    retired.security_state.crl.retired_nodes.insert(
+        "node-3".into(),
+        crate::cluster::retirement::NodeRetirement {
+            node_id: "node-3".into(),
+            retired_by: "operator".into(),
+            reason: "disk died".into(),
+            retired_at_unix_ms: 30,
+            released_placements: Default::default(),
+            released_registry_writers: Default::default(),
+            released_node_fault: None,
+            released_endpoint_consumer: false,
+        },
+    );
+    assert_eq!(homes(&retired)[0].1, ["node-1".to_string()]);
+}
+
 #[test]
 fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
     let mut running: InstanceStatus = serde_json::from_value(serde_json::json!({
@@ -5738,6 +6319,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            volume_homes: Vec::new(),
         },
         crate::bun::diagnostics::DesiredAppEvidence {
             app: "pending".into(),
@@ -5748,6 +6330,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            volume_homes: Vec::new(),
         },
     ];
     let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
@@ -6483,6 +7066,14 @@ async fn static_assets_and_health_stay_public() {
 /// given secret. Returns the app plus the receiver, so a test observes a
 /// triggered sync by a real message on the channel rather than a sleep.
 fn webhook_setup(secret: &str, rate_limit: u32) -> (Router, mpsc::Receiver<()>, CancellationToken) {
+    webhook_setup_for_council(secret, rate_limit, None)
+}
+
+fn webhook_setup_for_council(
+    secret: &str,
+    rate_limit: u32,
+    council: Option<Arc<crate::council::CouncilNode>>,
+) -> (Router, mpsc::Receiver<()>, CancellationToken) {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let shutdown = CancellationToken::new();
     let grill = MockGrill::new();
@@ -6503,7 +7094,7 @@ fn webhook_setup(secret: &str, rate_limit: u32) -> (Router, mpsc::Receiver<()>, 
         None,
         None,
         None,
-        None,
+        council,
         None,
         None,
         None,
@@ -6524,6 +7115,7 @@ fn webhook_setup(secret: &str, rate_limit: u32) -> (Router, mpsc::Receiver<()>, 
         false,
         crate::bun::capabilities::StaticCapabilities::default(),
         crate::bun::readiness::ReadinessTracker::new(),
+        None,
         None,
         None,
         None,
@@ -6842,6 +7434,7 @@ async fn webhook_fails_closed_without_a_configured_secret() {
         None,
         None,
         None,
+        None,
     );
     let status = post_webhook(&app, br#"{}"#, &[]).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -7116,5 +7709,1482 @@ async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(String::from_utf8_lossy(&body).contains("isn't an appliance"));
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn apply_uses_committed_namespace_context_before_any_resource_write() {
+    use crate::council::RaftRequest;
+    let council = seeded_council("namespace-context-review2").await;
+    let quota = crate::config::Config::parse("[namespace.existing]\ncpu = '2000m'\nmax_apps = 2\n")
+        .unwrap()
+        .namespace
+        .remove("existing")
+        .unwrap();
+    council
+        .write(RaftRequest::NamespaceSpec {
+            name: "existing".into(),
+            spec: Box::new(quota.clone()),
+        })
+        .await
+        .unwrap();
+    let (app, shutdown, token) = router_for_council(council.clone()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::relish::client::BunClient::new_with_token(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        Some(&token),
+    );
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
+    )
+    .unwrap();
+    let result = client.apply(&permission).await;
+    assert!(
+        result.is_ok(),
+        "committed namespace was rejected: {result:?}"
+    );
+    let desired = council.desired_state().await;
+    assert_eq!(desired.namespaces["existing"], quota);
+    assert_eq!(
+        desired.permissions["reader"],
+        permission.permission["reader"]
+    );
+    let ghost = crate::config::Config::parse(
+        "[permission.ghost]\nactions = ['logs']\napps = ['web']\nnamespaces = ['ghost']\n",
+    )
+    .unwrap();
+    assert!(client.apply(&ghost).await.is_err());
+    assert!(
+        !council
+            .desired_state()
+            .await
+            .permissions
+            .contains_key("ghost")
+    );
+    // Apply validates build declarations; execution is the separate build route.
+    let before_builds = council.desired_state().await;
+    for (namespace, expected) in [("existing", true), ("ghost", false)] {
+        let build = crate::config::Config::parse(&format!(
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = '{namespace}'\n"
+        )).unwrap();
+        let result = client.apply(&build).await;
+        assert_eq!(
+            result.is_ok(),
+            expected,
+            "build namespace={namespace}: {result:?}"
+        );
+        let after = council.desired_state().await;
+        assert_eq!(after.namespaces, before_builds.namespaces);
+        assert_eq!(after.permissions, before_builds.permissions);
+        assert_eq!(after.apps, before_builds.apps);
+    }
+    shutdown.cancel();
+    server.await.unwrap();
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn follower_apply_defers_namespace_existence_to_the_authoritative_leader() {
+    use crate::council::RaftRequest;
+    let nodes = council_of(3).await;
+    let leader_id = nodes[0].current_leader().await.unwrap();
+    let leader = nodes[(leader_id - 1) as usize].clone();
+    let follower = nodes
+        .iter()
+        .enumerate()
+        .find(|(index, _)| *index + 1 != leader_id as usize)
+        .unwrap()
+        .1
+        .clone();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while follower.current_leader().await != Some(leader_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("follower must know the elected leader before the HTTP request");
+    let quota = crate::config::Config::parse("[namespace.existing]\ncpu = '2000m'\nmax_apps = 2\n")
+        .unwrap()
+        .namespace
+        .remove("existing")
+        .unwrap();
+    leader
+        .write(RaftRequest::NamespaceSpec {
+            name: "existing".into(),
+            spec: Box::new(quota.clone()),
+        })
+        .await
+        .unwrap();
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let mut servers = Vec::new();
+    let shutdown = CancellationToken::new();
+    let client = crate::relish::client::BunClient::new_with_token(
+        &format!("http://{}", follower_listener.local_addr().unwrap()),
+        Some(&plaintext),
+    );
+    let reached_leader = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (node, listener, is_leader) in [
+        (leader.clone(), leader_listener, true),
+        (follower, follower_listener, false),
+    ] {
+        let (commands, _receiver) = mpsc::channel(4);
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(token.clone());
+        let mut app = router(
+            commands,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(node),
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            leader_port,
+            None,
+        );
+        if is_leader {
+            let reached = reached_leader.clone();
+            app = app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let reached = reached.clone();
+                    async move {
+                        if request.uri().path() == "/v1/apply" {
+                            reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+        }
+        let stop = shutdown.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await
+                .unwrap();
+        }));
+    }
+    let valid = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
+    )
+    .unwrap();
+    let accepted = client.apply(&valid).await;
+    assert!(
+        accepted.is_ok(),
+        "follower rejected a committed namespace: {accepted:?}"
+    );
+    assert_eq!(leader.desired_state().await.namespaces["existing"], quota);
+    assert_eq!(
+        leader.desired_state().await.permissions["reader"],
+        valid.permission["reader"]
+    );
+    let ghost = crate::config::Config::parse(
+        "[permission.ghost]\nactions = ['logs']\napps = ['web']\nnamespaces = ['ghost']\n",
+    )
+    .unwrap();
+    assert!(client.apply(&ghost).await.is_err());
+    assert!(
+        !leader
+            .desired_state()
+            .await
+            .permissions
+            .contains_key("ghost")
+    );
+    assert_eq!(
+        reached_leader.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both existence decisions must reach the leader"
+    );
+    shutdown.cancel();
+    for server in servers {
+        server.await.unwrap();
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
+    use crate::bun::agent::CurrentResourceStatus;
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+    let agent = tokio::spawn(async move {
+        let Some(AgentCommand::CurrentResources { response }) = cmd_rx.recv().await else {
+            panic!("wrong agent request")
+        };
+        response
+            .send(vec![
+                CurrentResourceStatus {
+                    resource: "app.team/web".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: Some("team-spec".into()),
+                },
+                CurrentResourceStatus {
+                    resource: "app.other/web".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: Some("other-spec".into()),
+                },
+                CurrentResourceStatus {
+                    resource: "job.team/migrate".into(),
+                    image: Some("web:v1".into()),
+                    fingerprint: None,
+                },
+            ])
+            .unwrap();
+    });
+    let context = crate::sesame::auth::AuthContext {
+        token_name: "team-reader".into(),
+        principal_id: "token:test".into(),
+        role: crate::sesame::types::ApiRole::ReadOnly,
+        scoped_apps: Some(vec!["web".into()]),
+        scoped_namespaces: Some(vec!["team".into()]),
+    };
+    let app = router(
+        cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    )
+    .layer(axum::Extension(context));
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/apps")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows: Vec<CurrentResourceStatus> =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].resource, "app.team/web");
+    assert_eq!(rows[0].fingerprint.as_deref(), Some("team-spec"));
+    agent.await.unwrap();
+}
+
+#[tokio::test]
+async fn dry_run_endpoint_refuses_unavailable_agent_evidence() {
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    drop(cmd_rx);
+    let app = router(
+        cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/apps")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_log_metadata_refuses_a_stalled_agent_within_a_bounded_wait() {
+    let (tx, mut held_commands) = mpsc::channel(16);
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    let mut request = axum::http::Request::get("/v1/logs/migration/default")
+        .body(Body::empty())
+        .unwrap();
+    let mut reader = deployer_context();
+    reader.role = crate::sesame::types::ApiRole::ReadOnly;
+    reader.scoped_apps = Some(vec!["migration".into()]);
+    reader.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(reader);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        held_commands.try_recv(),
+        Ok(AgentCommand::ResolveExecutionLogs { .. })
+    ));
+    assert!(
+        held_commands.try_recv().is_err(),
+        "a timed-out lookup enqueued work"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn common_apply_refuses_missing_durable_storage_before_agent_work() {
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+    );
+    let mut request = axum::http::Request::post("/v1/apply")
+        .body(Body::from("[job.migration]\nimage='test:v1'\n"))
+        .unwrap();
+    let mut deployer = deployer_context();
+    deployer.scoped_apps = Some(vec!["migration".into()]);
+    deployer.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(deployer);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned apply metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(commands.try_recv().is_err());
+    assert!(
+        commands.try_recv().is_err(),
+        "timed-out admission enqueued a deploy or run"
+    );
+}
+
+#[tokio::test]
+async fn owned_internal_run_metadata_refuses_a_stalled_agent_before_writes_or_launch() {
+    let council = seeded_council("owned-metadata-bound").await;
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let mut request = axum::http::Request::post("/v1/batch/run")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "batch_id": 1, "jobs": [{"name": "batch-bound", "spec": {"image": "test:v1"}}],
+                "execution_labels": {"batch-bound": {"name": "migration", "namespace": "default"}}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let mut system = deployer_context();
+    system.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+    system.principal_id = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+    system.role = crate::sesame::types::ApiRole::Admin;
+    request.extensions_mut().insert(system);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
+        .await
+        .expect("owned internal metadata lookup did not end within its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(AgentCommand::BatchOwnedExecutions { .. })
+    ));
+    assert!(
+        commands.try_recv().is_err(),
+        "timed-out admission enqueued a worker"
+    );
+    let desired = council.desired_state().await;
+    assert!(desired.apps.is_empty());
+    assert!(desired.batch_state.batches.is_empty());
+    assert!(desired.batch_state.execution_owners.is_empty());
+    assert_eq!(desired.batch_state.next_batch_id, 1);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn owned_remote_log_metadata_bounds_the_local_collision_check() {
+    let council = seeded_council("owned-remote-metadata-bound").await;
+    let batch = serde_json::from_value(serde_json::json!({
+        "jobs": [{"name": "migration", "execution_name": "batch-remote-bound", "namespace": "default", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
+        "submitted_at_epoch_secs": 1
+    })).unwrap();
+    write_admission_fixture(
+        &council,
+        crate::council::RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch,
+        },
+    )
+    .await
+    .unwrap();
+    let before = council.desired_state().await;
+    let (tx, mut commands) = mpsc::channel(16);
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let mut request = axum::http::Request::get(
+        "/v1/logs/entries/batch-remote-bound/default?instance=default__batch-remote-bound-0",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let mut reader = deployer_context();
+    reader.role = crate::sesame::types::ApiRole::ReadOnly;
+    reader.scoped_apps = Some(vec!["migration".into()]);
+    reader.scoped_namespaces = Some(vec!["default".into()]);
+    request.extensions_mut().insert(reader);
+    let (result, (_held_response, mut commands)) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request)),
+        async {
+            let Some(AgentCommand::ResolveExecutionLogs { response, .. }) = commands.recv().await
+            else {
+                panic!("first metadata phase must resolve the explicit selector");
+            };
+            response
+                .send(Err(crate::bun::BunError::BatchConflict(
+                    "no local owner".into(),
+                )))
+                .unwrap();
+            let Some(AgentCommand::Status { response }) = commands.recv().await else {
+                panic!("remote ownership needs a local ordinary collision check");
+            };
+            (response, commands)
+        }
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "metadata lookup enqueued work"
+    );
+    let after = council.desired_state().await;
+    assert_eq!(after.apps, before.apps);
+    assert_eq!(after.batch_state, before.batch_state);
+    council.shutdown().await.unwrap();
+    let response = result
+        .expect("remote collision metadata did not end within the overall deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// Durable admission owns a job name before an executor has dispatched it.
+#[tokio::test]
+async fn an_admitted_job_only_apply_owns_its_name_before_executor_dispatch() {
+    let council = seeded_council("ordinary-common-ownership").await;
+    let (cmd_tx, mut commands) = mpsc::channel(16);
+    // No executor: admission may queue, but another operation cannot steal its name.
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let ownership = tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            match command {
+                AgentCommand::BatchOwnedExecutions { response, .. } => {
+                    let _ = response.send(Default::default());
+                }
+                _ => panic!("admission must not invoke a legacy executor"),
+            }
+        }
+    });
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/apply")
+                .body(Body::from("[job.migrate]\nimage='migration:v1'\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if council
+                .desired_state()
+                .await
+                .task_arrays
+                .deployments()
+                .any(|(_, record)| record.apps_committed)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let competing = crate::config::Config::parse(
+        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n",
+    )
+    .unwrap();
+    let result = council
+        .write(crate::council::RaftRequest::TaskArray(Box::new(
+            crate::meat::task_array_store::TaskArrayWrite::DeployBegin {
+                operation_id: "55555555555555555555555555555555".into(),
+                config: Box::new(competing),
+                now_epoch_secs: 1,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        crate::council::CouncilResponse::Refused { .. }
+    ));
+    let desired = council.desired_state().await;
+    assert!(desired.apps.is_empty());
+    assert_eq!(desired.task_arrays.jobs().runs().count(), 1);
+    assert!(desired.prerequisite_claims.is_empty());
+    ownership.abort();
+    drop(response);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immediate_run() {
+    let (app, council, mut commands) = workload_admission_fixture("cluster-cron-common").await;
+    let body = "[app.web]\nimage='web:v2'\n[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n";
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/apply")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        response.into_body().collect(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .to_bytes();
+    assert!(
+        parse_sse_events(&bytes)
+            .iter()
+            .any(|event| matches!(event, ApplyEvent::Complete { .. }))
+    );
+    let desired = council.desired_state().await;
+    assert_eq!(desired.apps.len(), 1);
+    assert_eq!(
+        desired
+            .task_arrays
+            .jobs()
+            .definition("default", "tick")
+            .unwrap()
+            .definition
+            .cron
+            .as_ref()
+            .unwrap()
+            .expression,
+        "* * * * *"
+    );
+    assert_eq!(desired.task_arrays.jobs().runs().count(), 0);
+    assert!(desired.prerequisite_claims.is_empty());
+    assert!(commands.try_recv().is_err());
+    council.shutdown().await.unwrap();
+}
+
+/// Actual Raft writes with the lost-quorum test hook; synthetic results are
+/// transition evidence only. Owned runtime tests separately qualify exits.
+#[derive(Clone, Copy)]
+enum HangingPrerequisiteWrite {
+    Begin,
+    Commit,
+    KnownFailed,
+}
+
+async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPrerequisiteWrite) {
+    use crate::council::{CouncilResponse, RaftRequest};
+    use crate::meat::task_array_store::TaskArrayWrite;
+    let council = seeded_council("common-hung-deployment").await;
+    let operation_id = "55555555555555555555555555555555";
+    let manifest =
+        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n";
+    if !matches!(boundary, HangingPrerequisiteWrite::Begin) {
+        let result = council
+            .write(RaftRequest::TaskArray(Box::new(
+                TaskArrayWrite::DeployBegin {
+                    operation_id: operation_id.into(),
+                    config: Box::new(crate::config::Config::parse(manifest).unwrap()),
+                    now_epoch_secs: 1,
+                },
+            )))
+            .await
+            .unwrap();
+        assert!(!matches!(result, CouncilResponse::Refused { .. }));
+        let arrays = council.desired_state().await.task_arrays;
+        let run = arrays.deployment(operation_id).unwrap().hook_runs["migrate"];
+        let owner = crate::meat::NodeId::new("worker");
+        let result = council
+            .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+                batch_id: run,
+                now_epoch_secs: 2,
+                results: vec![],
+                grants: vec![(
+                    owner.clone(),
+                    crate::meat::index_set::IndexRangeSet::from_range(0..=0),
+                )],
+            })))
+            .await
+            .unwrap();
+        assert!(!matches!(result, CouncilResponse::Refused { .. }));
+        let failed = matches!(boundary, HangingPrerequisiteWrite::KnownFailed);
+        let result = council
+            .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+                batch_id: run,
+                now_epoch_secs: 3,
+                grants: vec![],
+                results: vec![(
+                    owner,
+                    crate::meat::task_array_state::ChunkResult {
+                        chunk: crate::meat::task_array::ChunkId(0),
+                        attempt: 1,
+                        succeeded: u32::from(!failed),
+                        failed_count: u32::from(failed),
+                        failed_indices: if failed {
+                            crate::meat::index_set::IndexRangeSet::from_range(0..=0)
+                        } else {
+                            Default::default()
+                        },
+                        not_run: 0,
+                        retried: 0,
+                        duration_counts: [0; 16],
+                    },
+                )],
+            })))
+            .await
+            .unwrap();
+        assert!(!matches!(result, CouncilResponse::Refused { .. }));
+    }
+    let before = council.desired_state().await;
+    council.hang_writes();
+    let (tx, mut incoming) = mpsc::channel(16);
+    let (trace, mut commands) = mpsc::channel(16);
+    tokio::spawn(async move {
+        while let Some(command) = incoming.recv().await {
+            match command {
+                AgentCommand::BatchOwnedExecutions { response, .. } => {
+                    let _ = response.send(Default::default());
+                }
+                AgentCommand::DeployOperations { response } => {
+                    let _ = response.send(crate::bun::deploy_operations::DeployOperationSnapshot {
+                        active_deploys: Vec::new(),
+                        history: Vec::new(),
+                    });
+                }
+                other => {
+                    let _ = trace.send(other).await;
+                }
+            }
+        }
+    });
+    let app = router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let request = if matches!(boundary, HangingPrerequisiteWrite::Begin) {
+        axum::http::Request::post("/v1/apply")
+            .body(Body::from(manifest))
+            .unwrap()
+    } else {
+        axum::http::Request::post(format!("/v1/deploys/operations/{operation_id}/cancel"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = tokio::time::timeout(std::time::Duration::from_secs(15), app.oneshot(request))
+        .await
+        .expect("lost-quorum write did not return a bounded unavailable outcome")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let after = council.desired_state().await;
+    assert_eq!(after.apps, before.apps);
+    assert_eq!(
+        after.task_arrays, before.task_arrays,
+        "uncertain publication or cancellation discarded durable intent"
+    );
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(AgentCommand::DeployOperations { .. }) | Err(_)
+    ));
+    assert!(commands.try_recv().is_err());
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hung_common_begin_returns_bounded_unavailability_without_publication() {
+    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Begin).await;
+}
+#[tokio::test]
+async fn hung_common_commit_preserves_the_exact_successful_hook_and_app_gate() {
+    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Commit).await;
+}
+#[tokio::test]
+async fn hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate() {
+    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::KnownFailed).await;
+}
+
+#[tokio::test]
+async fn hung_terminal_job_claim_settlement_exits_its_watcher_and_retains_claim() {
+    use crate::bun::agent::{ClusterJobExecution, ClusterJobReceipt, ClusterJobSettlement};
+    use crate::council::{CouncilResponse, RaftRequest};
+    use sha2::{Digest, Sha256};
+    let council = seeded_council("hung-terminal-job-settlement").await;
+    let config = crate::config::Config::parse("[job.work]\nimage='work:v1'\n").unwrap();
+    let operation_id = "55555555555555555555555555555555".to_string();
+    let begin = council
+        .write(RaftRequest::PrerequisiteBegin {
+            operation_id: operation_id.clone(),
+            term: council.current_term(),
+            config: Box::new(config.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(begin, CouncilResponse::Refused { .. }));
+    let commit = council
+        .write(RaftRequest::PrerequisiteCommit {
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(commit, CouncilResponse::Refused { .. }));
+    let before = council.desired_state().await;
+    let held = before.prerequisite_claims[&operation_id].clone();
+    assert!(held.apps_committed);
+    assert!(held.blocks("work", "default"));
+    let mut canonical = config.job["work"].clone();
+    canonical.namespace = Some("default".into());
+    let spec_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&("default", "work", canonical)).unwrap(),
+    ));
+    let instance = crate::grill::InstanceIdentity::new("default", "work", 0).instance_id();
+    let receipt = Arc::new(ClusterJobReceipt {
+        executions: std::collections::BTreeMap::from([(
+            instance.0,
+            ClusterJobExecution {
+                name: "work".into(),
+                namespace: "default".into(),
+                generation: 1,
+                spec_digest,
+            },
+        )]),
+    });
+    let expected_receipt = receipt.clone();
+    let actor_council = council.clone();
+    let (commands, mut requests) = mpsc::channel(1);
+    let actor = tokio::spawn(async move {
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+            .await
+            .expect("watcher did not request finite local settlement evidence")
+            .unwrap();
+        let AgentCommand::ClusterJobsSettlement { receipt, response } = request else {
+            panic!("watcher requested the wrong settlement evidence")
+        };
+        assert!(Arc::ptr_eq(&receipt, &expected_receipt));
+        // The actor reply is a boundary input, not a claim of real execution.
+        // Only the subsequent actual JobApplyComplete write is made to hang.
+        actor_council.hang_writes();
+        response.send(ClusterJobSettlement::Terminal).unwrap();
+    });
+    let mut watcher = super::apply::spawn_job_apply_settlement(
+        commands,
+        council.clone(),
+        operation_id.clone(),
+        receipt,
+    );
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(6), &mut watcher).await;
+    if finished.is_err() {
+        watcher.abort();
+        let _ = watcher.await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), actor)
+        .await
+        .expect("settlement actor failed to terminate")
+        .unwrap();
+    let after = council.desired_state().await;
+    council.shutdown().await.unwrap();
+    assert_eq!(after.apps, before.apps);
+    assert_eq!(after.prerequisite_claims.get(&operation_id), Some(&held));
+    assert!(
+        finished.is_ok(),
+        "known-terminal settlement left an unbounded Council watcher"
+    );
+    assert!(
+        finished.unwrap().is_ok(),
+        "bounded settlement watcher panicked"
+    );
+}
+
+async fn write_admission_fixture(
+    council: &crate::council::CouncilNode,
+    mut request: crate::council::RaftRequest,
+) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
+    let previous = council.desired_state().await.last_applied_log;
+    match &mut request {
+        crate::council::RaftRequest::BatchRegister {
+            expected_log_id, ..
+        } => *expected_log_id = previous,
+        crate::council::RaftRequest::SchedulingDecision(decision) => {
+            request = crate::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
+            }
+        }
+        _ => {}
+    }
+    council.write(request).await
+}
+
+#[tokio::test]
+async fn cluster_webhook_202_waits_for_replicated_trigger_admission() {
+    let council = seeded_council("webhook-durable-admission").await;
+    let (app, _receiver, shutdown) =
+        webhook_setup_for_council("hooksecret", 10, Some(council.clone()));
+    let body = br#"{"after":"abc123"}"#;
+    let status = post_webhook(
+        &app,
+        body,
+        &[
+            ("x-hub-signature-256", github_signature("hooksecret", body)),
+            ("x-github-delivery", "durable-admission".into()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let state = council.desired_state().await;
+    let sync = state
+        .gitops_sync_state
+        .expect("202 must record a durable pending trigger");
+    let sync = serde_json::to_value(sync).unwrap();
+    assert_eq!(sync["requested_generation"], 1);
+    assert_eq!(sync["completed_generation"], 0);
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_webhook_without_a_leader_is_never_accepted_and_remains_retryable() {
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    let council = Arc::new(
+        crate::council::CouncilNode::new(
+            1,
+            crate::council::types::CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, InMemoryRaftRouter::new()),
+            crate::council::log_store::MemLogStore::new(),
+            crate::council::state_machine::CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let (app, mut receiver, shutdown) =
+        webhook_setup_for_council("hooksecret", 10, Some(council.clone()));
+    let body = br#"{"after":"abc123"}"#;
+    let headers = [
+        ("x-hub-signature-256", github_signature("hooksecret", body)),
+        ("x-github-delivery", "retry-after-no-leader".into()),
+    ];
+    assert_eq!(
+        post_webhook(&app, body, &headers).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(receiver.try_recv().is_err());
+    council
+        .initialize(std::collections::BTreeMap::from([(
+            1,
+            crate::council::types::CouncilNodeInfo {
+                addr: "127.0.0.1:9444".parse().unwrap(),
+                name: "node-1".into(),
+            },
+        )]))
+        .await
+        .unwrap();
+    let mut metrics = council.metrics();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if council.is_leader().await {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        post_webhook(&app, body, &headers).await,
+        StatusCode::ACCEPTED
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_trigger() {
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+    let transport = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    let mut listeners = Vec::new();
+    let mut members = std::collections::BTreeMap::new();
+    let mut directory = crate::mustard::directory::NodeDirectory::default();
+    for id in 1u64..=3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = format!("node-{id}");
+        directory.endpoints.insert(
+            crate::meat::NodeId::new(&name),
+            crate::mustard::directory::NodeEndpoints {
+                api_address: address,
+                reporting_address: address,
+            },
+        );
+        members.insert(
+            id,
+            CouncilNodeInfo {
+                addr: address,
+                name,
+            },
+        );
+        let node = Arc::new(
+            crate::council::CouncilNode::new(
+                id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(id, transport.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        transport.register(id, node.raft().clone()).await;
+        nodes.push(node);
+        listeners.push(listener);
+    }
+    nodes[0].initialize(members).await.unwrap();
+    let mut metrics = nodes[0].metrics();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if nodes[0].is_leader().await {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    for node in nodes.iter().skip(1) {
+        let mut replicated = node.metrics();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if node.current_leader().await == Some(1) {
+                    break;
+                }
+                replicated.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let (_directory_tx, directory_rx) = tokio::sync::watch::channel(directory);
+    let mut routers = Vec::new();
+    let mut receivers = Vec::new();
+    let mut shutdowns = Vec::new();
+    let mut servers = Vec::new();
+    for (node, listener) in nodes.iter().zip(listeners) {
+        let (router, receiver, shutdown) =
+            webhook_setup_for_council("hooksecret", 10, Some(node.clone()));
+        let router = router.layer(axum::Extension(LeaderDirectory(directory_rx.clone())));
+        let serving = router.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, serving).await.unwrap()
+        }));
+        routers.push(router);
+        receivers.push(receiver);
+        shutdowns.push(shutdown);
+    }
+    let body = br#"{"after":"abc123","exact":"raw body must reach the leader"}"#;
+    let headers = [
+        ("x-hub-signature-256", github_signature("hooksecret", body)),
+        ("x-github-delivery", "handover-admission".into()),
+    ];
+    assert_eq!(
+        post_webhook(&routers[2], body, &headers).await,
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), receivers[0].recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        receivers[2].try_recv().is_err(),
+        "a follower must not consume the accepted trigger locally"
+    );
+    let admitted =
+        serde_json::to_value(nodes[0].desired_state().await.gitops_sync_state.unwrap()).unwrap();
+    assert_eq!(admitted["requested_generation"], 1);
+    assert_eq!(admitted["completed_generation"], 0);
+    // The exact nudge has been received, but no sync has run. Stop its leader
+    // through an explicit gate and prove its successor still owns that work.
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let released = stop.clone();
+    let old = nodes[0].clone();
+    let handover = tokio::spawn(async move {
+        released.notified().await;
+        old.shutdown().await.unwrap();
+    });
+    stop.notify_one();
+    handover.await.unwrap();
+    servers[0].abort();
+    let mut following = nodes[1].metrics();
+    let leader_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(id) = nodes[1].current_leader().await
+                && id != 1
+            {
+                break id;
+            }
+            following.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let index = leader_id as usize - 1;
+    assert!(nodes[index].is_leader().await);
+    let pending = serde_json::to_value(
+        nodes[index]
+            .desired_state()
+            .await
+            .gitops_sync_state
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pending["requested_generation"], 1);
+    assert_eq!(pending["completed_generation"], 0);
+    // A successor with a fresh local validator still rejects the committed receipt.
+    let (fresh_validator_router, _fresh_receiver, fresh_shutdown) =
+        webhook_setup_for_council("hooksecret", 10, Some(nodes[index].clone()));
+    assert_eq!(
+        post_webhook(&fresh_validator_router, body, &headers).await,
+        StatusCode::UNAUTHORIZED
+    );
+    fresh_shutdown.cancel();
+    for shutdown in shutdowns {
+        shutdown.cancel();
+    }
+    for server in servers {
+        server.abort();
+    }
+    for node in nodes.iter().skip(1) {
+        node.shutdown().await.unwrap();
+    }
+}
+
+fn webhook_boundary_setup(
+    secret: &str,
+    rate_limit: u32,
+    council: Option<Arc<crate::council::CouncilNode>>,
+    membership: Option<Arc<tokio::sync::RwLock<Vec<NodeMembershipInfo>>>>,
+) -> (
+    Router,
+    mpsc::Receiver<()>,
+    CancellationToken,
+    Arc<tokio::sync::Mutex<crate::lettuce::webhook::WebhookValidator>>,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let shutdown = CancellationToken::new();
+    let grill = MockGrill::new();
+    let port_allocator = PortAllocator::new(30000, 31000);
+    let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+    tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let (webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let validator = Arc::new(tokio::sync::Mutex::new(
+        crate::lettuce::webhook::WebhookValidator::new(secret, rate_limit),
+    ));
+    let app = router_with_upgrade(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        council,
+        None,
+        None,
+        None,
+        membership,
+        Some(webhook_tx),
+        Some(validator.clone()),
+        9117,
+        None,
+        None,
+        None,
+        "default".to_string(),
+        None,
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        crate::bun::capabilities::StaticCapabilities::default(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    // Own canceled-request cleanup in this fixture. On an intended old-source
+    // timeout, this layer drops the real handler before either held lock opens.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        shutdown.clone(),
+        async |State(stop): State<CancellationToken>,
+               request: axum::extract::Request,
+               next: axum::middleware::Next| {
+            tokio::select! {
+                _ = stop.cancelled() => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                response = next.run(request) => response,
+            }
+        },
+    ));
+    (app, webhook_rx, shutdown, validator)
+}
+
+async fn boundary_post_webhook(
+    address: std::net::SocketAddr,
+    delivery: &str,
+) -> Result<StatusCode, String> {
+    let body = br#"{"after":"abc123"}"#;
+    let request = reqwest::Client::new()
+        .post(format!("http://{address}/v1/gitops/webhook"))
+        .header("x-hub-signature-256", github_signature("hooksecret", body))
+        .header("x-github-delivery", delivery)
+        .body(body.to_vec());
+    // This six-second observation bound does not change the five-second
+    // production policy. Old handlers that never return fail this assertion.
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        response.bytes().await.map_err(|error| error.to_string())?;
+        Ok::<_, String>(status)
+    })
+    .await
+    .map_err(|_| "webhook did not return within its admission budget".to_owned())??;
+    if started.elapsed() > std::time::Duration::from_millis(5500) {
+        return Err("webhook exceeded five seconds plus bounded HTTP observation overhead".into());
+    }
+    Ok(response)
+}
+
+#[tokio::test]
+async fn whole_webhook_budget_bounds_a_held_validator_and_exact_id_remains_retryable() {
+    let council = seeded_council("webhook-held-validator-boundary").await;
+    let (app, mut receiver, shutdown, validator) =
+        webhook_boundary_setup("hooksecret", 1, Some(council.clone()), None);
+    let held = validator.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let result = boundary_post_webhook(address, "held-validator-exact-id").await;
+    let admission_absent = council.desired_state().await.gitops_sync_state.is_none();
+    let wake_absent = receiver.try_recv().is_err();
+    if !matches!(result, Ok(StatusCode::SERVICE_UNAVAILABLE)) {
+        // Drop the blocked HTTP handler before unlocking, so an intended red
+        // cannot accidentally create a late trigger during fixture cleanup.
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+        drop(held);
+        server.abort();
+        let _ = server.await;
+        panic!(
+            "whole validator wait must return 503: {result:?}; no admission={admission_absent}, no wake={wake_absent}"
+        );
+    }
+    assert!(
+        admission_absent && wake_absent,
+        "timed-out validator wait admitted work"
+    );
+    drop(held);
+    let retry = boundary_post_webhook(address, "held-validator-exact-id").await;
+    let state = council.desired_state().await;
+    let wake = receiver.try_recv().is_ok();
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    assert_eq!(retry.unwrap(), StatusCode::ACCEPTED);
+    let sync = state.gitops_sync_state.unwrap();
+    assert_eq!(
+        (sync.requested_generation, sync.completed_generation),
+        (1, 0)
+    );
+    assert!(wake, "healthy retry must wake its admitted leader");
+}
+
+#[tokio::test]
+async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reservations() {
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+    let transport = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    let mut listeners = Vec::new();
+    let mut members = std::collections::BTreeMap::new();
+    let mut membership = Vec::new();
+    for id in 1u64..=3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = format!("boundary-node-{id}");
+        members.insert(
+            id,
+            CouncilNodeInfo {
+                addr: address,
+                name: name.clone(),
+            },
+        );
+        membership.push(NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new(&name),
+            address,
+            api_advertised: true,
+        });
+        let node = Arc::new(
+            crate::council::CouncilNode::new(
+                id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(id, transport.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        transport.register(id, node.raft().clone()).await;
+        nodes.push(node);
+        listeners.push(listener);
+    }
+    nodes[0].initialize(members).await.unwrap();
+    for node in &nodes {
+        let mut metrics = node.metrics();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while node.current_leader().await != Some(1) {
+                metrics.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let membership = Arc::new(tokio::sync::RwLock::new(membership));
+    let held = membership.write().await;
+    let mut receivers = Vec::new();
+    let mut stops = Vec::new();
+    let mut servers = Vec::new();
+    let mut addresses = Vec::new();
+    for (node, listener) in nodes.iter().zip(listeners) {
+        addresses.push(listener.local_addr().unwrap());
+        let (app, receiver, shutdown, _) = webhook_boundary_setup(
+            "hooksecret",
+            1,
+            Some(node.clone()),
+            Some(membership.clone()),
+        );
+        // No LeaderDirectory layer: this exercises the actual locked metadata
+        // fallback used when gossip has no advertised directory entry.
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        receivers.push(receiver);
+        stops.push(shutdown);
+    }
+    let result = boundary_post_webhook(addresses[2], "held-metadata-exact-id").await;
+    let mut admission_absent = true;
+    for node in &nodes {
+        admission_absent &= node.desired_state().await.gitops_sync_state.is_none();
+    }
+    let wake_absent = receivers
+        .iter_mut()
+        .all(|receiver| receiver.try_recv().is_err());
+    if !matches!(result, Ok(StatusCode::SERVICE_UNAVAILABLE)) {
+        for stop in &stops {
+            stop.cancel();
+        }
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        drop(held);
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
+        panic!(
+            "whole metadata wait must return 503: {result:?}; no admission={admission_absent}, no wake={wake_absent}"
+        );
+    }
+    assert!(
+        admission_absent && wake_absent,
+        "timed-out metadata lookup admitted work"
+    );
+    drop(held);
+    let retry = boundary_post_webhook(addresses[2], "held-metadata-exact-id").await;
+    let state = nodes[0].desired_state().await;
+    let leader_wake = receivers[0].try_recv().is_ok();
+    let follower_wake = receivers[2].try_recv().is_ok();
+    for stop in &stops {
+        stop.cancel();
+    }
+    for node in &nodes {
+        node.shutdown().await.unwrap();
+    }
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+    assert_eq!(retry.unwrap(), StatusCode::ACCEPTED);
+    let sync = state.gitops_sync_state.unwrap();
+    assert_eq!(
+        (sync.requested_generation, sync.completed_generation),
+        (1, 0)
+    );
+    assert!(
+        leader_wake && !follower_wake,
+        "only the admitted leader consumes the wakeup"
+    );
+}
+
+/// F04 R4 through the API: prepare answers with a CSR the operator can
+/// sign, and each step refuses what it should.
+#[tokio::test]
+async fn ca_rotation_routes_hand_out_a_csr_and_refuse_bad_steps() {
+    use crate::sesame::ca_rotation::PreparedRotation;
+    let council = seeded_council_with_ikm("ca-rotation-routes").await;
+    let (app, shutdown, tok) = router_for_council(council.clone()).await;
+    let post = |uri: &'static str, body: String| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {tok}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }
+    };
+
+    // Nothing to finalise, and a typo is not a role.
+    let (status, _) = post("/v1/ca/rotation/finalize", r#"{"role":"Node"}"#.into()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post("/v1/ca/rotation/prepare", r#"{"role":"Nodes"}"#.into()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post("/v1/ca/rotation/prepare", r#"{"role":"Root"}"#.into()).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the root isn't an intermediate"
+    );
+
+    let (status, body) = post("/v1/ca/rotation/prepare", r#"{"role":"Node"}"#.into()).await;
+    assert_eq!(status, StatusCode::OK);
+    let prepared: PreparedRotation = serde_json::from_slice(&body).unwrap();
+    assert_eq!(prepared.generation, 1);
+    let security = council.security_state().await;
+    let root = security
+        .active_ca(crate::sesame::types::CaRole::Root)
+        .unwrap();
+    assert_eq!(
+        prepared.root_fingerprint,
+        crate::sesame::identity_store::root_ca_fingerprint(&root.certificate_der)
+    );
+    assert_eq!(security.pending_intermediates.len(), 1);
+
+    // A certificate another root signed for that CSR is refused, and the
+    // rotation doesn't begin.
+    use base64::Engine as _;
+    let foreign =
+        crate::sesame::ca::generate_root_ca("elsewhere", crate::sesame::types::SerialNumber(1))
+            .unwrap();
+    let certificate = crate::sesame::ca::sign_intermediate_csr(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&prepared.csr_b64)
+            .unwrap(),
+        crate::sesame::types::CaRole::Node,
+        "elsewhere",
+        crate::sesame::types::SerialNumber(prepared.serial),
+        &foreign.private_key_der,
+        &foreign.ca.certificate_der,
+    )
+    .unwrap();
+    let body = serde_json::to_string(&crate::sesame::ca_rotation::SignedIntermediate {
+        role: crate::sesame::types::CaRole::Node,
+        certificate_b64: base64::engine::general_purpose::STANDARD.encode(certificate),
+    })
+    .unwrap();
+    let (status, body) = post("/v1/ca/rotation/begin", body).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not signed by the active root"),
+        "{json}"
+    );
+    assert!(
+        council
+            .security_state()
+            .await
+            .retiring_ca(crate::sesame::types::CaRole::Node)
+            .is_none()
+    );
     shutdown.cancel();
 }

@@ -220,8 +220,11 @@ const BURGER_PACK: &str = "tar -czf docs/website/demo/burger.tar.gz -C examples/
 /// local build doesn't fail this.
 const BURGER_FILES: &[&str] = &[
     "Dockerfile",
+    "batch.go",
+    "batch_test.go",
     "burger.toml",
     "go.mod",
+    "jobs.toml",
     "main.go",
     "main_test.go",
 ];
