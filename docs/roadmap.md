@@ -239,11 +239,11 @@ migration and no feature gate
   [full](qualification/2026-10-05-v0.1.5-soak-full.md) soaks and the
   [8-hour final tier](qualification/2026-10-05-v0.1.5-sustained-v02-final.md),
   where the V02 gate passed.
-- [ ] **0.1.6: operations security, ready for release, qualification to follow**
+- [x] **0.1.6: operations security.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6)
+  on 7 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/12), merge
   train [#616](https://github.com/reliaburger/reliaburger/pull/616)). The rest of the 0.1.4 security
-  scope. Every item below has landed on `release-0-1-6`, and the crate says
-  0.1.6:
+  scope:
   - [x] images bound to a digest at apply, upstream trust rules, and cosign
     signatures checked on upstream images before deploy (F03a,
     [#361](https://github.com/reliaburger/reliaburger/issues/361), [#600](https://github.com/reliaburger/reliaburger/pull/600), [#597](https://github.com/reliaburger/reliaburger/pull/597),
@@ -264,7 +264,10 @@ migration and no feature gate
     ([#606](https://github.com/reliaburger/reliaburger/issues/606), [#613](https://github.com/reliaburger/reliaburger/issues/613),
     [#612](https://github.com/reliaburger/reliaburger/pull/612), [#614](https://github.com/reliaburger/reliaburger/pull/614)), and the quickstart
     guest leaves its clock to Lima's guest agent
-    ([#608](https://github.com/reliaburger/reliaburger/issues/608), [#617](https://github.com/reliaburger/reliaburger/pull/617));
+    ([#608](https://github.com/reliaburger/reliaburger/issues/608), [#617](https://github.com/reliaburger/reliaburger/pull/617)), and a network
+    partition fault waits until every caller is cut instead of skipping the
+    ones whose cgroup read ran out of time
+    ([#625](https://github.com/reliaburger/reliaburger/issues/625), [#627](https://github.com/reliaburger/reliaburger/pull/627));
   - [x] CI lints macOS with one Clippy pass ([#595](https://github.com/reliaburger/reliaburger/pull/595)), and
     the plan for keyless cosign and Sigstore bundles (F03c,
     [#620](https://github.com/reliaburger/reliaburger/pull/620)).
@@ -276,7 +279,12 @@ migration and no feature gate
   for digest-bound images, the CA set and its rotation, token rotation and
   namespace keys), so a 0.1.5 cluster can't roll to it:
   recreate the cluster ([upgrading from 0.1.5](releasing.md#upgrading-from-015)).
-  The security work comes before real fleets in 0.3.0.
+  The security work comes before real fleets in 0.3.0. The candidate passed the
+  [staged install](qualification/2026-10-06-v0.1.6-staged-install-apple-silicon.md),
+  the [compressed](qualification/2026-10-06-v0.1.6-soak-compressed.md) and
+  [full](qualification/2026-10-06-v0.1.6-soak-full.md) soaks and the
+  [8-hour final tier](qualification/2026-10-06-v0.1.6-sustained-v02-final.md),
+  where the V02 gate passed.
 - [x] **0.2.0: "A million jobs", foundation ready to merge after 0.1.6**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
   [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
@@ -353,15 +361,14 @@ what's shipped and what's scheduled.
   and the first steps of F03–F05, landed),
   [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11) (F05 I2, landed),
   [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
-  F04 R1–R4, F05 I3–I4),
+  F04 R1–R4, F05 I3–I4, landed),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
-  F06, F09, F11).
-- **Known bugs and flakes.** The open ones, the guest clock steps
-  ([#608](https://github.com/reliaburger/reliaburger/issues/608)) and the `oci_crash` flake
-  ([#526](https://github.com/reliaburger/reliaburger/issues/526)), are in
-  [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12); the open
+  F06, F09, F11, and the rest of F03–F05).
+- **Known bugs and flakes.** The open one, the `oci_crash` flake
+  ([#526](https://github.com/reliaburger/reliaburger/issues/526)), is in
+  [0.2.0](https://github.com/reliaburger/reliaburger/milestone/3); the open
   flakes are also in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
 
