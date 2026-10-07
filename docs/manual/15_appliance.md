@@ -369,8 +369,20 @@ either a terminal to ask at or `--trust-lan`.
 
 The cluster's keys are made here, on your laptop, and never anywhere else
 until node 1's seed carries them. `~/home-cluster/secrets` holds the master
-key and the sealed root CA key: back them up, because `relish council
-recover` needs them if the cluster ever loses its quorum. Every other
+key and the sealed root CA key, and `relish council recover` needs them if
+the cluster ever loses its quorum. So before relish sends any seed, it stops
+and waits:
+
+```
+Back up /Users/you/home-cluster/secrets: it holds the master key and the sealed root CA key, and `relish council recover` needs them if the cluster ever loses its quorum. Keep them somewhere safe off this machine, such as your password manager.
+Type yes once it's backed up:
+```
+
+Copy the folder somewhere that isn't this laptop, then type `yes`. Anything
+else asks again; Ctrl-D stops without claiming anything, and you start again
+from an empty directory. In a script, `--yes` prints the reminder and carries
+on without waiting, so the backup is then your script's job. Without a
+terminal and without `--yes`, relish refuses before it makes anything. Every other
 machine's seed holds only a join token: single-use, bound to that machine's
 name, and good for an hour (`--ttl` to change). Each machine fetches its
 certificate and the master key from the cluster itself when it joins. relish
@@ -410,8 +422,10 @@ relish cluster create --bare-metal ~/home-cluster --name home \
   d8:9e:f3:12:34:58@192.168.1.53
 ```
 
-`--operator`, `--network` and `--council-size` mean what they mean for a
-claim, and the secrets land in `~/home-cluster/secrets` the same way. A
+`--operator`, `--network`, `--council-size` and `--yes` mean what they mean
+for a claim. The secrets land in `~/home-cluster/secrets` the same way, and
+relish waits for you to confirm you've backed them up before it tells you
+how to make the stick. A
 stick's join tokens are good for a week (`--ttl` to change), since a stick
 travels slower than a claim.
 
