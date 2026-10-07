@@ -109,7 +109,7 @@ fn onion_objects_use_only_the_original_bpf_instruction_set() {
         let file = object::File::parse(&*bytes).unwrap();
         for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
             let data = section.data().unwrap();
-            for (index, instruction) in data.chunks_exact(8).enumerate() {
+            for (index, instruction) in data.as_chunks::<8>().0.iter().enumerate() {
                 let class = instruction[0] & 0x07;
                 assert!(
                     class != BPF_ALU && class != BPF_JMP32,
