@@ -956,6 +956,10 @@ enum ClusterAction {
         /// How many voters the council grows to: an odd number from 1 to 7.
         #[arg(long, value_name = "N", default_value = "5")]
         council_size: reliaburger::council::CouncilSize,
+        /// Don't wait for confirmation that the master key is backed up
+        /// (required without a terminal).
+        #[arg(long)]
+        yes: bool,
         /// Each machine as MAC@IP, node 1 first.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
@@ -978,6 +982,11 @@ enum ImageAction {
         /// Channel to read instead of the published one.
         #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
         channel: String,
+        /// Check the channel against this Ed25519 public key (PEM) instead
+        /// of the release keys, such as a CI lab build's
+        /// lab-signing-key.pub.pem.
+        #[arg(long, value_name = "PEM")]
+        key: Option<PathBuf>,
     },
     /// Write a disk image (.raw or .raw.zst) onto a device, erasing it.
     Write {
@@ -1010,6 +1019,11 @@ enum OsAction {
         /// Channel to read instead of the published one.
         #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
         channel: String,
+        /// Check the channel against this Ed25519 public key (PEM) instead
+        /// of the release keys, such as a CI lab build's
+        /// lab-signing-key.pub.pem.
+        #[arg(long, value_name = "PEM")]
+        key: Option<PathBuf>,
     },
     /// Roll an OS version across the cluster, one node at a time: workers,
     /// then the council, the leader last. Each node's workloads move off
@@ -1020,6 +1034,11 @@ enum OsAction {
         /// Channel the nodes read the release from.
         #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
         channel: String,
+        /// Read the newest version from a channel signed with this Ed25519
+        /// public key (PEM) instead of the release keys. Nodes still check
+        /// the release against the key their own image carries.
+        #[arg(long, value_name = "PEM", conflicts_with = "version")]
+        key: Option<PathBuf>,
         /// Allow a version older than what nodes run.
         #[arg(long)]
         allow_downgrade: bool,
@@ -1070,6 +1089,10 @@ enum MachinesAction {
         /// Don't ask to compare claim keys with the machines' consoles.
         #[arg(long)]
         trust_lan: bool,
+        /// Don't wait for confirmation that the new cluster's master key is
+        /// backed up (with --create; required without a terminal).
+        #[arg(long, requires = "create")]
+        yes: bool,
         /// Each machine by MAC (found over mDNS) or address.
         #[arg(required = true)]
         machines: Vec<String>,
@@ -2403,6 +2426,7 @@ async fn main() -> ExitCode {
                     ttl,
                     external_signing_key,
                     council_size,
+                    yes,
                     machines,
                 },
         } => match ssh_key.as_deref().map(std::fs::read).transpose() {
@@ -2420,6 +2444,7 @@ async fn main() -> ExitCode {
                     external_signing_key,
                     council_size,
                 },
+                yes,
             ),
         },
         Command::Image { action } => match action {
@@ -2428,7 +2453,13 @@ async fn main() -> ExitCode {
                 dir,
                 all,
                 channel,
-            } => reliaburger::relish::image::download(&channel, &arches, &dir, all).await,
+                key,
+            } => match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
+                Err(error) => Err(error),
+                Ok(trust) => {
+                    reliaburger::relish::image::download(&channel, &arches, &dir, all, &trust).await
+                }
+            },
             ImageAction::Write { image, device, yes } => {
                 reliaburger::relish::image::write(&image, &device, yes).map(|bytes| {
                     println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
@@ -2467,6 +2498,7 @@ async fn main() -> ExitCode {
                 ssh_key,
                 ttl,
                 trust_lan,
+                yes,
                 machines,
             }) => match ssh_key.as_deref().map(std::fs::read).transpose() {
                 Err(error) => Err(error.into()),
@@ -2483,6 +2515,7 @@ async fn main() -> ExitCode {
                                 external_signing_key,
                                 council_size: council_size
                                     .unwrap_or(reliaburger::council::CouncilSize::APPLIANCE),
+                                yes,
                             }),
                             token_ttl: std::time::Duration::from_secs(ttl),
                             ssh_key,
@@ -2513,12 +2546,24 @@ async fn main() -> ExitCode {
             .await
         }
         Command::Os { action } => match action {
-            OsAction::List { channel } => reliaburger::relish::os::list(&channel).await,
+            OsAction::List { channel, key } => {
+                match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
+                    Err(error) => Err(error),
+                    Ok(trust) => reliaburger::relish::os::list(&channel, &trust).await,
+                }
+            }
             OsAction::Upgrade {
                 version,
                 channel,
+                key,
                 allow_downgrade,
-            } => reliaburger::relish::os::upgrade(version, &channel, allow_downgrade).await,
+            } => match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
+                Err(error) => Err(error),
+                Ok(trust) => {
+                    reliaburger::relish::os::upgrade(version, &channel, &trust, allow_downgrade)
+                        .await
+                }
+            },
             OsAction::Status => reliaburger::relish::os::status().await,
             OsAction::Resume => reliaburger::relish::os::resume().await,
             OsAction::Abort => reliaburger::relish::os::abort().await,
@@ -3132,6 +3177,55 @@ mod tests {
     }
 
     #[test]
+    fn yes_skips_the_master_key_backup_question_and_needs_create_on_a_claim() {
+        let create = |extra: &[&str]| {
+            let mut args = vec![
+                "relish",
+                "cluster",
+                "create",
+                "--bare-metal",
+                "lab",
+                "--name",
+                "lab",
+                "--operator",
+                "10.42.0.1",
+            ];
+            args.extend_from_slice(extra);
+            args.push("d8:9e:f3:00:00:01@10.42.0.11");
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Cluster {
+                    action: ClusterAction::Create { yes, .. },
+                }) => yes,
+                _ => panic!("not cluster create"),
+            }
+        };
+        assert!(!create(&[]));
+        assert!(create(&["--yes"]));
+
+        let claim = |extra: &[&str]| {
+            let mut args = vec!["relish", "machines", "claim", "lab"];
+            args.extend_from_slice(extra);
+            args.push("10.42.0.11");
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Some(Command::Machines {
+                    action: Some(MachinesAction::Claim { yes, .. }),
+                    ..
+                }) => yes,
+                _ => panic!("not machines claim"),
+            })
+        };
+        let new = ["--create", "--name", "lab", "--operator", "10.42.0.1"];
+        assert!(!claim(&new).unwrap());
+        let mut confirmed = new.to_vec();
+        confirmed.push("--yes");
+        assert!(claim(&confirmed).unwrap());
+        assert!(
+            claim(&["--yes"]).is_err(),
+            "--yes only answers the backup question --create asks"
+        );
+    }
+
+    #[test]
     fn image_download_takes_every_architecture_unless_arch_is_repeated() {
         use reliaburger::relish::netboot::Arch;
         let arches = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
@@ -3151,6 +3245,52 @@ mod tests {
             Cli::try_parse_from(["relish", "image", "download", "--arch", "x86_64,aarch64"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn image_download_and_os_list_take_a_lab_key_but_default_to_the_release_keys() {
+        let download = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Image {
+                action: ImageAction::Download { key, .. },
+            } => key,
+            _ => panic!("not image download"),
+        };
+        assert_eq!(download(&["relish", "image", "download"]), None);
+        assert_eq!(
+            download(&["relish", "image", "download", "--key", "lab.pem"]),
+            Some(PathBuf::from("lab.pem"))
+        );
+        let list = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Os {
+                action: OsAction::List { key, .. },
+            } => key,
+            _ => panic!("not os list"),
+        };
+        assert_eq!(list(&["relish", "os", "list"]), None);
+        assert_eq!(
+            list(&["relish", "os", "list", "--key", "lab.pem"]),
+            Some(PathBuf::from("lab.pem"))
+        );
+    }
+
+    #[test]
+    fn os_upgrade_takes_a_lab_key_only_when_it_reads_the_channel() {
+        let upgrade = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Os {
+                action: OsAction::Upgrade { version, key, .. },
+            } => (version, key),
+            _ => panic!("not os upgrade"),
+        };
+        assert_eq!(
+            upgrade(&["relish", "os", "upgrade", "--key", "lab.pem"]),
+            (None, Some(PathBuf::from("lab.pem")))
+        );
+        assert_eq!(
+            upgrade(&["relish", "os", "upgrade", "2026.41.8"]),
+            (Some("2026.41.8".to_string()), None)
+        );
+        // A named version never reads the channel, so a key would do nothing.
+        assert!(parse(&["relish", "os", "upgrade", "2026.41.8", "--key", "lab.pem"]).is_err());
     }
 
     #[test]

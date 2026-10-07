@@ -533,9 +533,10 @@ jobs:
 
       - name: Upload the next version
         # Ready to serve: `gh run download <run> -n appliance-x86_64-next -D
-        # next`, then any web server on next/, and `relish os upgrade <next
-        # version> --channel http://<server>/releases/download/os-channel/os-channel.json`.
-        # The broken version's release sits beside it, for os-stage.
+        # next`, then any web server on next/, and `relish os upgrade --channel
+        # http://<server>/releases/download/os-channel/os-channel.json --key
+        # next/lab-signing-key.pub.pem`. The broken version's release sits
+        # beside it, for os-stage and the fallback test.
         if: env.NEXT_VERSION != ''
         uses: actions/upload-artifact@v4
         with:

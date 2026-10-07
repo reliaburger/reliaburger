@@ -1,4 +1,4 @@
-# Bare metal: the appliance and netboot (preview)
+# Bare metal: the appliance and netboot
 
 The five-minute tour builds its cluster in laptop VMs. This chapter builds one
 on real machines: a handful of old mini PCs or thin clients, each erased and
@@ -7,17 +7,19 @@ install, nothing to log in to, and no USB stick to boot from. Each machine
 boots from the network once, installs itself in under a minute, and from then
 on it's a node.
 
-It's a **preview**, and the rough edges are part of what it's for:
-- Until 0.3.0 publishes the first signed OS release, the images come from CI
-  lab builds, each signed with a throwaway key. A run you start by hand keeps
-  them for a week; a pull request's run, for a day.
-- We've run all of it in QEMU VMs, both aarch64 and x86_64. Real hardware (ten
-  Dell Wyse 3040s, netbooted from a Mac) comes next, so expect firmware
-  surprises.
+Four commands do it all:
+- `relish image download` fetches the newest signed OS release and checks it;
+- `sudo relish netboot` installs it on every machine that network-boots;
+- `relish machines claim` turns the installed machines into a cluster over
+  the network;
+- or `relish cluster create --bare-metal` writes a seed per machine for a USB
+  stick, if you'd rather not claim over the network.
 
-The short version: `relish image download` fetches the OS, `sudo relish
-netboot` installs it on every machine that network-boots, and `relish machines
-claim` turns the installed machines into a cluster.
+CI runs every one of them against QEMU VMs, both aarch64 and x86_64, on every
+change to the image. The hardware it's built for is the Dell Wyse 3040,
+netbooted from a Mac, and the release isn't tagged until three of them go
+from power-on to a working cluster. Other firmware may still have surprises;
+"What's missing" lists the ones we know of.
 
 ## What you need
 
@@ -49,14 +51,34 @@ claim` turns the installed machines into a cluster.
 
 ## Get the images
 
-Once an OS release is published, `relish image download --dir os` fetches the
-newest one (below). Until then, take a CI lab build.
+`relish image download --dir os` fetches every architecture the newest
+release has, whatever the machine you run it on, so an arm64 Mac serving
+x86_64 machines gets the right image. It checks each one against the release
+key relish carries, saves it as `os/x86_64/` and `os/aarch64/`, and ends by
+naming what it saved:
 
-The appliance workflow builds both architectures on every change. For a lab
-day, start a run by hand (Actions → Appliance image → Run workflow, with
-`publish` left off), so its artefacts last a week rather than a day. GitHub
-only offers that once the workflow is on `main`; until then, take the newest
-green pull request run and download it the same day:
+```
+Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)
+```
+
+To fetch only the architecture of your machines and save a few hundred
+megabytes, name it with `--arch`; repeat the flag for more than one:
+
+```sh
+relish image download --dir os --arch x86_64
+```
+
+An architecture the release doesn't have is refused, and so is a name relish
+doesn't know (`x86_64` and `aarch64` are the two it builds).
+
+### A CI lab build
+
+To try a change to the image before it's released, take a CI lab build
+instead. The appliance workflow builds both architectures on every change,
+each run signed with a throwaway key of its own. For a lab day, start a run
+by hand (Actions → Appliance image → Run workflow, with `publish` left off),
+so its artefacts last a week rather than a day. A pull request's run keeps
+them for a day, so download it the same day:
 
 ```sh
 gh run list --workflow appliance.yml --status success
@@ -74,26 +96,6 @@ You only need the architecture of your machines. Each artefact holds:
 The installer checks that signature before it writes anything. It carries the
 same run's public key. The x86_64 run also uploads `appliance-x86_64-next`,
 the version to update to ("Updating a CI build").
-
-For a published release, `relish image download --dir os` fetches every
-architecture the release has, whatever the machine you run it on, so an arm64
-Mac serving x86_64 machines gets the right image. It checks each one against
-the key relish carries, writes the same layout, `os/x86_64/` and
-`os/aarch64/`, and ends by naming what it saved:
-
-```
-Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)
-```
-
-To fetch only the architecture of your machines and save a few hundred
-megabytes, name it with `--arch`; repeat the flag for more than one:
-
-```sh
-relish image download --dir os --arch x86_64
-```
-
-An architecture the release doesn't have is refused, and so is a name relish
-doesn't know (`x86_64` and `aarch64` are the two it builds).
 
 ## Serve them
 
@@ -369,8 +371,20 @@ either a terminal to ask at or `--trust-lan`.
 
 The cluster's keys are made here, on your laptop, and never anywhere else
 until node 1's seed carries them. `~/home-cluster/secrets` holds the master
-key and the sealed root CA key: back them up, because `relish council
-recover` needs them if the cluster ever loses its quorum. Every other
+key and the sealed root CA key, and `relish council recover` needs them if
+the cluster ever loses its quorum. So before relish sends any seed, it stops
+and waits:
+
+```
+Back up /Users/you/home-cluster/secrets: it holds the master key and the sealed root CA key, and `relish council recover` needs them if the cluster ever loses its quorum. Keep them somewhere safe off this machine, such as your password manager.
+Type yes once it's backed up:
+```
+
+Copy the folder somewhere that isn't this laptop, then type `yes`. Anything
+else asks again; Ctrl-D stops without claiming anything, and you start again
+from an empty directory. In a script, `--yes` prints the reminder and carries
+on without waiting, so the backup is then your script's job. Without a
+terminal and without `--yes`, relish refuses before it makes anything. Every other
 machine's seed holds only a join token: single-use, bound to that machine's
 name, and good for an hour (`--ttl` to change). Each machine fetches its
 certificate and the master key from the cluster itself when it joins. relish
@@ -410,8 +424,10 @@ relish cluster create --bare-metal ~/home-cluster --name home \
   d8:9e:f3:12:34:58@192.168.1.53
 ```
 
-`--operator`, `--network` and `--council-size` mean what they mean for a
-claim, and the secrets land in `~/home-cluster/secrets` the same way. A
+`--operator`, `--network`, `--council-size` and `--yes` mean what they mean
+for a claim. The secrets land in `~/home-cluster/secrets` the same way, and
+relish waits for you to confirm you've backed them up before it tells you
+how to make the stick. A
 stick's join tokens are good for a week (`--ttl` to change), since a stick
 travels slower than a claim.
 
@@ -583,20 +599,36 @@ gh run download <run-id> -n appliance-x86_64-next -D next
 (cd next && python3 -m http.server 8000)
 ```
 
-Then name the version when you roll it out:
+The lab channel is signed with the run's throwaway key, not the release key,
+so relish refuses it unless you give it that key with `--key`. The run puts
+the public half beside the channel, as `next/lab-signing-key.pub.pem`:
 
 ```sh
-relish os upgrade 2026.41.8 \
-  --channel http://192.168.1.10:8000/releases/download/os-channel/os-channel.json
+channel=http://192.168.1.10:8000/releases/download/os-channel/os-channel.json
+relish os list --channel "$channel" --key next/lab-signing-key.pub.pem
+relish os upgrade --channel "$channel" --key next/lab-signing-key.pub.pem
 relish os status
 ```
 
-The nodes fetch the release from beside that channel and check it against
-the key their own image carries. relish itself trusts only the release key,
-so `relish os list --channel …` warns that it can't read this channel and
-shows the newest release as unknown, and `relish os upgrade` without a
-version refuses it. To check the channel by hand, it's signed like a
-published one:
+`relish os list` then shows the next version as the newest release, and
+`relish os upgrade` rolls it out. The nodes fetch the release from beside
+that channel and check it against the key their own image carries, which for
+a CI build is the same run's key.
+
+`--key` replaces the release keys rather than adding to them, and only for
+that one command: relish says so on stderr each time, and names the key file
+in the line that reports the check. It's never stored, and nothing on the
+nodes changes. Without it, relish checks a channel against the release keys
+it carries and nothing else, and refuses a lab channel with a pointer to
+`--key`. `relish image download` takes the same option. `relish os upgrade`
+refuses `--key` with a version you name, because it doesn't read the channel
+then:
+
+```sh
+relish os upgrade 2026.41.8 --channel "$channel"
+```
+
+To check the channel by hand, it's signed like a published one:
 
 ```sh
 openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \
@@ -617,8 +649,9 @@ ssh root@<node> /usr/lib/reliaburger/os-stage \
 ssh root@<node> systemctl reboot
 ```
 
-`relish os upgrade 2026.41.9` works too, but the leader picks the node, and
-the rollout pauses once it falls back. Either way, it's a test: don't roll it
+`relish os upgrade 2026.41.9 --channel "$channel"` works too (a named
+version, so no `--key`), but the leader picks the node, and the rollout
+pauses once it falls back. Either way, it's a test: don't roll it
 across a cluster you care about.
 
 ## What's missing

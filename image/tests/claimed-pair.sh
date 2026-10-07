@@ -94,7 +94,7 @@ if wait_for answering "${ips[0]}" && wait_for answering "${ips[1]}"; then
     deadline=$full
 fi
 if "$relish" machines claim "$work/cluster" --create --name pair --operator 10.42.0.1 \
-        --trust-lan "${ips[0]}" \
+        --trust-lan --yes "${ips[0]}" \
     && wait_for alive 1 \
     && wait_for sized \
     && "$relish" machines claim "$work/cluster" --trust-lan "${ips[1]}" \

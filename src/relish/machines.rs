@@ -281,6 +281,9 @@ pub struct NewCluster {
     pub external_signing_key: Option<String>,
     /// How many voters the council grows to.
     pub council_size: crate::council::CouncilSize,
+    /// `--yes`: don't wait for the operator to confirm the master-key
+    /// backup.
+    pub yes: bool,
 }
 
 impl NewCluster {
@@ -359,6 +362,16 @@ pub fn resolve(
 /// `relish machines claim`: check each machine's claim key, make its seed
 /// (a new cluster's, or a join to the cluster in the directory) and post it.
 pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
+    use std::io::IsTerminal;
+    let secrets = options.directory.join("secrets");
+    let backup = match &options.create {
+        Some(cluster) => Some(bare_metal::backup_check(
+            cluster.yes,
+            std::io::stdin().is_terminal(),
+            &secrets,
+        )?),
+        None => None,
+    };
     let discovered = if options.targets.iter().all(|t| t.parse::<IpAddr>().is_ok()) {
         Vec::new()
     } else {
@@ -403,6 +416,9 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
                 .cloned()
                 .zip(created.seeds.iter().cloned())
                 .collect::<Vec<_>>();
+            if let Some(check) = backup {
+                bare_metal::back_up(check, &secrets)?;
+            }
             (Some(created), seeds)
         }
         None => (None, {
@@ -586,6 +602,7 @@ mod tests {
             faults: false,
             external_signing_key: None,
             council_size: crate::council::CouncilSize::APPLIANCE,
+            yes: false,
         };
         let dir = tempfile::tempdir().unwrap();
         let options = cluster.create_options(

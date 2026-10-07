@@ -503,7 +503,7 @@ So we never hand out an address, and we can't break the router's DHCP. The limit
 - The laptop has to stay awake (`relish` can hold a power assertion while serving) and on the same LAN segment. Wired is better: five machines pulling an image over Wi-Fi turns step 4's transfer from seconds into minutes.
 - On Linux, `relish` needs `CAP_NET_BIND_SERVICE` or root for the same ports.
 
-**Or serve from the first node.** Once node 1 is installed (from a stick, or netbooted from the laptop) and claimed, it can do the serving: `relish netboot --node home-1`. That suits the rest of the fleet better:
+**Or serve from the first node.** Once node 1 is installed (from a stick, or netbooted from the laptop) and claimed, it can do the serving: `relish netboot --node home-1`. *(Dropped on 7 October 2026: the lab doesn't need it, and it isn't built.)* That suits the rest of the fleet better:
 - node 1 is wired, always on, and already holds the verified image (the running OS, or the next version sysupdate staged);
 - the laptop can go to sleep;
 - adding a sixth machine or replacing a dead one later is "plug it in and network-boot", with no laptop or stick at all.
@@ -609,7 +609,7 @@ See [`2026-09-27-plan-appliance-spike.md`](2026-09-27-plan-appliance-spike.md) a
 Unchanged from §4.7:
 - **Installer UKI** that pulls and verifies the image from its boot origin, and **streams** `/usr` onto the disk rather than into RAM. The 2 GB Wyse can't hold a full image in tmpfs (§9.2).
 - **`relish netboot`** on macOS and Linux: ProxyDHCP (`dhcproto`), a minimal TFTP for iPXE, HTTP via axum, a refusal when another proxy or `bootpd` is already answering, a `--mac` allow-list, and a time-boxed window. It serves only verified release artefacts.
-- **`relish netboot --node <name>`**: the same server as a bun subsystem.
+- ~~**`relish netboot --node <name>`**: the same server as a bun subsystem.~~ Dropped on 7 October 2026.
 - **Vendored iPXE** for x86_64 and arm64 EFI, pinned, with an embedded chain script.
 - **Tests:** the proxy-offer builder and property tests from §4.7; the Mac lab (§8.4 level 2); and the x86_64 CI lab on a bridge, which hosted runners allow with `sudo`.
 

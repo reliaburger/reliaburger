@@ -773,13 +773,15 @@ def clock_findings(state, node, inventory, fault_window):
 
     Lima's guest agent sets the guest clock to the host's every 10 s once
     they differ by more than 100 ms. systemd-timesyncd running beside it
-    fought it: the agent stepped the clock back every 10 s. Each step the
-    agent logged since the last check is counted; one after a power-on is
-    expected, a steady run of them outside a fault window is not."""
+    fought it: the agent stepped the clock back every 10 s. Ubuntu 26.04's
+    chrony would fight it the same way. Each step the agent logged since the
+    last check is counted; one after a power-on is expected, a steady run of
+    them outside a fault window is not."""
     findings = []
-    if (inventory.get("timesyncd") or [None])[0] == "active":
-        findings.append(finding("guest-clock", "fail",
-                                "systemd-timesyncd is running beside Lima's guest agent", node))
+    for kind, daemon in (("timesyncd", "systemd-timesyncd"), ("chrony", "chrony")):
+        if (inventory.get(kind) or [None])[0] == "active":
+            findings.append(finding("guest-clock", "fail",
+                                    f"{daemon} is running beside Lima's guest agent", node))
     steps = inventory_number(inventory, "clock_steps")
     if steps:
         counts = state.setdefault("clock_steps", {})

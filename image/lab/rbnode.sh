@@ -9,8 +9,9 @@
 #            installer over HTTP; the installer streams the image to disk and
 #            reboots, which -no-reboot turns into QEMU exiting.
 #   run      boots the installed disk in the background, passing the lab's
-#            SSH key and, if work/cluster/seeds/node-0<n>.tgz exists, the
-#            node's seed, as SMBIOS type 11 systemd credentials.
+#            SSH key and, if seed-lab.sh made one, the node's seed
+#            (work/cluster/stick/seeds/52-54-00-00-01-0<n>.seed), as SMBIOS
+#            type 11 systemd credentials.
 set -euo pipefail; . "$(dirname "$0")/lab.env"; cd "$WORK"
 n=${1:?usage: rbnode.sh <n> install|run [fresh]}; what=${2:?install or run}; hex=$(printf %02x "$n")
 if [ "${3:-}" = fresh ]; then rm -f "rb$n.qcow2" "rb$n-vars.fd"; fi
@@ -40,7 +41,7 @@ install)
     ;;
 run)
     creds=(-smbios "type=11,value=io.systemd.credential:ssh.authorized_keys.root=$(cat l2lab_key.pub)")
-    seed="$WORK/cluster/seeds/node-$(printf %02d "$n").tgz"
+    seed="$WORK/cluster/stick/seeds/52-54-00-00-01-$hex.seed"
     [ -f "$seed" ] && creds+=(-smbios "type=11,value=io.systemd.credential.binary:reliaburger.seed=$(base64 < "$seed" | tr -d '\n')")
     : > "rb$n.serial.log"
     # STICK=<image> plugs in a seed stick (make-seed-stick.sh) as USB storage.

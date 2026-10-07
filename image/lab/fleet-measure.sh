@@ -3,16 +3,15 @@
 # measurements on real hardware (research §9.7, step 6): memory, zram, bun's
 # RSS, bytes written to the system disk, disk use, load and temperature.
 # Needs root SSH on the nodes, so their seeds must carry a key
-# (`relish machines claim --ssh-key`, or seed-fleet.sh init --ssh-key).
+# (`relish machines claim --ssh-key`, or `relish cluster create --bare-metal
+# --ssh-key`).
 #
 #   fleet-measure.sh [--relish] <dir> [interval seconds] [samples]
 #
-# <dir> is where the fleet came from, and where the samples go:
-#   - a claim directory (`relish machines claim`): its fleet.json names the
-#     nodes and their addresses;
-#   - a seed-fleet.sh directory: its "fleet" file, nodes node-01, node-02, …
-# With --relish, the nodes come from `relish nodes --output json` instead
-# (RELISH names the binary), and <dir> only holds the samples.
+# <dir> is where the fleet came from, and where the samples go: the cluster
+# directory relish made, whose fleet.json names the nodes and their
+# addresses. With --relish, the nodes come from `relish nodes --output json`
+# instead (RELISH names the binary), and <dir> only holds the samples.
 # fleet-nodes.py does the reading, again before every sample, so machines
 # claimed during the run join it.
 # Defaults: every 300 s, forever (Ctrl-C stops). Each node gets

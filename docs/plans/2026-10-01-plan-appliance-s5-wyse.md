@@ -133,7 +133,7 @@ The [five-minute tour](../manual/08_five-minute-tour.md) from `relish apply`, wi
 ## 6. Measure for 24 hours (lab run)
 
 ```sh
-image/tools/fleet-measure.sh ~/wyse 300 288    # every 5 minutes, 24 hours
+image/lab/fleet-measure.sh ~/wyse 300 288    # every 5 minutes, 24 hours
 ```
 
 `~/wyse` is the claim directory, whose `fleet.json` names the nodes (`wyse-1` to `wyse-10`) and their addresses. `fleet-measure.sh --relish ~/wyse 300 288` takes them from `relish nodes --output json` instead. The script logs in as root over SSH, so it needs a lab image and the key from the claim's `--ssh-key`. Published images have no sshd, so the formal run doesn't repeat this.
@@ -154,12 +154,13 @@ Leave the tour's apps running for the first 12 hours, then remove them. One CSV 
 
 ```sh
 (cd next && python3 -m http.server 8000)
-relish os upgrade <next version> \
-  --channel http://10.77.0.2:8000/releases/download/os-channel/os-channel.json
+channel=http://10.77.0.2:8000/releases/download/os-channel/os-channel.json
+relish os list --channel "$channel" --key next/lab-signing-key.pub.pem
+relish os upgrade --channel "$channel" --key next/lab-signing-key.pub.pem
 relish os status
 ```
 
-Name the version: relish checks a channel against the release keys only, so it can't read the lab channel (`relish os list` shows the newest release as unknown). Formal run: `relish os list`, then `relish os upgrade` with no version, if a release newer than the installed one exists by then. The leader takes one node at a time, workers first and itself last.
+The lab channel is signed with the run's key, so relish reads it only with `--key`, and warns that it's not checking against the release keys. `relish os list` must show the next version as the newest release; if it doesn't, the `next/` directory is from another run. Formal run: `relish os list`, then `relish os upgrade` with no version, if a release newer than the installed one exists by then. The leader takes one node at a time, workers first and itself last.
 
 **The fallback** (lab run only). The broken version sits in `next/` beside the next one, signed with the same key, so the server from the update serves it too. Stage it by hand on one worker that isn't in the council (`relish council`), say wyse-9, with the image's `os-stage`. It checks the signature against the key the node's own image carries, which is this run's, so it needs no key argument:
 
@@ -169,7 +170,7 @@ ssh root@10.77.0.19 /usr/lib/reliaburger/os-stage \
 ssh root@10.77.0.19 systemctl reboot
 ```
 
-Then leave it. Each of the three tries waits for bun before the boot check reboots it, and after the third systemd-boot falls back to the version it ran before. (`relish os upgrade <broken version>` works too, and it's how CI does it, but then the leader picks the node rather than you, and the rollout pauses once that node falls back; `relish os abort` ends it.)
+Then leave it. Each of the three tries waits for bun before the boot check reboots it, and after the third systemd-boot falls back to the version it ran before. (`relish os upgrade <broken version> --channel "$channel"` works too, with no `--key` since it names the version, and it's how CI does it, but then the leader picks the node rather than you, and the rollout pauses once that node falls back; `relish os abort` ends it.)
 
 Until 7 October this step needed a second CI run built with `broken_bun`. That run signed with its own throwaway key, which the fleet doesn't trust, so `relish os upgrade` couldn't reach it and `os-stage` had to be handed the other run's `spike-signing-key.pub.pem`. And a run numbered one after the lab build carried the same version as the lab build's next. The broken version now comes from the lab build's own run, which removes all three traps. `broken_bun` stays for the Mac lab's arm64 builds (`image/lab/README.md`).
 

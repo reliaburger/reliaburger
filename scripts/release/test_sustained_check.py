@@ -735,9 +735,10 @@ class AgentLoopTurns(Evidence):
 class GuestClock(Evidence):
     """One clock source per guest: Lima's guest agent, not timesyncd as well (#608)."""
 
-    def clock(self, ts=NOW, timesyncd="inactive", steps=0):
+    def clock(self, ts=NOW, timesyncd="inactive", chrony="inactive", steps=0):
         return self.snapshot(ts=ts, **{"inventory__rb-a-1_txt":
-                                       INVENTORY + f"timesyncd {timesyncd}\nclock_steps {steps}\n"})
+                                       INVENTORY + f"timesyncd {timesyncd}\nchrony {chrony}\n"
+                                       f"clock_steps {steps}\n"})
 
     def test_a_guest_with_only_the_lima_agent_passes(self):
         _, verdict = self.evaluate(self.clock())
@@ -749,6 +750,13 @@ class GuestClock(Evidence):
         failure = next(item for item in verdict["findings"] if item["check"] == "guest-clock")
         self.assertEqual(failure["target"], "rb-a-1")
         self.assertIn("systemd-timesyncd", failure["detail"])
+
+    def test_chrony_running_beside_the_guest_agent_fails(self):
+        # Ubuntu 26.04 guests sync time with chrony, not timesyncd.
+        code, verdict = self.evaluate(self.clock(chrony="active"))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "guest-clock")
+        self.assertIn("chrony", failure["detail"])
 
     def test_clock_steps_outside_a_fault_window_warn_and_are_counted(self):
         _, verdict = self.evaluate(self.clock(steps=6))

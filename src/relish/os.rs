@@ -5,6 +5,7 @@
 use crate::os::rollout::{OsNodePhase, OsRollout, OsRolloutPhase, OsUpdateState};
 use crate::relish::RelishError;
 use crate::relish::client::BunClient;
+use crate::relish::image::ChannelTrust;
 
 /// One node's OS, as `relish os list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,19 +16,19 @@ pub struct NodeOs {
     pub update: OsUpdateState,
 }
 
-/// The newest release the channel names, checked against the release keys.
-pub async fn newest(channel_url: &str) -> Result<String, RelishError> {
-    let keys = crate::upgrade::keys::release_keys(&Default::default())
-        .map_err(|e| failed(&e.to_string()))?;
+/// The newest release the channel names, checked against `trust`: the
+/// release keys, or a lab build's key given with `--key`.
+pub async fn newest(channel_url: &str, trust: &ChannelTrust) -> Result<String, RelishError> {
+    if let Some(warning) = trust.warning() {
+        eprintln!("relish os: {warning}");
+    }
     let client = reqwest::Client::builder()
         .user_agent("relish")
         .build()
         .map_err(|e| failed(&e.to_string()))?;
     let channel = super::image::fetch(&client, channel_url).await?;
     let signature = super::image::fetch(&client, &format!("{channel_url}.sig")).await?;
-    let channel = crate::os::OsChannel::verified(&channel, &signature, &keys)
-        .map_err(|e| failed(&e.to_string()))?;
-    Ok(channel.version)
+    Ok(trust.verify(&channel, &signature)?.version)
 }
 
 /// Ask every node what it runs.
@@ -118,8 +119,8 @@ pub fn render_rollout(rollout: &OsRollout) -> String {
 }
 
 /// `relish os list`.
-pub async fn list(channel_url: &str) -> Result<(), RelishError> {
-    let newest = match newest(channel_url).await {
+pub async fn list(channel_url: &str, trust: &ChannelTrust) -> Result<(), RelishError> {
+    let newest = match newest(channel_url, trust).await {
         Ok(version) => Some(version),
         Err(error) => {
             eprintln!("warning: {error}");
@@ -131,15 +132,18 @@ pub async fn list(channel_url: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// `relish os upgrade [VERSION]`: the newest release unless named.
+/// `relish os upgrade [VERSION]`: the newest release unless named. Only
+/// the newest is read from the channel, so `trust` matters only then; the
+/// nodes check the release itself against their own image's key.
 pub async fn upgrade(
     version: Option<String>,
     channel_url: &str,
+    trust: &ChannelTrust,
     allow_downgrade: bool,
 ) -> Result<(), RelishError> {
     let version = match version {
         Some(version) => version,
-        None => newest(channel_url).await?,
+        None => newest(channel_url, trust).await?,
     };
     let answer = BunClient::default_local()
         .os_rollout_start(&version, channel_url, allow_downgrade)

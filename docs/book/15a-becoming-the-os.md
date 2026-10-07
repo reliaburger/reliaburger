@@ -64,7 +64,7 @@ Packages=
         iproute2
 ```
 
-`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, so the two channels test the same userland.
+`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
 
 The kernel package drags in the full `linux-firmware` set, hundreds of megabytes, unless something else provides it. `linux-firmware-minimal` does, and we add back only the Wyse's Realtek NIC firmware (and its Intel graphics firmware on x86-64, in `mkosi.conf.d/10-x86-64.conf`, a drop-in whose `[Match] Architecture=` line applies it to one architecture only).
 
@@ -621,7 +621,26 @@ Two rollouts that restart nodes must never overlap, and neither must a rollout a
 
 CI runs the whole thing. A lab build makes the image twice, one version apart, and signs both with its throwaway key. It also writes a lab `os-channel.json` naming the second version, with the same `os_release.py` code and the same canonical bytes as the published channel, signed with that throwaway key instead of the release key. One node boots the first version and forms a cluster from its seed, the runner serves the second laid out like a GitHub release beside that channel, and `relish os upgrade` has to end with the node healthy on the new version. The run uploads exactly that tree as `appliance-x86_64-next`, so the Wyse lab updates from what CI tested.
 
-The lab channel is a stand-in, not a back door. relish checks a channel against the release keys compiled into it and nothing else, so it refuses a lab channel: `relish os list` says the newest release is unknown, and in the lab you name the version, `relish os upgrade <version>`, which never reads the channel. The node still checks the release's `SHA256SUMS` against the key its own image carries. A test in `src/os/channel.rs` pins both halves down with a lab channel from `os_release.py`: it passes every rule a published channel does with its run's key, and fails the signature check against the release keys.
+The lab channel is a stand-in, not a back door. relish checks a channel against the release keys compiled into it and nothing else, so it refuses a lab channel. At first that meant the lab had to name the version, `relish os upgrade <version>`, which never reads the channel, while `relish os list` called the newest release unknown. That's a different path from the one a user takes, in the one test that's meant to look like a user. So `relish image download`, `relish os list` and `relish os upgrade` grew a `--key <PEM>` option: check the channel against this public key instead of the release keys. The run already puts the key's public half beside the channel, so the lab passes `--key next/lab-signing-key.pub.pem` and then runs exactly what a user runs.
+
+How do you add a "trust this other key" switch without building a back door? We settled on four rules. The default doesn't move: no `--key`, release keys. `--key` replaces the release keys rather than adding to them, so a lab command reads only its own build's channel and can't quietly accept something else. relish says so out loud: a warning on stderr every time, and the line that reports the check names the key file instead of saying "the release key". And it stays on the operator's laptop. It changes what one relish command believes, for one run, and nothing else: no config file, no API, no Raft entry.
+
+That last rule matters because of the nodes. They never read the channel. The leader passes the version and the channel's URL, and each node fetches that version's `SHA256SUMS` from beside the channel and checks it against the release keys plus the key its own image carries (`os::slot`). A lab image carries its run's throwaway key in `/usr`, under dm-verity like the rest of `/usr`, so the trust root for a lab fleet is fixed when the image is built. We could have let `relish os upgrade --key` send the key to the nodes too. That's a remote way to swap a running cluster's trust root, which is the one thing an attacker with an operator's credentials would most like to have. So it doesn't.
+
+All three commands share one small type in `src/relish/image.rs`:
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ChannelTrust {
+    keys: Vec<PublicKey>,
+    /// The `--key` file, when there is one.
+    operator_key: Option<PathBuf>,
+}
+```
+
+`ChannelTrust::from_key_file(None)` gives the release keys, and `from_key_file(Some(path))` reads and parses one Ed25519 PEM key. The fields are private, so nothing outside the module can push a key in some other way. `verify` wraps `OsChannel::verified` and makes its errors say which key failed. Without `--key`, a failed check adds a pointer to `--key`, since a lab channel is by far the likeliest reason. With it, the error names the file. Rust's `match` on a tuple, `(&error, &self.operator_key)`, picks the message for each pair of cases, and the compiler makes sure no pair is left out.
+
+`relish os upgrade` takes `--key` only when it reads the channel, which is when you don't name a version. clap's `conflicts_with = "version"` turns the other case into an argument error, so a key that would silently do nothing is refused instead. The tests in `src/relish/image.rs` check the lab channel from `os_release.py` against each kind of trust: refused by the release keys with a pointer to `--key`, accepted with its run's key, refused with any other key, and the release keys gone once `--key` is given. CI's OS update test now runs `relish os list --key` and expects the next version to be the newest, then `relish os upgrade --key` without naming it. A test in `src/os/channel.rs` still pins down the channel itself: it passes every rule a published channel does with its run's key, and fails the signature check against the release keys.
 
 ### Keeping /etc in step
 
@@ -661,6 +680,40 @@ A freshly installed appliance knows nothing. It has bun, an empty data partition
 From a *seed*: a small tarball with a `seed.toml` in it. Node 1's seed is a *create* seed, and carries the cluster's freshly made keys. Every other machine's is a *join* seed, and carries only a join token: single-use, bound to that machine's node name, and good for a week at most. `relish cluster create --bare-metal` makes all of them on the operator's laptop, so the cluster's keys are born there and nowhere else.
 
 The create seed carries one more thing: the council size. An appliance cluster grows its council to five voters rather than the usual seven (`--council-size` changes it), because the lab it was built for is ten 2 GB Wyses, and two more voters would buy one more tolerated failure at the price of two more machines doing council work. Node 1 commits the size to the council when it bootstraps, so every later leader reads the same number. Chapter 2's "Five voters, not seven" has the reconciler's side.
+
+### Waiting for the backup
+
+Born on the laptop also means the laptop holds the only copy. Lose it before node 1 boots and the cluster never existed; lose it later and `relish council recover`, which needs the master key, has nothing to work with. The first version of `relish cluster create --bare-metal` printed `Back up ~/home-cluster/secrets` between a list of seeds and the relish context, where nobody reads anything. So now it stops and waits. Both commands that make a cluster's keys, `cluster create --bare-metal` and `machines claim --create`, print what to back up and why, then ask `Type yes once it's backed up:` until the answer is yes. Nothing goes out (no stick instructions, no seed over the network) before that.
+
+A prompt that waits has an obvious failure mode: a script, or CI, with no one at the keyboard. Reading stdin there either hangs or reads end-of-file straight away, depending on what's attached. Neither is a good answer, and the first is worse. So the decision is made before anything is created, from two facts:
+
+```rust
+pub fn backup_check(yes: bool, terminal: bool, secrets: &Path) -> Result<BackupCheck, RelishError> {
+    match (yes, terminal) {
+        (true, _) => Ok(BackupCheck::Remind),
+        (false, true) => Ok(BackupCheck::Ask),
+        (false, false) => Err(RelishError::BackupConfirmationRequired {
+            secrets: secrets.to_path_buf(),
+        }),
+    }
+}
+```
+
+`--yes` prints the reminder and carries on, and the CI scripts that boot appliance VMs pass it. A terminal without `--yes` gets the question. No terminal and no `--yes` is refused with an error naming `--yes`, before a single key exists, so a script that forgot the flag leaves no half-made cluster behind. `terminal` comes from `std::io::stdin().is_terminal()`, a method of the standard library's `IsTerminal` trait. In Rust a trait's methods are only callable where the trait is in scope, so the caller needs `use std::io::IsTerminal;` first, even though `Stdin` already implements it.
+
+The question itself takes its input and output as parameters rather than reaching for stdin and stdout:
+
+```rust
+pub fn confirm_backup(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    secrets: &Path,
+) -> Result<(), RelishError> {
+```
+
+`impl BufRead` in argument position means "any type that implements `BufRead`". It's a generic parameter without the angle brackets, and the compiler makes a copy of the function for each type it's called with, much as a C++ template would. The real caller passes `std::io::stdin().lock()`; the tests pass a `std::io::Cursor` over a byte string, so `"\nno\nlater\nyes\n"` checks the loop asks four times, and `""` checks that end-of-file (Ctrl-D, or a pipe that closes) refuses with `BackupNotConfirmed` rather than spinning. `read_line` returns how many bytes it read, and zero is the only way Rust's standard library says end-of-file. Go's `bufio.Reader` returns `io.EOF` as an error instead; Rust treats it as a successful read of nothing.
+
+Three black-box tests in `tests/suite/bare_metal.rs` run the real binary with stdin from `/dev/null`: `cluster create --bare-metal` without `--yes` exits 1 and leaves no directory, with `--yes` it makes the cluster and prints the reminder, and `machines claim --create` without `--yes` fails before it tries to reach the machine. That last one points at an address in TEST-NET-1, where nothing answers, so a check in the wrong place shows up as a test that fails or hangs, not one that passes.
 
 ### A state machine that can lose power
 
@@ -781,6 +834,21 @@ Then the tour, the manual's five-minute walk through Reliaburger (`relish manual
 ### The virtual Wyse
 
 The Wyse 3040's Atom has SSE4.2 and AES-NI but no AVX. The virtual Wyse is x86_64 under TCG with `-cpu Westmere`, which matches that, so any accidental AVX dependency in our binaries shows up before the hardware stage. It goes through the whole real path: OVMF's firmware PXE, the ProxyDHCP, our iPXE, the installer. It installed in 29 s, and the same QEMU process then booted the disk and reached `bun healthy` at 62 s kernel time. No AVX problems.
+
+### Taking the scaffolding down
+
+Before relish could do any of this, shell scripts did. `image/tools/` held the bare-metal preview: `netboot-server.sh` glued dnsmasq to Python's `http.server`, `seed-fleet.sh` packed seeds, `node-toml.py` wrote each node's config, and `seed-admin`, a separate little Cargo project, hashed an admin token into the security bootstrap. Its first build took eight minutes. The lab had its own copies too: `seed-node1.sh` and `seed-joiner.sh`, which enrolled each joiner by hand from the server VM.
+
+Scaffolding is useful right up to the moment it disagrees with the building. Every one of those scripts now has a relish command that does the job and is tested in CI: `relish netboot` serves, `relish cluster create --bare-metal` and `relish image seed` write seeds, and `relish machines claim` sends them over the network. Two ways of doing the same thing would drift, and people would follow whichever one they found first. So the scripts went. The lab now forms its cluster with `seed-lab.sh`, which is little more than a `relish cluster create --bare-metal` naming each VM's MAC and reserved address. The joiners carry join tokens and enrol by themselves on their first boot, just as a Wyse does.
+
+Three things stayed, each for a reason we could write down:
+- `make-seed-stick.sh` turns the `stick/` directory relish writes into a FAT disk image for QEMU. relish writes the seeds, not filesystems, and on a real machine you'd just copy the folder onto a stick.
+- `fleet-measure.sh` samples memory, zram, eMMC writes and temperature over SSH for the Wyse lab's 24-hour run. No relish command reads those numbers yet, so it moved into `image/lab/`, without the code that read `seed-fleet.sh`'s old fleet list.
+- `os-stage` stages an OS update by hand. bun does it for real now, but the Wyse runbook's fallback test deliberately stages a broken image underneath bun, and that needs a tool that isn't bun.
+
+One idea went without ever being built: `relish netboot --node`, a node serving the netboot for the rest of the fleet. The lab doesn't need it, and a feature nobody needs is a feature nobody tests.
+
+Deleting code is easy; keeping it deleted takes a test. `image/tests/test_retired_tools.py` walks the repository and fails if anything but the history (this book, the plans and the qualification records) still names a retired script, so a stale README line or a lab script reaching for `image/tools/` breaks the build rather than a lab day.
 
 ## What bit us
 

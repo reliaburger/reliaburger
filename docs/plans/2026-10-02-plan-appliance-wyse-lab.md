@@ -127,17 +127,17 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 | Claim | `relish machines`, then `relish machines claim ~/wyse --create --name wyse --operator 10.77.0.2 --network 10.77.0.0/24 <mac-1> <mac-2> <mac-3>`, then `relish machines claim ~/wyse <mac-4> … <mac-10>` | Real; CI covers two VMs (`image/tests/claimed-pair.sh`) |
 | Check | `relish nodes`, `relish council`, `relish wtf` | Real |
 | Tour | `relish apply …`, ingress on port 80 of each node | Real |
-| Measure | `image/tools/fleet-measure.sh ~/wyse` | Preview script; reads a claim directory, a `seed-fleet.sh` directory or `relish nodes` (PR 6) |
-| OS update | `relish os upgrade <next> --channel http://10.77.0.2:8000/…/os-channel.json` | Real; needs a next version from the same run (PR 5) |
+| Measure | `image/lab/fleet-measure.sh ~/wyse` | Lab script; reads a claim directory or `relish nodes` (PR 6) |
+| OS update | `relish os upgrade --channel http://10.77.0.2:8000/…/os-channel.json --key next/lab-signing-key.pub.pem` | Real; needs a next version from the same run (PR 5); `--key` reads the lab channel |
 
 The claim asks you to compare each machine's claim key with its monitor. With one DisplayPort monitor and ten machines, that's ten cable swaps; `--trust-lan` skips it, which is fine on an isolated switch with nothing else on it.
 
 ### What's still preview or script-only
 
 - **The images' signing.** Lab builds carry a throwaway key per run, so a node can only update to a build from the same run (`os::slot` trusts the release keys and its own image's `os-signing-key.pub.pem`).
-- **`image/tools/`**: `netboot-server.sh`, `seed-fleet.sh`, `node-toml.py`, `fleet-measure.sh` and `seed-admin`. W7 retires them; only `fleet-measure.sh` is still needed for S5, and it needs SSH, which only lab images have (`mkosi.conf.d/30-lab.conf`). `relish machines claim --ssh-key` puts the key in the seed (`ClaimOptions::ssh_key` in `src/relish/machines.rs`).
-- **The manual** (`docs/manual/15_appliance.md`) is still titled "preview" and starts from CI runs; the S5 runbook still uses `netboot-server.sh` on "a Linux machine" and `seed-fleet.sh`. Both need rewriting around `relish netboot` and `relish machines claim` (W7, PR 7 here). **Done in PR 7:** both now start from `relish netboot` on the Mac, the Pi as router and `relish machines claim`.
-- **`relish netboot --node`** (a bun node serving netboot) isn't built. The lab doesn't need it.
+- **`image/tools/`**: `netboot-server.sh`, `seed-fleet.sh`, `node-toml.py`, `fleet-measure.sh` and `seed-admin`. W7 retires them; only `fleet-measure.sh` is still needed for S5, and it needs SSH, which only lab images have (`mkosi.conf.d/30-lab.conf`). `relish machines claim --ssh-key` puts the key in the seed (`ClaimOptions::ssh_key` in `src/relish/machines.rs`). **Done (W7):** `image/tools/` is retired, and `fleet-measure.sh` lives on in `image/lab/`.
+- **The manual** (`docs/manual/15_appliance.md`) is still titled "preview" and starts from CI runs; the S5 runbook still uses `netboot-server.sh` on "a Linux machine" and `seed-fleet.sh`. Both need rewriting around `relish netboot` and `relish machines claim` (W7, PR 7 here). **Done in PR 7:** both now start from `relish netboot` on the Mac, the Pi as router and `relish machines claim`. W7 dropped the "preview" title.
+- **`relish netboot --node`** (a bun node serving netboot) isn't built, and won't be: dropped on 7 October (decision 5). The lab doesn't need it.
 
 ### Wyse risks, and what covers each
 

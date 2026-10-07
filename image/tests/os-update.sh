@@ -43,15 +43,20 @@ case "${6:-}" in
     *) echo "$usage" >&2; exit 2 ;;
 esac
 if [ "$mode" = update ]; then
-    # The lab channel names the version the node updates to. relish checks a
-    # channel against the release keys only, so `relish os list` warns about
-    # this one, and the upgrade names its version.
+    # The lab channel names the version the node updates to, signed with the
+    # run's throwaway key (lab-signing-key.pub.pem, beside it). relish reads
+    # it with --key, so `relish os list` must name it as the newest, and the
+    # upgrade takes the newest without naming it, as the Wyse lab does.
     grep -q "\"version\":\"$target\"" "$tree/releases/download/os-channel/os-channel.json" \
         || { echo "os-update.sh: the lab channel doesn't name $target" >&2; exit 1; }
 else
+    # The channel doesn't name the broken version, so the upgrade names it,
+    # and a named version takes no --key: relish reads no channel for it,
+    # and the node checks the release against its own image's key.
     [ -f "$tree/releases/download/os-$target-x86_64/reliaburger-os_$target.SHA256SUMS.sig" ] \
         || { echo "os-update.sh: no signed release for $target in $tree" >&2; exit 1; }
 fi
+key="$tree/lab-signing-key.pub.pem"
 work=$(mktemp -d)
 mac=52:54:00:42:00:31
 ip=10.42.0.31
@@ -79,7 +84,7 @@ channel="http://10.42.0.1:8000/releases/download/os-channel/os-channel.json"
 
 export RELIABURGER_HOME="$work/home"
 mkdir -p "$RELIABURGER_HOME"
-"$relish" cluster create --bare-metal "$work/cluster" --name solo --operator 10.42.0.1 "$mac@$ip"
+"$relish" cluster create --bare-metal "$work/cluster" --name solo --operator 10.42.0.1 --yes "$mac@$ip"
 
 sudo ip tuntap add rbtap0 mode tap user "$(id -un)"
 sudo ip link set rbtap0 master rbbr0 up
@@ -114,7 +119,8 @@ at_least() { [ "$(seen "$1")" -ge "$2" ]; }
 healthy="reliaburger: bun healthy .* on OS"
 # Unanchored: the serial console ends its lines with \r\n.
 healthy_on() { at_least "$healthy $1" "${2:-1}"; }
-on_next() { "$relish" os list --channel "$channel" 2>/dev/null | grep -q "solo-1 *$target"; }
+on_next() { "$relish" os list --channel "$channel" --key "$key" 2>/dev/null | grep -q "solo-1 *$target"; }
+newest_is_next() { "$relish" os list --channel "$channel" --key "$key" | grep -x "Newest OS release: $target" >/dev/null; }
 finished() { "$relish" os status 2>/dev/null | tee "$work/status.txt" | grep -q "to $target: complete"; }
 # bun on <version> reads os-update.json, finds it isn't on <target> and says
 # so; the leader (the same node) pauses the rollout on it.
@@ -125,8 +131,8 @@ paused() {
 
 if [ "$mode" = update ]; then
     if wait_for healthy_on "$version" \
-        && "$relish" os list --channel "$channel" \
-        && "$relish" os upgrade "$target" --channel "$channel" \
+        && newest_is_next \
+        && "$relish" os upgrade --channel "$channel" --key "$key" \
         && wait_for healthy_on "$target" \
         && wait_for on_next \
         && wait_for finished; then
@@ -139,7 +145,7 @@ else
     # before the update, three tries of <target>, one back on <version>.
     t_upgrade='' t_reboot='' t_back=''
     if wait_for healthy_on "$version" \
-        && "$relish" os list --channel "$channel" \
+        && "$relish" os list --channel "$channel" --key "$key" \
         && "$relish" os upgrade "$target" --channel "$channel" \
         && t_upgrade=$(date +%s) \
         && wait_for at_least "Linux version" 2 \

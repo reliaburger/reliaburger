@@ -13,8 +13,7 @@ The scripts keep their state (VM disks, logs, keys, seeds, downloaded artefacts)
 ## What you need
 
 ```sh
-brew install qemu gh zstd mtools openssl@3 rustup
-rustup default stable        # for the seed-admin helper (image/tools/seed-admin)
+brew install qemu gh zstd mtools
 gh auth login
 ```
 
@@ -74,41 +73,43 @@ Each node gets a blank 10 GB disk and 2 GiB. It starts iPXE, takes its reserved 
 
 ## 4. Form the cluster
 
-Use the release that the image's bun came from; the run's step summary names it.
+Use the release that the image's bun came from; the run's step summary names it. The lab seeds its nodes the way the manual seeds real machines, with `relish cluster create --bare-metal`:
 
 ```sh
 ./fetch-relish.sh <release-tag>          # relish for the Mac (work/relish) and the server
-work/relish init --cluster-name lab --node-id node-01 work/cluster/init
-./seed-node1.sh 5                        # node 1's seed, with a pre-seeded admin token
-./rbnode.sh 1 run                        # boots with its seed as an SMBIOS credential
-for n in 2 3 4 5; do ./seed-joiner.sh $n 5; done   # needs node 1 up
-for n in 2 3 4 5; do ./rbnode.sh $n run; done
+./seed-lab.sh 5                          # the cluster, and a seed per node in work/cluster/stick/seeds
+for n in 1 2 3 4 5; do ./rbnode.sh $n run; done
 ./ssh.sh '. ~/lab/env.sh; relish nodes; relish council'
 ```
 
-A seed is a tarball of `node.toml`, the master key and the node's identity, and node 1's also carries the security bootstrap. It reaches the node as the `reliaburger.seed` systemd credential, and `reliaburger-seed.service` unpacks it into `/etc/reliaburger` once.
+`seed-lab.sh` runs `relish cluster create --bare-metal` on the Mac, naming each node's reserved MAC and address, with `--yes` to skip the master-key backup prompt (the lab's cluster is disposable). The cluster's PKI is made there. Node 1's seed carries the cluster's keys, and every other seed a single-use join token, so the joiners enrol with node 1 on their first boot. The cluster's directory is `work/cluster`, and its `secrets/` hold the master key and the admin token. The script then puts the admin token, the root CA and an `env.sh` on the server, because relish runs there: the server is on the nodes' network and in their `operator_cidrs`, and the Mac isn't. `OPERATOR_KEY="ed25519:…"` passes the key cluster bun upgrades need.
 
-Joiners enrol from the server: `relish join-token create`, then `relish join` pinned to the root CA's fingerprint. That's the manual path from `docs/linux-servers.md`, with the server standing in for the operator's laptop.
-
-`rbnode.sh run` also passes the lab's SSH key as the `ssh.authorized_keys.root` credential, the only thing that starts sshd on the appliance. So `ssh -F work/ssh_config root@192.168.105.101` works.
+`rbnode.sh run` passes a node its seed (`work/cluster/stick/seeds/<mac>.seed`) as the `reliaburger.seed` systemd credential, and bun's `appliance prepare` takes it from there. It also passes the lab's SSH key as the `ssh.authorized_keys.root` credential, the only thing that starts sshd on the appliance. So `ssh -F work/ssh_config root@192.168.105.101` works.
 
 ### Or seed from a USB stick, as on real machines
 
-The manual's bare-metal chapter (`docs/manual/15_appliance.md`) seeds real
-machines from a stick labelled `RBSEED`. To try that path here, make seeds
-with `image/tools/seed-fleet.sh` (it runs on the Mac for `init`, and on the
-server for `join`, since only the server reaches the nodes), build a stick
-image, and plug it in with `STICK=`:
+The manual's bare-metal chapter (`docs/manual/15_appliance.md`) carries seeds to real machines on a stick labelled `RBSEED`. To try that path here, turn the cluster's `stick` directory into a FAT image and plug it in with `STICK=`:
 
 ```sh
-./make-seed-stick.sh work/stick.img 52:54:00:00:01:06=<fleet>/stick/seeds/52-54-00-00-01-06.seed
-STICK=work/stick.img ./rbnode.sh 6 run
+./make-seed-stick.sh work/stick.img work/cluster/stick
+STICK=work/stick.img ./rbnode.sh 1 run
 ```
 
-The node's console then says `seed installed from the RBSEED stick`.
-`image/tools/netboot-server.sh` also runs on the server, inside the `nb`
-namespace, in place of the lab's own ProxyDHCP and HTTP services
-(`sudo systemctl stop l2lab-proxy l2lab-http` first).
+The node's console then says `seed installed from the RBSEED stick`. To add machines to the running cluster, `relish image seed` writes more seeds into the same directory.
+
+### Or serve the netboot with relish
+
+`relish netboot` can run on the server too, inside the `nb` namespace, in place of the lab's own ProxyDHCP and HTTP services (`sudo systemctl stop l2lab-proxy l2lab-http` first). The manual describes it; CI installs through it on every lab build (`image/tests/relish-netboot-install.sh`).
+
+### Measuring the fleet
+
+`fleet-measure.sh` samples every node over SSH into one CSV per node, for the Wyse lab's 24-hour run: memory, zram, bun's RSS, bytes written to the system disk, disk use, load and temperature. `fleet-nodes.py` tells it which nodes there are, from a cluster directory's `fleet.json` or from `relish nodes --output json` (`--relish`):
+
+```sh
+./fleet-measure.sh ~/wyse 300 288          # every 5 minutes for 24 hours
+```
+
+It needs root SSH on the nodes, so it only works on lab images, whose seeds carry a key (`--ssh-key`). No relish command samples these numbers yet, which is why the script stays.
 
 ## 5. The tour
 

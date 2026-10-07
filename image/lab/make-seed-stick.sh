@@ -1,17 +1,19 @@
 #!/bin/bash
-# make-seed-stick.sh <image> <mac>=<seed.tgz>...: a FAT image labelled RBSEED
-# holding seeds/<mac>.seed for each machine, the layout reliaburger-seed
-# reads from a real USB stick. rbnode.sh and wyse.sh plug it in with
-# STICK=<image>. On a real stick, copy the same seeds/ folder onto a FAT
-# filesystem labelled RBSEED instead.
+# make-seed-stick.sh <image> <stick dir>: a FAT image labelled RBSEED holding
+# the seeds/ folder of <stick dir>, which `relish cluster create --bare-metal`
+# and `relish image seed` write as <cluster dir>/stick. That's the layout bun
+# reads from a real USB stick; rbnode.sh and wyse.sh plug the image in with
+# STICK=<image>. On real machines you copy the same seeds/ folder onto a FAT
+# stick labelled RBSEED. relish writes the seeds but no filesystem image, so
+# QEMU still needs this.
 set -euo pipefail
-out=${1:?usage: make-seed-stick.sh <image> <mac>=<seed.tgz>...}; shift
-[ $# -ge 1 ] || { echo "name at least one <mac>=<seed.tgz>" >&2; exit 2; }
+usage="usage: make-seed-stick.sh <image> <stick dir>"
+out=${1:?$usage}
+stick=${2:?$usage}
+seeds=("$stick"/seeds/*.seed)
+[ -f "${seeds[0]}" ] || { echo "$stick/seeds holds no seeds" >&2; exit 2; }
 qemu-img create -q -f raw "$out" 64M
 mformat -i "$out" -v RBSEED -F ::
 mmd -i "$out" ::/seeds
-for pair in "$@"; do
-    mac=${pair%%=*} seed=${pair#*=}
-    mcopy -i "$out" "$seed" "::/seeds/$(echo "$mac" | tr 'A-F:' 'a-f-').seed"
-done
+mcopy -i "$out" "${seeds[@]}" ::/seeds/
 mdir -i "$out" ::/seeds
