@@ -5305,6 +5305,7 @@ dependencies = [
  "mime_guess",
  "nix 0.29.0",
  "nucleo-matcher",
+ "object 0.36.7",
  "object_store 0.14.1",
  "oci-distribution",
  "openraft",

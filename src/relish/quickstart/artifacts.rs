@@ -325,11 +325,14 @@ mod tests {
         for arch in ["aarch64", "x86_64"] {
             let image = guest_image(arch).unwrap();
             let source = &image.source;
+            // Ubuntu 26.04, the release the appliance image is built on.
             assert!(
                 source
                     .url
-                    .starts_with("https://cloud-images.ubuntu.com/releases/")
+                    .starts_with("https://cloud-images.ubuntu.com/releases/resolute/release-")
             );
+            assert!(source.file.starts_with("ubuntu-26.04-"));
+            assert!(image.asset.starts_with("reliaburger-guest-ubuntu-26.04-"));
             assert!(!source.url.contains("current"));
             assert_eq!(source.sha256.len(), 64);
             assert!(source.file.ends_with(&format!("{arch}.img")));
