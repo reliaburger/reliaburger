@@ -18,7 +18,9 @@ if [ "${2:-}" = fresh ]; then rm -f "wyse$n.qcow2" "wyse$n-vars.fd"; fi
 slot=$(cat slot.next 2>/dev/null || echo 1); echo $((slot + 1)) > slot.next
 [ "$slot" -le "$SLOTS" ] || { echo "out of hub slots ($SLOTS); restart the server" >&2; exit 2; }
 creds=(-smbios "type=11,value=io.systemd.credential:ssh.authorized_keys.root=$(cat l2lab_key.pub)")
-seed="$WORK/cluster/seeds/wyse-$(printf %02d "$n").tgz"
+# A seed for its MAC, if the cluster directory has one; without one it
+# boots unclaimed, for `relish machines claim`.
+seed="$WORK/cluster/stick/seeds/52-54-00-00-02-$hex.seed"
 [ -f "$seed" ] && creds+=(-smbios "type=11,value=io.systemd.credential.binary:reliaburger.seed=$(base64 < "$seed" | tr -d '\n')")
 : > "wyse$n.serial.log"
 # STICK=<image> plugs in a seed stick (make-seed-stick.sh) as USB storage.

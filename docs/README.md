@@ -594,7 +594,7 @@ For the whole walkthrough on three Linux VMs or bare-metal servers you
 already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
 To turn spare mini PCs or thin clients into appliance nodes over the network
-instead, with no distro to install, see the preview in
+instead, with no distro to install, see
 [Bare metal: the appliance and netboot](manual/15_appliance.md).
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
