@@ -604,6 +604,23 @@ openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \
   -sigfile next/releases/download/os-channel/os-channel.json.sig
 ```
 
+`next/` also holds a broken version, two build numbers on (`2026.41.9`),
+whose bun never starts. The channel doesn't name it. It's there to test the
+fallback: a node updated to it fails its boot checks three times, then comes
+back on the version it ran before, by itself. CI rolls it out on every x86_64
+build and records how long that took. To try it on one machine, stage it
+there with the image's `os-stage` and reboot:
+
+```sh
+ssh root@<node> /usr/lib/reliaburger/os-stage \
+  http://192.168.1.10:8000/releases/download/os-2026.41.9-x86_64 2026.41.9
+ssh root@<node> systemctl reboot
+```
+
+`relish os upgrade 2026.41.9` works too, but the leader picks the node, and
+the rollout pauses once it falls back. Either way, it's a test: don't roll it
+across a cluster you care about.
+
 ## What's missing
 
 - **A CI build can only update to its own next version.** Each run's images

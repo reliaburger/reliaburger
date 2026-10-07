@@ -402,6 +402,34 @@ class ApplianceTests(unittest.TestCase):
         # its releases within the run.
         self.assertIn("env.PUBLISH == 'true' && 3", self.step("Upload the image"))
 
+    def test_every_x86_64_lab_build_makes_a_broken_version_signed_with_the_runs_key(self):
+        # #406: the fallback test, and the Wyse lab's, need a broken version
+        # the run's own images trust, sorting above the next version.
+        build = self.step("Build a broken version (x86-64 lab builds)")
+        self.assertIn("if: env.NEXT_VERSION != ''", build)
+        self.assertIn("+ 2 ))", build)
+        self.assertIn('--extra-tree "$GITHUB_WORKSPACE/image/tests/broken-bun"', build)
+        self.assertIn('"$RUNNER_TEMP"/broken/*.SHA256SUMS', self.step("Sign (throwaway key)"))
+        lay_out = self.step("Lay out the next version as a release")
+        self.assertIn('"$RUNNER_TEMP/broken" "$BROKEN_VERSION"', lay_out)
+
+    def test_both_kinds_of_broken_build_break_bun_the_same_way(self):
+        self.assertIn("image/tests/broken-bun/", self.step("Break bun on purpose (spike S4)"))
+        conf = (REPO / "image/tests/broken-bun/usr/lib/systemd/system"
+                / "reliaburger.service.d/50-broken.conf").read_text()
+        self.assertIn("ExecStart=\nExecStart=/bin/false", conf)
+
+    def test_the_fallback_test_runs_on_every_x86_64_lab_build(self):
+        # Every pull request run, so the release train and its gate run it.
+        fallback = self.step("OS fallback (x86-64, KVM)")
+        condition = fallback.split("if:", 1)[1].split("\n", 1)[0]
+        self.assertIn("env.BROKEN_VERSION != ''", condition)
+        self.assertNotIn("event_name", condition)
+        self.assertIn('"$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback', fallback)
+        self.assertIn("timeout-minutes:", fallback)
+        branches = re.search(r"pull_request:\n(?:\s+#.*\n)*\s+branches: (\[.*\])", self.text)
+        self.assertIn('"release-*"', branches.group(1))
+
     def test_the_boot_test_uses_the_wyse_sized_disk(self):
         boot = self.step("Boot test")
         self.assertIn(". image/tests/disk.sh", boot)

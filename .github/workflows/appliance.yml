@@ -6,7 +6,9 @@ name: Appliance image
 # Pull requests build the `lab` profile, boot-test it and sign it with a
 # throwaway key, for the QEMU lab. On x86-64 they also build a next version
 # and a lab os-channel.json naming it, signed with the same key, so the OS
-# update runs end to end in CI and in the Wyse lab. A dispatched lab build's
+# update runs end to end in CI and in the Wyse lab; and a broken version
+# whose bun never starts, so CI proves a bad update falls back by itself
+# and times it, and the Wyse lab can stage the same. A dispatched lab build's
 # artefacts are kept a week, for the lab; a pull request's for a day. Every
 # QEMU test uses a 7.25 GiB disk, a Wyse 3040's eMMC (image/tests/disk.sh).
 # A dispatch on main with `publish` builds the production image with the
@@ -219,17 +221,14 @@ jobs:
 
       - name: Break bun on purpose (spike S4)
         # workflow_dispatch's broken_bun, or a commit adding image/spike-broken-bun
-        # (dispatch needs the workflow on main).
+        # (dispatch needs the workflow on main): the whole build is broken,
+        # for the Mac lab's arm64 fallback. x86-64 lab builds make a broken
+        # version of their own anyway (below).
         if: (inputs.broken_bun || hashFiles('image/spike-broken-bun') != '') && env.PUBLISH != 'true'
         run: |
           set -euo pipefail
-          install -D -m 0644 /dev/stdin image/bin-tree/usr/lib/systemd/system/reliaburger.service.d/50-spike-broken.conf <<'CONF'
-          # Spike S4: this build's bun never starts, so its boot check fails and
-          # systemd-boot has to fall back to the previous version.
-          [Service]
-          ExecStart=
-          ExecStart=/bin/false
-          CONF
+          mkdir -p image/bin-tree
+          cp -R image/tests/broken-bun/. image/bin-tree/
           echo "### Broken on purpose: bun won't start in this image" >> "$GITHUB_STEP_SUMMARY"
           # Its boot tests would fail by design; skip them so it still uploads.
           echo "BROKEN_BUN=1" >> "$GITHUB_ENV"
@@ -278,6 +277,24 @@ jobs:
             --extra-tree "$GITHUB_WORKSPACE/image/bin-tree" \
             --output-dir "$RUNNER_TEMP/next" build
           ls -l "$RUNNER_TEMP/next"
+
+      - name: Build a broken version (x86-64 lab builds)
+        # A third build, two versions on, whose bun never starts
+        # (image/tests/broken-bun), for the fallback test. Signed with the
+        # run's key like the next version and uploaded beside it, so the Wyse
+        # lab stages it from the same run (S5 runbook, step 7). Two on, not
+        # one, so it also sorts above the next version once a node has it.
+        if: env.NEXT_VERSION != ''
+        run: |
+          set -euo pipefail
+          broken="${IMAGE_VERSION%.*}.$(( ${IMAGE_VERSION##*.} + 2 ))"
+          echo "BROKEN_VERSION=$broken" >> "$GITHUB_ENV"
+          mkosi -C image --image-version "$broken" --profile lab \
+            --extra-tree "$GITHUB_WORKSPACE/image/bin-tree" \
+            --extra-tree "$GITHUB_WORKSPACE/image/tests/broken-bun" \
+            --output-dir "$RUNNER_TEMP/broken" build
+          ls -l "$RUNNER_TEMP/broken"
+          echo "### Broken version for the fallback test: $broken" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record sizes
         run: |
@@ -341,7 +358,7 @@ jobs:
           set -euo pipefail
           cd image/mkosi.output
           cp "$RUNNER_TEMP/spike.pub.pem" spike-signing-key.pub.pem
-          for sums in *.SHA256SUMS "$RUNNER_TEMP"/next/*.SHA256SUMS; do
+          for sums in *.SHA256SUMS "$RUNNER_TEMP"/next/*.SHA256SUMS "$RUNNER_TEMP"/broken/*.SHA256SUMS; do
             [ -f "$sums" ] || continue
             openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
             openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
@@ -362,9 +379,12 @@ jobs:
 
       - name: Lay out the next version as a release
         # As GitHub would: the next version's release beside the lab channel,
-        # for the OS update test and for appliance-x86_64-next.
+        # and the broken version's beside it, for the OS update and fallback
+        # tests and for appliance-x86_64-next.
         if: env.NEXT_VERSION != ''
-        run: image/tests/lab-release.sh "$RUNNER_TEMP/next" "$NEXT_VERSION" "$RUNNER_TEMP/lab-release"
+        run: |
+          image/tests/lab-release.sh "$RUNNER_TEMP/next" "$NEXT_VERSION" "$RUNNER_TEMP/lab-release" \
+            "$RUNNER_TEMP/broken" "$BROKEN_VERSION"
 
       - name: Boot test
         if: env.BROKEN_BUN != '1'
@@ -478,6 +498,18 @@ jobs:
           image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
             "$RUNNER_TEMP/lab-release" "$NEXT_VERSION" source-bin/relish-linux-x86_64
 
+      - name: OS fallback (x86-64, KVM)
+        # bun rolls the broken version onto a one-node cluster: three counted
+        # boots fail their boot checks, systemd-boot falls back on its own,
+        # and bun reports it, which pauses the rollout. The summary records
+        # how long the fallback took (#406; the Wyse exit test needs 10 min).
+        if: env.BROKEN_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
+            "$RUNNER_TEMP/lab-release" "$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback
+
       - name: Upload the image
         uses: actions/upload-artifact@v4
         with:
@@ -503,6 +535,7 @@ jobs:
         # Ready to serve: `gh run download <run> -n appliance-x86_64-next -D
         # next`, then any web server on next/, and `relish os upgrade <next
         # version> --channel http://<server>/releases/download/os-channel/os-channel.json`.
+        # The broken version's release sits beside it, for os-stage.
         if: env.NEXT_VERSION != ''
         uses: actions/upload-artifact@v4
         with:

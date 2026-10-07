@@ -230,7 +230,7 @@ The maintainer scoped the 0.3.0 milestone to the OS, netboot and appliance work 
 5. **Dropped:** `relish netboot --node`; the Raft `os.target_version` pin; the daily channel discovery on the leader.
 6. **Out of scope:** the QR code on tty1 and `relish machines claim --all`.
 7. **`os-stage` stays**, for the runbook's hand-staged fallback test.
-8. **In scope:** a CI fallback test with a broken image, so the fallback isn't only proven by hand.
+8. **In scope:** a CI fallback test with a broken image, so the fallback isn't only proven by hand. (Built for #406: every x86-64 lab build makes a broken version with its own key, and `image/tests/os-update.sh --fallback` rolls it out and times the fallback.)
 9. **The master-key backup becomes a real prompt** in `relish cluster create --bare-metal` and `relish machines claim --create`, with `--yes` to skip it in scripts.
 10. **The Ubuntu 26.04 quickstart guest stays in 0.3.0.**
 11. **The lab's Mac** is a maintainer's M1 or M2 MacBook Pro.

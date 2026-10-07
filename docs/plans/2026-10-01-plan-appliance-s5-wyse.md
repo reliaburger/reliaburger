@@ -42,7 +42,7 @@ Do the lab runs first. Each step below gives both where they differ.
   - Internet Sharing off, and no VM with shared or host networking running: either may hold UDP 67. `sudo lsof -nP -iUDP:67` should print nothing.
   - An SSH key for the lab runs: `~/.ssh/id_ed25519.pub`.
 - **A lab build** (lab runs only): 2026.40.46 or later, from a green run of the train. Dispatching the appliance workflow needs it on `main`, so until 0.3.0 merges, take the newest green pull request run into `release-1-3-0` and download it the same day: a pull request's artefacts last one day, a dispatched run's seven. Note the run ID and the image version (`IMAGE_VERSION`, the run's summary). Every x86_64 lab build also uploads `appliance-x86_64-next`: the next version, one build number on, laid out as a GitHub release beside a lab `os-channel.json`, all signed with the run's key. Step 7 serves it.
-- **A broken build** (lab runs only), for step 7's fallback: a second run whose bun never starts. Until the workflow is on `main`, open a throwaway draft pull request into `release-1-3-0` that adds an empty `image/spike-broken-bun` (never merge it); after that, dispatch with `broken_bun` ticked. Its image version must sort above the lab build's next version, so start it at least two runs after the lab build: lab versions are `<week>.<run number>`, and a run numbered exactly one after the lab build would carry the same version as its next.
+- **A broken version** (lab runs only), for step 7's fallback, comes with the lab build. `appliance-x86_64-next` also holds `os-<broken version>-x86_64`, two build numbers on from the lab build (`2026.41.7` → `2026.41.9`), whose bun never starts. The run signs it with its own throwaway key, the one the fleet trusts, so no second run is needed. The run's summary names it ("Broken version for the fallback test"), and its "OS fallback" step is the CI run of step 7, with the time it took. Lab builds from before 7 October have no broken version.
 - **Disk size:** CI tests on a 7.25 GiB disk (`image/tests/disk.sh`), a little under the 3040's ~7.3 GiB eMMC, so the data partition the tests see is the one the Wyses get.
 - A DisplayPort monitor and a USB keyboard: the 3040 has no serial port, and its monitor is where the installer's progress and the claim key show.
 
@@ -161,19 +161,19 @@ relish os status
 
 Name the version: relish checks a channel against the release keys only, so it can't read the lab channel (`relish os list` shows the newest release as unknown). Formal run: `relish os list`, then `relish os upgrade` with no version, if a release newer than the installed one exists by then. The leader takes one node at a time, workers first and itself last.
 
-**The fallback** (lab run only). The broken build can't go through `relish os upgrade`. It comes from another run, signed with that run's throwaway key, and the fleet trusts only its own run's key; that run makes no next version and no lab channel either. So stage it by hand on one worker, with the image's `os-stage`, which takes the key to check against. Pick a worker that isn't in the council (`relish council`), say wyse-9:
+**The fallback** (lab run only). The broken version sits in `next/` beside the next one, signed with the same key, so the server from the update serves it too. Stage it by hand on one worker that isn't in the council (`relish council`), say wyse-9, with the image's `os-stage`. It checks the signature against the key the node's own image carries, which is this run's, so it needs no key argument:
 
 ```sh
-gh run download <broken run> -R reliaburger/reliaburger -n appliance-x86_64 -D broken
-(cd broken && python3 -m http.server 8001)
-scp broken/spike-signing-key.pub.pem root@10.77.0.19:/run/broken.pem
-ssh root@10.77.0.19 /usr/lib/reliaburger/os-stage http://10.77.0.2:8001 <broken version> /run/broken.pem
+ssh root@10.77.0.19 /usr/lib/reliaburger/os-stage \
+  http://10.77.0.2:8000/releases/download/os-<broken version>-x86_64 <broken version>
 ssh root@10.77.0.19 systemctl reboot
 ```
 
-Then leave it. Each of the three tries waits for bun before the boot check reboots it, and after the third systemd-boot falls back to the version it ran before.
+Then leave it. Each of the three tries waits for bun before the boot check reboots it, and after the third systemd-boot falls back to the version it ran before. (`relish os upgrade <broken version>` works too, and it's how CI does it, but then the leader picks the node rather than you, and the rollout pauses once that node falls back; `relish os abort` ends it.)
 
-**Record:** the time per node from reboot to blessed; that the cluster stayed quorate; for the broken one, the time to fall back on its own (about 16 minutes in VMs with three 300 s checks; a counted boot now waits 120 s; the go/no-go needs 10 minutes or less) and whether the Wyse firmware kept counting tries.
+Until 7 October this step needed a second CI run built with `broken_bun`. That run signed with its own throwaway key, which the fleet doesn't trust, so `relish os upgrade` couldn't reach it and `os-stage` had to be handed the other run's `spike-signing-key.pub.pem`. And a run numbered one after the lab build carried the same version as the lab build's next. The broken version now comes from the lab build's own run, which removes all three traps. `broken_bun` stays for the Mac lab's arm64 builds (`image/lab/README.md`).
+
+**Record:** the time per node from reboot to blessed; that the cluster stayed quorate; for the broken one, the time to fall back on its own, from the reboot to bun healthy on the old version (about 16 minutes in VMs with three 300 s checks; with the 120 s check a counted boot now gets, CI's KVM VM measures it on every lab build, in the "OS fallback" summary; the go/no-go needs 10 minutes or less on the Wyse) and whether the Wyse firmware kept counting tries.
 
 ## 8. Write it up (S6)
 
