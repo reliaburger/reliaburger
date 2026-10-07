@@ -472,19 +472,31 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
     eprintln!("common cluster: UTC cron admitted run {id}; moving leadership");
     // Trigger a real election while keeping all workers and quorum alive.
     // Removing a voter is not a handover: the self-healing council may restore it.
-    nodes[follower]
-        .council
-        .raft()
-        .trigger()
-        .elect()
-        .await
-        .unwrap();
+    // One election doesn't always move leadership: voters refuse a candidate
+    // while the leader's lease holds, or while their log is ahead of the
+    // candidate's, and the old leader can win the election that follows its
+    // step-down. So ask again every two seconds until another node leads.
+    let mut last_election: Option<tokio::time::Instant> = None;
     wait_until(
         "replacement cron leader",
         Duration::from_secs(30),
         async || {
-            nodes[follower].council.is_leader().await
+            if nodes[follower].council.is_leader().await
                 || nodes[(leader + 2) % 3].council.is_leader().await
+            {
+                return true;
+            }
+            if last_election.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+                nodes[follower]
+                    .council
+                    .raft()
+                    .trigger()
+                    .elect()
+                    .await
+                    .unwrap();
+                last_election = Some(tokio::time::Instant::now());
+            }
+            false
         },
     )
     .await;
