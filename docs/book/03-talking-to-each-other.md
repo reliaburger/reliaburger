@@ -1005,6 +1005,22 @@ We spent two days trying to do DNS in-kernel with `cgroup/sendmsg4` and `cgroup/
 
 50 microseconds in userspace beats two weeks fighting kernel limitations. Pragmatism over purity.
 
+### Pin the instruction set, not just the source
+
+When the quickstart guest moved to Ubuntu 26.04 (Chapter 9), we built `bun` inside a 26.04 VM to try it, and every node crash-looped at start-up. The verifier on 26.04's kernel 7.0 refused `onion_connect`:
+
+```text
+231: (9c) w5 %= w3        ; R5=scalar()
+232: (26) if w5 > 0x1f goto pc+12
+...
+236: (0f) r0 += r4
+math between map_value pointer and register with unbounded min value is not allowed
+```
+
+That's the backend pick, `idx = (rr + i) % val->count` followed by `if (idx < MAX_BACKENDS ...)`. The `w` registers are the giveaway. They're the 32-bit halves of the `r` registers, and they only appear in BPF v3, which newer clang targets by default. Our release builds run on Ubuntu 22.04, whose clang 14 targets v1 and does all of that arithmetic in 64 bits. The VM had clang 21. After the 32-bit modulo the verifier knew nothing about `w5`. The bounds check then limited only its lower 32 bits, and the 64-bit copy that indexes the array was still unbounded as far as the verifier could tell. The released `bun` 0.1.6, built with clang 14, loaded on the same kernel without complaint.
+
+So the source hadn't changed and the kernel would take the program. What changed was the compiler's idea of which instructions to use. `build.rs` now passes `-mcpu=v1`, so every clang emits what the release builds always did. A test in `tests/ebpf.rs` opens each `.bpf.o` with the `object` crate and fails on any 32-bit ALU or jump instruction, the low three bits of each 8-byte opcode, so a toolchain upgrade can't quietly bring them back. It runs with `make test-linux`, beside the tests that load the programs into the kernel.
+
 ### AtomicU64 for round-robin
 
 The routing table's round-robin counter uses `AtomicU64` with `Ordering::Relaxed`. If you're coming from Go, think `atomic.AddUint64` with no memory barrier. If you're coming from C, think `__atomic_fetch_add` with `__ATOMIC_RELAXED`.

@@ -101,6 +101,11 @@ dhcproto = "0.15"
 aya = { version = "0.13", optional = true }
 aya-log = { version = "0.2", optional = true }
 
+# tests/ebpf.rs reads the compiled eBPF objects' instructions. aya already
+# depends on this version.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+object = { version = "0.36", default-features = false, features = ["read_core", "elf"] }
+
 [features]
 default = ["kubernetes"]
 kubernetes = ["dep:k8s-openapi"]

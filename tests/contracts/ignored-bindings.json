@@ -319,6 +319,12 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "onion_objects_use_only_the_original_bpf_instruction_set",
+    "binary": "reliaburger::ebpf",
+    "test": "onion_objects_use_only_the_original_bpf_instruction_set"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "embedded_program_loads_without_an_object_directory",
     "binary": "reliaburger::ebpf",
     "test": "embedded_program_loads_without_an_object_directory"
