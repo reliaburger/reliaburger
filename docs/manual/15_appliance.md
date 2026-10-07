@@ -597,20 +597,36 @@ gh run download <run-id> -n appliance-x86_64-next -D next
 (cd next && python3 -m http.server 8000)
 ```
 
-Then name the version when you roll it out:
+The lab channel is signed with the run's throwaway key, not the release key,
+so relish refuses it unless you give it that key with `--key`. The run puts
+the public half beside the channel, as `next/lab-signing-key.pub.pem`:
 
 ```sh
-relish os upgrade 2026.41.8 \
-  --channel http://192.168.1.10:8000/releases/download/os-channel/os-channel.json
+channel=http://192.168.1.10:8000/releases/download/os-channel/os-channel.json
+relish os list --channel "$channel" --key next/lab-signing-key.pub.pem
+relish os upgrade --channel "$channel" --key next/lab-signing-key.pub.pem
 relish os status
 ```
 
-The nodes fetch the release from beside that channel and check it against
-the key their own image carries. relish itself trusts only the release key,
-so `relish os list --channel …` warns that it can't read this channel and
-shows the newest release as unknown, and `relish os upgrade` without a
-version refuses it. To check the channel by hand, it's signed like a
-published one:
+`relish os list` then shows the next version as the newest release, and
+`relish os upgrade` rolls it out. The nodes fetch the release from beside
+that channel and check it against the key their own image carries, which for
+a CI build is the same run's key.
+
+`--key` replaces the release keys rather than adding to them, and only for
+that one command: relish says so on stderr each time, and names the key file
+in the line that reports the check. It's never stored, and nothing on the
+nodes changes. Without it, relish checks a channel against the release keys
+it carries and nothing else, and refuses a lab channel with a pointer to
+`--key`. `relish image download` takes the same option. `relish os upgrade`
+refuses `--key` with a version you name, because it doesn't read the channel
+then:
+
+```sh
+relish os upgrade 2026.41.8 --channel "$channel"
+```
+
+To check the channel by hand, it's signed like a published one:
 
 ```sh
 openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \

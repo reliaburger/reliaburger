@@ -982,6 +982,11 @@ enum ImageAction {
         /// Channel to read instead of the published one.
         #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
         channel: String,
+        /// Check the channel against this Ed25519 public key (PEM) instead
+        /// of the release keys, such as a CI lab build's
+        /// lab-signing-key.pub.pem.
+        #[arg(long, value_name = "PEM")]
+        key: Option<PathBuf>,
     },
     /// Write a disk image (.raw or .raw.zst) onto a device, erasing it.
     Write {
@@ -1014,6 +1019,11 @@ enum OsAction {
         /// Channel to read instead of the published one.
         #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
         channel: String,
+        /// Check the channel against this Ed25519 public key (PEM) instead
+        /// of the release keys, such as a CI lab build's
+        /// lab-signing-key.pub.pem.
+        #[arg(long, value_name = "PEM")]
+        key: Option<PathBuf>,
     },
     /// Roll an OS version across the cluster, one node at a time: workers,
     /// then the council, the leader last. Each node's workloads move off
@@ -1024,6 +1034,11 @@ enum OsAction {
         /// Channel the nodes read the release from.
         #[arg(long, default_value = reliaburger::relish::image::CHANNEL_URL)]
         channel: String,
+        /// Read the newest version from a channel signed with this Ed25519
+        /// public key (PEM) instead of the release keys. Nodes still check
+        /// the release against the key their own image carries.
+        #[arg(long, value_name = "PEM", conflicts_with = "version")]
+        key: Option<PathBuf>,
         /// Allow a version older than what nodes run.
         #[arg(long)]
         allow_downgrade: bool,
@@ -2438,7 +2453,13 @@ async fn main() -> ExitCode {
                 dir,
                 all,
                 channel,
-            } => reliaburger::relish::image::download(&channel, &arches, &dir, all).await,
+                key,
+            } => match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
+                Err(error) => Err(error),
+                Ok(trust) => {
+                    reliaburger::relish::image::download(&channel, &arches, &dir, all, &trust).await
+                }
+            },
             ImageAction::Write { image, device, yes } => {
                 reliaburger::relish::image::write(&image, &device, yes).map(|bytes| {
                     println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
@@ -2525,12 +2546,24 @@ async fn main() -> ExitCode {
             .await
         }
         Command::Os { action } => match action {
-            OsAction::List { channel } => reliaburger::relish::os::list(&channel).await,
+            OsAction::List { channel, key } => {
+                match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
+                    Err(error) => Err(error),
+                    Ok(trust) => reliaburger::relish::os::list(&channel, &trust).await,
+                }
+            }
             OsAction::Upgrade {
                 version,
                 channel,
+                key,
                 allow_downgrade,
-            } => reliaburger::relish::os::upgrade(version, &channel, allow_downgrade).await,
+            } => match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
+                Err(error) => Err(error),
+                Ok(trust) => {
+                    reliaburger::relish::os::upgrade(version, &channel, &trust, allow_downgrade)
+                        .await
+                }
+            },
             OsAction::Status => reliaburger::relish::os::status().await,
             OsAction::Resume => reliaburger::relish::os::resume().await,
             OsAction::Abort => reliaburger::relish::os::abort().await,
@@ -3212,6 +3245,52 @@ mod tests {
             Cli::try_parse_from(["relish", "image", "download", "--arch", "x86_64,aarch64"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn image_download_and_os_list_take_a_lab_key_but_default_to_the_release_keys() {
+        let download = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Image {
+                action: ImageAction::Download { key, .. },
+            } => key,
+            _ => panic!("not image download"),
+        };
+        assert_eq!(download(&["relish", "image", "download"]), None);
+        assert_eq!(
+            download(&["relish", "image", "download", "--key", "lab.pem"]),
+            Some(PathBuf::from("lab.pem"))
+        );
+        let list = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Os {
+                action: OsAction::List { key, .. },
+            } => key,
+            _ => panic!("not os list"),
+        };
+        assert_eq!(list(&["relish", "os", "list"]), None);
+        assert_eq!(
+            list(&["relish", "os", "list", "--key", "lab.pem"]),
+            Some(PathBuf::from("lab.pem"))
+        );
+    }
+
+    #[test]
+    fn os_upgrade_takes_a_lab_key_only_when_it_reads_the_channel() {
+        let upgrade = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Os {
+                action: OsAction::Upgrade { version, key, .. },
+            } => (version, key),
+            _ => panic!("not os upgrade"),
+        };
+        assert_eq!(
+            upgrade(&["relish", "os", "upgrade", "--key", "lab.pem"]),
+            (None, Some(PathBuf::from("lab.pem")))
+        );
+        assert_eq!(
+            upgrade(&["relish", "os", "upgrade", "2026.41.8"]),
+            (Some("2026.41.8".to_string()), None)
+        );
+        // A named version never reads the channel, so a key would do nothing.
+        assert!(parse(&["relish", "os", "upgrade", "2026.41.8", "--key", "lab.pem"]).is_err());
     }
 
     #[test]

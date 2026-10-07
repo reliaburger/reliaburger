@@ -24,11 +24,13 @@ version=${2:?$usage}
 tree=$(cd "${3:?$usage}" && pwd)
 next=${4:?$usage}
 relish=$(readlink -f "${5:?$usage}")
-# The lab channel names the version the node updates to. relish checks a
-# channel against the release keys only, so `relish os list` warns about this
-# one, and the upgrade names its version.
+# The lab channel names the version the node updates to, signed with the
+# run's throwaway key (lab-signing-key.pub.pem, beside it). relish reads it
+# with --key, so `relish os list` must name $next as the newest, and the
+# upgrade takes the newest without naming it, as the Wyse lab does.
 grep -q "\"version\":\"$next\"" "$tree/releases/download/os-channel/os-channel.json" \
     || { echo "os-update.sh: the lab channel doesn't name $next" >&2; exit 1; }
+key="$tree/lab-signing-key.pub.pem"
 work=$(mktemp -d)
 mac=52:54:00:42:00:31
 ip=10.42.0.31
@@ -86,11 +88,12 @@ wait_for() {
     done
 }
 healthy_on() { grep -a -q "reliaburger: bun healthy .* on OS $1" "$log"; }
-on_next() { "$relish" os list --channel "$channel" 2>/dev/null | grep -q "solo-1 *$next"; }
+on_next() { "$relish" os list --channel "$channel" --key "$key" 2>/dev/null | grep -q "solo-1 *$next"; }
+newest_is_next() { "$relish" os list --channel "$channel" --key "$key" | grep -x "Newest OS release: $next" >/dev/null; }
 finished() { "$relish" os status 2>/dev/null | tee "$work/status.txt" | grep -q "to $next: complete"; }
 if wait_for healthy_on "$version" \
-    && "$relish" os list --channel "$channel" \
-    && "$relish" os upgrade "$next" --channel "$channel" \
+    && newest_is_next \
+    && "$relish" os upgrade --channel "$channel" --key "$key" \
     && wait_for healthy_on "$next" \
     && wait_for on_next \
     && wait_for finished; then
