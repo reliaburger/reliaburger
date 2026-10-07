@@ -112,7 +112,8 @@ wait_for() {
 seen() { grep -a -c -e "$1" "$log" 2>/dev/null || true; }
 at_least() { [ "$(seen "$1")" -ge "$2" ]; }
 healthy="reliaburger: bun healthy .* on OS"
-healthy_on() { at_least "$healthy $1\$" "${2:-1}"; }
+# Unanchored: the serial console ends its lines with \r\n.
+healthy_on() { at_least "$healthy $1" "${2:-1}"; }
 on_next() { "$relish" os list --channel "$channel" 2>/dev/null | grep -q "solo-1 *$target"; }
 finished() { "$relish" os status 2>/dev/null | tee "$work/status.txt" | grep -q "to $target: complete"; }
 # bun on <version> reads os-update.json, finds it isn't on <target> and says
@@ -149,7 +150,7 @@ else
         result=pass
     fi
     tries=$(seen "reliaburger: bun not healthy after [0-9]* s on OS $target")
-    on_broken=$(seen "$healthy $target\$")
+    on_broken=$(seen "$healthy $target")
     boots=$(seen "Linux version")
     # Three failed tries, never healthy on the broken version: anything
     # else isn't the fallback this test is for.
