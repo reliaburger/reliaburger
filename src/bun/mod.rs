@@ -17,17 +17,30 @@ pub mod discovery_owners;
 pub mod disk_pressure;
 mod egress_owners;
 pub mod events;
+pub mod execution_budget;
 pub mod gpu;
 pub mod health;
 pub(crate) mod jobs;
 pub mod loop_meter;
+pub mod namespace_keys;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
 mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
+pub mod task_array_api;
+pub mod task_array_leader;
+pub mod task_array_node;
+pub mod task_executor;
+pub mod task_ledger;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub mod task_namespace;
+pub mod task_rates;
+pub mod task_result_index;
+pub mod task_runtime;
 pub mod testapp;
+pub mod token_sweep;
 pub mod top;
 pub mod volume_maintenance;
 
@@ -43,6 +56,19 @@ use crate::grill::{GrillError, InstanceId};
 /// Errors from Bun agent operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BunError {
+    /// Trusted dispatch attempted to change an existing execution owner.
+    #[error("batch execution conflict: {0}")]
+    BatchConflict(String),
+    /// Predictable admission limit; existing executions remain available.
+    #[error("batch execution capacity is unavailable: {0}")]
+    BatchCapacity(String),
+
+    /// Admission could not reserve all requested resource dimensions.
+    #[error("node capacity cannot admit {requested}; available {available}")]
+    Capacity {
+        requested: crate::meat::Resources,
+        available: crate::meat::Resources,
+    },
     /// Durable job execution evidence cannot be established.
     #[error("job state is unavailable: {0}")]
     JobState(String),
@@ -153,6 +179,9 @@ pub enum BunError {
     /// Deploy was rejected (e.g. process workload binary not in allowlist).
     #[error("deploy failed for {app_name:?}: {reason}")]
     DeployFailed { app_name: String, reason: String },
+    /// The prerequisite's observed nonzero status was durably settled.
+    #[error("run_before job {app_name} exited with {code}")]
+    PrerequisiteFailed { app_name: String, code: i32 },
 
     /// A fault injection was rejected (safety rail, or unsupported on
     /// this platform / without the eBPF feature).
@@ -202,3 +231,8 @@ pub enum BunError {
 
 #[cfg(test)]
 mod job_lifecycle_tests;
+
+pub mod job_api;
+/// Common deployment admission and durable hook settlement.
+pub mod job_apply;
+mod job_store;

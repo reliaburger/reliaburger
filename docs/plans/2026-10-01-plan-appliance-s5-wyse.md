@@ -1,6 +1,8 @@
-# Plan: spike S5, the ten Dell Wyse 3040s
+# Plan: spike S5, the Dell Wyse 3040s
 
-*Written 1 October 2026, before the hardware run, and rewritten on 3 October around the 0.3.0 train (`release-1-3-0`): `relish netboot` from the Mac, the Raspberry Pi as the lab's router, and claiming over the network instead of `netboot-server.sh` and `seed-fleet.sh`. The checklist is research §9.7; the lab and the reasons behind it are the [Wyse lab plan](2026-10-02-plan-appliance-wyse-lab.md); the commands are the [manual's appliance chapter](../manual/14_appliance.md). What to record at each step is in **Record**; it all goes into `docs/qualification/<date>-wyse-3040.md`.*
+*Written 1 October 2026, before the hardware run, and rewritten on 3 October around the 0.3.0 train (`release-1-3-0`): `relish netboot` from the Mac, the Raspberry Pi as the lab's router, and claiming over the network instead of `netboot-server.sh` and `seed-fleet.sh`. The checklist is research §9.7; the lab and the reasons behind it are the [Wyse lab plan](2026-10-02-plan-appliance-wyse-lab.md); the commands are the [manual's appliance chapter](../manual/15_appliance.md). What to record at each step is in **Record**; it all goes into `docs/qualification/<date>-wyse-3040.md`.*
+
+> **7 October 2026:** the exit test now gates on **three** Wyses, run on a lab build of the train, and gates the v0.3.0 tag; the go/no-go thresholds are in the [lab plan's decisions](2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026). The steps below still work for ten, and the lab can run them all; the gate counts three. The "formal run" on a signed channel no longer comes before the tag, since the weekly publish stays off until v0.3.0 is promoted.
 
 ## The lab
 
@@ -171,10 +173,10 @@ ssh root@10.77.0.19 systemctl reboot
 
 Then leave it. Each of the three tries waits for bun before the boot check reboots it, and after the third systemd-boot falls back to the version it ran before.
 
-**Record:** the time per node from reboot to blessed; that the cluster stayed quorate; for the broken one, the time to fall back on its own (about 16 minutes in VMs with three 300 s checks; a counted boot now waits 120 s) and whether the Wyse firmware kept counting tries.
+**Record:** the time per node from reboot to blessed; that the cluster stayed quorate; for the broken one, the time to fall back on its own (about 16 minutes in VMs with three 300 s checks; a counted boot now waits 120 s; the go/no-go needs 10 minutes or less) and whether the Wyse firmware kept counting tries.
 
 ## 8. Write it up (S6)
 
-`docs/qualification/<date>-wyse-3040.md` with the numbers above, then tick S5 and S6 in the [lab plan](2026-09-28-plan-appliance-lab.md), fold the numbers into research §9, and give the go/no-go for Phase 1.
+`docs/qualification/<date>-wyse-3040.md` with the numbers above, then tick S5 and S6 in the [lab plan](2026-09-28-plan-appliance-lab.md), fold the numbers into research §9, and give the go/no-go against the [7 October thresholds](2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026): 3 of 3 claimed, power-on to a working cluster in 60 minutes or less, at least 1.0 GB `MemAvailable` per node under the workload, at least 5 years of eMMC life at the measured rate, and a fallback within 10 minutes.
 
 Stop and write down what happened if a step fails: the failure is the result.

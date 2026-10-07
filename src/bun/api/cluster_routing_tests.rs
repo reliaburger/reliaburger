@@ -11,10 +11,13 @@ use tokio_util::sync::CancellationToken;
 const SERVICE_TOKEN: &str = "cluster-routing-internal";
 
 type Injected = Arc<tokio::sync::Mutex<Vec<(FaultRequest, Option<ReplicaEvidence>)>>>;
+/// The snapshot operations one fake agent carried out, as `"create db/a"`.
+type SnapshotLog = Arc<tokio::sync::Mutex<Vec<String>>>;
 
 struct FakeNode {
     url: String,
     injected: Injected,
+    snapshots: SnapshotLog,
 }
 
 struct FakeCluster {
@@ -91,11 +94,27 @@ fn summary_of(id: u64, request: &FaultRequest) -> FaultSummary {
     }
 }
 
+/// One snapshot of `/data` called `name`, as a fake agent reports it.
+fn snapshot_meta(namespace: &str, app: &str, name: &str) -> crate::grill::snapshot::SnapshotMeta {
+    crate::grill::snapshot::SnapshotMeta {
+        schema: 1,
+        namespace: namespace.to_string(),
+        app: app.to_string(),
+        volume_path: "/data".to_string(),
+        name: name.to_string(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        size_bytes: 23,
+        exports: Vec::new(),
+    }
+}
+
 /// Answer the agent commands the routing paths use from a fixed script.
 fn spawn_fake_agent(
     name: String,
     instances: Vec<InstanceStatus>,
+    desired: Vec<crate::bun::diagnostics::DesiredAppEvidence>,
     injected: Injected,
+    snapshots: SnapshotLog,
     mut commands: mpsc::Receiver<AgentCommand>,
     stop: CancellationToken,
 ) {
@@ -111,6 +130,57 @@ fn spawn_fake_agent(
             match command {
                 AgentCommand::Status { response } => {
                     let _ = response.send(instances.clone());
+                }
+                AgentCommand::DesiredApps { response } => {
+                    let _ = response.send(desired.clone());
+                }
+                AgentCommand::SnapshotCreate {
+                    namespace,
+                    app_name,
+                    name: snapshot,
+                    response,
+                    ..
+                } => {
+                    let snapshot = snapshot.unwrap_or_default();
+                    snapshots
+                        .lock()
+                        .await
+                        .push(format!("create {app_name}/{snapshot}"));
+                    let _ =
+                        response.send(Ok(vec![snapshot_meta(&namespace, &app_name, &snapshot)]));
+                }
+                AgentCommand::SnapshotList {
+                    namespace,
+                    app_name,
+                    response,
+                } => {
+                    snapshots.lock().await.push(format!("list {app_name}"));
+                    // Each node's listing names the node, so a test can tell whose copy it read.
+                    let _ = response.send(Ok(vec![snapshot_meta(&namespace, &app_name, &name)]));
+                }
+                AgentCommand::SnapshotRestore {
+                    app_name,
+                    name: snapshot,
+                    response,
+                    ..
+                } => {
+                    snapshots
+                        .lock()
+                        .await
+                        .push(format!("restore {app_name}/{snapshot}"));
+                    let _ = response.send(Ok(()));
+                }
+                AgentCommand::SnapshotDelete {
+                    app_name,
+                    name: snapshot,
+                    response,
+                    ..
+                } => {
+                    snapshots
+                        .lock()
+                        .await
+                        .push(format!("delete {app_name}/{snapshot}"));
+                    let _ = response.send(Ok(()));
                 }
                 AgentCommand::ListFaults { response } => {
                     let faults = injected
@@ -164,6 +234,15 @@ fn spawn_fake_agent(
 /// Start one router per `(name, instances)` pair, all sharing a
 /// membership table, a service token and one operator token.
 async fn start_cluster(layout: Vec<(&str, Vec<InstanceStatus>)>) -> FakeCluster {
+    start_cluster_with_desired(layout, Vec::new()).await
+}
+
+/// [`start_cluster`] whose agents all report `desired` as the cluster's
+/// desired apps, as a council-less node answers the desired-apps read.
+async fn start_cluster_with_desired(
+    layout: Vec<(&str, Vec<InstanceStatus>)>,
+    desired: Vec<crate::bun::diagnostics::DesiredAppEvidence>,
+) -> FakeCluster {
     let created = crate::sesame::token::create_token(
         "operator",
         crate::sesame::types::ApiRole::Admin,
@@ -206,10 +285,13 @@ async fn start_cluster(layout: Vec<(&str, Vec<InstanceStatus>)>) -> FakeCluster 
     for ((name, instances), listener) in layout.into_iter().zip(listeners) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let injected: Injected = Arc::default();
+        let snapshots: SnapshotLog = Arc::default();
         spawn_fake_agent(
             name.to_string(),
             instances,
+            desired.clone(),
             Arc::clone(&injected),
+            Arc::clone(&snapshots),
             cmd_rx,
             stop.clone(),
         );
@@ -256,6 +338,7 @@ async fn start_cluster(layout: Vec<(&str, Vec<InstanceStatus>)>) -> FakeCluster 
             None,
             None,
             None,
+            None,
         )
         .layer(axum::Extension(known.clone()));
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -266,7 +349,11 @@ async fn start_cluster(layout: Vec<(&str, Vec<InstanceStatus>)>) -> FakeCluster 
                 .await
                 .ok();
         });
-        nodes.push(FakeNode { url, injected });
+        nodes.push(FakeNode {
+            url,
+            injected,
+            snapshots,
+        });
     }
     FakeCluster {
         nodes,
@@ -980,4 +1067,192 @@ async fn the_relay_keeps_the_query_string() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let listing: ClusterFaultList = serde_json::from_str(&body).unwrap();
     assert_eq!(listing.faults.len(), 1);
+}
+
+/// `default/db`, a managed-volume app whose volumes live on `homes`.
+fn volume_app(homes: &[&str]) -> crate::bun::diagnostics::DesiredAppEvidence {
+    crate::bun::diagnostics::DesiredAppEvidence {
+        app: "db".to_string(),
+        namespace: "default".to_string(),
+        desired_replicas: u32::try_from(homes.len()).unwrap(),
+        scheduled_replicas: u32::try_from(homes.len()).unwrap(),
+        placements: homes.iter().map(|home| (home.to_string(), 1)).collect(),
+        service_port: None,
+        blocked: None,
+        volume_home_away: None,
+        volume_homes: homes.iter().map(ToString::to_string).collect(),
+    }
+}
+
+/// Send one snapshot request to the node at `entry` as the operator.
+async fn snapshot_call(
+    cluster: &FakeCluster,
+    entry: usize,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, String) {
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{}{path}", cluster.nodes[entry].url))
+        .bearer_auth(&cluster.operator);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+    (status, response.text().await.unwrap())
+}
+
+/// Run create, list, restore and delete of `db` through the node at `entry`.
+async fn every_snapshot_command(cluster: &FakeCluster, entry: usize) -> Vec<(StatusCode, String)> {
+    vec![
+        snapshot_call(
+            cluster,
+            entry,
+            reqwest::Method::POST,
+            "/v1/snapshots/default/db",
+            Some(serde_json::json!({ "volume": "/data", "name": "before" })),
+        )
+        .await,
+        snapshot_call(
+            cluster,
+            entry,
+            reqwest::Method::GET,
+            "/v1/snapshots/default/db",
+            None,
+        )
+        .await,
+        snapshot_call(
+            cluster,
+            entry,
+            reqwest::Method::POST,
+            "/v1/snapshots/default/db/restore",
+            Some(serde_json::json!({ "name": "before" })),
+        )
+        .await,
+        snapshot_call(
+            cluster,
+            entry,
+            reqwest::Method::DELETE,
+            "/v1/snapshots/default/db/before",
+            None,
+        )
+        .await,
+    ]
+}
+
+async fn snapshot_log(cluster: &FakeCluster, entry: usize) -> Vec<String> {
+    cluster.nodes[entry].snapshots.lock().await.clone()
+}
+
+const EVERY_SNAPSHOT_COMMAND: [&str; 4] = [
+    "create db/before",
+    "list db",
+    "restore db/before",
+    "delete db/before",
+];
+
+/// #482: a node with a stale copy of an app's volume (or none) must not
+/// answer snapshot requests from it. Whichever node receives them, they act
+/// on the node that holds the app's volume.
+#[tokio::test]
+async fn snapshot_commands_reach_the_node_that_holds_the_apps_volume() {
+    let cluster = start_cluster_with_desired(
+        vec![("node-1", vec![]), ("node-2", vec![]), ("node-3", vec![])],
+        vec![volume_app(&["node-2"])],
+    )
+    .await;
+    for entry in [0, 2] {
+        let answers = every_snapshot_command(&cluster, entry).await;
+        let statuses: Vec<StatusCode> = answers.iter().map(|(status, _)| *status).collect();
+        assert_eq!(
+            statuses,
+            [
+                StatusCode::CREATED,
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::OK
+            ],
+            "{answers:?}"
+        );
+        let listed: Vec<crate::grill::snapshot::SnapshotMeta> =
+            serde_json::from_str(&answers[1].1).unwrap();
+        assert_eq!(listed[0].name, "node-2", "listed another node's snapshots");
+    }
+    assert!(snapshot_log(&cluster, 0).await.is_empty());
+    assert!(snapshot_log(&cluster, 2).await.is_empty());
+    let mut expected = EVERY_SNAPSHOT_COMMAND.to_vec();
+    expected.extend(EVERY_SNAPSHOT_COMMAND);
+    assert_eq!(snapshot_log(&cluster, 1).await, expected);
+}
+
+/// A replica's own node acts on its own volume: each replica of a
+/// multi-replica volume app has its own copy, and the node that holds one is
+/// the right place for it.
+#[tokio::test]
+async fn a_snapshot_request_on_one_of_the_volume_homes_stays_there() {
+    let cluster = start_cluster_with_desired(
+        vec![("node-1", vec![]), ("node-2", vec![]), ("node-3", vec![])],
+        vec![volume_app(&["node-1", "node-2"])],
+    )
+    .await;
+    for entry in [0, 1] {
+        for (status, body) in every_snapshot_command(&cluster, entry).await {
+            assert!(status.is_success(), "{status} {body}");
+        }
+        assert_eq!(snapshot_log(&cluster, entry).await, EVERY_SNAPSHOT_COMMAND);
+    }
+    assert!(snapshot_log(&cluster, 2).await.is_empty());
+}
+
+/// Away from every home of a multi-replica app there is no one right copy,
+/// so the request is refused with the nodes that hold one.
+#[tokio::test]
+async fn a_snapshot_request_away_from_several_volume_homes_names_them() {
+    let cluster = start_cluster_with_desired(
+        vec![("node-1", vec![]), ("node-2", vec![]), ("node-3", vec![])],
+        vec![volume_app(&["node-1", "node-2"])],
+    )
+    .await;
+    for (status, body) in every_snapshot_command(&cluster, 2).await {
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("node-1") && body.contains("node-2"), "{body}");
+    }
+    for entry in 0..3 {
+        assert!(snapshot_log(&cluster, entry).await.is_empty());
+    }
+}
+
+/// An app the desired state gives no volume home (a standalone node, an
+/// unknown app) is handled where the request lands, as before.
+#[tokio::test]
+async fn a_snapshot_request_for_an_app_without_a_volume_home_stays_local() {
+    let cluster =
+        start_cluster_with_desired(vec![("node-1", vec![]), ("node-2", vec![])], Vec::new()).await;
+    for (status, body) in every_snapshot_command(&cluster, 0).await {
+        assert!(status.is_success(), "{status} {body}");
+    }
+    assert_eq!(snapshot_log(&cluster, 0).await, EVERY_SNAPSHOT_COMMAND);
+    assert!(snapshot_log(&cluster, 1).await.is_empty());
+}
+
+/// A forwarded snapshot request is answered where it arrives, so two nodes
+/// that disagree about the volume's home can't pass it back and forth.
+#[tokio::test]
+async fn a_forwarded_snapshot_request_is_never_forwarded_again() {
+    let cluster = start_cluster_with_desired(
+        vec![("node-1", vec![]), ("node-2", vec![])],
+        vec![volume_app(&["node-2"])],
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/snapshots/default/db", cluster.nodes[0].url))
+        .bearer_auth(&cluster.operator)
+        .header(super::snapshots::SNAPSHOT_FORWARDED_HEADER, "1")
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(snapshot_log(&cluster, 0).await, ["list db"]);
+    assert!(snapshot_log(&cluster, 1).await.is_empty());
 }

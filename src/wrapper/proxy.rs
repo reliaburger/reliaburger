@@ -188,13 +188,17 @@ pub async fn bind_proxy_with_tls(
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
         .build()
         .map_err(|e| WrapperError::ProxyFailed(format!("failed to build http client: {e}")))?;
     let fresh_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|e| WrapperError::ProxyFailed(format!("failed to build http client: {e}")))?;
@@ -2609,6 +2613,10 @@ mod tests {
 
     /// Serve one route, `web.test`, backed by a single backend on `port`.
     async fn proxy_for_one_backend(port: u16) -> (String, CancellationToken) {
+        proxy_for_one_backend_using(port, false).await
+    }
+
+    async fn proxy_for_one_backend_using(port: u16, fresh: bool) -> (String, CancellationToken) {
         use crate::onion::types::BackendInstance;
 
         let mut service_map = crate::onion::service_map::ServiceMap::new();
@@ -2642,7 +2650,7 @@ mod tests {
         let mut table = RoutingTable::new();
         table.rebuild(&service_map, &ingress).unwrap();
         let shutdown = CancellationToken::new();
-        let bound = bind_proxy(
+        let mut bound = bind_proxy(
             WrapperConfig {
                 http_port: 0,
                 https_port: 0,
@@ -2653,6 +2661,10 @@ mod tests {
         )
         .await
         .unwrap();
+        if fresh {
+            let state = Arc::get_mut(&mut bound.state).unwrap();
+            state.client = state.fresh_client.clone();
+        }
         let url = format!("http://127.0.0.1:{}/", bound.http_addr.port());
         tokio::spawn(async move {
             bound.serve().await.ok();
@@ -2729,5 +2741,225 @@ mod tests {
             "the POST was replayed: {seen:?}"
         );
         shutdown.cancel();
+    }
+    #[tokio::test]
+    async fn backend_redirects_reach_the_client_without_following_either_upstream_client() {
+        use crate::onion::{service_id::ServiceId, types::BackendInstance};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::AtomicUsize;
+
+        let landing_requests = Arc::new(AtomicUsize::new(0));
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let counted = landing_requests.clone();
+        let app = axum::Router::new()
+            .route("/{code}", axum::routing::any(move |axum::extract::Path(code): axum::extract::Path<u16>, uri: Uri| async move {
+                let location = if uri.query() == Some("absolute") {
+                    format!("http://127.0.0.1:{backend_port}/landing")
+                } else {
+                    "/landing".to_owned()
+                };
+                Response::builder().status(code).header("location", location)
+                    .header("set-cookie", "login=nonce; Path=/")
+                    .body(Body::from("redirect body")).unwrap()
+            }))
+            .route("/landing", axum::routing::any(move || {
+                let counted = counted.clone();
+                async move { counted.fetch_add(1, Ordering::SeqCst); "followed" }
+            }));
+        let backend_task = tokio::spawn(async move { axum::serve(backend, app).await.unwrap() });
+        let mut map = crate::onion::service_map::ServiceMap::new();
+        map.register_app("web", "default", 80, None).unwrap();
+        map.add_backend(
+            &ServiceId::new("default", "web"),
+            BackendInstance {
+                instance_id: "default__web-0".into(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: backend_port,
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+        let routes = std::collections::HashMap::from([(
+            ("default".into(), "web".into()),
+            crate::config::app::IngressSpec {
+                host: "web.test".into(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        )]);
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &routes).unwrap();
+        let table = Arc::new(RwLock::new(table));
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        for fresh in [false, true] {
+            let shutdown = CancellationToken::new();
+            let mut bound = bind_proxy(
+                WrapperConfig {
+                    http_port: 0,
+                    https_port: 0,
+                    ..Default::default()
+                },
+                table.clone(),
+                shutdown.clone(),
+            )
+            .await
+            .unwrap();
+            if fresh {
+                let state = Arc::get_mut(&mut bound.state).unwrap();
+                state.client = state.fresh_client.clone();
+            }
+            let port = bound.http_addr.port();
+            let proxy_task = tokio::spawn(bound.serve());
+            for code in [301, 302, 303, 307, 308] {
+                for absolute in [false, true] {
+                    let url = format!(
+                        "http://127.0.0.1:{port}/{code}{}",
+                        if absolute { "?absolute" } else { "" }
+                    );
+                    let response = client
+                        .post(url)
+                        .header("host", "web.test")
+                        .body("original POST")
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status().as_u16(),
+                        code,
+                        "fresh={fresh}, absolute={absolute}"
+                    );
+                    let expected = if absolute {
+                        format!("http://127.0.0.1:{backend_port}/landing")
+                    } else {
+                        "/landing".into()
+                    };
+                    assert_eq!(response.headers()["location"], expected);
+                    assert_eq!(response.headers()["set-cookie"], "login=nonce; Path=/");
+                    assert_eq!(response.text().await.unwrap(), "redirect body");
+                }
+            }
+            shutdown.cancel();
+            proxy_task.await.unwrap().unwrap();
+        }
+        assert_eq!(landing_requests.load(Ordering::SeqCst), 0);
+        backend_task.abort();
+    }
+    async fn assert_active_response_outlives_thirty_seconds(fresh: bool) {
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async {
+                let stream = futures_util::stream::unfold(0, |sent| async move {
+                    if sent == 34 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Some((Ok::<_, std::io::Error>("data: alive\n\n"), sent + 1))
+                });
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let backend = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (url, shutdown) = proxy_for_one_backend_using(port, fresh).await;
+        let response = reqwest::Client::new()
+            .get(url)
+            .header("host", "web.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = tokio::time::timeout(Duration::from_secs(40), response.text())
+            .await
+            .unwrap()
+            .expect("healthy stream was aborted");
+        assert_eq!(body, "data: alive\n\n".repeat(34));
+        shutdown.cancel();
+        backend.abort();
+    }
+
+    #[tokio::test]
+    async fn active_response_outlives_thirty_seconds_on_the_pooled_client() {
+        assert_active_response_outlives_thirty_seconds(false).await;
+    }
+
+    #[tokio::test]
+    async fn active_response_outlives_thirty_seconds_on_the_fresh_client() {
+        assert_active_response_outlives_thirty_seconds(true).await;
+    }
+
+    async fn assert_upstream_inactivity_is_bounded(fresh: bool) {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new()
+            .route(
+                "/headers",
+                axum::routing::get(|| async { std::future::pending::<&'static str>().await }),
+            )
+            .route(
+                "/body",
+                axum::routing::get(|| async {
+                    let stream = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>("first chunk")
+                    })
+                    .chain(futures_util::stream::pending());
+                    Body::from_stream(stream)
+                }),
+            );
+        let backend = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (url, shutdown) = proxy_for_one_backend_using(port, fresh).await;
+        let client = reqwest::Client::new();
+        let headers = async {
+            let response = client
+                .get(format!("{url}headers"))
+                .header("host", "web.test")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        };
+        let body = async {
+            let mut response = client
+                .get(format!("{url}body"))
+                .header("host", "web.test")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.chunk().await.unwrap().unwrap(), "first chunk");
+            assert!(
+                response.chunk().await.is_err(),
+                "stalled stream never timed out"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(35), async {
+            tokio::join!(headers, body);
+        })
+        .await
+        .expect("upstream timeout was lost");
+        shutdown.cancel();
+        backend.abort();
+    }
+    #[tokio::test]
+    async fn pooled_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded() {
+        assert_upstream_inactivity_is_bounded(false).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded() {
+        assert_upstream_inactivity_is_bounded(true).await;
     }
 }

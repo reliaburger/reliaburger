@@ -1,0 +1,7 @@
+Parent rerun of /tmp/reliaburger-network-repro, 3 October 2026.
+Loopback socket permission was granted for this local-only harness.
+
+redirect: status=200 OK location=None set-cookie=None body=landing
+stream: error after 30.004048708s, chunks=30, error=error decoding response body
+external UDP: bytes=29 rcode=0 tc=true
+external TCP retry: rcode=2

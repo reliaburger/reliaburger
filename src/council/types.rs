@@ -139,9 +139,14 @@ pub enum RaftRequest {
     AllocateSerial,
     /// Start a secret key rotation: add a new age keypair, mark the
     /// current one as read-only.
+    ///
+    /// A namespace's first key (F05 I4) carries `resealed`: the namespace's
+    /// stored values sealed again under the new key, applied in the same
+    /// entry. Every other rotation leaves it empty.
     RotateSecretKey {
         scope: crate::sesame::types::AgeKeyScope,
         new_keypair: crate::sesame::types::AgeKeypair,
+        resealed: Vec<crate::sesame::types::ResealedSecret>,
     },
     /// Finalise a secret key rotation: remove old read-only keypairs.
     FinalizeSecretRotation {
@@ -164,6 +169,8 @@ pub enum RaftRequest {
     /// Register a batch, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.
     BatchRegister {
+        /// Revision used to plan this complete allocation.
+        expected_log_id: Option<openraft::LogId<u64>>,
         batch: crate::meat::batch_tracker::BatchRecord,
     },
     /// Record a job's state transition within a tracked batch. An
@@ -171,7 +178,9 @@ pub enum RaftRequest {
     BatchJobUpdate {
         batch_id: u64,
         job_name: String,
+        namespace: String,
         status: crate::meat::batch_tracker::JobStatus,
+        exit_code: Option<i32>,
     },
     /// Register a build, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.
@@ -343,6 +352,74 @@ pub enum RaftRequest {
     CouncilSize {
         voters: crate::council::selection::CouncilSize,
     },
+    /// Remove the API tokens that expired more than
+    /// [`crate::sesame::token::EXPIRED_TOKEN_GRACE`] before `now_unix_ms`.
+    /// The leader proposes it on a timer; the state machine decides what to
+    /// remove from `now_unix_ms` alone, so every replica removes the same
+    /// tokens. It never removes the last Admin and never empties the store.
+    SweepExpiredApiTokens { now_unix_ms: u64 },
+    /// Hold migration intent before authorising any execution or app revision.
+    PrerequisiteBegin {
+        operation_id: String,
+        term: u64,
+        config: Box<crate::config::Config>,
+    },
+    /// Publish the held manifest atomically after durable prerequisite success.
+    PrerequisiteCommit { operation_id: String },
+    /// Release a positively failed, durably settled prerequisite operation.
+    PrerequisiteFailed { operation_id: String },
+    /// Release ordinary-job intent after trusted positive terminal proof.
+    JobApplyComplete { operation_id: String },
+    /// Publish dependent apps and admit ordinary indexed runs in one transaction.
+    JobApplyCommit {
+        operation_id: String,
+        now_epoch_secs: u64,
+    },
+    /// Commit one complete placement pass against its original admission revision.
+    SchedulingDecisions {
+        expected_log_id: Option<openraft::LogId<u64>>,
+        decisions: Vec<SchedulingDecision>,
+    },
+    /// Admit an authenticated webhook before returning 202 to its provider.
+    GitOpsSyncRequested { delivery: [u8; 32] },
+    /// Begin rotating an intermediate CA (F04 R1): `ca` becomes the role's
+    /// active CA and the current one retires, still trusted. One rotation
+    /// per role at a time; a retry of the same generation is a no-op. The
+    /// rules live in [`crate::sesame::ca_rotation::begin`].
+    CaRotationBegin {
+        role: crate::sesame::types::CaRole,
+        ca: Box<crate::sesame::types::CertificateAuthority>,
+    },
+    /// Finish rotating an intermediate CA: drop the retiring one, refused
+    /// while a live leaf could still chain to it. `now_unix_ms` is the
+    /// proposer's clock, carried in the log so every replica judges the
+    /// retiring window against the same instant.
+    CaRotationFinalize {
+        role: crate::sesame::types::CaRole,
+        now_unix_ms: u64,
+    },
+    /// Give an API token a new secret under the same name; the old secret
+    /// keeps working until the rotation's grace end (F05 I3). Refused for a
+    /// name that doesn't exist or belongs to a test lease.
+    RotateApiToken(crate::sesame::types::TokenRotation),
+    /// Hold a key the leader made for the role's next intermediate, and its
+    /// CSR, until the operator signs it with the root (F04 R4). Allocates the
+    /// certificate's serial and answers `SerialAllocated`. The rules live in
+    /// [`crate::sesame::ca_rotation::prepare`].
+    CaRotationPrepare {
+        role: crate::sesame::types::CaRole,
+        generation: u64,
+        csr_der: Vec<u8>,
+        private_key_wrapped: crate::sesame::types::WrappedKey,
+    },
+    /// A node has installed the trust set that includes Node CA
+    /// `generation` (F04 R4). The leader proposes it for the node that
+    /// authenticated the request.
+    AcknowledgeNodeTrust { node_id: String, generation: u64 },
+    /// Register, sync, cancel or requeue a task array (0.2.0, million
+    /// jobs). One variant wrapping the array's own write type, so the
+    /// rules live beside the data in `meat::task_array_store`.
+    TaskArray(Box<crate::meat::task_array_store::TaskArrayWrite>),
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +468,14 @@ pub enum CouncilResponse {
     RegistryPublicationStale,
     /// The execution fence committed; release requires all original consumer obligations to finish.
     EndpointExecutionRetired { released: bool },
+    /// A `SweepExpiredApiTokens` entry was applied; carries the names of the
+    /// tokens it removed, in store order (empty when nothing was due).
+    ApiTokensSwept { removed: Vec<String> },
+    /// Replicated webhook admission committed at this trigger generation.
+    GitOpsSyncRequested { generation: u64 },
+    /// A task array was registered under this id, taken from the same
+    /// counter as ordinary batches.
+    TaskArrayRegistered { batch_id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +551,9 @@ pub struct DesiredState {
     /// Durable batch tracker: monotonic id counter plus in-flight and
     /// recently terminal batches (12b.2 JOB4).
     pub batch_state: crate::meat::batch_tracker::BatchDurableState,
+    /// Task arrays (0.2.0): chunk tables and counts, never a record per
+    /// task. Ids come from `batch_state`'s counter.
+    pub task_arrays: crate::meat::task_array_store::TaskArrays,
     /// Durable build tracker, same shape and rationale as `batch_state`.
     pub build_state: crate::bun::build_runner::BuildDurableState,
     /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster
@@ -501,10 +589,32 @@ pub struct DesiredState {
     /// `None` keeps the reconciler's default cap of seven.
     #[serde(default)]
     pub council_size: Option<crate::council::selection::CouncilSize>,
+    /// Migration intent, retained across handover when the outcome is uncertain.
+    /// Missing ownership state is refused rather than decoded as an empty fence.
+    #[serde(deserialize_with = "super::prerequisites::deserialize_claims")]
+    pub prerequisite_claims:
+        std::collections::BTreeMap<String, super::prerequisites::PrerequisiteClaim>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
     pub last_membership: StoredMembership<u64, CouncilNodeInfo>,
+}
+
+impl DesiredState {
+    /// Turn a restored state into the first state of a new recovery epoch
+    /// (12b.2 D21/CP12).
+    ///
+    /// Bumps the epoch, drops the dead council's log position and
+    /// membership so the recovered node starts a fresh term line, and lifts
+    /// the catalogue generation above anything the old epoch published
+    /// (#478).
+    pub fn enter_recovery_epoch(&mut self) {
+        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+        self.last_applied_log = None;
+        self.last_membership = StoredMembership::default();
+        self.endpoint_withdrawals
+            .enter_recovery_epoch(self.recovery_epoch);
+    }
 }
 
 /// Serialises a `HashMap<K, V>` as a `Vec<(K, V)>`.
@@ -698,10 +808,19 @@ mod tests {
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH,
+                previous_secret: None,
             }),
             RaftRequest::RevokeApiToken {
                 name: "ci-deploy".to_string(),
             },
+            RaftRequest::RotateApiToken(crate::sesame::types::TokenRotation {
+                name: "ci-deploy".to_string(),
+                token_hash: vec![7, 8, 9],
+                token_salt: vec![1, 1, 1],
+                rotated_at: std::time::SystemTime::UNIX_EPOCH,
+                expires_at: None,
+                previous_valid_until: Some(std::time::SystemTime::UNIX_EPOCH),
+            }),
             RaftRequest::AllocateSerial,
         ];
 
@@ -723,6 +842,7 @@ mod tests {
                     gpu: Some(2),
                     max_apps: Some(50),
                     max_replicas: Some(200),
+                    secret_key: false,
                 }),
             },
             RaftRequest::NamespaceDelete {

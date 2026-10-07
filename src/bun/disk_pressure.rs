@@ -10,6 +10,12 @@
 //! and let the self-healing reconciler replace it. The pure state machine
 //! that decides "resign now?" with hysteresis lives here; the reconciler acts
 //! on its verdict.
+//!
+//! The two concerns measure different things. Export-then-prune enforces each
+//! store's `max_storage_mb` retention cap; resignation looks at the real
+//! filesystem under the Raft log ([`FilesystemUsage`]). A store over its cap
+//! with a mostly empty disk is a retention matter, not a reason to depose the
+//! council leader (#510).
 
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
@@ -190,6 +196,64 @@ async fn export_when_free(
 // Council-voter disk-pressure resignation (12b.2 T3)
 // ---------------------------------------------------------------------------
 
+/// Share of a filesystem in use, in percent, at which a council voter counts
+/// as under disk pressure. It matches the level `relish wtf` calls critical.
+pub const COUNCIL_DISK_PRESSURE_PERCENT: u64 = 95;
+
+/// Size and free space of the filesystem that holds a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilesystemUsage {
+    /// Size of the filesystem in bytes.
+    pub total_bytes: u64,
+    /// Bytes an unprivileged writer can still use. Blocks reserved for root
+    /// count as used, as they do in `df`.
+    pub available_bytes: u64,
+}
+
+impl FilesystemUsage {
+    /// Measure the filesystem holding `path`, or the nearest ancestor that
+    /// exists when `path` itself hasn't been created yet.
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        let existing = path
+            .ancestors()
+            .find(|candidate| candidate.exists())
+            .unwrap_or(path);
+        let stats = nix::sys::statvfs::statvfs(existing).map_err(std::io::Error::from)?;
+        // Darwin reports 32-bit block counts; Linux reports 64-bit ones.
+        #[allow(clippy::useless_conversion)]
+        let fragment = u64::from(stats.fragment_size());
+        #[allow(clippy::useless_conversion)]
+        let total_blocks = u64::from(stats.blocks());
+        #[allow(clippy::useless_conversion)]
+        let available_blocks = u64::from(stats.blocks_available());
+        Ok(Self {
+            total_bytes: total_blocks.saturating_mul(fragment),
+            available_bytes: available_blocks.saturating_mul(fragment),
+        })
+    }
+
+    /// Bytes in use, counting root-reserved blocks as used.
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.available_bytes)
+    }
+
+    /// Share of the filesystem in use, in whole percent (rounded down).
+    pub fn used_percent(&self) -> u64 {
+        if self.total_bytes == 0 {
+            return 0;
+        }
+        let used = u128::from(self.used_bytes()) * 100 / u128::from(self.total_bytes);
+        u64::try_from(used).unwrap_or(100)
+    }
+
+    /// Whether a council voter on this filesystem is under disk pressure:
+    /// at least [`COUNCIL_DISK_PRESSURE_PERCENT`] used, or nothing left to
+    /// write to at all.
+    pub fn is_pressured(&self) -> bool {
+        self.available_bytes == 0 || self.used_percent() >= COUNCIL_DISK_PRESSURE_PERCENT
+    }
+}
+
 /// Whether a council voter should resign because its disk is under sustained
 /// pressure. The recommendation the reconciler acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +357,7 @@ mod tests {
             .truncate(false)
             .open(directory.path().join("_export_checkpoint.lock"))
             .unwrap();
-        holder.try_lock().unwrap();
+        let holder = crate::file_lock::FileLock::try_lock(holder).unwrap();
         let release = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
             drop(holder);
@@ -426,6 +490,44 @@ mod tests {
         .await;
 
         assert_eq!(result.files_pruned, 0);
+    }
+
+    // -- filesystem usage (#510) --------------------------------------------
+
+    fn usage(total_bytes: u64, available_bytes: u64) -> FilesystemUsage {
+        FilesystemUsage {
+            total_bytes,
+            available_bytes,
+        }
+    }
+
+    #[test]
+    fn a_mostly_free_disk_is_not_pressured() {
+        // The 0.1.4 soak: 38% used, but the logs were over an 8 MB cap.
+        assert!(!usage(100 * 1024, 62 * 1024).is_pressured());
+        assert_eq!(usage(100, 62).used_percent(), 38);
+    }
+
+    #[test]
+    fn a_disk_at_the_pressure_level_is_pressured() {
+        assert!(!usage(100, 6).is_pressured());
+        assert!(usage(100, 5).is_pressured());
+        assert!(usage(100, 0).is_pressured());
+    }
+
+    #[test]
+    fn an_empty_filesystem_report_is_pressured_not_a_panic() {
+        // Nothing to write to: no division by zero, and Raft can't append.
+        assert!(usage(0, 0).is_pressured());
+    }
+
+    #[test]
+    fn usage_measures_the_nearest_existing_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("raft").join("not-yet");
+        let measured = FilesystemUsage::of(&missing).unwrap();
+        assert!(measured.total_bytes > 0);
+        assert!(measured.available_bytes <= measured.total_bytes);
     }
 
     // -- resignation state machine (12b.2 T3) ------------------------------

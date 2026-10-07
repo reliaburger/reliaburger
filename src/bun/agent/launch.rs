@@ -4,12 +4,42 @@
 
 use super::*;
 
+/// A known terminal failure may release the replicated gate; uncertainty cannot.
+#[derive(Debug)]
+pub struct PrerequisiteFailure {
+    pub message: String,
+    pub settled: bool,
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) fn validate_deploy_names(&self, config: &Config) -> Result<(), String> {
         use crate::bun::deploy_operations::DeployTargetKind;
         config
             .validate_workload_names()
             .map_err(|error| error.to_string())?;
+        for (name, namespace) in config
+            .app
+            .iter()
+            .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default")))
+            .chain(
+                config
+                    .job
+                    .iter()
+                    .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default"))),
+            )
+        {
+            let id = crate::grill::InstanceIdentity::new(namespace, name, 0).instance_id();
+            if self
+                .recorded_jobs
+                .get(&id.0)
+                .is_some_and(|job| job.batch_execution.is_some())
+                || self.retired_batch_executions.contains_key(&id.0)
+            {
+                return Err(format!(
+                    "workload {namespace}/{name} belongs to a batch execution"
+                ));
+            }
+        }
         for (name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
             if self
@@ -29,15 +59,151 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .map_err(|error| error.to_string())?;
         }
         for (name, spec) in &config.job {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if !spec.run_before.is_empty()
+                && self
+                    .scheduled_jobs
+                    .contains_key(&(name.clone(), namespace.into()))
+            {
+                return Err(format!(
+                    "workload {namespace}/{name} belongs to a registered cron job; stop it before running a migration"
+                ));
+            }
             self.supervisor
-                .admit_workload_kind(
-                    name,
-                    spec.namespace.as_deref().unwrap_or("default"),
-                    DeployTargetKind::Job,
-                )
+                .admit_job(name, namespace, spec)
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    /// Reserve all local targets and perform trust admission before Raft intent
+    /// or any execution. Failure here can release ownership without uncertainty.
+    pub(super) async fn prepare_prerequisites(
+        &mut self,
+        config: Config,
+        response: oneshot::Sender<
+            Result<(Config, crate::bun::deploy_operations::DeployOperationHandle), String>,
+        >,
+    ) {
+        if self.startup_cleanup_pending
+            || self.draining.load(std::sync::atomic::Ordering::Relaxed)
+            || self.stopping_target(&config).is_some()
+            || self.restoring_target(&config).is_some()
+        {
+            let _ = response.send(Err(
+                "node cleanup, stop, restore or drain still owns a target".into(),
+            ));
+            return;
+        }
+        if let Err(error) = self.validate_deploy_names(&config) {
+            let _ = response.send(Err(error));
+            return;
+        }
+        // LOOP-INLINE: in-memory target ownership, no I/O
+        let operation = match self.deploy_operations.start(&config).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                let _ = response.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let worker = self.prerequisite_worker(operation.clone());
+        tokio::spawn(async move {
+            let mut config = config;
+            // This shared preflight performs no runtime create or start.
+            let result = worker.preflight_prerequisites(&mut config).await;
+            if let Err(message) = result {
+                operation
+                    .finish(
+                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                        message.clone(),
+                    )
+                    .await;
+                let _ = response.send(Err(message));
+            } else if response.send(Ok((config, operation.clone()))).is_err() {
+                operation
+                    .finish(
+                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                        "prepared prerequisite receiver disappeared before dispatch",
+                    )
+                    .await;
+            }
+        });
+    }
+
+    fn prerequisite_worker(
+        &self,
+        operation: crate::bun::deploy_operations::DeployOperationHandle,
+    ) -> DeployWorker<G> {
+        DeployWorker {
+            rerun_unknown_jobs: false,
+            prepared_batch_jobs: None,
+            grill: self.supervisor.grill().clone(),
+            ops: DeployOps {
+                tx: self.deploy_ops_tx.clone(),
+            },
+            drains: self.drains.clone(),
+            operation: Some(operation),
+            stop_confirmation_timeout: self.stop_confirmation_timeout,
+            egress: self.egress_resolver(),
+        }
+    }
+
+    /// Run only migration jobs; the API retains the operation through commit.
+    pub(super) fn run_prepared_prerequisites(
+        &self,
+        config: Config,
+        operation: crate::bun::deploy_operations::DeployOperationHandle,
+        response: oneshot::Sender<Result<(), PrerequisiteFailure>>,
+    ) {
+        let worker = self.prerequisite_worker(operation.clone());
+        tokio::spawn(async move {
+            let result = async {
+                for (name, spec) in config
+                    .job
+                    .iter()
+                    .filter(|(_, job)| !job.run_before.is_empty())
+                {
+                    if operation.cancellation_requested() {
+                        return Err(PrerequisiteFailure {
+                            message: "prerequisite cancellation retains uncertain ownership".into(),
+                            settled: false,
+                        });
+                    }
+                    worker
+                        .run_prerequisite_job(
+                            name,
+                            spec.namespace.as_deref().unwrap_or("default"),
+                            spec,
+                        )
+                        .await
+                        .map_err(|error| PrerequisiteFailure {
+                            settled: matches!(error, BunError::PrerequisiteFailed { .. }),
+                            message: error.to_string(),
+                        })?;
+                }
+                // Match standalone deploy's boundary after migration settlement.
+                // A positive exit does not erase an accepted cancellation.
+                if operation.cancellation_requested() {
+                    return Err(PrerequisiteFailure {
+                        message:
+                            "prerequisite cancelled before app publication; ownership remains held"
+                                .into(),
+                        settled: false,
+                    });
+                }
+                Ok(())
+            }
+            .await;
+            if response.send(result).is_err() {
+                operation
+                    .finish(
+                        crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
+                        "prerequisite result receiver disappeared; replicated claim remains held",
+                    )
+                    .await;
+            }
+        });
     }
 
     /// Admit and track either an operator apply or one cron firing through
@@ -163,6 +329,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let observed_operation = operation.clone();
         let worker = DeployWorker {
             rerun_unknown_jobs,
+            prepared_batch_jobs: None,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
                 tx: self.deploy_ops_tx.clone(),
@@ -265,39 +432,59 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// root CA and returns the digest-pinned reference (`repo@sha256:…`) the
     /// deploy must use, so the runtime pulls exactly the verified bytes — a
     /// tag can move between verify and pull (IMG1).
+    ///
+    /// An image from outside Pickle must pass the node's
+    /// `[[images.trust_policy.upstream]]` rules first (F03 U2). That check
+    /// runs where the runtime pulls images and a council holds the catalogue
+    /// that tells Pickle's images from everyone else's. A standalone node
+    /// has no such catalogue here; its apply checked the same rules against
+    /// its own registry, on this node, before the deploy began.
     pub(super) async fn enforce_image_signature(
         &self,
         spec: &AppSpec,
     ) -> Result<Option<String>, String> {
+        self.enforce_image_reference_signature(spec.image.as_deref())
+            .await
+    }
+
+    pub(super) async fn enforce_image_reference_signature(
+        &self,
+        image: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        self.enforce_upstream_rules(image).await?;
         if !self.trust_policy.require_signatures {
             return Ok(None);
         }
         // A process workload has no image; nothing to verify.
-        if spec.image.is_none() {
+        if image.is_none() {
             return Ok(None);
         }
         let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
             return Err(format!(
                 "image {} requires a signature but this node has no cluster trust state to verify it against (require_signatures is enabled); run in cluster mode or disable require_signatures",
-                spec.image.as_deref().unwrap_or("<none>")
+                image.unwrap_or("<none>")
             ));
         };
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let catalog = council.manifest_catalog().await;
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
-        let root_ca = security_state
-            .get_ca(crate::sesame::types::CaRole::Root)
-            .map(|ca| ca.certificate_der.clone());
+        // Every root the council trusts (F04 R2): an image signed under one
+        // that's still trusted keeps verifying.
+        let trusted_roots: Vec<Vec<u8>> = security_state
+            .trusted_cas(crate::sesame::types::CaRole::Root)
+            .into_iter()
+            .map(|ca| ca.certificate_der.clone())
+            .collect();
         let verified = crate::meat::scheduler::verify_image_signature(
-            spec.image.as_deref(),
+            image,
             &catalog,
             &self.trust_policy,
-            root_ca.as_deref(),
+            &trusted_roots,
             Some(&security_state.crl),
         )
         .map_err(|e| e.to_string())?;
-        Ok(match (spec.image.as_deref(), verified) {
+        Ok(match (image, verified) {
             (Some(image), Some(digest)) => {
                 Some(crate::meat::scheduler::pin_image_reference(image, &digest))
             }
@@ -305,8 +492,73 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
+    /// Refuse an upstream image the node's upstream rules don't allow (see
+    /// [`Self::enforce_image_signature`] for where this applies).
+    async fn enforce_upstream_rules(&self, image: Option<&str>) -> Result<(), String> {
+        // With the default `allow = true` no rule can refuse anything, so
+        // skip the catalogue read.
+        if self.trust_policy.upstream_default.allow {
+            return Ok(());
+        }
+        // A path is a root filesystem runc runs as it is; no registry holds it.
+        let Some(image) = image.filter(|image| crate::grill::image::looks_like_image_ref(image))
+        else {
+            return Ok(());
+        };
+        if self.supervisor.grill().runtime_kind() == crate::grill::records::RuntimeKind::Process {
+            return Ok(());
+        }
+        let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+            return Ok(());
+        };
+        // LOOP-INLINE: reads the local council state machine; no quorum round trip
+        let catalog = council.manifest_catalog().await;
+        if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_some() {
+            return Ok(());
+        }
+        crate::pickle::trust::check_upstream(&self.trust_policy, image).map_err(|e| e.to_string())
+    }
+
+    /// The cosign signature check `image` owes before it deploys, if its
+    /// upstream rule requires one (F03 U3). The caller runs it off the agent
+    /// loop: it fetches the `.sig` image.
+    ///
+    /// Paths, images under the process runtime and Pickle's own images owe
+    /// nothing, as with [`Self::enforce_upstream_rules`]. A standalone node,
+    /// with no cluster catalogue, checks every image its rules name.
+    pub(super) async fn cosign_check(
+        &self,
+        image: Option<&str>,
+    ) -> Option<crate::pickle::trust::CosignCheck> {
+        if !self
+            .trust_policy
+            .upstream
+            .iter()
+            .any(|rule| rule.require_signatures)
+        {
+            return None;
+        }
+        let image = image.filter(|image| crate::grill::image::looks_like_image_ref(image))?;
+        if self.supervisor.grill().runtime_kind() == crate::grill::records::RuntimeKind::Process {
+            return None;
+        }
+        if let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) {
+            // LOOP-INLINE: reads the local council state machine; no quorum round trip
+            let catalog = council.manifest_catalog().await;
+            if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_some() {
+                return None;
+            }
+        }
+        crate::pickle::trust::CosignCheck::for_image(
+            &self.trust_policy,
+            image,
+            self.signature_source.as_ref(),
+        )
+    }
+
     /// Every age identity that could decrypt this namespace's secrets, newest
-    /// generation first: the namespace-scoped keys then the cluster-wide keys.
+    /// generation first: the namespace's own keys once it has one, the
+    /// cluster-wide keys otherwise, never both (F05 I4).
     ///
     /// Returning all live generations (not just the active one) is what makes a
     /// secret survive a rotation window — a value encrypted under the retiring
@@ -324,17 +576,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         // LOOP-INLINE: reads the local council state machine; no quorum round trip
         let security_state = council.security_state().await;
-
-        let ns_scope = crate::sesame::types::AgeKeyScope::Namespace(namespace.to_string());
-        security_state
-            .age_keypairs_for_scope(&ns_scope)
-            .into_iter()
-            .chain(
-                security_state
-                    .age_keypairs_for_scope(&crate::sesame::types::AgeKeyScope::ClusterWide),
-            )
-            .filter_map(|kp| crate::sesame::secret::unwrap_age_identity(kp, &ikm).ok())
-            .collect()
+        crate::sesame::secret::namespace_identities(&security_state, namespace, &ikm)
     }
 
     /// Build an OCI spec, decrypting `ENC[AGE:...]` env values with `identity`.
@@ -543,6 +785,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             None
         };
+        if let Err(error) = self.supervisor.reserve_execution(
+            id.clone(),
+            crate::meat::Resources::new(
+                spec.cpu.map_or(0, |r| r.request),
+                spec.memory.map_or(0, |r| r.request),
+                spec.gpu.unwrap_or(0),
+            ),
+        ) {
+            if let Some(port) = host_port {
+                // LOOP-INLINE: in-memory lock, no I/O
+                self.supervisor.port_allocator.release(port).await?;
+            }
+            return Err(error);
+        }
         self.supervisor.instances.insert(
             id.clone(),
             crate::bun::supervisor::WorkloadInstance {
@@ -688,7 +944,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 result => result?,
             }
         }
-        self.withdraw_service_ebpf(&service_id).await?;
+        // In a cluster the kernel entry also names other nodes' backends and
+        // the new replicas; only the old instances leave it (#481). The
+        // stepped rollout took them out of the local map, not the installed
+        // view, so every local backend there that isn't a replacement is old.
+        let replaced: Vec<InstanceId> = self
+            .service_map_tx
+            .borrow()
+            .resolve(&service_id)
+            .map(|entry| {
+                entry
+                    .backends
+                    .iter()
+                    .filter(|backend| backend.local)
+                    .filter(|backend| !new_ids.iter().any(|new| new.0 == backend.instance_id))
+                    .map(|backend| InstanceId(backend.instance_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !self
+            .withdraw_backends_from_view(&service_id, &replaced)
+            .await?
+        {
+            self.withdraw_service_ebpf(&service_id).await?;
+        }
         // Re-registration can be refused: a stop that withdrew the council's
         // allocation mid-rollout leaves nothing to register against. The
         // retained replacements then retire by proving withdrawal against

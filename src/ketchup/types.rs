@@ -29,6 +29,23 @@ impl LogStream {
     }
 }
 
+/// Identity observed on the same opened descriptor that supplies capture bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl CaptureFileIdentity {
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
 /// Where a captured line ended in the runtime's capture file.
 ///
 /// Capture files are append-only for as long as they exist, so the byte
@@ -42,6 +59,8 @@ pub struct CapturePosition {
     pub file: std::path::PathBuf,
     /// Byte offset just past the line's terminating newline.
     pub end_offset: u64,
+    /// None when the caller has not established file identity from read bytes.
+    pub identity: Option<CaptureFileIdentity>,
 }
 
 /// Where the log store has already read each capture file up to.
@@ -51,9 +70,17 @@ pub struct CapturePosition {
 /// (and discarding) everything before it again. A file with no entry starts
 /// at byte 0.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CaptureOffsets(pub std::collections::BTreeMap<std::path::PathBuf, u64>);
+pub struct CaptureOffsets(
+    pub std::collections::BTreeMap<std::path::PathBuf, u64>,
+    pub std::collections::BTreeMap<std::path::PathBuf, CaptureFileIdentity>,
+);
 
 impl CaptureOffsets {
+    /// File identity bound to the checkpointed offset, checked again on open.
+    pub fn identity(&self, file: &std::path::Path) -> Option<CaptureFileIdentity> {
+        self.1.get(file).copied()
+    }
+
     /// The checkpointed offset for `file`, if the store holds lines from it.
     pub fn get(&self, file: &std::path::Path) -> Option<u64> {
         self.0.get(file).copied()

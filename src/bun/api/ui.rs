@@ -56,9 +56,10 @@ pub(super) async fn ui_session_handler(
             .await
             .ok()
             .map(|ctx| {
-                let expires_at =
-                    crate::sesame::auth::find_token_by_principal(&ctx.principal_id, &tokens)
-                        .and_then(|token| token.expires_at);
+                // A session opened with a rotated-out secret lives no longer
+                // than that secret's grace period.
+                let expires_at = crate::sesame::auth::find_credential(&ctx.principal_id, &tokens)
+                    .and_then(|credential| credential.valid_until);
                 (
                     crate::sesame::session::SessionIdentity {
                         token_name: ctx.token_name,
@@ -622,4 +623,13 @@ pub(super) async fn app_env_handler(
         )
             .into_response(),
     }
+}
+
+/// A summary table refreshes independently of the app/instance tables.
+pub(super) async fn fragment_batches_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    let rows = crate::bun::task_array_api::summaries(&state, auth.as_deref()).await;
+    html_response(crate::brioche::dashboard::render_batches(&rows))
 }

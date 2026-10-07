@@ -1016,6 +1016,10 @@ fn node_identity(
         private_key_der,
         serial,
         ca_generation: 0,
+        trust: reliaburger::sesame::trust::TrustSet::single(
+            hierarchy.node.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ),
         node_ca_der: hierarchy.node.ca.certificate_der.clone(),
         root_ca_der: hierarchy.root.ca.certificate_der.clone(),
         not_before: SystemTime::UNIX_EPOCH,

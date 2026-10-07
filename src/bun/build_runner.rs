@@ -922,8 +922,27 @@ pub fn build_signer_uri(trust_domain: &str, namespace: &str) -> crate::sesame::t
     }
 }
 
+/// Whether a cached signer has useful current authority. Renew with at most a
+/// day's lead time, bounded by half the leaf's lifetime for a nearly expired CA.
+fn build_signer_needs_renewal(signer: &BuildSigner) -> bool {
+    let Ok((_, leaf)) = x509_parser::parse_x509_certificate(&signer.cert_der) else {
+        return true;
+    };
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let validity = leaf.validity();
+    let lifetime = validity.not_after.timestamp() - validity.not_before.timestamp();
+    let margin = (lifetime / 2).clamp(0, 24 * 3600);
+    validity.not_after.timestamp() <= now + margin
+        || crate::sesame::cert::validate_chain(
+            &signer.cert_der,
+            &signer.workload_ca_cert_der,
+            &signer.root_ca_cert_der,
+        )
+        .is_err()
+}
+
 /// Return the cached build signer for `namespace`, provisioning one via the
-/// council the first time. Reused across builds: two builds in the same
+/// council initially and before certificate expiry. Reused across builds: two builds in the same
 /// namespace share a single signing identity rather than minting a fresh
 /// ephemeral CSR each time.
 pub async fn get_or_provision_build_signer(
@@ -934,7 +953,9 @@ pub async fn get_or_provision_build_signer(
     node_name: &str,
 ) -> Result<BuildSigner, String> {
     let mut guard = cache.lock().await;
-    if let Some(existing) = guard.get(namespace) {
+    if let Some(existing) = guard.get(namespace)
+        && !build_signer_needs_renewal(existing)
+    {
         return Ok(existing.clone());
     }
 
@@ -995,7 +1016,7 @@ pub async fn sign_pushed_image(
         &signature,
         digest,
         &crate::config::node::TrustPolicySection::default(),
-        Some(&signer.root_ca_cert_der),
+        std::slice::from_ref(&signer.root_ca_cert_der),
         None,
     )
     .map_err(|e| format!("signature failed verification against the cluster ca: {e}"))?;
@@ -1887,6 +1908,8 @@ mod tests {
             oidc_signing_config: Some(oidc_config),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
+            node_leaves: std::collections::BTreeMap::new(),
+            pending_intermediates: Vec::new(),
         };
         node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
             .await
@@ -1912,6 +1935,64 @@ mod tests {
         assert_eq!(first.spiffe_uri, second.spiffe_uri);
         assert_eq!(first.private_key_der, second.private_key_der);
         assert_eq!(first.cert_der, second.cert_der);
+    }
+
+    #[tokio::test]
+    async fn cached_build_signers_are_replaced_before_or_after_expiry() {
+        use crate::sesame::{ca, cert, types::CaRole};
+        for seconds_remaining in [-3600, 60] {
+            let council = leader_with_security().await;
+            let cache = tokio::sync::Mutex::new(HashMap::new());
+            let mut previous = get_or_provision_build_signer(
+                &cache,
+                &council,
+                "test-cluster",
+                "default",
+                "node-1",
+            )
+            .await
+            .unwrap();
+            let security = council.security_state().await;
+            let authority = security.active_ca(CaRole::Workload).unwrap();
+            let (issuer_key, issuer_params) =
+                ca::ca_signing_material(authority, council.wrapping_ikm().unwrap()).unwrap();
+            let issuer = issuer_params.self_signed(&issuer_key).unwrap();
+            let leaf_key = rcgen::KeyPair::from_der_and_sign_algo(
+                &rustls::pki_types::PrivateKeyDer::try_from(previous.private_key_der.clone())
+                    .unwrap(),
+                &rcgen::PKCS_ECDSA_P256_SHA256,
+            )
+            .unwrap();
+            let mut leaf = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            leaf.subject_alt_names = vec![rcgen::SanType::URI(
+                previous.spiffe_uri.to_uri().try_into().unwrap(),
+            )];
+            leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::CodeSigning];
+            leaf.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+            leaf.not_after =
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds_remaining);
+            previous.cert_der = leaf
+                .signed_by(&leaf_key, &issuer, &issuer_key)
+                .unwrap()
+                .der()
+                .to_vec();
+            let expired_der = previous.cert_der.clone();
+            cache.lock().await.insert("default".into(), previous);
+            let current = get_or_provision_build_signer(
+                &cache,
+                &council,
+                "test-cluster",
+                "default",
+                "node-1",
+            )
+            .await
+            .unwrap();
+            assert_ne!(
+                current.cert_der, expired_der,
+                "expiring cached authority must be replaced ({seconds_remaining}s remaining)"
+            );
+            cert::check_validity(&current.cert_der).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2011,8 +2092,9 @@ mod tests {
             &crate::config::node::TrustPolicySection {
                 require_signatures: true,
                 keys: vec![],
+                ..Default::default()
             },
-            Some(&signer.root_ca_cert_der),
+            std::slice::from_ref(&signer.root_ca_cert_der),
             None,
         )
         .unwrap();

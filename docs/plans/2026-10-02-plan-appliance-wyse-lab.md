@@ -1,4 +1,4 @@
-# Plan: the Wyse lab, from today's code to ten netbooted nodes
+# Plan: the Wyse lab, from today's code to netbooted nodes
 
 *Written 2 October 2026 on the `appliance-train` branch (the spike, W1–W6 and the fleet research in one PR). It answers one question: what's left between the code on that branch and the maintainer's lab? It reads the code rather than the plans, cites files and functions, and marks anything not checked on real hardware or on macOS as **[unverified]**. It doesn't replace the [product plan](2026-10-01-plan-appliance-product.md) or the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md); it feeds both.*
 
@@ -9,7 +9,7 @@
 - **Ten Dell Wyse 3040s**: x86_64 (Atom x5-Z8350), 2 GB RAM, 8 GB eMMC, UEFI PXE through a Realtek RTL8111/8168, no serial port (research §9.1).
 - A **Raspberry Pi**.
 
-Everything on the switch, isolated from the home LAN. The ten Wyses netboot into the appliance and form one cluster with the real commands: `relish image download`, `relish netboot`, `relish machines claim`.
+Everything on the switch, isolated from the home LAN. The Wyses netboot into the appliance and form one cluster with the real commands: `relish image download`, `relish netboot`, `relish machines claim`. The lab has ten, and the 0.3.0 exit test gates on three of them ([decisions, 7 October 2026](#decisions-7-october-2026)).
 
 ## The short answer
 
@@ -136,7 +136,7 @@ The claim asks you to compare each machine's claim key with its monitor. With on
 
 - **The images' signing.** Lab builds carry a throwaway key per run, so a node can only update to a build from the same run (`os::slot` trusts the release keys and its own image's `os-signing-key.pub.pem`).
 - **`image/tools/`**: `netboot-server.sh`, `seed-fleet.sh`, `node-toml.py`, `fleet-measure.sh` and `seed-admin`. W7 retires them; only `fleet-measure.sh` is still needed for S5, and it needs SSH, which only lab images have (`mkosi.conf.d/30-lab.conf`). `relish machines claim --ssh-key` puts the key in the seed (`ClaimOptions::ssh_key` in `src/relish/machines.rs`).
-- **The manual** (`docs/manual/14_appliance.md`) is still titled "preview" and starts from CI runs; the S5 runbook still uses `netboot-server.sh` on "a Linux machine" and `seed-fleet.sh`. Both need rewriting around `relish netboot` and `relish machines claim` (W7, PR 7 here). **Done in PR 7:** both now start from `relish netboot` on the Mac, the Pi as router and `relish machines claim`.
+- **The manual** (`docs/manual/15_appliance.md`) is still titled "preview" and starts from CI runs; the S5 runbook still uses `netboot-server.sh` on "a Linux machine" and `seed-fleet.sh`. Both need rewriting around `relish netboot` and `relish machines claim` (W7, PR 7 here). **Done in PR 7:** both now start from `relish netboot` on the Mac, the Pi as router and `relish machines claim`.
 - **`relish netboot --node`** (a bun node serving netboot) isn't built. The lab doesn't need it.
 
 ### Wyse risks, and what covers each
@@ -212,4 +212,27 @@ Most of this needs no Wyse:
 6. **S5:** first lab runs on CI lab builds (PR 5); the formal S5 run on the signed channel after 0.3.0 publishes one.
 7. **Trust:** `--trust-lan` for day-to-day lab runs; the formal S5 run compares all ten claim keys on the monitor, as a user would.
 
-**The train:** `release-1-3-0` (gate PR #490). It's renumbered for compatibility when it lands on top of 0.1.5.
+**The train:** `release-1-3-0` (gate PR #490). It's renumbered for compatibility each time it takes main: on 7 October 2026, after main's 0.1.5, 0.1.6 and the 0.2.0 jobs work (protocol 48, state 65), to protocol 49 and state 66.
+
+## Decisions, 7 October 2026
+
+The maintainer scoped the 0.3.0 milestone to the OS, netboot and appliance work alone. The acceptance gates V01 to V04 ([#286](https://github.com/reliaburger/reliaburger/issues/286), [#287](https://github.com/reliaburger/reliaburger/issues/287), [#288](https://github.com/reliaburger/reliaburger/issues/288)), WebSocket drain parity and ACME (F08, [#369](https://github.com/reliaburger/reliaburger/issues/369)) and the fault pre-checks ([#334](https://github.com/reliaburger/reliaburger/issues/334)) moved to Later. For the lab and the exit test:
+
+1. **The exit test gates on three Wyses**, not ten. The lab can still run all ten; the gate counts three.
+2. **Go/no-go**, all five must hold:
+   - 3 of 3 machines claimed;
+   - power-on to a working cluster in 60 minutes or less;
+   - at least 1.0 GB `MemAvailable` on every node under the workload;
+   - at least 5 years of eMMC life at the write rate measured over 24 hours;
+   - a broken OS update falls back to the previous version by itself within 10 minutes. The VM lab measured about 16 minutes with three 300 s boot checks; counted boots now wait 120 s, so the Wyse run has to show the 10 minutes, not assume them.
+3. **The Wyse test runs on a lab build of the train** and gates the v0.3.0 tag, which follows the 0.2.0 release. This replaces decision 6 of 3 October: there's no formal run on a signed channel first, because the channel doesn't publish until v0.3.0 is promoted.
+4. **The weekly OS publish cron stays off until v0.3.0 is promoted.** `appliance.yml` has no `schedule` trigger until then (a CI script test pins that), so the train landing on main publishes nothing by itself; a dispatch with `publish` is the only way.
+5. **Dropped:** `relish netboot --node`; the Raft `os.target_version` pin; the daily channel discovery on the leader.
+6. **Out of scope:** the QR code on tty1 and `relish machines claim --all`.
+7. **`os-stage` stays**, for the runbook's hand-staged fallback test.
+8. **In scope:** a CI fallback test with a broken image, so the fallback isn't only proven by hand.
+9. **The master-key backup becomes a real prompt** in `relish cluster create --bare-metal` and `relish machines claim --create`, with `--yes` to skip it in scripts.
+10. **The Ubuntu 26.04 quickstart guest stays in 0.3.0.**
+11. **The lab's Mac** is a maintainer's M1 or M2 MacBook Pro.
+
+Decision 7 of 3 October (comparing all ten claim keys on the formal run) now means all three of the gated machines.

@@ -301,6 +301,11 @@ pub fn spawn_leader_scheduler(
                     .contains_key(&member.node_id.0)
             });
             let reports = aggregated_rx.borrow().clone();
+            if aggregated_rx.has_changed().is_err()
+                || reports.leadership_epoch != Some(council.current_term())
+            {
+                continue; // the maintainer has not published this leader's epoch yet
+            }
 
             let alive_names: HashSet<&str> = members
                 .iter()
@@ -492,38 +497,41 @@ pub fn spawn_leader_scheduler(
                 continue;
             }
 
-            for decision in decisions {
-                // Revalidate against the LATEST membership before the async
-                // Raft write: a node that died between planning and commit
-                // (or between two commits in this pass) must not receive the
-                // placement. `members`/`reports` were snapshotted at the top
-                // of the tick; membership can move under a slow write. A
-                // suspect node still holds the placements it kept.
-                let live: HashSet<NodeId> = membership_rx
-                    .borrow()
-                    .iter()
-                    .filter(|m| matches!(m.state, NodeState::Alive | NodeState::Suspect))
-                    .map(|m| m.node_id.clone())
-                    .collect();
-                if !decision
-                    .placements
-                    .iter()
-                    .all(|p| live.contains(&p.node_id))
+            // A pass owns one original revision, even if unrelated entries
+            // commit while we plan. Refreshing it would admit a stale plan.
+            let live: HashSet<NodeId> = membership_rx
+                .borrow()
+                .iter()
+                .filter(|m| matches!(m.state, NodeState::Alive | NodeState::Suspect))
+                .map(|m| m.node_id.clone())
+                .collect();
+            if !decisions.is_empty()
+                && decisions.iter().all(|decision| {
+                    decision
+                        .placements
+                        .iter()
+                        .all(|p| live.contains(&p.node_id))
+                })
+            {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    council.write(RaftRequest::SchedulingDecisions {
+                        expected_log_id: desired.last_applied_log,
+                        decisions,
+                    }),
+                )
+                .await
                 {
-                    eprintln!(
-                        "scheduler: dropping stale placement for {} (a target node left mid-pass)",
-                        decision.app_id
-                    );
-                    continue;
-                }
-                if let Err(e) = council
-                    .write(RaftRequest::SchedulingDecision(decision.clone()))
-                    .await
-                {
-                    eprintln!(
-                        "scheduler: failed to commit placement for {}: {e}",
-                        decision.app_id
-                    );
+                    Ok(Ok(crate::council::types::CouncilResponse::Refused { reason })) => {
+                        eprintln!("scheduler: placement pass refused: {reason}")
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("scheduler: failed to commit placement pass: {error}")
+                    }
+                    Err(_) => eprintln!(
+                        "scheduler: placement acknowledgement timed out; outcome unknown; next tick replans from committed state"
+                    ),
+                    _ => {}
                 }
             }
             // Why an app isn't placed is durable council state, so any node
@@ -646,6 +654,8 @@ fn plan_pass(
 ) -> PassPlan {
     use crate::meat::scheduler::Scheduler;
 
+    crate::meat::admission::reserve_commitments(cache, desired);
+
     for node_id in cache.node_ids() {
         if desired
             .security_state
@@ -656,22 +666,6 @@ fn plan_pass(
         {
             node.ready = false;
             cache.set_node(node);
-        }
-    }
-    // Reports can lag committed assignments by several ticks. Reconstruct
-    // missing reservations before admitting any app, including when all of
-    // an earlier app's placements are already converged.
-    for (app_id, placements) in &desired.scheduling {
-        let mut counts = HashMap::<NodeId, u32>::new();
-        for placement in placements {
-            let committed = counts.entry(placement.node_id.clone()).or_default();
-            *committed += 1;
-            let reported = cache
-                .get_node(&placement.node_id)
-                .map_or(0, |node| node.replicas_of(app_id));
-            if *committed > reported {
-                cache.reserve(&placement.node_id, app_id, &placement.resources);
-            }
         }
     }
     let retired: HashSet<NodeId> = desired
@@ -1220,8 +1214,25 @@ pub(crate) fn volume_home_away(
     spec: &AppSpec,
     live: &HashSet<String>,
 ) -> Option<NodeId> {
-    if !has_managed_volume(spec) || desired.stopped_apps.contains(app_id) {
+    if desired.stopped_apps.contains(app_id) {
         return None;
+    }
+    volume_homes(desired, app_id, spec)
+        .into_iter()
+        .find(|node| !live.contains(&node.0))
+}
+
+/// Every node that holds `app_id`'s managed volumes, live or not: its
+/// placements, or with none (a stopped app), the nodes it last ran on, less
+/// any decommissioned node, in placement order without repeats. Empty for an
+/// app without a managed volume.
+pub(crate) fn volume_homes(
+    desired: &crate::council::types::DesiredState,
+    app_id: &crate::meat::types::AppId,
+    spec: &AppSpec,
+) -> Vec<NodeId> {
+    if !has_managed_volume(spec) {
+        return Vec::new();
     }
     let placed: Vec<&NodeId> = desired
         .scheduling
@@ -1238,10 +1249,13 @@ pub(crate) fn volume_home_away(
         placed
     };
     let retired = &desired.security_state.crl.retired_nodes;
-    homes
-        .into_iter()
-        .find(|node| !live.contains(&node.0) && !retired.contains_key(&node.0))
-        .cloned()
+    let mut unique: Vec<NodeId> = Vec::new();
+    for node in homes {
+        if !retired.contains_key(&node.0) && !unique.contains(node) {
+            unique.push(node.clone());
+        }
+    }
+    unique
 }
 
 /// Whether a fixed-size app keeps state in a managed volume, which lives on
@@ -1271,7 +1285,7 @@ fn node_can_run(
 fn has_stale_member(members: &[MembershipSnapshot], reports: &AggregatedState) -> bool {
     members
         .iter()
-        .any(|member| reports.stale_nodes.contains(&member.node_id))
+        .any(|member| !reports.report_is_fresh(&member.node_id))
 }
 
 /// The members gossip currently puts in `state`.
@@ -1335,11 +1349,7 @@ fn daemon_eligible_count(
 /// The per-replica resources an app requests, for quota accounting. Mirrors
 /// the scheduler's `extract_resources` (request values, zero when unset).
 fn scheduler_resources(spec: &AppSpec) -> Resources {
-    Resources::new(
-        spec.cpu.as_ref().map(|r| r.request).unwrap_or(0),
-        spec.memory.as_ref().map(|r| r.request).unwrap_or(0),
-        spec.gpu.unwrap_or(0),
-    )
+    crate::meat::admission::app_requests(spec)
 }
 
 /// The replica count the scheduler should target for an app: the
@@ -1650,6 +1660,9 @@ fn build_cluster_cache(
         if member.state != NodeState::Alive {
             continue;
         }
+        if !reports.report_is_fresh(&member.node_id) {
+            continue;
+        }
         let Some(report) = reports.reports.get(&member.node_id) else {
             continue;
         };
@@ -1697,6 +1710,18 @@ fn build_cluster_cache(
             // inert rather than fed guesses.
             cached_images: HashSet::new(),
         });
+        for instance in &report.running_apps {
+            cache.record_reported_instance(
+                &member.node_id,
+                &crate::meat::AppId::new(&instance.app_name, &instance.namespace),
+                instance.instance_id,
+                Resources::new(
+                    u64::from(instance.resource_usage.cpu_millicores),
+                    u64::from(instance.resource_usage.memory_mb) * 1024 * 1024,
+                    0,
+                ),
+            );
+        }
     }
     cache
 }
@@ -4422,6 +4447,8 @@ image = "busybox:latest"
         let members = vec![member("a", 1), dead, member("unreported", 3)];
 
         let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
@@ -4432,6 +4459,16 @@ image = "busybox:latest"
         // but has no report — both are excluded.
         reports.reports.insert(NodeId::new("dead"), report(4000, 0));
 
+        reports.receive_deadlines = reports
+            .reports
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+            })
+            .collect();
         let cache = build_cluster_cache(&members, &reports);
         assert_eq!(cache.node_count(), 1);
         let node = cache.get_node(&NodeId::new("a")).unwrap();
@@ -4470,13 +4507,25 @@ image = "busybox:latest"
             egress_degraded: false,
             egress_affected_workloads: Vec::new(),
         };
-        let reports = AggregatedState {
+        let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
             reports: HashMap::from([(NodeId::new("guarded"), guarded)]),
             stale_nodes: vec![],
             capabilities: HashMap::from([(NodeId::new("guarded"), capability)]),
             readiness: HashMap::new(),
         };
 
+        reports.receive_deadlines = reports
+            .reports
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+            })
+            .collect();
         let cache = build_cluster_cache(&members, &reports);
 
         assert!(
@@ -4511,13 +4560,25 @@ image = "busybox:latest"
                 namespace: "prod".to_string(),
             }],
         };
-        let reports = AggregatedState {
+        let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
             reports: HashMap::from([(NodeId::new("unsafe"), unsafe_report)]),
             stale_nodes: vec![],
             capabilities: HashMap::from([(NodeId::new("unsafe"), capability)]),
             readiness: HashMap::new(),
         };
 
+        reports.receive_deadlines = reports
+            .reports
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+            })
+            .collect();
         let cache = build_cluster_cache(&members, &reports);
 
         assert!(!cache.get_node(&NodeId::new("unsafe")).unwrap().ready);
@@ -4527,6 +4588,8 @@ image = "busybox:latest"
     fn cache_skips_zero_capacity_reports() {
         let members = vec![member("zero", 1)];
         let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
@@ -4534,6 +4597,16 @@ image = "busybox:latest"
         };
         reports.reports.insert(NodeId::new("zero"), report(0, 0));
 
+        reports.receive_deadlines = reports
+            .reports
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+            })
+            .collect();
         let cache = build_cluster_cache(&members, &reports);
         assert_eq!(cache.node_count(), 0);
     }
@@ -4657,6 +4730,8 @@ image = "busybox:latest"
         // the catalogue must carry both backends with each node's real IP.
         let members = vec![member("node-a", 5001), member("node-b", 5002)];
         let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
@@ -4813,6 +4888,8 @@ image = "busybox:latest"
         // both skipped — nothing to resolve.
         let members = vec![member("node-a", 5001)];
         let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
@@ -5471,6 +5548,16 @@ image = "busybox:latest"
             .insert(NodeId::new("busy"), readiness("busy", true));
         reports.stale_nodes.push(NodeId::new("home"));
         let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+        reports.receive_deadlines = reports
+            .reports
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+            })
+            .collect();
         let mut cache = build_cluster_cache(&members, &reports);
         let unheard = unheard_nodes(&alive, &reports);
 
@@ -6309,6 +6396,7 @@ image = "busybox:latest"
                 gpu: None,
                 max_apps: None,
                 max_replicas: None,
+                secret_key: false,
             },
         );
         let a = AppId::new("greedy", "prod");
@@ -6406,6 +6494,7 @@ image = "busybox:latest"
             gpu: None,
             max_apps: None,
             max_replicas: None,
+            secret_key: false,
         }
     }
 
@@ -6541,6 +6630,7 @@ image = "busybox:latest"
                 gpu: None,
                 max_apps: None,
                 max_replicas: None,
+                secret_key: false,
             },
         );
         let a = AppId::new("modest", "prod");
@@ -6670,6 +6760,26 @@ mod audit_stale_endpoints {
         };
         let members = vec![member("planned")];
         let mut reports = AggregatedState::default();
+        let node = NodeId::new("planned");
+        reports.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        );
+        reports.reports.insert(
+            node.clone(),
+            crate::reporting::types::StateReport {
+                node_id: node,
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                running_apps: vec![],
+                cached_specs: vec![],
+                resource_usage: crate::reporting::types::ResourceUsage {
+                    cpu_total_millicores: 1000,
+                    ..Default::default()
+                },
+                event_log: vec![],
+                has_buildah: false,
+            },
+        );
         assert!(!has_stale_member(&members, &reports));
         reports.stale_nodes.push(NodeId::new("retired"));
         assert!(!has_stale_member(&members, &reports));
@@ -6790,6 +6900,13 @@ mod audit_daemon_self_reservation {
         a.app_replicas.insert(app.clone(), 1);
         let mut fresh = ClusterStateCache::new();
         fresh.set_node(a);
+        let ordinal = first[0]
+            .placements
+            .iter()
+            .find(|placement| placement.node_id == NodeId::new("a"))
+            .unwrap()
+            .ordinal;
+        fresh.record_reported_instance(&NodeId::new("a"), &app, ordinal, Resources::new(600, 0, 0));
         fresh.set_node(sched_node("b", 1000, BTreeMap::new()));
         let second =
             plan_scheduling_pass(&mut fresh, &desired, &alive, &mut QuotaLedger::default());
@@ -7089,6 +7206,7 @@ mod revalidation_in_place {
         let mut cache = ClusterStateCache::new();
         cache.set_node(home);
         cache.set_node(busy);
+        cache.record_reported_instance(&NodeId::new("home"), app, 0, Resources::new(600, 0, 0));
         cache
     }
 
@@ -7124,6 +7242,198 @@ mod revalidation_in_place {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn assert_reported_footprint(
+        batch: bool,
+        reported_cpu: u32,
+        ordinal: u32,
+        extra_cpu: u64,
+        should_place: bool,
+    ) {
+        let mut desired = DesiredState::default();
+        let name = if batch {
+            "opaque-execution"
+        } else {
+            "existing-app"
+        };
+        if batch {
+            desired.batch_state.register(serde_json::from_value(serde_json::json!({
+                        "submitted_at_epoch_secs": 1, "jobs": [{"name":"logical", "namespace":"default", "execution_name":name,
+                        "spec_digest":"a".repeat(64), "node":"home", "status":"Pending", "resources":{"cpu_millicores":500,"memory_bytes":0,"gpus":0}}]
+                    })).unwrap()).unwrap();
+        } else {
+            let app = AppId::new(name, "default");
+            desired
+                .apps
+                .insert(app.clone(), requesting(500, Replicas::Fixed(1)));
+            desired.scheduling.insert(
+                app,
+                vec![Placement {
+                    node_id: NodeId::new("home"),
+                    resources: Resources::new(500, 0, 0),
+                    ordinal: 0,
+                }],
+            );
+        }
+        let extra = AppId::new("z-extra", "default");
+        desired
+            .apps
+            .insert(extra.clone(), requesting(extra_cpu, Replicas::Fixed(1)));
+        let member = MembershipSnapshot {
+            node_id: NodeId::new("home"),
+            address: "127.0.0.1:9117".parse().unwrap(),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: Default::default(),
+            first_seen: std::time::Instant::now(),
+            resources: None,
+        };
+        let mut reports = AggregatedState::default();
+        reports.receive_deadlines.insert(
+            member.node_id.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        );
+        reports.readiness.insert(
+            member.node_id.clone(),
+            crate::reporting::types::NodeReadinessReport {
+                node_id: member.node_id.clone(),
+                evidence: crate::bun::readiness::NodeReadinessEvidence {
+                    ready: true,
+                    observed_at_unix_ms: 0,
+                    subsystems: Vec::new(),
+                },
+            },
+        );
+        reports.reports.insert(
+            member.node_id.clone(),
+            crate::reporting::types::StateReport {
+                node_id: member.node_id.clone(),
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                has_buildah: false,
+                cached_specs: Vec::new(),
+                event_log: Vec::new(),
+                resource_usage: crate::reporting::types::ResourceUsage {
+                    cpu_total_millicores: 1000,
+                    cpu_used_millicores: reported_cpu,
+                    memory_total_mb: 8192,
+                    ..Default::default()
+                },
+                running_apps: vec![crate::reporting::types::RunningApp {
+                    execution: None,
+                    app_name: name.into(),
+                    namespace: "default".into(),
+                    instance_id: ordinal,
+                    image: "x:1".into(),
+                    port: None,
+                    health_status: crate::reporting::types::ReportHealthStatus::Healthy,
+                    uptime: Duration::ZERO,
+                    resource_usage: crate::reporting::types::AppResourceUsage {
+                        cpu_millicores: reported_cpu,
+                        memory_mb: 0,
+                    },
+                }],
+            },
+        );
+        let mut cache = build_cluster_cache(&[member], &reports);
+        let decisions = plan_scheduling_pass(
+            &mut cache,
+            &desired,
+            &HashSet::from([NodeId::new("home")]),
+            &mut QuotaLedger::default(),
+        );
+        assert_eq!(
+            !placements_of(&decisions, &extra).is_empty(),
+            should_place,
+            "batch={batch},reported={reported_cpu},ordinal={ordinal}: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_app_partial_request_cannot_credit_the_full_placement() {
+        assert_reported_footprint(false, 250, 0, 600, false);
+    }
+
+    #[test]
+    fn ordinary_app_other_ordinal_cannot_credit_the_committed_instance() {
+        assert_reported_footprint(false, 500, 1, 500, false);
+    }
+
+    #[test]
+    fn ordinary_app_exact_complete_report_is_counted_once() {
+        assert_reported_footprint(false, 500, 0, 500, true);
+    }
+
+    #[test]
+    fn owned_batch_partial_request_cannot_credit_the_full_reservation() {
+        assert_reported_footprint(true, 250, 0, 600, false);
+    }
+
+    #[test]
+    fn owned_batch_other_ordinal_cannot_credit_execution_zero() {
+        assert_reported_footprint(true, 500, 1, 500, false);
+    }
+
+    #[test]
+    fn owned_batch_exact_complete_report_is_counted_once() {
+        assert_reported_footprint(true, 500, 0, 500, true);
+    }
+
+    #[test]
+    fn ordinary_apps_respect_unreported_batch_reservations_and_exact_namespace_dedup() {
+        for reported_namespace in [None, Some("default"), Some("other")] {
+            let mut desired = DesiredState::default();
+            let app = AppId::new("web", "default");
+            desired
+                .apps
+                .insert(app.clone(), requesting(4000, Replicas::Fixed(1)));
+            let batch: crate::meat::batch_tracker::BatchRecord = serde_json::from_value(serde_json::json!({
+                "submitted_at_epoch_secs": 1,
+                "jobs": [{"name":"logical", "namespace":"default", "execution_name":"opaque-owned",
+                    "spec_digest":"a".repeat(64), "node":"home", "status":"Pending",
+                    "resources":{"cpu_millicores":5000,"memory_bytes":0,"gpus":0}}]
+            })).unwrap();
+            desired.batch_state.register(batch).unwrap();
+            let mut home = node("home", 8000, "east");
+            if let Some(namespace) = reported_namespace {
+                home.allocated = Resources::new(5000, 0, 0);
+                home.app_replicas
+                    .insert(AppId::new("opaque-owned", namespace), 1);
+            }
+            let mut cache = ClusterStateCache::new();
+            cache.set_node(home);
+            if let Some(namespace) = reported_namespace {
+                cache.record_reported_instance(
+                    &NodeId::new("home"),
+                    &AppId::new("opaque-owned", namespace),
+                    0,
+                    Resources::new(5000, 0, 0),
+                );
+            }
+            let decisions = plan_scheduling_pass(
+                &mut cache,
+                &desired,
+                &HashSet::from([NodeId::new("home")]),
+                &mut QuotaLedger::default(),
+            );
+            assert!(
+                placements_of(&decisions, &app).is_empty(),
+                "namespace={reported_namespace:?}: {decisions:?}"
+            );
+            let allocated = cache
+                .get_node(&NodeId::new("home"))
+                .unwrap()
+                .allocated
+                .cpu_millicores;
+            let expected = if reported_namespace == Some("other") {
+                10000
+            } else {
+                5000
+            };
+            assert_eq!(allocated, expected, "namespace={reported_namespace:?}");
+        }
     }
 
     #[test]
@@ -7233,6 +7543,7 @@ mod revalidation_in_place {
         home.allocated = Resources::new(600, 0, 0);
         home.app_replicas.insert(app.clone(), 1);
         cache.set_node(home);
+        cache.record_reported_instance(&NodeId::new("home"), &app, 0, Resources::new(600, 0, 0));
 
         let decisions = plan_scheduling_pass(
             &mut cache,
@@ -7269,5 +7580,120 @@ mod revalidation_in_place {
         assert_eq!(placements_of(&decisions, &app), [("home".to_string(), 900)]);
         let home = cache.get_node(&NodeId::new("home")).unwrap();
         assert_eq!(home.allocated.cpu_millicores, 900);
+    }
+}
+
+// Append to src/cluster/orchestrate.rs after integrating root534 + actual543.
+#[cfg(test)]
+mod audit_prerequisite_capacity {
+    use super::*;
+    use crate::council::prerequisites::PrerequisiteClaim;
+    use crate::meat::types::AppId;
+
+    fn approved() -> Config {
+        Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nimage='migration:v1'\ncpu='5'\nrun_before=['app.web']\n[job.notify]\nimage='notify:v1'\ncpu='3'\n").unwrap()
+    }
+    fn candidates() -> ClusterStateCache {
+        let mut cache = ClusterStateCache::new();
+        for name in ["a", "b"] {
+            cache.set_node(SchedulerNodeState {
+                node_id: NodeId::new(name),
+                allocatable: Resources::new(8000, 16 * 1024 * 1024 * 1024, 0),
+                allocated: Resources::default(),
+                labels: Default::default(),
+                ready: true,
+                capabilities: Default::default(),
+                app_replicas: Default::default(),
+                uptime_secs: 100,
+                cached_images: Default::default(),
+            });
+        }
+        cache
+    }
+    fn probe(cpu: u64) -> (AppId, AppSpec) {
+        let id = AppId::new("capacity-probe", "another-namespace");
+        let mut spec: AppSpec = toml::from_str("image='probe:v1'").unwrap();
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu,
+            limit: cpu,
+        });
+        (id, spec)
+    }
+    fn run(desired: &crate::council::types::DesiredState, cpu: u64) -> (ClusterStateCache, bool) {
+        let mut desired = desired.clone();
+        let (id, spec) = probe(cpu);
+        desired.apps.insert(id.clone(), spec);
+        let mut cache = candidates();
+        let decisions = plan_scheduling_pass(
+            &mut cache,
+            &desired,
+            &HashSet::from([NodeId::new("a"), NodeId::new("b")]),
+            &mut crate::meat::quota::QuotaLedger::default(),
+        );
+        let placed = decisions
+            .iter()
+            .any(|decision| decision.app_id == id && !decision.placements.is_empty());
+        (cache, placed)
+    }
+    #[test]
+    fn ordinary_placement_subtracts_precommit_jobs_from_every_candidate_before_reports_arrive() {
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.prerequisite_claims.insert(
+            "1234567890abcdef1234567890abcdef".into(),
+            PrerequisiteClaim {
+                term: 1,
+                recovery_epoch: 0,
+                apps_committed: false,
+                config: approved(),
+            },
+        );
+        let (cache, placed) = run(&desired, 4000);
+        assert!(
+            !placed,
+            "planner spent capacity held by an unreported migration/ordinary job"
+        );
+        for node in ["a", "b"] {
+            let state = cache.get_node(&NodeId::new(node)).unwrap();
+            assert_eq!(state.allocated.cpu_millicores, 8000, "{node}");
+            assert_eq!(
+                state.replicas_of(&AppId::new("migrate", "default")),
+                0,
+                "a reservation invented a report replica"
+            );
+        }
+        desired
+            .prerequisite_claims
+            .values_mut()
+            .next()
+            .unwrap()
+            .term = 99;
+        let (_, placed) = run(&desired, 4000);
+        assert!(!placed, "a different owner term is not proof of settlement");
+    }
+    #[test]
+    fn ordinary_placement_releases_migration_after_commit_but_keeps_the_ordinary_tail() {
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.prerequisite_claims.insert(
+            "1234567890abcdef1234567890abcdef".into(),
+            PrerequisiteClaim {
+                term: 1,
+                recovery_epoch: 0,
+                apps_committed: true,
+                config: approved(),
+            },
+        );
+        let (_, placed) = run(&desired, 6000);
+        assert!(!placed, "ordinary tail's 3000m reservation disappeared");
+        let (_, placed) = run(&desired, 4000);
+        assert!(
+            placed,
+            "completed migration's 5000m reservation survived commit"
+        );
+        desired.prerequisite_claims.clear();
+        let (_, placed) = run(&desired, 8000);
+        assert!(
+            placed,
+            "positively released ownership still blocked placement"
+        );
     }
 }

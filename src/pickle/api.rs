@@ -128,6 +128,12 @@ impl PickleState {
         headers: &HeaderMap,
         principal: Option<&crate::sesame::auth::AuthContext>,
     ) -> Result<RegistryWriteAccess, Response> {
+        if self.quota.total_bytes != 0 {
+            self.store
+                .configure_storage_limit(self.quota.total_bytes)
+                .await
+                .map_err(registry_write_error)?;
+        }
         let lease = headers
             .get("x-reliaburger-test-lease")
             .map(|value| value.to_str())
@@ -203,7 +209,11 @@ impl PickleState {
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
     async fn enforce_quota(&self, repository: &str, incoming: u64) -> Result<(), Response> {
-        if self.quota.is_unlimited() {
+        let logical_quota = QuotaConfig {
+            total_bytes: 0,
+            ..self.quota
+        };
+        if logical_quota.is_unlimited() {
             return Ok(());
         }
         let (repo_current, total_current) = self
@@ -211,7 +221,7 @@ impl PickleState {
             .await
             .map_err(registry_write_error)?;
         match super::registry_auth::check_quota(
-            &self.quota,
+            &logical_quota,
             repository,
             incoming,
             repo_current,
@@ -885,15 +895,14 @@ impl V2Route {
 ///
 /// A scoped reader may only name repositories in its scope. Blobs are stored
 /// once by digest and shared by every repository, so a scoped reader's blob
-/// GET must also be for a blob the named repository's catalogue references;
-/// otherwise `team-a/web/blobs/<team-b's layer digest>` would hand over
-/// another namespace's layer. A HEAD answers only "does this digest exist",
-/// which is what a push asks before uploading, so it skips that lookup.
+/// reads and publication require a catalogue reference or a completed upload
+/// into this repository. HEAD follows the same rule so clients upload bytes
+/// they cannot yet reuse. Physical presence alone confers no authority.
 // `Response` is large but it IS the HTTP reply to send on failure.
 #[allow(clippy::result_large_err)]
 async fn authorise_repository_read(
     state: &PickleState,
-    method: &axum::http::Method,
+    _method: &axum::http::Method,
     route: &V2Route,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
@@ -902,14 +911,18 @@ async fn authorise_repository_read(
     let V2Route::Blob { name, digest } = route else {
         return Ok(());
     };
-    if method != axum::http::Method::GET || !super::registry_auth::is_scoped(reader.as_ref()) {
+    if !super::registry_auth::is_scoped(reader.as_ref()) {
         return Ok(());
     }
     let catalog = state
         .catalog_snapshot(name)
         .await
         .map_err(registry_write_error)?;
-    if catalog.referenced_digest_set().contains(digest.as_str()) {
+    let Ok(parsed) = Digest::new(digest) else {
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    };
+    let authority = RepositoryBlobAuthority::new(&state.store, name, &catalog);
+    if authority.contains(&parsed).map_err(registry_write_error)? {
         Ok(())
     } else {
         Err(oci_error(
@@ -1053,7 +1066,7 @@ async fn blob_upload_initiate(
             .await
         {
             Ok(id) => id,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(error) => return registry_write_error(error),
         };
         drop(access);
         return blob_upload_complete(state, name, &upload_id, &digest_str, headers_in, body).await;
@@ -1075,7 +1088,7 @@ async fn blob_upload_initiate(
             );
             (StatusCode::ACCEPTED, headers).into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(error) => registry_write_error(error),
     }
 }
 
@@ -1190,7 +1203,7 @@ async fn stream_upload(
                 .store
                 .write_upload_chunk(upload_id, &chunk)
                 .await
-                .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+                .map_err(registry_write_error)?;
         }
         state
             .store
@@ -1298,7 +1311,7 @@ async fn blob_upload_complete(
     state.sessions.retire(upload_id).await;
     let result = state
         .store
-        .complete_upload_guarded(upload_id, &digest, Some(writer), access.guard.clone())
+        .complete_repository_upload_guarded(upload_id, &digest, writer, access, name)
         .await;
     if result.is_ok() {
         state.sessions.complete(upload_id).await;
@@ -1331,6 +1344,7 @@ async fn blob_upload_complete(
         Err(super::types::PickleError::InvalidUploadId(_)) => {
             StatusCode::BAD_REQUEST.into_response()
         }
+        Err(error @ super::types::PickleError::StorageQuotaExceeded) => registry_write_error(error),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1397,6 +1411,7 @@ const INDEX_MEDIA_TYPES: [&str; 2] = [
 
 fn registry_write_error(error: super::types::PickleError) -> Response {
     let status = match error {
+        super::types::PickleError::StorageQuotaExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         super::types::PickleError::LeaseDenied(_) => StatusCode::FORBIDDEN,
         super::types::PickleError::ReplicationFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1416,6 +1431,39 @@ fn oci_error(status: StatusCode, code: &str, message: String) -> Response {
         .into_response()
 }
 
+/// Repository authority uses current catalogue references and durable evidence
+/// of bytes uploaded under this repository's exact ownership generation.
+struct RepositoryBlobAuthority<'a> {
+    store: &'a BlobStore,
+    repository: &'a str,
+    lease: Option<&'a str>,
+    references: std::collections::HashSet<String>,
+}
+
+impl<'a> RepositoryBlobAuthority<'a> {
+    fn new(store: &'a BlobStore, repository: &'a str, catalog: &'a ManifestCatalog) -> Self {
+        Self {
+            store,
+            repository,
+            lease: catalog
+                .repository_owners
+                .get(repository)
+                .map(String::as_str),
+            references: catalog.referenced_digest_set(),
+        }
+    }
+
+    fn contains(&self, digest: &Digest) -> Result<bool, super::types::PickleError> {
+        if super::lease::is_test_repository(self.repository) && self.lease.is_none() {
+            return Ok(false);
+        }
+        Ok(self.references.contains(digest.as_str())
+            || self
+                .store
+                .has_repository_upload(digest, self.repository, self.lease)?)
+    }
+}
+
 /// Validate one manifest descriptor against the local blob store:
 /// well-formed digest, blob present (OCI push order puts blobs before
 /// the manifest), and size matching what's actually on disk.
@@ -1426,6 +1474,7 @@ fn check_descriptor(
     store: &BlobStore,
     what: &str,
     descriptor: &OciDescriptor,
+    authority: Option<&RepositoryBlobAuthority<'_>>,
 ) -> Result<LayerDescriptor, Box<Response>> {
     let digest = Digest::new(&descriptor.digest).map_err(|e| {
         Box::new(oci_error(
@@ -1440,6 +1489,21 @@ fn check_descriptor(
             "MANIFEST_BLOB_UNKNOWN",
             format!("{what} blob {digest} is not present in the registry"),
         )));
+    }
+    if let Some(authority) = authority {
+        match authority.contains(&digest) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Box::new(oci_error(
+                    StatusCode::FORBIDDEN,
+                    "DENIED",
+                    format!(
+                        "{what} blob {digest} has no upload or catalogue authority in this repository"
+                    ),
+                )));
+            }
+            Err(error) => return Err(Box::new(registry_write_error(error))),
+        }
     }
     let actual_size = store.blob_size(&digest).unwrap_or(0);
     if actual_size != descriptor.size {
@@ -1583,6 +1647,17 @@ async fn manifest_put(
         );
     };
 
+    let authority_catalog = if super::registry_auth::is_scoped(principal.as_ref()) {
+        match state.catalog_snapshot(name).await {
+            Ok(catalog) => Some(catalog),
+            Err(error) => return registry_write_error(error),
+        }
+    } else {
+        None
+    };
+    let authority = authority_catalog
+        .as_ref()
+        .map(|catalog| RepositoryBlobAuthority::new(&state.store, name, catalog));
     let manifest = if INDEX_MEDIA_TYPES.contains(&media_type.as_str()) {
         // Image index / manifest list: every sub-manifest must already
         // be in the store (docker pushes them by digest first). The
@@ -1597,7 +1672,7 @@ async fn manifest_put(
         }
         let mut sub_manifests = Vec::new();
         for descriptor in &manifest_json.manifests {
-            match check_descriptor(&state.store, "sub-manifest", descriptor) {
+            match check_descriptor(&state.store, "sub-manifest", descriptor, authority.as_ref()) {
                 // Record the platform the index names, so an image listing
                 // can say which platforms the image offers.
                 Ok(layer) => sub_manifests.push(LayerDescriptor {
@@ -1632,13 +1707,13 @@ async fn manifest_put(
                 "manifest has no config descriptor".to_string(),
             );
         };
-        let config = match check_descriptor(&state.store, "config", config) {
+        let config = match check_descriptor(&state.store, "config", config, authority.as_ref()) {
             Ok(layer) => layer,
             Err(response) => return *response,
         };
         let mut layers = Vec::new();
         for descriptor in &manifest_json.layers {
-            match check_descriptor(&state.store, "layer", descriptor) {
+            match check_descriptor(&state.store, "layer", descriptor, authority.as_ref()) {
                 Ok(layer) => layers.push(layer),
                 Err(response) => return *response,
             }
@@ -1680,11 +1755,7 @@ async fn manifest_put(
     )
     .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to store manifest blob: {e}")})),
-        )
-            .into_response();
+        return registry_write_error(e);
     }
     if let Err(error) =
         record_commit_with_access(state, manifest, reference.to_string(), &access).await
@@ -3860,6 +3931,53 @@ mod tests {
             .map(|value| value.to_str().unwrap().to_string())
     }
 
+    #[tokio::test]
+    async fn registry_reads_and_writes_share_the_api_verification_admission() {
+        let (state, _dir, deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        for authorization in [format!("Bearer {deployer}"), basic("ci", &deployer)] {
+            for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
+                let permits = crate::sesame::auth::hold_all_verify_permits().await;
+                let request =
+                    app.clone()
+                        .oneshot(client_request(method, uri, Some(&authorization), true));
+                tokio::pin!(request);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(20), &mut request)
+                        .await
+                        .is_err(),
+                    "{method} registry verification bypassed the shared admission"
+                );
+                drop(permits);
+                let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                    .await
+                    .expect("registry verification should resume after admission opens")
+                    .unwrap();
+                assert!(response.status().is_success());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_registry_credentials_do_not_wait_for_verification_admission() {
+        let (state, _dir, _deployer, _reader) = standard_client_state().await;
+        let app = test_router(state);
+        let _permits = crate::sesame::auth::hold_all_verify_permits().await;
+        for authorization in ["Bearer invalid".to_string(), basic("ci", "invalid")] {
+            for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    app.clone()
+                        .oneshot(client_request(method, uri, Some(&authorization), true)),
+                )
+                .await
+                .expect("malformed credentials should be refused before hashing")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+
     /// `docker login` probes `GET /v2/` with the stored credential; a
     /// Deployer token as the Basic password must answer 200.
     #[tokio::test]
@@ -4336,6 +4454,161 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_publication_requires_authority_for_every_descriptor() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let ordinary = b"{}";
+        let other_digest = compute_sha256(ordinary);
+        assert_eq!(
+            push_image(
+                &app,
+                "team-b/web",
+                &format!("Bearer {}", tokens.deployer),
+                false,
+                ordinary
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let response = app
+            .clone()
+            .oneshot(with_body(
+                client_request(
+                    "PUT",
+                    "/v2/team-a/web/manifests/v1",
+                    Some(&format!("Bearer {}", tokens.team_a_deployer)),
+                    true,
+                ),
+                manifest_body(&other_digest, ordinary.len()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "physical presence is not descriptor authority"
+        );
+        let response = app
+            .oneshot(client_request(
+                "GET",
+                &format!("/v2/team-a/web/blobs/{}", other_digest.as_str()),
+                Some(&format!("Bearer {}", tokens.team_a_reader)),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scoped_blob_probe_does_not_skip_a_required_repository_upload() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let ordinary = b"{}";
+        let digest = compute_sha256(ordinary);
+        assert_eq!(
+            push_image(
+                &app,
+                "team-b/web",
+                &format!("Bearer {}", tokens.deployer),
+                false,
+                ordinary
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let response = app
+            .oneshot(client_request(
+                "HEAD",
+                &format!("/v2/team-a/web/blobs/{}", digest.as_str()),
+                Some(&format!("Bearer {}", tokens.team_a_deployer)),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a client must upload bytes it cannot reuse authoritatively"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_layer_and_index_publication_need_destination_authority() {
+        let (state, _dir, tokens) = scoped_state().await;
+        let app = test_router(state);
+        let other = b"{}";
+        let other_config = compute_sha256(other);
+        let foreign_manifest = manifest_body(&other_config, other.len());
+        assert_eq!(
+            push_image(
+                &app,
+                "team-b/web",
+                &format!("Bearer {}", tokens.deployer),
+                false,
+                other
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let own = b"own configuration";
+        let own_config = compute_sha256(own);
+        let authorization = format!("Bearer {}", tokens.team_a_deployer);
+        assert_eq!(
+            push_image(&app, "team-a/web", &authorization, true, own).await,
+            StatusCode::CREATED
+        );
+        let layer_body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion":2, "mediaType":"application/vnd.oci.image.manifest.v1+json",
+            "config":{"digest":own_config.as_str(),"size":own.len()},
+            "layers":[{"digest":other_config.as_str(),"size":other.len()}]
+        }))
+        .unwrap();
+        let index_body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion":2, "mediaType":"application/vnd.oci.image.index.v1+json",
+            "manifests":[{"digest":compute_sha256(&foreign_manifest).as_str(),"size":foreign_manifest.len()}]
+        })).unwrap();
+        for body in [layer_body, index_body] {
+            let response = app
+                .clone()
+                .oneshot(with_body(
+                    client_request(
+                        "PUT",
+                        "/v2/team-a/web/manifests/foreign",
+                        Some(&authorization),
+                        true,
+                    ),
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        // A normal push supplies the destination bytes and remains usable.
+        assert_eq!(
+            push_image(&app, "team-a/web", &authorization, true, other).await,
+            StatusCode::CREATED
+        );
+        let own_index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion":2, "mediaType":"application/vnd.oci.image.index.v1+json",
+            "manifests":[{"digest":compute_sha256(&foreign_manifest).as_str(),"size":foreign_manifest.len()}]
+        })).unwrap();
+        let response = app
+            .oneshot(with_body(
+                client_request(
+                    "PUT",
+                    "/v2/team-a/web/manifests/index",
+                    Some(&authorization),
+                    true,
+                ),
+                own_index,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -5100,6 +5373,128 @@ mod tests {
             );
         }
         assert!(state.catalog_snapshot("ordinary").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn physical_quota_counts_bare_blobs_without_a_manifest() {
+        let (mut state, _dir) = test_state();
+        state.quota.total_bytes = 2 + serde_json::to_vec(&("web", Option::<&str>::None))
+            .unwrap()
+            .len() as u64;
+        let app = test_router(state.clone());
+        for (bytes, expected) in [
+            (b"aa".as_slice(), StatusCode::CREATED),
+            (b"bb".as_slice(), StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let digest = compute_sha256(bytes);
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+                        .body(Body::from(bytes.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "bare blobs consume the physical ceiling"
+            );
+        }
+        assert_eq!(state.store.list_blobs().unwrap().len(), 1);
+        assert!(state.catalog.read().await.manifests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn physical_quota_refuses_an_oversized_chunk_before_disk_growth() {
+        let (mut state, _dir) = test_state();
+        state.quota.total_bytes = 2;
+        let app = test_router(state.clone());
+        let started = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let location = started.headers()["location"].to_str().unwrap();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri(location)
+                    .body(Body::from(b"oversized".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let paths = std::fs::read_dir(state.store.base_dir().join("uploads")).unwrap();
+        assert_eq!(
+            paths
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_quota_counts_distinct_repository_receipts_for_one_shared_blob() {
+        let (mut state, _dir) = test_state();
+        let receipt_bytes = serde_json::to_vec(&("repo-0", Option::<&str>::None))
+            .unwrap()
+            .len() as u64;
+        // The third upload copy still fits; its new receipt must be refused
+        // after digest verification rather than growing metadata past the cap.
+        state.quota.total_bytes = 4 + 2 * receipt_bytes;
+        let app = test_router(state.clone());
+        let digest = compute_sha256(b"aa");
+        for index in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v2/repo-{index}/blobs/uploads/?digest={}",
+                            digest.as_str()
+                        ))
+                        .body(Body::from(b"aa".to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if index < 2 {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+        }
+        assert_eq!(state.store.list_blobs().unwrap().len(), 1);
+        let receipts = state
+            .store
+            .blob_path(&digest)
+            .parent()
+            .unwrap()
+            .join("repositories");
+        assert_eq!(std::fs::read_dir(receipts).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(state.store.base_dir().join("uploads"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     /// REG4: a push that would breach the repository quota is refused with

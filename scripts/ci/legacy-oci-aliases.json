@@ -1,0 +1,317 @@
+[
+  {
+    "source": "tests/owned_network.rs",
+    "function": "owned_network_setup_and_forwarding_retire_through_the_generation",
+    "binary": "reliaburger::owned_network",
+    "test": "owned_network_setup_and_forwarding_retire_through_the_generation",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_network",
+    "runtime": "linux-network-namespaces",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
+    "case_id": "legacy-oci-owned_network-owned_network_setup_and_forwarding_retire_through_the_generation"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "killed_network_caller_cannot_publish_a_veth_after_recovered_retirement",
+    "binary": "reliaburger::owned_network",
+    "test": "killed_network_caller_cannot_publish_a_veth_after_recovered_retirement",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_network",
+    "runtime": "linux-network-namespaces",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
+    "case_id": "legacy-oci-owned_network-killed_network_caller_cannot_publish_a_veth_after_recovered_retirement"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "same_node_containers_have_independent_host_and_peer_routes",
+    "binary": "reliaburger::owned_network",
+    "test": "same_node_containers_have_independent_host_and_peer_routes",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_network",
+    "runtime": "linux-network-namespaces",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
+    "case_id": "legacy-oci-owned_network-same_node_containers_have_independent_host_and_peer_routes"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "operator_cidr_reaches_the_api_port_but_not_cluster_ports",
+    "binary": "reliaburger::owned_network",
+    "test": "operator_cidr_reaches_the_api_port_but_not_cluster_ports",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_network",
+    "runtime": "linux-network-namespaces",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
+    "case_id": "legacy-oci-owned_network-operator_cidr_reaches_the_api_port_but_not_cluster_ports"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_preparation_recovers_original_intent_and_retires_without_adoption",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_preparation_recovers_original_intent_and_retires_without_adoption",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-runc_owned_preparation_recovers_original_intent_and_retires_without_adoption"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_adoption_validates_generation_and_restores_live_network",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_adoption_validates_generation_and_restores_live_network",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-runc_owned_adoption_validates_generation_and_restores_live_network"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_completed_log_reader_cannot_block_a_replacement_generation",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_completed_log_reader_cannot_block_a_replacement_generation",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-runc_owned_completed_log_reader_cannot_block_a_replacement_generation"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "following_a_large_capture_after_a_restart_does_not_hold_the_runtime",
+    "binary": "reliaburger::owned_runc",
+    "test": "following_a_large_capture_after_a_restart_does_not_hold_the_runtime",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-following_a_large_capture_after_a_restart_does_not_hold_the_runtime"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "generated_cgroup_path_matches_the_actual_container_before_its_first_instruction",
+    "binary": "reliaburger::owned_runc",
+    "test": "generated_cgroup_path_matches_the_actual_container_before_its_first_instruction",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-generated_cgroup_path_matches_the_actual_container_before_its_first_instruction"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "recovered_source_identity_belongs_to_the_container_not_its_launcher",
+    "binary": "reliaburger::owned_runc",
+    "test": "recovered_source_identity_belongs_to_the_container_not_its_launcher",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-recovered_source_identity_belongs_to_the_container_not_its_launcher"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "source_identity_refuses_a_container_moved_out_of_its_original_cgroup",
+    "binary": "reliaburger::owned_runc",
+    "test": "source_identity_refuses_a_container_moved_out_of_its_original_cgroup",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-source_identity_refuses_a_container_moved_out_of_its_original_cgroup"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "retiring_a_rollout_predecessor_preserves_its_live_successor",
+    "binary": "reliaburger::owned_runc",
+    "test": "retiring_a_rollout_predecessor_preserves_its_live_successor",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-retiring_a_rollout_predecessor_preserves_its_live_successor"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases",
+    "binary": "reliaburger::owned_runc",
+    "test": "retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "restart_recovers_a_retiring_generation_that_still_holds_its_address",
+    "binary": "reliaburger::owned_runc",
+    "test": "restart_recovers_a_retiring_generation_that_still_holds_its_address",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-restart_recovers_a_retiring_generation_that_still_holds_its_address"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "previous_boot_intent_cannot_start_or_remove_conflicting_live_resources",
+    "binary": "reliaburger::owned_runc",
+    "test": "previous_boot_intent_cannot_start_or_remove_conflicting_live_resources",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-previous_boot_intent_cannot_start_or_remove_conflicting_live_resources"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "restart_after_unit_cgroup_stop_recovers_a_running_generation",
+    "binary": "reliaburger::owned_runc",
+    "test": "restart_after_unit_cgroup_stop_recovers_a_running_generation",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-restart_after_unit_cgroup_stop_recovers_a_running_generation"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "restart_after_unit_cgroup_stop_recovers_a_retiring_generation",
+    "binary": "reliaburger::owned_runc",
+    "test": "restart_after_unit_cgroup_stop_recovers_a_retiring_generation",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-restart_after_unit_cgroup_stop_recovers_a_retiring_generation"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
+    "declared_owner": [
+      "make",
+      "test-linux"
+    ],
+    "gate": "oci-interruptions",
+    "group": "owned_runc",
+    "runtime": "runc",
+    "source_sha256": "2dc70dc4d301f244b8113651cc29f922056af74c1487af440332fe6dadd2e156",
+    "case_id": "legacy-oci-owned_runc-a_stale_adoption_record_retires_its_generation_and_others_still_adopt"
+  }
+]

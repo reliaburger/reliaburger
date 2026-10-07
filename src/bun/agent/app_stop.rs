@@ -365,7 +365,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Runtime retirement can release a reusable container address. Refuse
         // before that happens if an old VIP can still route to the address.
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        self.withdraw_service_ebpf(&service_id).await?;
+        if !self
+            .withdraw_backends_from_view(&service_id, &instances)
+            .await?
+        {
+            self.withdraw_service_ebpf(&service_id).await?;
+        }
         for id in &instances {
             let _ = self.service_map.remove_backend(&service_id, &id.0);
         }
@@ -388,6 +393,58 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             owns_job,
             taken_restarts,
         })
+    }
+
+    /// Take this node's `instances` out of the installed consumer view of
+    /// `id`, kernel entry first, and keep every other backend. Returns false
+    /// when this node has no consumer view of the service; the caller then
+    /// withdraws the whole entry, which names only local backends.
+    ///
+    /// In a cluster the kernel entry for a VIP is the whole view, other
+    /// nodes' backends included. Deleting it on a local stop refused every
+    /// local client with `EPERM` until the next catalogue arrived (#481).
+    /// A local rollout retires its old instances the same way.
+    pub(super) async fn withdraw_backends_from_view(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        instances: &[InstanceId],
+    ) -> Result<bool, BunError> {
+        if self.consumer_owner().is_none() {
+            return Ok(false);
+        }
+        let mut view: Vec<_> = self
+            .service_map_tx
+            .borrow()
+            .resolve_all()
+            .into_iter()
+            .cloned()
+            .collect();
+        let Some(entry) = view
+            .iter_mut()
+            .find(|entry| entry.namespace == id.namespace && entry.app_name == id.name)
+        else {
+            return Ok(false);
+        };
+        // Remote backends are never this stop's to remove, whatever their names.
+        entry.backends.retain(|backend| {
+            !(backend.local
+                && instances
+                    .iter()
+                    .any(|stopping| stopping.0 == backend.instance_id))
+        });
+        let view =
+            crate::onion::service_map::ServiceMap::from_snapshot(&view).map_err(|error| {
+                BunError::BackendRetirement {
+                    service: id.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        // Only this service's entry changes, so only it is rewritten. Wrapper
+        // keeps its routes until the next refresh rebuilds the whole view.
+        self.publish_backend_kernel(id, &view).await?;
+        self.service_map_tx.send_replace(view);
+        self.mark_consumer_view_stale()?;
+        Ok(true)
     }
 
     /// The exit wait for a begun stop, detached from `self` so it can run on
@@ -468,7 +525,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if job.phase != crate::bun::jobs::JobPhase::Unknown {
                     job.phase = crate::bun::jobs::JobPhase::Stopped;
                 }
-                job.runtime_absent = true;
+                // Confirmed process exit does not establish OCI object absence.
+                job.runtime_absent = job.batch_execution.is_none()
+                    || job.runtime == crate::grill::records::RuntimeKind::Process;
             }
         }
         if owns_job {

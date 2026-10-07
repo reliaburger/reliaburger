@@ -115,19 +115,19 @@ async fn initialized_leader(
 async fn stop_must_not_claim_cleanup_before_any_worker_has_seen_it() {
     let network = council::network::InMemoryRaftRouter::new();
     let leader = initialized_leader(&network).await;
-    leader
-        .write(RaftRequest::SchedulingDecision(
-            meat::types::SchedulingDecision {
-                app_id: AppId::new("web", "default"),
-                placements: vec![Placement {
-                    node_id: NodeId::new("unreachable-worker"),
-                    resources: Resources::default(),
-                    ordinal: 0,
-                }],
-            },
-        ))
-        .await
-        .unwrap();
+    write_admission_fixture(
+        &leader,
+        RaftRequest::SchedulingDecision(meat::types::SchedulingDecision {
+            app_id: AppId::new("web", "default"),
+            placements: vec![Placement {
+                node_id: NodeId::new("unreachable-worker"),
+                resources: Resources::default(),
+                ordinal: 0,
+            }],
+        }),
+    )
+    .await
+    .unwrap();
     let (url, server, mut commands) = api_for(leader.clone(), None).await;
     let response = reqwest::Client::new()
         .post(format!("{url}/v1/stop/web/default"))
@@ -166,4 +166,24 @@ async fn delete_reports_an_accepted_request_not_completed_cleanup() {
     leader.shutdown().await.unwrap();
     assert_eq!(code, reqwest::StatusCode::ACCEPTED);
     assert_eq!(body["status"], "deleting");
+}
+
+async fn write_admission_fixture(
+    council: &reliaburger::council::CouncilNode,
+    mut request: reliaburger::council::RaftRequest,
+) -> Result<reliaburger::council::CouncilResponse, reliaburger::council::CouncilError> {
+    let previous = council.desired_state().await.last_applied_log;
+    match &mut request {
+        reliaburger::council::RaftRequest::BatchRegister {
+            expected_log_id, ..
+        } => *expected_log_id = previous,
+        reliaburger::council::RaftRequest::SchedulingDecision(decision) => {
+            request = reliaburger::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
+            }
+        }
+        _ => {}
+    }
+    council.write(request).await
 }

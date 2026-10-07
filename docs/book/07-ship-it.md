@@ -152,6 +152,50 @@ Jobs can declare `run_before = ["app.web"]`, meaning they must complete before t
 
 The orchestrator models this as a `RunningPreDeps` phase. If any pre-deploy job fails, the deploy fails immediately and no instances are modified.
 
+Cluster apply has another gate to protect: the app spec in Raft. Once that spec
+commits, another node can schedule the new app. The agent first reserves the
+local operation and checks image trust for the complete manifest. Raft then
+records a bounded claim owning every app and job identity, without publishing
+the new desired state. Prerequisites must reference an app in the same apply
+and effective namespace.
+
+A migration opens the gate only after a positive zero exit and a durable job
+checkpoint. A negative exit is recorded before reporting failure; failed
+migrations never enter the ordinary automatic retry path. The claim's original
+leadership term and recovery epoch fence an old worker. A new leader cannot
+infer the outcome from its own local records, so uncertainty retains ownership
+and prevents a changed app-only or job-only submission from repeating the work.
+
+After success, one Raft entry checks the complete manifest again and publishes
+its desired writes atomically. If ordinary jobs remain, their identities stay
+reserved until exact namespace, spec and generation receipts establish positive
+terminal outcomes. A startup acknowledgment or an empty receipt cannot release
+that ownership. Registered cron work has no finite execution receipt: cluster
+apply refuses recurring schedules before creating claims or launching work.
+Standalone cron registration remains supported.
+
+Migration cancellation also needs a boundary after the job settles. An accepted cancellation remains meaningful when the child subsequently exits zero: check it after settlement and immediately before proposing the desired-state transaction. A proposal already submitted to Raft can still commit; cancellation cannot roll that transaction back. Each replicated ownership write has a five-second caller deadline. A timeout does not tell us whether Raft committed, so we keep the uncertain fence and report an error. This is why the terminal job watcher ends without inventing a release when its settlement write stalls.
+
+The tests hold real Process migrations while inspecting desired state, forward
+a failed migration through a follower and change leaders while an old runner
+is blocked. A cold restart preserves a failed generation; an explicitly
+corrected apply launches a new one. State-machine and actor tests also cover
+atomic refusals, overlapping identities, malformed snapshots, pending retries
+and missing or uncertain ordinary-job receipts. Old-term or recovered claims
+stay held; there is no automatic expiry or replay, and administrator recovery
+is a separately proposed extension.
+
+
+Held migration and ordinary-job claims also protect placement capacity. These
+jobs run on the receiving leader; the claim records no authoritative worker
+assignment. Both app and batch planners therefore reserve the complete held
+CPU/memory request on every candidate, without crediting a guessed replica or
+an unrelated report. Before app publication this includes all jobs; afterwards
+it includes only the ordinary tail. This can over-reserve capacity, including
+capacity already reported locally. It prevents new placements from spending
+uncertain commitments; it does not add initial job capacity or quota admission.
+Positive terminal settlement releases the corresponding held request.
+
 ## From the model to the wired path
 
 Here's a honesty note that's easy to skip past. Everything above — `DeployOrchestrator`, the `DeployDriver` trait, `execute_blue_green`, the exhaustive rollback tests — is a *model* of the deploy state machine. It's driven in tests by `MockDriver`, and it's where we work out the tricky transitions in microseconds. But it is not the code that runs on a node. The path that actually deploys your app lives in the Bun agent: `rolling_redeploy`, `blue_green_redeploy`, and an inline `run_before` gate, each calling the supervisor and the container runtime directly.
@@ -742,7 +786,7 @@ Two tests pin the behaviour down. The first deploys an app whose `create` sleeps
 
 ## One config, two front doors, one path
 
-A Reliaburger config file describes more than apps. It can declare namespaces (with resource budgets), permissions (who can do what), jobs, and image builds — all in the same TOML. And there are two ways to get that file into the cluster. You can run `relish apply` by hand, or you can commit it to a git repo and let the Lettuce GitOps engine sync it. Same file, two front doors.
+A Reliaburger config file describes more than apps. It can declare namespaces (with resource budgets), permissions (who can do what), jobs, and image builds — all in the same TOML. Apps, namespaces and permissions have two routes into desired state: manual `relish apply` and the Lettuce GitOps engine. Manual apply additionally executes jobs. GitOps refuses a tree containing any job before it writes desired state; sharing the configuration format does not give Lettuce a job execution path.
 
 Here's the question that keeps you up at night: do those two doors lead to the same room? If `relish apply` writes an app but silently drops the namespace, while GitOps writes the namespace but mangles the app's identity, then "declarative" is a lie. The cluster's state depends on *how* you applied the config, not *what's in it*. That's the worst kind of bug, because it only shows up when someone switches from one door to the other and wonders why their quota vanished.
 
@@ -831,6 +875,16 @@ The test for this drives `apply_changes` against a council that was never made l
 
 The first version of this fix only checked the outer `Err`, and a static review (B15) caught what that misses. `council.write` returns `Result<CouncilResponse, CouncilError>`, and `Err` only means Raft didn't commit the entry. An entry can commit and still be *refused*: the state machine applies it in log order, decides it isn't allowed, and answers `Ok(CouncilResponse::Refused { reason })` with desired state untouched. An app in an `rbtest-*` namespace is one, since only a leased test write may create those. That `Ok` counted as applied, and the commit advanced past a change that never happened. The `match` above names the refusal next to the transport error, so both stop the sync. The pattern `A | B` in one arm matches either shape, and `Ok(_)` after it catches every other response. The test drives `apply_changes` on a real leader with an `rbtest-lease/web` app and expects the refusal to come back as that resource's id.
 
+## Validating with the right namespace context
+
+A permission file can refer to `prod` after an earlier apply created that namespace. The CLI only has the new file, so a validation pass that insists on seeing `[namespace.prod]` there rejects a valid request. Adding the declaration to satisfy the CLI can replace the namespace's existing quota. The server had the right `validate_against` method, but its earlier validation pass rejected the request before that method ran.
+
+We now share the field checks and make the available context explicit. `validate_intrinsic` checks names, resource values, workload specifications, permission actions and build destination syntax. It leaves permission/build namespace existence for live admission. `validate_against` passes the union of inline declarations and committed namespaces to the same checks; offline `validate` uses only inline declarations.
+
+The helper takes `Option<&[String]>`. `None` means the caller has no authoritative namespace catalogue yet; `Some` supplies a borrowed slice, so validation reads the catalogue without owning or copying it. The CLI's apply and deploy paths use the intrinsic pass. A cluster API repeats it, forwards the original credential if needed, and the leader performs the context check before any desired-state write. Standalone admission and offline lint still use full validation.
+
+A build-only apply also reaches the leader for validation, although build execution remains the separate build route. The regressions use the actual HTTP client against a leader and a three-council follower: existing references succeed without replacing the stored quota, and ghost references fail without adding a permission or app. They also check both permission and build manifest loading locally.
+
 ## The namespace bug that got away
 
 We fixed the identity mismatch on the *write* side and celebrated. Then someone deleted an app from git and watched the wrong one disappear.
@@ -892,27 +946,36 @@ let public = Router::new()
 and the handler does the checking itself, over the raw bytes of the body, before it nudges anything:
 
 ```rust
-async fn gitops_webhook_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    let Some(validator) = &state.gitops_webhook_validator else {
-        return service_unavailable("webhook secret not configured");  // fail closed
-    };
-    let mut guard = validator.lock().await;
-    match guard.validate(&body, signature, delivery_id, branch) {
-        Ok(_)  => { let _ = tx.send(()).await; accepted() }
-        Err(e) => unauthorized_or_rate_limited(e),
-    }
+// After reserving standalone queue capacity, or selecting the cluster leader:
+let mut guard = validator.lock().await;
+let admission = guard.reserve(
+    &body, signature, gitlab_token, delivery_id, &branch,
+)?;
+
+// The standalone handler consumes its reserved channel permit. On the
+// cluster leader, admission must be replicated before the HTTP 202:
+let receipt = Sha256::digest(delivery_id.unwrap().as_bytes());
+let response = council.write(RaftRequest::GitOpsSyncRequested {
+    delivery: receipt.into(),
+}).await?;
+if let CouncilResponse::GitOpsSyncRequested { generation } = response {
+    admission.commit();
+    let _ = tx.try_send(()); // wakeup only; the committed generation owns the work
+    return (StatusCode::ACCEPTED, Json(serde_json::json!({
+        "message": "sync admitted", "generation": generation,
+    }))).into_response();
 }
+// Dropping an uncommitted admission restores the replay and rate reservation.
+
 ```
 
-Three checks, in order. The signature must verify against the configured secret — `ring::hmac::verify` does this in constant time, so a wrong signature leaks nothing about how close it was. The delivery id must be one we haven't seen, or a replayed POST (the same signed body, captured and re-sent) would trigger a fresh sync every time. And the request must fit under a rate limit, so a flood of valid hooks can't hammer the sync loop. Only when all three pass does the handler send `()` down the channel to wake the runner.
+Three checks, in order. The signature must verify against the configured secret — `ring::hmac::verify` does this in constant time, so a wrong signature leaks nothing about how close it was. The delivery id must be one we haven't seen, or a replayed POST (the same signed body, captured and re-sent) would trigger a fresh sync every time. And the request must fit under a rate limit, so a flood of valid hooks can't hammer the sync loop. Only when all three pass can the handler admit the delivery. A standalone API consumes its reserved queue slot. A cluster follower forwards the original authenticated request to the leader; the leader commits a trigger generation through Raft before returning 202 and waking its runner.
 
 Two design choices are worth pausing on. First, **fail closed**: if no `[gitops] webhook_secret` is configured, there's no validator, and the handler returns 503 rather than triggering an unauthenticated sync. A public route with no way to authenticate the caller is worse than no route at all. Second, the validator is `Arc<Mutex<WebhookValidator>>` — shared and *mutable*, because the replay set and the rate-limit window are state that changes on every request. `Mutex` here isn't guarding against data races in the C sense; it's making sure two hooks arriving at once can't both slip past the "have I seen this delivery id?" check. Rust's type system won't let you mutate shared state without saying how you're synchronising it, so the `Mutex` is the compiler asking you to be explicit, and the right answer.
 
-The tests exercise the whole contract with no bearer token in sight: a bad signature is a 401 and triggers no sync (observed by an empty channel), a missing signature is a 401, a replayed delivery id is a 401 the second time, a rate-limit flood is a 429, and a correctly-signed GitHub-shaped POST is a 202 that *does* nudge the channel. That last one is the point of the whole exercise — a real git host, sending exactly what it sends, gets through.
+The tests exercise the whole contract with no bearer token in sight: a bad signature is a 401 and triggers no sync (observed by an empty channel), a missing signature is a 401, a replayed delivery id is a 401 the second time, a rate-limit flood is a 429, and a correctly-signed GitHub-shaped POST is a 202 that nudges the standalone channel or commits a cluster trigger. Cluster tests send the signed body through a follower, replace the leader before its run starts, and check that the accepted generation and replay receipt survive the handover.
+
+This admission changes both the wire and durable-state formats. The new Council request is also stored in the Raft log; an older binary cannot decode it. Defaulting absent JSON fields does not make an old reader preserve pending generations or receipts. We increment both compatibility generations when this change joins the release train. Before 1.0 we do not migrate these logs or snapshots: start a fresh cluster with the same new binary on every node and re-apply the repository.
 
 ## Refuses to be tricked by a filename
 
@@ -1143,7 +1206,7 @@ Several smaller races had the same flavour:
 - **Cancel is a request.** `relish cancel-deploy <id>` signals a `CancellationToken` and waits for the worker to notice. The worker checks it at safe points: health waits are read-only, so `tokio::select!` can abandon them, but a `create`, `start` or cleanup call always finishes first. The operation becomes `Cancelled` only after the worker returns. It cancels one node's attempt and doesn't touch Raft's desired state, so apply the corrected config too.
 - **Tell the restart driver first.** Between our `kill` and our observing the exit, the one-second crash detector could see an instance marked `Running` exit unexpectedly and restart it. The worker now sends `BeginRetire`, which marks the instance `Stopping` and turns off retries, before it signals anything.
 - **Names must not collide.** An app and a job called `web` in the same namespace both mapped to `default__web-0`, so config validation now requires distinct names. An app called `worker-g1` could collide with generation one of `worker`, so fresh deploys check every proposed ID against existing owners. After a self-upgrade, the generation counter restarts in memory, so it now starts above every adopted instance's generation, using checked arithmetic that errors instead of wrapping. Each generation also gets its own cgroup (`web/0`, `web/g7-0`): when two generations shared one, removing the old group stopped the new container as well.
-- **Routes are confirmed before they're published.** The replacement's backend goes into the kernel map first; only if that works does the new map reach DNS and Wrapper. The map has 32 backend slots per app; replica 33 used to fail with a log line while the deploy reported `Complete`. Now it's a deploy error. Ordinary stops and automatic restarts also drain in-flight requests the way a rollout does.
+- **Routes are confirmed before they're published.** The replacement's backend goes into the kernel map first; only if that works does the new map reach DNS and Wrapper. The kernel map has 32 backend slots in each node's consumer pool. The service catalogue retains every replica, so DNS and Wrapper can see replica 33 and beyond. Each node picks its bounded pool deterministically from healthy backends, preferring local ones; its stable node identity spreads remote choices across consumers. A client using the kernel map can reach that node's selected pool, rather than every replica at once. The earlier replica-33 failure was first turned into a deploy error; the bounded pool now removes that catalogue-wide limit. Ordinary stops and automatic restarts also drain in-flight requests the way a rollout does.
 - **Keep the evidence cleanup needs.** Finalising a rollout rebuilds the app's local service entry: unregister it, then register it again against the council's committed allocation. If `relish stop` lands mid-rollout, the council has already withdrawn that allocation, so the second step refuses, and the first has thrown away the entry the retained replacement's cleanup needs. Bun only releases a container address once the live service map proves its backend is gone (see [Writing it down before doing it](03-talking-to-each-other.md#writing-it-down-before-doing-it)), and with no entry there's nothing to prove it against. The orchestrator retried the stop on every two-second tick, failing with "original service withdrawal is unproven" each time. It took a crash, a recovery that redeployed and a badly timed stop to hit, which is why it showed up in CI once and never in eight runs in the VM. Finalisation now keeps a `clone()` of the map from before the rebuild and puts it back if the rebuild refuses. Rust never copies heap data behind your back, so `clone()` is an explicit deep copy; for a few dozen services it's cheap, and much simpler than undoing a half-finished rebuild step by step.
 - **A failed attempt mustn't leave work for the retry.** The V02 soak restarted every node and then applied its workloads. One node got the deploy for `soak-redis` before the council's allocation for it reached its view, so registering the service refused ("local service requires its committed cluster allocation"). That's fine on its own: the orchestrator retries with backoff. The trouble was what the first attempt left behind. It had already created a `Pending` instance, so the retry saw an existing owner and ran a *rollout*, for a service this node had never published. The replacement's container address was held by the runtime, but recording that hold in the discovery journal refused (the journal won't track an address for a service it has no entry for), and the agent only remembers a hold once the journal has it. Every later attempt then tried to retire that replacement and found a hold that nothing tracked, and Bun refuses to release an address it can't account for ("retained network reference requires original discovery reconciliation"). Seven attempts, then nothing. Three changes fix it. A fresh deploy whose registration fails forgets the instances it just created, as long as they never left `Pending` and the registration left no reservation behind, so the retry is another fresh deploy. A refused journal write hands the runtime's hold straight back, since a refusal decided in memory never reached disk. And retirement now asks the journal about a hold it doesn't remember. The answer is a three-variant enum, `Recorded`, `Unrecorded` or `Unknown`, rather than a `bool`, because "the journal is authoritative and says no" and "I can't tell" call for opposite actions. Launches only happen after the journal records their hold, so an unrecorded one belongs to an instance that never started and no route can name it: Bun releases it. A disabled or uncertain journal still refuses, as before.
 - **Wait for the allocation instead of failing on it.** That fix made the failed attempt harmless, but it was still a failed attempt, with a five-second backoff and a scary line in the log. The 0.1.0 soak kept printing it, once right after a deploy on the same node had timed out, which made the timeout look guilty. It wasn't. The leader writes an app's placement and its catalogue allocation to the council separately, and the catalogue write can lag or be refused ("endpoint publication generation changed"), so a node's poll can say "run `web` here" while the catalogue it arrived with has no `web` in it. The reconciler now checks that before deploying: a placement whose port the catalogue doesn't allocate yet is skipped, logged once, and deployed from a later poll. It isn't a failure, so it doesn't count towards the backoff. The first version of this check broke two cluster tests: their workers run without discovery ownership, allocate services locally, and never see a catalogue, so they waited forever for an allocation they didn't need. The agent now says which kind it is in its reply to each catalogue sync (`requires_allocations` on `ConsumerUpdate`), and only an agent that registers at committed allocations makes its placements wait. The check is one `Option` method, `resolve(&service).is_none_or(|allocation| allocation.port != port)`: `is_none_or` is true for `None` and otherwise runs the closure, which also catches an allocation still at the old port after a port change. The test answers the reconciler's poll with exactly that state and failed first with the soak's own error line.
@@ -1178,6 +1241,24 @@ pub(super) enum JobPhase {
 (`pub(super)` makes the enum visible to the parent module, `bun`, and nowhere else; it's finer-grained than Go's upper-case export rule.) After a restart, bun adopts a job that's still running. A job that has gone, with an exit code the runtime can still report, becomes `Exited`. Anything else caught in `Preparing` or `Launching` becomes `Unknown`, and stays that way. Bun never guesses "probably failed, let's retry".
 
 `relish apply` refuses to start a job whose previous outcome is unknown, and says why: `previous outcome is unknown; use apply --rerun-jobs for an explicit rerun`. `--rerun-jobs` is the human saying "I've checked, run it again". The API accepts it only from a user with the Deployer role, and only for a file containing nothing but non-scheduled jobs. GitOps and the reconciler never set it. Cron jobs are the one exception: once bun has confirmed the old run's container is gone, the next scheduled occurrence runs normally. That's a new occurrence, not a replay of the uncertain one. Chapter 8 covers the retry budget and the crash tests behind this.
+
+### One workload grant rule at both submission routes
+
+An apply manifest and a batch request resolve their workload names and
+namespaces differently, but they must ask the same authority question before
+writing or dispatching. Both now call `sesame::auth::authorize_workload` after
+intrinsic validation and lease checks. The helper borrows the caller and
+permission map: it creates no new principal or grants. Scope, deployment and
+host execution checks keep their existing order and refusal responses.
+
+A follower still forwards the original bearer. The leader repeats the shared
+rule against its authoritative grants before admitting the batch. The paired
+HTTP control uses that same scoped credential for direct leader apply and
+follower batch. Image workloads need deployment permission; explicit binaries
+and scripts also need host-exec. Refused pairs must add no desired writes or
+workload commands, and allowed pairs must reach their actual route admission.
+The command acknowledgements in this authority fixture do not claim a real
+process exit or container lifecycle.
 
 ## Stop means stop, delete means delete
 
@@ -1457,8 +1538,8 @@ Phase 7 adds 48 tests, bringing the total to 1047.
 
 A valid signature doesn't prove the sync loop received a notification. The HTTP
 handler used to discard a failed channel send and return 202 even after the
-receiver had gone away. It now reserves queue capacity first and returns 503 if
-the loop is unavailable or its queue is full. Only an authenticated, validated
+receiver had gone away. On a standalone API it reserves queue capacity first
+and returns 503 if the loop is unavailable or its queue is full. Only an authenticated, validated
 delivery uses the reservation and receives “sync queued”.
 
 The reservation also prevents an awkward retry bug. Validation records the
@@ -1466,6 +1547,14 @@ delivery ID for replay protection; doing that before discovering a full queue
 would make the provider's retry look like a replay. We reserve before validation,
 so a rejected delivery can be retried after capacity becomes available. Tests
 close the receiver and fill the queue, then drain one slot and retry the same ID.
+
+In a cluster, a local notification is too weak: a follower can consume it while it is idle, and a leader can lose it during handover. An authenticated request arriving at a follower is forwarded with its original raw body, signature or GitLab token and delivery ID. The leader returns 202 only after Raft commits a pending trigger generation and a bounded delivery receipt. An unavailable leader, rejected write or forwarding loop returns 503; a canceled or failed admission restores the local replay and rate reservation so the provider can retry.
+
+The runner watches committed trigger generations and leadership changes as well as the polling timer. A new leader sees accepted pending work immediately. A successful run acknowledges the generation it captured before starting; a newer webhook arriving during that run stays pending for another run. Failure keeps the trigger pending and uses the existing retry backoff. Stale status updates preserve newer generations and the bounded replay receipt inventory instead of overwriting them. That inventory retains the most recent 1,000 committed delivery IDs; an older delivery can be admitted again after eviction.
+
+The handover tests cover the persisted trigger and replay receipt before a run starts. Resource and status writes continue to use the runner’s existing Raft writes and periodic drift reconciliation. An entire Git sync has no captured leadership-term guard or atomic transaction.
+
+The five-second admission budget surrounds the whole handler, including waiting for the validator mutex and reading follower metadata. Timing just the eventual HTTP exchange leaves an unbounded queue before that timer starts. If the whole budget expires, dropping the inner future drops its admission guard and restores the local reservations. The tests hold each real lock across an HTTP request, require a 503 with no trigger or wakeup, then release it and retry the exact delivery ID with a one-request rate budget.
 
 The same idea had one more place to go. Inside the validator, the replay check
 recorded the delivery ID and only then asked the rate limiter (B10). A delivery
@@ -1493,3 +1582,52 @@ of seconds to a fixed start. It exhausts a budget of one, gets a second
 delivery refused as rate-limited, moves the clock 61 seconds on, and expects
 that same delivery to be accepted, and a replay of it after that to still be
 refused. Before the fix the retry failed as "duplicate delivery ID (replay)".
+
+## Compiling a tree without losing namespace ownership
+
+Put `web` in both `prod/web.toml` and `staging/web.toml`, then compile the tree. The namespaces differ, but `Config` stores apps under their bare names. Inserting the second `web` used to replace the first without even a warning. The same problem affected jobs and builds.
+
+Until one serialised manifest can represent repeated names across namespaces, the compiler refuses this tree and names both namespaces in its error. Apply the manifests separately or give the resources distinct names. Treating an unrepresentable identity as an error keeps the output honest: a successful compile cannot quietly omit a namespace's workload. Same-namespace duplicate definitions keep the existing deterministic last-file-wins policy and its warning.
+
+The merge returns `Result<Vec<String>, RelishError>`: warnings are the successful value, while an identity collision is an error. The `?` operator on each recursive merge returns that error all the way to the CLI, so it cannot print a partial manifest. Regressions cover apps, jobs and builds with explicit namespaces, plus two directory-derived app namespaces.
+
+## A compile either includes the whole tree or fails
+
+A malformed workload next to a valid one used to produce a warning and a successful partial manifest. The CLI printed that manifest and exited zero, so a build pipeline could deploy it as if every file had been processed. Malformed defaults and unreadable subdirectories had similar escape paths.
+
+Parsing and reading errors now return through `Result` and `?`, including errors from recursive directories. Defaults must load successfully before the compiler considers workloads, and a broken TOML symlink is an error with its path. Duplicate-definition warnings remain separate from missing input. Regression fixtures mix good and bad files, repeat the case in a nested namespace directory, break a defaults file and supply an unreadable symlink. Each must fail before the CLI can emit a partial manifest.
+
+## Defaults must survive compilation
+
+A shared `memory` limit is useful only if it reaches the resolved app. The old directory compiler accepted any TOML keys in `_defaults.toml`, but copied only `image`. Typed defaults now carry image, memory, CPU and environment into apps and jobs, plus deployment settings into apps. Unknown keys and malformed values fail with the defaults file's path. A default image does not turn an explicit host executable or script into a container.
+
+Inheritance merges fields: a child directory can change CPU while keeping its parent's image and memory. Environment keys and deployment options merge individually. A workload's explicit fields win, including `max_unavailable = 0` and `auto_rollback = false`; omitted options inherit. An empty environment table adds no overrides. Regression fixtures resolve parent, child and workload values, then round-trip the manifest to prove its resource settings survive serialization.
+
+### One configuration tree for CLI and GitOps
+
+A repository containing `_defaults.toml` used to compile through the CLI and fail through GitOps: Lettuce tried to parse the defaults file as a workload. A directory namespace also disappeared on the Git path. We now pass both inputs to `compile_sources`, an internal resolver that accepts a `BTreeMap<PathBuf, String>`. `BTreeMap` visits keys in order, so the resolver can process the root files and then each child directory deterministically. The filesystem adapter reads the tree; the Git adapter reads the verified commit under the configured watch directory.
+
+Both paths inherit typed defaults and use the nearest directory name when a workload omits its namespace. The watch root itself contributes no namespace. The resolver returns `Result<CompileResult, TreeError>`: `?` propagates a malformed file or identity collision before a caller can use partial desired state. GitOps refuses duplicate definitions, while CLI compilation retains its warning for deterministic overrides within one namespace. Neither can represent two resources of the same kind and bare name in different namespaces.
+
+The regression compares physical CLI compilation with a real Git sync under a watched subdirectory, first unsigned and then with a trusted SSH commit signature. It checks the resulting app specification and resource identity. Other cases cover nested defaults, directory-only namespaces, duplicate definitions and malformed trees. These exercise the adapters and the sync diff as well as the resolver.
+### Comparing a complete deployment specification
+
+A dry run used to compare only image strings. Keeping an image unchanged while
+changing replicas, a port, environment variables or resource limits therefore
+printed an unchanged workload. The preview now fingerprints the complete
+serialized desired specification. Namespace is part of the resource identity:
+`app.team/web` and `app.other/web` have separate evidence. Replica ordinals are
+placement details, so they do not alter an app's desired-spec fingerprint.
+
+The API returns this evidence for apps, jobs, namespace quotas and permissions.
+Council state supplies the authoritative app, namespace and permission specs;
+local job checkpoints supply job specs. The endpoint filters the result through
+the caller's app and namespace scope. If different executions of one logical
+job have different specifications, their combined evidence is unknown.
+
+An absent fingerprint cannot prove equality. The plan prints `?` and serializes
+`unknown` for incomplete evidence, while a known image change still proves an
+update. An offline preview states that its creates assume no live comparison.
+A failed live lookup returns an error instead of manufacturing an empty cluster.
+Tests exercise the client-to-router-to-agent path and same-image changes, along
+with quotas, permissions, namespace separation and incomplete evidence.

@@ -43,6 +43,37 @@ pub fn new_token_store() -> TokenStore {
     Arc::new(RwLock::new(Vec::new()))
 }
 
+/// When each API token last authenticated a request on this node, as Unix
+/// seconds keyed by the token's principal id (`token:<digest>`).
+///
+/// Node-local and in memory on purpose (F05 I2): writing "last used" through
+/// Raft would turn every authenticated request into a cluster-wide log entry.
+/// `GET /v1/token/list` asks every node for its map and keeps the latest per
+/// token. A restarted node forgets its share, which only ever makes a token
+/// look *less* recently used than it was.
+pub type TokenLastUsed = Arc<RwLock<std::collections::HashMap<String, u64>>>;
+
+/// Create an empty last-used map.
+pub fn new_token_last_used() -> TokenLastUsed {
+    Arc::new(RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Record that `principal_id` authenticated a request just now.
+async fn record_token_use(last_used: &TokenLastUsed, principal_id: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // The write lock covers one map insert; it's never held across I/O.
+    let mut map = last_used.write().await;
+    match map.get_mut(principal_id) {
+        Some(seen) => *seen = (*seen).max(now),
+        None => {
+            map.insert(principal_id.to_string(), now);
+        }
+    }
+}
+
 /// Reserved name for the internal service principal (the derived service
 /// token). Not a real user token; never stored in `SecurityState`.
 pub const SYSTEM_PRINCIPAL: &str = "__system";
@@ -92,6 +123,8 @@ pub struct AuthState {
     /// Verifier for workload-identity JWT bearers. `None` disables JWT auth
     /// (single-node / pre-OIDC), leaving the token and session paths unchanged.
     pub jwt_verifier: Option<Arc<WorkloadJwtVerifier>>,
+    /// When each user token last authenticated a request here.
+    pub last_used: TokenLastUsed,
 }
 
 impl AuthState {
@@ -102,7 +135,14 @@ impl AuthState {
             service_token,
             sessions: super::session::SessionStore::new(),
             jwt_verifier: None,
+            last_used: new_token_last_used(),
         }
+    }
+
+    /// Share `last_used` with the API, so the token listing can read it.
+    pub fn with_last_used(mut self, last_used: TokenLastUsed) -> Self {
+        self.last_used = last_used;
+        self
     }
 
     /// Attach a workload-JWT verifier, enabling JWT bearer authentication.
@@ -136,31 +176,24 @@ fn extract_bearer(header_value: &str) -> Option<&str> {
 /// Authenticate a request by validating the Bearer token.
 ///
 /// Returns the `AuthContext` if the token is valid, or an HTTP error response.
+/// A token's old secret, inside the grace period after `relish token rotate`,
+/// authenticates as the same token but as its own principal (F05 I3).
 pub fn authenticate(
     plaintext_token: &str,
     tokens: &[ApiToken],
 ) -> Result<AuthContext, (StatusCode, String)> {
-    // Try to find a matching token. If the hash matches but the token
-    // is expired, we want to report "expired" specifically.
-    let stored = match token::find_valid_token(plaintext_token, tokens) {
-        Ok(t) => t,
-        Err(_) => {
-            // Check if any token's hash matches but is expired
-            for t in tokens {
-                // If the hash matches (ignoring expiry), it's an expired token
-                if let Some(expires) = t.expires_at
-                    && std::time::SystemTime::now() > expires
-                {
-                    // Could be this token — check hash by creating temp non-expired copy
-                    let mut temp = t.clone();
-                    temp.expires_at = None;
-                    if token::validate_token(plaintext_token, &temp).is_ok() {
-                        return Err((StatusCode::UNAUTHORIZED, "token expired".to_string()));
-                    }
-                }
-            }
-            return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    let (stored, matched) = match token::find_valid_token(plaintext_token, tokens) {
+        Ok(found) => found,
+        Err(token::TokenError::Expired) => {
+            return Err((StatusCode::UNAUTHORIZED, "token expired".to_string()));
         }
+        Err(token::TokenError::Rotated) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "token rotated: this secret has stopped working".to_string(),
+            ));
+        }
+        Err(_) => return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string())),
     };
 
     // Defence in depth (AUTH4): the system principal is a side-channel
@@ -173,38 +206,67 @@ pub fn authenticate(
         return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
     }
 
+    let principal_id = match (matched, &stored.previous_secret) {
+        (token::MatchedSecret::Previous, Some(previous)) => {
+            principal_for_hash(&previous.token_hash)
+        }
+        _ => token_principal_id(stored),
+    };
     Ok(AuthContext {
         token_name: stored.name.clone(),
-        principal_id: token_principal_id(stored),
+        principal_id,
         role: stored.role,
         scoped_apps: stored.scope.apps.clone(),
         scoped_namespaces: stored.scope.namespaces.clone(),
     })
 }
 
-/// The stable principal id for a stored token: a digest of its hash, so it
-/// names this exact credential rather than its (reusable) name.
-fn token_principal_id(token: &ApiToken) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, &token.token_hash);
+/// The stable principal id for a stored token's current secret: a digest of
+/// its hash, so it names this exact credential rather than its (reusable)
+/// name. A rotation changes it.
+pub(crate) fn token_principal_id(token: &ApiToken) -> String {
+    principal_for_hash(&token.token_hash)
+}
+
+/// The principal id of the secret behind an Argon2id hash.
+fn principal_for_hash(token_hash: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, token_hash);
     format!("token:{}", hex::encode(digest.as_ref()))
 }
 
-/// The stored token that `principal_id` names, if it is still in the store.
-///
-/// The lifetime `'a` says the returned reference borrows from `tokens`, so it
-/// can't outlive the snapshot it was found in.
-pub(crate) fn find_token_by_principal<'a>(
-    principal_id: &str,
-    tokens: &'a [ApiToken],
-) -> Option<&'a ApiToken> {
-    tokens
-        .iter()
-        .find(|token| token_principal_id(token) == principal_id)
+/// A stored token secret, found by its principal id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Credential {
+    /// When the secret stops working: the token's expiry for its current
+    /// secret, the end of the grace period for an old one.
+    pub valid_until: Option<std::time::SystemTime>,
+}
+
+/// The stored secret that `principal_id` names, if it is still in the store:
+/// a token's current secret, or its old one during the grace period after a
+/// rotation.
+pub(crate) fn find_credential(principal_id: &str, tokens: &[ApiToken]) -> Option<Credential> {
+    tokens.iter().find_map(|token| {
+        if token_principal_id(token) == principal_id {
+            return Some(Credential {
+                valid_until: token.expires_at,
+            });
+        }
+        token
+            .previous_secret
+            .as_ref()
+            .filter(|previous| principal_for_hash(&previous.token_hash) == principal_id)
+            .map(|previous| Credential {
+                valid_until: Some(previous.valid_until),
+            })
+    })
 }
 
 /// Whether the credential a browser session was created from still stands
-/// (B11): the exact token must still be in the store and unexpired. A session
-/// from the internal service token holds while that token is configured.
+/// (B11): the exact secret must still be in the store and working. A session
+/// opened with a token's old secret ends when its grace period does. A
+/// session from the internal service token holds while that token is
+/// configured.
 fn session_credential_is_live(
     identity: &super::session::SessionIdentity,
     tokens: &[ApiToken],
@@ -214,10 +276,9 @@ fn session_credential_is_live(
         return service_token_configured;
     }
     let now = std::time::SystemTime::now();
-    find_token_by_principal(&identity.principal_id, tokens)
-        .is_some_and(|token| token.expires_at.is_none_or(|at| now < at))
+    find_credential(&identity.principal_id, tokens)
+        .is_some_and(|credential| credential.valid_until.is_none_or(|at| now < at))
 }
-
 /// Authenticate a bearer without holding the token-store lock (AUTH5).
 ///
 /// Takes ownership of a cloned token list (the caller already released the
@@ -382,6 +443,7 @@ pub async fn auth_middleware(
         }
         return match authenticate_off_lock(bearer_token, tokens).await {
             Ok(ctx) => {
+                record_token_use(&state.last_used, &ctx.principal_id).await;
                 request.extensions_mut().insert(ctx);
                 next.run(request).await
             }
@@ -404,6 +466,8 @@ pub async fn auth_middleware(
         && let Some(identity) = state.sessions.validate(&id).await
     {
         if session_credential_is_live(&identity, &tokens, state.service_token.is_some()) {
+            // A dashboard session is its token at work, too.
+            record_token_use(&state.last_used, &identity.principal_id).await;
             request
                 .extensions_mut()
                 .insert(readonly_session_context(&identity));
@@ -543,6 +607,38 @@ pub fn authorize_scoped(
         )
             .into_response())
     }
+}
+
+/// Authorise one resolved workload before any desired write or dispatch.
+/// Scope is checked first, then Deploy, then HostExec for host binaries/scripts.
+/// The caller supplies its authoritative permission snapshot and still owns
+/// role, lease, resource validation and transport admission.
+#[allow(clippy::result_large_err)]
+pub fn authorize_workload(
+    ctx: Option<&AuthContext>,
+    app: &str,
+    namespace: &str,
+    host_execution: bool,
+    permissions: &std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+) -> Result<(), Response> {
+    authorize_scoped(ctx, app, namespace)?;
+    authorize_permission(
+        ctx,
+        crate::config::PermissionAction::Deploy,
+        app,
+        namespace,
+        permissions,
+    )?;
+    if host_execution {
+        authorize_permission(
+            ctx,
+            crate::config::PermissionAction::HostExec,
+            app,
+            namespace,
+            permissions,
+        )?;
+    }
+    Ok(())
 }
 
 /// Enforce a principal's `[permission]` spec on a specific action + target.
@@ -730,6 +826,79 @@ mod tests {
         let err = authenticate(&created.plaintext, &tokens).unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert!(err.1.contains("expired"));
+    }
+
+    /// `created` rotated now with `grace`: the new plaintext and the token.
+    fn rotate(created: &crate::sesame::token::CreatedToken, grace: Duration) -> (String, ApiToken) {
+        let rotation =
+            crate::sesame::token::rotate_token(&created.token, SystemTime::now(), grace).unwrap();
+        let mut token = created.token.clone();
+        crate::sesame::token::apply_rotation(&mut token, &rotation.rotation);
+        (rotation.plaintext, token)
+    }
+
+    /// F05 I3: the old secret is its own principal, so what it opened
+    /// (sessions, last use) ends with it rather than following the name.
+    #[test]
+    fn the_old_secret_authenticates_as_its_own_principal_during_the_grace_period() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let (new_secret, token) = rotate(&created, Duration::from_secs(3_600));
+        let tokens = vec![token.clone()];
+
+        let old = authenticate(&created.plaintext, &tokens).unwrap();
+        let new = authenticate(&new_secret, &tokens).unwrap();
+        assert_eq!(old.token_name, "ci");
+        assert_eq!(new.token_name, "ci");
+        assert_eq!(old.principal_id, token_principal_id(&created.token));
+        assert_eq!(new.principal_id, token_principal_id(&token));
+        assert_ne!(old.principal_id, new.principal_id);
+    }
+
+    #[test]
+    fn an_old_secret_past_its_grace_period_gets_401_saying_it_was_rotated() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let (_, mut token) = rotate(&created, Duration::from_secs(3_600));
+        if let Some(previous) = token.previous_secret.as_mut() {
+            previous.valid_until = SystemTime::now() - Duration::from_secs(1);
+        }
+        let err = authenticate(&created.plaintext, &[token]).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert!(err.1.contains("rotated"), "{}", err.1);
+    }
+
+    #[tokio::test]
+    async fn a_session_opened_with_the_old_secret_ends_with_its_grace_period() {
+        let created = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let (_, token) = rotate(&created, Duration::from_secs(3_600));
+        let store = new_token_store();
+        store.write().await.push(token);
+        let state = AuthState::new(store.clone(), None);
+        // The login handler keys a session by the principal that logged in.
+        let identity = super::super::session::SessionIdentity {
+            token_name: "u".to_string(),
+            principal_id: token_principal_id(&created.token),
+            scope: TokenScope::default(),
+        };
+        let id = state.sessions.create(identity, None).await.id;
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::OK);
+
+        if let Some(previous) = store.write().await[0].previous_secret.as_mut() {
+            previous.valid_until = SystemTime::now() - Duration::from_secs(1);
+        }
+        assert_eq!(cookie_status(&state, &id).await, StatusCode::UNAUTHORIZED);
+        assert!(state.sessions.validate(&id).await.is_none());
+    }
+
+    #[test]
+    fn credential_validity_is_the_grace_end_for_an_old_secret() {
+        let created = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let (_, token) = rotate(&created, Duration::from_secs(3_600));
+        let grace_end = token.previous_secret.as_ref().map(|p| p.valid_until);
+        let tokens = [token.clone()];
+        let old = find_credential(&token_principal_id(&created.token), &tokens).unwrap();
+        assert_eq!(old.valid_until, grace_end);
+        let new = find_credential(&token_principal_id(&token), &tokens).unwrap();
+        assert_eq!(new.valid_until, None);
     }
 
     #[test]

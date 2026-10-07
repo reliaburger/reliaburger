@@ -2,7 +2,8 @@
 
 use super::{
     ca, cert, join,
-    types::{CaRole, SecurityState, SerialNumber},
+    trust::TrustSet,
+    types::{SecurityState, SerialNumber},
 };
 use crate::council::{CouncilNode, CouncilResponse, RaftRequest};
 
@@ -113,30 +114,85 @@ pub async fn issue_renewal(
     Ok(join::JoinBundle::from_result(&result))
 }
 
+/// A node tells the leader it has installed the council's trust set (F04 R4),
+/// so a Node CA rotation can move on: nodes renew onto the new CA only once
+/// every node trusts it, and finalise waits for it too.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustAcknowledgement {
+    /// Required cluster protocol and state generations.
+    pub compatibility: crate::compatibility::Compatibility,
+    /// The `sha256:HEX` fingerprint of every Node CA the node trusts.
+    pub node_ca_fingerprints: Vec<String>,
+}
+
+/// The most Node CAs an acknowledgement may list. A rotation trusts two.
+const MAX_ACKNOWLEDGED_NODE_CAS: usize = 8;
+
+/// Record that the authenticated node trusts the active Node CA. Refused
+/// unless the node lists every Node CA the council trusts, so the record
+/// can't run ahead of what the node really installed. Returns the
+/// acknowledged generation.
+pub async fn acknowledge_trust(
+    council: &CouncilNode,
+    peer: &TlsPeerCertificate,
+    request: &TrustAcknowledgement,
+) -> Result<u64, RenewalError> {
+    request
+        .compatibility
+        .require_current()
+        .map_err(|error| RenewalError::Request(error.to_string()))?;
+    if request.node_ca_fingerprints.len() > MAX_ACKNOWLEDGED_NODE_CAS {
+        return Err(RenewalError::Request(format!(
+            "an acknowledgement lists at most {MAX_ACKNOWLEDGED_NODE_CAS} Node CAs"
+        )));
+    }
+    let state = council
+        .security_state_linearizable()
+        .await
+        .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
+    let node_id = validate_peer(peer, &state)?;
+    let trusted = state.trusted_cas(super::types::CaRole::Node);
+    let generation = trusted
+        .first()
+        .map(|ca| ca.generation)
+        .ok_or_else(|| RenewalError::Unavailable("no Node CA is available".into()))?;
+    let installed = trusted.iter().all(|ca| {
+        let fingerprint = super::identity_store::root_ca_fingerprint(&ca.certificate_der);
+        request.node_ca_fingerprints.contains(&fingerprint)
+    });
+    if !installed {
+        return Err(RenewalError::Request(
+            "the node has not installed the council's trust set yet".into(),
+        ));
+    }
+    match council
+        .write(RaftRequest::AcknowledgeNodeTrust {
+            node_id,
+            generation,
+        })
+        .await
+        .map_err(|error| RenewalError::Unavailable(error.to_string()))?
+    {
+        CouncilResponse::Refused { reason } => Err(RenewalError::Request(reason)),
+        _ => Ok(generation),
+    }
+}
+
 /// Validate the current node identity, chain, validity and retirement state
 /// before authorising a control request on a potentially long-lived connection.
 pub(crate) fn validate_peer(
     peer: &TlsPeerCertificate,
     state: &SecurityState,
 ) -> Result<String, RenewalError> {
-    let node_ca = state
-        .get_ca(CaRole::Node)
-        .ok_or_else(|| RenewalError::Unavailable("Node CA is unavailable".into()))?;
-    let root_ca = state
-        .get_ca(CaRole::Root)
-        .ok_or_else(|| RenewalError::Unavailable("Root CA is unavailable".into()))?;
-    cert::validate_chain(&peer.0, &node_ca.certificate_der, &root_ca.certificate_der)
+    // Every Node CA the council trusts, so a node holding a leaf from a
+    // retiring CA can still renew onto the new one (F04 R2).
+    let trust = TrustSet::from_state(state)
+        .ok_or_else(|| RenewalError::Unavailable("Node CA or root is unavailable".into()))?;
+    let chain = trust
+        .validate_node_leaf(&peer.0)
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
-    cert::check_issuer_binding(&peer.0, &node_ca.certificate_der)
-        .and_then(|()| {
-            cert::check_issuer_binding(&node_ca.certificate_der, &root_ca.certificate_der)
-        })
-        .map_err(|error| RenewalError::Identity(error.to_string()))?;
-    for certificate in [
-        peer.0.as_ref(),
-        &node_ca.certificate_der,
-        &root_ca.certificate_der,
-    ] {
+    for certificate in [peer.0.as_ref(), chain.node_ca, chain.root] {
         let (_, parsed) = x509_parser::parse_x509_certificate(certificate)
             .map_err(|error| RenewalError::Identity(error.to_string()))?;
         if parsed.serial.to_bytes_be().len() > 8 {

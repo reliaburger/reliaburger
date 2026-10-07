@@ -56,9 +56,10 @@ pub struct SnapshotUploader {
     part_bytes: usize,
     /// Deadline for each stage (spooling, uploading) of one export.
     stage_timeout: Duration,
-    /// Most bytes one spooled archive may use; `None` keeps 5% of the
-    /// spool filesystem free.
-    spool_limit: Option<u64>,
+    /// Reads the spool filesystem's free space, which sets the spool
+    /// quota. Production reads the host with `statvfs`; tests pass a fixed
+    /// reading so their outcome never depends on the developer's disk.
+    spool_space: fn(&Path) -> Result<DiskSpace, String>,
 }
 
 impl SnapshotUploader {
@@ -75,7 +76,7 @@ impl SnapshotUploader {
             node: node.to_string(),
             part_bytes: DEFAULT_PART_BYTES,
             stage_timeout,
-            spool_limit: None,
+            spool_space: host_disk_space,
         })
     }
 
@@ -358,11 +359,17 @@ async fn export_snapshot(
 ) -> Result<UploadStats, String> {
     let snapshot_dir = snapshots.snapshot_path(meta);
     let spool_dir = volumes_dir.join(SPOOL_DIR);
-    let limit = uploader.spool_limit;
+    let read_space = uploader.spool_space;
     let deadline = std::time::Instant::now() + uploader.stage_timeout;
     let archive_cancel = cancel.clone();
     let spooled = tokio::task::spawn_blocking(move || {
-        spool_archive(&snapshot_dir, &spool_dir, limit, deadline, &archive_cancel)
+        spool_archive(
+            &snapshot_dir,
+            &spool_dir,
+            read_space,
+            deadline,
+            &archive_cancel,
+        )
     })
     .await
     .map_err(|e| format!("archive task: {e}"))??;
@@ -425,15 +432,12 @@ async fn export_snapshot(
 fn spool_archive(
     snapshot_dir: &Path,
     spool_dir: &Path,
-    limit: Option<u64>,
+    read_space: fn(&Path) -> Result<DiskSpace, String>,
     deadline: std::time::Instant,
     cancel: &CancellationToken,
 ) -> Result<SpooledArchive, String> {
     std::fs::create_dir_all(spool_dir).map_err(|e| format!("spool: {e}"))?;
-    let limit = match limit {
-        Some(limit) => limit,
-        None => spool_quota(spool_dir)?,
-    };
+    let limit = spool_quota(read_space(spool_dir)?);
     let file = tempfile::Builder::new()
         .suffix(".tar.gz")
         .tempfile_in(spool_dir)
@@ -467,15 +471,35 @@ fn spool_archive(
     })
 }
 
-/// Bytes a spooled archive may use: whatever is free on the spool's
-/// filesystem, less 5% of its size, so an export never fills the disk the
-/// volumes live on.
-fn spool_quota(spool_dir: &Path) -> Result<u64, String> {
+/// Most space the spool holds back for everything else on the volumes
+/// filesystem. 5% of a 926 GiB disk is 46 GiB, so without this cap a
+/// large disk with 35 GiB free would refuse every export.
+const MAX_SPOOL_RESERVE: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Free and total bytes on a filesystem, as an unprivileged writer sees
+/// them.
+#[derive(Debug, Clone, Copy)]
+struct DiskSpace {
+    available: u64,
+    total: u64,
+}
+
+/// Bytes a spooled archive may use: whatever is free, less a reserve of 5%
+/// of the filesystem or 10 GiB, whichever is smaller, so an export never
+/// fills the disk the volumes live on.
+fn spool_quota(space: DiskSpace) -> u64 {
+    let reserve = (space.total / 20).min(MAX_SPOOL_RESERVE);
+    space.available.saturating_sub(reserve)
+}
+
+/// The host's reading of the filesystem holding `spool_dir`.
+fn host_disk_space(spool_dir: &Path) -> Result<DiskSpace, String> {
     let stats = nix::sys::statvfs::statvfs(spool_dir).map_err(|e| format!("spool statvfs: {e}"))?;
     let fragment = stats.fragment_size() as u64;
-    let available = (stats.blocks_available() as u64).saturating_mul(fragment);
-    let total = (stats.blocks() as u64).saturating_mul(fragment);
-    Ok(available.saturating_sub(total / 20))
+    Ok(DiskSpace {
+        available: (stats.blocks_available() as u64).saturating_mul(fragment),
+        total: (stats.blocks() as u64).saturating_mul(fragment),
+    })
 }
 
 /// The spool file's writer: hashes and counts what passes through, and
@@ -789,12 +813,14 @@ mod tests {
     }
 
     fn file_uploader(dest: &Path, node: &str) -> SnapshotUploader {
-        SnapshotUploader::from_url(
+        let mut uploader = SnapshotUploader::from_url(
             &format!("file://{}", dest.display()),
             node,
             Duration::from_secs(60),
         )
-        .unwrap()
+        .unwrap();
+        uploader.spool_space = roomy_disk;
+        uploader
     }
 
     /// An uploader over any store, as `node`.
@@ -810,8 +836,36 @@ mod tests {
             node: node.to_string(),
             part_bytes: DEFAULT_PART_BYTES,
             stage_timeout: Duration::from_secs(60),
-            spool_limit: None,
+            spool_space: roomy_disk,
         }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A fixture disk with room to spare: tests never read the host's
+    /// free space, so a nearly full developer disk can't fail them.
+    fn roomy_disk(_: &Path) -> Result<DiskSpace, String> {
+        Ok(DiskSpace {
+            available: 100 * GIB,
+            total: 200 * GIB,
+        })
+    }
+
+    /// A fixture disk with nothing free.
+    fn full_disk(_: &Path) -> Result<DiskSpace, String> {
+        Ok(DiskSpace {
+            available: 0,
+            total: 200 * GIB,
+        })
+    }
+
+    /// A fixture 1 MiB disk with 64 KiB free above its 5% reserve.
+    fn nearly_full_disk(_: &Path) -> Result<DiskSpace, String> {
+        let total = 1024 * 1024;
+        Ok(DiskSpace {
+            available: total / 20 + 64 * 1024,
+            total,
+        })
     }
 
     async fn tick(
@@ -1287,7 +1341,7 @@ mod tests {
         );
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let mut uploader = store_uploader(store.clone(), "memory:///shared", "n");
-        uploader.spool_limit = Some(64 * 1024);
+        uploader.spool_space = nearly_full_disk;
 
         let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
         assert_eq!(report.uploaded, 0);
@@ -1310,5 +1364,82 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(spooled, 0);
+    }
+
+    /// The spool quota comes from the uploader's disk reading, never the
+    /// host's own: the same export fails on a full fixture disk and
+    /// succeeds on the roomy one the other tests use, whatever the
+    /// developer's disk holds (#524).
+    #[tokio::test]
+    async fn a_full_host_disk_does_not_change_the_tests_outcome() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        fake_snapshot(volumes_dir.path(), &meta("db", "/data", "1000", 1000), b"x");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut uploader = store_uploader(store.clone(), "memory:///shared", "n");
+
+        uploader.spool_space = full_disk;
+        let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
+        assert_eq!(report.uploaded, 0);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("0 byte spool quota")),
+            "{:?}",
+            report.errors
+        );
+
+        uploader.spool_space = roomy_disk;
+        let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
+        assert_eq!(report.uploaded, 1, "{:?}", report.errors);
+    }
+
+    /// Production reads the host; only the tests swap the reading out.
+    #[test]
+    fn production_uploader_reads_the_host_disk() {
+        let dest = tempfile::tempdir().unwrap();
+        let uploader = SnapshotUploader::from_url(
+            &format!("file://{}", dest.path().display()),
+            "n",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let read = (uploader.spool_space)(dest.path()).unwrap();
+        assert!(read.total > 0);
+        assert_eq!(read.total, host_disk_space(dest.path()).unwrap().total);
+    }
+
+    #[test]
+    fn spool_keeps_five_percent_free_on_a_small_disk() {
+        let space = DiskSpace {
+            available: 30 * GIB,
+            total: 100 * GIB,
+        };
+        assert_eq!(spool_quota(space), 25 * GIB);
+    }
+
+    /// 5% of 926 GiB is 46 GiB; capping the reserve at 10 GiB lets a disk
+    /// with 35 GiB free still spool 25 GiB.
+    #[test]
+    fn spool_reserve_is_capped_on_a_large_disk() {
+        let space = DiskSpace {
+            available: 35 * GIB,
+            total: 926 * GIB,
+        };
+        assert_eq!(spool_quota(space), 25 * GIB);
+    }
+
+    #[test]
+    fn spool_quota_is_zero_inside_the_reserve() {
+        let small = DiskSpace {
+            available: 4 * GIB,
+            total: 100 * GIB,
+        };
+        assert_eq!(spool_quota(small), 0);
+        let large = DiskSpace {
+            available: 9 * GIB,
+            total: 4096 * GIB,
+        };
+        assert_eq!(spool_quota(large), 0);
     }
 }

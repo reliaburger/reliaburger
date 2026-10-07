@@ -91,7 +91,9 @@ pub const GROUPS: &[CommandGroup] = &[
             "stop",
             "delete",
             "batch",
+            "run",
             "batch-status",
+            "jobs",
         ],
     },
     CommandGroup {
@@ -154,7 +156,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "security and access",
             path: "docs/manual/10_security.md",
         }],
-        commands: &["token", "secret", "sign"],
+        commands: &["token", "secret", "ca", "sign"],
     },
     CommandGroup {
         title: "Images and volumes",

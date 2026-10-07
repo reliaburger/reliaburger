@@ -107,6 +107,13 @@ func env(name, fallback string) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "batch" {
+		if err := batch(os.Args[2:], os.Stdout); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	cashier, err := os.Hostname()
 	if err != nil {
 		cashier = "unknown"

@@ -22,7 +22,13 @@ use super::oci_pull::retry_registry_read;
 pub struct ImageReference {
     pub registry: String,
     pub repository: String,
+    /// What a pull asks for: the tag, or the digest when there is one.
     pub tag: String,
+    /// The tag a reference bound at apply still carries for people
+    /// (`nginx:1.27@sha256:…` keeps `1.27`). The pull ignores it; the
+    /// pull-through cache records the image under it, so a later apply can
+    /// bind the tag from the cache while upstream is down.
+    pub bound_tag: Option<String>,
 }
 
 /// Errors from image operations.
@@ -72,7 +78,7 @@ impl ImageReference {
         }
 
         // Split off the tag (last `:` that isn't part of a port number)
-        let (name_part, tag) = split_name_tag(s);
+        let (name_part, tag, bound_tag) = split_name_tag(s);
 
         // Determine if the first component is a registry (contains `.` or `:`)
         let parts: Vec<&str> = name_part.splitn(2, '/').collect();
@@ -95,6 +101,7 @@ impl ImageReference {
             registry,
             repository,
             tag,
+            bound_tag,
         })
     }
 
@@ -119,21 +126,22 @@ impl ImageReference {
     }
 }
 
-/// Split an image name into (name, tag). Defaults tag to "latest".
+/// Split an image name into (name, tag, bound tag). Defaults tag to
+/// "latest".
 ///
 /// A digest-pinned reference (`name@sha256:…`) carries the digest in
 /// the tag position — content addressing makes a tag redundant, and
 /// downstream code recognises the `sha256:` prefix.
-fn split_name_tag(s: &str) -> (&str, String) {
+fn split_name_tag(s: &str) -> (&str, String, Option<String>) {
     // A digest wins over a tag. A reference bound at apply carries both
-    // (`nginx:1.27@sha256:…`): the tag is for people, so drop it here.
+    // (`nginx:1.27@sha256:…`): the tag is for people, so it's kept aside.
     if let Some((name, digest)) = s.split_once('@') {
-        let (name, _tag) = split_tag(name);
-        return (name, digest.to_string());
+        let (name, tag) = split_tag(name);
+        return (name, digest.to_string(), tag.map(str::to_string));
     }
     match split_tag(s) {
-        (name, Some(tag)) => (name, tag.to_string()),
-        (name, None) => (name, "latest".to_string()),
+        (name, Some(tag)) => (name, tag.to_string(), None),
+        (name, None) => (name, "latest".to_string(), None),
     }
 }
 
@@ -215,6 +223,7 @@ impl ImageMirrors {
             registry: mirror.clone(),
             repository: image.repository.clone(),
             tag: image.tag.clone(),
+            bound_tag: image.bound_tag.clone(),
         })
     }
 
@@ -304,6 +313,8 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
 #[derive(Clone)]
 pub struct ImageStore {
     store_root: PathBuf,
+    blob_store:
+        std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::pickle::store::BlobStore>>>,
     /// Set once at startup when clustering is enabled; shared across
     /// clones (the runc grill holds one). A lock-free `OnceLock` read
     /// sits on every pull, a set happens at most once.
@@ -332,11 +343,25 @@ impl ImageStore {
     pub fn new(store_root: PathBuf) -> Self {
         Self {
             store_root,
+            blob_store: std::sync::Arc::new(std::sync::OnceLock::new()),
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
             unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             owner_shift: None,
             mirrors: ImageMirrors::default(),
         }
+    }
+
+    /// Install the registry's shared physical payload budget before any pulls.
+    pub fn set_blob_store(
+        &self,
+        store: std::sync::Arc<crate::pickle::store::BlobStore>,
+    ) -> Result<(), String> {
+        if store.base_dir() != self.store_root.as_path() {
+            return Err("runtime and registry image directories differ".into());
+        }
+        self.blob_store
+            .set(store)
+            .map_err(|_| "runtime blob store already configured".into())
     }
 
     /// Try `mirrors` before an image's own registry for digest-pinned pulls.
@@ -616,13 +641,33 @@ impl ImageStore {
                 }
                 Ok(())
             };
-            if blob_path.exists() {
+            let store = self.blob_store.get().cloned().unwrap_or_else(|| {
+                std::sync::Arc::new(crate::pickle::store::BlobStore::new(
+                    self.store_root.clone(),
+                ))
+            });
+            let expected = crate::pickle::types::Digest::new(digest).map_err(|error| {
+                ImageError::LayerPull {
+                    digest: digest.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let cached_store = store.clone();
+            let cached_digest = expected.clone();
+            let cached =
+                tokio::task::spawn_blocking(move || cached_store.revalidate_blob(&cached_digest))
+                    .await
+                    .map_err(|error| ImageError::LayerPull {
+                        digest: digest.clone(),
+                        reason: error.to_string(),
+                    })?
+                    .map_err(|error| ImageError::LayerPull {
+                        digest: digest.clone(),
+                        reason: error.to_string(),
+                    })?;
+            if cached {
                 verify_size(tokio::fs::metadata(&blob_path).await?.len())?;
                 continue;
-            }
-
-            if let Some(parent) = blob_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
             }
 
             let blob_data = retry_registry_read(super::oci_pull::LAYER_READ, || async {
@@ -652,20 +697,19 @@ impl ImageStore {
 
             // Write atomically (temp + rename) so a crash mid-write can't leave
             // a truncated blob at the final path that a later pull treats as a
-            // valid cache hit (M3) — the `exists()` check above never
-            // re-verifies a cached file. The digest was verified above, so a
-            // completed rename only ever publishes a good blob.
-            // The temp file is synced before the rename and the directory
-            // after it, so a power cut can't publish an empty blob either.
-            let published = blob_path.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::sesame::identity::atomic_write(&published, &blob_data)
-            })
-            .await
-            .map_err(|e| ImageError::UnpackFailed {
-                digest: digest.clone(),
-                reason: e.to_string(),
-            })??;
+            // valid cache hit (M3). Warm and cold paths both verify the
+            // digest through the shared store before use. Publication syncs
+            // the payload and each required ancestor directory entry.
+            tokio::task::spawn_blocking(move || store.write_blob(&blob_data, &expected))
+                .await
+                .map_err(|e| ImageError::UnpackFailed {
+                    digest: digest.clone(),
+                    reason: e.to_string(),
+                })?
+                .map_err(|error| ImageError::LayerPull {
+                    digest: digest.clone(),
+                    reason: error.to_string(),
+                })?;
         }
         Ok((manifest.layers, config))
     }
@@ -1119,6 +1163,18 @@ mod tests {
             assert_eq!(r.tag, digest, "{input}");
             assert!(r.to_oci_reference().is_ok(), "{input}");
         }
+    }
+
+    /// The tag a bound reference carries is kept beside the digest, so the
+    /// pull-through cache can remember it; a plain pin or tag has none.
+    #[test]
+    fn a_bound_reference_keeps_its_tag_aside() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let bound = ImageReference::parse(&format!("localhost:5000/app:v1@{digest}")).unwrap();
+        assert_eq!(bound.bound_tag.as_deref(), Some("v1"));
+        let pinned = ImageReference::parse(&format!("localhost:5000/app@{digest}")).unwrap();
+        assert_eq!(pinned.bound_tag, None);
+        assert_eq!(ImageReference::parse("app:v1").unwrap().bound_tag, None);
     }
 
     /// A port in the registry is not a tag, with or without a digest.
@@ -1936,6 +1992,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_sized_corrupt_cached_layer_is_refetched_before_unpack() {
+        let fixture = start_registry_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let first = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.manifest_path(&reference)).unwrap())
+                .unwrap();
+        let digest = manifest["layers"][0]["digest"].as_str().unwrap();
+        let path = store.blob_path(digest);
+        let verified = std::fs::read(&path).unwrap();
+        // Ordinary disk corruption: preserve the advertised size, retain no
+        // valid compressed bytes. A fresh rootfs must recover from the source.
+        std::fs::write(&path, vec![0u8; verified.len()]).unwrap();
+        // Discard both generation and completion marker to require a fresh unpack.
+        std::fs::remove_file(first.rootfs.with_extension("complete")).unwrap();
+        std::fs::remove_dir_all(first.rootfs).unwrap();
+        // Reopen with a cap exactly equal to the already cached layer. The
+        // corrupt file must return its reservation through the shared store
+        // before refetch; keeping stale accounting would refuse publication.
+        let registry = std::sync::Arc::new(crate::pickle::store::BlobStore::new(directory.path()));
+        registry
+            .configure_storage_limit(verified.len() as u64)
+            .await
+            .unwrap();
+        let reopened = ImageStore::new(directory.path().to_path_buf());
+        reopened.set_blob_store(registry.clone()).unwrap();
+        let recovered = reopened
+            .pull_and_unpack(&fixture.reference)
+            .await
+            .expect("warm-cache corruption should be discarded and refetched");
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(path).unwrap(), verified);
+        assert_eq!(
+            std::fs::read(recovered.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert!(
+            matches!(
+                registry.write_blob(b"x", &crate::pickle::store::compute_sha256(b"x")),
+                Err(crate::pickle::types::PickleError::StorageQuotaExceeded)
+            ),
+            "verified replacement remains charged"
+        );
+        std::fs::remove_file(recovered.rootfs.with_extension("complete")).unwrap();
+        std::fs::remove_dir_all(recovered.rootfs).unwrap();
+        let healthy = reopened.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            fixture.layer_requests.load(Ordering::SeqCst),
+            2,
+            "healthy warm cache still avoids a layer download"
+        );
+        assert_eq!(
+            std::fs::read(healthy.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+    }
+
+    #[tokio::test]
     async fn upstream_layer_sizes_match_direct_downloads_and_cached_blobs() {
         for warm_cache in [false, true] {
             let directory = tempfile::tempdir().unwrap();
@@ -2428,6 +2545,27 @@ mod tests {
         assert_eq!(pulled.config.cmd, ["-c", "true"]);
         assert_eq!(pulled.config.env, ["FIXTURE=1"]);
         assert_eq!(pulled.config.working_dir.as_deref(), Some("/etc"));
+    }
+
+    #[tokio::test]
+    async fn runtime_pull_shares_the_registry_physical_storage_ceiling() {
+        let fixture = start_registry_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let registry = std::sync::Arc::new(crate::pickle::store::BlobStore::new(directory.path()));
+        registry.configure_storage_limit(1).await.unwrap();
+        let image = ImageStore::new(directory.path().to_path_buf());
+        image.set_blob_store(registry.clone()).unwrap();
+        let error = image.pull_and_unpack(&fixture.reference).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("physical image storage quota exceeded"),
+            "{error}"
+        );
+        assert!(registry.list_blobs().unwrap().is_empty());
+        assert!(!registry.base_dir().join("blobs/sha256").exists());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        assert!(!image.rootfs_path(&reference).exists());
     }
 
     #[tokio::test]

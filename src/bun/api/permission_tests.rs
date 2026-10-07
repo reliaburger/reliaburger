@@ -302,12 +302,16 @@ fn refuses_system_principal(path: &str) -> bool {
         "/v1/token/create"
             | "/v1/token/list"
             | "/v1/token/revoke"
+            | "/v1/token/rotate"
             | "/v1/join-token/create"
             | "/v1/join-token/list"
             | "/v1/join-token/revoke"
             | "/v1/perimeter/admit"
             | "/v1/identity/sign"
             | "/v1/secret/rotate"
+            | "/v1/ca/rotation/prepare"
+            | "/v1/ca/rotation/begin"
+            | "/v1/ca/rotation/finalize"
             | "/v1/nodes/decommission"
     )
 }
@@ -479,8 +483,23 @@ fn spawn_status_agent(mut commands: mpsc::Receiver<AgentCommand>, stop: Cancella
                     None => return,
                 },
             };
-            if let AgentCommand::Status { response } = command {
-                let _ = response.send(vec![instance(TARGET_APP), instance(OTHER_APP)]);
+            match command {
+                AgentCommand::Status { response } => {
+                    let _ = response.send(vec![instance(TARGET_APP), instance(OTHER_APP)]);
+                }
+                AgentCommand::ResolveExecutionLogs {
+                    app_name,
+                    instance,
+                    response,
+                    ..
+                } => {
+                    let _ = response.send(Ok(crate::bun::agent::LogExecutionSelection {
+                        logical_name: app_name,
+                        instances: Vec::new(),
+                        selected_instance: instance,
+                    }));
+                }
+                _ => {}
             }
         }
     });

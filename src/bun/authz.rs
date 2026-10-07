@@ -155,6 +155,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/node/{name}", AnyToken),
     route(Get, "/ui/gitops", AnyToken),
     route(Get, "/ui/fragment/apps", AnyToken),
+    route(Get, "/ui/fragment/batches", AnyToken),
     route(Get, "/ui/fragment/nodes", AnyToken),
     gated(Get, "/ui/fragment/alerts", AnyToken, Cluster(METRICS)),
     route(
@@ -169,6 +170,16 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/apps", AnyToken),
     route(Get, "/v1/readiness", AnyToken),
     route(Get, "/v1/jobs", AnyToken),
+    route(Get, "/v1/jobs/definitions", AnyToken),
+    gated(Post, "/v1/jobs/runs", Deployer, Body(DEPLOY)),
+    // Replay additionally requires a user principal and exact side-effect acknowledgement.
+    gated(Post, "/v1/jobs/runs/{id}/replay", Deployer, Body(DEPLOY)),
+    gated(
+        Post,
+        "/v1/jobs/definitions/{name}/{namespace}/disable",
+        Deployer,
+        Body(DEPLOY),
+    ),
     route(Get, "/v1/events", AnyToken),
     route(Get, "/v1/ws/events", AnyToken),
     gated(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken, App(LOGS)),
@@ -188,6 +199,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Cluster + upgrade.
     // Renewal additionally requires the existing node TLS peer certificate.
     route(Post, "/v1/cluster/renew", System),
+    // As does a trust acknowledgement (F04 R4).
+    route(Post, "/v1/cluster/trust-ack", System),
     route(Post, "/v1/cluster/workload-csr", System),
     route(Post, "/v1/registry/propose", System),
     route(Post, "/v1/registry/query", System),
@@ -291,6 +304,17 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/batch/run", System),
     route(Post, "/v1/batch/{id}/report", System),
     route(Get, "/v1/batch/{id}", AnyToken),
+    // Task arrays. `sync` and the `local` reads are the leader's calls to
+    // nodes; results and logs are also held to the array's scope.
+    route(Post, "/v1/batch/array", Deployer),
+    route(Post, "/v1/batch/manifest", Deployer),
+    route(Get, "/v1/batch/summaries", AnyToken),
+    route(Post, "/v1/batch/array/sync", System),
+    route(Get, "/v1/batch/array/{id}/local/results", System),
+    route(Get, "/v1/batch/array/{id}/local/tasks/{index}/logs", System),
+    route(Post, "/v1/batch/{id}/cancel", Deployer),
+    route(Get, "/v1/batch/{id}/results", AnyToken),
+    route(Get, "/v1/batch/{id}/tasks/{index}/logs", AnyToken),
     route(Post, "/v1/build", Deployer),
     route(Post, "/v1/build/run", System),
     route(Post, "/v1/build/track", System),
@@ -303,14 +327,22 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/identity/sign", Admin, Cluster(ADMIN)),
     // Credential and trust management additionally requires an unscoped user.
     gated(Post, "/v1/token/create", Admin, Cluster(ADMIN)),
+    // With `local=true` the system principal may also read it: that's the
+    // node fan-out asking a peer for its last-use times (F05 I2).
     gated(Get, "/v1/token/list", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/token/rotate", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
     gated(Get, "/v1/join-token/list", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/revoke", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/perimeter/admit", Admin, Cluster(ADMIN)),
     route(Get, "/v1/secret/public-key", AnyToken),
     gated(Post, "/v1/secret/rotate", Admin, Cluster(SECRET_WRITE)),
+    // Rotating an intermediate CA (F04 R4): the operator's root signs, so
+    // only an unscoped Admin may start, submit or finalise one.
+    gated(Post, "/v1/ca/rotation/prepare", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/ca/rotation/begin", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/ca/rotation/finalize", Admin, Cluster(ADMIN)),
 ];
 
 /// Look up the principal a `(method, path)` requires, if the matrix
@@ -362,8 +394,10 @@ mod tests {
     fn node_to_node_routes_require_the_system_principal() {
         for path in [
             "/v1/cluster/renew",
+            "/v1/cluster/trust-ack",
             "/v1/batch/run",
             "/v1/batch/{id}/report",
+            "/v1/batch/array/sync",
             "/v1/build/run",
             "/v1/build/track",
             "/v1/build/sign",
@@ -488,7 +522,7 @@ mod tests {
                 for (index, _) in args.match_indices(pattern) {
                     let ident: String = args[index + pattern.len()..]
                         .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
                         .collect();
                     if ident.ends_with("_handler") {
                         handlers.push(ident);
@@ -515,6 +549,7 @@ mod tests {
     const API_ROUTE_MODULES: &[&str] = &[
         include_str!("api/apply.rs"),
         include_str!("api/apps.rs"),
+        include_str!("api/ca.rs"),
         include_str!("api/deploys.rs"),
         include_str!("api/discovery.rs"),
         include_str!("api/faults.rs"),
@@ -539,6 +574,10 @@ mod tests {
     /// A mounted handler's body, from the file that mounts it or from one
     /// of api.rs's route modules.
     fn mounted_handler_body<'a>(source: &'a str, ident: &str) -> Option<&'a str> {
+        let ident = ident.strip_prefix("super::").unwrap_or(ident);
+        if let Some(ident) = ident.strip_prefix("job_api::") {
+            return handler_body(include_str!("job_api.rs"), ident);
+        }
         std::iter::once(source)
             .chain(API_ROUTE_MODULES.iter().copied())
             .find_map(|candidate| handler_body(candidate, ident))
@@ -588,6 +627,219 @@ mod tests {
         );
     }
 
+    fn handler_checks_permission_action(
+        body: &str,
+        action: PermissionAction,
+        shared_auth_source: &str,
+    ) -> bool {
+        let marker = format!("PermissionAction::{action:?}");
+        if body.contains(&marker)
+            || (action == PermissionAction::Admin && body.contains("authorize_cluster_admin"))
+        {
+            return true;
+        }
+        // Only Deploy is unconditional in the one shared workload rule.
+        // HostExec remains conditional and cannot satisfy another route gate.
+        if action != PermissionAction::Deploy {
+            return false;
+        }
+        let Ok(auth_file) = syn::parse_file(shared_auth_source) else {
+            return false;
+        };
+        let Some(helper) = auth_file.items.iter().find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "authorize_workload" => Some(function),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let shared_deploy = helper.block.stmts.iter().any(|statement| {
+            let syn::Stmt::Expr(syn::Expr::Try(checked), _) = statement else {
+                return false;
+            };
+            let syn::Expr::Call(call) = checked.expr.as_ref() else {
+                return false;
+            };
+            let syn::Expr::Path(function) = call.func.as_ref() else {
+                return false;
+            };
+            if !function.path.is_ident("authorize_permission") || call.args.len() != 5 {
+                return false;
+            }
+            let Some(syn::Expr::Path(permission)) = call.args.iter().nth(1) else {
+                return false;
+            };
+            permission
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .eq(["crate", "config", "PermissionAction", "Deploy"])
+        });
+        if !shared_deploy {
+            return false;
+        }
+        let Ok(handler) = syn::parse_str::<syn::ItemFn>(body) else {
+            return false;
+        };
+        struct SharedWorkloadGuard(bool);
+        impl<'ast> syn::visit::Visit<'ast> for SharedWorkloadGuard {
+            fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+                let recognized = (|| {
+                    let syn::Expr::Let(condition) = expression.cond.as_ref() else {
+                        return false;
+                    };
+                    let syn::Pat::TupleStruct(pattern) = condition.pat.as_ref() else {
+                        return false;
+                    };
+                    if !pattern.path.is_ident("Err") || pattern.elems.len() != 1 {
+                        return false;
+                    }
+                    let Some(syn::Pat::Ident(binding)) = pattern.elems.first() else {
+                        return false;
+                    };
+                    let syn::Expr::Call(call) = condition.expr.as_ref() else {
+                        return false;
+                    };
+                    let syn::Expr::Path(function) = call.func.as_ref() else {
+                        return false;
+                    };
+                    if call.args.len() != 5
+                        || !function
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .eq(["crate", "sesame", "auth", "authorize_workload"])
+                        || expression.else_branch.is_some()
+                        || expression.then_branch.stmts.len() != 1
+                    {
+                        return false;
+                    }
+                    let syn::Stmt::Expr(syn::Expr::Return(returned), _) =
+                        &expression.then_branch.stmts[0]
+                    else {
+                        return false;
+                    };
+                    matches!(returned.expr.as_deref(), Some(syn::Expr::Path(value)) if value.path.is_ident(&binding.ident))
+                })();
+                self.0 |= recognized;
+                syn::visit::visit_expr_if(self, expression);
+            }
+        }
+        let mut guard = SharedWorkloadGuard(false);
+        syn::visit::Visit::visit_block(&mut guard, &handler.block);
+        guard.0
+    }
+
+    #[test]
+    fn permission_guardian_accepts_actual_shared_deploy_check() {
+        let body = handler_body(include_str!("api/apply.rs"), "apply_handler")
+            .expect("actual apply handler");
+        assert!(handler_checks_permission_action(
+            body,
+            PermissionAction::Deploy,
+            include_str!("../sesame/auth.rs"),
+        ));
+    }
+
+    #[test]
+    fn permission_guardian_requires_exact_error_returning_shared_call() {
+        let actual = handler_body(include_str!("api/apply.rs"), "apply_handler")
+            .expect("actual apply handler");
+        let auth = include_str!("../sesame/auth.rs");
+        for replacement in [
+            "crate::sesame::auth::unrecognized_workload",
+            "authorize_workload",
+            "other::authorize_workload",
+        ] {
+            let body = actual.replace("crate::sesame::auth::authorize_workload", replacement);
+            assert!(!handler_checks_permission_action(
+                &body,
+                PermissionAction::Deploy,
+                auth
+            ));
+        }
+        let ignored = "async fn handler() { let _ = crate::sesame::auth::authorize_workload(ctx, app, ns, host, permissions); }";
+        assert!(!handler_checks_permission_action(
+            ignored,
+            PermissionAction::Deploy,
+            auth
+        ));
+        assert!(!handler_checks_permission_action(
+            "async fn handler() { /* crate::sesame::auth::authorize_workload(ctx, app, ns, host, permissions) */ }",
+            PermissionAction::Deploy,
+            auth,
+        ));
+        let swallowed = actual.replace("return response;", "let _ = response;");
+        assert!(!handler_checks_permission_action(
+            &swallowed,
+            PermissionAction::Deploy,
+            auth
+        ));
+    }
+
+    #[test]
+    fn permission_guardian_requires_real_unconditional_shared_deploy_permission() {
+        let body = handler_body(include_str!("api/apply.rs"), "apply_handler")
+            .expect("actual apply handler");
+        for helper in [
+            "pub fn authorize_workload() { Ok(()) }",
+            "pub fn authorize_workload() { authorize_permission(ctx, crate::config::PermissionAction::HostExec, app, namespace, permissions)?; Ok(()) }",
+            "pub fn authorize_workload() { unrelated_permission(ctx, crate::config::PermissionAction::Deploy, app, namespace, permissions)?; Ok(()) }",
+            "pub fn authorize_workload() { if host { authorize_permission(ctx, crate::config::PermissionAction::Deploy, app, namespace, permissions)?; } Ok(()) }",
+            "pub fn authorize_workload() { let _ = authorize_permission(ctx, crate::config::PermissionAction::Deploy, app, namespace, permissions); Ok(()) }",
+            "pub fn other() { authorize_permission(ctx, crate::config::PermissionAction::Deploy, app, namespace, permissions)?; Ok(()) }",
+        ] {
+            assert!(!handler_checks_permission_action(
+                body,
+                PermissionAction::Deploy,
+                helper
+            ));
+        }
+    }
+
+    #[test]
+    fn permission_guardian_does_not_credit_optional_host_execution_or_other_actions() {
+        // The actual apply handler separately checks Admin for namespace and
+        // permission mutations. This isolated guard tests only the shared call.
+        let body = "async fn handler() { if let Err(response) = crate::sesame::auth::authorize_workload(ctx, app, namespace, host, permissions) { return response; } }";
+        for action in [
+            PermissionAction::HostExec,
+            PermissionAction::Exec,
+            PermissionAction::Admin,
+        ] {
+            assert!(!handler_checks_permission_action(
+                body,
+                action,
+                include_str!("../sesame/auth.rs"),
+            ));
+        }
+    }
+
+    #[test]
+    fn permission_guardian_retains_direct_action_and_cluster_admin_checks() {
+        assert!(handler_checks_permission_action(
+            "PermissionAction::Exec",
+            PermissionAction::Exec,
+            "",
+        ));
+        assert!(handler_checks_permission_action(
+            "authorize_cluster_admin",
+            PermissionAction::Admin,
+            "",
+        ));
+        assert!(!handler_checks_permission_action(
+            "PermissionAction::Exec",
+            PermissionAction::Deploy,
+            "",
+        ));
+        assert!(!handler_checks_permission_action(
+            "authorize_cluster_admin",
+            PermissionAction::Deploy,
+            "",
+        ));
+    }
+
     /// Every route the matrix gates on a `[permission]` action must name that
     /// action in its handler (B18).
     ///
@@ -629,9 +881,11 @@ mod tests {
                 let body = mounted_handler_body(source, &handler)
                     .unwrap_or_else(|| panic!("{} dispatches to missing {handler}", row.path));
                 checked += 1;
-                let cluster_admin =
-                    action == PermissionAction::Admin && body.contains("authorize_cluster_admin");
-                if !body.contains(&marker) && !cluster_admin {
+                if !handler_checks_permission_action(
+                    body,
+                    action,
+                    include_str!("../sesame/auth.rs"),
+                ) {
                     unchecked.push(format!("{} → {handler} ({marker})", row.path));
                 }
             }
@@ -667,6 +921,7 @@ mod tests {
         for handler in [
             "token_create_handler",
             "token_revoke_handler",
+            "token_rotate_handler",
             "join_token_create_handler",
             "secret_rotate_handler",
         ] {

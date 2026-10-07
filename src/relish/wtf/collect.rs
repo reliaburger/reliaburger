@@ -19,7 +19,8 @@ use super::{
     AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
     ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
     DiskObservation, Evidence, FaultObservation, LogObservation, NodeObservation,
-    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation, WtfInputs,
+    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
+    TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -214,6 +215,15 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
     let alerts = collect_alerts(&collected, app, collected_at);
     let local = collect_local_diagnostics(&collected, collected_at);
     let registry = collect_registry(capabilities_result, collected_at);
+    let tokens = if cluster_enabled {
+        collect_tokens(
+            bounded("token list", client.token_list()).await,
+            collected_at,
+        )
+    } else {
+        // Tokens live in the council; a standalone node has none.
+        Evidence::available(collected_at, Vec::new())
+    };
     let recent_logs = collect_logs(client, app, &restarts, collected_at).await;
 
     Ok(WtfInputs {
@@ -228,6 +238,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             disks: local.disks,
             certificates: local.certificates,
             registry,
+            tokens,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -856,6 +867,33 @@ fn append_diagnostic_source<T, U, F>(
     }
 }
 
+/// Token lifetimes from `GET /v1/token/list`. Only an unscoped Admin may
+/// read it, so with a lesser credential the evidence is unavailable and
+/// says why.
+fn collect_tokens(
+    listing: Result<crate::relish::client::TokenListing, String>,
+    observed_at: u64,
+) -> Evidence<Vec<TokenObservation>> {
+    match listing {
+        Ok(listing) => Evidence::available(
+            observed_at,
+            listing
+                .tokens
+                .into_iter()
+                .map(|token| TokenObservation {
+                    name: token.name,
+                    role: token.role,
+                    created_at: token.created_at,
+                    expires_at: token.expires_at,
+                })
+                .collect(),
+        ),
+        Err(reason) => Evidence::Unavailable {
+            reason: format!("{reason} (token lifetimes need an unscoped admin credential)"),
+        },
+    }
+}
+
 fn collect_registry(
     report: Result<ClusterCapabilityReport, String>,
     observed_at: u64,
@@ -1079,6 +1117,7 @@ mod tests {
                 service_port: Some(8080),
                 blocked: None,
                 volume_home_away: None,
+                volume_homes: Vec::new(),
             }]),
             Ok(Vec::new()),
             None,

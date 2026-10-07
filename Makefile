@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands
+.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -49,7 +49,7 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites
-	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) '
+	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) '
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -85,6 +85,15 @@ lint: ## Run clippy for every target, with all features and with none, warnings 
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
 	$(CARGO) clippy --all-targets --no-default-features -- -D warnings
 
+# One Clippy pass for the macOS CI job. The `lint` job on Linux runs both
+# passes. What only macOS compiles is `cfg(target_os = "macos")` code and the
+# `not(all(feature = "ebpf", target_os = "linux"))` fallbacks, and every
+# feature leaves both in, so the all-features pass covers them. The code that
+# only the no-features pass reaches is gated on a feature alone, and that
+# compiles the same on Linux. A second pass here took about three minutes.
+lint-macos: ## Run clippy once, every target with all features (the macOS CI job; `lint` runs both)
+	$(CARGO) clippy --all-targets --all-features -- -D warnings
+
 audit: ## Fail on new RustSec findings or an expired advisory exception
 	@today=$$(date -u +%Y%m%d); expiry=20261118; \
 	if [ "$$today" -gt "$$expiry" ]; then \
@@ -103,6 +112,9 @@ bench: ## Run reproducible transport and 5-250 node gossip benchmarks
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
+
+bench-task-arrays: ## Run in-process task-array benchmarks (leader cost, pool overhead, fork/exec floor)
+	$(CARGO) bench --bench task_arrays
 
 coverage: ## Run the portable suite once under line coverage and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
@@ -164,3 +176,7 @@ clean: ## Remove build artefacts and generated files
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  make %-12s %s\n", $$1, $$2}'
+
+.PHONY: test-contract-boundaries
+test-contract-boundaries: ## Run the actual-source optimized cron boundary contract
+	$(NEXTEST) --manifest-path tests/contracts/cron/Cargo.toml --config-file tests/contracts/cron/nextest.toml --release --locked

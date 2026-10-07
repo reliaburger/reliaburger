@@ -114,7 +114,7 @@
 - **The seeds' `node.toml`** keeps one old bun (`[upgrades] retain_versions = 1`) and two days of unreferenced images (`[images] gc_retain_days = 2`). `[metrics]` and `[logs] max_storage_mb` were left alone, because they only prune files already exported; the V02 soak's 7–11 MB per 12 h means a week of each fits.
 - **`image/tools/fleet-measure.sh`** samples every node over SSH into one CSV per node, for S5's 24-hour run: `MemAvailable`, swap and zram, bun's RSS, bytes written to the system disk (`/sys/block/<disk>/stat`), data partition use, load, the hottest thermal zone, and the OS and bun versions. Checked against the lab VM.
 
-**The bare-metal preview (29–30 Sep).** It covers the manual chapter `docs/manual/14_appliance.md`, the book chapter `docs/book/15a-becoming-the-os.md`, and the tools in `image/tools/`.
+**The bare-metal preview (29–30 Sep).** It covers the manual chapter `docs/manual/15_appliance.md`, the book chapter `docs/book/15a-becoming-the-os.md`, and the tools in `image/tools/`.
 - **Seeds for real machines:** real hardware has no SMBIOS channel for the lab's seed credential. So `reliaburger-seed` now also reads a USB stick labelled `RBSEED`, with `seeds/<mac>.seed` for one of the machine's NICs, so one stick serves a whole fleet. Without it, a physical node could install but never join a cluster, and S5 would have been blocked.
 - **The guide, followed end to end in the lab:**
   1. `image/tools/netboot-server.sh` ran in the netboot namespace in place of the lab's own services, and served two netboot installs (16 s each). The installer prints each NIC's MAC and address.

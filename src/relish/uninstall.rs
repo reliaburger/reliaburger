@@ -405,8 +405,10 @@ mod tests {
         let (_temp, root, local_bin) = installed_home();
         std::fs::write(root.join("context.lock"), "").unwrap();
         let plan = plan(&root, Some(&local_bin)).unwrap();
-        let held = std::fs::File::open(root.join("context.lock")).unwrap();
-        held.try_lock().unwrap();
+        let _held = crate::file_lock::FileLock::try_lock(
+            std::fs::File::open(root.join("context.lock")).unwrap(),
+        )
+        .unwrap();
         let error = execute(&plan).unwrap_err();
         assert!(
             matches!(error, UninstallError::Remove { ref path, .. } if path.ends_with("context.lock"))

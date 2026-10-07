@@ -60,6 +60,25 @@ pub struct WrappedKey {
     pub hkdf_info: String,
 }
 
+/// Where a CA stands in a rotation (F04 R1).
+///
+/// Outside a rotation every CA is `Active`. Beginning a rotation adds the new
+/// CA as `Active` and marks the one it replaces `Retiring`: verifiers still
+/// trust it, but nothing new is signed with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaState {
+    /// Signs new certificates and is trusted by every verifier.
+    Active,
+    /// Trusted, never used to sign, and due to go once the rotation is
+    /// finalised.
+    Retiring {
+        /// When the longest-lived leaf this CA could have signed before the
+        /// rotation began expires. After it nothing can depend on the CA, so
+        /// finalise no longer has to prove that leaves moved.
+        until: SystemTime,
+    },
+}
+
 /// One CA in the hierarchy (root, node, workload, or ingress).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CertificateAuthority {
@@ -78,8 +97,48 @@ pub struct CertificateAuthority {
     pub not_after: SystemTime,
     /// The parent CA's serial (None for the root CA).
     pub issuer_serial: Option<SerialNumber>,
-    /// Generation counter, incremented on `relish ca rotate`.
+    /// Generation counter: 0 at init, one more for each rotation of the
+    /// role (`RaftRequest::CaRotationBegin`).
     pub generation: u64,
+    /// Whether this CA signs, or is only trusted while a rotation finishes.
+    pub state: CaState,
+}
+
+/// The node leaf the council last issued to a node, kept so finalising a Node
+/// CA rotation can tell whether any node still depends on the retiring CA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLeafRecord {
+    /// The serial allocated for the leaf.
+    pub serial: SerialNumber,
+    /// The generation of the Node CA that was active when the serial was
+    /// allocated, which is the CA that signs it.
+    pub ca_generation: u64,
+    /// The newest Node CA generation the node has acknowledged trusting
+    /// (F04 R4). A node acknowledges once it has installed the council's
+    /// trust set, so a Node CA rotation re-issues leaves only after every
+    /// node will accept them, and finalises only after that too.
+    pub trust_generation: u64,
+}
+
+/// An intermediate CA the council has made a key for and is waiting for the
+/// operator to sign (F04 R4).
+///
+/// `relish ca rotate` asks for it, signs the CSR with the root key it holds
+/// locally and sends the certificate back. The private key never leaves the
+/// cluster and the root key never reaches it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingIntermediate {
+    /// Which intermediate this replaces.
+    pub role: CaRole,
+    /// The generation the new CA will have: the active one's plus one.
+    pub generation: u64,
+    /// The serial the certificate must carry, allocated by the council so it
+    /// never collides with a revoked one.
+    pub serial: SerialNumber,
+    /// The PKCS#10 request for the new key, DER.
+    pub csr_der: Vec<u8>,
+    /// The new private key, wrapped with the cluster's wrapping key.
+    pub private_key_wrapped: WrappedKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +354,45 @@ pub struct ApiToken {
     pub scope: TokenScope,
     /// When the token expires.
     pub expires_at: Option<SystemTime>,
-    /// When the token was created.
+    /// When the token's current secret was issued: at creation, then at
+    /// each `relish token rotate`.
     pub created_at: SystemTime,
+    /// The secret this token had before its last rotation, while it is
+    /// still accepted. `None` when the token was never rotated, or was
+    /// rotated with no grace period.
+    #[serde(default)]
+    pub previous_secret: Option<PreviousSecret>,
+}
+
+/// A rotated-out token secret that keeps working until `valid_until`, so
+/// clients can move to the new secret without an outage (F05 I3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreviousSecret {
+    /// Argon2id hash of the old secret.
+    pub token_hash: Vec<u8>,
+    /// Salt the old secret was hashed with.
+    pub token_salt: Vec<u8>,
+    /// When the old secret stops working.
+    pub valid_until: SystemTime,
+}
+
+/// A new secret for an existing API token, as `RaftRequest::RotateApiToken`
+/// carries it. The leader hashes the secret and reads the clock, so every
+/// replica applies the same values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenRotation {
+    /// The token being rotated.
+    pub name: String,
+    /// Argon2id hash of the new secret.
+    pub token_hash: Vec<u8>,
+    /// Salt the new secret was hashed with.
+    pub token_salt: Vec<u8>,
+    /// When the new secret was issued.
+    pub rotated_at: SystemTime,
+    /// When the new secret expires.
+    pub expires_at: Option<SystemTime>,
+    /// Until when the old secret keeps working; `None` ends it at once.
+    pub previous_valid_until: Option<SystemTime>,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +450,26 @@ pub struct SecretSeal {
     pub scope: AgeKeyScope,
     /// The generation of that scope's key at write time.
     pub generation: u64,
+}
+
+/// One stored secret that a namespace's first key re-sealed (F05 I4).
+///
+/// When a namespace opts in to its own key, the leader decrypts each of the
+/// namespace's `ENC[AGE:...]` values with the cluster-wide key and seals
+/// the same plaintext again with the new namespace key. The new key and
+/// every re-sealed value commit in one Raft entry, so no replica ever sees
+/// the key without the values it can open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResealedSecret {
+    /// The app whose environment holds the value.
+    pub app_id: crate::meat::types::AppId,
+    /// The environment variable's name.
+    pub env_key: String,
+    /// The `ENC[AGE:...]` value the leader read. If the stored value has
+    /// changed since, the whole entry is refused.
+    pub previous: String,
+    /// The same plaintext sealed under the namespace's key.
+    pub sealed: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -466,14 +582,55 @@ pub struct SecurityState {
     /// `namespace/app/ENV_KEY` (PKI8). An encrypted secret with no entry
     /// counts as "unknown generation" and blocks finalise until re-encrypted.
     pub secret_seals: std::collections::BTreeMap<String, SecretSeal>,
+    /// The latest node leaf issued to each node, keyed by node id (F04 R1).
+    pub node_leaves: std::collections::BTreeMap<String, NodeLeafRecord>,
+    /// Intermediates waiting for the operator's signature, at most one per
+    /// role (F04 R4).
+    pub pending_intermediates: Vec<PendingIntermediate>,
 }
 
 impl SecurityState {
-    /// Get the CA for a given role.
-    pub fn get_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
+    /// Whether this state was seeded: it holds a CA, a secret key or a token.
+    /// The council refuses to seed an initialised state again.
+    pub fn is_initialised(&self) -> bool {
+        !self.certificate_authorities.is_empty()
+            || !self.age_keypairs.is_empty()
+            || !self.api_tokens.is_empty()
+    }
+
+    /// The CA that signs new certificates for a role: the newest `Active`
+    /// one. `None` when the state holds no CA for the role.
+    pub fn active_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
         self.certificate_authorities
             .iter()
-            .find(|ca| ca.role == role)
+            .filter(|ca| ca.role == role && ca.state == CaState::Active)
+            .max_by_key(|ca| ca.generation)
+    }
+
+    /// Every CA a verifier should accept for a role, the active one first and
+    /// then any that are retiring. Outside a rotation that's one CA.
+    pub fn trusted_cas(&self, role: CaRole) -> Vec<&CertificateAuthority> {
+        let mut cas: Vec<&CertificateAuthority> = self
+            .certificate_authorities
+            .iter()
+            .filter(|ca| ca.role == role)
+            .collect();
+        // `false` sorts before `true`, so the active CA leads, then the
+        // retiring ones newest first.
+        cas.sort_by_key(|ca| {
+            (
+                ca.state != CaState::Active,
+                std::cmp::Reverse(ca.generation),
+            )
+        });
+        cas
+    }
+
+    /// The CA a role is rotating away from, if a rotation is in progress.
+    pub fn retiring_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
+        self.certificate_authorities
+            .iter()
+            .find(|ca| ca.role == role && matches!(ca.state, CaState::Retiring { .. }))
     }
 
     /// The **active** keypair for a scope — the one new secrets should be
@@ -508,6 +665,27 @@ impl SecurityState {
             .collect();
         kps.sort_by_key(|kp| std::cmp::Reverse(kp.generation));
         kps
+    }
+
+    /// Whether `namespace` has a secret key of its own (F05 I4).
+    pub fn has_namespace_key(&self, namespace: &str) -> bool {
+        let scope = AgeKeyScope::Namespace(namespace.to_string());
+        self.age_keypairs.iter().any(|kp| kp.scope == scope)
+    }
+
+    /// Every keypair that may decrypt a value stored in `namespace`, newest
+    /// generation first.
+    ///
+    /// A namespace with a key of its own gets only its own keys: no
+    /// fallback to the cluster-wide key, or a value sealed for the whole
+    /// cluster would still open there and the boundary would be nominal
+    /// (F05 I4). A namespace without one uses the cluster-wide keys.
+    pub fn decryption_keypairs(&self, namespace: &str) -> Vec<&AgeKeypair> {
+        if self.has_namespace_key(namespace) {
+            self.age_keypairs_for_scope(&AgeKeyScope::Namespace(namespace.to_string()))
+        } else {
+            self.age_keypairs_for_scope(&AgeKeyScope::ClusterWide)
+        }
     }
 
     /// The active cluster-wide age keypair (for encrypting new secrets).
@@ -623,6 +801,49 @@ mod tests {
             vec![2, 1, 0],
             "decryption tries newest generation first"
         );
+    }
+
+    #[test]
+    fn a_namespace_without_its_own_key_decrypts_with_the_cluster_keys() {
+        let state = SecurityState {
+            age_keypairs: vec![
+                age_kp(AgeKeyScope::ClusterWide, 0, true),
+                age_kp(AgeKeyScope::ClusterWide, 1, false),
+                age_kp(AgeKeyScope::Namespace("team-a".into()), 0, false),
+            ],
+            ..SecurityState::default()
+        };
+        assert!(!state.has_namespace_key("team-b"));
+        let scopes: Vec<(AgeKeyScope, u64)> = state
+            .decryption_keypairs("team-b")
+            .iter()
+            .map(|kp| (kp.scope.clone(), kp.generation))
+            .collect();
+        assert_eq!(
+            scopes,
+            [(AgeKeyScope::ClusterWide, 1), (AgeKeyScope::ClusterWide, 0)],
+            "team-a's key never opens team-b's values"
+        );
+    }
+
+    #[test]
+    fn a_namespace_with_its_own_key_never_falls_back_to_the_cluster_key() {
+        let team_a = AgeKeyScope::Namespace("team-a".into());
+        let state = SecurityState {
+            age_keypairs: vec![
+                age_kp(AgeKeyScope::ClusterWide, 0, false),
+                age_kp(team_a.clone(), 0, true),
+                age_kp(team_a.clone(), 1, false),
+            ],
+            ..SecurityState::default()
+        };
+        assert!(state.has_namespace_key("team-a"));
+        let scopes: Vec<(AgeKeyScope, u64)> = state
+            .decryption_keypairs("team-a")
+            .iter()
+            .map(|kp| (kp.scope.clone(), kp.generation))
+            .collect();
+        assert_eq!(scopes, [(team_a.clone(), 1), (team_a, 0)]);
     }
 
     #[test]

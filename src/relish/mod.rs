@@ -1,5 +1,6 @@
 pub mod bare_metal;
 pub mod bench_cmd;
+pub mod ca_cmd;
 /// Relish CLI library.
 ///
 /// Separates CLI logic from the binary so it can be tested as a library.
@@ -205,4 +206,16 @@ pub enum RelishError {
     /// `relish manual CHAPTER` named no single chapter.
     #[error("{0}")]
     Manual(#[from] manual::ManualError),
+
+    /// A root CA backup couldn't be built, sealed, opened or verified.
+    #[error("{0}")]
+    RootBackup(#[from] crate::sesame::root_backup::RootBackupError),
+
+    /// The root couldn't sign the council's intermediate CSR (F04 R4).
+    #[error("{0}")]
+    CertificateAuthority(#[from] crate::sesame::ca::CaError),
+
+    /// The master key or security state `relish init` wrote couldn't be read.
+    #[error("{0}")]
+    SecurityFiles(#[from] crate::sesame::bootstrap::BootstrapError),
 }

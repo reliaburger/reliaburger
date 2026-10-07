@@ -346,9 +346,93 @@ pub struct SecuritySection {
     /// the council leader for node renewals, the signing member for joins,
     /// each node for its own ingress leaves.
     pub leaf_lifetime_override_secs: Option<u64>,
+
+    /// API token defaults (`[security.tokens]`).
+    pub tokens: TokensSection,
+}
+
+/// API token defaults (`[security.tokens]`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokensSection {
+    /// The lifetime of a Deployer or ReadOnly token created without
+    /// `--ttl-days` or `--no-expiry`: `"90d"`, `"12h"`, or `"none"` for no
+    /// default. Admin tokens never get one. Default `"90d"`.
+    pub default_ttl: TokenTtl,
+}
+
+/// A default token lifetime as `[security.tokens] default_ttl` spells it.
+///
+/// `#[serde(try_from = "String")]` makes serde read the TOML value as a
+/// `String` and then call our `TryFrom` impl, so a bad value fails the
+/// config load with its field named, instead of surfacing at the first
+/// `relish token create`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TokenTtl(pub Option<std::time::Duration>);
+
+impl Default for TokenTtl {
+    fn default() -> Self {
+        Self(Some(crate::sesame::token::DEFAULT_TOKEN_TTL))
+    }
+}
+
+impl TryFrom<String> for TokenTtl {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value == "none" {
+            return Ok(Self(None));
+        }
+        let invalid = || {
+            format!(
+                "default_ttl {value:?} is not a positive number of days (\"90d\") \
+                 or hours (\"12h\"), or \"none\""
+            )
+        };
+        let (count, unit_seconds) = if let Some(days) = value.strip_suffix('d') {
+            (days, 86_400)
+        } else if let Some(hours) = value.strip_suffix('h') {
+            (hours, 3_600)
+        } else {
+            return Err(invalid());
+        };
+        let seconds = count
+            .parse::<u64>()
+            .ok()
+            .filter(|count| *count > 0)
+            .and_then(|count| count.checked_mul(unit_seconds))
+            // A lifetime past the year 2^64 seconds can't be added to now.
+            .filter(|seconds| {
+                std::time::SystemTime::now()
+                    .checked_add(std::time::Duration::from_secs(*seconds))
+                    .is_some()
+            })
+            .ok_or_else(invalid)?;
+        Ok(Self(Some(std::time::Duration::from_secs(seconds))))
+    }
+}
+
+impl From<TokenTtl> for String {
+    fn from(ttl: TokenTtl) -> Self {
+        match ttl.0 {
+            None => "none".to_string(),
+            Some(lifetime) if lifetime.as_secs().is_multiple_of(86_400) => {
+                format!("{}d", lifetime.as_secs() / 86_400)
+            }
+            Some(lifetime) => format!("{}h", lifetime.as_secs().div_ceil(3_600)),
+        }
+    }
 }
 
 impl SecuritySection {
+    /// The lifetime this node gives a new token that names none.
+    pub fn token_lifetime(&self) -> crate::sesame::token::TokenLifetimePolicy {
+        crate::sesame::token::TokenLifetimePolicy {
+            default_ttl: self.tokens.default_ttl.0,
+        }
+    }
+
     /// Lifetime of node leaves this member signs (joins and renewals).
     pub fn node_leaf_lifetime(&self) -> std::time::Duration {
         self.shortened(crate::sesame::ca::NODE_LEAF_LIFETIME)
@@ -765,11 +849,11 @@ pub struct ExternalRegistrySection {
 
 /// Image trust policy controlling signature requirements.
 ///
-/// When `require_signatures` is `true`, the scheduler refuses to
-/// schedule Pickle-hosted images that have no attached signature, and a
-/// node that can't reach the cluster trust state to verify one refuses the
-/// deploy rather than skipping the check (fail-closed, IMG2). Images from
-/// external registries are not checked.
+/// When `require_signatures` is `true`, Bun refuses to deploy
+/// Pickle-hosted images that have no valid signature, and a node that
+/// can't reach the cluster trust state to verify one refuses the deploy
+/// rather than skipping the check (fail-closed, IMG2). Images from external
+/// registries answer to the `upstream` rules instead (F03 U2).
 ///
 /// There is deliberately no `build_signer` key path to configure: the
 /// build signer is a persistent code-signing identity the council mints
@@ -784,6 +868,104 @@ pub struct TrustPolicySection {
     pub require_signatures: bool,
     /// Base64-encoded ECDSA P-256 public keys trusted for external signing.
     pub keys: Vec<String>,
+    /// Rules for images from outside Pickle (`[[images.trust_policy.upstream]]`).
+    /// The most specific rule matching an image's repository applies.
+    pub upstream: Vec<UpstreamTrustRule>,
+    /// What happens to an upstream image no rule matches.
+    pub upstream_default: UpstreamDefault,
+}
+
+/// One `[[images.trust_policy.upstream]]` rule (F03 U2, #361).
+///
+/// An image matching a rule is allowed, bound to a digest at apply, and
+/// (once cosign verification lands, U3) checked for a signature when the
+/// rule asks for one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTrustRule {
+    /// A repository, `docker.io/library/nginx`, or a prefix ending in `*`,
+    /// `ghcr.io/acme/*`. Docker Hub shorthand is spelled out: `nginx` is
+    /// `docker.io/library/nginx`.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Require a key-based cosign signature over the bound digest, in the
+    /// classic `.sig` layout, from one of `cosign_keys` (F03 U3).
+    #[serde(default)]
+    pub require_signatures: bool,
+    /// PEM ECDSA P-256 public keys (`cosign.pub`) trusted for this rule.
+    #[serde(default)]
+    pub cosign_keys: Vec<String>,
+}
+
+/// `[images.trust_policy.upstream_default]`: upstream images no rule matches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamDefault {
+    /// Allow them (the default). `false` turns the rules into an allow-list.
+    pub allow: bool,
+}
+
+impl Default for UpstreamDefault {
+    fn default() -> Self {
+        Self { allow: true }
+    }
+}
+
+impl TrustPolicySection {
+    /// Reject upstream rules that could never match, or that ask for checks
+    /// this release can't make, before the node starts on them.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        let mut seen = std::collections::HashSet::new();
+        for rule in &self.upstream {
+            let bad = |reason: &str| super::error::ConfigError::Validation {
+                field: format!("match = {:?}", rule.pattern),
+                context: "images.trust_policy.upstream".to_string(),
+                reason: reason.to_string(),
+            };
+            let literal = rule.pattern.strip_suffix('*').unwrap_or(&rule.pattern);
+            if literal.is_empty() {
+                return Err(bad("must name a registry and repository"));
+            }
+            if literal.contains('*') {
+                return Err(bad("may hold `*` only at its end"));
+            }
+            let Some((host, path)) = literal.split_once('/') else {
+                return Err(bad(
+                    "must start with a registry host, as in docker.io/library/nginx",
+                ));
+            };
+            if !(host.contains('.') || host.contains(':') || host == "localhost") {
+                return Err(bad(
+                    "must start with a registry host, as in docker.io/library/nginx",
+                ));
+            }
+            // A registry port is in the host; a `:` or `@` in the path is a
+            // tag or a digest, and rules match repositories.
+            if path.contains(':') || path.contains('@') {
+                return Err(bad("matches repositories, so it takes no tag or digest"));
+            }
+            match (rule.require_signatures, rule.cosign_keys.is_empty()) {
+                (true, true) => {
+                    return Err(bad(
+                        "requires signatures, so it needs at least one cosign_keys entry",
+                    ));
+                }
+                // Keys without the requirement would look like a check
+                // that never runs.
+                (false, false) => {
+                    return Err(bad("lists cosign_keys without require_signatures = true"));
+                }
+                _ => {}
+            }
+            if let Err(error) = crate::pickle::cosign::CosignKey::parse_all(&rule.cosign_keys) {
+                return Err(bad(&error.to_string()));
+            }
+            if !seen.insert(rule.pattern.as_str()) {
+                return Err(bad("appears twice"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ImagesSection {
@@ -998,6 +1180,38 @@ mod tests {
             error.to_string().contains("without a scheme or path"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn token_default_ttl_is_ninety_days_unless_configured() {
+        let day = std::time::Duration::from_secs(86_400);
+        assert_eq!(
+            NodeConfig::parse("").unwrap().security.token_lifetime(),
+            crate::sesame::token::TokenLifetimePolicy {
+                default_ttl: Some(90 * day)
+            }
+        );
+        let config = NodeConfig::parse("[security.tokens]\ndefault_ttl = \"30d\"\n").unwrap();
+        assert_eq!(config.security.token_lifetime().default_ttl, Some(30 * day));
+        let config = NodeConfig::parse("[security.tokens]\ndefault_ttl = \"12h\"\n").unwrap();
+        assert_eq!(
+            config.security.token_lifetime().default_ttl,
+            Some(std::time::Duration::from_secs(12 * 3_600))
+        );
+        let config = NodeConfig::parse("[security.tokens]\ndefault_ttl = \"none\"\n").unwrap();
+        assert_eq!(config.security.token_lifetime().default_ttl, None);
+    }
+
+    #[test]
+    fn token_default_ttl_refuses_zero_unitless_and_overflowing_values() {
+        for value in ["0d", "90", "ninety", "-1d", "99999999999999999d", ""] {
+            let toml = format!("[security.tokens]\ndefault_ttl = \"{value}\"\n");
+            let error = NodeConfig::parse(&toml).unwrap_err();
+            assert!(
+                error.to_string().contains("default_ttl"),
+                "{value}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1403,6 +1617,114 @@ mod tests {
         let nc = NodeConfig::parse("").unwrap();
         assert!(!nc.images.trust_policy.require_signatures);
         assert!(nc.images.trust_policy.keys.is_empty());
+        assert!(nc.images.trust_policy.upstream.is_empty());
+        assert!(nc.images.trust_policy.upstream_default.allow);
+    }
+
+    #[test]
+    fn parse_upstream_trust_rules() {
+        let nc = NodeConfig::parse(
+            r#"
+            [[images.trust_policy.upstream]]
+            match = "docker.io/library/*"
+            require_signatures = false
+
+            [[images.trust_policy.upstream]]
+            match = "ghcr.io/acme/web"
+
+            [images.trust_policy.upstream_default]
+            allow = false
+            "#,
+        )
+        .unwrap();
+        let policy = &nc.images.trust_policy;
+        assert_eq!(policy.upstream.len(), 2);
+        assert_eq!(policy.upstream[0].pattern, "docker.io/library/*");
+        assert!(!policy.upstream_default.allow);
+        policy.validate().unwrap();
+    }
+
+    fn upstream_rule_error(pattern: &str, require_signatures: bool) -> String {
+        signature_rule_error(pattern, require_signatures, vec![])
+    }
+
+    fn signature_rule_error(
+        pattern: &str,
+        require_signatures: bool,
+        cosign_keys: Vec<String>,
+    ) -> String {
+        let policy = TrustPolicySection {
+            upstream: vec![UpstreamTrustRule {
+                pattern: pattern.to_string(),
+                require_signatures,
+                cosign_keys,
+            }],
+            ..Default::default()
+        };
+        policy.validate().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn an_upstream_rule_that_could_never_match_is_refused() {
+        for (pattern, reason) in [
+            ("", "registry and repository"),
+            ("*", "registry and repository"),
+            ("docker.io/*/nginx", "only at its end"),
+            ("nginx", "registry host"),
+            ("library/nginx", "registry host"),
+            ("docker.io/library/nginx:1.27", "no tag or digest"),
+            ("docker.io/library/nginx@sha256:abc", "no tag or digest"),
+        ] {
+            let error = upstream_rule_error(pattern, false);
+            assert!(error.contains(reason), "{pattern:?}: {error}");
+        }
+        for pattern in ["localhost:5000/*", "registry.internal:443/team/app"] {
+            let policy = TrustPolicySection {
+                upstream: vec![UpstreamTrustRule {
+                    pattern: pattern.to_string(),
+                    require_signatures: false,
+                    cosign_keys: vec![],
+                }],
+                ..Default::default()
+            };
+            policy.validate().unwrap();
+        }
+    }
+
+    /// A signature rule needs keys that parse, and keys need the rule to
+    /// require signatures: either half alone would be a check that never runs.
+    #[test]
+    fn a_signature_rule_needs_cosign_keys_that_parse() {
+        let key = crate::pickle::cosign::fixture::PUBLIC_KEY.to_string();
+        let error = signature_rule_error("ghcr.io/acme/*", true, vec![]);
+        assert!(error.contains("cosign_keys"), "{error}");
+        let error = signature_rule_error("ghcr.io/acme/*", false, vec![key.clone()]);
+        assert!(error.contains("without require_signatures"), "{error}");
+        let error = signature_rule_error("ghcr.io/acme/*", true, vec!["not pem".into()]);
+        assert!(error.contains("cosign public key"), "{error}");
+        let policy = TrustPolicySection {
+            upstream: vec![UpstreamTrustRule {
+                pattern: "ghcr.io/acme/*".to_string(),
+                require_signatures: true,
+                cosign_keys: vec![key],
+            }],
+            ..Default::default()
+        };
+        policy.validate().unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_upstream_rule_is_refused() {
+        let rule = UpstreamTrustRule {
+            pattern: "ghcr.io/acme/*".to_string(),
+            require_signatures: false,
+            cosign_keys: vec![],
+        };
+        let policy = TrustPolicySection {
+            upstream: vec![rule.clone(), rule],
+            ..Default::default()
+        };
+        assert!(policy.validate().unwrap_err().to_string().contains("twice"));
     }
 
     #[test]

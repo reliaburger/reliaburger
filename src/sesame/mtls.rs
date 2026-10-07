@@ -33,6 +33,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, S
 
 use super::cert::{self, CertError};
 use super::identity_store::NodeIdentity;
+use super::trust::TrustSet;
 use super::types::Crl;
 
 /// Errors from mTLS operations.
@@ -116,6 +117,36 @@ impl CrlHandle {
     }
 }
 
+/// Where a verifier reads the CAs it trusts (F04 R2).
+///
+/// A listener or client built from a [`LiveNodeIdentity`] reads the live
+/// identity's trust set on every handshake, so a trust set the security
+/// refresh installs reaches existing listeners without a rebuild or a restart.
+///
+/// [`LiveNodeIdentity`]: super::credentials::LiveNodeIdentity
+#[derive(Debug, Clone)]
+pub enum TrustSource {
+    /// A trust set fixed when the verifier was built.
+    Fixed(Arc<TrustSet>),
+    /// Whatever the live identity trusts at the moment of the handshake.
+    Live(super::credentials::LiveNodeIdentity),
+}
+
+impl TrustSource {
+    /// Trust exactly this set, for the life of the verifier.
+    pub fn fixed(trust: TrustSet) -> Self {
+        Self::Fixed(Arc::new(trust))
+    }
+
+    /// The trust set to verify this handshake against.
+    pub fn current(&self) -> Arc<TrustSet> {
+        match self {
+            Self::Fixed(trust) => Arc::clone(trust),
+            Self::Live(identity) => Arc::new(identity.snapshot().trust.clone()),
+        }
+    }
+}
+
 /// Map our certificate errors onto rustls's error vocabulary.
 fn cert_error_to_rustls(err: CertError) -> rustls::Error {
     match err {
@@ -138,30 +169,49 @@ fn cert_error_to_rustls(err: CertError) -> rustls::Error {
     }
 }
 
-/// A client-certificate verifier that delegates chain building to
-/// `WebPkiClientVerifier` and then rejects revoked certificates.
+/// A client-certificate verifier that builds a `WebPkiClientVerifier` over
+/// the trusted Node CAs for each handshake, then rejects revoked
+/// certificates.
+///
+/// Building per handshake is what lets the trust set change under a running
+/// listener: two anchors are a couple of parsed certificates, and cluster
+/// connections are few and long-lived.
 #[derive(Debug)]
 pub struct RevocationCheckingClientVerifier {
-    inner: Arc<dyn ClientCertVerifier>,
+    trust: TrustSource,
     crl: CrlHandle,
+    /// The Raft and reporting listeners require a client certificate; the
+    /// API listener lets a client without one through to bearer or cookie
+    /// authentication.
+    mandatory: bool,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl RevocationCheckingClientVerifier {
+    fn new(trust: TrustSource, crl: CrlHandle, mandatory: bool) -> Self {
+        Self {
+            trust,
+            crl,
+            mandatory,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
 }
 
 impl ClientCertVerifier for RevocationCheckingClientVerifier {
+    // The hints name the acceptable CAs. Our clients pick their certificate
+    // without them (they hold one node identity), and the anchors change
+    // under us, so we send none.
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        self.inner.root_hint_subjects()
+        &[]
     }
 
-    // Delegate the auth-required policy to the inner verifier: the Raft/
-    // reporting configs require a client cert; the API config allows an
-    // unauthenticated client (relish/browsers use a bearer token or cookie).
-    // Without these the trait defaults to mandatory, ignoring the inner
-    // builder's `allow_unauthenticated`.
     fn offer_client_auth(&self) -> bool {
-        self.inner.offer_client_auth()
+        true
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        self.inner.client_auth_mandatory()
+        self.mandatory
     }
 
     fn verify_client_cert(
@@ -170,9 +220,27 @@ impl ClientCertVerifier for RevocationCheckingClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let verified = self
-            .inner
-            .verify_client_cert(end_entity, intermediates, now)?;
+        // Anchor on the **Node CAs**, not the roots. Node certs and workload
+        // certs are both signed under the root, and node certs carry
+        // ClientAuth EKU, so trusting a root would let a workload certificate
+        // authenticate as a node. Anchoring on the Node CAs admits only certs
+        // they issued directly (PKI2). During a rotation that's both of them.
+        let trust = self.trust.current();
+        let mut anchors = RootCertStore::empty();
+        for node_ca in &trust.node_cas {
+            anchors
+                .add(CertificateDer::from(node_ca.clone()))
+                .map_err(|_| {
+                    rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+                })?;
+        }
+        let webpki = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(anchors),
+            Arc::clone(&self.provider),
+        )
+        .build()
+        .map_err(|error| rustls::Error::General(format!("client verifier: {error}")))?;
+        let verified = webpki.verify_client_cert(end_entity, intermediates, now)?;
         let mut chain: Vec<&CertificateDer<'_>> = vec![end_entity];
         chain.extend(intermediates.iter());
         self.crl.check_chain(&chain)?;
@@ -185,7 +253,12 @@ impl ClientCertVerifier for RevocationCheckingClientVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -194,19 +267,27 @@ impl ClientCertVerifier for RevocationCheckingClientVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 /// A server-certificate verifier for cluster peers.
 ///
-/// Validates the presented certificate against the **pinned** Node CA and
-/// Root CA from this node's identity, checks the CRL, and skips hostname
-/// verification (peers are dialled by gossip IP, not by a DNS name).
+/// Validates the presented certificate against the **pinned** Node CAs and
+/// roots of this node's trust set (any trusted Node CA under any trusted
+/// root), checks the CRL, and skips hostname verification (peers are dialled
+/// by gossip IP, not by a DNS name).
 ///
 /// When `expected_node_id` is set (PKI3), the verifier additionally asserts
 /// that the peer leaf carries the matching node-id URI SAN
@@ -217,20 +298,18 @@ impl ClientCertVerifier for RevocationCheckingClientVerifier {
 /// which is what the join-time bootstrap and node-to-node API calls use.
 #[derive(Debug)]
 pub struct PinnedChainServerVerifier {
-    node_ca_der: Vec<u8>,
-    root_ca_der: Vec<u8>,
+    trust: TrustSource,
     crl: CrlHandle,
     expected_node_id: Option<String>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl PinnedChainServerVerifier {
-    /// Build a verifier pinned to the given CA certificates, without node-id
+    /// Build a verifier pinned to the given trust set, without node-id
     /// binding (CA-pin + CRL only).
-    pub fn new(node_ca_der: Vec<u8>, root_ca_der: Vec<u8>, crl: CrlHandle) -> Self {
+    pub fn new(trust: TrustSource, crl: CrlHandle) -> Self {
         Self {
-            node_ca_der,
-            root_ca_der,
+            trust,
             crl,
             expected_node_id: None,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
@@ -239,15 +318,9 @@ impl PinnedChainServerVerifier {
 
     /// Build a verifier that also binds the connection to `expected_node_id`
     /// (PKI3): the peer leaf must carry the matching node-id URI SAN.
-    pub fn new_bound(
-        node_ca_der: Vec<u8>,
-        root_ca_der: Vec<u8>,
-        crl: CrlHandle,
-        expected_node_id: String,
-    ) -> Self {
+    pub fn new_bound(trust: TrustSource, crl: CrlHandle, expected_node_id: String) -> Self {
         Self {
-            node_ca_der,
-            root_ca_der,
+            trust,
             crl,
             expected_node_id: Some(expected_node_id),
             provider: Arc::new(rustls::crypto::ring::default_provider()),
@@ -281,11 +354,12 @@ impl ServerCertVerifier for PinnedChainServerVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         // Chain checks run against the pinned CAs, not whatever
         // intermediates the peer chose to present.
-        cert::validate_chain(end_entity, &self.node_ca_der, &self.root_ca_der)
+        let trust = self.trust.current();
+        let chain = trust
+            .validate_node_leaf(end_entity)
             .map_err(cert_error_to_rustls)?;
         self.crl.check_chain(&[end_entity])?;
-        let node_ca_serial =
-            cert::serial_from_der(&self.node_ca_der).map_err(cert_error_to_rustls)?;
+        let node_ca_serial = cert::serial_from_der(chain.node_ca).map_err(cert_error_to_rustls)?;
         self.crl
             .check(node_ca_serial)
             .map_err(cert_error_to_rustls)?;
@@ -356,25 +430,25 @@ pub fn build_mtls_server_config(
     identity: &NodeIdentity,
     crl: CrlHandle,
 ) -> Result<Arc<ServerConfig>, MtlsError> {
+    let trust = TrustSource::fixed(identity.trust.clone());
+    server_config(identity, trust, crl, true)
+}
+
+/// A server config presenting `identity` whose client verifier trusts
+/// `trust`. `mandatory` decides whether a client without a certificate is
+/// refused (Raft, reporting) or let through to token authentication (API).
+fn server_config(
+    identity: &NodeIdentity,
+    trust: TrustSource,
+    crl: CrlHandle,
+    mandatory: bool,
+) -> Result<Arc<ServerConfig>, MtlsError> {
     // Install the ring crypto provider (idempotent)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Pin the trust anchor to the **Node CA**, not the Root CA. Node certs
-    // and workload certs are both signed under the Root, and node certs carry
-    // ClientAuth EKU — so trusting the Root would let a workload certificate
-    // authenticate as a node. Anchoring on the Node CA admits only certs it
-    // issued directly (PKI2). The peer presents [leaf, node-ca]; webpki finds
-    // the node-ca anchor and verifies the leaf against it.
-    let mut root_store = RootCertStore::empty();
-    root_store
-        .add(CertificateDer::from(identity.node_ca_der.clone()))
-        .map_err(|e| MtlsError::InvalidCert(format!("node CA: {e}")))?;
-
-    // Chain building goes through WebPKI; revocation through the CRL handle.
-    let webpki = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-        .build()
-        .map_err(|e| MtlsError::ConfigFailed(format!("client verifier: {e}")))?;
-    let client_verifier = Arc::new(RevocationCheckingClientVerifier { inner: webpki, crl });
+    // Chain building goes through WebPKI over the trusted Node CAs;
+    // revocation through the CRL handle.
+    let client_verifier = Arc::new(RevocationCheckingClientVerifier::new(trust, crl, mandatory));
 
     let (chain, key) = identity_chain_and_key(identity)?;
     let mut config = ServerConfig::builder()
@@ -405,29 +479,11 @@ pub fn build_api_server_config(
     identity: &NodeIdentity,
     crl: CrlHandle,
 ) -> Result<Arc<ServerConfig>, MtlsError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let mut root_store = RootCertStore::empty();
-    root_store
-        .add(CertificateDer::from(identity.node_ca_der.clone()))
-        .map_err(|e| MtlsError::InvalidCert(format!("node CA: {e}")))?;
-    let webpki = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-        .allow_unauthenticated()
-        .build()
-        .map_err(|e| MtlsError::ConfigFailed(format!("client verifier: {e}")))?;
-    let client_verifier = Arc::new(RevocationCheckingClientVerifier { inner: webpki, crl });
-
-    let (chain, key) = identity_chain_and_key(identity)?;
-    let mut config = ServerConfig::builder()
-        .with_client_cert_verifier(client_verifier)
-        .with_single_cert(chain, key)
-        .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
-    // A resumed session can skip certificate verification. Peer API clients
-    // present node identities, so force a fresh check against the live CRL on
-    // every connection just as the Raft/reporting listeners do.
-    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-    config.send_tls13_tickets = 0;
-    Ok(Arc::new(config))
+    // The same config as the required-mTLS listeners, with resumption off
+    // for the same reason: peer API clients present node identities, and a
+    // resumed session would skip the fresh CRL check.
+    let trust = TrustSource::fixed(identity.trust.clone());
+    server_config(identity, trust, crl, false)
 }
 
 /// Build a reqwest client for mutually authenticated node-to-node API calls.
@@ -452,14 +508,10 @@ pub fn build_cluster_http_client(
 /// chain, so the token never reaches an impostor. Hostname verification is
 /// skipped (the same as node-to-node calls — members are dialled by IP), and an
 /// empty CRL is used because a joiner has no revocation list yet.
-pub fn build_ca_pinned_client(
-    node_ca_der: Vec<u8>,
-    root_ca_der: Vec<u8>,
-) -> Result<reqwest::Client, MtlsError> {
+pub fn build_ca_pinned_client(trust: TrustSet) -> Result<reqwest::Client, MtlsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let verifier = Arc::new(PinnedChainServerVerifier::new(
-        node_ca_der,
-        root_ca_der,
+        TrustSource::fixed(trust),
         CrlHandle::new(Crl::default()),
     ));
     let tls = ClientConfig::builder()
@@ -487,8 +539,7 @@ pub fn build_cluster_http_client_with_bearer(
 ) -> Result<reqwest::Client, MtlsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let verifier = Arc::new(PinnedChainServerVerifier::new(
-        identity.node_ca_der.clone(),
-        identity.root_ca_der.clone(),
+        TrustSource::fixed(identity.trust.clone()),
         crl,
     ));
     let (chain, key) = identity_chain_and_key(identity)?;
@@ -554,19 +605,23 @@ pub fn build_mtls_client_config(
     identity: &NodeIdentity,
     crl: CrlHandle,
 ) -> Result<Arc<ClientConfig>, MtlsError> {
+    let trust = TrustSource::fixed(identity.trust.clone());
+    client_config(identity, PinnedChainServerVerifier::new(trust, crl))
+}
+
+/// A client config presenting `identity` and verifying servers with
+/// `verifier`.
+fn client_config(
+    identity: &NodeIdentity,
+    verifier: PinnedChainServerVerifier,
+) -> Result<Arc<ClientConfig>, MtlsError> {
     // Install the ring crypto provider (idempotent)
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let verifier = Arc::new(PinnedChainServerVerifier::new(
-        identity.node_ca_der.clone(),
-        identity.root_ca_der.clone(),
-        crl,
-    ));
 
     let (chain, key) = identity_chain_and_key(identity)?;
     let config = ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_auth_cert(chain, key)
         .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
 
@@ -582,23 +637,11 @@ pub fn build_mtls_client_config_bound(
     crl: CrlHandle,
     expected_node_id: &str,
 ) -> Result<Arc<ClientConfig>, MtlsError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let verifier = Arc::new(PinnedChainServerVerifier::new_bound(
-        identity.node_ca_der.clone(),
-        identity.root_ca_der.clone(),
-        crl,
-        expected_node_id.to_string(),
-    ));
-
-    let (chain, key) = identity_chain_and_key(identity)?;
-    let config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_auth_cert(chain, key)
-        .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
-
-    Ok(Arc::new(config))
+    let trust = TrustSource::fixed(identity.trust.clone());
+    client_config(
+        identity,
+        PinnedChainServerVerifier::new_bound(trust, crl, expected_node_id.to_string()),
+    )
 }
 
 /// Build a required-mTLS listener using this node's live credentials.
@@ -606,7 +649,8 @@ pub fn build_live_mtls_server_config(
     identity: &super::credentials::LiveNodeIdentity,
     crl: CrlHandle,
 ) -> Result<Arc<ServerConfig>, MtlsError> {
-    let mut config = (*build_mtls_server_config(&identity.snapshot(), crl)?).clone();
+    let trust = TrustSource::Live(identity.clone());
+    let mut config = (*server_config(&identity.snapshot(), trust, crl, true)?).clone();
     config.cert_resolver = Arc::new(identity.clone());
     Ok(Arc::new(config))
 }
@@ -616,7 +660,8 @@ pub fn build_live_api_server_config(
     identity: &super::credentials::LiveNodeIdentity,
     crl: CrlHandle,
 ) -> Result<Arc<ServerConfig>, MtlsError> {
-    let mut config = (*build_api_server_config(&identity.snapshot(), crl)?).clone();
+    let trust = TrustSource::Live(identity.clone());
+    let mut config = (*server_config(&identity.snapshot(), trust, crl, false)?).clone();
     config.cert_resolver = Arc::new(identity.clone());
     Ok(Arc::new(config))
 }
@@ -627,10 +672,12 @@ pub fn build_live_mtls_client_config(
     crl: CrlHandle,
     expected_node_id: Option<&str>,
 ) -> Result<Arc<ClientConfig>, MtlsError> {
-    let initial = match expected_node_id {
-        Some(node) => build_mtls_client_config_bound(&identity.snapshot(), crl, node)?,
-        None => build_mtls_client_config(&identity.snapshot(), crl)?,
+    let trust = TrustSource::Live(identity.clone());
+    let verifier = match expected_node_id {
+        Some(node) => PinnedChainServerVerifier::new_bound(trust, crl, node.to_string()),
+        None => PinnedChainServerVerifier::new(trust, crl),
     };
+    let initial = client_config(&identity.snapshot(), verifier)?;
     let mut config = (*initial).clone();
     config.client_auth_cert_resolver = Arc::new(identity.clone());
     // A resumed session can retain an earlier client identity. Every reconnect
@@ -755,6 +802,10 @@ mod tests {
             private_key_der: key_der,
             serial,
             ca_generation: 0,
+            trust: crate::sesame::trust::TrustSet::single(
+                hierarchy.node.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
             node_ca_der: hierarchy.node.ca.certificate_der.clone(),
             root_ca_der: hierarchy.root.ca.certificate_der.clone(),
             not_before: now,
@@ -787,6 +838,10 @@ mod tests {
             serial,
             ca_generation: 0,
             // Presents the Workload CA as its chain intermediate.
+            trust: crate::sesame::trust::TrustSet::single(
+                hierarchy.workload.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
             node_ca_der: hierarchy.workload.ca.certificate_der.clone(),
             root_ca_der: hierarchy.root.ca.certificate_der.clone(),
             not_before: now,
@@ -872,8 +927,7 @@ mod tests {
 
         // A client that trusts the cluster CAs but presents no certificate.
         let verifier = Arc::new(PinnedChainServerVerifier::new(
-            server_id.node_ca_der.clone(),
-            server_id.root_ca_der.clone(),
+            TrustSource::fixed(server_id.trust.clone()),
             CrlHandle::default(),
         ));
         let client = Arc::new(
@@ -900,8 +954,7 @@ mod tests {
         // cookie, so the API listener deliberately accepts an anonymous TLS
         // client that still pins the cluster CAs.
         let verifier = Arc::new(PinnedChainServerVerifier::new(
-            server_id.node_ca_der.clone(),
-            server_id.root_ca_der.clone(),
+            TrustSource::fixed(server_id.trust.clone()),
             CrlHandle::default(),
         ));
         let client = Arc::new(

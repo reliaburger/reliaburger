@@ -155,7 +155,11 @@ All fault injection requests flow through the cluster API on the leader node:
   caller, a source-scoped key only the instance with that cgroup. Pooled
   clients reconnect and meet the fault. The injection answers only once every
   cut has run: cuts that outlast the agent turn's budget finish in a task that
-  sends the answer afterwards (#450). We chose `ss -K` (SOCK_DESTROY over
+  sends the answer afterwards (#450). A source-scoped partition also waits
+  for every source instance to have a key: callers whose cgroup the injecting
+  turn couldn't read in time are read by a follow-up task (10 s patience),
+  then keyed and cut again before the answer, and one still unread fails the
+  injection (#625). We chose `ss -K` (SOCK_DESTROY over
   inet_diag, `CONFIG_INET_DIAG_DESTROY`, present in stock Ubuntu kernels) over
   a `bpf_sock_destroy()` iterator: the kfunc needs kernel 6.5+ and a second
   BPF program, while `ss` ships with iproute2 on every host that already runs

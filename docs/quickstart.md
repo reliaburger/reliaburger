@@ -1,6 +1,6 @@
 # A laptop cluster
 
-The command below installs the published, signed 0.1.2 release (1 October
+The command below installs the published, signed 0.1.6 release (7 October
 2026) and builds a laptop cluster from it. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
 to a ready three-node cluster ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
@@ -18,7 +18,7 @@ relish dashboard             # Ctrl-C stops the browser connection
 ```
 
 The installer says what it's fetching before each download (for example
-`Downloading relish v0.1.2 for macos-aarch64 (37.2 MiB)...`), draws curl's
+`Downloading relish v0.1.6 for macos-aarch64 (89.4 MiB)...`), draws curl's
 progress bar when you run it in a terminal, and finishes each download with
 the bytes and seconds it took. In a log or a pipe it prints only those lines.
 
@@ -53,6 +53,14 @@ least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
 image download time also depends on your connection. The VMs don't install
 anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
 `~/.reliaburger/lima`, isolated from your normal Lima configuration.
+
+Each VM takes its time from your Mac. Lima's guest agent sets the guest clock
+to the host's whenever the two drift more than 100 ms apart, checking every
+10 s, so the guests catch up within seconds after the laptop wakes from sleep
+and don't need to reach an NTP server. That makes Lima the guests' only clock
+source: the guest image ships with systemd-timesyncd disabled, and
+provisioning disables it on a stock Ubuntu image. With both running, they
+fought, and the guest clock jumped back about 0.1 s every 10 s.
 
 For a smaller single-node cluster:
 

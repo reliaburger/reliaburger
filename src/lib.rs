@@ -14,6 +14,7 @@ pub mod compatibility;
 pub mod config;
 pub mod council;
 pub(crate) mod durable;
+pub mod file_lock;
 pub mod firewall;
 pub mod grill;
 pub mod ketchup;

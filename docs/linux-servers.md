@@ -106,8 +106,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.2 or vX.Y.Z)
-VERSION="v0.1.2"
+# Release version to install (e.g. v0.1.6 or vX.Y.Z)
+VERSION="v0.1.6"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -134,7 +134,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.1.2 (e89d24d)`. Every node should print the same commit.
+`bun 0.1.6 (82fa78e)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `clang llvm libbpf-dev` and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
@@ -173,7 +173,10 @@ This writes the following files under `/etc/reliaburger`:
 
 > **Important**: `relish init` prints two `Root CA:` lines to stderr. Copy the
 > one that starts with `sha256:`; that's the root CA fingerprint the joining
-> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together.
+> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together,
+> and make a copy of the root that only you can open with
+> `sudo relish ca backup --out prod-root-backup.age --dir /etc/reliaburger`
+> (see the manual's security chapter).
 
 ### 3.2 Write the Node 1 configuration
 
@@ -533,8 +536,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.2 or vX.Y.Z)
-VERSION="v0.1.2"
+# Release version to install (e.g. v0.1.6 or vX.Y.Z)
+VERSION="v0.1.6"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp

@@ -383,13 +383,14 @@ async fn peer_pull_uses_the_verified_digest_when_the_tag_moves() {
     let policy = TrustPolicySection {
         require_signatures: true,
         keys: vec![],
+        ..Default::default()
     };
     let catalog_at_verify = node1.state.catalog.read().await.clone();
     let verified = verify_image_signature(
         Some("web:v1"),
         &catalog_at_verify,
         &policy,
-        Some(&hierarchy.root.ca.certificate_der),
+        std::slice::from_ref(&hierarchy.root.ca.certificate_der),
         None,
     )
     .unwrap()

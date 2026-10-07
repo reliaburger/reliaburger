@@ -18,6 +18,8 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
+use crate::file_lock::{FileLock, FileLockError};
+
 pub(crate) mod exec;
 
 const RECORD_LIMIT: u64 = 1024 * 1024;
@@ -238,7 +240,8 @@ pub fn run_owner_generation(directory: &Path, generation: &str) -> io::Result<()
     run_locked_owner(directory, &mut record, lock)
 }
 
-pub(crate) fn lock_owner(directory: &Path) -> io::Result<File> {
+/// Take the owner lock, which a live owner holds for its whole life.
+pub(crate) fn lock_owner(directory: &Path) -> io::Result<FileLock> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -247,16 +250,13 @@ pub(crate) fn lock_owner(directory: &Path) -> io::Result<File> {
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(directory.join("owner.lock"))?;
-    lock.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => {
-            io::Error::new(io::ErrorKind::WouldBlock, "process owner is busy")
-        }
-        std::fs::TryLockError::Error(error) => error,
-    })?;
-    Ok(lock)
+    FileLock::try_lock(lock).map_err(|error| match error {
+        FileLockError::Busy => io::Error::new(io::ErrorKind::WouldBlock, "process owner is busy"),
+        FileLockError::Io(error) => error,
+    })
 }
 
-fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> io::Result<()> {
+fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock) -> io::Result<()> {
     if !matches!(record.phase, OwnerPhase::Prepared) {
         return Err(io::Error::other(
             "process owner generation has already started",
@@ -761,6 +761,7 @@ mod tests {
                         readonly: false,
                     },
                     process: OciProcess {
+                        rlimits: Vec::new(),
                         args: vec!["true".into()],
                         env: vec![],
                         cwd: "/".into(),

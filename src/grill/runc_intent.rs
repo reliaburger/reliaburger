@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{InstanceId, OciSpec};
 use crate::durable::{Access, read_json, validate_directory, validate_file};
+use crate::file_lock::{FileLock, FileLockError};
 
 mod commands;
 use super::command::CommandId;
@@ -114,6 +115,9 @@ pub struct RuntimeIntent {
     /// Generation required by any subsequent mutation.
     pub generation: IntentGeneration,
     /// Original specification, before image, rootfs or network preparation.
+    /// Once retired, only environment variable names remain (see
+    /// [`OciSpec::without_environment_values`]); compare it with
+    /// [`OciSpec::matches_journal`], never `==`.
     pub spec: OciSpec,
     /// Runtime configuration that gave this request its meaning.
     pub configuration: IntentConfiguration,
@@ -147,17 +151,6 @@ pub struct IntentJournal {
     configuration: IntentConfiguration,
 }
 
-// Never unlink or replace a lock file: another process may already hold it.
-// Explicit unlock also prevents forked, pre-exec children extending its lifetime.
-#[derive(Debug)]
-struct LifecycleLock(File);
-
-impl Drop for LifecycleLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 /// Exclusive lifecycle authority shared across independently opened adapters.
 ///
 /// Keep this claim alive through all effects it authorises. Persistence consumes
@@ -168,7 +161,7 @@ pub struct IntentClaim {
     journal: IntentJournal,
     instance: InstanceId,
     record: Option<RuntimeIntent>,
-    _lock: LifecycleLock,
+    _lock: FileLock,
 }
 
 impl IntentJournal {
@@ -217,13 +210,14 @@ impl IntentJournal {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(locks.join(&instance.0))?;
             validate_file(&file, Access::OwnerOnly)?;
-            file.try_lock().map_err(|error| match error {
-                std::fs::TryLockError::WouldBlock => {
+            // Never unlink or replace a lock file: another process may
+            // already hold it.
+            let lock = FileLock::try_lock(file).map_err(|error| match error {
+                FileLockError::Busy => {
                     io::Error::new(io::ErrorKind::WouldBlock, "runtime lifecycle is busy")
                 }
-                std::fs::TryLockError::Error(error) => error,
+                FileLockError::Io(error) => error,
             })?;
-            let lock = LifecycleLock(file);
             let record = journal.load(&instance)?;
             if record.as_ref().map(|record| &record.generation) != expected.as_ref() {
                 return Err(io::Error::other("runtime intent generation changed"));
@@ -533,6 +527,10 @@ impl IntentClaim {
                 return Ok(self);
             }
             record.phase = IntentPhase::Retired { exit_code };
+            // Nothing can adopt or relaunch a retired generation, so its
+            // environment values, decrypted secrets included, have no reader.
+            // Keep the names: recovery still matches the rest of the spec.
+            record.spec = record.spec.without_environment_values();
             persist(
                 &self
                     .journal

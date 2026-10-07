@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::*;
-use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader, read_capture_chunk};
+use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader};
 use crate::grill::command::{
     ClaimedCommandExecutor, CommandOutput, CommandState, RuntimeCommandExecutor,
 };
@@ -864,7 +864,7 @@ impl RuncGrill {
         let adoption = adoption.clone();
         self.owned_operation(instance, move |runtime, id, context| async move {
             let intent = context.intent().await?;
-            if intent.spec != adoption.oci_spec
+            if !adoption.oci_spec.matches_journal(&intent.spec)
                 || adoption.instance_id != id.0
                 || adoption.runtime != crate::grill::records::RuntimeKind::Runc
                 || adoption.runc_container_id.as_deref() != Some(&id.0)
@@ -896,14 +896,16 @@ impl RuncGrill {
                 runtime.owned_cleanup(&id, &context).await?;
                 return Ok(false);
             };
-            // Same ±2 s tolerance as every other adoption: /proc start times
-            // are derived from boot time, which moves with NTP steps.
-            if adoption.pid != launcher_pid
-                || !crate::grill::records::process_matches(launcher_pid, adoption.pid_started_at)
-            {
-                return Err(io::Error::other(
-                    "adoption process identity conflicts with runtime owner",
-                ));
+            // The owner proves which launcher runs this generation. An
+            // adoption record naming another process is stale: retire the
+            // generation so the instance starts again. Refusing here took
+            // the agent, and every workload on the node, down with it (#607).
+            if adoption.pid != launcher_pid || !crate::grill::records::is_live(&adoption) {
+                eprintln!(
+                    "runc: {id}: adoption record names another process than the running launcher {launcher_pid}; retiring the generation"
+                );
+                runtime.owned_cleanup(&id, &context).await?;
+                return Ok(false);
             }
             runtime
                 .remember_launcher(&id, &context, launcher_pid)
@@ -1035,10 +1037,7 @@ impl RuncGrill {
             // holding a runtime worker (it once starved startup adoption).
             let mut backlog = false;
             for reader in &mut readers {
-                let Some(file) = reader.file().map(std::path::Path::to_path_buf) else {
-                    continue;
-                };
-                let Ok(bytes) = read_capture_chunk(&file, reader.read_offset()).await else {
+                let Ok(bytes) = reader.read_chunk().await else {
                     continue;
                 };
                 backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;

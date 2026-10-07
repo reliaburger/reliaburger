@@ -110,6 +110,7 @@ mod tests {
                 readonly: false,
             },
             process: OciProcess {
+                rlimits: Vec::new(),
                 args: vec!["sh".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),

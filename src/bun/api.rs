@@ -43,8 +43,9 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
 // One module per route group. `router_with_upgrade` wires their handlers;
 // the helpers at the bottom of this file are the ones several groups share.
-mod apply;
+pub(crate) mod apply;
 mod apps;
+mod ca;
 mod deploys;
 mod discovery;
 mod faults;
@@ -65,9 +66,10 @@ mod test_leases;
 mod ui;
 mod upgrade;
 
-pub(crate) use apply::leader_api_url;
 use apply::{apply_handler, cluster_apply};
+pub(crate) use apply::{bind_images, leader_api_url};
 use apps::{delete_handler, exec_handler, stop_handler};
+use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
     cluster_deploy_history, deploy_cancel_handler, deploys_active_handler, deploys_history_handler,
     deploys_operations_handler, rollback_handler,
@@ -83,13 +85,16 @@ use gitops::gitops_webhook_handler;
 use identity::{
     identity_jwks_handler, identity_sign_handler, join_token_create_handler,
     join_token_list_handler, join_token_revoke_handler, perimeter_admit_handler,
-    token_create_handler, token_list_handler, token_revoke_handler,
+    token_create_handler, token_list_handler, token_revoke_handler, token_rotate_handler,
 };
 use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
     producer_retirement_handler, refuse_retired_tls_peer, workload_csr_handler,
 };
-use join::{cluster_ca_handler, join_handler, master_key_handler, node_renewal_handler};
+use join::{
+    cluster_ca_handler, join_handler, master_key_handler, node_renewal_handler,
+    node_trust_ack_handler,
+};
 use logs::{
     logs_cross_node_handler, logs_entries_handler, logs_export_handler, logs_handler,
     logs_sql_handler, ws_logs_handler,
@@ -132,8 +137,9 @@ use test_leases::{
 };
 use ui::{
     app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
-    fragment_apps_handler, fragment_instances_handler, fragment_nodes_handler, gitops_handler,
-    login_handler, node_detail_handler, ui_logout_handler, ui_session_handler,
+    fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
+    fragment_nodes_handler, gitops_handler, login_handler, node_detail_handler, ui_logout_handler,
+    ui_session_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -351,6 +357,9 @@ pub struct ApiState {
     /// live. Read by the auth middleware. Production Bun always supplies one;
     /// `None` remains available to small embedded/test routers.
     pub token_store: Option<crate::sesame::auth::TokenStore>,
+    /// When each API token last authenticated a request on this node, shared
+    /// with the auth middleware that records it.
+    pub token_last_used: crate::sesame::auth::TokenLastUsed,
     /// The cluster's internal service token, presented on cross-node fan-out
     /// calls so peers accept them as the system principal. `None` single-node.
     pub service_token: Option<String>,
@@ -420,6 +429,9 @@ pub struct ApiState {
     pub build_signers: Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, super::build_runner::BuildSigner>>,
     >,
+    /// Task arrays: this node's executor, the standalone store and the
+    /// leader's latest view of every node (0.2.0, million jobs).
+    pub task_arrays: Arc<super::task_array_leader::TaskArrayService>,
 }
 
 /// Build the API router.
@@ -471,6 +483,7 @@ pub fn router(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -511,7 +524,9 @@ pub fn router_with_upgrade(
     local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
     jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
     status: Option<super::agent::StatusReader>,
+    task_arrays: Option<Arc<super::task_array_leader::TaskArrayService>>,
 ) -> Router {
+    let token_last_used = crate::sesame::auth::new_token_last_used();
     let state = ApiState {
         cmd_tx,
         status,
@@ -529,6 +544,7 @@ pub fn router_with_upgrade(
         rollup_store,
         membership,
         token_store: token_store.clone(),
+        token_last_used: token_last_used.clone(),
         service_token: service_token.clone(),
         cluster_http,
         api_port,
@@ -552,14 +568,18 @@ pub fn router_with_upgrade(
         batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         active_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        task_arrays: task_arrays
+            .unwrap_or_else(|| Arc::new(super::task_array_leader::TaskArrayService::new(None))),
     };
 
     spawn_node_fault_reaper(state.clone());
+    super::task_array_leader::spawn_leader_loop(state.clone());
 
     let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
         service_token,
-    );
+    )
+    .with_last_used(token_last_used);
     if let Some(verifier) = jwt_verifier {
         auth_state = auth_state.with_jwt_verifier(verifier);
     }
@@ -605,6 +625,7 @@ pub fn router_with_upgrade(
         .route("/ui/node/{name}", get(node_detail_handler))
         .route("/ui/gitops", get(gitops_handler))
         .route("/ui/fragment/apps", get(fragment_apps_handler))
+        .route("/ui/fragment/batches", get(fragment_batches_handler))
         .route("/ui/fragment/nodes", get(fragment_nodes_handler))
         .route("/ui/fragment/alerts", get(fragment_alerts_handler))
         .route(
@@ -617,6 +638,19 @@ pub fn router_with_upgrade(
         .route("/v1/apps", get(current_apps_handler))
         .route("/v1/readiness", get(readiness_handler))
         .route("/v1/jobs", get(jobs_handler))
+        .route("/v1/jobs/runs", post(super::job_api::submit_handler))
+        .route(
+            "/v1/jobs/runs/{id}/replay",
+            post(super::job_api::replay_handler),
+        )
+        .route(
+            "/v1/jobs/definitions",
+            get(super::job_api::definitions_handler),
+        )
+        .route(
+            "/v1/jobs/definitions/{name}/{namespace}/disable",
+            post(super::job_api::disable_schedule_handler),
+        )
         .route("/v1/events", get(events_handler))
         .route("/v1/ws/events", get(ws_events_handler))
         .route("/v1/ws/logs/{app}/{namespace}", get(ws_logs_handler))
@@ -642,6 +676,10 @@ pub fn router_with_upgrade(
         .route(
             "/v1/cluster/renew",
             post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/v1/cluster/trust-ack",
+            post(node_trust_ack_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/v1/registry/query",
@@ -756,12 +794,48 @@ pub fn router_with_upgrade(
         .route("/v1/test/leases/retired", post(test_lease_retired_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(super::batch::batch_submit_handler))
+        .route(
+            "/v1/batch/summaries",
+            get(super::task_array_api::summaries_handler),
+        )
         .route("/v1/batch/run", post(super::batch::batch_run_handler))
         .route(
             "/v1/batch/{id}/report",
             post(super::batch::batch_report_handler),
         )
         .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
+        .route(
+            "/v1/batch/manifest",
+            post(super::task_array_api::manifest_handler),
+        )
+        .route(
+            "/v1/batch/array",
+            post(super::task_array_api::submit_handler),
+        )
+        .route(
+            "/v1/batch/array/sync",
+            post(super::task_array_api::sync_handler),
+        )
+        .route(
+            "/v1/batch/array/{id}/local/results",
+            get(super::task_array_api::local_results_handler),
+        )
+        .route(
+            "/v1/batch/array/{id}/local/tasks/{index}/logs",
+            get(super::task_array_api::local_logs_handler),
+        )
+        .route(
+            "/v1/batch/{id}/cancel",
+            post(super::task_array_api::cancel_handler),
+        )
+        .route(
+            "/v1/batch/{id}/results",
+            get(super::task_array_api::results_handler),
+        )
+        .route(
+            "/v1/batch/{id}/tasks/{index}/logs",
+            get(super::task_array_api::logs_handler),
+        )
         .route("/v1/build", post(super::build_runner::build_submit_handler))
         .route(
             "/v1/build/run",
@@ -783,12 +857,19 @@ pub fn router_with_upgrade(
         .route("/v1/token/create", post(token_create_handler))
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
+        .route("/v1/token/rotate", post(token_rotate_handler))
         .route("/v1/join-token/create", post(join_token_create_handler))
         .route("/v1/join-token/list", get(join_token_list_handler))
         .route("/v1/join-token/revoke", post(join_token_revoke_handler))
         .route("/v1/perimeter/admit", post(perimeter_admit_handler))
         .route("/v1/secret/public-key", get(secret_public_key_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
+        .route("/v1/ca/rotation/prepare", post(ca_rotation_prepare_handler))
+        .route("/v1/ca/rotation/begin", post(ca_rotation_begin_handler))
+        .route(
+            "/v1/ca/rotation/finalize",
+            post(ca_rotation_finalize_handler),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::sesame::auth::auth_middleware,
@@ -868,6 +949,20 @@ async fn ask_agent<T>(
         .map_err(|_| internal_error("agent dropped response"))
 }
 
+/// New execution-ownership metadata must bound both queueing and the reply.
+/// Keep the legacy helper's semantics for its existing consumers.
+// The HTTP response crosses this helper directly to the calling route.
+#[allow(clippy::result_large_err)]
+pub(super) async fn ask_agent_bounded<T>(
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> AgentCommand,
+) -> Result<T, Response> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), ask_agent(cmd_tx, build)).await {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(agent_unavailable()),
+    }
+}
+
 fn internal_error(message: &str) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -919,7 +1014,7 @@ async fn enforce_cluster_permission(
 
 /// The replicated `[permission]` map, keyed by token name. Empty without a
 /// council (single-node mode, where permissions can't be configured).
-async fn permission_map(
+pub(crate) async fn permission_map(
     state: &ApiState,
 ) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
     match &state.council {
@@ -929,6 +1024,12 @@ async fn permission_map(
 }
 
 async fn local_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String> {
+    let mut rows = agent_statuses(state).await?;
+    rows.extend(status::common_local_statuses(state).await);
+    Ok(rows)
+}
+
+async fn agent_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String> {
     if let Some(reader) = &state.status {
         return reader.read().await.map_err(|error| error.to_string());
     }
@@ -1139,7 +1240,7 @@ async fn known_node_api_url(
 
 /// Preserve the end user's credential so the target node repeats every
 /// authentication and server-policy check.
-fn copy_forwarded_auth(
+pub(crate) fn copy_forwarded_auth(
     mut request: reqwest::RequestBuilder,
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
@@ -1166,7 +1267,13 @@ mod permission_tests;
 mod cluster_view_tests;
 
 #[cfg(test)]
+mod token_tests;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod cluster_routing_tests;
+
+#[cfg(test)]
+mod binding_tests;

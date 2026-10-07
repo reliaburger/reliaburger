@@ -77,7 +77,7 @@ enum Command {
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
-        /// Explicitly rerun jobs with unknown outcomes on the selected node.
+        /// Request another job run; unresolved outcomes require grant-specific replay.
         #[arg(long, conflicts_with = "dry_run")]
         rerun_jobs: bool,
     },
@@ -362,10 +362,78 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
-    /// Submit a batch of jobs for high-throughput scheduling.
+    /// List bounded job run summaries and rates, or durable schedule definitions.
+    Jobs {
+        #[arg(long)]
+        definitions: bool,
+    },
+    /// Submit a batch of jobs, or manage a task array.
+    #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
     Batch {
+        #[command(subcommand)]
+        action: Option<BatchAction>,
         /// Path to a TOML config file with [job.*] sections.
-        path: PathBuf,
+        path: Option<PathBuf>,
+    },
+    /// Run a resource-aware task array from an image or allowlisted host binary.
+    ///
+    /// Every task runs the same binary with `{index}` in its arguments
+    /// replaced by its own index, from 0 to COUNT-1, and gets
+    /// RELIABURGER_TASK_INDEX, RELIABURGER_TASK_COUNT,
+    /// RELIABURGER_TASK_ATTEMPT and RELIABURGER_BATCH_ID in its
+    /// environment. The binary must be in the nodes' [process_workloads]
+    /// allowed_binaries.
+    ///
+    /// Tasks run at least once, not exactly once: a task that finished
+    /// just before its node crashed can run again. Make tasks safe to
+    /// repeat.
+    Run {
+        /// Name for the array (required: task arrays are the only kind of
+        /// run so far).
+        #[arg(long = "batch", value_name = "NAME")]
+        batch: String,
+        /// Number of tasks; one uses the same indexed executor.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        /// Register a durable five-field UTC cron schedule instead of running now.
+        #[arg(long)]
+        schedule: Option<String>,
+        /// Host binary every task runs.
+        #[arg(long, required_unless_present = "image", conflicts_with = "image")]
+        exec: Option<PathBuf>,
+        /// OCI image executed by the owned Linux runtime.
+        #[arg(long, required_unless_present = "exec", conflicts_with = "exec")]
+        image: Option<String>,
+        /// CPU request-limit range, such as 250m-500m.
+        #[arg(long)]
+        cpu: Option<String>,
+        /// Memory request-limit range, such as 64Mi-128Mi.
+        #[arg(long)]
+        memory: Option<String>,
+        /// Tasks per chunk: the unit the cluster hands to nodes.
+        #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_CHUNK_SIZE)]
+        chunk: u32,
+        /// Attempts per task before it counts as failed.
+        #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_MAX_ATTEMPTS)]
+        max_attempts: u8,
+        /// Stop the whole array once more than this many tasks have failed.
+        #[arg(long)]
+        max_failed: Option<u32>,
+        /// Per-attempt timeout, in seconds.
+        #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_TASK_TIMEOUT_SECS)]
+        timeout: u32,
+        /// Most tasks one node runs at once (default: 256, bounded by requests).
+        #[arg(long)]
+        concurrency: Option<u32>,
+        /// Namespace the array belongs to.
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+        /// An environment variable for every task (repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Arguments after `--`; `{index}` becomes the task's index.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Show the progress of a submitted batch.
     #[command(name = "batch-status")]
@@ -385,12 +453,17 @@ enum Command {
         #[command(subcommand)]
         action: SecretAction,
     },
+    /// Back up the cluster's root CA, check the backup, and rotate intermediates.
+    Ca {
+        #[command(subcommand)]
+        action: CaAction,
+    },
     /// Manage API tokens.
     Token {
         #[command(subcommand)]
         action: TokenAction,
     },
-    /// Create a cluster of bare-metal appliances (docs/manual/14_appliance.md).
+    /// Create a cluster of bare-metal appliances (docs/manual/15_appliance.md).
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
@@ -677,10 +750,11 @@ enum CouncilCommand {
     /// Recover a cluster whose entire council was lost.
     ///
     /// Run this against a STOPPED surviving node. It restores the desired
-    /// state from a sealed backup (or this node's own durable snapshot),
-    /// wipes the dead cluster's Raft log, and stamps a fresh recovery epoch.
-    /// Starting the node afterwards re-bootstraps a single-voter council that
-    /// the reconciler regrows. Writes made after the last backup are lost.
+    /// state from a sealed backup (or, on a former voter, from its own
+    /// snapshot and committed Raft log), moves the dead cluster's Raft
+    /// directory aside, and stamps a fresh recovery epoch. Starting the node
+    /// afterwards re-bootstraps a single-voter council that the reconciler
+    /// regrows. Writes made after the restored state are lost.
     Recover {
         /// The node's data directory (`[storage] data`), whose `raft/`
         /// subdirectory is recovered in place.
@@ -688,11 +762,12 @@ enum CouncilCommand {
         data_dir: std::path::PathBuf,
         /// Restore from a sealed backup at this object-store URL
         /// (`file://`, `s3://`, `gs://`). Omit to restore from the node's own
-        /// durable snapshot under `data_dir`.
+        /// snapshot and committed Raft log under `data_dir`.
         #[arg(long)]
         from: Option<String>,
         /// Path to the cluster master key file (32-byte hex), needed to
-        /// unseal a backup. Defaults to `/etc/reliaburger/master.key`.
+        /// unseal a backup or read an encrypted Raft log. Defaults to
+        /// `/etc/reliaburger/master.key`.
         #[arg(long)]
         master_key: Option<std::path::PathBuf>,
         /// Skip the "is a council still alive?" safety check. Only pass this
@@ -801,16 +876,36 @@ enum TokenAction {
         /// Restrict to specific namespaces (comma-separated).
         #[arg(long)]
         namespaces: Option<String>,
-        /// TTL in days (e.g. 90).
-        #[arg(long)]
+        /// TTL in days (e.g. 30). Without it, deployer and read-only tokens
+        /// get the cluster's default lifetime (90 days unless
+        /// `[security.tokens] default_ttl` says otherwise); admin tokens
+        /// don't expire.
+        #[arg(long, conflicts_with = "no_expiry")]
         ttl_days: Option<u64>,
+        /// Never expire, instead of the default lifetime.
+        #[arg(long)]
+        no_expiry: bool,
+        /// Give the token the `[permission]` spec already keyed by its name.
+        /// Without this, creating a token under such a name is refused.
+        #[arg(long)]
+        inherit_permissions: bool,
     },
-    /// List all API tokens.
+    /// List all API tokens with their scope, expiry and last use.
     List,
     /// Revoke an API token by name.
     Revoke {
         /// Token name to revoke.
         name: String,
+    },
+    /// Give a token a new secret under the same name. The old secret keeps
+    /// working for the grace period, then stops.
+    Rotate {
+        /// Token name to rotate.
+        name: String,
+        /// Hours the old secret keeps working (default 24). 0 ends it at
+        /// once, for a leaked secret.
+        #[arg(long)]
+        grace_hours: Option<u64>,
     },
 }
 
@@ -1103,6 +1198,63 @@ fn parse_join_token_ttl(value: &str) -> Result<u64, String> {
 }
 
 #[derive(Subcommand)]
+enum BatchAction {
+    /// Submit a compact TOML manifest containing mixed resource profiles.
+    Submit {
+        path: PathBuf,
+        /// Validate the manifest locally without submitting work.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Acknowledge repeating side effects for the exact unknown owner grants.
+    Replay {
+        id: u64,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        grant_digest: String,
+        #[arg(long, required = true)]
+        acknowledge_side_effects: bool,
+    },
+    /// Watch rates, bounded profile summaries and duration distributions.
+    Watch {
+        id: u64,
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+    },
+    /// Cancel an array or mixed manifest and retire its active attempts.
+    Cancel {
+        /// Batch id from `relish run --batch`.
+        id: u64,
+    },
+    /// Read a bounded indexed page of accepted task outcomes.
+    Results {
+        /// Batch id from `relish run --batch`.
+        id: u64,
+        /// Only the tasks that failed.
+        #[arg(long)]
+        failed: bool,
+        /// Most rows to show.
+        #[arg(long, default_value_t = reliaburger::bun::task_array_api::DEFAULT_RESULT_ROWS)]
+        limit: usize,
+        /// Cursor returned by the previous page.
+        #[arg(long)]
+        after: Option<u32>,
+        /// Look up one task directly.
+        #[arg(long, conflicts_with = "after")]
+        index: Option<u32>,
+    },
+    /// Print a failed task's output (the first and last 2 KiB).
+    Logs {
+        /// Batch id from `relish run --batch`.
+        id: u64,
+        /// The task's index.
+        #[arg(long)]
+        index: u32,
+    },
+}
+
+#[derive(Subcommand)]
 enum SecretAction {
     /// Print the cluster's age public key (for `relish secret encrypt`).
     ///
@@ -1113,6 +1265,10 @@ enum SecretAction {
     Pubkey {
         /// Read the key offline from this `relish init` directory.
         dir: Option<PathBuf>,
+        /// Print this namespace's own key instead, for a namespace that set
+        /// `secret_key = true`.
+        #[arg(long, conflicts_with = "dir")]
+        namespace: Option<String>,
     },
     /// Encrypt a plaintext value for use in app config ENC[AGE:...] fields.
     Encrypt {
@@ -1123,11 +1279,114 @@ enum SecretAction {
         value: String,
     },
     /// Rotate the secret encryption key (start or finalise).
+    ///
+    /// Rotates the cluster key, or with `--namespace` that namespace's own
+    /// key. Either way it takes an Admin token scoped to the whole cluster.
     Rotate {
         /// Finalise rotation: remove old read-only keypair.
         #[arg(long)]
         finalize: bool,
+        /// Rotate this namespace's own key instead of the cluster key.
+        #[arg(long)]
+        namespace: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum CaAction {
+    /// Write the root CA's key and certificate to a sealed file you keep.
+    ///
+    /// Run it on the node where `relish init` ran: it reads the master key,
+    /// the security bootstrap state and the sealed root key from `--dir`. The
+    /// backup holds the root key and certificate plus the cluster, trust
+    /// domain, fingerprint and expiry. It's sealed to a passphrase (asked at
+    /// the terminal, twice) or, with `--recipient`, to your age public key,
+    /// never to a cluster key. The file is never overwritten.
+    Backup {
+        /// Where to write the sealed backup (created owner-only).
+        #[arg(long)]
+        out: PathBuf,
+        /// The directory `relish init` wrote to.
+        #[arg(long, default_value = reliaburger::relish::ca_cmd::DEFAULT_INIT_DIR)]
+        dir: PathBuf,
+        /// The cluster name, when the directory holds more than one.
+        #[arg(long)]
+        cluster_name: Option<String>,
+        /// Seal to this age public key (`age1...`) instead of a passphrase.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        recipient: Option<String>,
+        /// Read the passphrase from the first line of this file instead of
+        /// asking.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Check a root CA backup offline.
+    ///
+    /// Opens the backup and checks that the key matches the certificate,
+    /// that the root hasn't expired and that its fingerprint is the one
+    /// your cluster's nodes pin (printed by `relish init` and `relish join`).
+    Verify {
+        /// The sealed backup `relish ca backup` wrote.
+        file: PathBuf,
+        /// The cluster's root CA fingerprint (`sha256:...`).
+        #[arg(long)]
+        fingerprint: String,
+        /// Read the passphrase from the first line of this file instead of
+        /// asking.
+        #[arg(long, conflicts_with = "identity")]
+        passphrase_file: Option<PathBuf>,
+        /// Your age identity file, for a backup sealed with `--recipient`.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Rotate an intermediate CA, signing the new one with your root backup.
+    ///
+    /// The cluster makes the new key and sends a CSR. `relish` opens the
+    /// backup here, checks it is the root the cluster trusts, signs the CSR
+    /// and sends back only the certificate: the root key never leaves this
+    /// machine. Both CAs are trusted until you finalise. Node leaves are
+    /// re-issued at once, one node at a time; workload leaves move within
+    /// their hour; ingress certificates are re-minted from the new CA.
+    ///
+    /// Run it again with `--finalize` to retire the old CA. That's refused
+    /// until every node trusts the new CA and holds a leaf from it (Node), or
+    /// until the old CA's leaves have expired (Workload, Ingress).
+    Rotate {
+        /// The intermediate to rotate.
+        #[arg(long, value_enum)]
+        role: CaRotationRole,
+        /// The sealed root backup `relish ca backup` wrote.
+        #[arg(long, required_unless_present = "finalize")]
+        root_backup: Option<PathBuf>,
+        /// Retire the old CA instead of starting a rotation.
+        #[arg(long, conflicts_with_all = ["root_backup", "passphrase_file", "identity"])]
+        finalize: bool,
+        /// Read the backup's passphrase from the first line of this file
+        /// instead of asking.
+        #[arg(long, conflicts_with = "identity")]
+        passphrase_file: Option<PathBuf>,
+        /// Your age identity file, for a backup sealed with `--recipient`.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+}
+
+/// The intermediates `relish ca rotate` can rotate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CaRotationRole {
+    Node,
+    Workload,
+    Ingress,
+}
+
+impl From<CaRotationRole> for reliaburger::sesame::types::CaRole {
+    fn from(role: CaRotationRole) -> Self {
+        match role {
+            CaRotationRole::Node => Self::Node,
+            CaRotationRole::Workload => Self::Workload,
+            CaRotationRole::Ingress => Self::Ingress,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -1940,14 +2199,160 @@ async fn main() -> ExitCode {
             registry_port,
             timeout,
         } => commands::build(path, registry_port, timeout).await,
-        Command::Batch { ref path } => commands::batch(path).await,
+        Command::Batch { action, path } => match (action, path) {
+            (Some(BatchAction::Submit { path, dry_run }), _) => {
+                commands::submit_task_manifest(&path, cli.output, dry_run).await
+            }
+            (Some(BatchAction::Watch { id, timeout }), _) => {
+                commands::watch_task_batch(id, timeout).await
+            }
+            (
+                Some(BatchAction::Replay {
+                    id,
+                    node,
+                    grant_digest,
+                    ..
+                }),
+                _,
+            ) => commands::replay_job(id, &node, &grant_digest).await,
+            (Some(BatchAction::Cancel { id }), _) => commands::batch_cancel(id).await,
+            (
+                Some(BatchAction::Results {
+                    id,
+                    failed,
+                    limit,
+                    after,
+                    index,
+                }),
+                _,
+            ) => commands::batch_results(id, failed, limit, after, index, cli.output).await,
+            (Some(BatchAction::Logs { id, index }), _) => {
+                commands::batch_task_logs(id, index).await
+            }
+            (None, Some(path)) => commands::batch(&path).await,
+            (None, None) => Err(reliaburger::relish::RelishError::InvalidFlag {
+                flag: "file".to_string(),
+                reason: "give a [job.*] TOML file, or one of: cancel, results, logs".to_string(),
+            }),
+        },
+        Command::Jobs { definitions } => commands::jobs(definitions, cli.output).await,
+        Command::Run {
+            schedule,
+            batch,
+            count,
+            exec,
+            image,
+            cpu,
+            memory,
+            chunk,
+            max_attempts,
+            max_failed,
+            timeout,
+            concurrency,
+            namespace,
+            env,
+            args,
+        } => {
+            commands::run_task_array(commands::TaskArrayRun {
+                schedule,
+                name: batch,
+                namespace,
+                exec,
+                image,
+                cpu,
+                memory,
+                args,
+                env,
+                spec: reliaburger::meat::task_array::TaskArraySpec {
+                    count,
+                    chunk_size: chunk,
+                    max_attempts,
+                    max_failed_indexes: max_failed,
+                    task_timeout_secs: timeout,
+                    per_node_concurrency: concurrency,
+                },
+            })
+            .await
+        }
         Command::BatchStatus { id, wait, timeout } => {
-            commands::batch_status(id, wait, timeout).await
+            commands::batch_status(id, wait, timeout, cli.output).await
         }
         Command::Secret { action } => match &action {
-            SecretAction::Pubkey { dir } => commands::secret_pubkey(dir.as_deref()).await,
+            SecretAction::Pubkey { dir, namespace } => {
+                commands::secret_pubkey(dir.as_deref(), namespace.as_deref()).await
+            }
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
-            SecretAction::Rotate { finalize } => commands::secret_rotate(*finalize).await,
+            SecretAction::Rotate {
+                finalize,
+                namespace,
+            } => commands::secret_rotate(*finalize, namespace.as_deref()).await,
+        },
+        Command::Ca { action } => match &action {
+            CaAction::Backup {
+                out,
+                dir,
+                cluster_name,
+                recipient,
+                passphrase_file,
+            } => {
+                use reliaburger::relish::ca_cmd::{BackupTarget, PassphraseSource};
+                let target = match (recipient, passphrase_file) {
+                    (Some(recipient), _) => BackupTarget::Recipient(recipient.clone()),
+                    (None, Some(path)) => {
+                        BackupTarget::Passphrase(PassphraseSource::File(path.clone()))
+                    }
+                    (None, None) => BackupTarget::Passphrase(PassphraseSource::Prompt),
+                };
+                reliaburger::relish::ca_cmd::ca_backup(out, dir, cluster_name.as_deref(), &target)
+            }
+            CaAction::Verify {
+                file,
+                fingerprint,
+                passphrase_file,
+                identity,
+            } => {
+                use reliaburger::relish::ca_cmd::PassphraseSource;
+                let passphrase = match passphrase_file {
+                    Some(path) => PassphraseSource::File(path.clone()),
+                    None => PassphraseSource::Prompt,
+                };
+                reliaburger::relish::ca_cmd::ca_verify(
+                    file,
+                    fingerprint,
+                    &passphrase,
+                    identity.as_deref(),
+                )
+            }
+            CaAction::Rotate {
+                role,
+                root_backup,
+                finalize,
+                passphrase_file,
+                identity,
+            } => {
+                use reliaburger::relish::ca_cmd::PassphraseSource;
+                let role = (*role).into();
+                match (finalize, root_backup) {
+                    (true, _) => reliaburger::relish::ca_cmd::ca_rotate_finalize(role).await,
+                    (false, Some(root_backup)) => {
+                        let passphrase = match passphrase_file {
+                            Some(path) => PassphraseSource::File(path.clone()),
+                            None => PassphraseSource::Prompt,
+                        };
+                        reliaburger::relish::ca_cmd::ca_rotate(
+                            role,
+                            root_backup,
+                            &passphrase,
+                            identity.as_deref(),
+                        )
+                        .await
+                    }
+                    (false, None) => Err(reliaburger::relish::RelishError::InvalidFlag {
+                        flag: "root-backup".to_string(),
+                        reason: "a rotation needs the root backup to sign with".to_string(),
+                    }),
+                }
+            }
         },
         Command::Token { action } => match &action {
             TokenAction::Create {
@@ -1956,18 +2361,34 @@ async fn main() -> ExitCode {
                 apps,
                 namespaces,
                 ttl_days,
+                no_expiry,
+                inherit_permissions,
             } => {
-                commands::token_create(
-                    name,
-                    role,
-                    apps.as_deref(),
-                    namespaces.as_deref(),
-                    *ttl_days,
-                )
+                use reliaburger::relish::client::{TokenLifetime, TokenRequest};
+                let split = |list: &Option<String>| {
+                    list.as_ref()
+                        .map(|list| list.split(',').map(|s| s.trim().to_string()).collect())
+                };
+                let lifetime = match (ttl_days, no_expiry) {
+                    (Some(days), _) => TokenLifetime::Days(*days),
+                    (None, true) => TokenLifetime::Never,
+                    (None, false) => TokenLifetime::Default,
+                };
+                commands::token_create(&TokenRequest {
+                    name: name.clone(),
+                    role: role.clone(),
+                    apps: split(apps),
+                    namespaces: split(namespaces),
+                    lifetime,
+                    inherit_permissions: *inherit_permissions,
+                })
                 .await
             }
-            TokenAction::List => commands::token_list().await,
+            TokenAction::List => commands::token_list(cli.output).await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
+            TokenAction::Rotate { name, grace_hours } => {
+                commands::token_rotate(name, *grace_hours).await
+            }
         },
         Command::Cluster {
             action:
@@ -2432,6 +2853,51 @@ mod tests {
     // the README describes that build.
     #[cfg(feature = "kubernetes")]
     #[test]
+    fn common_job_commands_accept_singletons_schedules_and_explicit_replay() {
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "run",
+                "--batch",
+                "single",
+                "--exec",
+                "/bin/true",
+                "--schedule",
+                "* * * * *"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["relish", "jobs", "--definitions"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "batch",
+                "replay",
+                "1",
+                "--node",
+                "lost",
+                "--grant-digest",
+                "digest",
+                "--acknowledge-side-effects"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "batch",
+                "replay",
+                "1",
+                "--node",
+                "lost",
+                "--grant-digest",
+                "digest"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn readme_command_list_matches_the_cli() {
         use clap::CommandFactory;
         use reliaburger::relish::command_reference::{
@@ -2454,19 +2920,154 @@ mod tests {
     }
 
     #[test]
+    fn ca_backup_seals_to_a_passphrase_unless_given_a_recipient() {
+        let cli = Cli::try_parse_from(["relish", "ca", "backup", "--out", "root.age"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Backup {
+                    recipient: None,
+                    passphrase_file: None,
+                    cluster_name: None,
+                    ref dir,
+                    ..
+                }
+            }) if dir == std::path::Path::new("/etc/reliaburger")
+        ));
+        let cli = Cli::try_parse_from([
+            "relish",
+            "ca",
+            "backup",
+            "--out",
+            "root.age",
+            "--recipient",
+            "age1example",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Backup {
+                    recipient: Some(ref r),
+                    ..
+                }
+            }) if r == "age1example"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "ca",
+                "backup",
+                "--out",
+                "root.age",
+                "--recipient",
+                "age1example",
+                "--passphrase-file",
+                "p",
+            ])
+            .is_err(),
+            "a recipient and a passphrase are two different seals"
+        );
+    }
+
+    #[test]
+    fn ca_rotate_needs_a_root_backup_unless_finalising() {
+        assert!(
+            Cli::try_parse_from(["relish", "ca", "rotate", "--role", "node"]).is_err(),
+            "a rotation is signed with the root backup"
+        );
+        assert!(
+            Cli::try_parse_from(["relish", "ca", "rotate", "--role", "root", "--finalize"])
+                .is_err(),
+            "the root isn't an intermediate"
+        );
+        let cli = Cli::try_parse_from([
+            "relish",
+            "ca",
+            "rotate",
+            "--role",
+            "workload",
+            "--root-backup",
+            "root.age",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Rotate {
+                    role: CaRotationRole::Workload,
+                    root_backup: Some(_),
+                    finalize: false,
+                    ..
+                }
+            })
+        ));
+        let cli = Cli::try_parse_from(["relish", "ca", "rotate", "--role", "node", "--finalize"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Rotate {
+                    role: CaRotationRole::Node,
+                    root_backup: None,
+                    finalize: true,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "ca",
+                "rotate",
+                "--role",
+                "node",
+                "--finalize",
+                "--root-backup",
+                "root.age",
+            ])
+            .is_err(),
+            "finalising signs nothing"
+        );
+    }
+
+    #[test]
+    fn ca_verify_needs_the_clusters_fingerprint() {
+        assert!(Cli::try_parse_from(["relish", "ca", "verify", "root.age"]).is_err());
+        let cli = Cli::try_parse_from([
+            "relish",
+            "ca",
+            "verify",
+            "root.age",
+            "--fingerprint",
+            "sha256:abc",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ca {
+                action: CaAction::Verify { ref fingerprint, .. }
+            }) if fingerprint == "sha256:abc"
+        ));
+    }
+
+    #[test]
     fn secret_pubkey_asks_the_cluster_unless_given_an_init_directory() {
         let cli = Cli::try_parse_from(["relish", "secret", "pubkey"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Secret {
-                action: SecretAction::Pubkey { dir: None }
+                action: SecretAction::Pubkey {
+                    dir: None,
+                    namespace: None
+                }
             })
         ));
         let cli = Cli::try_parse_from(["relish", "secret", "pubkey", "cluster"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Secret {
-                action: SecretAction::Pubkey { dir: Some(ref dir) }
+                action: SecretAction::Pubkey { dir: Some(ref dir), namespace: None }
             }) if dir == std::path::Path::new("cluster")
         ));
     }
@@ -2550,6 +3151,45 @@ mod tests {
             Cli::try_parse_from(["relish", "image", "download", "--arch", "x86_64,aarch64"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn secret_pubkey_and_rotate_take_a_namespace() {
+        let cli =
+            Cli::try_parse_from(["relish", "secret", "pubkey", "--namespace", "team-a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Pubkey { dir: None, namespace: Some(ref namespace) }
+            }) if namespace == "team-a"
+        ));
+        // The offline bootstrap only holds the cluster key.
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "secret",
+                "pubkey",
+                "cluster",
+                "--namespace",
+                "team-a"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "relish",
+            "secret",
+            "rotate",
+            "--finalize",
+            "--namespace",
+            "team-a",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Rotate { finalize: true, namespace: Some(ref namespace) }
+            }) if namespace == "team-a"
+        ));
     }
 
     #[test]
@@ -4000,7 +4640,106 @@ mod tests {
     #[test]
     fn parse_batch_command() {
         let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
-        assert!(matches!(cli.command, Command::Batch { .. }));
+        match cli.command {
+            Command::Batch { action, path } => {
+                assert!(action.is_none());
+                assert_eq!(path, Some(PathBuf::from("jobs.toml")));
+            }
+            _ => panic!("expected Batch"),
+        }
+    }
+
+    #[test]
+    fn parse_batch_subcommands() {
+        let cli = parse(&["relish", "batch", "cancel", "7"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch {
+                action: Some(BatchAction::Cancel { id: 7 }),
+                path: None
+            }
+        ));
+        let cli = parse(&["relish", "batch", "results", "7", "--failed"]).unwrap();
+        match cli.command {
+            Command::Batch {
+                action:
+                    Some(BatchAction::Results {
+                        id, failed, limit, ..
+                    }),
+                ..
+            } => {
+                assert_eq!((id, failed), (7, true));
+                assert_eq!(limit, reliaburger::bun::task_array_api::DEFAULT_RESULT_ROWS);
+            }
+            _ => panic!("expected batch results"),
+        }
+        let cli = parse(&["relish", "batch", "logs", "7", "--index", "42"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch {
+                action: Some(BatchAction::Logs { id: 7, index: 42 }),
+                ..
+            }
+        ));
+        assert!(
+            parse(&["relish", "batch", "logs", "7"]).is_err(),
+            "--index is required"
+        );
+    }
+
+    #[test]
+    fn parse_run_batch_with_arguments_after_the_separator() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "render",
+            "--count",
+            "1000000",
+            "--exec",
+            "/usr/local/bin/rb-task",
+            "--max-failed",
+            "10",
+            "--env",
+            "MODE=fast",
+            "--",
+            "--frame",
+            "{index}",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run {
+                batch,
+                count,
+                exec,
+                chunk,
+                max_attempts,
+                max_failed,
+                timeout,
+                concurrency,
+                namespace,
+                env,
+                args,
+                ..
+            } => {
+                assert_eq!(batch, "render");
+                assert_eq!(count, 1_000_000);
+                assert_eq!(exec, Some(PathBuf::from("/usr/local/bin/rb-task")));
+                assert_eq!(chunk, 1024);
+                assert_eq!(max_attempts, 3);
+                assert_eq!(max_failed, Some(10));
+                assert_eq!(timeout, 600);
+                assert_eq!(concurrency, None);
+                assert_eq!(namespace, "default");
+                assert_eq!(env, vec!["MODE=fast"]);
+                assert_eq!(args, vec!["--frame", "{index}"]);
+            }
+            _ => panic!("expected Run"),
+        }
+        assert!(
+            parse(&["relish", "run", "--count", "3", "--exec", "/bin/true"]).is_err(),
+            "--batch is required"
+        );
     }
 
     #[test]

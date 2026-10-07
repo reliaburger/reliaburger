@@ -7,8 +7,8 @@
 //!
 //! Recovery is operator-triggered, never automatic, because it deliberately
 //! discards the dead cluster's Raft history. A survivor restores the desired
-//! state from the last sealed backup (or its own durable snapshot if it was a
-//! voter), re-bootstraps a fresh single-voter Raft with a bumped recovery
+//! state from the last sealed backup (or, if it was a voter, its own snapshot and
+//! committed log), re-bootstraps a fresh single-voter Raft with a bumped recovery
 //! epoch, and the #88 reconciler regrows the council from healthy members. The
 //! cost is honest: anything written after the last backup is lost.
 
@@ -43,11 +43,11 @@ pub enum RecoveryError {
     #[error("open recovery source: {0}")]
     OpenSource(String),
     #[error(
-        "no committed snapshot exists at {path}: this node holds no durable state to recover from \
-         (a young or low-churn cluster may never have snapshotted — restore from a sealed backup \
-         with `--from` instead of the node's data directory)"
+        "{path} holds no committed council state, neither a snapshot nor a committed log entry: \
+         this node was never a voter, or its stores were lost; restore from a sealed backup with \
+         `--from`"
     )]
-    EmptySnapshot { path: String },
+    NoDurableState { path: String },
     #[error("re-bootstrap: {0}")]
     Bootstrap(String),
     #[error("persist recovered snapshot: {0}")]
@@ -98,9 +98,8 @@ pub fn live_council_voter(members: &[MembershipSnapshot]) -> Option<String> {
 
 /// Load and unseal a `DesiredState` from a recovery source.
 ///
-/// `master_key` is required for `BackupUrl` (to unseal); `NodeDataDir` reads
-/// the plaintext durable snapshot the node already trusts, so it ignores the
-/// key.
+/// `master_key` is required for `BackupUrl` (to unseal). `NodeDataDir`
+/// needs it only when the cluster encrypts its Raft log at rest.
 pub async fn load_recovery_state(
     source: &RecoverySource,
     master_key: Option<&[u8; 32]>,
@@ -121,40 +120,80 @@ pub async fn load_recovery_state(
             serde_json::from_slice(&bytes)
                 .map_err(|e| RecoveryError::OpenSource(format!("decode backup payload: {e}")))
         }
-        RecoverySource::NodeDataDir(dir) => load_state_from_data_dir(dir).await,
+        RecoverySource::NodeDataDir(dir) => load_state_from_data_dir(dir, master_key).await,
     }
 }
 
-/// Read the durable Raft snapshot under `{data_dir}/raft/snapshot.redb` into a
-/// `DesiredState`. Used when the recovering node was itself a voter and still
-/// holds the most recent committed state.
-async fn load_state_from_data_dir(data_dir: &Path) -> Result<DesiredState, RecoveryError> {
-    let snapshot_path = data_dir.join("raft").join("snapshot.redb");
-    // `redb::Database::create` would fabricate an empty store for a missing
-    // file, and `with_store` returns empty state when no snapshot blob has
-    // been written yet — so a young cluster would "recover" into zero apps,
-    // no CAs and no tokens, reported as success. Refuse both cases.
-    if !snapshot_path.exists() {
-        return Err(RecoveryError::EmptySnapshot {
-            path: snapshot_path.display().to_string(),
-        });
+/// Rebuild the state a voter had committed from its Raft directory
+/// (`{data_dir}/raft`): the durable snapshot, then every committed log entry
+/// after it (#479).
+///
+/// A cluster takes its first snapshot only after `snapshot_threshold`
+/// (10,000) entries, so a young one holds its whole state in the log. The
+/// stores open the way a node start opens them (finishing an interrupted
+/// recovery, checking the purge boundary), and the log needs `master_key`
+/// when the cluster encrypts it. Entries past the node's commit point are
+/// left out: the dead council never agreed them.
+async fn load_state_from_data_dir(
+    data_dir: &Path,
+    master_key: Option<&[u8; 32]>,
+) -> Result<DesiredState, RecoveryError> {
+    use openraft::RaftLogReader;
+    use openraft::storage::{RaftLogStorage, RaftStateMachine};
+
+    let raft_dir = data_dir.join("raft");
+    let no_state = || RecoveryError::NoDurableState {
+        path: raft_dir.display().to_string(),
+    };
+    // Opening the stores would create empty ones, and an empty state machine
+    // would "recover" into zero apps, no CAs and no tokens, reported as
+    // success. Refuse before anything is created.
+    if !raft_dir.join("log.redb").exists() && !raft_dir.join("snapshot.redb").exists() {
+        return Err(no_state());
     }
     crate::compatibility::ensure_state_compatible(data_dir)
         .map_err(|e| RecoveryError::OpenSource(e.to_string()))?;
-    let db = std::sync::Arc::new(
-        redb::Database::create(&snapshot_path)
-            .map_err(|e| RecoveryError::OpenSource(format!("open snapshot store: {e}")))?,
-    );
-    if !CouncilStateMachine::snapshot_present(&db)
-        .map_err(|e| RecoveryError::OpenSource(format!("inspect snapshot store: {e}")))?
-    {
-        return Err(RecoveryError::EmptySnapshot {
-            path: snapshot_path.display().to_string(),
-        });
+    let (mut log, _fresh, mut machine) =
+        crate::cluster::runtime::open_raft_storage(&raft_dir, master_key.map(|k| k.to_vec()))
+            .await
+            .map_err(|e| RecoveryError::OpenSource(e.to_string()))?;
+    let read_error = |e: openraft::StorageError<u64>| {
+        let hint = if master_key.is_none() {
+            " (a secured cluster encrypts its log: pass --master-key)"
+        } else {
+            ""
+        };
+        RecoveryError::OpenSource(format!("read the committed log: {e}{hint}"))
+    };
+
+    let holds_snapshot = machine.holds_snapshot().await;
+    let applied = machine.read_desired(|state| state.last_applied_log).await;
+    let first = applied.map_or(0, |log_id| log_id.index + 1);
+    let committed = log.read_committed().await.map_err(read_error)?;
+    let mut replayed = false;
+    if let Some(committed) = committed.filter(|committed| committed.index >= first) {
+        let entries = log
+            .try_get_log_entries(first..=committed.index)
+            .await
+            .map_err(read_error)?;
+        let complete = entries.len() as u64 == committed.index - first + 1
+            && entries.last().map(|entry| entry.log_id) == Some(committed);
+        if !complete {
+            return Err(RecoveryError::OpenSource(format!(
+                "the committed log from index {first} to {} is incomplete",
+                committed.index
+            )));
+        }
+        machine
+            .apply(entries)
+            .await
+            .map_err(|e| RecoveryError::OpenSource(format!("replay the committed log: {e}")))?;
+        replayed = true;
     }
-    let state_machine = CouncilStateMachine::with_store(db)
-        .map_err(|e| RecoveryError::OpenSource(format!("load snapshot: {e}")))?;
-    Ok(state_machine.desired_state().await)
+    if !holds_snapshot && !replayed {
+        return Err(no_state());
+    }
+    Ok(machine.desired_state().await)
 }
 
 /// Offline recovery: replace the node's Raft directory with one holding only
@@ -364,14 +403,173 @@ mod tests {
         assert!(!dir.path().join(crate::compatibility::STATE_STAMP).exists());
     }
 
+    fn config_entry(term: u64, index: u64, key: &str) -> openraft::Entry<TypeConfig> {
+        openraft::Entry {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(term, 0), index),
+            payload: openraft::EntryPayload::Normal(
+                crate::council::types::RaftRequest::ConfigSet {
+                    key: key.to_string(),
+                    value: index.to_string(),
+                },
+            ),
+        }
+    }
+
+    /// Write `entries` into `{data_dir}/raft/log.redb`, the way a voter's
+    /// running council would, and record `committed` as its commit point.
+    async fn write_voter_log(
+        data_dir: &Path,
+        key: Option<&[u8; 32]>,
+        entries: Vec<openraft::Entry<TypeConfig>>,
+        committed: Option<u64>,
+    ) {
+        use openraft::storage::RaftLogStorage;
+        crate::compatibility::ensure_state_compatible(data_dir).unwrap();
+        let raft = data_dir.join("raft");
+        std::fs::create_dir_all(&raft).unwrap();
+        let mut log = crate::council::durable_log::DurableLogStore::open_with_key(
+            raft.join("log.redb"),
+            key.map(|k| k.to_vec()),
+        )
+        .unwrap();
+        let committed = committed.map(|index| {
+            entries
+                .iter()
+                .find(|entry| entry.log_id.index == index)
+                .unwrap()
+                .log_id
+        });
+        log.write_entries(entries).unwrap();
+        log.save_committed(committed).await.unwrap();
+    }
+
+    fn config_keys(state: &DesiredState) -> Vec<&str> {
+        let mut keys: Vec<_> = state.config.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// #479: a young cluster never crossed the 10,000-entry snapshot
+    /// threshold, so its whole state is in the committed log. Recovery
+    /// without `--from` replays it.
+    #[tokio::test]
+    async fn recovery_replays_a_committed_log_that_was_never_snapshotted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_voter_log(
+            dir.path(),
+            None,
+            vec![
+                config_entry(1, 0, "a"),
+                config_entry(1, 1, "b"),
+                config_entry(2, 2, "c"),
+            ],
+            Some(2),
+        )
+        .await;
+        let loaded = load_state_from_data_dir(dir.path(), None).await.unwrap();
+        assert_eq!(config_keys(&loaded), ["a", "b", "c"]);
+    }
+
+    /// Entries past the node's commit point were never agreed by the dead
+    /// council; replaying them could resurrect a write its client saw fail.
+    #[tokio::test]
+    async fn recovery_stops_at_the_commit_point() {
+        let dir = tempfile::tempdir().unwrap();
+        write_voter_log(
+            dir.path(),
+            None,
+            vec![config_entry(1, 0, "a"), config_entry(1, 1, "uncommitted")],
+            Some(0),
+        )
+        .await;
+        let loaded = load_state_from_data_dir(dir.path(), None).await.unwrap();
+        assert_eq!(config_keys(&loaded), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_a_log_with_nothing_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_voter_log(dir.path(), None, vec![config_entry(1, 0, "a")], None).await;
+        let err = load_state_from_data_dir(dir.path(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RecoveryError::NoDurableState { .. }),
+            "expected NoDurableState, got {err:?}"
+        );
+    }
+
+    /// A snapshot covers only a prefix: the committed tail after it is
+    /// replayed too, or recovery would silently drop up to 10,000 writes.
+    #[tokio::test]
+    async fn recovery_replays_the_committed_tail_after_the_snapshot() {
+        use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+        let dir = tempfile::tempdir().unwrap();
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
+        let raft = dir.path().join("raft");
+        std::fs::create_dir_all(&raft).unwrap();
+        {
+            let db =
+                std::sync::Arc::new(redb::Database::create(raft.join("snapshot.redb")).unwrap());
+            let mut machine = CouncilStateMachine::with_store(db).unwrap();
+            machine
+                .apply(vec![config_entry(1, 0, "a"), config_entry(1, 1, "b")])
+                .await
+                .unwrap();
+            machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+        }
+        write_voter_log(
+            dir.path(),
+            None,
+            vec![config_entry(1, 2, "c"), config_entry(1, 3, "d")],
+            Some(3),
+        )
+        .await;
+        let loaded = load_state_from_data_dir(dir.path(), None).await.unwrap();
+        assert_eq!(config_keys(&loaded), ["a", "b", "c", "d"]);
+    }
+
+    /// A secured cluster encrypts its log with the master key, so replay
+    /// needs it; without it recovery refuses instead of losing entries.
+    #[tokio::test]
+    async fn recovery_replays_an_encrypted_log_only_with_the_master_key() {
+        let key = [7u8; 32];
+        let dir = tempfile::tempdir().unwrap();
+        write_voter_log(
+            dir.path(),
+            Some(&key),
+            vec![config_entry(1, 0, "a")],
+            Some(0),
+        )
+        .await;
+        let err = load_state_from_data_dir(dir.path(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--master-key"),
+            "the refusal should name --master-key: {err}"
+        );
+        let loaded = load_state_from_data_dir(dir.path(), Some(&key))
+            .await
+            .unwrap();
+        assert_eq!(config_keys(&loaded), ["a"]);
+    }
+
     #[tokio::test]
     async fn recovery_refuses_a_data_dir_with_no_snapshot_file() {
         // A young cluster that never snapshotted: no snapshot.redb at all.
         let dir = tempfile::tempdir().unwrap();
-        let err = load_state_from_data_dir(dir.path()).await.unwrap_err();
+        let err = load_state_from_data_dir(dir.path(), None)
+            .await
+            .unwrap_err();
         assert!(
-            matches!(err, RecoveryError::EmptySnapshot { .. }),
-            "expected EmptySnapshot, got {err:?}"
+            matches!(err, RecoveryError::NoDurableState { .. }),
+            "expected NoDurableState, got {err:?}"
         );
     }
 
@@ -390,10 +588,12 @@ mod tests {
             let _ = CouncilStateMachine::with_store(db).unwrap();
         }
 
-        let err = load_state_from_data_dir(dir.path()).await.unwrap_err();
+        let err = load_state_from_data_dir(dir.path(), None)
+            .await
+            .unwrap_err();
         assert!(
-            matches!(err, RecoveryError::EmptySnapshot { .. }),
-            "expected EmptySnapshot, got {err:?}"
+            matches!(err, RecoveryError::NoDurableState { .. }),
+            "expected NoDurableState, got {err:?}"
         );
     }
 
@@ -405,8 +605,46 @@ mod tests {
         state.config.insert("k".to_string(), "v".to_string());
         recover_data_dir(dir.path(), state).unwrap();
 
-        let loaded = load_state_from_data_dir(dir.path()).await.unwrap();
+        let loaded = load_state_from_data_dir(dir.path(), None).await.unwrap();
         assert_eq!(loaded.config.get("k").map(String::as_str), Some("v"));
+    }
+
+    /// #478: nodes refuse a catalogue generation below the newest they saw.
+    /// The backup predates whatever the dead council published after it, so
+    /// the recovered council starts its epoch's generations above every
+    /// generation the replaced epoch could have reached.
+    #[tokio::test]
+    async fn a_recovered_council_publishes_above_the_epoch_it_replaces() {
+        use crate::onion::withdrawal::EndpointWithdrawals;
+        let mut backup = DesiredState::default();
+        backup.endpoint_withdrawals.generation = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        recover_data_dir(dir.path(), backup.clone()).unwrap();
+        let offline = load_state_from_data_dir(dir.path(), None).await.unwrap();
+        let in_process = CouncilStateMachine::from_recovered_state(backup)
+            .desired_state()
+            .await;
+
+        for state in [offline, in_process] {
+            assert_eq!(state.recovery_epoch, 1);
+            let generation = state.endpoint_withdrawals.generation;
+            assert_eq!(generation, EndpointWithdrawals::epoch_floor(1));
+            // Every generation epoch 0 could have published is below it.
+            assert!(EndpointWithdrawals::epoch_floor(0) + u64::from(u32::MAX) < generation);
+        }
+    }
+
+    /// A restored generation already past the new epoch's floor is never
+    /// lowered: nodes may have seen it.
+    #[test]
+    fn entering_an_epoch_never_lowers_the_generation() {
+        let mut withdrawals = crate::onion::withdrawal::EndpointWithdrawals {
+            generation: u64::MAX - 1,
+            ..Default::default()
+        };
+        withdrawals.enter_recovery_epoch(1);
+        assert_eq!(withdrawals.generation, u64::MAX - 1);
     }
 
     #[tokio::test]

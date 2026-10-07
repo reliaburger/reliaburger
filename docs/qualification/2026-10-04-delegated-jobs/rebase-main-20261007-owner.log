@@ -1,0 +1,12 @@
+python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+...........................................................................................................................................Manual OCI owner: {"attempt": "1", "authority": "manual", "commit": "23db821233f6a3426865fbe49e7ae269968d4905", "host": "linux", "owner": "observed-operator", "run_id": "manual:fe65b2d1-a900-4b75-9af8-842235a92430"}
+Manual OCI evidence: /private/var/folders/2_/8114g2p575n5_8_3x1p7484c0000gn/T/tmprg_ch6p0/checkout/target/contracts/manual-oci/ee83d29a-8221-404c-9b99-266ac6c8ece4
+.Manual OCI owner: {"attempt": "1", "authority": "manual", "commit": "23db821233f6a3426865fbe49e7ae269968d4905", "host": "linux", "owner": "supplied-operator", "run_id": "manual:explicit"}
+Manual OCI evidence: /private/var/folders/2_/8114g2p575n5_8_3x1p7484c0000gn/T/tmpjgcdz9sw/checkout/target/contracts/manual-oci/84733890-25bc-463e-aa17-12cc8e12f43b
+..................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 318 tests in 27.302s
+
+OK
+python3 scripts/ci/ignored_owners.py reasons
+every ignored test has an owner (reasons)

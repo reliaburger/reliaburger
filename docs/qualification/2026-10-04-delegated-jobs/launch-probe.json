@@ -1,0 +1,39 @@
+{
+  "hardware": "4-vCPU, 8-GiB aarch64 Linux VM",
+  "compiler": "cc -O2 -pthread",
+  "workload": "64 dependent integer mixing rounds seeded by the task index",
+  "scope": "Standalone primitive only: no cluster scheduling, runtime ownership, task limits, concurrent application, output collection, ledger/index or council acknowledgement",
+  "qualification_pass": false,
+  "results": [
+    {
+      "mode": "spawn",
+      "tasks": 20000,
+      "completed": 20000,
+      "failed": 0,
+      "slots": 4,
+      "seconds": 0.865413,
+      "rate": 23110.361,
+      "checksum": 0
+    },
+    {
+      "mode": "pooled",
+      "tasks": 1000000,
+      "completed": 1000000,
+      "failed": 0,
+      "slots": 4,
+      "seconds": 0.088014,
+      "rate": 11361843.0,
+      "checksum": 9362417196737296128
+    },
+    {
+      "mode": "spawn",
+      "tasks": 1000000,
+      "completed": 1000000,
+      "failed": 0,
+      "slots": 4,
+      "seconds": 66.360375,
+      "rate": 15069.234,
+      "checksum": 0
+    }
+  ]
+}

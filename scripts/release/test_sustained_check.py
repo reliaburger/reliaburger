@@ -732,6 +732,47 @@ class AgentLoopTurns(Evidence):
         self.assertEqual(sorted(state["turns"]), ["rb-a-1", "rb-a-2"])
 
 
+class GuestClock(Evidence):
+    """One clock source per guest: Lima's guest agent, not timesyncd as well (#608)."""
+
+    def clock(self, ts=NOW, timesyncd="inactive", steps=0):
+        return self.snapshot(ts=ts, **{"inventory__rb-a-1_txt":
+                                       INVENTORY + f"timesyncd {timesyncd}\nclock_steps {steps}\n"})
+
+    def test_a_guest_with_only_the_lima_agent_passes(self):
+        _, verdict = self.evaluate(self.clock())
+        self.assertEqual([item for item in verdict["findings"] if item["check"].startswith("guest-clock")], [])
+
+    def test_timesyncd_running_beside_the_guest_agent_fails(self):
+        code, verdict = self.evaluate(self.clock(timesyncd="active"))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "guest-clock")
+        self.assertEqual(failure["target"], "rb-a-1")
+        self.assertIn("systemd-timesyncd", failure["detail"])
+
+    def test_clock_steps_outside_a_fault_window_warn_and_are_counted(self):
+        _, verdict = self.evaluate(self.clock(steps=6))
+        self.assertEqual(self.failures(verdict), [])
+        warning = next(item for item in verdict["findings"] if item["check"] == "guest-clock-steps")
+        self.assertEqual(warning["severity"], "warn")
+        self.assertIn("6", warning["detail"])
+        self.evaluate(self.clock(ts=NOW + 3600, steps=2))
+        self.assertEqual(checker.load_state(self.evidence)["clock_steps"], {"rb-a-1": 8})
+
+    def test_a_step_after_a_power_on_is_expected(self):
+        checker.main(["window", str(self.evidence), "open", "power-off", "--down", "1"])
+        _, verdict = self.evaluate(self.clock(steps=1))
+        steps = [item for item in verdict["findings"] if item["check"] == "guest-clock-steps"]
+        self.assertEqual([item["severity"] for item in steps], ["info"])
+
+    def test_the_record_counts_clock_steps_per_node(self):
+        self.evaluate(self.clock(steps=3))
+        Record.write_run(self)
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        self.assertIn("- Guest clock steps by Lima's guest agent: rb-a-1 3", record.read_text())
+
+
 class Record(Evidence):
     def write_run(self, failures=()):
         (self.evidence / "metadata.json").write_text(json.dumps({

@@ -79,12 +79,22 @@ impl LogStoreInner {
 #[derive(Debug, Clone, Default)]
 pub struct MemLogStore {
     inner: Arc<Mutex<LogStoreInner>>,
+    /// Test hook: once set, every append fails as a full disk would (#480).
+    #[cfg(test)]
+    fail_appends: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MemLogStore {
     /// Create a new empty log store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test hook: make every later append fail with ENOSPC.
+    #[cfg(test)]
+    pub(crate) fn fail_appends(&self) {
+        self.fail_appends
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -176,6 +186,13 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        #[cfg(test)]
+        if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+            let error = std::io::Error::from_raw_os_error(28); // ENOSPC
+            return Err(StorageError::from(openraft::StorageIOError::write_logs(
+                &error,
+            )));
+        }
         let mut guard = self.inner.lock().await;
         guard.append_entries(entries);
         // In-memory storage is "durable" immediately.

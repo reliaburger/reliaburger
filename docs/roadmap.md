@@ -81,11 +81,9 @@ migration and no feature gate
   0.1.2 changes the protocol and state formats (27 and 46 in 0.1.1; 28 and 47
   now), so a 0.1.1 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.1](releasing.md#upgrading-from-011)).
-- [ ] **0.1.3: ready for release, qualification in progress**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)). Every
-  item has landed and the crate says 0.1.3; what's left is building, staging,
-  soaking and promoting the candidate ([runbook](releasing.md)). 0.1.3 is about
-  the agent loop, observability and test quality:
+- [x] **0.1.3: agent loop, observability and test quality.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.3)
+  on 3 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/4)):
   - [x] an agent loop that's metered and never waits inline on slow work: a
     turn meter, a starvation harness and the inline-await rule, the status
     snapshot, parallel state reads and restarts off the loop, and the last
@@ -133,15 +131,18 @@ migration and no feature gate
     ([#419](https://github.com/reliaburger/reliaburger/issues/419), [#422](https://github.com/reliaburger/reliaburger/issues/422), [#448](https://github.com/reliaburger/reliaburger/issues/448), [#450](https://github.com/reliaburger/reliaburger/issues/450), [#456](https://github.com/reliaburger/reliaburger/issues/456), [#461](https://github.com/reliaburger/reliaburger/issues/461), [#420](https://github.com/reliaburger/reliaburger/pull/420), [#421](https://github.com/reliaburger/reliaburger/pull/421),
     [#449](https://github.com/reliaburger/reliaburger/pull/449), [#453](https://github.com/reliaburger/reliaburger/pull/453), [#464](https://github.com/reliaburger/reliaburger/pull/464), [#465](https://github.com/reliaburger/reliaburger/pull/465)).
 
+  The homepage tour was re-recorded against the published install, with
+  `relish council status`, the council line in `relish status` and replicas
+  numbered across the cluster.
   0.1.3 changes the protocol and state formats (28 and 47 in 0.1.2; 33 and 49
   now), so a 0.1.2 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.2](releasing.md#upgrading-from-012)). 0.1.2's leader
   refuses the upgrade before it records a run.
-- [ ] **0.1.4: ready for release, qualification to follow 0.1.3**
+- [x] **0.1.4: cross-node logs and events, security fixes.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.4)
+  on 3 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/8), merge
-  train [#474](https://github.com/reliaburger/reliaburger/pull/474)). Every
-  item has landed on `release-1-1-4` and the crate says 0.1.4. 0.1.4 is part 2
-  of F07 ([#392](https://github.com/reliaburger/reliaburger/issues/392)),
+  train [#474](https://github.com/reliaburger/reliaburger/pull/474)). 0.1.4 is
+  part 2 of F07 ([#392](https://github.com/reliaburger/reliaburger/issues/392)),
   security fixes, and the first steps of the operations-security work:
   - [x] separate stderr capture for process workloads
     ([#466](https://github.com/reliaburger/reliaburger/pull/466)) and a
@@ -176,27 +177,129 @@ migration and no feature gate
   changes the protocol (33 in 0.1.3; 34 now, for the new audit event kinds),
   so a 0.1.3 cluster can't roll to it: recreate the cluster
   ([upgrading from 0.1.3](releasing.md#upgrading-from-013)).
-- [ ] **0.1.5: operations security**
+  The homepage tour was re-recorded against the published install. The
+  [compressed](qualification/2026-10-03-v0.1.4-soak-compressed.md) and
+  [full](qualification/2026-10-03-v0.1.4-soak-full.md) soaks found three bugs that 0.1.4 ships
+  with and 0.1.5 fixes: consumer syncs over the agent loop's turn budget
+  ([#505](https://github.com/reliaburger/reliaburger/issues/505)), a pooled peer connection presenting an expired leaf
+  ([#509](https://github.com/reliaburger/reliaburger/issues/509)), and the leader resigning for disk pressure over unexported logs
+  ([#510](https://github.com/reliaburger/reliaburger/issues/510)).
+- [x] **0.1.5: bug fixes.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.5)
+  on 6 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/11), merge
-  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). The rest
-  of the 0.1.4 security scope, moved here so 0.1.4 could ship soon after
-  0.1.3: upstream image trust, binding images to a digest at apply, the
-  upstream policy and cosign (F03a,
-  [#361](https://github.com/reliaburger/reliaburger/issues/361)); CA backup
-  and intermediate rotation (F04 R1–R4,
-  [#362](https://github.com/reliaburger/reliaburger/issues/362)); token
-  visibility, expiry, rotation and per-namespace secret keys (F05 I2–I4,
-  [#363](https://github.com/reliaburger/reliaburger/issues/363)); and the
-  retired intent that keeps decrypted secrets
-  ([#476](https://github.com/reliaburger/reliaburger/issues/476)). Worker
-  key separation (F03b), root rotation and restore (F04 R5–R7) and per-app
-  audiences (F05 I5–I6) follow later. The security work comes before real
-  fleets in 0.3.0.
-- [ ] **0.2.0: "A million jobs"**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/3),
-  [#266](https://github.com/reliaburger/reliaburger/pull/266)). Task arrays
-  keep compact state in Raft and expand on each node, and finish a million
-  tasks in minutes on three nodes.
+  train [#484](https://github.com/reliaburger/reliaburger/pull/484)). 0.1.5 is the bug-fix release:
+  - [x] token list with scope, expiry and last use, and an hourly sweep of
+    expired tokens that never removes the last Admin (F05 I2,
+    [#483](https://github.com/reliaburger/reliaburger/pull/483));
+  - [x] council recovery that keeps its restored tokens, publishes above the
+    replaced council's catalogue generation and recovers from a log that was
+    never snapshotted ([#477](https://github.com/reliaburger/reliaburger/issues/477)–[#479](https://github.com/reliaburger/reliaburger/issues/479), [#513](https://github.com/reliaburger/reliaburger/pull/513));
+  - [x] disk pressure measured on the real disk, and a voter whose Raft core
+    stopped on a full disk restarts instead of lagging for good
+    ([#480](https://github.com/reliaburger/reliaburger/issues/480), [#510](https://github.com/reliaburger/reliaburger/issues/510), [#516](https://github.com/reliaburger/reliaburger/pull/516));
+  - [x] remote backends kept routed when a node stops or rolls its last
+    local replica ([#481](https://github.com/reliaburger/reliaburger/issues/481), [#515](https://github.com/reliaburger/reliaburger/pull/515));
+  - [x] snapshot commands routed to the node holding the app's volume
+    ([#482](https://github.com/reliaburger/reliaburger/issues/482), [#514](https://github.com/reliaburger/reliaburger/pull/514));
+  - [x] a retired runc intent scrubbed of decrypted environment values
+    ([#476](https://github.com/reliaburger/reliaburger/issues/476), [#512](https://github.com/reliaburger/reliaburger/pull/512));
+  - [x] the 0.1.4 soak findings: a consumer sync journals one write a turn
+    ([#505](https://github.com/reliaburger/reliaburger/issues/505), [#506](https://github.com/reliaburger/reliaburger/pull/506)), and a peer TLS connection retires when its
+    client leaf expires ([#509](https://github.com/reliaburger/reliaburger/issues/509), [#518](https://github.com/reliaburger/reliaburger/pull/518));
+  - [x] the codebase audit's 28 fixes ([#528](https://github.com/reliaburger/reliaburger/issues/528)–[#555](https://github.com/reliaburger/reliaburger/issues/555),
+    [#556](https://github.com/reliaburger/reliaburger/pull/556)): data safety in volumes, logs, metrics and the registry;
+    token scope on batch submission and repository isolation in Pickle;
+    ingress, DNS and service-discovery routing; batch, cron and migration
+    correctness; config compile, `_defaults.toml`, GitOps and `apply
+    --dry-run`; and one behaviour across every entry point;
+  - [x] flakes: `flock` guards that unlock on drop, slow-disk scenarios that
+    count persists, a spool quota independent of the host disk, warmed fake
+    executables and closed scripted connections ([#497](https://github.com/reliaburger/reliaburger/issues/497), [#500](https://github.com/reliaburger/reliaburger/issues/500),
+    [#508](https://github.com/reliaburger/reliaburger/issues/508), [#517](https://github.com/reliaburger/reliaburger/issues/517), [#519](https://github.com/reliaburger/reliaburger/issues/519)–[#521](https://github.com/reliaburger/reliaburger/issues/521), [#524](https://github.com/reliaburger/reliaburger/issues/524), [#585](https://github.com/reliaburger/reliaburger/issues/585), [#523](https://github.com/reliaburger/reliaburger/pull/523),
+    [#525](https://github.com/reliaburger/reliaburger/pull/525), [#557](https://github.com/reliaburger/reliaburger/pull/557), [#586](https://github.com/reliaburger/reliaburger/pull/586));
+  - [x] adopted processes identified by boot-relative clock ticks, so a guest
+    clock step can't crash-loop a node, and stale runc records retired instead
+    of refused ([#607](https://github.com/reliaburger/reliaburger/issues/607), [#609](https://github.com/reliaburger/reliaburger/pull/609));
+  - [x] backported from 0.1.6: a node's first consumer sync after a restart
+    takes one slow wait a turn, and every file lock unlocks on drop
+    ([#603](https://github.com/reliaburger/reliaburger/issues/603), [#606](https://github.com/reliaburger/reliaburger/issues/606), [#613](https://github.com/reliaburger/reliaburger/issues/613), [#615](https://github.com/reliaburger/reliaburger/pull/615)).
+
+  The self-upgrade fixes for the privileged Linux `oci_crash` flake are in
+  too, but that flake isn't proven gone yet, so
+  [#526](https://github.com/reliaburger/reliaburger/issues/526) stays open. 0.1.5
+  changes the protocol and state formats (34 and 49 in 0.1.4; 40 and 58 now,
+  for the token sweep, the audit fixes and boot IDs on instance records), so a
+  0.1.4 cluster can't roll to it: recreate the cluster
+  ([upgrading from 0.1.4](releasing.md#upgrading-from-014)).
+  The first candidate's 8-hour final tier found a crash loop after a guest
+  clock step ([#607](https://github.com/reliaburger/reliaburger/issues/607)); [#609](https://github.com/reliaburger/reliaburger/pull/609) fixed it and the
+  release was re-cut. The re-cut passed the
+  [staged install](qualification/2026-10-05-v0.1.5-staged-install-apple-silicon.md),
+  the [compressed](qualification/2026-10-05-v0.1.5-soak-compressed.md) and
+  [full](qualification/2026-10-05-v0.1.5-soak-full.md) soaks and the
+  [8-hour final tier](qualification/2026-10-05-v0.1.5-sustained-v02-final.md),
+  where the V02 gate passed.
+- [x] **0.1.6: operations security.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6)
+  on 7 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/12), merge
+  train [#616](https://github.com/reliaburger/reliaburger/pull/616)). The rest of the 0.1.4 security
+  scope:
+  - [x] images bound to a digest at apply, upstream trust rules, and cosign
+    signatures checked on upstream images before deploy (F03a,
+    [#361](https://github.com/reliaburger/reliaburger/issues/361), [#600](https://github.com/reliaburger/reliaburger/pull/600), [#597](https://github.com/reliaburger/reliaburger/pull/597),
+    [#611](https://github.com/reliaburger/reliaburger/pull/611));
+  - [x] several CAs per role rotated through Raft, every CA in the set
+    trusted by every verifier, `relish ca backup` and `ca verify` for a root
+    backup the operator holds, and intermediate rotation signed with that
+    backup (F04 R1–R4, [#362](https://github.com/reliaburger/reliaburger/issues/362),
+    [#596](https://github.com/reliaburger/reliaburger/pull/596), [#602](https://github.com/reliaburger/reliaburger/pull/602),
+    [#598](https://github.com/reliaburger/reliaburger/pull/598), [#610](https://github.com/reliaburger/reliaburger/pull/610));
+  - [x] token rotation with a grace period and a 90-day default lifetime, and
+    a secret key per namespace (F05 I3–I4,
+    [#363](https://github.com/reliaburger/reliaburger/issues/363), [#601](https://github.com/reliaburger/reliaburger/pull/601),
+    [#599](https://github.com/reliaburger/reliaburger/pull/599));
+  - [x] fixes: a consumer sync's inventory read gets a turn of its own
+    ([#603](https://github.com/reliaburger/reliaburger/issues/603), [#605](https://github.com/reliaburger/reliaburger/pull/605)), the Raft
+    recovery lock and every other file lock unlock before they close
+    ([#606](https://github.com/reliaburger/reliaburger/issues/606), [#613](https://github.com/reliaburger/reliaburger/issues/613),
+    [#612](https://github.com/reliaburger/reliaburger/pull/612), [#614](https://github.com/reliaburger/reliaburger/pull/614)), and the quickstart
+    guest leaves its clock to Lima's guest agent
+    ([#608](https://github.com/reliaburger/reliaburger/issues/608), [#617](https://github.com/reliaburger/reliaburger/pull/617)), and a network
+    partition fault waits until every caller is cut instead of skipping the
+    ones whose cgroup read ran out of time
+    ([#625](https://github.com/reliaburger/reliaburger/issues/625), [#627](https://github.com/reliaburger/reliaburger/pull/627));
+  - [x] CI lints macOS with one Clippy pass ([#595](https://github.com/reliaburger/reliaburger/pull/595)), and
+    the plan for keyless cosign and Sigstore bundles (F03c,
+    [#620](https://github.com/reliaburger/reliaburger/pull/620)).
+
+  Worker key separation (F03b), root rotation and restore (F04 R5–R7),
+  per-app audiences (F05 I5–I6) and keyless cosign (F03c,
+  [#619](https://github.com/reliaburger/reliaburger/issues/619)) follow later. 0.1.6
+  changes the protocol and state formats (40 and 58 in 0.1.5; 46 and 63 now,
+  for digest-bound images, the CA set and its rotation, token rotation and
+  namespace keys), so a 0.1.5 cluster can't roll to it:
+  recreate the cluster ([upgrading from 0.1.5](releasing.md#upgrading-from-015)).
+  The security work comes before real fleets in 0.3.0. The candidate passed the
+  [staged install](qualification/2026-10-06-v0.1.6-staged-install-apple-silicon.md),
+  the [compressed](qualification/2026-10-06-v0.1.6-soak-compressed.md) and
+  [full](qualification/2026-10-06-v0.1.6-soak-full.md) soaks and the
+  [8-hour final tier](qualification/2026-10-06-v0.1.6-sustained-v02-final.md),
+  where the V02 gate passed.
+- [x] **0.2.0: "A million jobs", foundation and common lifecycle implemented**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/3)). The
+  compact task-array foundation landed in [#266](https://github.com/reliaburger/reliaburger/pull/266)
+  and resolved #588. [#642](https://github.com/reliaburger/reliaburger/pull/642)
+  implements [#638](https://github.com/reliaburger/reliaburger/issues/638):
+  singleton jobs, arrays, cron and deployment hooks share durable runs, resource
+  admission and accepted outcomes ([plan](plans/2026-10-07-plan-common-job-lifecycle.md),
+  [qualification](qualification/2026-10-07-common-jobs/README.md)). This tick
+  records implementation; 0.2.0 isn't released. Reusable executors
+  [#639](https://github.com/reliaburger/reliaburger/issues/639), throughput
+  qualification and the high-volume demo
+  [#640](https://github.com/reliaburger/reliaburger/issues/640), and resident model
+  workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
+  The million-task release gate and sustained 100m/day claim still require
+  real-runtime qualification ([foundation evidence](qualification/2026-10-04-delegated-jobs/README.md)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
@@ -204,12 +307,12 @@ migration and no feature gate
   appliance OS (our own mkosi image on Ubuntu 26.04), `relish netboot` and
   claiming machines over the LAN, weekly signed OS builds with A/B updates,
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
-  fleet control plane can extend it later. Alongside it: the acceptance gates
-  0.1.0 didn't close (V01–V04, below), WebSocket drain parity and ACME (F08,
-  [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
-  pre-checks that read the leader's gossip view
-  ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
-  ten Dell Wyse 3040s from power-on to a cluster.
+  fleet control plane can extend it later. On 7 October 2026 the maintainer
+  scoped the milestone to the OS, netboot and appliance work alone; the other
+  items it held moved to Later. Exit test: three Dell Wyse 3040s from power-on
+  to a cluster ([decisions](plans/2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026)).
+  Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490);
+  the v0.3.0 tag follows the 0.2.0 release.
 - [ ] **0.4.0: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [#268](https://github.com/reliaburger/reliaburger/pull/268)). Drain and
@@ -234,10 +337,15 @@ migration and no feature gate
   [#359](https://github.com/reliaburger/reliaburger/issues/359)); rootless
   clusters (F02, [#360](https://github.com/reliaburger/reliaburger/issues/360));
   PromQL and the full metrics architecture (F06,
-  [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
+  [#364](https://github.com/reliaburger/reliaburger/issues/364)); WebSocket
+  drain parity and ACME (F08,
+  [#369](https://github.com/reliaburger/reliaburger/issues/369)); bandwidth
   faults (F09, [#366](https://github.com/reliaburger/reliaburger/issues/366));
-  and the remaining Kubernetes translations (F11,
-  [#368](https://github.com/reliaburger/reliaburger/issues/368)).
+  the remaining Kubernetes translations (F11,
+  [#368](https://github.com/reliaburger/reliaburger/issues/368)); fault
+  pre-checks that read the leader's gossip view
+  ([#334](https://github.com/reliaburger/reliaburger/issues/334)); and the
+  acceptance gates 0.1.0 didn't close (V01–V04, below).
 
 ## Known gaps
 
@@ -250,16 +358,22 @@ what's shipped and what's scheduled.
   the V02 leftovers, the snapshot uploader under power cuts and the
   `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
   V04, cold installs on Intel macOS, Linux x86_64 and Linux arm64
-  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
+  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in
+  [Later](https://github.com/reliaburger/reliaburger/milestone/9).
 - **Missing capabilities F01–F11**, one issue each, placed in
   [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
-  [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F03–F05,
-  F07 part 2),
-  [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
+  [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F07 part 2
+  and the first steps of F03–F05, landed),
+  [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11) (F05 I2, landed),
+  [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
+  F04 R1–R4, F05 I3–I4, landed),
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
-  F06, F09, F11).
-- **Flakes.** The open ones are in the [known flakes register](flakes.md)
+  F06, F08, F09, F11, and the rest of F03–F05).
+- **Known bugs and flakes.** The open one, the `oci_crash` flake
+  ([#526](https://github.com/reliaburger/reliaburger/issues/526)), is in
+  [0.2.0](https://github.com/reliaburger/reliaburger/milestone/3); the open
+  flakes are also in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
 
 ## How we got to 0.1.0

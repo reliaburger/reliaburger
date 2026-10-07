@@ -2985,7 +2985,20 @@ else {
 };
 ```
 
-`matches!` is a macro that returns `true` if a value fits a pattern; `{ .. }` means "ignore the fields". `let Some(...) = ... else { ... }` is *let-else*: if the pattern matches, its bindings (`launcher_pid` here) stay available for the rest of the function; if not, the `else` block runs and must leave the function. A launcher that isn't running gets cleaned up rather than adopted. After this excerpt, the launcher's PID and start time must agree with the adoption record to within two seconds. Linux reports process start times relative to boot and converts them using the boot time, which moves when NTP steps the clock. An exact comparison refused a healthy container after a one-second correction.
+`matches!` is a macro that returns `true` if a value fits a pattern; `{ .. }` means "ignore the fields". `let Some(...) = ... else { ... }` is *let-else*: if the pattern matches, its bindings (`launcher_pid` here) stay available for the rest of the function; if not, the `else` block runs and must leave the function. A launcher that isn't running gets cleaned up rather than adopted. After this excerpt, the launcher's PID and start time must agree with the adoption record.
+
+What "start time" means took us three tries. The kernel stores a process's start as clock ticks since boot (field 22 of `/proc/<pid>/stat`), and that number never changes. Our first version asked the `sysinfo` crate, which adds the boot time to get seconds since 1970. The kernel doesn't store the boot time, though. It works it out as "now minus uptime", so every time NTP steps the wall clock, the boot time moves with it. The first symptom was an exact comparison refusing a healthy container after a one-second correction, so we allowed two seconds either way. Then the 0.1.5 release soak ran three Lima VMs whose guest agent stepped the clock back about 120 ms every ten seconds. Twenty minutes of that moved the boot time back 17 seconds. Every adoption record on the node then looked 17 seconds too late, and Bun refused to start. A tolerance can't fix a drift that keeps growing. So on Linux we now read the tick count ourselves and compare it exactly:
+
+```rust
+fn stat_start_ticks(stat: &str) -> Option<u64> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(22 - 3)?.parse().ok()
+}
+```
+
+The command name in field 2 sits in parentheses and can contain spaces and `)` itself, which is why we split at the *last* parenthesis (`rsplit_once`). The state is then the first field (field 3), so the start is `nth(19)`. A tick count resets when the machine boots, so every adoption record now also stores the boot ID (described below), and a record from another boot never matches.
+
+The same incident fixed what happens on a mismatch. The check used to return an error, and Bun refuses to start on any adoption error, so one stale record took every workload on the node down. The process owner is the authority on which launcher runs this generation. A record that names a different process is therefore just out of date, so adoption now cleans the generation up and returns `Ok(false)`, and the instance starts again like any other that wasn't adopted.
 
 One question remains: did the *machine* restart? Kill Bun and the container can keep running. Reboot Linux and it can't. Every intent and owner record stores the kernel's boot ID from `/proc/sys/kernel/random/boot_id`, a random UUID that changes on every boot. A different boot ID proves that every process from the old record is dead, so recovery records the execution as interrupted with no exit code and removes the stale runc state directly. It never passes the old PID to `runc delete --force`; that number might belong to something else by now.
 

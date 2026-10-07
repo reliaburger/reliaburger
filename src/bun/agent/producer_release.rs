@@ -114,7 +114,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     || instance
                         .oci_spec
                         .as_ref()
-                        .is_some_and(|spec| spec != &original.spec)
+                        .is_some_and(|spec| !original.launched(spec))
             })
         {
             return Err(refuse(

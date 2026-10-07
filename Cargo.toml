@@ -1,6 +1,6 @@
 [package]
 name = "reliaburger"
-version = "0.1.4"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -26,7 +26,7 @@ path = "src/bin/testapp.rs"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
-nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "dir", "mount"] }
+nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "dir", "mount", "term"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -40,6 +40,7 @@ tokio-util = { version = "0.7", features = ["rt", "io"] }
 toml = "0.8"
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 flate2 = "1"
+crc32fast = "1"
 tar = "0.4"
 sha2 = "0.10"
 siphasher = "1"
@@ -177,6 +178,10 @@ harness = false
 
 [[bench]]
 name = "gossip_large"
+harness = false
+
+[[bench]]
+name = "task_arrays"
 harness = false
 
 # Parquet 59.3 can reserve memory for a Thrift list count far larger than

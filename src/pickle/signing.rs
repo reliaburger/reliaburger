@@ -241,21 +241,27 @@ pub fn key_fingerprint(public_key: &[u8]) -> String {
 /// Verify an image signature against the trust policy.
 ///
 /// Dispatches to keyless or external key verification based on the
-/// signing method. `crl` is the cluster revocation list: a keyless
-/// signature whose chain contains a revoked certificate fails closed.
+/// signing method. A keyless signature must chain to one of
+/// `trusted_roots` (every root the council trusts, F04 R2). `crl` is the
+/// cluster revocation list: a keyless signature whose chain contains a
+/// revoked certificate fails closed.
 pub fn verify_signature(
     sig: &ImageSignature,
     digest: &Digest,
     trust_policy: &TrustPolicySection,
-    root_ca_cert_der: Option<&[u8]>,
+    trusted_roots: &[Vec<u8>],
     crl: Option<&crate::sesame::types::Crl>,
 ) -> Result<(), SigningError> {
     match &sig.method {
         SigningMethod::Keyless { .. } => {
-            let root = root_ca_cert_der.ok_or_else(|| {
-                SigningError::ChainVerifyFailed("no root CA provided".to_string())
-            })?;
-            verify_keyless(sig, digest, root, crl)
+            let mut last_error = SigningError::ChainVerifyFailed("no root CA provided".to_string());
+            for root in trusted_roots {
+                match verify_keyless(sig, digest, root, crl) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(last_error)
         }
         SigningMethod::ExternalKey { .. } => verify_external_key(sig, digest, &trust_policy.keys),
     }
@@ -686,9 +692,17 @@ gW44LD4On4yfIPRJkluhNQ5G35R5vZyQY5DspOlhl16ImqPQIVADgGQv
     }
 
     #[test]
+    fn cluster_artifact_signature_remains_valid_after_two_hours() {
+        let (sig, root) = codesigning_keyless_sig();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600);
+        verify_keyless_at(&sig, &test_digest(), &root, None, later)
+            .expect("artifact authority must outlive the runtime workload's one-hour identity");
+    }
+
+    #[test]
     fn verify_keyless_rejects_an_expired_chain() {
         let (sig, root) = codesigning_keyless_sig();
-        // Ten years hence, the (one-hour) leaf has long expired.
+        // Ten years hence, the signing leaf and its authority have expired.
         let future =
             std::time::SystemTime::now() + std::time::Duration::from_secs(10 * 365 * 24 * 3600);
         assert!(verify_keyless_at(&sig, &test_digest(), &root, None, future).is_err());
@@ -788,7 +802,14 @@ gW44LD4On4yfIPRJkluhNQ5G35R5vZyQY5DspOlhl16ImqPQIVADgGQv
     fn verify_dispatches_to_keyless() {
         let (sig, root) = codesigning_keyless_sig();
         let policy = TrustPolicySection::default();
-        verify_signature(&sig, &test_digest(), &policy, Some(&root), None).unwrap();
+        verify_signature(
+            &sig,
+            &test_digest(),
+            &policy,
+            std::slice::from_ref(&root),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -797,8 +818,9 @@ gW44LD4On4yfIPRJkluhNQ5G35R5vZyQY5DspOlhl16ImqPQIVADgGQv
         let policy = TrustPolicySection {
             require_signatures: true,
             keys: vec![key.public_key_base64()],
+            ..Default::default()
         };
-        verify_signature(&sig, &test_digest(), &policy, None, None).unwrap();
+        verify_signature(&sig, &test_digest(), &policy, &[], None).unwrap();
     }
 
     #[test]

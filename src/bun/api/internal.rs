@@ -274,6 +274,7 @@ pub(super) async fn workload_csr_handler(
             cert_der: signed.cert_der,
             workload_ca_cert_der: signed.workload_ca_cert_der,
             root_ca_cert_der: signed.root_ca_cert_der,
+            ca_bundle_der: signed.ca_bundle_der,
             jwt_token: signed.jwt_token,
         }))
         .into_response(),

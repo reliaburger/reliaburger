@@ -28,7 +28,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 
 ### W1. OS builds, signing and the channel (~1.5 weeks), [#401](https://github.com/reliaburger/reliaburger/issues/401)
 
-- **Triggers:** a weekly `appliance.yml` run on main (Monday 04:00 UTC), or a dispatch with `publish`. Version `YYYY.WW.N` (ISO week; N counts that week's releases). Pull requests still build the `lab` profile with a throwaway key, for the QEMU lab.
+- **Triggers:** a weekly `appliance.yml` run on main (Monday 04:00 UTC), or a dispatch with `publish`. The weekly run stays off until v0.3.0 is promoted (7 October 2026). Version `YYYY.WW.N` (ISO week; N counts that week's releases). Pull requests still build the `lab` profile with a throwaway key, for the QEMU lab.
 - **What a release is:** the latest released bun and relish. A week whose package list and build record (bun release, `image/` git tree) match the last release publishes nothing.
 - **Signing:** the `sign` job runs only first-party actions (checkout, download and upload artefact) and `scripts/release/os_release.py`. It signs every `SHA256SUMS` with the release key, in the raw Ed25519 form the installer and `os-stage` already check with `openssl`. `SHA256SUMS` lists every artefact, so one signature covers the build. The image and installer ship the release public key (`os-signing-key.pub.pem`, tested against `src/upgrade/keys.rs`).
 - **Checking it:** the netboot install test re-runs on the signed artefacts before anything is published.
@@ -63,7 +63,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 
 ### W3. relish for bare metal (~1.5 weeks), [#403](https://github.com/reliaburger/reliaburger/issues/403)
 
-- `relish cluster create --bare-metal`: the cluster's PKI on the laptop, in a bare-metal context (generalising `LocalContext`), with the master-key backup prompt.
+- `relish cluster create --bare-metal`: the cluster's PKI on the laptop, in a bare-metal context (generalising `LocalContext`), with the master-key backup prompt. (7 October 2026: it becomes a real prompt, with `--yes` to skip it.)
 - `relish image download | write | seed`: fetch and verify a channel release, write a disk or stick, write seeds. These replace `seed-fleet.sh`, `node-toml.py` and `make-seed-stick.sh`.
 - **Tests:** snapshot tests of the generated seeds and `node.toml`, and verification failures.
 
@@ -85,7 +85,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
   - a clear error without root;
   - (added 3 October 2026, Wyse lab plan PR 1) a used disk is wiped only after the operator's yes at the `relish netboot` terminal, or when `--wipe <mac>` lists the machine. The installer reports the disk with `POST /disk` and polls a read-only `GET /disk/<ticket>`, so no machine can answer its own question (`src/relish/netboot/wipe.rs`).
 - **Installed machines get `exit`:** remember them by MAC and SMBIOS UUID, and serve `boot.ipxe` with those as query parameters.
-- `relish netboot --node <name>`: the same server run by a bun node.
+- ~~`relish netboot --node <name>`: the same server run by a bun node.~~ Dropped on 7 October 2026.
 - **Tests:**
   - unit and property tests for the offer builder and TFTP;
   - the x86_64 CI netboot test switched from dnsmasq to `relish netboot`;
@@ -105,14 +105,14 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
   - the claim API (one valid seed, then 409), the pinned verifier over real TLS on loopback (a wrong pin never delivers the seed), target resolution, join windows and the admit handler's bounds;
   - `image/tests/claimed-pair.sh` in the appliance workflow: two unseeded VMs found over mDNS, node 1 claimed by address with `--create` and no `--network`, node 2 claimed afterwards through the join window;
   - a scripted Mac-lab qualification: netboot five VMs, claim them, run the tour, kill one, and write a record in `docs/qualification/`.
-- **Deferred:** a QR code on tty1 (the short fingerprint is what people compare); claiming with `--all`, which would trust whatever answers mDNS.
+- **Out of scope** (7 October 2026): a QR code on tty1 (the short fingerprint is what people compare); claiming with `--all`, which would trust whatever answers mDNS.
 
 ### W6. OS updates run by bun (~2.5 weeks), [#406](https://github.com/reliaburger/reliaburger/issues/406)
 
 What was built, and (in italics) what the original plan had that wasn't:
 
-- **Discovery:** `relish os list` reads and verifies `os-channel.json` and shows each node's OS version beside the newest release. `relish wtf` warns about a node whose OS update failed and about nodes on different versions. It doesn't fetch the channel, since `wtf --watch` polls and clusters may be offline, so "update available" is `relish os list`'s. *Not built:* a daily leader-side check and a Brioche notice; `relish nodes` has no OS column (`relish os list` is the per-node view).
-- **The rollout, not a pin:** `relish os upgrade [version]` writes an `OsRollout` to Raft (`DesiredState::os_rollout`, with history). Raft's apply refuses one while a bun upgrade is active, and the other way round. A later `relish os upgrade` of the same version brings new machines from older images in line, skipping nodes already there. *Not built:* a standing `os.target_version` pin that nodes move to before taking workloads; the rollout covers it without a second mechanism.
+- **Discovery:** `relish os list` reads and verifies `os-channel.json` and shows each node's OS version beside the newest release. `relish wtf` warns about a node whose OS update failed and about nodes on different versions. It doesn't fetch the channel, since `wtf --watch` polls and clusters may be offline, so "update available" is `relish os list`'s. *Not built, and dropped on 7 October 2026:* a daily leader-side check and a Brioche notice; `relish nodes` has no OS column (`relish os list` is the per-node view).
+- **The rollout, not a pin:** `relish os upgrade [version]` writes an `OsRollout` to Raft (`DesiredState::os_rollout`, with history). Raft's apply refuses one while a bun upgrade is active, and the other way round. A later `relish os upgrade` of the same version brings new machines from older images in line, skipping nodes already there. *Not built, and dropped on 7 October 2026:* a standing `os.target_version` pin that nodes move to before taking workloads; the rollout covers it without a second mechanism.
 - **Rolling it out:** `os::rollout::step` is pure apart from an `OsControl` trait, and the leader runs it every 5 s, one node at a time: workers, council members while quorum can spare one, the leader last.
   - Each node is cordoned through the scheduler cache, as bun upgrades are, and drained until no movable replica is placed on it, or 5 minutes.
   - Then `POST /v1/os/stage`. The node's `os::slot::OsSlot` (not an `UpgradeManager` backend: the two share nothing but the word "upgrade") fetches the release's signed `SHA256SUMS` from `os-<version>-<arch>`, checks it against the release keys and its own image's `os-signing-key.pub.pem`, streams and hashes the three files, runs systemd-sysupdate and reboots.
@@ -122,14 +122,14 @@ What was built, and (in italics) what the original plan had that wasn't:
 - **Tests:**
   - unit tests for every rollout transition, the slot (a signed release staged end to end from a local server, a wrongly signed one refused, fallback detection), the Raft guards, the scheduler cordon, the routes' authz and the renderers;
   - `image/tests/os-update.sh` in the appliance workflow: lab builds build a second image one version on, and a seeded node updates to it through `relish os upgrade`.
-  - *Not built:* a CI fallback test with a broken image. The lab did it by hand (book, "Three tries, then fall back"), and `after_boot` is unit-tested.
+  - *Not built yet, and in scope since 7 October 2026:* a CI fallback test with a broken image. The lab did it by hand (book, "Three tries, then fall back"), and `after_boot` is unit-tested. `os-stage` stays for the runbook's hand-staged test.
 
 ### W7. Docs, lab and the exit test (~1.5 weeks, then the hardware), [#407](https://github.com/reliaburger/reliaburger/issues/407)
 
-- **Docs:** rewrite `docs/manual/14_appliance.md` around the real commands (no "preview" scripts). Update `docs/book/15a-becoming-the-os.md` with the Rust parts and the lessons. Update README, `docs/README.md` and the roadmap.
+- **Docs:** rewrite `docs/manual/15_appliance.md` around the real commands (no "preview" scripts). Update `docs/book/15a-becoming-the-os.md` with the Rust parts and the lessons. Update README, `docs/README.md` and the roadmap.
 - **Retire the preview tools:** `image/tools/` and the lab's hand staging go once their replacements are tested. The lab keeps only what QEMU needs.
 - **The quickstart guest moves to Ubuntu 26.04**, sharing the appliance's package list (approved 27 Sep).
-- **S5 and S6 last:** ten Wyse 3040s from power-on to a cluster with the real commands, measured as in the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md); then the go/no-go record.
+- **S5 and S6 last:** three Wyse 3040s from power-on to a cluster with the real commands, on a lab build of the train, measured as in the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md); then the go/no-go record against the [7 October thresholds](2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026). It gates the v0.3.0 tag, which follows the 0.2.0 release.
 
 ## Order
 

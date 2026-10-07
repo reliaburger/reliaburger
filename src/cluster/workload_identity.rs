@@ -36,6 +36,9 @@ pub struct WorkloadCsrResponse {
     pub workload_ca_cert_der: String,
     /// Base64 DER-encoded Root CA certificate.
     pub root_ca_cert_der: String,
+    /// Base64 DER of every trusted Workload CA and root, the workload's
+    /// `ca.pem` (F04 R2).
+    pub ca_bundle_der: Vec<String>,
     /// OIDC JWT, when the cluster issues them.
     pub jwt_token: Option<String>,
 }
@@ -49,6 +52,8 @@ pub struct SignedWorkload {
     pub workload_ca_cert_der: Vec<u8>,
     /// DER-encoded Root CA certificate.
     pub root_ca_cert_der: Vec<u8>,
+    /// Every trusted Workload CA and root, active first.
+    pub ca_bundle_der: Vec<Vec<u8>>,
     /// OIDC JWT, when the cluster issues them.
     pub jwt_token: Option<String>,
 }
@@ -60,6 +65,11 @@ impl WorkloadCsrResponse {
             cert_der: BASE64.encode(&signed.cert_der),
             workload_ca_cert_der: BASE64.encode(&signed.workload_ca_cert_der),
             root_ca_cert_der: BASE64.encode(&signed.root_ca_cert_der),
+            ca_bundle_der: signed
+                .ca_bundle_der
+                .iter()
+                .map(|der| BASE64.encode(der))
+                .collect(),
             jwt_token: signed.jwt_token.clone(),
         }
     }
@@ -75,6 +85,11 @@ impl WorkloadCsrResponse {
             cert_der: decode("certificate", &self.cert_der)?,
             workload_ca_cert_der: decode("Workload CA", &self.workload_ca_cert_der)?,
             root_ca_cert_der: decode("Root CA", &self.root_ca_cert_der)?,
+            ca_bundle_der: self
+                .ca_bundle_der
+                .iter()
+                .map(|value| decode("CA bundle", value))
+                .collect::<io::Result<_>>()?,
             jwt_token: self.jwt_token,
         })
     }
@@ -248,6 +263,7 @@ mod tests {
             cert_der: vec![1, 2, 3],
             workload_ca_cert_der: vec![4],
             root_ca_cert_der: vec![5, 6],
+            ca_bundle_der: vec![vec![4], vec![5, 6]],
             jwt_token: Some("jwt".into()),
         };
         assert_eq!(

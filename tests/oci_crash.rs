@@ -1441,6 +1441,21 @@ async fn enrolled_upgrade_fixture(
     (Node::start(root).await, key)
 }
 
+/// The last lines of each node's `bun.log`, for a failure message.
+#[cfg(feature = "ebpf")]
+fn node_log_tails(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|root| {
+            let log = std::fs::read_to_string(root.join("bun.log")).unwrap_or_default();
+            let lines: Vec<_> = log.lines().collect();
+            let tail = lines[lines.len().saturating_sub(40)..].join("\n");
+            format!("--- {}/bun.log ---\n{tail}", root.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(feature = "ebpf")]
 #[tokio::test]
 #[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
@@ -1514,15 +1529,22 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
         let mut order: Vec<_> = (0..3).collect();
         order.sort_by_key(|i| format!("rolling-{i}") == leader);
         for i in order {
-            if version == "v0.2.0" {
+            // The node answers before it execs, so a lost answer is a bug (#526).
+            let answer = if version == "v0.2.0" {
                 nodes[i]
                     .client
                     .upgrade_apply(&owned_upgrade_directive(&roots[i], &keys[i]))
                     .await
-                    .unwrap();
+                    .map(drop)
             } else {
-                nodes[i].client.upgrade_node_rollback(None).await.unwrap();
-            }
+                nodes[i].client.upgrade_node_rollback(None).await
+            };
+            answer.unwrap_or_else(|error| {
+                panic!(
+                    "rolling-{i} did not answer its move to {version}: {error:?}\n{}",
+                    node_log_tails(&roots)
+                )
+            });
             tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
                     if let Ok(status) = nodes[i].client.upgrade_status().await
@@ -1535,7 +1557,12 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
                 }
             })
             .await
-            .expect("clustered owned upgrade did not settle");
+            .unwrap_or_else(|_| {
+                panic!(
+                    "rolling-{i}'s move to {version} did not settle\n{}",
+                    node_log_tails(&roots)
+                )
+            });
             for node in &nodes {
                 wait_cluster_publication(&node.client, &name).await;
             }

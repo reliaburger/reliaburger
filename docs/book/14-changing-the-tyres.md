@@ -386,14 +386,11 @@ The sharp edge: **pids get reused**. A record saying "web-0 is pid 4242" proves 
 
 ```rust
 pub fn is_live(record: &InstanceRecord) -> bool {
-    match process_start_time(record.pid) {
-        Some(started_at) => started_at.abs_diff(record.pid_started_at) <= 2,
-        None => false,
-    }
+    from_this_boot(record) && process_matches(record.pid, record.pid_started_at)
 }
 ```
 
-A pid plus its start time is, for practical purposes, a unique process identity. (The `±2s` slack exists because platforms round start times differently depending on when you ask. `abs_diff`, note, is the panic-free way to ask "how far apart" for unsigned integers — `a - b` on `u64` aborts in debug if `b > a`.)
+A pid plus its start time is, for practical purposes, a unique process identity, as long as you stay within one boot. The start time has to be one the clock can't move. On Linux it's the kernel's tick count since boot, from `/proc/<pid>/stat`, and it must match exactly. A wall-clock start time computed from the boot time drifts whenever NTP steps the clock, and in the 0.1.5 release soak that drift stopped a node from starting (Chapter 1 has the story). Ticks restart from zero on every boot, so the record also stores the kernel's boot ID, and `from_this_boot` rejects a record written in any other boot. On macOS the kernel stores an absolute start time at fork, which is safe from later clock steps too. There we keep a two-second slack, because it's reported in whole seconds that platforms round differently depending on when you ask. The comparison uses `abs_diff`, the panic-free way to ask how far apart two unsigned integers are: `a - b` on `u64` panics in a debug build if `b > a`.
 
 ### Problem 2: the pipe trap — logs must be files
 
@@ -426,7 +423,7 @@ match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
 
 It works, and it has two holes. A job that finished while Bun was down has no exit code, so "did my job succeed?" becomes "unknown". And there's a gap between spawning a process and writing its record: crash there and nobody knows the process exists. So in production, neither Bun nor its successor is the parent any more. Every workload, in process mode and under runc alike, runs beneath a small *process owner*: a helper that outlives Bun, records its child before letting it run, reaps it, and writes the real exit code to disk. Chapter 1 walks through how it works for runc and Chapter 8 for process workloads. For this chapter, the point is that Bun's exec can't lose a reaper it never was. After an exec or a restart, Bun reconnects to each owner over its private socket and asks. The poller above survives only in the owner-less, file-backed mode the unit tests use.
 
-Adoption still cross-checks the adoption record against the owner. For runc, the owner must report the `runc run` launcher as running, and its PID and start time must match the record. A rootless container's network helper is an owned process too, so the same machinery covers it.
+Adoption still cross-checks the adoption record against the owner. For runc, the owner must report the `runc run` launcher as running, and its PID and start time must match the record. If they don't, the record is the stale side: the owner decides which launcher runs the generation, so adoption cleans that generation up and the instance starts again, rather than refusing to start Bun at all. A rootless container's network helper is an owned process too, so the same machinery covers it.
 
 Apple Container adoption drops the pid check entirely. An Apple workload runs *inside a VM* managed by the `container` daemon; it was never a child of bun, so there's no pid to fingerprint. The recoverable handle is the container itself: `container inspect <id>` reporting `running` means the VM sailed through our exec, so we re-track the entry and re-discover its IP. A vanished container declines adoption; an inspection that *fails* is an error, not absence, and stops startup rather than deleting a record we might still need. (The Apple adapter isn't part of the 0.1.0 release, for reasons Chapter 1 explains, but its adoption tests still run behind `make test-apple`.)
 
@@ -466,7 +463,13 @@ Three Rust-meets-Unix notes. `CString` is the NUL-terminated string C expects �
 
 What about all the open sockets, the redb database, the log files? This is where a decision Rust's std made years ago quietly pays off: every file descriptor Rust opens is `O_CLOEXEC` — closed atomically by the kernel *during* exec. No shutdown code runs (there's no code left to run), yet the listener port is free for the new process to bind, and redb's file locks (which live on the fds) evaporate with them. The new binary just... boots, like any boot. There's a sub-second blip where the API answers nothing; gossip shrugs it off (the incarnation number bumps on restart, existing behaviour).
 
-One genuinely awkward wrinkle: the upgrade arrives over HTTP, and the response must escape the process before exec destroys the socket. The agent replies `202 Accepted` after `prepare` succeeds, then sleeps 200ms before `execute`. Yes, a sleep. The alternatives (hooking response-flush completion through axum's internals) buy precision nobody needs — the caller polls `/v1/version` to observe the outcome anyway, so a lost response is survivable; the sleep just makes it rare.
+One genuinely awkward wrinkle: the upgrade arrives over HTTP, and the response must escape the process before exec destroys the socket. The agent replies `202 Accepted` after `prepare` succeeds, then waits for that reply to leave before `execute`.
+
+The first version slept 200 ms instead. Yes, a sleep. We argued that hooking response-flush completion through axum's internals bought precision nobody needed, since the caller polls `/v1/version` anyway. Then a three-node test on a busy CI runner got `AgentUnreachable` from a node that upgraded perfectly well (#526). The handler hadn't been scheduled to write its answer within 200 ms, so exec closed the socket first. The orchestrator shrugs that off and re-sends, but `relish upgrade apply` told the operator the agent was unreachable while the node swapped itself out underneath them.
+
+The fix turned out to need no axum internals at all. Our own connection loop (`serve_http_connection`, in `src/sesame/connection.rs`) already owns the Hyper connection future, and that future only finishes once every answer on the connection is written and the socket is closed. So it hands each request a `ConnectionClosed` extension, a `CancellationToken` cancelled by a drop guard (a local whose `Drop` cancels the token, so it fires however the function returns, early exits included). The upgrade handlers answer with `Connection: close`, which makes Hyper close the connection straight after the 202, and pass the extension to the agent inside the `UpgradeApply` command. The agent waits on it, bounded at two seconds so a client that stops reading can't keep the node on the old version, and only then execs. `an_upgrade_execs_only_after_its_answer_is_delivered` holds the "delivered" signal back and checks that the marker is still `Staged` well past the old 200 ms.
+
+The sleep turned out to have been hiding a second bug. A leader rolling the cluster back directs itself last, and it records "directive sent" only after the send returns (§14.9 explains why it sends first). With the 200 ms pause, that Raft write usually beat the exec. Without it, the leader exec'd straight after its answer left, its successor process found the node still `Pending` and sent the rollback again, and the node refused: a rollback marker was already verifying. Upgrades never hit this, because a re-delivered upgrade with the same `upgrade_id` was already a polite no-op. Rollbacks now get the same treatment: a rollback to the version the in-flight marker is rolling back to answers `Ok(None)`, and a re-delivery that starts nothing clears the drain flag rather than leaving the node refusing work.
 
 ### Draining, verifying, committing
 
@@ -585,7 +588,7 @@ A refusal is only as good as its first line. The 0.1.0 version said `invalid or 
 So every refusal now leads with the pair, then the remedy, then a link to the policy:
 
 ```text
-incompatible state format: found 47; this binary (reliaburger v0.1.4 (465fdeb)) needs 49. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
+incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
 ```
 
 A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
@@ -605,7 +608,7 @@ Two bits of `thiserror` syntax are new here. `{found}` names a field of the vari
 
 `this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.3 (465fdeb)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
 
-The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 33, state 49; this binary (...) needs protocol 34, state 49`.
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 40, state 58; this binary (...) needs protocol 46, state 63`.
 
 The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
 
@@ -614,6 +617,8 @@ A candidate binary gets checked too, before it's staged. Run `bun --compatibilit
 Tests cover mismatched gossip and Raft messages, refused development state, rejected joins, signed-but-incompatible executables and rollback refusal. Test fixtures that model a *compatible* peer take their pair from `compatibility::CURRENT` rather than hard-coding numbers. We learnt that one when a state bump turned ten unrelated tests red at the compatibility check instead of at the behaviour they were meant to test.
 
 That fresh-cluster promise outlived 0.1.0. We sketched a stricter rule for after the release: bump a generation only for a change old nodes can't read, ship a migration with every bump, and let additive JSON fields through without one. Then we asked who it would serve. Before 1.0.0 every release is a development release, and every migration is code we'd have to test and then carry for a cluster you could simply rebuild. So the rule waits for 1.0.0. Until then, any incompatible change bumps its generation, nodes refuse old peers and old state, and you start a fresh cluster.
+
+Two lines of work bumping the same counters is where this gets fiddly. The 0.3.0 appliance work lives on its own merge train, and it added two things to the council's log and state: the OS rollout (`RaftRequest::OsRolloutUpdate` and `OsRolloutClear`, with `DesiredState::os_rollout` and its history) and the cluster-wide council size (`RaftRequest::CouncilSize`, `DesiredState::council_size`). Meanwhile main moved on to 48/65 for 0.2.0's jobs. The two bumps don't add up by themselves: the train said 36/51, main said 48/65, and a merge that kept either number would let a train binary talk to a main binary that can't read its Raft entries. So the merge takes the larger pair and goes one past it, 49/66, and `peers_and_state_from_before_the_appliance_train_are_refused` pins main's 48/65 as a generation the train must refuse.
 
 ### Cordoning
 
@@ -1407,7 +1412,7 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 34, state 49; this cluster (reliaburger v0.1.3 (…)) needs protocol 33, state 49` (a 0.1.3 cluster offered 0.1.4), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58` (a 0.1.5 cluster offered 0.1.6), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 

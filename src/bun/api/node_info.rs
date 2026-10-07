@@ -90,7 +90,7 @@ pub(super) async fn local_capability_report(
         Some(council) => {
             let security = council.security_state().await;
             security
-                .get_ca(crate::sesame::types::CaRole::Root)
+                .active_ca(crate::sesame::types::CaRole::Root)
                 .map(|root| {
                     let digest = ring::digest::digest(&ring::digest::SHA256, &root.certificate_der);
                     format!("sha256:{}", hex::encode(digest.as_ref()))
@@ -357,6 +357,10 @@ pub(super) fn council_app_evidence(
                     crate::cluster::orchestrate::volume_home_away(desired, app_id, spec, live)
                         .map(|node| node.0)
                 }),
+                volume_homes: crate::cluster::orchestrate::volume_homes(desired, app_id, spec)
+                    .into_iter()
+                    .map(|node| node.0)
+                    .collect(),
             },
         )
         .collect::<Vec<_>>();
