@@ -432,6 +432,12 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
         .unwrap();
     let follower = (leader + 1) % 3;
     let http = reqwest::Client::new();
+    // Registering a schedule marks the minute it lands in as already
+    // observed. A request sent in the last moments of a minute can land in
+    // the target minute and skip it, so start well inside one.
+    while time::OffsetDateTime::now_utc().second() >= 45 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     // One upcoming minute, so a later legitimate occurrence cannot look like a duplicate.
     let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
     let expression = format!(
