@@ -26,14 +26,14 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.1.5 PROTOTYPE</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.1.6 PROTOTYPE</div>
           <h1 id="title">One binary.<br>A complete container platform. Zero assembly required.</h1>
           <p class="lede">Kubernetes gave us container orchestration, but gave every team an accidental 
             platform engineering department. Reliaburger gives you the full production platform — scheduling, 
             mTLS, ingress, registry, metrics, logs, GitOps, and chaos testing — compiled into a single, 
             lightning-fast Rust binary that runs anywhere in under five minutes.</p>
           <div class="intro-links">
-            <a class="primary-link" href="#install">Install 0.1.5 <span aria-hidden="true">↓</span></a>
+            <a class="primary-link" href="#install">Install 0.1.6 <span aria-hidden="true">↓</span></a>
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
             <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
               <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf" aria-label="The whitepaper as a PDF">PDF</a></span>
@@ -71,18 +71,18 @@
               and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
-              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.5">Release notes <span aria-hidden="true">↗</span></a></p>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
         </div>
       </section>
 
       <aside class="status" aria-label="Release status">
-        <strong>0.1.5 (Prototype)</strong>
-        <p>Released on 6 October 2026: every bug we knew about fixed, from council
-          recovery to routing and snapshots, the 28 fixes from a codebase audit, a token
-          list that shows scope and last use, and nodes that survive a clock step. Signed binaries for Linux and macOS, and a
-          one-line installer that builds a laptop cluster from them. Five minutes is the target; the documentation lists what 0.1.5 doesn’t do yet.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.5">Release notes <span aria-hidden="true">↗</span></a>
+        <strong>0.1.6 (Prototype)</strong>
+        <p>Released on 7 October 2026: operations security. Images bound to a digest
+          when you apply them, CA backup and intermediate rotation, tokens that expire
+          and rotate, and per-namespace secret keys. Signed binaries for Linux and macOS, and a
+          one-line installer that builds a laptop cluster from them. Five minutes is the target; the documentation lists what 0.1.6 doesn’t do yet.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status">
@@ -289,7 +289,7 @@
               <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
               an isolated container or a multi-node cluster.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.1.5.</p>
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.1.6.</p>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
           </div>
           <div class="terminal">
@@ -348,7 +348,7 @@ target/debug/relish</code></pre>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.1.5 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <p>What’s implemented, what 0.1.6 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:
