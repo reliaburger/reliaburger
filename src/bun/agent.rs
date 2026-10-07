@@ -102,8 +102,6 @@ mod job_runs;
 mod launch;
 #[cfg(test)]
 pub(crate) use cluster_jobs::ClusterJobExecution;
-#[cfg(test)]
-pub(crate) use launch::PrerequisiteFailure;
 mod launch_evidence;
 mod logs;
 mod networking;
@@ -1277,7 +1275,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         data: &std::path::Path,
     ) -> std::io::Result<super::task_runtime::OwnedRunner<G>> {
-        super::task_runtime::OwnedRunner::for_data_dir(self.supervisor.grill().clone(), data)
+        let mut runner =
+            super::task_runtime::OwnedRunner::for_data_dir(self.supervisor.grill().clone(), data)?
+                .with_log_sink(self.log_tx.clone(), self.capture_offsets.clone());
+        if let Some(cluster) = &self.cluster
+            && let (Some(council), Some(ikm)) = (&cluster.council, cluster.wrapping_ikm)
+        {
+            runner = runner.with_secrets(council.clone(), ikm);
+        }
+        Ok(runner)
     }
     /// The same kernel owner used by apps, for delegated source ancestry.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]

@@ -65,6 +65,8 @@ pub enum AttemptOutcome {
     TimedOut,
     /// The process couldn't be started. Retrying can't fix that.
     SpawnFailed { reason: String },
+    /// Execution may have occurred, but its exit status could not be established.
+    Unknown { reason: String },
     /// The array was cancelled while the attempt ran.
     Cancelled,
 }
@@ -79,7 +81,7 @@ impl AttemptOutcome {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Exited { .. } | Self::Signalled { .. } | Self::TimedOut
+            Self::Exited { .. } | Self::Signalled { .. } | Self::TimedOut | Self::Unknown { .. }
         ) && !self.succeeded()
     }
 }
@@ -125,13 +127,21 @@ pub struct Attempt {
 /// A trait because there are two real implementations: the process
 /// runner the node uses, and the fake the tests and benchmarks use.
 pub trait TaskRunner: Send + Sync + 'static {
-    /// Run `task`, killing it after `timeout` or when `cancel` fires.
+    /// Run `task`, killing it after a nonzero `timeout` or when `cancel` fires.
     fn run(
         &self,
         task: &TaskInvocation,
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> impl Future<Output = Attempt> + Send;
+}
+
+/// A zero duration preserves jobs with no implicit wall-clock deadline.
+pub(crate) async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Spawns each attempt as a host process, directly: no shell, no owner
@@ -190,7 +200,7 @@ impl TaskRunner for ProcessRunner {
                 Ok(status) => outcome_of(status),
                 Err(error) => AttemptOutcome::SpawnFailed { reason: error.to_string() },
             },
-            () = tokio::time::sleep(timeout) => {
+            () = wait_deadline((!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout)) => {
                 kill_now(&mut child).await;
                 AttemptOutcome::TimedOut
             }
@@ -320,8 +330,8 @@ impl TaskRunner for FakeRunner {
             (self.outcome)(task)
         } else {
             tokio::select! {
-                () = tokio::time::sleep(self.delay.min(timeout)) => {
-                    if self.delay > timeout {
+                () = tokio::time::sleep(if timeout.is_zero() { self.delay } else { self.delay.min(timeout) }) => {
+                    if !timeout.is_zero() && self.delay > timeout {
                         AttemptOutcome::TimedOut
                     } else {
                         (self.outcome)(task)
@@ -351,6 +361,8 @@ pub struct ChunkWork {
     pub chunk: ChunkId,
     /// The leader's grant attempt, echoed back in the result.
     pub grant_attempt: u64,
+    /// Explicit permission to repeat an attempt whose outcome is ambiguous.
+    pub replay_unknown: bool,
     /// Host binary to run.
     pub program: PathBuf,
     /// Argument template, with `{index}` placeholders.
@@ -447,6 +459,8 @@ pub struct PoolCounters {
     pub failed: AtomicU64,
     /// Retries (attempts after the first).
     pub retried: AtomicU64,
+    /// An ambiguous attempt is waiting for an operator decision.
+    pub unknown: std::sync::atomic::AtomicBool,
 }
 
 /// Runs the tasks of any number of chunks through one shared set of
@@ -739,6 +753,19 @@ impl<R: TaskRunner> TaskAttempts<R> {
             drop(node_permit);
             drop(resource_lease);
 
+            if !self.work.replay_unknown
+                && matches!(
+                    result.outcome,
+                    AttemptOutcome::TimedOut | AttemptOutcome::Unknown { .. }
+                )
+            {
+                self.counters.unknown.store(true, Ordering::Relaxed);
+                self.cancel.cancelled().await;
+                return TaskRecord {
+                    attempts: attempt,
+                    ..not_run(index)
+                };
+            }
             let exit_code = match result.outcome {
                 AttemptOutcome::Exited { code } => Some(code),
                 AttemptOutcome::Signalled { signal } => Some(-signal),
@@ -757,6 +784,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 self.counters.succeeded.fetch_add(1, Ordering::Relaxed);
                 return TaskRecord {
                     outcome: TaskFinal::Succeeded,
+                    output: (self.work.spec.count == 1).then_some(result.output),
                     ..record
                 };
             }
@@ -809,6 +837,7 @@ mod tests {
             },
             chunk: ChunkId(chunk),
             grant_attempt: 1,
+            replay_unknown: true,
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), "exit 0".to_string()],
             env: Vec::new(),
@@ -835,6 +864,31 @@ mod tests {
     }
 
     // -- M3.1: runners ---------------------------------------------------
+
+    #[tokio::test]
+    async fn an_ambiguous_singleton_attempt_waits_for_operator_replay() {
+        let runner = FakeRunner::new(Duration::ZERO, |_| AttemptOutcome::TimedOut);
+        let pool = Arc::new(TaskPool::new(Arc::new(runner), fast(1)));
+        let mut work = work(1, 1, 0);
+        work.replay_unknown = false;
+        let cancel = CancellationToken::new();
+        let running = {
+            let pool = pool.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { pool.run_chunk(&work, &cancel).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.counters().unknown.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.counters().attempts_started.load(Ordering::Relaxed), 1);
+        assert!(!running.is_finished());
+        cancel.cancel();
+        running.await.unwrap();
+    }
 
     #[tokio::test]
     async fn process_runner_reports_the_exit_code() {
@@ -875,6 +929,36 @@ mod tests {
         let text = String::from_utf8_lossy(&attempt.output.head).to_string();
         assert!(text.contains("hello task-3"), "{text:?}");
         assert!(text.contains("oops"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_preserves_unbounded_job_execution_and_cancellation() {
+        let runner = ProcessRunner::default();
+        let outcome = runner
+            .run(
+                &invocation("/bin/sh", &["-c", "sleep 0.05; exit 0"]),
+                Duration::ZERO,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.outcome, AttemptOutcome::Exited { code: 0 });
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            runner.run(
+                &invocation("/bin/sh", &["-c", "exec sleep 30"]),
+                Duration::ZERO,
+                &cancel,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.outcome, AttemptOutcome::Cancelled);
     }
 
     #[tokio::test]
@@ -971,6 +1055,28 @@ mod tests {
         assert!(outcome.records.iter().all(|record| record.output.is_none()));
     }
 
+    #[tokio::test]
+    async fn singleton_success_preserves_selected_output() {
+        struct Writes;
+        impl TaskRunner for Writes {
+            async fn run(&self, _: &TaskInvocation, _: Duration, _: &CancellationToken) -> Attempt {
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 0 },
+                    output: CapturedOutput {
+                        head: b"result".to_vec(),
+                        tail: vec![],
+                        total_bytes: 6,
+                    },
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(Writes), fast(1));
+        let result = pool
+            .run_chunk(&work(1, 1, 0), &CancellationToken::new())
+            .await;
+        assert_eq!(result.records[0].output.as_ref().unwrap().head, b"result");
+    }
+
     #[test]
     fn sparse_failures_keep_exact_counts_with_a_bounded_control_preview() {
         let work = ChunkWork {
@@ -982,6 +1088,7 @@ mod tests {
             },
             chunk: ChunkId(0),
             grant_attempt: 1,
+            replay_unknown: true,
             program: "/unused".into(),
             args: vec![],
             env: vec![],

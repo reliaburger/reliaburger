@@ -63,14 +63,60 @@ pub struct TaskManifest {
     pub name: String,
     pub namespace: String,
     pub cohorts: Vec<(String, u64)>,
+    /// Finite named singleton group; authorise every child rather than a synthetic parent.
+    pub common_jobs: bool,
+    /// Idempotent finite-group request identity and complete input digest.
+    pub request: Option<(String, String)>,
     pub submitted_at_epoch_secs: u64,
 }
 
 /// A change to the set of task arrays. Carried by one Raft entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TaskArrayWrite {
+    /// Atomically admit a bounded heterogeneous group of ordinary singletons.
+    RegisterJobs {
+        request_id: String,
+        jobs: Vec<(String, JobSpec)>,
+        submitted_at_epoch_secs: u64,
+    },
+    /// Disable future occurrences and cancel all current runs in one transaction.
+    StopDefinition {
+        name: String,
+        namespace: String,
+        forget: bool,
+        now_epoch_secs: u64,
+    },
+    /// Persist deployment ownership and admit only its prerequisite runs.
+    DeployBegin {
+        operation_id: String,
+        config: Box<crate::config::Config>,
+        now_epoch_secs: u64,
+    },
+    /// App publication succeeded; admit ordinary jobs and register schedules.
+    DeployCommitted {
+        operation_id: String,
+        now_epoch_secs: u64,
+    },
+    /// Cancel the intent before draining any running tasks.
+    DeployCancel {
+        operation_id: String,
+        now_epoch_secs: u64,
+    },
+    /// Positively settled operations release workload ownership.
+    DeployRelease { operation_id: String },
     /// Definition/run transaction using the same indexed execution state.
     Job(Box<super::job::JobWrite>),
+    /// Persist the latest observed UTC minute independently of matching schedules.
+    CronObserve { minute: i64 },
+    /// Retain a conservative run's ownership when its outcome cannot be established.
+    Unknown { batch_id: u64, node: NodeId },
+    /// An operator acknowledged repeating an unknown owner's side effects.
+    Replay {
+        batch_id: u64,
+        node: NodeId,
+        grant_digest: String,
+        now_epoch_secs: u64,
+    },
     /// Atomically register every profile before any work is dispatched.
     RegisterManifest {
         name: String,
@@ -162,10 +208,205 @@ pub enum TaskArrayStoreError {
 
 /// The replicated set of task arrays, keyed by batch id.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ArraysWire", into = "ArraysWire")]
 pub struct TaskArrays {
     jobs: super::job::JobCatalog,
+    cron_observed_minute: Option<i64>,
+    deployments: BTreeMap<String, super::job_deploy::DeploymentRecord>,
     arrays: BTreeMap<u64, TaskArrayRecord>,
     manifests: BTreeMap<u64, TaskManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArraysWire {
+    jobs: super::job::JobCatalog,
+    cron_observed_minute: Option<i64>,
+    deployments: BTreeMap<String, super::job_deploy::DeploymentRecord>,
+    arrays: BTreeMap<u64, TaskArrayRecord>,
+    manifests: BTreeMap<u64, TaskManifest>,
+}
+impl From<TaskArrays> for ArraysWire {
+    fn from(store: TaskArrays) -> Self {
+        Self {
+            jobs: store.jobs,
+            cron_observed_minute: store.cron_observed_minute,
+            deployments: store.deployments,
+            arrays: store.arrays,
+            manifests: store.manifests,
+        }
+    }
+}
+impl TryFrom<ArraysWire> for TaskArrays {
+    type Error = String;
+    fn try_from(wire: ArraysWire) -> Result<Self, String> {
+        let store = Self {
+            jobs: wire.jobs,
+            cron_observed_minute: wire.cron_observed_minute,
+            deployments: wire.deployments,
+            arrays: wire.arrays,
+            manifests: wire.manifests,
+        };
+        if store.cron_observed_minute.is_some_and(|minute| minute < 0)
+            || store.active().count() > MAX_ACTIVE_ARRAYS
+            || store.arrays.len() > 2048
+            || store.manifests.len() > 84
+            || store
+                .deployments
+                .values()
+                .filter(|record| !record.completed)
+                .count()
+                > 64
+            || store
+                .deployments
+                .values()
+                .filter(|record| record.completed)
+                .count()
+                > 20
+        {
+            return Err("job state exceeds its capacity or clock bounds".into());
+        }
+        for (id, record) in &store.arrays {
+            if *id == 0
+                || !crate::config::valid_workload_label(&record.name)
+                || !crate::config::valid_workload_label(&record.namespace)
+            {
+                return Err("invalid run identity".into());
+            }
+            validate_template(&record.template).map_err(|error| error.to_string())?;
+            record.state.validate_snapshot()?;
+            if record.state.status().is_terminal() != record.terminal_at_epoch_secs.is_some() {
+                return Err("run has inconsistent terminal receipt".into());
+            }
+        }
+        for (id, run) in store.jobs.runs() {
+            if store
+                .get(id)
+                .is_none_or(|record| record.name != run.name || record.namespace != run.namespace)
+            {
+                return Err("run provenance has no matching execution state".into());
+            }
+        }
+        let mut children = std::collections::BTreeSet::new();
+        for (id, manifest) in &store.manifests {
+            if *id == 0
+                || store.arrays.contains_key(id)
+                || manifest.cohorts.is_empty()
+                || manifest.cohorts.len() > if manifest.common_jobs { 64 } else { 16 }
+            {
+                return Err("invalid manifest identity or profile count".into());
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for (name, child) in &manifest.cohorts {
+                if !names.insert(name)
+                    || !children.insert(*child)
+                    || store.get(*child).is_none()
+                    || (manifest.common_jobs && store.jobs.run(*child).is_none())
+                {
+                    return Err("manifest has a missing or duplicate profile".into());
+                }
+            }
+        }
+        let mut owned = std::collections::BTreeSet::new();
+        for (id, record) in &store.deployments {
+            if id.len() != 32
+                || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || serde_json::to_vec(&record.config).map_or(true, |bytes| bytes.len() > 128 * 1024)
+            {
+                return Err("invalid deployment identity or size".into());
+            }
+            record
+                .config
+                .validate_intrinsic()
+                .map_err(|error| error.to_string())?;
+            let expected: std::collections::BTreeSet<_> = record
+                .config
+                .job
+                .iter()
+                .filter(|(_, spec)| !spec.run_before.is_empty())
+                .map(|(name, _)| name)
+                .collect();
+            if record
+                .hook_runs
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+                != expected
+            {
+                return Err("deployment has missing or unexpected hooks".into());
+            }
+            let expected_jobs: std::collections::BTreeSet<_> = record
+                .config
+                .job
+                .iter()
+                .filter(|(_, spec)| spec.run_before.is_empty() && spec.schedule.is_none())
+                .map(|(name, _)| name)
+                .collect();
+            if (record.apps_committed
+                && record
+                    .job_runs
+                    .keys()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    != expected_jobs)
+                || (!record.apps_committed && !record.job_runs.is_empty())
+            {
+                return Err("deployment has inconsistent ordinary run identities".into());
+            }
+            if record.completed != record.outcome.is_some()
+                || record.completed != record.finished_at.is_some()
+            {
+                return Err("deployment has inconsistent settlement receipt".into());
+            }
+            if record.completed {
+                continue;
+            }
+            for (name, run_id) in record.hook_runs.iter().chain(&record.job_runs) {
+                let spec = record
+                    .config
+                    .job
+                    .get(name)
+                    .ok_or("deployment references an unknown job")?;
+                let run = store
+                    .jobs
+                    .run(*run_id)
+                    .ok_or("pending deployment lost run provenance")?;
+                if run.name != *name
+                    || run.namespace != spec.namespace.as_deref().unwrap_or("default")
+                    || run.trigger
+                        != (super::job::RunTrigger::Hook {
+                            operation_id: id.clone(),
+                        })
+                {
+                    return Err("deployment run belongs to a different operation".into());
+                }
+            }
+            if record.apps_committed
+                && !record.hook_runs.values().all(|id| {
+                    store.get(*id).is_some_and(|run| {
+                        run.state.status() == super::task_array_state::TaskArrayStatus::Succeeded
+                    })
+                })
+            {
+                return Err("dependent apps have no accepted successful hook proof".into());
+            }
+            for (name, namespace) in
+                record
+                    .config
+                    .app
+                    .iter()
+                    .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default")))
+                    .chain(
+                        record.config.job.iter().map(|(name, spec)| {
+                            (name, spec.namespace.as_deref().unwrap_or("default"))
+                        }),
+                    )
+            {
+                if record.blocks(name, namespace) && !owned.insert((namespace, name)) {
+                    return Err("deployments have conflicting workload ownership".into());
+                }
+            }
+        }
+        Ok(store)
+    }
 }
 
 impl TaskArrays {
@@ -176,7 +417,62 @@ impl TaskArrays {
         write: &TaskArrayWrite,
         mut allocate_id: impl FnMut() -> u64,
     ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
+        if let TaskArrayWrite::Register {
+            name, namespace, ..
+        }
+        | TaskArrayWrite::RegisterManifest {
+            name, namespace, ..
+        } = write
+            && self.deployment_owner(name, namespace).is_some()
+        {
+            return Err(TaskArrayStoreError::Job(
+                "an unsettled deployment owns this workload".into(),
+            ));
+        }
         match write {
+            TaskArrayWrite::RegisterJobs { .. }
+            | TaskArrayWrite::DeployBegin { .. }
+            | TaskArrayWrite::DeployCommitted { .. }
+            | TaskArrayWrite::DeployCancel { .. }
+            | TaskArrayWrite::DeployRelease { .. } => {
+                // Preflight the complete transaction, including every definition and ID,
+                // before touching the caller's allocation counter or publishing any state.
+                self.registration_ids(write)?;
+                let mut candidate = self.clone();
+                let result = candidate.apply_deployment(write, &mut allocate_id)?;
+                *self = candidate;
+                Ok(result)
+            }
+            TaskArrayWrite::StopDefinition {
+                name,
+                namespace,
+                forget,
+                now_epoch_secs,
+            } => {
+                self.jobs
+                    .stop(namespace, name, *forget)
+                    .map_err(TaskArrayStoreError::Job)?;
+                let ids: Vec<_> = self
+                    .jobs
+                    .runs()
+                    .filter(|(_, run)| run.name == *name && run.namespace == *namespace)
+                    .map(|(id, _)| id)
+                    .collect();
+                for id in ids {
+                    self.record_mut(id)?.state.cancel();
+                    self.mark_terminal(id, *now_epoch_secs)?;
+                }
+                Ok(TaskArrayApplied::Cancelled)
+            }
+            TaskArrayWrite::CronObserve { minute } => {
+                if *minute < 0 {
+                    return Err(TaskArrayStoreError::Job(
+                        "cron minute precedes the epoch".into(),
+                    ));
+                }
+                self.cron_observed_minute = self.cron_observed_minute.max(Some(*minute));
+                Ok(TaskArrayApplied::JobRecorded)
+            }
             TaskArrayWrite::Job(write) => self.apply_job(write, allocate_id),
             TaskArrayWrite::RegisterManifest {
                 name,
@@ -241,6 +537,8 @@ impl TaskArrays {
                         name: name.clone(),
                         namespace: namespace.clone(),
                         cohorts: identities,
+                        common_jobs: false,
+                        request: None,
                         submitted_at_epoch_secs: *submitted_at_epoch_secs,
                     },
                 );
@@ -331,11 +629,74 @@ impl TaskArrays {
                 self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Cancelled)
             }
+            TaskArrayWrite::Unknown { batch_id, node } => {
+                if self
+                    .get(*batch_id)
+                    .ok_or(TaskArrayStoreError::UnknownArray {
+                        batch_id: *batch_id,
+                    })?
+                    .state
+                    .held_by(node)
+                    .is_none()
+                {
+                    return Err(TaskArrayStoreError::Job(
+                        "unknown observation does not name a held grant".into(),
+                    ));
+                }
+                let run = self
+                    .jobs
+                    .run_mut(*batch_id)
+                    .ok_or_else(|| TaskArrayStoreError::Job("unknown run".into()))?;
+                if run.unknown_owners.len() >= 64 && !run.unknown_owners.contains(node) {
+                    return Err(TaskArrayStoreError::Job(
+                        "unknown owner limit reached".into(),
+                    ));
+                }
+                run.unknown_owners.insert(node.clone());
+                Ok(TaskArrayApplied::JobRecorded)
+            }
+            TaskArrayWrite::Replay {
+                batch_id,
+                node,
+                grant_digest,
+                now_epoch_secs,
+            } => {
+                let run = self
+                    .jobs
+                    .run(*batch_id)
+                    .ok_or_else(|| TaskArrayStoreError::Job("unknown run".into()))?;
+                if !run.unknown_owners.contains(node) {
+                    return Err(TaskArrayStoreError::Job(
+                        "owner has no unresolved execution".into(),
+                    ));
+                }
+                if self.owner_fingerprint(*batch_id, node).as_deref() != Some(grant_digest.as_str())
+                {
+                    return Err(TaskArrayStoreError::Job(
+                        "replay acknowledgement names stale grants".into(),
+                    ));
+                }
+                let chunks = self.record_mut(*batch_id)?.state.requeue_node(node);
+                if let Some(run) = self.jobs.run_mut(*batch_id) {
+                    run.unknown_owners.remove(node);
+                }
+                self.mark_terminal(*batch_id, *now_epoch_secs)?;
+                Ok(TaskArrayApplied::Requeued { chunks })
+            }
             TaskArrayWrite::Requeue {
                 batch_id,
                 node,
                 now_epoch_secs,
             } => {
+                if self
+                    .jobs
+                    .run(*batch_id)
+                    .is_some_and(|run| !run.replay_unknown)
+                {
+                    return Err(TaskArrayStoreError::Job(
+                        "unknown outcome requires acknowledged replay".into(),
+                    ));
+                }
                 let chunks = self.record_mut(*batch_id)?.state.requeue_node(node);
                 self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Requeued { chunks })
@@ -346,18 +707,93 @@ impl TaskArrays {
     /// IDs needed by this exact transaction; idempotent replays and skipped
     /// occurrences remain admissible even when the shared counter is exhausted.
     pub fn registration_ids(&self, write: &TaskArrayWrite) -> Result<usize, TaskArrayStoreError> {
+        if matches!(
+            write,
+            TaskArrayWrite::RegisterJobs { .. }
+                | TaskArrayWrite::DeployBegin { .. }
+                | TaskArrayWrite::DeployCommitted { .. }
+                | TaskArrayWrite::DeployCancel { .. }
+                | TaskArrayWrite::DeployRelease { .. }
+        ) {
+            let mut candidate = self.clone();
+            let mut next = 0u64;
+            let mut count = 0;
+            candidate.apply_deployment(write, &mut || {
+                next += 1;
+                while self.arrays.contains_key(&next) || self.manifests.contains_key(&next) {
+                    next += 1;
+                }
+                count += 1;
+                next
+            })?;
+            return Ok(count);
+        }
+        if let TaskArrayWrite::Job(write) = write
+            && let super::job::JobWrite::Fire { minute, .. } = write.as_ref()
+            && self
+                .cron_observed_minute
+                .is_some_and(|observed| observed > *minute)
+        {
+            return Ok(0);
+        }
         if let TaskArrayWrite::Job(write) = write {
-            let active = self.active().map(|(id, _)| id).collect();
-            let mut candidate = self.jobs.clone();
-            let plan = candidate
-                .prepare(write, &active)
-                .map_err(TaskArrayStoreError::Job)?;
-            return Ok(usize::from(matches!(
-                plan,
-                super::job::JobPlan::Register { .. }
-            )));
+            let mut candidate = self.clone();
+            let mut next = 0u64;
+            let mut count = 0;
+            candidate.apply_job(write, || {
+                next += 1;
+                while self.arrays.contains_key(&next) || self.manifests.contains_key(&next) {
+                    next += 1;
+                }
+                count += 1;
+                next
+            })?;
+            return Ok(count);
         }
         Ok(write.registration_ids())
+    }
+
+    /// Counter headroom for all stages known at deployment admission.
+    pub fn planned_ids(&self, write: &TaskArrayWrite) -> Result<usize, TaskArrayStoreError> {
+        let actual = self.registration_ids(write)?;
+        if let TaskArrayWrite::DeployBegin {
+            operation_id,
+            config,
+            ..
+        } = write
+            && !self.deployments.contains_key(operation_id)
+        {
+            return Ok(config
+                .job
+                .values()
+                .filter(|spec| spec.schedule.is_none())
+                .count()
+                .max(actual));
+        }
+        Ok(actual)
+    }
+
+    /// Cluster/standalone schedule clock high-water mark.
+    pub fn cron_observed_minute(&self) -> Option<i64> {
+        self.cron_observed_minute
+    }
+
+    /// Fingerprint an owner's exact held chunk generations for replay acknowledgements.
+    pub fn owner_fingerprint(&self, id: u64, node: &NodeId) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let record = self.get(id)?;
+        let held = record.state.held_by(node)?;
+        let generations: Vec<_> = held
+            .iter()
+            .map(|chunk| {
+                (
+                    chunk,
+                    record.state.attempt_of(super::task_array::ChunkId(chunk)),
+                )
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&(id, node, generations)).ok()?;
+        Some(hex::encode(Sha256::digest(bytes)))
     }
 
     /// Reusable definitions and immutable provenance accompanying execution runs.
@@ -365,20 +801,77 @@ impl TaskArrays {
         &self.jobs
     }
 
+    /// A workload kind cannot reuse an identity while its job history remains visible.
+    pub fn job_identity_reserved(&self, namespace: &str, name: &str) -> bool {
+        self.jobs.definition(namespace, name).is_some()
+            || self
+                .jobs
+                .runs()
+                .any(|(_, run)| run.namespace == namespace && run.name == name)
+    }
+
     fn apply_job(
         &mut self,
         write: &super::job::JobWrite,
         mut allocate_id: impl FnMut() -> u64,
     ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
+        if let super::job::JobWrite::Fire { minute, .. } = write
+            && self
+                .cron_observed_minute
+                .is_some_and(|observed| observed > *minute)
+        {
+            return Ok(TaskArrayApplied::JobRecorded);
+        }
         use super::job::JobPlan;
         let active = self.active().map(|(id, _)| id).collect();
-        let mut jobs = self.jobs.clone();
+        let mut replay = self.jobs.clone();
+        if let Ok(super::job::JobPlan::Existing(batch_id)) = replay.prepare(write, &active) {
+            return Ok(TaskArrayApplied::Registered { batch_id });
+        }
+        let now = match write {
+            super::job::JobWrite::Put { now_epoch_secs, .. }
+            | super::job::JobWrite::Fire { now_epoch_secs, .. } => *now_epoch_secs,
+        };
+        let mut retained = self.clone();
+        retained.prune(now);
+        let mut jobs = retained.jobs.clone();
         let plan = jobs
             .prepare(write, &active)
             .map_err(TaskArrayStoreError::Job)?;
+        if !matches!(plan, JobPlan::Existing(_)) {
+            let (name, namespace, operation) = match write {
+                super::job::JobWrite::Put {
+                    name,
+                    namespace,
+                    trigger,
+                    ..
+                } => (
+                    name,
+                    namespace,
+                    match trigger {
+                        Some(super::job::RunTrigger::Hook { operation_id }) => {
+                            Some(operation_id.as_str())
+                        }
+                        _ => None,
+                    },
+                ),
+                super::job::JobWrite::Fire {
+                    name, namespace, ..
+                } => (name, namespace, None),
+            };
+            if self
+                .deployment_owner(name, namespace)
+                .is_some_and(|owner| Some(owner) != operation)
+            {
+                return Err(TaskArrayStoreError::Job(
+                    "a deployment owns this workload".into(),
+                ));
+            }
+        }
         match plan {
             JobPlan::Existing(batch_id) => Ok(TaskArrayApplied::Registered { batch_id }),
             JobPlan::Recorded => {
+                self.prune(now);
                 self.jobs = jobs;
                 Ok(TaskArrayApplied::JobRecorded)
             }
@@ -419,6 +912,11 @@ impl TaskArrays {
         if record.state.status().is_terminal() && record.terminal_at_epoch_secs.is_none() {
             record.terminal_at_epoch_secs = Some(now.max(record.state.submitted_at_epoch_secs));
         }
+        let state = record.state.clone();
+        if let Some(run) = self.jobs.run_mut(id) {
+            run.unknown_owners
+                .retain(|node| state.held_by(node).is_some());
+        }
         Ok(())
     }
 
@@ -431,7 +929,13 @@ impl TaskArrays {
     /// Drop finished arrays past the retention window, then keep at most
     /// [`MAX_TERMINAL_ARRAYS`] of the rest (newest ids win). `now` comes
     /// from the write, so every replica prunes the same arrays.
-    fn prune(&mut self, now_epoch_secs: u64) {
+    pub(crate) fn prune(&mut self, now_epoch_secs: u64) {
+        let pinned: std::collections::BTreeSet<_> = self
+            .deployments
+            .values()
+            .filter(|record| !record.completed)
+            .flat_map(|record| record.runs())
+            .collect();
         let children: std::collections::BTreeSet<u64> = self
             .manifests
             .values()
@@ -451,7 +955,7 @@ impl TaskArrays {
                 completed.map(|times| (times.into_iter().max().unwrap_or(0), *id, true))
             })
             .chain(self.arrays.iter().filter_map(|(id, r)| {
-                if children.contains(id) {
+                if children.contains(id) || pinned.contains(id) {
                     return None;
                 }
                 r.terminal_at_epoch_secs.map(|time| (time, *id, false))
@@ -483,6 +987,394 @@ impl TaskArrays {
         }
         self.jobs
             .retain_runs(&self.arrays.keys().copied().collect());
+    }
+
+    /// Active deployment intent, excluding bounded terminal receipts.
+    pub fn deployment(&self, operation_id: &str) -> Option<&super::job_deploy::DeploymentRecord> {
+        self.deployments
+            .get(operation_id)
+            .filter(|record| !record.completed)
+    }
+    /// Active and recent terminal deployment receipts.
+    pub fn deployments(
+        &self,
+    ) -> impl Iterator<Item = (&str, &super::job_deploy::DeploymentRecord)> {
+        self.deployments
+            .iter()
+            .map(|(id, record)| (id.as_str(), record))
+    }
+    /// Durable workload ownership, shared by apply, cron and direct run admission.
+    pub fn deployment_owner(&self, name: &str, namespace: &str) -> Option<&str> {
+        self.deployments()
+            .find_map(|(id, record)| record.blocks(name, namespace).then_some(id))
+    }
+    fn apply_deployment(
+        &mut self,
+        write: &TaskArrayWrite,
+        allocate: &mut impl FnMut() -> u64,
+    ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
+        use super::{
+            job::{JobDefinition, JobWrite, RunTrigger},
+            job_deploy::DeploymentRecord,
+            task_array_state::TaskArrayStatus,
+        };
+        let refuse = |reason: &str| TaskArrayStoreError::Job(reason.into());
+        match write {
+            TaskArrayWrite::RegisterJobs {
+                request_id,
+                jobs,
+                submitted_at_epoch_secs,
+            } => {
+                use sha2::{Digest, Sha256};
+                if request_id.is_empty()
+                    || request_id.len() > 128
+                    || request_id.chars().any(char::is_control)
+                    || jobs.is_empty()
+                    || jobs.len() > MAX_ACTIVE_ARRAYS
+                {
+                    return Err(refuse(
+                        "finite batches require a request identity and 1–64 named jobs; use resource profiles for larger submissions",
+                    ));
+                }
+                let mut jobs = jobs.clone();
+                jobs.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut names = std::collections::BTreeSet::new();
+                for (name, spec) in &mut jobs {
+                    if !crate::config::valid_workload_label(name)
+                        || !names.insert(name.clone())
+                        || spec.schedule.is_some()
+                        || !spec.run_before.is_empty()
+                    {
+                        return Err(refuse(
+                            "finite batch jobs need distinct DNS-label names and no trigger fields",
+                        ));
+                    }
+                    let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+                    if !crate::config::valid_workload_label(&namespace) {
+                        return Err(refuse("invalid finite job namespace"));
+                    }
+                    spec.namespace = Some(namespace);
+                    JobDefinition::from_spec(spec.clone())
+                        .validate()
+                        .map_err(TaskArrayStoreError::Job)?;
+                }
+                let bytes = serde_json::to_vec(&jobs)
+                    .map_err(|error| TaskArrayStoreError::Job(error.to_string()))?;
+                let digest = hex::encode(Sha256::digest(bytes));
+                if let Some((id, prior)) = self.manifests.iter().find(|(_, record)| {
+                    record
+                        .request
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == request_id)
+                }) {
+                    return if prior
+                        .request
+                        .as_ref()
+                        .is_some_and(|(_, prior)| prior == &digest)
+                    {
+                        Ok(TaskArrayApplied::Registered { batch_id: *id })
+                    } else {
+                        Err(refuse("batch request already names different work"))
+                    };
+                }
+                let mut cohorts = Vec::new();
+                for (name, spec) in jobs {
+                    let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+                    let result = self.apply_job(
+                        &JobWrite::Put {
+                            name: name.clone(),
+                            namespace,
+                            definition: Box::new(JobDefinition::from_spec(spec)),
+                            trigger: Some(RunTrigger::Manual {
+                                request_id: request_id.clone(),
+                            }),
+                            now_epoch_secs: *submitted_at_epoch_secs,
+                        },
+                        &mut *allocate,
+                    )?;
+                    let TaskArrayApplied::Registered { batch_id } = result else {
+                        return Err(refuse("finite job produced no run"));
+                    };
+                    cohorts.push((name, batch_id));
+                }
+                let batch_id = allocate();
+                self.manifests.insert(
+                    batch_id,
+                    TaskManifest {
+                        name: format!(
+                            "jobs-{}",
+                            &hex::encode(Sha256::digest(request_id.as_bytes()))[..32]
+                        ),
+                        namespace: "default".into(),
+                        cohorts,
+                        common_jobs: true,
+                        request: Some((request_id.clone(), digest)),
+                        submitted_at_epoch_secs: *submitted_at_epoch_secs,
+                    },
+                );
+                Ok(TaskArrayApplied::Registered { batch_id })
+            }
+            TaskArrayWrite::DeployBegin {
+                operation_id,
+                config,
+                now_epoch_secs,
+            } => {
+                if operation_id.len() != 32
+                    || !operation_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(refuse(
+                        "deployment identity must be 32 hexadecimal characters",
+                    ));
+                }
+                config
+                    .validate_intrinsic()
+                    .map_err(|error| TaskArrayStoreError::Job(error.to_string()))?;
+                if serde_json::to_vec(config).map_or(true, |bytes| bytes.len() > 128 * 1024) {
+                    return Err(refuse("deployment exceeds 128 KiB"));
+                }
+                if let Some(prior) = self.deployments.get(operation_id) {
+                    return if prior.config == *config {
+                        Ok(TaskArrayApplied::JobRecorded)
+                    } else {
+                        Err(refuse("deployment identity already names different work"))
+                    };
+                }
+                if self
+                    .deployments
+                    .values()
+                    .filter(|record| !record.completed)
+                    .count()
+                    >= 64
+                {
+                    return Err(refuse("64 deployments are already unsettled"));
+                }
+                for (name, namespace) in
+                    config
+                        .app
+                        .iter()
+                        .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default")))
+                        .chain(config.job.iter().map(|(name, spec)| {
+                            (name, spec.namespace.as_deref().unwrap_or("default"))
+                        }))
+                {
+                    if self.deployment_owner(name, namespace).is_some() {
+                        return Err(refuse("another deployment still owns this workload"));
+                    }
+                }
+                if config.app.iter().any(|(name, spec)| {
+                    self.job_identity_reserved(spec.namespace.as_deref().unwrap_or("default"), name)
+                }) {
+                    return Err(refuse(
+                        "app identity belongs to a job definition or retained run",
+                    ));
+                }
+                let mut prospective = self.clone();
+                let mut preview_id = 0u64;
+                for (name, spec) in &config.job {
+                    let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+                    let mut definition = JobDefinition::from_spec(spec.clone());
+                    definition.template.namespace = Some(namespace.clone());
+                    let trigger = definition.cron.is_none().then(|| RunTrigger::Hook {
+                        operation_id: operation_id.clone(),
+                    });
+                    prospective.apply_job(
+                        &JobWrite::Put {
+                            name: name.clone(),
+                            namespace,
+                            definition: Box::new(definition),
+                            trigger,
+                            now_epoch_secs: *now_epoch_secs,
+                        },
+                        || {
+                            preview_id += 1;
+                            while self.arrays.contains_key(&preview_id)
+                                || self.manifests.contains_key(&preview_id)
+                            {
+                                preview_id += 1;
+                            }
+                            preview_id
+                        },
+                    )?;
+                }
+                let terminal: Vec<_> = self
+                    .deployments
+                    .iter()
+                    .filter(|(_, record)| record.completed)
+                    .map(|(id, record)| (record.submitted_at_epoch_secs, id.clone()))
+                    .collect();
+                let mut terminal = terminal;
+                terminal.sort();
+                for (_, id) in terminal.iter().take(terminal.len().saturating_sub(19)) {
+                    self.deployments.remove(id);
+                }
+                let mut record = DeploymentRecord {
+                    config: config.clone(),
+                    hook_runs: BTreeMap::new(),
+                    job_runs: BTreeMap::new(),
+                    apps_committed: false,
+                    cancelled: false,
+                    completed: false,
+                    outcome: None,
+                    finished_at: None,
+                    submitted_at_epoch_secs: *now_epoch_secs,
+                };
+                // Ownership is recorded before prune can discard an earlier hook result.
+                self.deployments
+                    .insert(operation_id.clone(), record.clone());
+                for (name, spec) in &config.job {
+                    if spec.run_before.is_empty() {
+                        continue;
+                    }
+                    let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+                    let mut definition = JobDefinition::from_spec(spec.clone());
+                    definition.template.namespace = Some(namespace.clone());
+                    let result = self.apply_job(
+                        &JobWrite::Put {
+                            name: name.clone(),
+                            namespace,
+                            definition: Box::new(definition),
+                            trigger: Some(RunTrigger::Hook {
+                                operation_id: operation_id.clone(),
+                            }),
+                            now_epoch_secs: *now_epoch_secs,
+                        },
+                        &mut *allocate,
+                    )?;
+                    let TaskArrayApplied::Registered { batch_id } = result else {
+                        return Err(refuse("hook admission produced no run"));
+                    };
+                    record.hook_runs.insert(name.clone(), batch_id);
+                    self.deployments
+                        .insert(operation_id.clone(), record.clone());
+                }
+                Ok(TaskArrayApplied::JobRecorded)
+            }
+            TaskArrayWrite::DeployCommitted {
+                operation_id,
+                now_epoch_secs,
+            } => {
+                let mut record = self
+                    .deployments
+                    .get(operation_id)
+                    .cloned()
+                    .ok_or_else(|| refuse("unknown deployment"))?;
+                if record.cancelled {
+                    return Err(refuse("cancelled deployment cannot publish apps"));
+                }
+                if record.apps_committed {
+                    return Ok(TaskArrayApplied::JobRecorded);
+                }
+                if !record.hook_runs.values().all(|id| {
+                    self.get(*id)
+                        .is_some_and(|run| run.state.status() == TaskArrayStatus::Succeeded)
+                }) {
+                    return Err(refuse("hooks have no accepted successful outcome"));
+                }
+                // This is a preflighted candidate: release this operation's own
+                // definition ownership before admitting its ordinary jobs and schedules.
+                record.apps_committed = true;
+                self.deployments
+                    .insert(operation_id.clone(), record.clone());
+                for (name, spec) in &record.config.job {
+                    if !spec.run_before.is_empty() {
+                        continue;
+                    }
+                    let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+                    let mut definition = JobDefinition::from_spec(spec.clone());
+                    definition.template.namespace = Some(namespace.clone());
+                    let trigger = definition.cron.is_none().then(|| RunTrigger::Hook {
+                        operation_id: operation_id.clone(),
+                    });
+                    let result = self.apply_job(
+                        &JobWrite::Put {
+                            name: name.clone(),
+                            namespace,
+                            definition: Box::new(definition),
+                            trigger,
+                            now_epoch_secs: *now_epoch_secs,
+                        },
+                        &mut *allocate,
+                    )?;
+                    if let TaskArrayApplied::Registered { batch_id } = result {
+                        record.job_runs.insert(name.clone(), batch_id);
+                    }
+                    self.deployments
+                        .insert(operation_id.clone(), record.clone());
+                }
+                record.apps_committed = true;
+                self.deployments.insert(operation_id.clone(), record);
+                Ok(TaskArrayApplied::JobRecorded)
+            }
+            TaskArrayWrite::DeployCancel {
+                operation_id,
+                now_epoch_secs,
+            } => {
+                let mut record = self
+                    .deployments
+                    .get(operation_id)
+                    .cloned()
+                    .ok_or_else(|| refuse("unknown deployment"))?;
+                if record.completed {
+                    return Ok(TaskArrayApplied::JobRecorded);
+                }
+                record.cancelled = true;
+                for id in record.runs() {
+                    self.record_mut(id)?.state.cancel();
+                    self.mark_terminal(id, *now_epoch_secs)?;
+                }
+                self.deployments.insert(operation_id.clone(), record);
+                Ok(TaskArrayApplied::Cancelled)
+            }
+            TaskArrayWrite::DeployRelease { operation_id } => {
+                let record = self
+                    .deployments
+                    .get(operation_id)
+                    .ok_or_else(|| refuse("unknown deployment"))?;
+                if record.completed {
+                    return Ok(TaskArrayApplied::JobRecorded);
+                }
+                let terminal = record.runs().all(|id| {
+                    self.get(id)
+                        .is_some_and(|run| run.state.status().is_terminal())
+                });
+                let failed = record.hook_runs.values().any(|id| {
+                    self.get(*id).is_some_and(|run| {
+                        run.state.status().is_terminal()
+                            && run.state.status() != TaskArrayStatus::Succeeded
+                    })
+                });
+                if !terminal || (!record.apps_committed && !record.cancelled && !failed) {
+                    return Err(refuse("deployment has not positively settled"));
+                }
+                let any_failed = record.runs().any(|id| {
+                    self.get(id).is_some_and(|run| {
+                        matches!(
+                            run.state.status(),
+                            TaskArrayStatus::Failed | TaskArrayStatus::CompletedWithFailures
+                        )
+                    })
+                });
+                let finished_at = record
+                    .runs()
+                    .filter_map(|id| self.get(id).and_then(|run| run.terminal_at_epoch_secs))
+                    .max()
+                    .unwrap_or(record.submitted_at_epoch_secs);
+                let outcome = if any_failed {
+                    super::job_deploy::DeploymentOutcome::Failed
+                } else if record.cancelled {
+                    super::job_deploy::DeploymentOutcome::Cancelled
+                } else {
+                    super::job_deploy::DeploymentOutcome::Completed
+                };
+                if let Some(record) = self.deployments.get_mut(operation_id) {
+                    record.completed = true;
+                    record.outcome = Some(outcome);
+                    record.finished_at = Some(finished_at);
+                }
+                Ok(TaskArrayApplied::JobRecorded)
+            }
+            _ => Err(refuse("not a deployment transaction")),
+        }
     }
 
     /// Retained parent summaries, without enumerating any task.
@@ -824,6 +1716,71 @@ mod tests {
         let state = &arrays.get(id).unwrap().state;
         assert_eq!(state.attempt_of(ChunkId(0)), 2);
         assert!(state.held_by(&node("b")).is_some());
+    }
+
+    #[test]
+    fn raw_arrays_cannot_take_over_an_unsettled_deployment_name() {
+        for manifest in [false, true] {
+            let mut arrays = TaskArrays::default();
+            let config = crate::config::Config::parse(
+                "[app.web]\nimage='web:v1'\n[job.render]\nexec='/bin/true'\nrun_before=['app.web']",
+            )
+            .unwrap();
+            let mut next = 1;
+            arrays
+                .apply(
+                    &TaskArrayWrite::DeployBegin {
+                        operation_id: "a".repeat(32),
+                        config: Box::new(config),
+                        now_epoch_secs: 1,
+                    },
+                    || {
+                        let id = next;
+                        next += 1;
+                        id
+                    },
+                )
+                .unwrap();
+            let mut write = register(1, 1, 2);
+            let TaskArrayWrite::Register { name, .. } = &mut write else {
+                unreachable!()
+            };
+            *name = "render".into();
+            if manifest {
+                let TaskArrayWrite::Register {
+                    name,
+                    namespace,
+                    template,
+                    spec,
+                    submitted_at_epoch_secs,
+                } = write
+                else {
+                    unreachable!()
+                };
+                write = TaskArrayWrite::RegisterManifest {
+                    name,
+                    namespace,
+                    cohorts: vec![ManifestCohort {
+                        name: "small".into(),
+                        template: *template,
+                        spec,
+                    }],
+                    submitted_at_epoch_secs,
+                };
+            }
+            let before = arrays.clone();
+            assert!(
+                arrays
+                    .apply(&write, || {
+                        let id = next;
+                        next += 1;
+                        id
+                    })
+                    .is_err()
+            );
+            assert_eq!(arrays, before);
+            assert_eq!(next, 2, "refusal must not allocate an identity");
+        }
     }
 
     #[test]

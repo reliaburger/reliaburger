@@ -11,8 +11,8 @@
 //! [`SILENCE_TIMEOUT`] gets a `Requeue`, which hands its chunks to others
 //! at the next attempt, so a late report from it is fenced off.
 //!
-//! Tests can run the same loop with volatile standalone state. Production
-//! admission requires a council for durable definitions and identities.
+//! Production persists the same state through a council or the private
+//! standalone job store. Tests may explicitly select volatile standalone state.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -66,6 +66,9 @@ pub struct NodeView {
 /// Task-array settings, the node executor and the leader's in-memory
 /// view, shared by the API handlers and the leader loop.
 pub struct TaskArrayService {
+    /// Standalone app publication is serialised with admission and cancellation.
+    pub(crate) apply_gate: Arc<Mutex<()>>,
+    pub(crate) publishing: Mutex<std::collections::BTreeSet<String>>,
     /// Image signature policy applied before admission and dispatch.
     pub trust_policy: crate::config::node::TrustPolicySection,
     /// Registry client shared with normal job admission for cosign checks.
@@ -73,8 +76,10 @@ pub struct TaskArrayService {
     /// This node's executor; `None` means this node can't run tasks
     /// (it still coordinates when it leads).
     pub node: Option<Arc<TaskArrayNode>>,
-    /// Production definitions require replicated storage, never volatile IDs.
+    /// Unconfigured production services refuse volatile standalone admission.
     require_council: bool,
+    standalone: Option<Arc<std::sync::Mutex<super::job_store::JobStore>>>,
+    storage_fenced: std::sync::atomic::AtomicBool,
     /// Time between syncs.
     pub sync_interval: Duration,
     /// Silence before a node's chunks are taken back.
@@ -94,6 +99,11 @@ impl TaskArrayService {
         service
     }
 
+    /// A production standalone coordinator must have durable storage configured.
+    pub(crate) fn admission_configured(&self) -> bool {
+        !self.require_council || self.standalone.is_some()
+    }
+
     /// Apply the configured image policy to batch admission too.
     pub fn with_trust_policy(mut self, policy: crate::config::node::TrustPolicySection) -> Self {
         self.trust_policy = policy;
@@ -109,16 +119,20 @@ impl TaskArrayService {
     }
 
     /// Test harness service with explicit timings and volatile standalone state.
-    /// Production uses `new`, which requires a council for durable definitions.
+    /// Production adds durable storage with `with_storage` or uses a council.
     pub fn with_timings(
         node: Option<Arc<TaskArrayNode>>,
         sync_interval: Duration,
         silence_timeout: Duration,
     ) -> Self {
         Self {
+            apply_gate: Arc::new(Mutex::new(())),
+            publishing: Mutex::new(Default::default()),
             trust_policy: Default::default(),
             signature_source: None,
             require_council: false,
+            standalone: None,
+            storage_fenced: std::sync::atomic::AtomicBool::new(false),
             node,
             sync_interval,
             silence_timeout,
@@ -126,6 +140,18 @@ impl TaskArrayService {
             views: Mutex::new(HashMap::new()),
             rates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Open private durable standalone state before admitting or dispatching work.
+    pub async fn with_storage(mut self, data: &std::path::Path) -> std::io::Result<Self> {
+        let directory = data.join("job-state");
+        let store =
+            tokio::task::spawn_blocking(move || super::job_store::JobStore::open(&directory))
+                .await
+                .map_err(std::io::Error::other)??;
+        self.standalone = Some(Arc::new(std::sync::Mutex::new(store)));
+        self.require_council = false;
+        Ok(self)
     }
 
     /// Rate of unique accepted results; first or stale samples are unknown.
@@ -178,6 +204,7 @@ pub(crate) async fn write_task_array(
         TaskArrayWrite::Sync { now_epoch_secs, .. }
         | TaskArrayWrite::Cancel { now_epoch_secs, .. }
         | TaskArrayWrite::Requeue { now_epoch_secs, .. }
+        | TaskArrayWrite::Replay { now_epoch_secs, .. }
         | TaskArrayWrite::CancelManifest { now_epoch_secs, .. }
             if *now_epoch_secs == 0 =>
         {
@@ -191,10 +218,54 @@ pub(crate) async fn write_task_array(
                 "delegated arrays require a council for durable definitions and identities".into(),
             ));
         }
+        if let Some(store) = &state.task_arrays.standalone {
+            if state
+                .task_arrays
+                .storage_fenced
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(TaskArrayWriteError::Unavailable(
+                    "standalone publication timed out; restart and reconcile".into(),
+                ));
+            }
+            let store = Arc::clone(store);
+            let publication = tokio::task::spawn_blocking(move || {
+                let mut store = store.lock().map_err(|_| {
+                    TaskArrayWriteError::Unavailable("job store lock poisoned".into())
+                })?;
+                store.apply(&write).map_err(|error| {
+                    if store.ready() {
+                        TaskArrayWriteError::Refused(error)
+                    } else {
+                        TaskArrayWriteError::Unavailable(error)
+                    }
+                })
+            });
+            return match tokio::time::timeout(WRITE_TIMEOUT, publication).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    state
+                        .task_arrays
+                        .storage_fenced
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    Err(TaskArrayWriteError::Unavailable(error.to_string()))
+                }
+                Err(_) => {
+                    state
+                        .task_arrays
+                        .storage_fenced
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    Err(TaskArrayWriteError::Unavailable(
+                        "standalone publication timed out; admission and dispatch are fenced"
+                            .into(),
+                    ))
+                }
+            };
+        }
         let mut tracker = state.batch_tracker.lock().await;
         let mut arrays = state.task_arrays.local.lock().await;
         let ids = arrays
-            .registration_ids(&write)
+            .planned_ids(&write)
             .map_err(|error| TaskArrayWriteError::Refused(error.to_string()))?;
         tracker
             .preflight_ids(ids)
@@ -224,7 +295,23 @@ pub(crate) async fn write_task_array(
 pub(crate) async fn read_task_arrays(state: &ApiState) -> TaskArrays {
     match &state.council {
         Some(council) => council.desired_state().await.task_arrays,
-        None => state.task_arrays.local.lock().await.clone(),
+        None => local_snapshot(&state.task_arrays).await.0,
+    }
+}
+
+async fn local_snapshot(service: &TaskArrayService) -> (TaskArrays, u64) {
+    if let Some(store) = &service.standalone {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (store.arrays().clone(), store.revision())
+        })
+        .await
+        .unwrap_or_else(|_| (TaskArrays::default(), 0))
+    } else {
+        (service.local.lock().await.clone(), 0)
     }
 }
 
@@ -255,20 +342,36 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
             0,
         ),
         spec: state.spec.clone(),
-        program: record.template.exec.clone().unwrap_or_default(),
-        args: record.template.command.clone().unwrap_or_default(),
+        program: record.template.exec.clone().unwrap_or_else(|| {
+            if record.template.script.is_some() {
+                "/bin/sh".into()
+            } else {
+                Default::default()
+            }
+        }),
+        args: record
+            .template
+            .script
+            .as_ref()
+            .map(|script| vec!["-c".into(), script.clone()])
+            .unwrap_or_else(|| record.template.command.clone().unwrap_or_default()),
         env: record
             .template
             .env
             .iter()
             .filter_map(|(key, value)| match value {
                 EnvValue::Plain(value) => Some((key.clone(), value.clone())),
-                // Refused at submit; never reaches a node.
+                // The owned runner decrypts the original template at execution.
                 EnvValue::Encrypted(_) => None,
             })
+            .chain(std::iter::once((
+                "RELIABURGER_JOB_NAME".into(),
+                record.name.clone(),
+            )))
             .collect(),
         held,
         stopping: state.stop_reason().is_some(),
+        replay_unknown: true,
     }
 }
 
@@ -280,7 +383,14 @@ pub fn sync_request_for(arrays: &TaskArrays, node: &NodeId) -> NodeSyncRequest {
         known: arrays.ids(),
         arrays: arrays
             .active()
-            .map(|(batch_id, record)| assignment_for(batch_id, record, node))
+            .map(|(batch_id, record)| {
+                let mut assignment = assignment_for(batch_id, record, node);
+                assignment.replay_unknown = arrays
+                    .jobs()
+                    .run(batch_id)
+                    .is_none_or(|run| run.replay_unknown);
+                assignment
+            })
             .collect(),
     }
 }
@@ -399,6 +509,26 @@ pub(crate) fn spawn_leader_loop(state: ApiState) {
 }
 
 async fn is_leading(state: &ApiState) -> bool {
+    if state
+        .task_arrays
+        .storage_fenced
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return false;
+    }
+
+    if let Some(store) = &state.task_arrays.standalone {
+        let store = store.clone();
+        if !tokio::task::spawn_blocking(move || {
+            store.lock().map(|store| store.ready()).unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+
     match &state.council {
         Some(council) => council.is_leader().await,
         None => true,
@@ -423,6 +553,74 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
     targets
 }
 
+async fn fire_due_schedules(state: &ApiState) {
+    let now = crate::meat::batch_tracker::epoch_now_secs();
+    let Ok(minute) = i64::try_from(now / 60) else {
+        return;
+    };
+    let arrays = read_task_arrays(state).await;
+    if arrays
+        .cron_observed_minute()
+        .is_none_or(|seen| minute > seen)
+    {
+        if write_task_array(state, TaskArrayWrite::CronObserve { minute })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    } else if arrays
+        .cron_observed_minute()
+        .is_some_and(|seen| minute < seen)
+    {
+        return;
+    }
+    let Ok(at) = time::OffsetDateTime::from_unix_timestamp(i64::try_from(now).unwrap_or(i64::MAX))
+    else {
+        return;
+    };
+    let claims = match &state.council {
+        Some(council) => council.desired_state().await.prerequisite_claims,
+        None => Default::default(),
+    };
+    for (key, record) in arrays
+        .jobs()
+        .definitions()
+        .filter(|(_, record)| {
+            record.last_observed_minute.is_none_or(|seen| seen < minute)
+                && record.definition.cron.as_ref().is_some_and(|cron| {
+                    crate::meat::cron::CronSchedule::parse(&cron.expression)
+                        .is_ok_and(|schedule| schedule.matches(at))
+                })
+        })
+        .take(16)
+    {
+        let Some((namespace, name)) = key.split_once('/') else {
+            continue;
+        };
+        if claims.values().any(|claim| claim.blocks(name, namespace)) {
+            continue;
+        }
+        if !is_leading(state).await {
+            return;
+        }
+        if let Err(error) = write_task_array(
+            state,
+            TaskArrayWrite::Job(Box::new(crate::meat::job::JobWrite::Fire {
+                name: name.into(),
+                namespace: namespace.into(),
+                revision: record.revision,
+                minute,
+                now_epoch_secs: now,
+            })),
+        )
+        .await
+        {
+            eprintln!("bun: cron {key}: {error}");
+        }
+    }
+}
+
 async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     if !is_leading(state).await {
         memory.since = None;
@@ -432,6 +630,8 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         state.task_arrays.rates.lock().await.clear();
         return;
     }
+    super::job_apply::settle(state).await;
+    fire_due_schedules(state).await;
     let now = Instant::now();
     let since = *memory.since.get_or_insert(now);
     let (arrays, version) = match &state.council {
@@ -444,7 +644,16 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             };
             (desired.task_arrays, version)
         }
-        None => (read_task_arrays(state).await, Default::default()),
+        None => {
+            let (arrays, revision) = local_snapshot(&state.task_arrays).await;
+            (
+                arrays,
+                super::task_array_node::ControlVersion {
+                    index: revision,
+                    ..Default::default()
+                },
+            )
+        }
     };
     if !is_leading(state).await {
         return;
@@ -507,16 +716,28 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         );
         lost.extend(refusing_holders(record, &for_array));
         for node in lost {
-            eprintln!(
-                "bun: task array {batch_id}: {node} can't finish its chunks; requeueing them"
-            );
-            let write = TaskArrayWrite::Requeue {
-                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
-                batch_id,
-                node,
+            let write = if arrays
+                .jobs()
+                .run(batch_id)
+                .is_some_and(|run| !run.replay_unknown)
+            {
+                if arrays
+                    .jobs()
+                    .run(batch_id)
+                    .is_some_and(|run| run.unknown_owners.contains(&node))
+                {
+                    continue;
+                }
+                TaskArrayWrite::Unknown { batch_id, node }
+            } else {
+                TaskArrayWrite::Requeue {
+                    now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                    batch_id,
+                    node,
+                }
             };
             if let Err(error) = write_task_array(state, write).await {
-                eprintln!("bun: task array {batch_id}: requeue failed: {error}");
+                eprintln!("bun: task array {batch_id}: owner-loss write failed: {error}");
             }
         }
         if let Some(write) = plan_sync(batch_id, record, &for_array)
@@ -686,7 +907,10 @@ mod tests {
         assert_eq!(assignment.args, vec!["frame", "{index}"]);
         assert_eq!(
             assignment.env,
-            vec![("PLAIN".to_string(), "yes".to_string())]
+            vec![
+                ("PLAIN".to_string(), "yes".to_string()),
+                ("RELIABURGER_JOB_NAME".to_string(), "render".to_string())
+            ]
         );
         assert!(!assignment.stopping);
         assert!(assignment_for(1, &record, &node("b")).held.is_empty());

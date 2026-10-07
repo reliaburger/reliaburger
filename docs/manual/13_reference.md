@@ -83,6 +83,25 @@ and keeps the cache. `relish uninstall` then removes the CLI, the tools, the
 cache and the Lima home (plus `context.lock` when no `context.json` is left),
 and leaves anything else under `~/.reliaburger`.
 
+## Job commands and identities
+
+| Command | Purpose |
+|---------|---------|
+| `relish jobs` | Bounded run summaries, backlog and accepted rates |
+| `relish jobs --definitions` | Definitions, revisions and durable UTC schedules |
+| `relish run --batch NAME --image IMAGE -- COMMAND` | Indexed run, count one by default |
+| `relish run --batch NAME --count N --schedule "0 3 * * *" --image IMAGE -- COMMAND` | Register a durable array schedule |
+| `relish batch watch ID` | Counts, queue, accepted rates and duration buckets |
+| `relish batch results ID --index N` | One accepted task outcome |
+| `relish batch logs ID --index N` | Retained head/tail output |
+| `relish logs NAME --namespace NS --instance run-ID` | Singleton log stream selected by run |
+| `relish batch cancel ID` | Cancel one run or all profiles in its parent |
+| `relish batch replay ID --node NODE --grant-digest DIGEST --acknowledge-side-effects` | Acknowledge repeated effects for exact unknown grants |
+
+Use returned IDs; physical executor slots can be reused. Ordinary TOML jobs,
+cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
+for retry, overlap, retention, supported runtimes and API shapes.
+
 ## Files on a node
 
 `relish setup` puts `bun` in `~/.reliaburger/bin` as `bun-vX.Y.Z` plus a `bun`
@@ -93,7 +112,7 @@ under systemd or another supervisor yourself. Bun's own data goes where
 
 | Setting | Default |
 |---------|---------|
-| `[storage] data` | `/var/lib/reliaburger/data` (Raft, ownership records, identity) |
+| `[storage] data` | `/var/lib/reliaburger/data` (Raft, standalone `job-state/jobs.json`, worker ledgers, ownership records, identity) |
 | `[storage] images` | `/var/lib/reliaburger/images` |
 | `[storage] logs` | `/var/lib/reliaburger/logs` |
 | `[storage] metrics` | `/var/lib/reliaburger/metrics` |

@@ -1334,10 +1334,12 @@ async fn dns_responder_non_internal_times_out() {
     let (_map_tx, map_rx) = tokio::sync::watch::channel(ServiceMap::new());
     let shutdown = CancellationToken::new();
 
-    // Point upstream at a non-existent resolver so forwarding times out
+    // Keep an owned upstream silent. A VM may transparently proxy port 53
+    // even for TEST-NET addresses, so an external address cannot prove timeout.
+    let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
-        upstream: "192.0.2.1:53".parse().unwrap(), // TEST-NET, unreachable
+        upstream: upstream.local_addr().unwrap(),
         upstream_timeout: Duration::from_millis(500),
         source_namespaces: tokio::sync::watch::channel(
             reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(

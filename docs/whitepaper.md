@@ -247,7 +247,28 @@ image = "cleanup:latest"
 schedule = "0 3 * * *"
 ```
 
-**High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions. The bin-packing allocator ships; the full delegated dispatch-and-completion pipeline is a Phase 12 deliverable (see [design/scheduler-meat.md](design/scheduler-meat.md) §5.2). On-demand and scheduled Jobs run today.
+**Common execution lifecycle (0.2.0 development):** A definition describes work;
+a run fixes its revision and trigger. A singleton is an indexed run with count
+one. Manual jobs, arrays, cron and deployment hooks share placement, node-local
+CPU/memory admission, owned attempts, cancellation and durable results. The
+leader grants chunks of indexes; workers start each attempt when its actual
+request fits beside applications. A chunk of 1,000 isn't 1,000 simultaneously
+reserved jobs. Mixed manifests group distinct resource profiles.
+
+Cron claims a UTC minute and creates its run in one durable transaction. Default
+overlap is forbidden and missed minutes are skipped; clock rollback and leader
+changes can't replay claimed occurrences. Deployment intent pins hook results
+and gates app publication on accepted success. Standalone operation persists
+the same state before acknowledging work.
+
+Known failures follow the run's attempt policy. Ordinary jobs and hooks keep an
+unknown outcome owned until a user acknowledges replay; bulk work can opt into
+at-least-once retry. Neither policy promises exactly-once external effects.
+Encrypted templates and authorised scripts retain namespace and host-execution
+checks. Bounded summaries, accepted rates, backlog, duration histograms and
+selected result pages replace listing millions of jobs. The daily throughput
+claim still needs sustained qualification, including container launch cost,
+resource demand, storage and service quality. See the [job manual](manual/14_batch-jobs.md).
 
 **Image builds:** `relish build` builds container images from `[build.*]` declarations and pushes them to Pickle. A `destination` field (a `pickle://` reference) scopes registry access. This is a manual build path; Lettuce does not dispatch build jobs or inject `${GIT_SHA}` into their tags.
 
@@ -1124,7 +1145,7 @@ See the [AI implementation sequence](plans/2026-10-04-plan-delegated-jobs.md#ai-
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
-100M jobs a day remains an unqualified design target (§2). The 0.2.0 development implementation keeps arrays compact in Raft and expands them on workers. On-demand and cron jobs still use the ordinary per-job path; high-volume callers use arrays or mixed-profile manifests.
+100M jobs a day remains an unqualified design target (§2). The 0.2.0 development implementation keeps arrays compact in Raft and expands them on workers. Singleton jobs, cron and hooks create runs through the same indexed path as arrays. High-volume callers compress repeated work into arrays or mixed-profile manifests.
 
 The leader grants chunks: "Node 7, here are your next 200 indexes." Workers execute within their shared CPU/memory budget. A leader-driven HTTP sync accepts durable aggregate completions and retransmits grants; per-task ledgers and indexes stay on workers. This removes global placement and Raft writes per task. Runtime startup, resource demand, storage, result retention and application service quality still determine whether a particular cluster can sustain the daily target. The [qualification report](qualification/2026-10-04-delegated-jobs/README.md) records the evidence and the remaining sustained gate.
 

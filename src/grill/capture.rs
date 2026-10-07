@@ -42,6 +42,70 @@ pub async fn read_capture_chunk(path: &Path, offset: u64) -> io::Result<Vec<u8>>
     Ok(chunk)
 }
 
+/// A bounded tail and the exact complete-line positions from the same snapshot.
+/// Resume after these positions so a live follower never duplicates the tail.
+#[derive(Default)]
+pub(crate) struct TailSnapshot {
+    pub text: String,
+    pub offsets: CaptureOffsets,
+}
+
+impl TailSnapshot {
+    pub fn add(
+        &mut self,
+        path: PathBuf,
+        bytes: &[u8],
+        start: u64,
+        identity: Option<CaptureFileIdentity>,
+    ) {
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+        let first = if start == 0 {
+            0
+        } else {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(complete, |at| at + 1)
+        };
+        self.text
+            .push_str(&String::from_utf8_lossy(&bytes[first..complete]));
+        self.offsets.0.insert(path.clone(), start + complete as u64);
+        if let Some(identity) = identity {
+            self.offsets.1.insert(path, identity);
+        }
+    }
+    pub async fn files(stem: &Path) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut snapshot = Self::default();
+        for suffix in ["stdout", "stderr"] {
+            let path = stem.with_extension(suffix);
+            let Ok(mut file) = tokio::fs::File::open(&path).await else {
+                continue;
+            };
+            let Ok(meta) = file.metadata().await else {
+                continue;
+            };
+            let start = meta.len().saturating_sub(1024 * 1024);
+            if file.seek(io::SeekFrom::Start(start)).await.is_err() {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if file
+                .take(meta.len() - start)
+                .read_to_end(&mut bytes)
+                .await
+                .is_ok()
+            {
+                snapshot.add(path, &bytes, start, Some(CaptureFileIdentity::of(&meta)));
+            }
+        }
+        snapshot
+    }
+}
+
 /// Turns chunks of one captured stream into [`CapturedLine`]s.
 #[derive(Debug)]
 pub struct CaptureReader {
@@ -70,6 +134,14 @@ impl CaptureReader {
             #[cfg(test)]
             read_test_gate: None,
         }
+    }
+
+    /// Resume an in-memory stream at a snapshot position. No file checkpoint
+    /// or persistent identity is implied by this process-local byte offset.
+    pub(crate) fn memory_at(stream: LogStream, offset: u64) -> Self {
+        let mut reader = Self::new(stream, None);
+        reader.consumed = offset;
+        reader
     }
 
     /// A reader for the capture `file` of `stream`, positioned where the log

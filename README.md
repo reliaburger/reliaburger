@@ -102,12 +102,14 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
+  - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
   - `relish batch watch <ID>`: Watch rates, bounded profile summaries and duration distributions
   - `relish batch cancel <ID>`: Cancel an array or mixed manifest and retire its active attempts
   - `relish batch results <ID>`: Read a bounded indexed page of accepted task outcomes
   - `relish batch logs --index <INDEX> <ID>`: Print a failed task's output (the first and last 2 KiB)
-- `relish run --batch <NAME> --count <COUNT> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
+- `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
 - `relish batch-status <ID>`: Show the progress of a submitted batch
+- `relish jobs`: List bounded job run summaries and rates, or durable schedule definitions
 
 **Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
 
@@ -284,9 +286,8 @@ ask it to.
 
 Batch jobs retain distinct execution identities and their original scoped
 labels across retries and recovery. Finite durable history keeps replay fences;
-see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and batches share
-committed capacity reservations across leader changes. Clustered admission
-requires current, unexpired reports and refuses new work on retired nodes.
+see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and job attempts share node CPU/memory admission. Committed grants and
+accepted outcomes survive leader changes; retired nodes receive no new work.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
@@ -335,9 +336,12 @@ Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
 The [common job lifecycle plan](docs/plans/2026-10-07-plan-common-job-lifecycle.md)
-tracks unifying singleton jobs, batches, cron and deployment hooks (#638).
-The definition/run model is the first step; public job and cron paths still
-use their existing implementations during this work.
+describes the common definition/run/task/attempt path for singleton jobs,
+arrays, durable UTC cron and deployment hooks (#638). The development API,
+CLI and dashboard show bounded summaries and accepted rates. Ordinary jobs and
+hooks require acknowledged replay after an unknown outcome; standalone admission
+is durable. See the [job manual](docs/manual/14_batch-jobs.md) for policies and
+runtime limits.
 
 ## Limits in 0.1.6
 

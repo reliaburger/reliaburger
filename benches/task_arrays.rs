@@ -128,6 +128,7 @@ fn chunk_work(count: u32, chunk: u32, program: &str, args: &[&str]) -> ChunkWork
         },
         chunk: ChunkId(chunk),
         grant_attempt: 1,
+        replay_unknown: true,
         program: PathBuf::from(program),
         args: args.iter().map(|a| a.to_string()).collect(),
         env: Vec::new(),

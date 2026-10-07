@@ -1702,9 +1702,17 @@ impl BunClient {
         // The agent's own endpoint answers plain text with no instance or
         // time on each line, so it can't honour these filters: an empty
         // answer is the answer.
-        if options.instance.is_some() || options.end.is_some() || options.stream.is_some() {
+        let selected_run = options.instance.as_deref().is_some_and(|id| {
+            id.strip_prefix("run-")
+                .is_some_and(|id| id.parse::<u64>().is_ok())
+        });
+        if options.end.is_some()
+            || options.stream.is_some()
+            || (options.instance.is_some() && (!selected_run || options.start.is_some()))
+        {
             return Ok(String::new());
         }
+
         // Fall back to the local agent endpoint (process logs that
         // haven't been ingested into the LogStore yet)
         self.logs_local(app, namespace, options).await
@@ -2499,11 +2507,37 @@ impl BunClient {
         })
     }
 
+    /// Bounded common run summaries or reusable schedule definitions.
+    pub async fn job_summaries(&self, definitions: bool) -> Result<serde_json::Value, RelishError> {
+        self.get_json(if definitions {
+            "/v1/jobs/definitions"
+        } else {
+            "/v1/batch/summaries"
+        })
+        .await
+    }
+    /// An operator decision bound to the exact unknown owner generations.
+    pub async fn replay_job(
+        &self,
+        id: u64,
+        node: &str,
+        digest: &str,
+    ) -> Result<serde_json::Value, RelishError> {
+        let response = self
+            .http()?
+            .post(format!("{}/v1/jobs/runs/{id}/replay", self.base_url))
+            .json(&serde_json::json!({"node":node,"grant_digest":digest,"acknowledged":true}))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
     /// Submit a task array (`POST /v1/batch/array`).
     pub async fn submit_task_array(
         &self,
         request: &crate::bun::task_array_api::TaskArraySubmitRequest,
-    ) -> Result<crate::bun::task_array_api::TaskArraySubmitResponse, RelishError> {
+    ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch/array", self.base_url);
         let response = self
             .http()?

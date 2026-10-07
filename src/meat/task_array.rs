@@ -56,6 +56,7 @@ pub struct ChunkId(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskArraySpec {
     /// Number of tasks; indices run from 0 to `count - 1`.
+    #[serde(default = "default_count")]
     pub count: u32,
     /// Tasks per chunk.
     #[serde(default = "default_chunk_size")]
@@ -67,13 +68,17 @@ pub struct TaskArraySpec {
     /// for good. `None` never stops early.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_failed_indexes: Option<u32>,
-    /// Per-attempt wall-clock limit.
+    /// Per-attempt wall-clock limit; zero disables the deadline.
     #[serde(default = "default_task_timeout_secs")]
     pub task_timeout_secs: u32,
     /// Most tasks of this array one node runs at once. `None` lets each
     /// node use its configured safety cap, further bounded by resource requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_node_concurrency: Option<u32>,
+}
+
+fn default_count() -> u32 {
+    1
 }
 
 fn default_chunk_size() -> u32 {
@@ -153,7 +158,7 @@ impl TaskArraySpec {
                 max_attempts: self.max_attempts,
             });
         }
-        if self.task_timeout_secs == 0 || self.task_timeout_secs > MAX_TASK_TIMEOUT_SECS {
+        if self.task_timeout_secs > MAX_TASK_TIMEOUT_SECS {
             return Err(TaskArraySpecError::TimeoutOutOfRange {
                 seconds: self.task_timeout_secs,
             });
@@ -202,17 +207,13 @@ pub fn validate_template(template: &JobSpec) -> Result<(), TaskArraySpecError> {
             field: "a template larger than 16 KiB",
         });
     }
-    if template.image.is_some() && template.exec.is_some() {
+    if usize::from(template.image.is_some())
+        + usize::from(template.exec.is_some())
+        + usize::from(template.script.is_some())
+        != 1
+    {
         return Err(TaskArraySpecError::UnsupportedTemplate {
-            found: "both image and exec",
-        });
-    }
-    if template.script.is_some() {
-        return Err(TaskArraySpecError::UnsupportedTemplate { found: "a script" });
-    }
-    if template.exec.is_none() && template.image.is_none() {
-        return Err(TaskArraySpecError::UnsupportedTemplate {
-            found: "a template without image or exec",
+            found: "a template without exactly one of image, exec or script",
         });
     }
     if template.cpu.is_some_and(|r| r.request == 0)
@@ -220,11 +221,6 @@ pub fn validate_template(template: &JobSpec) -> Result<(), TaskArraySpecError> {
     {
         return Err(TaskArraySpecError::TemplateField {
             field: "a zero CPU or memory request",
-        });
-    }
-    if template.env.values().any(|value| value.is_encrypted()) {
-        return Err(TaskArraySpecError::TemplateField {
-            field: "encrypted environment values",
         });
     }
     if template.schedule.is_some() {
@@ -282,6 +278,33 @@ mod tests {
             exec: Some(PathBuf::from("/usr/local/bin/rb-task")),
             script: None,
         }
+    }
+
+    #[test]
+    fn a_zero_attempt_timeout_means_no_deadline_for_long_running_work() {
+        let mut spec = TaskArraySpec::with_count(1);
+        spec.task_timeout_secs = 0;
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn common_templates_accept_authorised_scripts_and_encrypted_environment() {
+        let mut job = exec_template(&[]);
+        job.exec = None;
+        job.script = Some("echo {index}".into());
+        job.env.insert(
+            "TOKEN".into(),
+            crate::config::types::EnvValue::Encrypted("ciphertext".into()),
+        );
+        assert_eq!(validate_template(&job), Ok(()));
+        job.exec = Some("/bin/true".into());
+        assert!(validate_template(&job).is_err());
+    }
+
+    #[test]
+    fn omitted_task_count_means_one() {
+        let spec: TaskArraySpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(spec, TaskArraySpec::with_count(1));
     }
 
     #[test]
@@ -369,10 +392,12 @@ mod tests {
             ),
             (
                 TaskArraySpec {
-                    task_timeout_secs: 0,
+                    task_timeout_secs: MAX_TASK_TIMEOUT_SECS + 1,
                     ..base.clone()
                 },
-                TaskArraySpecError::TimeoutOutOfRange { seconds: 0 },
+                TaskArraySpecError::TimeoutOutOfRange {
+                    seconds: MAX_TASK_TIMEOUT_SECS + 1,
+                },
             ),
             (
                 TaskArraySpec {

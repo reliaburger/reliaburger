@@ -1067,23 +1067,23 @@ can't recreate a runtime ID whose predecessor might still be alive. Runc
 containers follow the same rule, down to requiring a normal unmount of the root
 filesystem before their address is released.
 
-Jobs need one more thing: memory. Suppose a database migration fails twice and
-Bun restarts during the third attempt. The old recovery code rebuilt every
-workload with a zero retry counter, handing the migration a fresh budget on
-every restart. Bun now writes a job checkpoint *before* calling the runtime. Its
-phase is an enum (`Preparing`, `Launching`, `Exited { code }`, `Unknown`,
-`Stopping`, `Stopped`), and the split between the first two matters. If Bun
-crashes after claiming a retry but before the runtime replaces the old launch
-record, a naive recovery reads the *previous* attempt's exit code as this one's.
-A recovered `Preparing` attempt never inherits an old exit code. A job that
-vanished without a recorded exit becomes `Unknown` and isn't retried
-automatically, because its side effects may already have happened;
-`relish apply jobs.toml --rerun-jobs` runs it again on purpose.
+Jobs need one more thing: memory. Suppose a migration performs its external
+write and Bun disappears before recording its result. A fresh retry budget would
+repeat that write. The common lifecycle stores definition revision, trigger and
+policy before dispatch; the worker stores launch intent before starting. Known
+failures use the attempt budget. An unfinished conservative attempt becomes
+`Unknown` after restart and retains its owner. A user can acknowledge replay
+with the exact grant digest after checking its external effects.
 
-Cron schedules are checkpointed too, before Bun acknowledges a registration or a
-stop, and each due minute is claimed on disk before launch. If Bun dies in
-between, that occurrence is skipped, not replayed. We'd rather miss a backup
-than run a migration twice.
+The leader evaluates UTC cron and atomically records each matching occurrence
+with its run. Registration starts from the current minute. Default overlap is
+forbidden and missed minutes are skipped; skipped and launched occurrences both
+advance the durable cursor. It survives leadership changes, definition updates,
+pruning and clock rollback. Standalone uses the same state machine with private
+fsync'd JSON. Deployment hooks create common runs too; app publication waits for
+accepted success even after the submitting leader leaves.
+[Chapter 12](12-squeezing-every-drop.md#definitions-runs-and-durable-trigger-identities)
+walks through these contracts.
 
 A cron step can be larger than the field it advances. `59/255` still means
 minute 59, once an hour. The parser walks a bounded inclusive range with
@@ -1095,6 +1095,12 @@ the expression too, so a malformed schedule fails before it reaches the
 agent's command loop.
 
 ## Batch scheduling
+
+The allocator below explains the original finite-batch design. Public jobs now
+use the common lifecycle: bounded finite groups contain count-one runs; repeated
+work uses compact arrays and mixed profiles. Nodes acquire capacity per actual
+attempt. The old internal callbacks remain covered for retained ownership
+fixtures; they aren't public submission.
 
 Submitting a batch can start a host process just as applying a job can. We check the caller's token role and app/namespace scope, the namespace's `deploy` grant, and `host-exec` for an explicit binary or script before registering or dispatching any job. Followers make the same check and forward the caller's credential, so the leader rechecks its current permission map. Using the cluster service token for that hop would turn a restricted user into a system principal.
 

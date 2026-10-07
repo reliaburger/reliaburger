@@ -1,10 +1,90 @@
 # Batch jobs
 
-Development preview for 0.2.0. Build the PR #266 binaries and use a fresh
-cluster: protocol 48 and state 65 change the control messages, snapshots and
-worker ledgers. Production submissions require a council so definitions and
-identities survive restart; standalone in-memory execution is a test harness.
-The published 0.1.5 binaries do not have these commands.
+Development preview for 0.2.0. Build matching development binaries and start a
+fresh cluster: protocol 48 and state 65 change control messages and durable
+state. Published 0.1.5 binaries don't have this lifecycle. A council replicates
+cluster definitions and runs; standalone Bun persists the same state in private
+`job-state/jobs.json` before acknowledging admission.
+
+## One lifecycle, several triggers
+
+A definition stores reusable work and policies. A run captures its revision and
+trigger identity. Tasks and attempts belong to that run. An ordinary job has one
+task; arrays add indexes to the same placement, resource admission, runtime,
+result, retry and cancellation machinery.
+
+```toml
+[job.migrate]
+image = "database-tools:v1"
+command = ["/migrate"]
+run_before = ["app.api"]
+
+[app.api]
+image = "api:v2"
+
+[job.cleanup]
+image = "database-tools:v1"
+command = ["/cleanup"]
+schedule = "0 3 * * *"
+```
+
+`relish apply jobs.toml` records a durable deployment operation. Required
+`run_before` jobs must have accepted successful outcomes before applications are
+published. Hook dependencies name applications in this apply and namespace;
+arbitrary task dependency graphs aren't supported. Ordinary jobs are admitted
+when application publication succeeds. A disconnected client or a new leader
+can resume the operation from the same accepted run identities.
+
+Ordinary TOML jobs get four attempts for known failures; deployment hooks get one
+attempt, so a failed migration is not repeated automatically. Ordinary jobs have no implicit
+runtime deadline; hooks have a 600-second deadline. An uncertain attempt outcome
+becomes `Unknown`, retains ownership and prevents automatic replay, even after
+worker restart or disappearance. A successful launch isn't evidence of successful
+work. Explicit bulk submissions retain at-least-once replay, including a
+one-element array. This is a retry policy on the common engine.
+
+Cron uses five fields in UTC. Registration starts with the next matching minute.
+The leader atomically claims the occurrence and admits its run. Default overlap
+is `forbid`; JSON definitions can select `allow`. Both skip missed minutes, with
+no catch-up queue. Skipped overlapping occurrences advance the cursor too.
+Registration and observation cursors survive leader changes, result pruning and
+clock rollback. A conservative definition with unknown ownership skips new
+occurrences even when overlap is allowed.
+
+```sh
+relish jobs
+relish jobs --definitions
+relish --output json batch-status 42
+relish batch cancel 42
+relish stop cleanup
+```
+
+`jobs` shows bounded run summaries, backlog and accepted rates; `--definitions`
+includes dormant schedules and revisions. Stop disables future occurrences and
+cancels retained runs. Deleting a definition doesn't erase uncertain ownership.
+Deployment inventory and cancellation use `/v1/deploys/operations` and
+`/v1/deploys/cancel/OPERATION_ID`. Cancellation is durable; capacity and gates
+remain held until workers positively retire their launches.
+
+Inspect an `Unknown` summary's owner and grant digest before deciding to repeat
+work:
+
+```sh
+relish batch replay 42 --node worker-2 --grant-digest DIGEST --acknowledge-side-effects
+```
+
+Replay acknowledges that external effects may happen again. The digest identifies
+those exact unknown grants; repeating an old acknowledgement can't authorise a
+later unknown attempt. The cluster service principal cannot make this decision.
+
+Singleton status and logs use `run-ID`, a stable identifier independent of the
+worker's reusable runtime slot. `relish status` reports a live singleton's PID;
+indexed batches stay in summary views. Select `--instance run-ID` when several
+retained runs share a logical name. Live logs follow the owning worker and
+completed singleton output remains bounded by the task-output retention policy.
+Apps, reusable job definitions and retained job runs cannot share the same name
+and namespace across workload kinds. Delete the definition and wait for its run
+receipts to be pruned before reusing that identity for an app.
 
 ## Submit compact work
 
@@ -26,7 +106,8 @@ packing; rootful Linux containers enforce limits. Omitted values mean 1 CPU and
 status. Images are bound to a digest at submission and must pass the cluster's Pickle
 and upstream trust policies, including required cosign signatures.
 
-Every task receives `RELIABURGER_TASK_INDEX`, `RELIABURGER_TASK_COUNT`, `RELIABURGER_BATCH_ID` and `RELIABURGER_TASK_ATTEMPT`.
+`--count` defaults to one. Add `--schedule "0 3 * * *"` to register an array
+schedule without an immediate run. Every task receives `RELIABURGER_TASK_INDEX`, `RELIABURGER_TASK_COUNT`, `RELIABURGER_BATCH_ID` and `RELIABURGER_TASK_ATTEMPT`.
 Its identity is the array ID and index; retries keep that identity. The job image and command apply to
 all indexes; build separate profiles when resources or commands differ.
 
@@ -85,10 +166,11 @@ contact at most eight workers. A page can end earlier when tiny chunks span
 more workers. An
 empty failure page can still contain `next_after`: continue with that cursor.
 Only the worker and grant whose completion was accepted can supply an outcome
-or failed-task output. Unreachable workers are explicit; successful tasks keep
-no output. Control reports keep exact failure counts and at most 256 index
+or retained task output. Unreachable workers are explicit. Singletons keep bounded successful output as
+well as failure output; larger arrays discard successful output. Control reports keep exact failure counts and at most 256 index
 ranges per chunk; indexed detail remains available beyond that preview.
-Failure output retains a bounded head and tail. Never interpret
+Retained output keeps a bounded head and tail. Singleton live stdout/stderr also
+uses ordinary log capture under its logical name, namespace and `run-ID` selector. Never interpret
 missing detail as success. A missing or corrupt result index is an explicit
 error; rebuilding it is worker recovery, rather than an unbounded page read.
 Use the child array ID for results and logs. Each profile index has a 1 MiB
@@ -109,15 +191,18 @@ capacity during backoff.
 
 ## Execution and capacity limits
 
-Execution is at least once. A lost worker or a crash before a durable outcome
+Explicit bulk execution is at least once. Ordinary jobs and hooks use
+acknowledged replay for unknown outcomes. A lost worker or a crash before a durable outcome
 can rerun a task, so external effects need a stable business idempotency key.
 Array ID and index identify a task within this cluster history; backup rollback
 or a new cluster can reuse those IDs. Grant fencing prevents accepting an obsolete result; it cannot undo
-an external effect. Submission timeouts have an uncertain outcome: check the
-retained summary list before submitting again, since a new submission creates
-new task identities. Workers repair an incomplete ledger tail before appending,
+an external effect. Submission timeouts have an uncertain outcome. Reuse the same `Idempotency-Key`
+for array, finite group or apply admission; the JSON definition endpoint uses
+`request_id`. Changed content under a retained identity is refused. Dedupe lasts
+while that receipt is retained; a new request creates new identities. Workers repair an incomplete ledger tail before appending,
 commit incremental outcomes in groups and acknowledge chunks only after
-outcomes and their result index are durable. Storage failure cancels local work
+outcomes and their result index are durable. Standalone admission reserves sparse progress within its 64 MiB store before
+accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
 
 After council disaster recovery advances the recovery epoch, workers with old
@@ -127,15 +212,21 @@ worker data before resuming batch execution; a restart alone cannot clear the
 refusal. Fresh workers can join the recovered epoch. Ordinary leader failover
 within the same epoch continues to reconcile existing results.
 
-Image tasks require the rootful Linux owned runtime. Runtime slots reuse cached
-image layers and bounded instance identities per namespace; each attempt still has its own
-container launch and fresh temporary scratch space. The image root is read
-only. Container tasks have a 1 MiB limit per regular output or scratch file
-(`RLIMIT_FSIZE`), so logging cannot fill the disk without bound. GPU jobs, encrypted task environment, scripts, cron and dependency hooks
-are refused. Host tasks require the owned process runtime, an absolute allowlisted
-binary and disabled mount isolation. That backend cannot enforce CPU/memory
-limits, so explicit resource ranges are refused. Prefer image tasks for shared
-clusters.
+Arrays containing multiple image tasks require the rootful Linux owned runtime.
+Singletons use the configured owned container or process runtime, preserving its
+supported limits. Unsupported explicit CPU/memory limits are refused on process
+and rootless runtimes. Slots reuse cached image layers and bounded instance
+identities; every attempt gets a fresh launch. Singleton container roots are
+writable. Larger arrays use a read-only root, temporary scratch and a 1 MiB limit
+per regular output or scratch file (`RLIMIT_FSIZE`).
+
+Authorised scripts and encrypted environment values use the common path. Workers
+decrypt with live keys for the job's namespace. Decrypted configuration stays
+execution-local; captured output uses normal scoped retention. Host jobs require the owned process runtime, an absolute
+allowlisted binary (or `/bin/sh` for scripts) and disabled mount isolation.
+That backend cannot enforce explicit resource ranges. GPU jobs remain refused;
+GPU placement is tracked separately in #359. Test-lease workloads retain their
+lease-aware admission; unowned lease namespaces and images are refused here.
 
 With eBPF enabled, image tasks inherit their namespace before starting. They
 may reach services in that namespace; cross-namespace services are refused.
@@ -166,3 +257,24 @@ Namespace app quotas currently govern ordinary app placement, not delegated
 array resource usage. Scope checks still apply to submission and reads. Use
 admission limits and dedicated capacity for mutually untrusted batch tenants
 until tenant resource allocation is added.
+
+## API admission shapes
+
+`POST /v1/jobs/runs` accepts `name`, optional `namespace`, a `definition` and a
+manual `request_id`. A definition has `template`, optional `tasks` (count one by
+default), optional `cron` (`expression`, `overlap`, `missed`) and
+`replay_unknown` (false by default). `tasks.task_timeout_secs = 0` means no
+deadline. JSON task-policy defaults remain three attempts and 600 seconds;
+set them explicitly when submitting a side-effecting job.
+
+`POST /v1/batch` admits up to 64 distinct named singleton jobs atomically,
+returning a parent ID and each `run-ID`. `assigned` reports accepted jobs,
+which may still wait for a worker; use summaries for queued or refused work.
+Group repeated commands/resources into compact manifests rather than sending a
+separate definition per index.
+
+`POST /v1/batch/array` and `/v1/batch/manifest` admit compact repeated work.
+`GET /v1/jobs/definitions` lists scoped definitions without secret templates.
+`POST /v1/jobs/definitions/NAME/NAMESPACE/disable` disables future occurrences.
+`POST /v1/jobs/runs/ID/replay` requires `node`, `grant_digest` and
+`acknowledged=true`, under a user credential with current workload permissions.

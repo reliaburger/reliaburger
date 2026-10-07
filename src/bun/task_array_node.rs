@@ -75,6 +75,8 @@ pub struct ArrayAssignment {
     pub held: Vec<HeldChunk>,
     /// The array has stopped: finish nothing new, report what's held.
     pub stopping: bool,
+    /// Whether a missing outcome may be executed again after worker restart.
+    pub replay_unknown: bool,
 }
 
 /// Orders cluster recovery, leadership and committed assignment revisions.
@@ -293,6 +295,21 @@ impl TaskArrayNode {
         self
     }
 
+    /// The private runtime slot of an active singleton; absent for bulk or synthetic runners.
+    pub(crate) fn singleton_runtime(
+        &self,
+        run: u64,
+    ) -> Option<(
+        crate::grill::AnyGrill,
+        crate::grill::InstanceId,
+        super::task_runtime::SingletonLogBinding,
+    )> {
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => runner.singleton_runtime(run),
+            _ => None,
+        }
+    }
+
     /// Where this node keeps one array's files.
     pub fn array_dir(&self, batch_id: u64) -> PathBuf {
         self.config.root.join(batch_id.to_string())
@@ -428,6 +445,14 @@ impl TaskArrayNode {
 
     /// Whether this node may run the array's binary at all.
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
+        if assignment
+            .template
+            .as_ref()
+            .is_some_and(|template| template.env.values().any(|value| value.is_encrypted()))
+            && !matches!(self.runner.as_ref(), NodeRunner::Owned(_))
+        {
+            return Err("encrypted templates require the owned runtime and namespace keys".into());
+        }
         if assignment.resources.cpu_millicores == 0
             || assignment.resources.memory_bytes == 0
             || assignment.resources.gpus != 0
@@ -446,7 +471,15 @@ impl TaskArrayNode {
             .is_some_and(|t| t.image.is_some())
         {
             return match self.runner.as_ref() {
-                NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
+                NodeRunner::Owned(runner)
+                    if runner.supports_containers()
+                        || (assignment.spec.count == 1
+                            && assignment.template.as_ref().is_some_and(|template| {
+                                runner.supports_singleton_image(template)
+                            })) =>
+                {
+                    Ok(())
+                }
                 NodeRunner::Fake(_) => Ok(()),
                 _ => Err("container tasks require the rootful owned Linux runtime".into()),
             };
@@ -568,6 +601,7 @@ impl TaskArrayNode {
             }
         }
         if changed {
+            run.pool.counters().unknown.store(false, Ordering::Relaxed);
             let path = self.array_dir(assignment.batch_id).join("grants.json");
             let highest = run.highest.clone();
             let persisted =
@@ -602,6 +636,43 @@ impl TaskArrayNode {
             if run.chunks.contains_key(&chunk) {
                 continue;
             }
+            if !assignment.replay_unknown {
+                let complete = run.resumed.get(&chunk).is_some_and(|records| {
+                    assignment
+                        .spec
+                        .chunk_range(ChunkId(chunk))
+                        .is_some_and(|range| {
+                            let expected = usize::try_from(range.end() - range.start() + 1)
+                                .unwrap_or(usize::MAX);
+                            let unique: std::collections::BTreeSet<_> = records
+                                .iter()
+                                .filter(|record| record.grant_attempt == attempt)
+                                .map(|record| record.index)
+                                .collect();
+                            unique.len() == expected
+                        })
+                });
+                let marker = self
+                    .array_dir(assignment.batch_id)
+                    .join(format!("started-{chunk}-{attempt}"));
+                let authorised =
+                    tokio::task::spawn_blocking(move || match std::fs::metadata(&marker) {
+                        Ok(_) => Ok(complete),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            crate::sesame::identity::atomic_write_mode(
+                                &marker,
+                                b"started",
+                                Some(0o600),
+                            )?;
+                            Ok(true)
+                        }
+                        Err(error) => Err(error),
+                    })
+                    .await;
+                if !matches!(authorised, Ok(Ok(true))) {
+                    return refused(assignment.batch_id, "unknown execution or unavailable launch fence; acknowledged replay required".into());
+                }
+            }
             let cancel = run.cancel.child_token();
             run.chunks.insert(chunk, (attempt, cancel.clone()));
             let work = ChunkWork {
@@ -610,6 +681,7 @@ impl TaskArrayNode {
                 spec: assignment.spec.clone(),
                 chunk: ChunkId(chunk),
                 grant_attempt: attempt,
+                replay_unknown: assignment.replay_unknown,
                 program: assignment.program.clone(),
                 args: assignment.args.clone(),
                 env: assignment.env.clone(),
@@ -634,6 +706,12 @@ impl TaskArrayNode {
             ));
         }
 
+        if !assignment.stopping && run.pool.counters().unknown.load(Ordering::Relaxed) {
+            return refused(
+                assignment.batch_id,
+                "unknown execution outcome; acknowledged replay required".into(),
+            );
+        }
         let counters = run.pool.counters();
         ArrayProgress {
             batch_id: assignment.batch_id,
@@ -777,7 +855,7 @@ impl TaskArrayNode {
             .into_iter()
             .next()
             .ok_or(TaskArrayNodeError::NoOutput { index })?;
-        if row.succeeded || row.not_run {
+        if row.not_run {
             return Err(TaskArrayNodeError::NoOutput { index });
         }
         self.task_output_grant(batch_id, index, row.grant_attempt)
@@ -942,7 +1020,13 @@ fn write_outputs(directory: &Path, outputs: &[(u32, u64, CapturedOutput)]) -> st
             bytes.extend_from_slice(&output.tail);
         }
         use std::io::Write;
-        let mut file = std::fs::File::create(directory.join(format!("{index}-{grant}")))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(directory.join(format!("{index}-{grant}")))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
@@ -1005,7 +1089,37 @@ mod tests {
                 })
                 .collect(),
             stopping: false,
+            replay_unknown: true,
         }
+    }
+
+    #[tokio::test]
+    async fn singleton_images_use_the_configured_owned_runtime_without_claiming_unsupported_limits()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = assignment(1, 1, &[(0, 1)]);
+        task.template = Some(Box::new(
+            toml::from_str("image='proc-grill:image-ignored'\ncommand=['true']").unwrap(),
+        ));
+        let runner = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
+            crate::grill::ProcessGrill::new(),
+        ));
+        let node = TaskArrayNode::new(
+            TaskArrayNodeConfig::for_data_dir(dir.path(), ProcessWorkloadsConfig::default()),
+            NodeRunner::Owned(Box::new(runner)),
+        );
+        assert!(node.admit(&task).is_ok());
+        task.template.as_mut().unwrap().cpu = Some(crate::config::types::ResourceRange {
+            request: 100,
+            limit: 100,
+        });
+        assert!(node.admit(&task).is_err());
+        task.template.as_mut().unwrap().cpu = None;
+        task.spec.count = 100;
+        assert!(
+            node.admit(&task).is_err(),
+            "bulk containers still require the rootful Linux backend"
+        );
     }
 
     fn request(arrays: Vec<ArrayAssignment>) -> NodeSyncRequest {
@@ -1035,6 +1149,41 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_conservative_grant_cannot_restart_without_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let mut a = assignment(1, 10, &[]);
+        a.replay_unknown = false;
+        let req = request(vec![a.clone()]);
+        assert!(node.sync(&req).await.arrays[0].refused.is_none());
+        std::fs::write(node.array_dir(1).join("started-0-1"), b"started").unwrap();
+        a.held = vec![HeldChunk {
+            chunk: ChunkId(0),
+            attempt: 1,
+        }];
+        let req = request(vec![a.clone()]);
+        assert!(
+            node.sync(&req).await.arrays[0]
+                .refused
+                .as_deref()
+                .unwrap()
+                .contains("unknown")
+        );
+        assert_eq!(
+            node.arrays.lock().await[&1]
+                .pool
+                .counters()
+                .attempts_started
+                .load(Ordering::Relaxed),
+            0
+        );
+        a.held[0].attempt = 2;
+        let req = request(vec![a]);
+        let progress = sync_until_finished(&node, &req, 1).await;
+        assert_eq!(progress.finished[0].succeeded, 10);
     }
 
     #[tokio::test]

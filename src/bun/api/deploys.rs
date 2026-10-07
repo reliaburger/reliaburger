@@ -8,6 +8,7 @@ pub(super) async fn deploy_cancel_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(response) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -47,6 +48,51 @@ pub(super) async fn deploy_cancel_handler(
             return response;
         }
     }
+    let arrays = crate::bun::task_array_leader::read_task_arrays(&state).await;
+    if arrays.deployments().any(|(operation, _)| operation == id) {
+        if let Some(council) = &state.council
+            && !council.is_leader().await
+        {
+            return crate::bun::batch::forward_to_leader(
+                &state,
+                council,
+                &format!("/v1/deploys/operations/{id}/cancel"),
+                String::new(),
+                &headers,
+            )
+            .await;
+        }
+        let _gate = if state.council.is_none() {
+            Some(state.task_arrays.apply_gate.clone().lock_owned().await)
+        } else {
+            None
+        };
+        if let Err(error) = crate::bun::task_array_leader::write_task_array(
+            &state,
+            crate::meat::task_array_store::TaskArrayWrite::DeployCancel {
+                operation_id: id.clone(),
+                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+            },
+        )
+        .await
+        {
+            return crate::bun::job_api::write_error(error);
+        }
+        let arrays = crate::bun::task_array_leader::read_task_arrays(&state).await;
+        if let Some((_, record)) = arrays.deployments().find(|(operation, _)| *operation == id) {
+            let operation = durable_operation(&id, record, &arrays);
+            return (
+                if operation.outcome.is_some() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                Json(operation),
+            )
+                .into_response();
+        }
+        return (StatusCode::NOT_FOUND, "deploy operation no longer retained").into_response();
+    }
     let (response, result) = oneshot::channel();
     let request = async {
         state
@@ -80,9 +126,12 @@ pub(super) async fn deploy_cancel_handler(
     }
 }
 
-/// `GET /v1/deploys/active` — list active deploys.
-pub(super) async fn deploys_active_handler(State(state): State<ApiState>) -> Response {
-    match deploy_operation_snapshot(&state).await {
+/// `GET /v1/deploys/active` — bounded, scoped operation summaries.
+pub(super) async fn deploys_active_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    match scoped_snapshot(&state, auth.as_deref()).await {
         Ok(snapshot) => Json(crate::bun::deploy_operations::ActiveDeployOperations {
             active_deploys: snapshot.active_deploys,
         })
@@ -91,49 +140,143 @@ pub(super) async fn deploys_active_handler(State(state): State<ApiState>) -> Res
     }
 }
 
-/// `GET /v1/deploys/operations` — active operations and bounded recent
-/// terminal history, using the same stable record shape for both.
-pub(super) async fn deploys_operations_handler(State(state): State<ApiState>) -> Response {
-    match deploy_operation_snapshot(&state).await {
+/// `GET /v1/deploys/operations` — active intent and bounded settled receipts.
+pub(super) async fn deploys_operations_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    match scoped_snapshot(&state, auth.as_deref()).await {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(response) => response,
     }
 }
 
-// `Response` is large but it IS the HTTP reply to send on failure —
-// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
+async fn scoped_snapshot(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, Response> {
+    let mut snapshot = deploy_operation_snapshot(state).await?;
+    let visible = |operation: &crate::bun::deploy_operations::DeployOperation| {
+        operation.targets.iter().all(|target| {
+            crate::sesame::auth::authorize_scoped(auth, &target.name, &target.namespace).is_ok()
+        })
+    };
+    snapshot.active_deploys.retain(visible);
+    snapshot.history.retain(visible);
+    Ok(snapshot)
+}
+
+fn durable_operation(
+    id: &str,
+    record: &crate::meat::job_deploy::DeploymentRecord,
+    arrays: &crate::meat::task_array_store::TaskArrays,
+) -> crate::bun::deploy_operations::DeployOperation {
+    use crate::bun::deploy_operations::{
+        DeployOperation, DeployOperationOutcome, DeployOperationPhase, DeployTarget,
+        DeployTargetKind,
+    };
+    let mut targets: Vec<_> = record
+        .config
+        .app
+        .iter()
+        .map(|(name, spec)| DeployTarget {
+            kind: DeployTargetKind::App,
+            name: name.clone(),
+            namespace: spec.namespace.clone().unwrap_or_else(|| "default".into()),
+        })
+        .chain(record.config.job.iter().map(|(name, spec)| DeployTarget {
+            kind: DeployTargetKind::Job,
+            name: name.clone(),
+            namespace: spec.namespace.clone().unwrap_or_else(|| "default".into()),
+        }))
+        .collect();
+    targets.sort();
+    let unknown = record.runs().any(|id| {
+        arrays
+            .jobs()
+            .run(id)
+            .is_some_and(|run| !run.unknown_owners.is_empty())
+    });
+    let outcome = record.outcome.map(|outcome| match outcome {
+        crate::meat::job_deploy::DeploymentOutcome::Completed => DeployOperationOutcome::Completed,
+        crate::meat::job_deploy::DeploymentOutcome::Failed => DeployOperationOutcome::Failed,
+        crate::meat::job_deploy::DeploymentOutcome::Cancelled => DeployOperationOutcome::Cancelled,
+    });
+    DeployOperation {
+        id: id.into(),
+        phase: if record.completed {
+            DeployOperationPhase::Finished
+        } else if record.apps_committed {
+            DeployOperationPhase::DeployingJobs
+        } else {
+            DeployOperationPhase::Accepted
+        },
+        outcome,
+        started_at: record.submitted_at_epoch_secs,
+        phase_changed_at: record.finished_at.unwrap_or(record.submitted_at_epoch_secs),
+        finished_at: record.finished_at,
+        cancellation_requested_at: record.cancelled.then_some(record.submitted_at_epoch_secs),
+        targets,
+        current_target: None,
+        message: if record.completed {
+            "durable deployment settled"
+        } else if unknown {
+            "unknown run ownership; inspect runs before acknowledging replay"
+        } else if record.cancelled {
+            "cancellation recorded; waiting for positive retirement"
+        } else if record.apps_committed {
+            "apps published; jobs admitted"
+        } else {
+            "waiting for accepted successful hooks"
+        }
+        .into(),
+    }
+}
+
+// Response is the exact HTTP failure returned by callers.
 #[allow(clippy::result_large_err)]
 pub(super) async fn deploy_operation_snapshot(
     state: &ApiState,
 ) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, Response> {
+    use crate::bun::deploy_operations::DeployOperationSnapshot;
+    let arrays = crate::bun::task_array_leader::read_task_arrays(state).await;
+    let mut snapshot = DeployOperationSnapshot {
+        active_deploys: Vec::new(),
+        history: Vec::new(),
+    };
+    for (id, record) in arrays.deployments() {
+        let operation = durable_operation(id, record, &arrays);
+        if record.completed {
+            snapshot.history.push(operation);
+        } else {
+            snapshot.active_deploys.push(operation);
+        }
+    }
     let (response, result) = oneshot::channel();
-    state
-        .cmd_tx
-        .send(AgentCommand::DeployOperations { response })
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "agent unavailable"})),
-            )
-                .into_response()
-        })?;
-    tokio::time::timeout(std::time::Duration::from_secs(2), result)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({"error": "agent deploy-state query timed out"})),
-            )
-                .into_response()
-        })?
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "agent unavailable"})),
-            )
-                .into_response()
-        })
+    let request = async {
+        state
+            .cmd_tx
+            .send(AgentCommand::DeployOperations { response })
+            .await
+            .ok()?;
+        result.await.ok()
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), request).await {
+        Ok(Some(local)) => {
+            snapshot.active_deploys.extend(local.active_deploys);
+            snapshot.history.extend(local.history);
+        }
+        _ if snapshot.active_deploys.is_empty() && snapshot.history.is_empty() => {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "agent unavailable").into_response());
+        }
+        _ => {}
+    }
+    snapshot
+        .history
+        .sort_by_key(|operation| std::cmp::Reverse(operation.finished_at));
+    snapshot.history.truncate(70);
+    Ok(snapshot)
 }
 
 #[derive(Deserialize)]

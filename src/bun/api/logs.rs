@@ -67,6 +67,55 @@ async fn resolve_log_path_inner(
     namespace: &str,
     instance: Option<&str>,
 ) -> Result<crate::bun::agent::LogExecutionSelection, Response> {
+    if instance.is_none() && !app.starts_with("run-") {
+        let arrays = crate::bun::task_array_leader::read_task_arrays(state).await;
+        let mut runs = arrays.jobs().runs().filter(|(id, run)| {
+            run.name == app
+                && run.namespace == namespace
+                && arrays
+                    .get(*id)
+                    .is_some_and(|record| record.state.spec.count == 1)
+        });
+        if let Some((id, _)) = runs.next() {
+            if runs.next().is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "several runs are retained; select --instance run-ID",
+                )
+                    .into_response());
+            }
+            return Ok(crate::bun::agent::LogExecutionSelection {
+                logical_name: app.into(),
+                instances: vec![format!("run-{id}")],
+                selected_instance: Some(format!("run-{id}")),
+            });
+        }
+    }
+    let run_selector = instance.or_else(|| app.starts_with("run-").then_some(app));
+    if let Some(selector) = run_selector
+        && let Some(id) = selector
+            .strip_prefix("run-")
+            .and_then(|id| id.parse::<u64>().ok())
+    {
+        let arrays = crate::bun::task_array_leader::read_task_arrays(state).await;
+        if let Some(record) = arrays.get(id)
+            && arrays.jobs().run(id).is_some()
+            && record.namespace == namespace
+            && (record.name == app || selector == app)
+            && record.state.spec.count == 1
+        {
+            return Ok(crate::bun::agent::LogExecutionSelection {
+                logical_name: record.name.clone(),
+                instances: vec![format!("run-{id}")],
+                selected_instance: Some(format!("run-{id}")),
+            });
+        }
+        return Err((
+            StatusCode::NOT_FOUND,
+            "selected run does not belong to this workload and namespace",
+        )
+            .into_response());
+    }
     let resolved = ask_agent_bounded(&state.cmd_tx, |response| {
         AgentCommand::ResolveExecutionLogs {
             app_name: app.into(),
@@ -157,6 +206,33 @@ async fn owned_follow_node(
     instance: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> Result<Option<crate::meat::NodeId>, Response> {
+    if let Some(id) = instance
+        .and_then(|id| id.strip_prefix("run-"))
+        .and_then(|id| id.parse::<u64>().ok())
+    {
+        let arrays = crate::bun::task_array_leader::read_task_arrays(state).await;
+        let record = arrays
+            .get(id)
+            .filter(|record| {
+                record.name == app && record.namespace == namespace && record.state.spec.count == 1
+            })
+            .ok_or_else(agent_unavailable)?;
+        let mut held = record.state.holders();
+        let owner = record
+            .state
+            .accepted_grant(crate::meat::task_array::ChunkId(0))
+            .map(|(owner, _)| owner)
+            .or_else(|| held.next().cloned())
+            .ok_or_else(agent_unavailable)?;
+        if !super::super::task_array_api::every_node(state)
+            .await
+            .iter()
+            .any(|(node, _)| node == &owner)
+        {
+            return Err(agent_unavailable());
+        }
+        return Ok(Some(owner));
+    }
     let Some(council) = &state.council else {
         return Ok(None);
     };
@@ -234,6 +310,7 @@ pub(super) async fn logs_handler(
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(mut query): Query<LogsQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(response) = log_metadata_preflight(auth.as_deref(), &namespace, &query) {
         return response;
@@ -343,6 +420,29 @@ pub(super) async fn logs_handler(
             .into_response();
     }
 
+    if let Some(id) = query
+        .instance
+        .as_deref()
+        .and_then(|instance| instance.strip_prefix("run-"))
+        .and_then(|id| id.parse::<u64>().ok())
+    {
+        let response =
+            crate::bun::task_array_api::logs_handler(State(state), auth, Path((id, 0)), headers)
+                .await;
+        if !response.status().is_success() {
+            return response;
+        }
+        let bytes = match axum::body::to_bytes(response.into_body(), 16384).await {
+            Ok(bytes) => bytes,
+            Err(_) => return agent_unavailable(),
+        };
+        let logs = String::from_utf8_lossy(&bytes);
+        let logs = query.tail.map_or_else(
+            || logs.to_string(),
+            |tail| super::super::agent::tail_lines(&logs, tail),
+        );
+        return Json(serde_json::json!({"logs":logs})).into_response();
+    }
     match ask_agent(&state.cmd_tx, |response| AgentCommand::LogCaptures {
         instances: selection.instances,
         tail: query.tail,
@@ -373,6 +473,97 @@ pub(super) async fn follow_local_logs(
     label: Option<String>,
 ) -> Result<mpsc::Receiver<String>, Response> {
     let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
+    if let Some(id) = instance
+        .as_deref()
+        .and_then(|value| value.strip_prefix("run-"))
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let node = state
+            .task_arrays
+            .node
+            .clone()
+            .ok_or_else(agent_unavailable)?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let prefix = label
+                .map(|node| format!("[{node} run-{id}] "))
+                .unwrap_or_default();
+            loop {
+                if lines_tx.is_closed() {
+                    return;
+                }
+                if let Some((runtime, physical, binding)) = node.singleton_runtime(id) {
+                    let retired = binding.retired();
+                    let offsets = if let Some(tail) = tail {
+                        let snapshot = tokio::select! {
+                            biased;
+                            () = retired.cancelled() => return,
+                            snapshot = runtime.tail_snapshot(&physical) => snapshot,
+                        };
+                        let text = super::super::agent::tail_lines(&snapshot.text, tail);
+                        for line in text.lines() {
+                            if lines_tx.send(format!("{prefix}{line}")).await.is_err() {
+                                return;
+                            }
+                        }
+                        snapshot.offsets
+                    } else {
+                        Default::default()
+                    };
+                    let (captured_tx, mut captured_rx) = mpsc::channel(64);
+                    let producer = tokio::spawn(async move {
+                        binding
+                            .follow(&runtime, &physical, captured_tx, &offsets)
+                            .await;
+                    });
+                    while let Some(captured) = captured_rx.recv().await {
+                        if lines_tx
+                            .send(format!("{prefix}{}", captured.line))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    producer.abort();
+                    let _ = producer.await;
+                    return;
+                }
+                let arrays = crate::bun::task_array_leader::read_task_arrays(&state).await;
+                let Some(record) = arrays.get(id) else {
+                    return;
+                };
+                if record.state.status().is_terminal() {
+                    if let Some((_, grant)) = record
+                        .state
+                        .accepted_grant(crate::meat::task_array::ChunkId(0))
+                        && let Ok(bytes) = node.task_output_grant(id, 0, grant).await
+                    {
+                        let text = String::from_utf8_lossy(&bytes);
+                        let text = tail.map_or_else(
+                            || text.to_string(),
+                            |tail| super::super::agent::tail_lines(&text, tail),
+                        );
+                        for line in text.lines() {
+                            if lines_tx.send(format!("{prefix}{line}")).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    return;
+                }
+                if arrays
+                    .jobs()
+                    .run(id)
+                    .is_some_and(|run| !run.unknown_owners.is_empty())
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        return Ok(lines_rx);
+    }
     state
         .cmd_tx
         .send(AgentCommand::FollowLogs {

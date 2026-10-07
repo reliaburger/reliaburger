@@ -351,6 +351,34 @@ impl ProcessGrill {
         self.read_stream(instance, false).await
     }
 
+    pub(crate) async fn tail_snapshot(
+        &self,
+        instance: &InstanceId,
+    ) -> super::capture::TailSnapshot {
+        if let Some(stem) = super::Grill::log_stem(self, instance).await {
+            return super::capture::TailSnapshot::files(&stem).await;
+        }
+        let buffers = {
+            let procs = self.processes.lock().await;
+            let Some(entry) = procs.get(instance) else {
+                return Default::default();
+            };
+            [entry.stdout_buf.clone(), entry.stderr_buf.clone()]
+        };
+        let mut snapshot = super::capture::TailSnapshot::default();
+        for (suffix, buffer) in ["stdout", "stderr"].into_iter().zip(buffers) {
+            let bytes = buffer.lock().await;
+            let start = bytes.len().saturating_sub(1024 * 1024);
+            snapshot.add(
+                PathBuf::from(format!("{}.{suffix}", instance.0)),
+                &bytes[start..],
+                start as u64,
+                None,
+            );
+        }
+        snapshot
+    }
+
     async fn read_stream(
         &self,
         instance: &InstanceId,
@@ -873,7 +901,12 @@ impl super::Grill for ProcessGrill {
             return control.log_stem(instance).ok();
         }
         let procs = self.processes.lock().await;
-        procs.get(instance).and_then(|e| e.log_stem.clone())
+        procs.get(instance).and_then(|entry| {
+            entry
+                .log_stem
+                .clone()
+                .or_else(|| self.log_dir.as_ref().map(|dir| dir.join(&instance.0)))
+        })
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
@@ -1003,7 +1036,12 @@ impl super::Grill for ProcessGrill {
                     )
                     .await
                 }
-                None => crate::grill::capture::CaptureReader::new(stream, None),
+                None => crate::grill::capture::CaptureReader::memory_at(
+                    stream,
+                    resume
+                        .get(&PathBuf::from(format!("{}.{suffix}", instance.0)))
+                        .unwrap_or(0),
+                ),
             };
             readers.push((reader, buffer));
         }

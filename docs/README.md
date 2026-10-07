@@ -1462,7 +1462,8 @@ a service. Build matching development binaries and use a fresh cluster (protocol
 and the still-unqualified 100m/day sustained throughput target.
 
 The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
-tracks #638. Its replicated definition/run model is in development; ordinary
-jobs, cron and hooks still use their existing submission paths until that
-wiring is complete. Executor reuse (#639), sustained throughput/demo (#640)
+describes #638: ordinary singleton jobs, arrays, durable UTC cron and deployment
+hooks share the definition/run/task/attempt lifecycle, resource admission and
+accepted-result machinery. Standalone admission persists before acknowledgement;
+conservative jobs retain unknown ownership until acknowledged replay. Executor reuse (#639), sustained throughput/demo (#640)
 and resident model workers (#641) follow separately.

@@ -9,9 +9,8 @@ use super::*;
 ///
 /// Cluster mode answers from the council's desired state (authoritative and
 /// cluster-wide: complete app, namespace and permission specifications),
-/// merged over the local agent's view (which contributes node-local jobs —
-/// jobs don't live in desired state). Standalone answers from the local
-/// agent alone.
+/// merged with legacy agent resources and durable common job definitions.
+/// Standalone uses its local agent plus the same persisted job definitions.
 pub(super) async fn current_apps_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -65,6 +64,46 @@ pub(super) async fn current_apps_handler(
                 },
             );
         }
+    }
+    let common = crate::bun::task_array_leader::read_task_arrays(&state).await;
+    for (key, definition) in common.jobs().definitions() {
+        let Some((namespace, name)) = key.split_once('/') else {
+            continue;
+        };
+        let mut spec = definition.definition.template.clone();
+        spec.schedule = definition
+            .definition
+            .cron
+            .as_ref()
+            .map(|policy| policy.expression.clone());
+        if let Some(original) = common
+            .deployments()
+            .filter_map(|(_, deployment)| {
+                deployment
+                    .config
+                    .job
+                    .get(name)
+                    .filter(|original| {
+                        original.namespace.as_deref().unwrap_or("default") == namespace
+                            && crate::meat::job::JobDefinition::from_spec((*original).clone())
+                                == definition.definition
+                    })
+                    .map(|original| (deployment.submitted_at_epoch_secs, original))
+            })
+            .max_by_key(|(submitted, _)| *submitted)
+            .map(|(_, spec)| spec)
+        {
+            spec = original.clone();
+        }
+        let resource = crate::config::fingerprint::job_resource_key(name, namespace);
+        resources.insert(
+            resource.clone(),
+            CurrentResourceStatus {
+                resource,
+                image: spec.image.clone(),
+                fingerprint: crate::config::fingerprint::job_fingerprint(&spec),
+            },
+        );
     }
     let rows: Vec<_> = resources
         .into_values()
@@ -262,43 +301,210 @@ pub(super) async fn local_top_rows(
     ))
 }
 
+/// Singleton runs retain the ordinary status view without expanding indexed jobs.
+pub(super) async fn common_local_statuses(state: &ApiState) -> Vec<InstanceStatus> {
+    use crate::grill::Grill;
+    use crate::meat::task_array::ChunkId;
+    let Some(node) = &state.task_arrays.node else {
+        return Vec::new();
+    };
+    let arrays = crate::bun::task_array_leader::read_task_arrays(state).await;
+    let local = crate::meat::NodeId::new(local_node_name(state));
+    let mut rows = Vec::new();
+    let mut observations = futures_util::stream::FuturesUnordered::new();
+    for (id, run) in arrays.jobs().runs() {
+        let Some(record) = arrays.get(id).filter(|record| record.state.spec.count == 1) else {
+            continue;
+        };
+        let owned = record.state.held_by(&local).is_some()
+            || record
+                .state
+                .accepted_grant(ChunkId(0))
+                .is_some_and(|(owner, _)| owner == local);
+        if state.council.is_some() && !owned {
+            continue;
+        }
+        let summary = record.state.summary();
+        let mut row = InstanceStatus {
+            id: format!("run-{id}"),
+            app_name: run.name.clone(),
+            namespace: run.namespace.clone(),
+            state: common_job_state(summary.status, !run.unknown_owners.is_empty()).into(),
+            restart_count: u32::try_from(summary.retried).unwrap_or(u32::MAX),
+            host_port: None,
+            exit_code: (summary.succeeded == 1).then_some(0),
+            pid: None,
+            runtime_unknown: !run.unknown_owners.is_empty(),
+            status_age_ms: None,
+        };
+        if let Some((runtime, physical, binding)) = node.singleton_runtime(id) {
+            let index = rows.len();
+            row.runtime_unknown = true;
+            observations.push(async move {
+                let retired = binding.retired();
+                let result = tokio::select! {
+                    biased;
+                    () = retired.cancelled() => Err(crate::grill::GrillError::StateUnavailable { instance: physical.clone(), reason: "original job runtime generation retired".into() }),
+                    result = async {
+                        let status = runtime.state(&physical).await?;
+                        let pid = runtime.pid(&physical).await?;
+                        Ok::<_, crate::grill::GrillError>((status, pid))
+                    } => result,
+                };
+                drop(binding);
+                (index, result)
+            });
+        } else if !summary.status.is_terminal() && !row.runtime_unknown {
+            row.state = "pending".into();
+        }
+        for view in state.task_arrays.node_views(id).await {
+            row.restart_count = row
+                .restart_count
+                .max(u32::try_from(view.counters.retried).unwrap_or(u32::MAX));
+        }
+        rows.push(row);
+    }
+    // One deadline for the bounded inventory, rather than two seconds per run.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while let Ok(Some((index, result))) =
+        tokio::time::timeout_at(deadline, observations.next()).await
+    {
+        if let Ok((status, pid)) = result {
+            let row = &mut rows[index];
+            row.pid = pid;
+            row.runtime_unknown = row.state == "unknown";
+            if !row.runtime_unknown {
+                row.state = match status {
+                    crate::grill::ContainerState::Running => "running",
+                    _ => "pending",
+                }
+                .into();
+            }
+        }
+    }
+    rows
+}
+
+fn common_job_state(
+    status: crate::meat::task_array_state::TaskArrayStatus,
+    unknown: bool,
+) -> &'static str {
+    use crate::meat::task_array_state::TaskArrayStatus;
+    if unknown && !status.is_terminal() {
+        return "unknown";
+    }
+    match status {
+        TaskArrayStatus::Succeeded => "stopped",
+        TaskArrayStatus::Failed | TaskArrayStatus::CompletedWithFailures => "failed",
+        TaskArrayStatus::Cancelled => "cancelled",
+        TaskArrayStatus::Stopping => "stopping",
+        TaskArrayStatus::Running => "running",
+    }
+}
+
 /// List all run-to-completion workload instances.
 ///
 /// `?cluster=true` merges every live member's jobs, each tagged with its
 /// node, and names any member that didn't answer. Either way the rows are
 /// trimmed to the caller's token scope.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct JobsQuery {
+    #[serde(default)]
+    cluster: bool,
+    #[serde(default)]
+    local: bool,
+}
+
 pub(super) async fn jobs_handler(
     State(state): State<ApiState>,
-    Query(query): Query<StatusQuery>,
+    Query(query): Query<JobsQuery>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
     let auth = auth.as_deref();
     let visible = |job: &crate::bun::agent::JobStatus| {
         crate::sesame::auth::authorize_scoped(auth, &job.name, &job.namespace).is_ok()
     };
-    let Ok(mut local) = ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
+    let mut common = Vec::new();
+    if !query.local {
+        let arrays = crate::bun::task_array_leader::read_task_arrays(&state).await;
+        let now = crate::meat::batch_tracker::epoch_now_secs();
+        for (id, run) in arrays.jobs().runs() {
+            let Some(record) = arrays.get(id) else {
+                continue;
+            };
+            let summary = record.state.summary();
+            let live_retries = state
+                .task_arrays
+                .node_views(id)
+                .await
+                .iter()
+                .map(|view| view.counters.retried)
+                .sum::<u64>();
+            common.push(crate::bun::agent::JobStatus {
+                name: run.name.clone(),
+                namespace: run.namespace.clone(),
+                instance_id: format!("run-{id}"),
+                image: record.template.image.clone().unwrap_or_else(|| {
+                    record
+                        .template
+                        .exec
+                        .as_ref()
+                        .map_or("script".into(), |path| path.display().to_string())
+                }),
+                state: common_job_state(summary.status, !run.unknown_owners.is_empty()).into(),
+                restart_count: u32::try_from(summary.retried.max(live_retries)).unwrap_or(u32::MAX),
+                age_seconds: now.saturating_sub(record.state.submitted_at_epoch_secs),
+            });
+        }
+        for (key, record) in arrays
+            .jobs()
+            .definitions()
+            .filter(|(_, record)| record.definition.cron.is_some())
+        {
+            let Some((namespace, name)) = key.split_once('/') else {
+                continue;
+            };
+            common.push(crate::bun::agent::JobStatus {
+                name: name.into(),
+                namespace: namespace.into(),
+                instance_id: format!("definition-{key}"),
+                image: record
+                    .definition
+                    .template
+                    .image
+                    .clone()
+                    .unwrap_or_else(|| "scheduled process".into()),
+                state: "scheduled".into(),
+                restart_count: 0,
+                age_seconds: 0,
+            });
+        }
+        common.retain(visible);
+    }
+    let local = match ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
         response,
     })
     .await
-    else {
-        return agent_unavailable();
+    {
+        Ok(local) => local,
+        Err(_) if !common.is_empty() => Vec::new(),
+        Err(_) => return agent_unavailable(),
     };
     if !query.cluster {
-        local.retain(visible);
-        return Json(local).into_response();
+        common.extend(local.into_iter().filter(visible));
+        return Json(common).into_response();
     }
     let (peers, warnings) = fan_out_to_peers::<Vec<crate::bun::agent::JobStatus>>(
         &state,
-        "/v1/jobs",
+        "/v1/jobs?local=true",
         CLUSTER_STATUS_TIMEOUT,
     )
     .await;
-    let mut jobs = crate::bun::cluster_view::merge_jobs(
-        std::iter::once((local_node_name(&state), local))
-            .chain(peers)
-            .collect(),
-    );
-    // Peers answered with the service token, which sees every namespace.
+    let mut answers: Vec<_> = std::iter::once((local_node_name(&state), local))
+        .chain(peers)
+        .collect();
+    answers.push(("cluster".into(), common));
+    let mut jobs = crate::bun::cluster_view::merge_jobs(answers);
     jobs.retain(|job| visible(&job.row));
     Json(crate::bun::cluster_view::ClusterJobs { jobs, warnings }).into_response()
 }

@@ -29,3 +29,6 @@ pub use types::{AppId, NodeCapacity, NodeId, Placement, Resources, SchedulingDec
 
 /// Reusable job definitions and durable trigger provenance.
 pub mod job;
+
+/// Durable deployment intent for the common job execution path.
+pub mod job_deploy;

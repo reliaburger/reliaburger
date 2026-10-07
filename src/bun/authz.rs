@@ -168,6 +168,16 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/apps", AnyToken),
     route(Get, "/v1/readiness", AnyToken),
     route(Get, "/v1/jobs", AnyToken),
+    route(Get, "/v1/jobs/definitions", AnyToken),
+    gated(Post, "/v1/jobs/runs", Deployer, Body(DEPLOY)),
+    // Replay additionally requires a user principal and exact side-effect acknowledgement.
+    gated(Post, "/v1/jobs/runs/{id}/replay", Deployer, Body(DEPLOY)),
+    gated(
+        Post,
+        "/v1/jobs/definitions/{name}/{namespace}/disable",
+        Deployer,
+        Body(DEPLOY),
+    ),
     route(Get, "/v1/events", AnyToken),
     route(Get, "/v1/ws/events", AnyToken),
     gated(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken, App(LOGS)),
@@ -500,7 +510,7 @@ mod tests {
                 for (index, _) in args.match_indices(pattern) {
                     let ident: String = args[index + pattern.len()..]
                         .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
                         .collect();
                     if ident.ends_with("_handler") {
                         handlers.push(ident);
@@ -551,6 +561,10 @@ mod tests {
     /// A mounted handler's body, from the file that mounts it or from one
     /// of api.rs's route modules.
     fn mounted_handler_body<'a>(source: &'a str, ident: &str) -> Option<&'a str> {
+        let ident = ident.strip_prefix("super::").unwrap_or(ident);
+        if let Some(ident) = ident.strip_prefix("job_api::") {
+            return handler_body(include_str!("job_api.rs"), ident);
+        }
         std::iter::once(source)
             .chain(API_ROUTE_MODULES.iter().copied())
             .find_map(|candidate| handler_body(candidate, ident))

@@ -43,7 +43,7 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
 // One module per route group. `router_with_upgrade` wires their handlers;
 // the helpers at the bottom of this file are the ones several groups share.
-mod apply;
+pub(crate) mod apply;
 mod apps;
 mod ca;
 mod deploys;
@@ -626,6 +626,19 @@ pub fn router_with_upgrade(
         .route("/v1/apps", get(current_apps_handler))
         .route("/v1/readiness", get(readiness_handler))
         .route("/v1/jobs", get(jobs_handler))
+        .route("/v1/jobs/runs", post(super::job_api::submit_handler))
+        .route(
+            "/v1/jobs/runs/{id}/replay",
+            post(super::job_api::replay_handler),
+        )
+        .route(
+            "/v1/jobs/definitions",
+            get(super::job_api::definitions_handler),
+        )
+        .route(
+            "/v1/jobs/definitions/{name}/{namespace}/disable",
+            post(super::job_api::disable_schedule_handler),
+        )
         .route("/v1/events", get(events_handler))
         .route("/v1/ws/events", get(ws_events_handler))
         .route("/v1/ws/logs/{app}/{namespace}", get(ws_logs_handler))
@@ -991,6 +1004,12 @@ pub(crate) async fn permission_map(
 }
 
 async fn local_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String> {
+    let mut rows = agent_statuses(state).await?;
+    rows.extend(status::common_local_statuses(state).await);
+    Ok(rows)
+}
+
+async fn agent_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String> {
     if let Some(reader) = &state.status {
         return reader.read().await.map_err(|error| error.to_string());
     }

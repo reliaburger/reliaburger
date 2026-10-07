@@ -1408,5 +1408,23 @@
     "function": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner",
     "binary": "reliaburger::owned_task_arrays",
     "test": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success"
   }
 ]

@@ -117,7 +117,7 @@ pub fn render_dashboard(data: &DashboardData) -> String {
     html.push_str(&render_apps_table_fragment(&data.apps));
     html.push_str("</div>\n</section>\n");
 
-    html.push_str("<section><h2>Batch jobs</h2><div hx-get=\"/ui/fragment/batches\" hx-trigger=\"load, every 3s\" hx-swap=\"innerHTML\">Loading summaries…</div></section>\n");
+    html.push_str("<section><h2>Job runs and schedules</h2><div hx-get=\"/ui/fragment/batches\" hx-trigger=\"load, every 3s\" hx-swap=\"innerHTML\">Loading summaries…</div></section>\n");
 
     // Nodes table (HTMX-polled)
     html.push_str("<section>\n<h2>Nodes</h2>\n");
@@ -167,16 +167,24 @@ pub fn escape_html(s: &str) -> String {
 /// Render aggregate counters only. Names remain escaped like other dashboard input.
 pub fn render_batches(rows: &[serde_json::Value]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Batch</th><th>Namespace</th><th>State</th><th>Succeeded / total</th><th>Failed</th><th>Queued</th><th>Accepted successes/s</th><th>Profiles</th></tr></thead><tbody>",
+        "<table><thead><tr><th>Run</th><th>Namespace</th><th>State</th><th>Succeeded / total</th><th>Failed</th><th>Queued</th><th>Accepted successes/s</th><th>Profiles</th></tr></thead><tbody>",
     );
     for row in rows {
         let name = escape_html(row["name"].as_str().unwrap_or("?"));
         let ns = escape_html(row["namespace"].as_str().unwrap_or("default"));
         let status = escape_html(row["status"].as_str().unwrap_or("unknown"));
+        if row["kind"] == "schedule" {
+            let expression = escape_html(row["cron"]["expression"].as_str().unwrap_or("?"));
+            html.push_str(&format!("<tr><td>{name}</td><td>{ns}</td><td>{status}</td><td colspan=\"5\">UTC schedule: {expression}; {} tasks per occurrence</td></tr>", row["total"]));
+            continue;
+        }
         let rate = row["rates"]["successes_per_second"]
             .as_f64()
             .map_or("unknown".into(), |r| format!("{r:.1}"));
         html.push_str(&format!("<tr><td>{} {name}</td><td>{ns}</td><td>{status}</td><td>{} / {}</td><td>{}</td><td>{}</td><td>{rate}</td><td>{}</td></tr>", row["batch_id"].as_u64().unwrap_or(0), row["succeeded"].as_u64().unwrap_or(0), row["total"].as_u64().unwrap_or(0), row["failed"].as_u64().unwrap_or(0), row["queued"].as_u64().unwrap_or(0), row["cohorts"].as_array().map_or(1, Vec::len)));
+        if row["status"] == "Unknown" {
+            html.push_str("<tr><td colspan=\"8\">Outcome unknown: keep ownership or choose acknowledged replay after checking side effects. Inspect the scoped run summary for the exact owner and grant digest; use <code>relish batch replay</code>.</td></tr>");
+        }
     }
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"8\">No retained batches</td></tr>");
@@ -188,6 +196,24 @@ pub fn render_batches(rows: &[serde_json::Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_definitions_show_a_schedule_without_a_fabricated_run_zero() {
+        let html = render_batches(&[
+            serde_json::json!({"kind":"schedule","name":"nightly","namespace":"default","status":"Scheduled","cron":{"expression":"0 3 * * *"},"total":1}),
+        ]);
+        assert!(html.contains("0 3 * * *"));
+        assert!(!html.contains("0 nightly"));
+    }
+
+    #[test]
+    fn unknown_run_summaries_explain_the_required_operator_decision() {
+        let html = render_batches(&[
+            serde_json::json!({"batch_id":1,"name":"migrate","status":"Unknown","unknown_owners":[{"node":"lost","grant_digest":"digest"}],"total":1}),
+        ]);
+        assert!(html.contains("acknowledged replay"));
+        assert!(html.contains("relish batch replay"));
+    }
 
     #[test]
     fn render_empty_dashboard() {

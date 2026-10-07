@@ -77,7 +77,7 @@ enum Command {
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
-        /// Explicitly rerun jobs with unknown outcomes on the selected node.
+        /// Request another job run; unresolved outcomes require grant-specific replay.
         #[arg(long, conflicts_with = "dry_run")]
         rerun_jobs: bool,
     },
@@ -362,6 +362,11 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
+    /// List bounded job run summaries and rates, or durable schedule definitions.
+    Jobs {
+        #[arg(long)]
+        definitions: bool,
+    },
     /// Submit a batch of jobs, or manage a task array.
     #[command(args_conflicts_with_subcommands = true, arg_required_else_help = true)]
     Batch {
@@ -387,9 +392,12 @@ enum Command {
         /// run so far).
         #[arg(long = "batch", value_name = "NAME")]
         batch: String,
-        /// Number of tasks.
-        #[arg(long)]
+        /// Number of tasks; one uses the same indexed executor.
+        #[arg(long, default_value_t = 1)]
         count: u32,
+        /// Register a durable five-field UTC cron schedule instead of running now.
+        #[arg(long)]
+        schedule: Option<String>,
         /// Host binary every task runs.
         #[arg(long, required_unless_present = "image", conflicts_with = "image")]
         exec: Option<PathBuf>,
@@ -886,6 +894,16 @@ enum BatchAction {
         /// Validate the manifest locally without submitting work.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Acknowledge repeating side effects for the exact unknown owner grants.
+    Replay {
+        id: u64,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        grant_digest: String,
+        #[arg(long, required = true)]
+        acknowledge_side_effects: bool,
     },
     /// Watch rates, bounded profile summaries and duration distributions.
     Watch {
@@ -1877,6 +1895,15 @@ async fn main() -> ExitCode {
             (Some(BatchAction::Watch { id, timeout }), _) => {
                 commands::watch_task_batch(id, timeout).await
             }
+            (
+                Some(BatchAction::Replay {
+                    id,
+                    node,
+                    grant_digest,
+                    ..
+                }),
+                _,
+            ) => commands::replay_job(id, &node, &grant_digest).await,
             (Some(BatchAction::Cancel { id }), _) => commands::batch_cancel(id).await,
             (
                 Some(BatchAction::Results {
@@ -1897,7 +1924,9 @@ async fn main() -> ExitCode {
                 reason: "give a [job.*] TOML file, or one of: cancel, results, logs".to_string(),
             }),
         },
+        Command::Jobs { definitions } => commands::jobs(definitions, cli.output).await,
         Command::Run {
+            schedule,
             batch,
             count,
             exec,
@@ -1914,6 +1943,7 @@ async fn main() -> ExitCode {
             args,
         } => {
             commands::run_task_array(commands::TaskArrayRun {
+                schedule,
                 name: batch,
                 namespace,
                 exec,
@@ -2376,6 +2406,51 @@ mod tests {
     // Import and export only exist with the default `kubernetes` feature, so
     // the README describes that build.
     #[cfg(feature = "kubernetes")]
+    #[test]
+    fn common_job_commands_accept_singletons_schedules_and_explicit_replay() {
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "run",
+                "--batch",
+                "single",
+                "--exec",
+                "/bin/true",
+                "--schedule",
+                "* * * * *"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["relish", "jobs", "--definitions"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "batch",
+                "replay",
+                "1",
+                "--node",
+                "lost",
+                "--grant-digest",
+                "digest",
+                "--acknowledge-side-effects"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "batch",
+                "replay",
+                "1",
+                "--node",
+                "lost",
+                "--grant-digest",
+                "digest"
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn readme_command_list_matches_the_cli() {
         use clap::CommandFactory;

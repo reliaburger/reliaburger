@@ -1,7 +1,7 @@
 # Plan: one job execution lifecycle
 
 Date: 7 October 2026. Issue: #638. Release: 0.2.0.
-Base: main after #266 (56ede9d9).
+Base: main after #266; rebased onto the 0.1.6 release updates (86c022e7).
 
 ## Contract
 
@@ -15,7 +15,8 @@ Manual submission, cron and deployment hooks create runs. They do not select
 separate execution engines. Keep the existing image digest/trust checks,
 namespace and host-execution authorisation, script policy, secret decryption and
 output behaviour. Preparation must finish before committing runnable work;
-plaintext secrets must not enter Raft or the worker outcome ledger.
+decrypted configuration stays execution-local rather than entering Raft or
+worker checkpoints. Captured output keeps its scoped retention contract.
 
 ## Durable definitions and triggers
 
@@ -84,15 +85,14 @@ subsequent work.
 
 ## Progress
 
-Fresh branch created from main after #266. The first implementation step adds
-bounded replicated definitions, immutable run provenance, atomic manual/hook
-trigger admission and cron occurrence transactions to the task-array store.
-State-machine preflight allocates no IDs for replays or deliberately skipped
-occurrences. Model and Raft regressions cover these behaviours.
+Implemented in PR #642 from main after #266. Public ordinary jobs, finite groups,
+arrays, leader-driven UTC cron and durable deployment hooks use common runs.
+Standalone admission persists the same state. Workers preserve script/secret
+and output contracts and fence conservative unknown outcomes. CLI, API,
+dashboard, manual, whitepaper and book use the common model.
 
-Portable CI and the multi-node cluster gate pass for this step. Public admission,
-leader cron firing, hooks, runtime contract preservation, unknown-outcome policy
-enforcement and standalone persistence remain pending. Before wiring cron, define
-its registration-time baseline and test clock rollback before the first firing.
-The draft PR remains open for the remaining steps; this model alone does not
-complete #638.
+The complete implementation passed portable CI, wall-clock acceptance, all
+cluster and upgrade cases, the provisioned Linux runtime gate and rootless
+acceptance ([qualification](../qualification/2026-10-07-common-jobs/README.md)).
+Checks on PR #642 record validation of the published revision. #638 closes only
+after that PR is merged.

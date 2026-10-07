@@ -7849,6 +7849,87 @@
       "boundaries": [
         "These image-backed cases require the warmed-image Linux gate; the network-isolated OCI interruption driver cannot substitute."
       ]
+    },
+    {
+      "id": "issue-638-a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+      "issue": 638,
+      "promise": "Cron occurrence IDs survive leader replacement without duplicate dispatch.",
+      "supported_paths": [
+        "Common job lifecycle with durable coordinator and worker state."
+      ],
+      "refused_paths": [
+        "No success from admission, stale ownership, or an unaccepted exit."
+      ],
+      "boundaries": [
+        "Real execution in the declared gate is required; synthetic evidence cannot qualify the runtime."
+      ],
+      "cases": [
+        {
+          "id": "common-a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-638-losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+      "issue": 638,
+      "promise": "Lost singleton owners remain unknown until exact acknowledged replay.",
+      "supported_paths": [
+        "Common job lifecycle with durable coordinator and worker state."
+      ],
+      "refused_paths": [
+        "No success from admission, stale ownership, or an unaccepted exit."
+      ],
+      "boundaries": [
+        "Real execution in the declared gate is required; synthetic evidence cannot qualify the runtime."
+      ],
+      "cases": [
+        {
+          "id": "common-losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-638-runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+      "issue": 638,
+      "promise": "Singleton API jobs and hooks execute in real containers with encrypted templates and accepted outcomes.",
+      "supported_paths": [
+        "Common job lifecycle with durable coordinator and worker state."
+      ],
+      "refused_paths": [
+        "No success from admission, stale ownership, or an unaccepted exit."
+      ],
+      "boundaries": [
+        "Real execution in the declared gate is required; synthetic evidence cannot qualify the runtime."
+      ],
+      "cases": [
+        {
+          "id": "common-runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ]
     }
   ]
 }

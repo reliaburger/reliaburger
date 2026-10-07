@@ -35,6 +35,26 @@ pub struct JobDefinition {
 }
 
 impl JobDefinition {
+    /// Normalise a TOML job into one indexed task, retaining its execution contract.
+    pub fn from_spec(mut template: JobSpec) -> Self {
+        let cron = template.schedule.take().map(|expression| CronPolicy {
+            expression,
+            overlap: OverlapPolicy::Forbid,
+            missed: MissedRunPolicy::Skip,
+        });
+        let hook = !template.run_before.is_empty();
+        template.run_before.clear();
+        let mut tasks = TaskArraySpec::with_count(1);
+        tasks.max_attempts = if hook { 1 } else { 4 };
+        tasks.task_timeout_secs = if hook { 600 } else { 0 };
+        Self {
+            template,
+            tasks,
+            cron,
+            replay_unknown: false,
+        }
+    }
+
     /// Validate the immutable definition before recording any revision or run.
     pub fn validate(&self) -> Result<(), String> {
         if serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > 20 * 1024) {
@@ -147,6 +167,8 @@ pub struct RunRecord {
     pub definition_digest: String,
     /// Captured unknown-outcome policy; definition updates cannot change it.
     pub replay_unknown: bool,
+    /// Owners whose execution outcome needs positive evidence or acknowledged replay.
+    pub unknown_owners: BTreeSet<crate::meat::NodeId>,
 }
 
 /// Deterministic job-definition and run transaction carried by the array store.
@@ -214,6 +236,7 @@ impl TryFrom<CatalogWire> for JobCatalog {
             validate_key(&run.namespace, &run.name)?;
             run.trigger.validate()?;
             if *id == 0
+                || run.unknown_owners.len() > 64
                 || run.revision == 0
                 || run.definition_digest.len() != 64
                 || !run.definition_digest.bytes().all(|b| b.is_ascii_hexdigit())
@@ -252,6 +275,30 @@ fn validate_key(namespace: &str, name: &str) -> Result<(), String> {
 }
 
 impl JobCatalog {
+    pub(crate) fn stop(&mut self, namespace: &str, name: &str, forget: bool) -> Result<(), String> {
+        let key = format!("{namespace}/{name}");
+        let record = self
+            .definitions
+            .get_mut(&key)
+            .ok_or("unknown job definition")?;
+        if record.definition.cron.is_some() {
+            record.revision = record
+                .revision
+                .checked_add(1)
+                .ok_or("job definition revision exhausted")?;
+            record.definition.cron = None;
+        }
+        if forget {
+            self.definitions.remove(&key);
+        }
+        Ok(())
+    }
+
+    /// Bounded retained provenance; never enumerates task indices.
+    pub fn runs(&self) -> impl Iterator<Item = (u64, &RunRecord)> {
+        self.runs.iter().map(|(id, run)| (*id, run))
+    }
+
     /// A reusable definition, including the durable cron cursor.
     pub fn definition(&self, namespace: &str, name: &str) -> Option<&DefinitionRecord> {
         self.definitions.get(&format!("{namespace}/{name}"))
@@ -260,6 +307,16 @@ impl JobCatalog {
     pub fn run(&self, id: u64) -> Option<&RunRecord> {
         self.runs.get(&id)
     }
+    /// Reusable definitions, bounded independently of task counts.
+    pub fn definitions(&self) -> impl Iterator<Item = (&str, &DefinitionRecord)> {
+        self.definitions
+            .iter()
+            .map(|(key, record)| (key.as_str(), record))
+    }
+    pub(crate) fn run_mut(&mut self, id: u64) -> Option<&mut RunRecord> {
+        self.runs.get_mut(&id)
+    }
+
     /// Bound run provenance by the same retained execution identities.
     pub(crate) fn retain_runs(&mut self, retained: &BTreeSet<u64>) {
         self.runs.retain(|id, _| retained.contains(id));
@@ -319,6 +376,16 @@ impl JobCatalog {
                         return Ok(JobPlan::Existing(*id));
                     }
                 }
+                if trigger.is_some()
+                    && self.runs.iter().any(|(id, run)| {
+                        active.contains(id)
+                            && run.name == *name
+                            && run.namespace == *namespace
+                            && !run.unknown_owners.is_empty()
+                    })
+                {
+                    return Err("an unknown run still owns this job; acknowledge replay before another admission".into());
+                }
                 let prior = self.definitions.get(&key);
                 let revision = match prior {
                     Some(record) if record.definition == definition => record.revision,
@@ -330,10 +397,28 @@ impl JobCatalog {
                         if self.definitions.len() >= MAX_JOB_DEFINITIONS {
                             return Err("job definition limit reached".into());
                         }
-                        1
+                        self.runs
+                            .values()
+                            .filter(|run| run.name == *name && run.namespace == *namespace)
+                            .map(|run| run.revision)
+                            .max()
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .ok_or("job definition revision exhausted")?
                     }
                 };
-                let last_observed_minute = prior.and_then(|r| r.last_observed_minute);
+                let baseline = if definition.cron.is_some()
+                    && prior.is_none_or(|record| {
+                        record.definition != definition || record.last_observed_minute.is_none()
+                    }) {
+                    Some(
+                        i64::try_from(*now_epoch_secs / 60)
+                            .map_err(|_| "cron time out of range")?,
+                    )
+                } else {
+                    None
+                };
+                let last_observed_minute = prior.and_then(|r| r.last_observed_minute).max(baseline);
                 self.definitions.insert(
                     key,
                     DefinitionRecord {
@@ -389,11 +474,12 @@ impl JobCatalog {
                     return Err("cron occurrence does not match the schedule".into());
                 }
                 record.last_observed_minute = Some(*minute);
-                if cron.overlap == OverlapPolicy::Forbid
-                    && self.runs.iter().any(|(id, run)| {
-                        active.contains(id) && run.namespace == *namespace && run.name == *name
-                    })
-                {
+                if self.runs.iter().any(|(id, run)| {
+                    run.namespace == *namespace
+                        && run.name == *name
+                        && ((!run.replay_unknown && !run.unknown_owners.is_empty())
+                            || (cron.overlap == OverlapPolicy::Forbid && active.contains(id)))
+                }) {
                     return Ok(JobPlan::Recorded);
                 }
                 (
@@ -414,6 +500,7 @@ impl JobCatalog {
             trigger,
             definition_digest: definition.digest()?,
             replay_unknown: definition.replay_unknown,
+            unknown_owners: BTreeSet::new(),
         };
         Ok(JobPlan::Register {
             definition: Box::new(definition),
@@ -469,6 +556,183 @@ mod tests {
                 *next
             })
             .unwrap()
+    }
+
+    #[test]
+    fn deployment_hooks_preserve_the_single_attempt_side_effect_policy() {
+        let hook: JobSpec = toml::from_str("exec='/bin/true'\nrun_before=['app.web']").unwrap();
+        assert_eq!(JobDefinition::from_spec(hook).tasks.max_attempts, 1);
+    }
+
+    #[test]
+    fn observed_schedule_time_skips_missed_minutes_even_after_clock_rollback() {
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        apply(
+            &mut store,
+            put(definition(1, Some("* * * * *")), None),
+            &mut next,
+        );
+        apply(
+            &mut store,
+            TaskArrayWrite::CronObserve { minute: 10 },
+            &mut next,
+        );
+        assert_eq!(
+            apply(&mut store, fire(1, 3), &mut next),
+            TaskArrayApplied::JobRecorded
+        );
+        apply(
+            &mut store,
+            TaskArrayWrite::CronObserve { minute: 2 },
+            &mut next,
+        );
+        assert_eq!(
+            apply(&mut store, fire(1, 4), &mut next),
+            TaskArrayApplied::JobRecorded
+        );
+        assert_eq!(next, 0);
+        assert_eq!(
+            apply(&mut store, fire(1, 10), &mut next),
+            TaskArrayApplied::Registered { batch_id: 1 }
+        );
+    }
+
+    #[test]
+    fn allowing_overlap_does_not_replay_unknown_side_effects_through_a_new_cron_occurrence() {
+        use crate::meat::{NodeId, index_set::IndexRangeSet};
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        let mut definition = definition(1, Some("* * * * *"));
+        definition.cron.as_mut().unwrap().overlap = OverlapPolicy::Allow;
+        apply(&mut store, put(definition, None), &mut next);
+        apply(&mut store, fire(1, 3), &mut next);
+        let node = NodeId::new("worker");
+        apply(
+            &mut store,
+            TaskArrayWrite::Sync {
+                batch_id: 1,
+                now_epoch_secs: 180,
+                results: vec![],
+                grants: vec![(node.clone(), IndexRangeSet::from_range(0..=0))],
+            },
+            &mut next,
+        );
+        apply(
+            &mut store,
+            TaskArrayWrite::Unknown { batch_id: 1, node },
+            &mut next,
+        );
+        assert_eq!(
+            apply(&mut store, fire(1, 4), &mut next),
+            TaskArrayApplied::JobRecorded
+        );
+        assert_eq!(next, 1);
+        assert_eq!(
+            store
+                .jobs()
+                .definition("default", "cleanup")
+                .unwrap()
+                .last_observed_minute,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn loss_of_an_ordinary_owner_requires_acknowledged_replay() {
+        use crate::meat::{NodeId, index_set::IndexRangeSet};
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        apply(
+            &mut store,
+            put(
+                definition(1, None),
+                Some(RunTrigger::Manual {
+                    request_id: "side-effect".into(),
+                }),
+            ),
+            &mut next,
+        );
+        let owner = NodeId::new("worker");
+        let mut chunks = IndexRangeSet::new();
+        chunks.insert(0);
+        apply(
+            &mut store,
+            TaskArrayWrite::Sync {
+                batch_id: 1,
+                now_epoch_secs: 120,
+                results: vec![],
+                grants: vec![(owner.clone(), chunks)],
+            },
+            &mut next,
+        );
+        let before = store.clone();
+        assert!(
+            store
+                .apply(
+                    &TaskArrayWrite::Requeue {
+                        batch_id: 1,
+                        node: owner.clone(),
+                        now_epoch_secs: 121
+                    },
+                    || panic!("no allocation")
+                )
+                .is_err()
+        );
+        assert_eq!(store, before);
+        apply(
+            &mut store,
+            TaskArrayWrite::Unknown {
+                batch_id: 1,
+                node: owner.clone(),
+            },
+            &mut next,
+        );
+        assert!(store.jobs().run(1).unwrap().unknown_owners.contains(&owner));
+        let grant_digest = store.owner_fingerprint(1, &owner).unwrap();
+        apply(
+            &mut store,
+            TaskArrayWrite::Replay {
+                batch_id: 1,
+                node: owner,
+                grant_digest,
+                now_epoch_secs: 122,
+            },
+            &mut next,
+        );
+        assert!(store.jobs().run(1).unwrap().unknown_owners.is_empty());
+        assert_eq!(
+            store
+                .get(1)
+                .unwrap()
+                .state
+                .attempt_of(crate::meat::task_array::ChunkId(0)),
+            2
+        );
+    }
+
+    #[test]
+    fn clock_rollback_before_the_first_occurrence_cannot_launch_pre_registration_work() {
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        apply(
+            &mut store,
+            put(definition(1, Some("* * * * *")), None),
+            &mut next,
+        );
+        assert_eq!(
+            apply(&mut store, fire(1, 1), &mut next),
+            TaskArrayApplied::JobRecorded
+        );
+        assert_eq!(next, 0);
+        assert_eq!(
+            apply(&mut store, fire(1, 2), &mut next),
+            TaskArrayApplied::JobRecorded
+        );
+        assert_eq!(
+            apply(&mut store, fire(1, 3), &mut next),
+            TaskArrayApplied::Registered { batch_id: 1 }
+        );
     }
 
     #[test]
