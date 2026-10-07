@@ -75,9 +75,11 @@ pub struct Compatibility {
 /// and node ledgers under `task-arrays/`), including mixed-profile manifests,
 /// persistent recovery/term/index fences, 64-bit grant generations, accepted
 /// ownership ranges, duration buckets and indexed result pages (47/64).
+/// Reusable job definitions, immutable run provenance and atomic schedule
+/// occurrence claims in the common execution store (48/65, #638).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 47,
-    state: 64,
+    protocol: 48,
+    state: 65,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

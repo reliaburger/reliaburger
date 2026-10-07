@@ -123,6 +123,8 @@ pub enum TaskArrayError {
     FailurePreviewTooLarge { chunk: u32 },
     #[error("the array has stopped; no more chunks can be granted")]
     Stopped,
+    #[error("execution owner must contain 1–128 bytes without control characters")]
+    InvalidOwner,
 }
 
 /// Aggregate progress of one array, computed without touching tasks.
@@ -177,7 +179,91 @@ pub struct TaskArrayState {
     duration_counts: [u64; 16],
 }
 
+fn valid_node_id(node: &NodeId) -> bool {
+    !node.0.is_empty() && node.0.len() <= 128 && !node.0.chars().any(char::is_control)
+}
+
 impl TaskArrayState {
+    /// Refuse inconsistent progress before a reopened snapshot can authorise work.
+    pub(crate) fn validate_snapshot(&self) -> Result<(), String> {
+        self.spec.validate().map_err(|error| error.to_string())?;
+        let chunks = self.spec.chunk_count();
+        let valid_ranges =
+            |ranges: &IndexRangeSet, bound: u32| ranges.ranges().all(|range| *range.end() < bound);
+        let mut partition = IndexRangeSet::new();
+        let mut partition_size = 0u64;
+        for ranges in std::iter::once(&self.queued)
+            .chain(self.grants.values())
+            .chain(std::iter::once(&self.done))
+        {
+            if !valid_ranges(ranges, chunks) {
+                return Err("chunk progress exceeds the run".into());
+            }
+            partition_size = partition_size
+                .checked_add(ranges.len())
+                .ok_or("chunk partition overflow")?;
+            partition.extend_from(ranges);
+        }
+        if partition_size != u64::from(chunks) || partition.len() != partition_size {
+            return Err("chunk partition is incomplete or overlaps".into());
+        }
+        if self
+            .grants
+            .keys()
+            .chain(self.accepted.keys())
+            .any(|node| !valid_node_id(node))
+        {
+            return Err("invalid execution owner".into());
+        }
+        if self
+            .attempts
+            .iter()
+            .any(|(chunk, attempt)| *chunk >= chunks || *attempt < 2 || self.done.contains(*chunk))
+        {
+            return Err("invalid grant attempt".into());
+        }
+        let mut accepted = IndexRangeSet::new();
+        for grants in self.accepted.values() {
+            for (attempt, ranges) in grants {
+                if *attempt == 0
+                    || ranges.is_empty()
+                    || !ranges.ranges().all(|range| self.done.contains_range(range))
+                {
+                    return Err("accepted grant has no retired progress".into());
+                }
+                let expected = accepted.len() + ranges.len();
+                accepted.extend_from(ranges);
+                if accepted.len() != expected {
+                    return Err("accepted grants overlap".into());
+                }
+            }
+        }
+        let accounted = self
+            .succeeded
+            .checked_add(self.failed)
+            .and_then(|count| count.checked_add(self.not_run))
+            .ok_or("task counter overflow")?;
+        if accounted != self.tasks_in(&self.done)
+            || self.failed_indices.range_count() > MAX_FAILED_RANGES
+            || !valid_ranges(&self.failed_indices, self.spec.count)
+            || self.failed_indices.len().checked_add(self.failed_overflow) != Some(self.failed)
+        {
+            return Err("task counters disagree with retired chunks".into());
+        }
+        if self
+            .duration_counts
+            .iter()
+            .try_fold(0u64, |total, count| total.checked_add(*count))
+            .is_none_or(|count| count > self.succeeded + self.failed)
+        {
+            return Err("duration counts exceed executed tasks".into());
+        }
+        if self.stopped.is_some() && !self.queued.is_empty() {
+            return Err("stopped run retains queued work".into());
+        }
+        Ok(())
+    }
+
     /// A new array with every chunk queued.
     pub fn new(
         spec: TaskArraySpec,
@@ -257,6 +343,9 @@ impl TaskArrayState {
     /// Hand `chunks` to `node`. Every chunk must be queued; nothing moves
     /// unless all of them are.
     pub fn grant(&mut self, node: &NodeId, chunks: &IndexRangeSet) -> Result<(), TaskArrayError> {
+        if !valid_node_id(node) {
+            return Err(TaskArrayError::InvalidOwner);
+        }
         if self.stopped.is_some() {
             return Err(TaskArrayError::Stopped);
         }

@@ -1,28 +1,7 @@
-//! Batch job submission, dispatch, and tracking (Phase 12, F1).
-//!
-//! The flow: `POST /v1/batch` (leader-forwarded) carries full job
-//! specs; the leader maps the reporting pipeline's `AggregatedState`
-//! into scheduler capacities, runs the library `schedule_batch`
-//! bin-packer, registers the batch durably (Raft when a council
-//! exists, the in-memory tracker standalone), and dispatches per-node
-//! job groups — locally for itself, via `POST /v1/batch/run` for
-//! peers. Running nodes watch their jobs to a terminal state and
-//! report through `POST /v1/batch/{id}/report`; `GET /v1/batch/{id}`
-//! serves the summary.
-//!
-//! Since 12b.2 (JOB3/JOB4) the push reports have a pull backstop: the
-//! leader runs a per-batch watcher that polls the assigned nodes, so a
-//! lost callback (or a leader restart — the watcher respawns from the
-//! durable record) can no longer strand a batch. Dispatch and
-//! callbacks retry with bounded backoff, reports are transition-
-//! validated and idempotent, unschedulable jobs appear in the batch
-//! as `Unschedulable` instead of vanishing, and the job namespace is
-//! resolved once at submit and used everywhere.
-//!
-//! Batch deliberately does NOT ride the deploy placements reconciler:
-//! that machinery *converges desired state* — a completed job looks
-//! like drift to it, and moving an assignment would kill a running
-//! job. Run-to-completion work wants dispatch + completion callbacks.
+//! Finite job groups enter the common indexed executor as named count-one runs.
+//! Parent receipts provide bounded summaries and cancellation. Historical tracker
+//! helpers remain for internal ownership tests; public submission never dispatches
+//! node-local jobs or synthesises completion from a missing callback.
 
 use std::collections::BTreeMap;
 
@@ -34,9 +13,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::config::job::JobSpec;
+#[cfg(test)]
 use crate::meat::batch::{BatchJob, schedule_batch};
 use crate::meat::batch_tracker::{
-    BatchJobRecord, BatchRecord, JobStatus, ReportError, ReportOutcome, epoch_now_secs,
+    BatchRecord, JobStatus, ReportError, ReportOutcome, epoch_now_secs,
 };
 use crate::meat::types::{NodeCapacity, NodeId, Resources};
 use crate::reporting::aggregator::AggregatedState;
@@ -54,9 +34,6 @@ const WATCH_GRACE_SECS: u64 = 60;
 
 /// How often the leader-side pull watcher polls assigned nodes.
 const PULL_INTERVAL_MS: u64 = 1000;
-
-/// Attempts for dispatching a job group to its node.
-const DISPATCH_ATTEMPTS: u32 = 3;
 
 /// Attempts for delivering a completion callback.
 const CALLBACK_ATTEMPTS: u32 = 4;
@@ -300,50 +277,6 @@ fn map_report_error(error: ReportError) -> BatchRejection {
         ReportError::IllegalTransition { .. }
         | ReportError::NotReportable { .. }
         | ReportError::UnprovenExit => BatchRejection::Conflict(error.to_string()),
-    }
-}
-
-/// Register a batch record durably: through Raft when a council
-/// exists (the id comes from the replicated counter, JOB4), through
-/// the in-memory tracker standalone.
-pub(crate) async fn register_batch(
-    state: &ApiState,
-    record: BatchRecord,
-    expected_log_id: Option<openraft::LogId<u64>>,
-) -> Result<u64, String> {
-    match &state.council {
-        Some(council) => {
-            let desired = council.desired_state().await;
-            desired.batch_state.preflight_registration(&record)?;
-            if record.jobs.iter().any(|job| {
-                desired.apps.contains_key(&crate::meat::types::AppId::new(
-                    &job.execution_name,
-                    &job.namespace,
-                ))
-            }) {
-                return Err("execution identity already belongs to an app".into());
-            }
-            match council
-                .write(crate::council::types::RaftRequest::BatchRegister {
-                    expected_log_id,
-                    batch: record,
-                })
-                .await
-            {
-                Ok(crate::council::types::CouncilResponse::BatchRegistered { batch_id }) => {
-                    Ok(batch_id)
-                }
-                Ok(crate::council::types::CouncilResponse::Refused { reason }) => Err(reason),
-                Ok(other) => Err(format!("unexpected raft response: {other:?}")),
-                Err(e) => Err(format!("raft register failed: {e}")),
-            }
-        }
-        None => state
-            .batch_tracker
-            .lock()
-            .await
-            .register(record)
-            .map(|id| id.0),
     }
 }
 
@@ -838,148 +771,11 @@ async fn fetch_remote_outcome(
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn plan_batch_admission(
-    state: &ApiState,
-    jobs: &[BatchJobSubmission],
-    executions: &BTreeMap<String, String>,
-    self_name: &str,
-) -> Result<(u64, crate::meat::batch::BatchAllocation), Box<Response>> {
-    let batch_jobs: Vec<BatchJob> = jobs
-        .iter()
-        .map(|job| BatchJob {
-            name: job.name.clone(),
-            resources: crate::meat::admission::job_requests(&job.spec),
-        })
-        .collect();
-    for _ in 0..8 {
-        let desired = match &state.council {
-            Some(council) => Some(council.desired_state().await),
-            None => None,
-        };
-        let expected_log_id = desired.as_ref().and_then(|state| state.last_applied_log);
-        let mut capacities = if desired.is_some() {
-            let (Some(aggregated_rx), Some(membership)) = (&state.aggregated_rx, &state.membership)
-            else {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cluster batch capacity reports are unavailable",
-                )
-                    .into_response()
-                    .into());
-            };
-            if aggregated_rx.has_changed().is_err() {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cluster capacity publisher is unavailable",
-                )
-                    .into_response()
-                    .into());
-            }
-            let members = membership.read().await.clone();
-            let aggregated = aggregated_rx.borrow().clone();
-            if state
-                .council
-                .as_ref()
-                .is_none_or(|council| aggregated.leadership_epoch != Some(council.current_term()))
-            {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cluster capacity snapshot belongs to another leadership epoch",
-                )
-                    .into_response()
-                    .into());
-            }
-            let mut capacities = capacities_from_reports(&members, &aggregated);
-            if let Some(desired) = &desired {
-                capacities.retain(|capacity| {
-                    !desired
-                        .security_state
-                        .crl
-                        .retired_nodes
-                        .contains_key(&capacity.node_id.0)
-                });
-            }
-            if capacities.is_empty() {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cluster batch capacity reports are not fresh",
-                )
-                    .into_response()
-                    .into());
-            }
-            if let Some(desired) = &desired {
-                for capacity in &mut capacities {
-                    if let Some(report) = aggregated.reports.get(&capacity.node_id) {
-                        capacity.allocated = capacity.allocated.saturating_add(
-                            &crate::meat::admission::unreported_commitments(
-                                desired,
-                                &capacity.node_id,
-                                report,
-                            ),
-                        );
-                    }
-                }
-            }
-            capacities
-        } else {
-            local_only_capacity(self_name)
-        };
-        let allocation = schedule_batch(&batch_jobs, &mut capacities);
-        let mut job_records = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            let node = allocation
-                .assignments
-                .iter()
-                .find(|(name, _)| name == &job.name)
-                .map(|(_, node)| node.clone());
-            let digest = match crate::meat::batch_execution::spec_digest(
-                job.namespace(),
-                &job.name,
-                &job.spec,
-            ) {
-                Ok(digest) => digest,
-                Err(error) => {
-                    return Err((StatusCode::BAD_REQUEST, error.to_string())
-                        .into_response()
-                        .into());
-                }
-            };
-            job_records.push(BatchJobRecord {
-                resources: crate::meat::admission::job_requests(&job.spec),
-                name: job.name.clone(),
-                execution_name: executions[&job.name].clone(),
-                spec_digest: digest,
-                namespace: job.namespace().to_string(),
-                status: if node.is_some() {
-                    JobStatus::Pending
-                } else {
-                    JobStatus::Unschedulable
-                },
-                node,
-            });
-        }
-        let record = BatchRecord {
-            jobs: job_records,
-            submitted_at_epoch_secs: epoch_now_secs(),
-        };
-        match register_batch(state, record, expected_log_id).await {
-            Ok(batch_id) => return Ok((batch_id, allocation)),
-            Err(error) if error == "admission revision changed" => continue,
-            Err(error) => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":format!("cluster batch tracker unavailable: {error}")}))).into_response().into()),
-        }
-    }
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "cluster batch admission remained busy",
-    )
-        .into_response()
-        .into())
-}
-
 /// `POST /v1/batch` — leader-forwarded submission.
 pub async fn batch_submit_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
@@ -1039,136 +835,73 @@ pub async fn batch_submit_handler(
     {
         return forward_to_leader(&state, council, "/v1/batch", body, &headers).await;
     }
-    // Stable input order: together with the scheduler's ordered
-    // profile groups this pins the assignment plan (the old
-    // allocation-order finding).
-    jobs.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let self_name = state
-        .node_name
-        .clone()
-        .unwrap_or_else(|| "local".to_string());
-
-    let executions: BTreeMap<String, String> = jobs
-        .iter()
-        .map(|job| {
-            (
-                job.name.clone(),
-                format!("batch-{:032x}", rand::random::<u128>()),
-            )
-        })
-        .collect();
-    // Replan after a conflicting committed entry, with a finite retry budget.
-    // Dispatch starts only after the original snapshot wins the shared CAS.
-    let (batch_id, allocation) = match tokio::time::timeout(
-        std::time::Duration::from_secs(5), plan_batch_admission(&state, &jobs, &executions, &self_name),
-    ).await {
-        Ok(Ok(admission)) => admission,
-        Ok(Err(response)) => return *response,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "cluster batch admission timed out; outcome unknown; any late allocation stays reserved").into_response(),
+    let _gate = if state.council.is_none() {
+        Some(state.task_arrays.apply_gate.clone().lock_owned().await)
+    } else {
+        None
     };
-
-    // Group assignments by node and dispatch. A BTreeMap so dispatch
-    // order is deterministic too.
-    let mut by_node: BTreeMap<NodeId, Vec<BatchJobSubmission>> = BTreeMap::new();
-    for (job_name, node_id) in &allocation.assignments {
-        if let Some(submission) = jobs.iter().find(|j| &j.name == job_name) {
-            by_node
-                .entry(node_id.clone())
-                .or_default()
-                .push(BatchJobSubmission {
-                    name: executions[&submission.name].clone(),
-                    ..submission.clone()
-                });
+    for job in &mut jobs {
+        let namespace = job.namespace().to_owned();
+        let mut definition = crate::meat::job::JobDefinition::from_spec(job.spec.clone());
+        if let Err(response) = super::job_api::admit_definition(
+            &state,
+            auth.as_deref(),
+            binder.as_deref(),
+            &job.name,
+            &namespace,
+            &mut definition,
+        )
+        .await
+        {
+            return response;
         }
+        job.spec = definition.template;
     }
-
-    let all_labels: BTreeMap<String, BatchExecutionLabel> = jobs
-        .iter()
-        .map(|job| {
+    let request_id = match headers.get("idempotency-key") {
+        Some(key) => match key.to_str() {
+            Ok(key) => key.to_owned(),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response(),
+        },
+        None => format!("{:032x}", rand::random::<u128>()),
+    };
+    let write = crate::meat::task_array_store::TaskArrayWrite::RegisterJobs {
+        request_id,
+        jobs: jobs.into_iter().map(|job| (job.name, job.spec)).collect(),
+        submitted_at_epoch_secs: epoch_now_secs(),
+    };
+    match super::task_array_leader::write_task_array(&state, write).await {
+        Ok(Some(batch_id)) => {
+            let arrays = super::task_array_leader::read_task_arrays(&state).await;
+            let Some(manifest) = arrays.manifest(batch_id) else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "committed batch receipt is unavailable",
+                )
+                    .into_response();
+            };
+            let executions = manifest
+                .cohorts
+                .iter()
+                .map(|(name, id)| (name.clone(), format!("run-{id}")))
+                .collect();
             (
-                executions[&job.name].clone(),
-                BatchExecutionLabel {
-                    name: job.name.clone(),
-                    namespace: job.namespace().to_string(),
-                },
+                StatusCode::ACCEPTED,
+                Json(BatchSubmitResponse {
+                    executions,
+                    batch_id,
+                    assigned: manifest.cohorts.len(),
+                    unschedulable: Vec::new(),
+                }),
             )
-        })
-        .collect();
-    let callback_base_url = self_callback_url(&state, &self_name).await;
-    for (node_id, node_jobs) in by_node {
-        let execution_labels = node_jobs
-            .iter()
-            .map(|job| (job.name.clone(), all_labels[&job.name].clone()))
-            .collect();
-        if node_id.0 == self_name {
-            if let Err(response) = admit_jobs_and_watch(
-                &state,
-                batch_id,
-                node_jobs,
-                execution_labels,
-                Reporter::Leader(Box::new(state.clone())),
-            )
-            .await
-            {
-                return response;
-            }
-            continue;
+                .into_response()
         }
-        let Some(url) = node_api_url(&state, &node_id).await else {
-            eprintln!(
-                "bun: batch {batch_id}: no address for {node_id:?}; execution remains unknown"
-            );
-            continue;
-        };
-        let run = BatchRunRequest {
-            batch_id,
-            callback_base_url: callback_base_url.clone(),
-            jobs: node_jobs,
-            execution_labels,
-        };
-        let dispatch_state = state.clone();
-        tokio::spawn(async move {
-            let client = dispatch_state.cluster_http.client().clone();
-            for attempt in 0..DISPATCH_ATTEMPTS {
-                let mut request = client.post(format!("{url}/v1/batch/run")).json(&run);
-                if let Some(token) = &dispatch_state.service_token {
-                    request = request.bearer_auth(token);
-                }
-                match request.send().await {
-                    Ok(response) if response.status().is_success() => return,
-                    Ok(response) => eprintln!(
-                        "bun: batch dispatch to {url}: {} (attempt {})",
-                        response.status(),
-                        attempt + 1
-                    ),
-                    Err(error) => eprintln!("bun: batch dispatch to {url} failed: {error}"),
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    500 * u64::from(attempt + 1),
-                ))
-                .await;
-            }
-            eprintln!(
-                "bun: batch {batch_id}: dispatch exhausted; original execution remains unknown"
-            );
-        });
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "batch registration produced no identity",
+        )
+            .into_response(),
+        Err(error) => super::job_api::write_error(error),
     }
-
-    // The pull backstop: polls assigned nodes so a lost callback can
-    // never strand the batch.
-    spawn_batch_watcher(&state, batch_id);
-
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!(BatchSubmitResponse {
-            executions,
-            batch_id,
-            assigned: allocation.assignments.len(),
-            unschedulable: allocation.unschedulable,
-        })),
-    )
-        .into_response()
 }
 
 /// `POST /v1/batch/run` — a node receives its share of a batch.
@@ -1221,6 +954,19 @@ pub async fn batch_run_handler(
     };
     if let Err((status, error)) = validate_batch_jobs(&state, &jobs, &headers).await {
         return (status, Json(serde_json::json!({"error": error}))).into_response();
+    }
+    let common = super::task_array_leader::read_task_arrays(&state).await;
+    if jobs.iter().any(|job| {
+        common
+            .jobs()
+            .definition(job.namespace(), &job.name)
+            .is_some()
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            "execution identity belongs to a common job definition",
+        )
+            .into_response();
     }
     if run.batch_id == 0
         || run.execution_labels.len() != jobs.len()
@@ -1387,12 +1133,14 @@ pub async fn batch_report_handler(
 pub async fn batch_status_handler(
     State(state): State<ApiState>,
     AxumPath(batch_id): AxumPath<u64>,
+    headers: axum::http::HeaderMap,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
     if let Some(council) = &state.council
         && !council.is_leader().await
     {
-        return forward_get_to_leader(&state, council, &format!("/v1/batch/{batch_id}")).await;
+        return forward_get_to_leader(&state, council, &format!("/v1/batch/{batch_id}"), &headers)
+            .await;
     }
 
     match get_batch(&state, batch_id).await {
@@ -1419,6 +1167,7 @@ pub async fn batch_status_handler(
                 let nodes = state.task_arrays.node_views(batch_id).await;
                 let progress = record.state.summary();
                 let mut summary = super::task_array_api::array_summary(batch_id, record, &nodes);
+                super::task_array_api::enrich_summary(&mut summary, &arrays, batch_id);
                 summary["rates"] = serde_json::to_value(
                     state
                         .task_arrays
@@ -1429,11 +1178,9 @@ pub async fn batch_status_handler(
                 return Json(summary).into_response();
             }
             if let Some(manifest) = arrays.manifest(batch_id) {
-                if let Err(response) = crate::sesame::auth::authorize_scoped(
-                    auth.as_deref(),
-                    &manifest.name,
-                    &manifest.namespace,
-                ) {
+                if let Err(response) =
+                    super::task_array_api::authorize_manifest(auth.as_deref(), manifest, &arrays)
+                {
                     return response;
                 }
                 return Json(
@@ -1480,7 +1227,27 @@ pub(crate) async fn forward_to_leader(
         .post(format!("{leader_url}{path}"))
         .header("content-type", "application/json")
         .body(body);
-    let request = super::api::copy_forwarded_auth(request, headers);
+    let mut request = super::api::copy_forwarded_auth(request, headers);
+    for key in ["idempotency-key", "x-reliaburger-rerun-jobs"] {
+        if let Some(value) = headers.get(key) {
+            request = request.header(key, value.as_bytes());
+        }
+    }
+    if path == "/v1/apply" {
+        return match request.send().await {
+            Ok(response) => {
+                let mut builder = Response::builder().status(response.status());
+                if let Some(content_type) = response.headers().get(axum::http::header::CONTENT_TYPE)
+                {
+                    builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+                }
+                builder
+                    .body(axum::body::Body::from_stream(response.bytes_stream()))
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+            }
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        };
+    }
     proxy_response(request.send().await).await
 }
 
@@ -1488,6 +1255,7 @@ pub(crate) async fn forward_get_to_leader(
     state: &ApiState,
     council: &crate::council::CouncilNode,
     path: &str,
+    headers: &axum::http::HeaderMap,
 ) -> Response {
     let Some(leader_url) = super::api::leader_api_url(state, council).await else {
         return (
@@ -1496,13 +1264,13 @@ pub(crate) async fn forward_get_to_leader(
         )
             .into_response();
     };
-    let mut request = state
-        .cluster_http
-        .client()
-        .get(format!("{leader_url}{path}"));
-    if let Some(token) = &state.service_token {
-        request = request.bearer_auth(token);
-    }
+    let request = super::api::copy_forwarded_auth(
+        state
+            .cluster_http
+            .client()
+            .get(format!("{leader_url}{path}")),
+        headers,
+    );
     proxy_response(request.send().await).await
 }
 
@@ -1548,12 +1316,6 @@ async fn node_api_url(state: &ApiState, node_id: &NodeId) -> Option<String> {
         .iter()
         .find(|m| &m.node_id == node_id)
         .map(|m| state.cluster_http.url(&m.address.to_string(), ""))
-}
-
-/// Our own reachable base URL, for completion callbacks. `None` when
-/// standalone (local shares report in-process anyway).
-async fn self_callback_url(state: &ApiState, self_name: &str) -> Option<String> {
-    node_api_url(state, &NodeId(self_name.to_string())).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,7 +1661,7 @@ mod tests {
         )
         .layer(axum::Extension(crate::sesame::auth::system_context()));
         council.hang_writes();
-        let response = tokio::time::timeout(std::time::Duration::from_secs(7), router.oneshot(
+        let response = tokio::time::timeout(std::time::Duration::from_secs(12), router.oneshot(
             axum::http::Request::post("/v1/batch").header("content-type", "application/json")
                 .body(axum::body::Body::from(r#"{"jobs":[{"name":"held","spec":{"image":"proc-grill:ignored","command":["true"]}}]}"#)).unwrap()
         )).await;

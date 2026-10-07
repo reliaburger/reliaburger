@@ -184,30 +184,77 @@ impl Drop for BunProcess {
 /// use" however often the harness retries.
 const TEST_PORTS: std::ops::Range<u16> = 27000..30000;
 
-/// `count` consecutive loopback ports, each free for both TCP and UDP right now.
-///
-/// They come from [`TEST_PORTS`], which no outgoing connection can be given,
-/// so only another test's concurrent random pick can take one before its
-/// owner binds it.
-pub fn reserve_port_block(count: u16) -> u16 {
-    use rand::Rng;
-    let mut random = rand::thread_rng();
-    for _ in 0..1_000 {
-        let base = random.gen_range(TEST_PORTS.start..TEST_PORTS.end - count);
-        // Holding every socket until the whole block checks out keeps a port
-        // from being counted twice.
-        let held: Option<Vec<_>> = (base..base + count)
+/// A block held by a crash fixture while its Bun is offline.
+#[derive(Debug)]
+pub struct PortBlockReservation {
+    pub base: u16,
+    _leases: Vec<reliaburger::file_lock::FileLock>,
+}
+
+impl PortBlockReservation {
+    /// Claim an exact block if both protocols and the fixture leases are free.
+    pub fn try_reserve(base: u16, count: u16) -> Option<Self> {
+        let end = base.checked_add(count)?;
+        if count == 0 || base < TEST_PORTS.start || end > TEST_PORTS.end {
+            return None;
+        }
+        use reliaburger::file_lock::{FileLock, FileLockError};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let directory =
+            std::env::temp_dir().join(format!("reliaburger-test-ports-{}", nix::unistd::geteuid()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("cannot create port lease directory: {error}"),
+        }
+        let mut leases = Vec::with_capacity(usize::from(count));
+        for port in base..end {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(directory.join(port.to_string()))
+                .unwrap();
+            match FileLock::try_lock(file) {
+                Ok(lease) => leases.push(lease),
+                Err(FileLockError::Busy) => return None,
+                Err(error) => panic!("cannot take port lease: {error}"),
+            }
+        }
+        let held: Option<Vec<_>> = (base..end)
             .map(|port| {
                 let tcp = TcpListener::bind(("127.0.0.1", port)).ok()?;
                 let udp = std::net::UdpSocket::bind(("127.0.0.1", port)).ok()?;
                 Some((tcp, udp))
             })
             .collect();
-        if held.is_some() {
-            return base;
+        let _held = held?;
+        Some(Self {
+            base,
+            _leases: leases,
+        })
+    }
+}
+
+/// Reserve a block until its returned guard is dropped, including downtime.
+pub fn reserve_port_block_lease(count: u16) -> PortBlockReservation {
+    use rand::Rng;
+    assert!(count > 0 && count < TEST_PORTS.end - TEST_PORTS.start);
+    let mut random = rand::thread_rng();
+    for _ in 0..1_000 {
+        let base = random.gen_range(TEST_PORTS.start..TEST_PORTS.end - count);
+        if let Some(reservation) = PortBlockReservation::try_reserve(base, count) {
+            return reservation;
         }
     }
     panic!("no free block of {count} test ports in {TEST_PORTS:?}");
+}
+
+/// Find currently TCP/UDP-free ports, respecting other fixtures' leases.
+pub fn reserve_port_block(count: u16) -> u16 {
+    reserve_port_block_lease(count).base
 }
 
 /// A free loopback address for a Bun listener.

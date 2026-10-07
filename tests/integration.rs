@@ -627,39 +627,22 @@ async fn logs_follow_returns_output_for_completed_job() {
         })
         .await;
 
-    // Send FollowLogs — for a stopped process, ProcessGrill sends
-    // buffered output then returns when it sees state == Stopped.
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-    harness
-        .cmd_tx
-        .send(reliaburger::bun::agent::AgentCommand::FollowLogs {
-            app_name: "echoer2".to_string(),
-            namespace: "default".to_string(),
-            tail: None,
-            instance: None,
-            label: None,
-            lines: event_tx,
-        })
-        .await
-        .unwrap();
-
-    // Use a timeout to avoid hanging if something goes wrong
-    let mut lines = Vec::new();
-    let collect = async {
-        while let Some(line) = event_rx.recv().await {
-            lines.push(line);
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), collect)
-        .await
-        .expect("follow stream did not close after the completed job");
-
-    assert!(
-        lines.len() >= 2,
-        "expected at least 2 lines from follow, got: {lines:?}"
-    );
-    assert_eq!(lines[0], "follow-line1");
-    assert_eq!(lines[1], "follow-line2");
+    let logs = tokio::time::timeout(Duration::from_secs(5), async {
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/v1/logs/echoer2/default?follow=true",
+                harness.client.base_url()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        response.text().await.unwrap()
+    })
+    .await
+    .expect("common run follow did not close");
+    assert!(logs.contains("follow-line1"), "{logs}");
+    assert!(logs.contains("follow-line2"), "{logs}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -977,4 +960,137 @@ unsafe extern "C" {
 }
 fn libc_kill(pid: i32, sig: i32) -> i32 {
     unsafe { kill(pid, sig) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn common_live_follow_tails_the_selected_run_without_replaying_earlier_lines() {
+    let harness = TestHarness::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let ready = root.path().join("ready");
+    let release = root.path().join("release");
+    let mut config = Config::parse("[job.live-run]\nimage='test:v1'").unwrap();
+    config.job.get_mut("live-run").unwrap().command = Some(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "echo old-first; echo old-last; touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; echo live-next",
+            ready.display(),
+            release.display()
+        ),
+    ]);
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let run = harness
+        .client
+        .status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.app_name == "live-run")
+        .unwrap();
+    assert!(run.id.starts_with("run-"));
+    assert!(run.pid.is_some());
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/logs/live-run/default?follow=true&tail=1&instance={}",
+            harness.client.base_url(),
+            run.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let mut stream = response.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    std::fs::write(&release, "release").unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = first.to_vec();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        String::from_utf8(bytes).unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!output.contains("old-first"), "{output}");
+    assert_eq!(output.matches("old-last").count(), 1, "{output}");
+    assert_eq!(output.matches("live-next").count(), 1, "{output}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_common_run_logs_are_available_without_a_log_store() {
+    let harness = TestHarness::start().await;
+    let config = Config::parse(
+        "[job.selected]\nimage='test:v1'\ncommand=['sh','-c','echo selected-output']",
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    let run = harness
+        .wait_for_instance("selected", Duration::from_secs(5), |row| {
+            row.state == "stopped"
+        })
+        .await;
+    let logs = harness
+        .client
+        .logs(
+            "selected",
+            "default",
+            &LogOptions {
+                instance: Some(run.id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(logs.contains("selected-output"), "{logs}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_apps_and_common_definitions_cannot_share_a_logical_identity() {
+    let harness = TestHarness::start().await;
+    harness
+        .client
+        .apply(&Config::parse("[app.app-first]\nimage='test:v1'\ncommand=['sleep','30']").unwrap())
+        .await
+        .unwrap();
+    let result = harness
+        .client
+        .apply(
+            &Config::parse("[job.app-first]\nimage='test:v1'\ncommand=['/usr/bin/true']").unwrap(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a common job aliased an existing standalone application"
+    );
+    harness
+        .client
+        .apply(
+            &Config::parse("[job.job-first]\nimage='test:v1'\ncommand=['/usr/bin/true']").unwrap(),
+        )
+        .await
+        .unwrap();
+    harness
+        .wait_for_instance("job-first", Duration::from_secs(5), |row| {
+            row.state == "stopped"
+        })
+        .await;
+    let result = harness
+        .client
+        .apply(&Config::parse("[app.job-first]\nimage='test:v1'\ncommand=['sleep','30']").unwrap())
+        .await;
+    assert!(
+        result.is_err(),
+        "an application aliased a retained common definition"
+    );
 }

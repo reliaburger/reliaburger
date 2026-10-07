@@ -88,6 +88,7 @@ pub const GROUPS: &[CommandGroup] = &[
             "batch",
             "run",
             "batch-status",
+            "jobs",
         ],
     },
     CommandGroup {

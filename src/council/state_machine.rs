@@ -374,6 +374,58 @@ impl StateMachineInner {
         position: ApplyEntryPosition,
     ) -> Option<CouncilResponse> {
         match request {
+            RaftRequest::JobApplyCommit {
+                operation_id,
+                now_epoch_secs,
+            } => {
+                let Some(record) = self
+                    .state
+                    .task_arrays
+                    .deployments()
+                    .find_map(|(id, record)| (id == operation_id).then_some(record.clone()))
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "unknown deployment".into(),
+                    });
+                };
+                if record.cancelled {
+                    return Some(CouncilResponse::Refused {
+                        reason: "deployment was cancelled".into(),
+                    });
+                }
+                if record.apps_committed {
+                    return None;
+                }
+                let namespaces: Vec<_> = self.state.namespaces.keys().cloned().collect();
+                if let Err(error) = record.config.validate_against(&namespaces) {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
+                let mut staged = StateMachineInner {
+                    state: self.state.clone(),
+                    ..Default::default()
+                };
+                let transition = RaftRequest::TaskArray(Box::new(
+                    crate::meat::task_array_store::TaskArrayWrite::DeployCommitted {
+                        operation_id: operation_id.clone(),
+                        now_epoch_secs: *now_epoch_secs,
+                    },
+                ));
+                if let Some(CouncilResponse::Refused { reason }) =
+                    staged.apply_request_at(&transition, position)
+                {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+                for write in super::config_to_desired_writes(&record.config) {
+                    if let Some(CouncilResponse::Refused { reason }) =
+                        staged.apply_request_at(&write, position)
+                    {
+                        return Some(CouncilResponse::Refused { reason });
+                    }
+                }
+                self.state = staged.state;
+            }
             RaftRequest::PrerequisiteBegin {
                 operation_id,
                 term,
@@ -596,6 +648,15 @@ impl StateMachineInner {
             RaftRequest::AppSpec { app_id, spec } => {
                 if self
                     .state
+                    .task_arrays
+                    .job_identity_reserved(&app_id.namespace, &app_id.name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "identity belongs to a job definition or retained run".into(),
+                    });
+                }
+                if self
+                    .state
                     .batch_state
                     .execution_owner(&app_id.namespace, &app_id.name)
                     .is_some()
@@ -609,6 +670,11 @@ impl StateMachineInner {
                     .prerequisite_claims
                     .values()
                     .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
+                    || self
+                        .state
+                        .task_arrays
+                        .deployment_owner(&app_id.name, &app_id.namespace)
+                        .is_some()
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "an outstanding prerequisite owns this app".into(),
@@ -634,6 +700,11 @@ impl StateMachineInner {
                     .prerequisite_claims
                     .values()
                     .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
+                    || self
+                        .state
+                        .task_arrays
+                        .deployment_owner(&app_id.name, &app_id.namespace)
+                        .is_some()
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "an outstanding job operation owns this app".into(),
@@ -652,6 +723,11 @@ impl StateMachineInner {
                     .prerequisite_claims
                     .values()
                     .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
+                    || self
+                        .state
+                        .task_arrays
+                        .deployment_owner(&app_id.name, &app_id.namespace)
+                        .is_some()
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "an outstanding job operation owns this app".into(),
@@ -1364,11 +1440,121 @@ impl StateMachineInner {
                 }
             }
             RaftRequest::TaskArray(write) => {
+                use crate::meat::task_array_store::TaskArrayWrite;
+                if let TaskArrayWrite::DeployBegin { config, .. } = write.as_ref() {
+                    let namespaces: Vec<_> = self.state.namespaces.keys().cloned().collect();
+                    if let Err(error) = config.validate_against(&namespaces) {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                    if super::prerequisites::conflict(&self.state.prerequisite_claims, config)
+                        .is_some()
+                    {
+                        return Some(CouncilResponse::Refused {
+                            reason: "an earlier job operation still owns a workload".into(),
+                        });
+                    }
+                    let mut staged = StateMachineInner {
+                        state: self.state.clone(),
+                        ..Default::default()
+                    };
+                    for (name, spec) in &config.job {
+                        let namespace = spec.namespace.as_deref().unwrap_or("default");
+                        if self
+                            .state
+                            .apps
+                            .contains_key(&crate::meat::AppId::new(name, namespace))
+                            || config.app.get(name).is_some_and(|app| {
+                                app.namespace.as_deref().unwrap_or("default") == namespace
+                            })
+                        {
+                            return Some(CouncilResponse::Refused {
+                                reason: "job identity belongs to an app".into(),
+                            });
+                        }
+                        if self
+                            .state
+                            .batch_state
+                            .execution_owner(namespace, name)
+                            .is_some()
+                        {
+                            return Some(CouncilResponse::Refused {
+                                reason: "identity belongs to a batch execution".into(),
+                            });
+                        }
+                    }
+                    // Existing replayed ownership is ignored only for this preview;
+                    // the real transaction still verifies the complete identity.
+                    let op = match write.as_ref() {
+                        TaskArrayWrite::DeployBegin { operation_id, .. } => operation_id.as_str(),
+                        _ => "",
+                    };
+                    let mut preview = config.as_ref().clone();
+                    preview.app.retain(|name, spec| {
+                        self.state
+                            .task_arrays
+                            .deployment_owner(name, spec.namespace.as_deref().unwrap_or("default"))
+                            .is_none_or(|owner| owner != op)
+                    });
+                    for desired in super::config_to_desired_writes(&preview) {
+                        if let Some(CouncilResponse::Refused { reason }) =
+                            staged.apply_request_at(&desired, position)
+                        {
+                            return Some(CouncilResponse::Refused { reason });
+                        }
+                    }
+                }
+                if let TaskArrayWrite::Job(job) = write.as_ref() {
+                    let (name, namespace) = match job.as_ref() {
+                        crate::meat::job::JobWrite::Put {
+                            name, namespace, ..
+                        }
+                        | crate::meat::job::JobWrite::Fire {
+                            name, namespace, ..
+                        } => (name, namespace),
+                    };
+                    if self
+                        .state
+                        .apps
+                        .contains_key(&crate::meat::AppId::new(name, namespace))
+                    {
+                        return Some(CouncilResponse::Refused { reason: "identity belongs to an app; delete it before changing workload kind".into() });
+                    }
+                    if self
+                        .state
+                        .batch_state
+                        .execution_owner(namespace, name)
+                        .is_some()
+                    {
+                        return Some(CouncilResponse::Refused {
+                            reason: "identity belongs to a batch execution".into(),
+                        });
+                    }
+                    if self
+                        .state
+                        .prerequisite_claims
+                        .values()
+                        .any(|claim| claim.blocks(name, namespace))
+                    {
+                        return Some(CouncilResponse::Refused {
+                            reason: "an earlier job operation owns this workload".into(),
+                        });
+                    }
+                }
                 // Arrays share the batch id counter, so `batch-status ID`
                 // names one thing. Every rule lives in `TaskArrays::apply`;
                 // a refused write leaves the state untouched.
+                let ids = match self.state.task_arrays.planned_ids(write) {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
                 let batch_state = &mut self.state.batch_state;
-                if let Err(reason) = batch_state.preflight_ids(write.registration_ids()) {
+                if let Err(reason) = batch_state.preflight_ids(ids) {
                     return Some(CouncilResponse::Refused { reason });
                 }
                 match self
@@ -1753,6 +1939,11 @@ impl StateMachineInner {
                     .prerequisite_claims
                     .values()
                     .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
+                    || self
+                        .state
+                        .task_arrays
+                        .deployment_owner(&app_id.name, &app_id.namespace)
+                        .is_some()
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "an outstanding prerequisite owns this app".into(),
@@ -7474,6 +7665,106 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn common_job_and_app_names_cannot_alias_in_the_same_namespace() {
+        use crate::meat::{
+            job::{JobDefinition, JobWrite},
+            task_array_store::TaskArrayWrite,
+        };
+        let config = crate::config::Config::parse("[app.render]\nimage='web:v1'").unwrap();
+        let app = RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new("render", "default"),
+            spec: Box::new(config.app["render"].clone()),
+        };
+        let job = RaftRequest::TaskArray(Box::new(TaskArrayWrite::Job(Box::new(JobWrite::Put {
+            name: "render".into(),
+            namespace: "default".into(),
+            definition: Box::new(JobDefinition::from_spec(
+                toml::from_str("exec='/bin/true'").unwrap(),
+            )),
+            trigger: None,
+            now_epoch_secs: 1,
+        }))));
+        for (first, second) in [(&app, &job), (&job, &app)] {
+            let mut inner = StateMachineInner::default();
+            assert!(!matches!(
+                inner.apply_request(first),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            let before = inner.state.clone();
+            assert!(matches!(
+                inner.apply_request(second),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert_eq!(
+                serde_json::to_value(&inner.state).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn forgetting_a_definition_cannot_alias_its_retained_runs_as_an_app() {
+        use crate::meat::{
+            job::{JobDefinition, JobWrite, RunTrigger},
+            task_array_store::TaskArrayWrite,
+        };
+        let mut inner = StateMachineInner::default();
+        let job = RaftRequest::TaskArray(Box::new(TaskArrayWrite::Job(Box::new(JobWrite::Put {
+            name: "reserved".into(),
+            namespace: "default".into(),
+            definition: Box::new(JobDefinition::from_spec(
+                toml::from_str("exec='/bin/true'").unwrap(),
+            )),
+            trigger: Some(RunTrigger::Manual {
+                request_id: "one".into(),
+            }),
+            now_epoch_secs: 1,
+        }))));
+        assert!(!matches!(
+            inner.apply_request(&job),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TaskArray(Box::new(
+            TaskArrayWrite::StopDefinition {
+                name: "reserved".into(),
+                namespace: "default".into(),
+                forget: true,
+                now_epoch_secs: 2,
+            },
+        )));
+        assert!(
+            inner
+                .state
+                .task_arrays
+                .jobs()
+                .definition("default", "reserved")
+                .is_none()
+        );
+        assert_eq!(inner.state.task_arrays.jobs().runs().count(), 1);
+        let app = RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new("reserved", "default"),
+            spec: Box::new(
+                crate::config::Config::parse("[app.reserved]\nimage='web:v1'")
+                    .unwrap()
+                    .app["reserved"]
+                    .clone(),
+            ),
+        };
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&app),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        inner.state.task_arrays.prune(4_000);
+        assert_eq!(inner.state.task_arrays.jobs().runs().count(), 0);
+        assert!(!matches!(
+            inner.apply_request(&app),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn task_array_id_exhaustion_refuses_without_partial_registration() {
         use crate::meat::task_array_store::{ManifestCohort, TaskArrayWrite};
@@ -7515,6 +7806,184 @@ mod tests {
             assert!(state.task_arrays.ids().is_empty());
             assert_eq!(state.task_arrays.manifests().count(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn common_hooks_gate_app_writes_across_a_leader_change() {
+        use crate::meat::{
+            index_set::IndexRangeSet, task_array::ChunkId, task_array_state::ChunkResult,
+            task_array_store::TaskArrayWrite,
+        };
+        let mut sm = CouncilStateMachine::new();
+        let op = "0123456789abcdef0123456789abcdef".to_string();
+        let config = crate::config::Config::parse(
+            "[app.web]\nimage='web:v1'\n[job.migrate]\nexec='/bin/true'\nrun_before=['app.web']",
+        )
+        .unwrap();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::TaskArray(Box::new(TaskArrayWrite::DeployBegin {
+                operation_id: op.clone(),
+                config: Box::new(config.clone()),
+                now_epoch_secs: 10,
+            })),
+        )])
+        .await
+        .unwrap();
+        let responses = sm
+            .apply(vec![normal_entry(
+                2,
+                2,
+                RaftRequest::JobApplyCommit {
+                    operation_id: op.clone(),
+                    now_epoch_secs: 11,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(sm.desired_state().await.apps.is_empty());
+        let responses = sm
+            .apply(vec![normal_entry(
+                2,
+                3,
+                RaftRequest::AppSpec {
+                    app_id: AppId::new("web", "default"),
+                    spec: Box::new(config.app["web"].clone()),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        let worker = NodeId::new("worker");
+        sm.apply(vec![
+            normal_entry(
+                2,
+                4,
+                RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+                    batch_id: 1,
+                    now_epoch_secs: 11,
+                    results: vec![],
+                    grants: vec![(worker.clone(), IndexRangeSet::from_range(0..=0))],
+                })),
+            ),
+            normal_entry(
+                2,
+                5,
+                RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+                    batch_id: 1,
+                    now_epoch_secs: 12,
+                    grants: vec![],
+                    results: vec![(
+                        worker,
+                        ChunkResult {
+                            chunk: ChunkId(0),
+                            attempt: 1,
+                            succeeded: 1,
+                            failed_count: 0,
+                            failed_indices: IndexRangeSet::new(),
+                            not_run: 0,
+                            retried: 0,
+                            duration_counts: [0; 16],
+                        },
+                    )],
+                })),
+            ),
+        ])
+        .await
+        .unwrap();
+        let responses = sm
+            .apply(vec![normal_entry(
+                3,
+                6,
+                RaftRequest::JobApplyCommit {
+                    operation_id: op,
+                    now_epoch_secs: 13,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(!matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(
+            sm.desired_state()
+                .await
+                .apps
+                .contains_key(&AppId::new("web", "default"))
+        );
+    }
+
+    fn common_job_request(request_id: &str) -> RaftRequest {
+        use crate::meat::job::{JobDefinition, JobWrite, RunTrigger};
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let RaftRequest::TaskArray(array) = task_array_register(1) else {
+            unreachable!()
+        };
+        let TaskArrayWrite::Register { template, spec, .. } = *array else {
+            unreachable!()
+        };
+        RaftRequest::TaskArray(Box::new(TaskArrayWrite::Job(Box::new(JobWrite::Put {
+            name: "render".into(),
+            namespace: "default".into(),
+            definition: Box::new(JobDefinition {
+                template: *template,
+                tasks: spec,
+                cron: None,
+                replay_unknown: false,
+            }),
+            trigger: Some(RunTrigger::Manual {
+                request_id: request_id.into(),
+            }),
+            now_epoch_secs: 1_000_000,
+        }))))
+    }
+
+    #[tokio::test]
+    async fn a_common_run_replay_after_term_change_needs_no_new_ids() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply(vec![normal_entry(1, 1, common_job_request("original"))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[0],
+            CouncilResponse::TaskArrayRegistered { batch_id: 1 }
+        );
+        sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX;
+        let original = sm.desired_state().await.task_arrays;
+        let responses = sm
+            .apply(vec![normal_entry(2, 2, common_job_request("original"))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[0],
+            CouncilResponse::TaskArrayRegistered { batch_id: 1 }
+        );
+        let state = sm.desired_state().await;
+        assert_eq!(state.task_arrays, original);
+        assert_eq!(state.batch_state.next_batch_id, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn common_run_id_exhaustion_cannot_publish_a_definition_without_its_run() {
+        let mut sm = CouncilStateMachine::new();
+        sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX;
+        let original = sm.desired_state().await.task_arrays;
+        let responses = sm
+            .apply(vec![normal_entry(1, 1, common_job_request("fresh"))])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        let state = sm.desired_state().await;
+        assert_eq!(state.task_arrays, original);
+        assert!(
+            state
+                .task_arrays
+                .jobs()
+                .definition("default", "render")
+                .is_none()
+        );
+        assert_eq!(state.batch_state.next_batch_id, u64::MAX);
     }
 
     #[tokio::test]

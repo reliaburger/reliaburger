@@ -314,3 +314,385 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     .await;
     root.cancel();
 }
+
+async fn start_common_node(
+    index: usize,
+    seeds: Vec<std::net::SocketAddr>,
+    root: &CancellationToken,
+    data: &std::path::Path,
+    delay: Duration,
+    operator: &reliaburger::sesame::types::ApiToken,
+) -> WiredNode {
+    let executor = TaskArrayNode::new(
+        TaskArrayNodeConfig {
+            root: data.join("task-arrays"),
+            policy: ProcessWorkloadsConfig {
+                allowed_binaries: vec![BINARY.into()],
+                mount_isolation: false,
+                ..Default::default()
+            },
+            default_concurrency: 2,
+            backoff: (Duration::from_millis(1), Duration::from_millis(5)),
+            group_commit: GroupCommit::default(),
+        },
+        NodeRunner::Fake(FakeRunner::new(delay, |_| AttemptOutcome::Exited {
+            code: 0,
+        })),
+    );
+    start_wired_node(WiredNodeOptions {
+        name: format!("common{index}"),
+        gossip_port: BASE_PORT + 100 + index as u16 * 10,
+        seeds,
+        shutdown: root.child_token(),
+        data_dir_prefix: "rb-common-jobs",
+        stale_report_timeout_secs: 10,
+        metrics_rollup: None,
+        scheduler: None,
+        lease_reaper: false,
+        membership: MembershipSource::Gossip,
+        service_identity: Some(SERVICE_TOKEN.into()),
+        operator_token: Some(operator.clone()),
+        fault_injection: false,
+        labels: Default::default(),
+        keep_data_dir: false,
+        task_arrays: Some(Arc::new(TaskArrayService::with_timings(
+            Some(Arc::new(executor)),
+            Duration::from_millis(100),
+            Duration::from_secs(3),
+        ))),
+    })
+    .await
+}
+
+async fn common_cluster(
+    delay: Duration,
+) -> (
+    CancellationToken,
+    Vec<tempfile::TempDir>,
+    Vec<WiredNode>,
+    String,
+) {
+    let operator = reliaburger::sesame::token::create_token(
+        "common-operator",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let root = CancellationToken::new();
+    let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (index, directory) in data.iter().enumerate() {
+        nodes.push(
+            start_common_node(
+                index,
+                if index == 0 {
+                    vec![]
+                } else {
+                    vec![local(BASE_PORT + 100)]
+                },
+                &root,
+                directory.path(),
+                delay,
+                &operator.token,
+            )
+            .await,
+        );
+    }
+    wait_until(
+        "common cluster's three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&nodes).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    wait_until(
+        "common cluster gossip roster",
+        Duration::from_secs(60),
+        async || {
+            for node in &nodes {
+                if node.membership_table.read().await.len() < 3 {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    (root, data, nodes, operator.plaintext)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a real multi-node cluster; run with make test-cluster"]
+async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change() {
+    assert!(cluster_tests_enabled());
+    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(2)).await;
+    let leader = nodes
+        .iter()
+        .position(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    let follower = (leader + 1) % 3;
+    let http = reqwest::Client::new();
+    // One upcoming minute, so a later legitimate occurrence cannot look like a duplicate.
+    let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+    let expression = format!(
+        "{} {} {} {} *",
+        next.minute(),
+        next.hour(),
+        next.day(),
+        u8::from(next.month())
+    );
+    let response = http.post(format!("http://127.0.0.1:{}/v1/jobs/runs", nodes[follower].api_port)).bearer_auth(&token)
+        .json(&json!({"name":"scheduled-singleton","definition":{"template":{"exec":BINARY},"cron":{"expression":expression}}})).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let mut id = None;
+    wait_until(
+        "actual UTC cron tick",
+        Duration::from_secs(75),
+        async || {
+            id = nodes[leader]
+                .council
+                .desired_state()
+                .await
+                .task_arrays
+                .jobs()
+                .runs()
+                .find(|(_, run)| run.name == "scheduled-singleton")
+                .map(|(id, _)| id);
+            id.is_some()
+        },
+    )
+    .await;
+    let id = id.unwrap();
+    eprintln!("common cluster: UTC cron admitted run {id}; moving leadership");
+    // Trigger a real election while keeping all workers and quorum alive.
+    // Removing a voter is not a handover: the self-healing council may restore it.
+    nodes[follower]
+        .council
+        .raft()
+        .trigger()
+        .elect()
+        .await
+        .unwrap();
+    wait_until(
+        "replacement cron leader",
+        Duration::from_secs(30),
+        async || {
+            nodes[follower].council.is_leader().await
+                || nodes[(leader + 2) % 3].council.is_leader().await
+        },
+    )
+    .await;
+    let new_leader = if nodes[follower].council.is_leader().await {
+        follower
+    } else {
+        (leader + 2) % 3
+    };
+    wait_until(
+        "accepted scheduled singleton",
+        Duration::from_secs(15),
+        async || {
+            nodes[new_leader]
+                .council
+                .desired_state()
+                .await
+                .task_arrays
+                .get(id)
+                .is_some_and(|record| record.state.summary().succeeded == 1)
+        },
+    )
+    .await;
+    let arrays = nodes[new_leader].council.desired_state().await.task_arrays;
+    assert_eq!(
+        arrays
+            .jobs()
+            .runs()
+            .filter(|(_, run)| run.name == "scheduled-singleton")
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec![id]
+    );
+    let revision = arrays
+        .jobs()
+        .definition("default", "scheduled-singleton")
+        .unwrap()
+        .revision;
+    let minute = next.unix_timestamp() / 60;
+    let replayed = nodes[new_leader]
+        .council
+        .write(reliaburger::council::RaftRequest::TaskArray(Box::new(
+            reliaburger::meat::task_array_store::TaskArrayWrite::Job(Box::new(
+                reliaburger::meat::job::JobWrite::Fire {
+                    name: "scheduled-singleton".into(),
+                    namespace: "default".into(),
+                    revision,
+                    minute,
+                    now_epoch_secs: (minute * 60) as u64,
+                },
+            )),
+        )))
+        .await
+        .unwrap();
+    // A processed cron tick is acknowledged as a no-op, including a skipped
+    // occurrence. The retained run, rather than the acknowledgement, owns its ID.
+    assert!(
+        matches!(
+            replayed,
+            reliaburger::council::CouncilResponse::Applied { .. }
+        ),
+        "{replayed:?}"
+    );
+    let after = nodes[new_leader].council.desired_state().await.task_arrays;
+    assert_eq!(
+        after
+            .jobs()
+            .runs()
+            .filter(|(_, run)| run.name == "scheduled-singleton")
+            .map(|(run, _)| run)
+            .collect::<Vec<_>>(),
+        vec![id],
+        "a replay after a real handover must not admit a second occurrence"
+    );
+    assert_eq!(after.get(id).unwrap().state.summary().succeeded, 1);
+    root.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a real multi-node cluster; run with make test-cluster"]
+async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt() {
+    assert!(cluster_tests_enabled());
+    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(10)).await;
+    let leader = nodes
+        .iter()
+        .position(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    let follower = (leader + 1) % 3;
+    let http = reqwest::Client::new();
+    let response = http.post(format!("http://127.0.0.1:{}/v1/jobs/runs", nodes[follower].api_port)).bearer_auth(&token)
+        .json(&json!({"name":"side-effects","request_id":"first","definition":{"template":{"exec":BINARY},"tasks":{"max_attempts":1},"replay_unknown":false}})).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    let mut owner = None;
+    wait_until(
+        "actual worker attempt acknowledgement",
+        Duration::from_secs(8),
+        async || {
+            let answer = http
+                .get(format!(
+                    "http://127.0.0.1:{}/v1/batch/{id}",
+                    nodes[leader].api_port
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            owner = answer["nodes"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["counters"]["running"] == 1))
+                .and_then(|row| row["node"].as_str())
+                .map(str::to_owned);
+            owner.is_some()
+        },
+    )
+    .await;
+    let owner = owner.unwrap();
+    let victim = nodes.iter().position(|node| node.name == owner).unwrap();
+    nodes[victim].shutdown.cancel();
+    let survivors: Vec<_> = (0..3).filter(|index| *index != victim).collect();
+    wait_until(
+        "surviving singleton leader",
+        Duration::from_secs(30),
+        async || {
+            nodes[survivors[0]].council.is_leader().await
+                || nodes[survivors[1]].council.is_leader().await
+        },
+    )
+    .await;
+    let current = if nodes[survivors[0]].council.is_leader().await {
+        survivors[0]
+    } else {
+        survivors[1]
+    };
+    let read_follower = survivors
+        .iter()
+        .copied()
+        .find(|index| *index != current)
+        .unwrap();
+    let mut proof = Value::Null;
+    wait_until(
+        "durable unknown owner",
+        Duration::from_secs(20),
+        async || {
+            proof = http
+                .get(format!(
+                    "http://127.0.0.1:{}/v1/batch/{id}",
+                    nodes[read_follower].api_port
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            proof["status"] == "Unknown"
+        },
+    )
+    .await;
+    assert_eq!(proof["succeeded"], 0);
+    assert_eq!(proof["failed"], 0);
+    assert_eq!(proof["held"], 1);
+    assert_eq!(proof["queued"], 0);
+    assert_eq!(proof["unknown_owners"][0]["node"], owner);
+    let replay = format!(
+        "http://127.0.0.1:{}/v1/jobs/runs/{id}/replay",
+        nodes[read_follower].api_port
+    );
+    let stale = http
+        .post(&replay)
+        .bearer_auth(&token)
+        .json(&json!({"node":owner,"grant_digest":"0".repeat(64),"acknowledged":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 409);
+    let accepted = http.post(&replay).bearer_auth(&token).json(&json!({"node":owner,"grant_digest":proof["unknown_owners"][0]["grant_digest"],"acknowledged":true})).send().await.unwrap();
+    assert_eq!(accepted.status(), 202);
+    wait_until(
+        "accepted replay outcome",
+        Duration::from_secs(30),
+        async || {
+            nodes[current]
+                .council
+                .desired_state()
+                .await
+                .task_arrays
+                .get(id)
+                .is_some_and(|record| record.state.summary().succeeded == 1)
+        },
+    )
+    .await;
+    let record = nodes[current]
+        .council
+        .desired_state()
+        .await
+        .task_arrays
+        .get(id)
+        .unwrap()
+        .clone();
+    assert_eq!(record.state.summary().failed, 0);
+    assert_ne!(
+        record
+            .state
+            .accepted_grant(reliaburger::meat::task_array::ChunkId(0))
+            .unwrap()
+            .0
+            .0,
+        owner
+    );
+    root.cancel();
+}

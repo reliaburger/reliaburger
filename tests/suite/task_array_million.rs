@@ -94,6 +94,7 @@ fn dispatch(
             spec: state.spec.clone(),
             chunk: ChunkId(chunk),
             grant_attempt: state.attempt_of(ChunkId(chunk)),
+            replay_unknown: true,
             program: PathBuf::from("/unused"),
             args: vec!["{index}".to_string()],
             env: Vec::new(),

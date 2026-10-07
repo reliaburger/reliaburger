@@ -1,0 +1,129 @@
+PR #642, macOS portable CI, 7 October 2026. Production source unchanged.
+
+        FAIL [  14.151s] (5417/6131) reliaburger upgrade::manager::tests::verified_upgrade_probes_survive_concurrent_process_creation
+  stdout ───
+
+    running 1 test
+    test upgrade::manager::tests::verified_upgrade_probes_survive_concurrent_process_creation ... FAILED
+
+    failures:
+
+    failures:
+        upgrade::manager::tests::verified_upgrade_probes_survive_concurrent_process_creation
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5408 filtered out; finished in 14.14s
+
+  stderr ───
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-begin
+    upgrade-fixture phase=fetch-end elapsed=3.755734209s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=3.756478s
+    upgrade-fixture phase=fetch-end elapsed=3.582545333s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=3.583268875s
+    upgrade-fixture phase=fetch-end elapsed=3.386403791s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=3.387107916s
+    upgrade-fixture phase=fetch-end elapsed=3.218666417s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=3.219481125s
+    upgrade-fixture phase=fetch-end elapsed=3.100802292s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=3.101519292s
+    upgrade-fixture phase=fetch-end elapsed=2.994697958s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=2.995435916s
+    upgrade-fixture phase=fetch-end elapsed=2.914956042s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=2.915687417s
+    upgrade-fixture phase=fetch-end elapsed=2.845908875s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=2.846645166s
+    upgrade-fixture phase=fetch-end elapsed=2.565602834s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=2.56637575s
+    upgrade-fixture phase=fetch-end elapsed=2.295243375s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=2.295987125s
+    upgrade-fixture phase=fetch-end elapsed=2.076983708s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=2.077701583s
+    upgrade-fixture phase=fetch-end elapsed=1.927786291s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.928499416s
+    upgrade-fixture phase=fetch-end elapsed=1.824709541s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.825424083s
+    upgrade-fixture phase=fetch-end elapsed=1.685290959s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.6860695s
+    upgrade-fixture phase=fetch-end elapsed=1.545864291s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.547166416s
+    upgrade-fixture phase=fetch-end elapsed=1.427769584s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.428502542s
+    upgrade-fixture phase=fetch-end elapsed=1.285970292s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.286697959s
+    upgrade-fixture phase=fetch-end elapsed=1.153589042s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.154290042s
+    upgrade-fixture phase=fetch-end elapsed=1.04488075s
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=1.046288417s
+    upgrade-fixture phase=fetch-end elapsed=931.196959ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=932.212709ms
+    upgrade-fixture phase=fetch-end elapsed=822.048083ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=822.764333ms
+    upgrade-fixture phase=fetch-end elapsed=742.657083ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=743.366458ms
+    upgrade-fixture phase=fetch-end elapsed=667.289625ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=668.004833ms
+    upgrade-fixture phase=fetch-end elapsed=545.043042ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=545.749625ms
+    upgrade-fixture phase=fetch-end elapsed=438.109792ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=438.884875ms
+    upgrade-fixture phase=fetch-end elapsed=329.319625ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=330.47475ms
+    upgrade-fixture phase=fetch-end elapsed=222.049667ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=222.784167ms
+    upgrade-fixture phase=fetch-end elapsed=187.359875ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=188.0665ms
+    upgrade-fixture phase=fetch-end elapsed=159.054916ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=159.798583ms
+    upgrade-fixture phase=fetch-end elapsed=125.159917ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=125.865083ms
+    upgrade-fixture phase=fetch-end elapsed=76.844042ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=77.559625ms
+    upgrade-fixture phase=fetch-end elapsed=25.39275ms
+    upgrade-fixture phase=signature-verified-probe-begin elapsed=26.096542ms
+
+    thread 'upgrade::manager::tests::verified_upgrade_probes_survive_concurrent_process_creation' (184605495) panicked at src/upgrade/manager.rs:1324:20:
+    called `Result::unwrap()` on an `Err` value: IncompatibleBinary("compatibility query failed: Err(Elapsed(()))")
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized] target(s) in 0.53s
+────────────
+ Nextest run ID a3a67d79-7167-4bba-bac7-4507f216d794 with nextest profile: ci
+    Starting 1 test across 1 binary (5408 tests skipped)
+────────────
+     Summary [   4.528s] 1 test run: 1 passed, 5408 skipped

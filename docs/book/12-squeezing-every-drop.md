@@ -822,6 +822,94 @@ Main's finite evidence registry now names both runtime cases and the cluster
 worker-loss case explicitly. A repository regression check catches missing
 bindings and stale reviewed OCI source fingerprints before aggregation.
 
+### Definitions, runs and durable trigger identities
+
+A template and a count describe work, but not why it runs. A manually submitted
+cleanup, the same cleanup at 03:00 UTC, and a deployment migration need stable
+run identities. Replaying the admission transaction after a lost response must
+return the original run, rather than launch the command again.
+
+#638 adds `JobDefinition` and `JobCatalog` to the existing
+`TaskArrays` state machine. A definition fixes the template, task count and
+trigger policies. Each admitted `RunRecord` captures a revision, the complete
+definition's digest and its trigger. The execution snapshot remains in the
+ordinary task-array record. Updating the reusable definition cannot rewrite
+that snapshot or change an existing run's unknown-outcome policy. Count defaults
+to one when the task policy is omitted.
+
+`JobWrite` is an enum: its `Put` variant records a definition and optionally
+starts a manual or deployment-hook run; `Fire` claims a scheduled occurrence.
+Matching the enum forces each transaction to handle its own inputs. The store
+prepares metadata on a candidate clone, validates execution capacity, and only
+then allocates an ID and publishes both pieces. A refused transaction cannot
+advance the definition revision without creating its promised run. A duplicate
+manual or hook identity returns the existing run; changed work under the same
+identity is refused. This deduplication lasts while the run is retained.
+
+Cron identity uses the definition revision and UTC minute. The same transaction
+advances the occurrence cursor and creates the run. With overlap forbidden,
+it advances the cursor even when it deliberately skips a firing. The cursor
+survives result pruning and definition updates, so neither a new leader nor a
+backwards clock step can revive that occurrence. The initial missed-run policy
+is explicitly `skip`; there is no catch-up queue. An `allow` overlap policy
+still obeys the shared active-run bound.
+
+The catalogue caps reusable definitions and retained run provenance, validates
+its shape when deserialising, and bounds complete definition bytes, including
+schedule text. Before checking the shared counter, the store computes whether
+this exact write needs an ID. Replaying an accepted run or skipping an occurrence
+still works when the counter has no IDs left.
+
+The public paths now use those transactions. TOML apply persists a deployment
+intent, admits prerequisite hooks, and waits for accepted successful results.
+A leader commits app publication and ordinary run admission together. The
+standalone controller serialises app publication and cancellation through an
+owned mutex guard, held by an independent worker even if the client drops its
+event stream. Tokio's `OwnedMutexGuard` keeps an `Arc` reference to the mutex,
+so a spawned task can hold it without borrowing a departed stack frame.
+
+Standalone writes clone the checkpoint, preflight identities and progress
+capacity, then publish private JSON with file and directory fsync. Only durable
+publication replaces the in-memory value. An I/O error fences later writes and
+dispatch. Compact initial ranges can expand into sparse progress; admission
+reserves that representation before accepting work. Reopen validates the chunk
+partition, counts and exact hook identities. Omitted metadata must never open
+an app gate. Expired results are pruned before capacity preflight; otherwise the
+last receipt could block the submission that would prune it.
+
+Worker admission preserves encrypted templates. Execution decrypts with live
+namespace keys in a blocking task, then injects indexed environment without
+discarding the decrypted values. Decrypted configuration stays execution-local;
+retained output follows the normal scoped capture contract.
+A conservative launch marker is durable before start. On reopen an unfinished
+marker becomes unknown. Known non-zero exits can retry; uncertain execution
+requires a user decision tied to the exact grant fingerprint. Losing namespace
+enforcement after launch is unknown too: retiring the process tree cannot prove
+that external effects never occurred. The real-container test establishes a
+running owner before removing its binding, then checks retirement and that
+honest outcome. Bulk runs keep at-least-once replay on the same engine.
+
+Singleton attempts retain successful head/tail output and forward stdout/stderr
+under the logical name, namespace and stable `run-ID`. Physical executor slots
+can't serve as log selectors because later jobs reuse them. A per-run reader
+guard holds that generation while its follower drains. Cleanup closes new
+readers, gives existing readers a bounded grace period, then cancels stalled
+followers before reusing the slot. Rust's `Drop` releases the guard even when a
+client disconnects. Reused process slots replace old capture files before
+launch, giving checkpoint readers a new file identity; old bytes cannot become
+another job's output. A tail snapshots complete-line offsets and file identity;
+following resumes there instead of replaying those lines twice. Bounded CLI and
+dashboard summaries show runs, schedules, accepted counts and rates. Detail is
+an indexed worker query. Followers preserve the caller's credential for reads
+and writes, so forwarding cannot expand a scoped user's authority.
+
+The regressions exercise replay, immutable snapshots, cron rollback and overlap,
+hooks across leadership changes, storage failure, malformed reopen, worker
+restart, output identity and public endpoints. Protocol/state are 48/65 and
+require matching binaries and a fresh cluster. Executor reuse, throughput
+qualification and resident model workers remain separate issues; these semantics
+don't establish 100m accepted successes/day.
+
 ## Lessons from the phase
 
 **Optimisation is an audit with a deliverable.** The single most consistent finding of this phase wasn't a speed-up. It was library-not-wired: `add_port_mapping` with no production callers, `VolumeManager` with no production callers, an HTTPS-only pull client that made cluster images undeployable, a CLI that sent job names to a cluster that had never heard of the jobs. Well-tested libraries pass review; only tracing the live path from the user's artefact to the kernel finds the missing arrow. If you take one habit from this chapter: when you're asked to optimise something, first prove it runs.

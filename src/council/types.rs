@@ -357,6 +357,11 @@ pub enum RaftRequest {
     PrerequisiteFailed { operation_id: String },
     /// Release ordinary-job intent after trusted positive terminal proof.
     JobApplyComplete { operation_id: String },
+    /// Publish dependent apps and admit ordinary indexed runs in one transaction.
+    JobApplyCommit {
+        operation_id: String,
+        now_epoch_secs: u64,
+    },
     /// Commit one complete placement pass against its original admission revision.
     SchedulingDecisions {
         expected_log_id: Option<openraft::LogId<u64>>,

@@ -1457,6 +1457,13 @@ manifests, app/job resource accounting, watch summaries, indexed detail, retries
 and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
 homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
 a service. Build matching development binaries and use a fresh cluster (protocol
-47 / state 64); the published 0.1.4 recording predates this step. The
+48 / state 65); the published 0.1.4 recording predates this step. The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.
+
+The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
+describes #638: ordinary singleton jobs, arrays, durable UTC cron and deployment
+hooks share the definition/run/task/attempt lifecycle, resource admission and
+accepted-result machinery. Standalone admission persists before acknowledgement;
+conservative jobs retain unknown ownership until acknowledged replay. Executor reuse (#639), sustained throughput/demo (#640)
+and resident model workers (#641) follow separately.

@@ -1261,7 +1261,7 @@ mod capacity_contract {
     use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
     use reliaburger::grill::image::{ClusterFetchFuture, ClusterImageSource, LocalImageBlobs};
     use reliaburger::grill::runc::RuncGrill;
-    use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceIdentity, PortAllocator};
+    use reliaburger::grill::{ContainerState, Grill, ImageStore, PortAllocator};
     use reliaburger::relish::client::BunClient;
     use sha2::{Digest, Sha256};
     use tokio::sync::{RwLock, mpsc};
@@ -1282,21 +1282,43 @@ mod capacity_contract {
             let (cmd_tx, cmd_rx) = mpsc::channel(256);
             let shutdown = CancellationToken::new();
             let mut agent = BunAgent::new(
-                grill,
+                reliaburger::grill::AnyGrill::Runc(grill),
                 PortAllocator::new(42000, 43000),
                 cmd_rx,
                 shutdown.clone(),
             );
+            agent.set_node_capacity(8000, 16384);
             agent.set_records_dir(records);
             agent.adopt_recorded_instances().await.unwrap();
             let volumes = tempfile::tempdir().unwrap();
             agent.set_volumes_dir(volumes.path().to_path_buf());
             let deploy_history = agent.deploy_history_handle();
             let status_reader = agent.status_reader();
+            let job_data = tempfile::tempdir().unwrap();
+            let runner = agent.delegated_task_runner(job_data.path()).unwrap();
+            let executor = reliaburger::bun::task_array_node::TaskArrayNode::new(
+                reliaburger::bun::task_array_node::TaskArrayNodeConfig::for_data_dir(
+                    job_data.path(),
+                    Default::default(),
+                ),
+                reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(runner)),
+            )
+            .with_budget(agent.execution_budget());
+            let task_arrays = Arc::new(
+                reliaburger::bun::task_array_leader::TaskArrayService::with_timings(
+                    Some(Arc::new(executor)),
+                    Duration::from_millis(50),
+                    Duration::from_secs(3),
+                )
+                .with_storage(job_data.path())
+                .await
+                .unwrap(),
+            );
             let agent_task = tokio::spawn(async move {
                 agent.run().await;
                 drop(agent);
                 drop(volumes);
+                drop(job_data);
             });
 
             let node = reliaburger::meat::NodeId::new("node-1");
@@ -1366,7 +1388,7 @@ mod capacity_contract {
                 None,
                 None,
                 Some(status_reader),
-                None,
+                Some(task_arrays),
             );
             let server_shutdown = shutdown.clone();
             let server_task = tokio::spawn(async move {
@@ -1599,20 +1621,6 @@ mod capacity_contract {
         }
     }
 
-    fn ordinary_record(records: &Path, namespace: &str) -> serde_json::Value {
-        let checkpoint: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(records.join("job-attempts.checkpoint")).unwrap(),
-        )
-        .unwrap();
-        checkpoint["jobs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|job| job["name"] == "ordinary" && job["namespace"] == namespace)
-            .expect("actual ordinary job attempt was not durably recorded")
-            .clone()
-    }
-
     fn fresh_capacity(harness: &Harness, term: u64) {
         harness._capacity_publisher.send_modify(|state| {
             state.leadership_epoch = Some(term);
@@ -1671,7 +1679,28 @@ mod capacity_contract {
             .await
             .expect("real ordinary apply did not acknowledge")
             .unwrap();
-        let identity = InstanceIdentity::new(&namespace, "ordinary", 0).instance_id();
+        let mut identity = None;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while identity.is_none() {
+                identity = runtime
+                    .launch_inventory()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .find(|launch| {
+                        launch
+                            .instance_id
+                            .0
+                            .starts_with(&format!("{namespace}__executor-"))
+                    })
+                    .map(|launch| launch.instance_id);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let identity = identity.unwrap();
         let rootfs = root.path().join("bundles").join(&identity.0).join("rootfs");
         let release = ReleaseOnDrop(rootfs.join("work/release"));
         tokio::time::timeout(Duration::from_secs(20), async {
@@ -1680,89 +1709,99 @@ mod capacity_contract {
             }
         })
         .await
-        .expect("actual owned child did not acknowledge its blocked phase");
-        assert!(!rootfs.join("work/released").exists());
+        .expect("owned singleton did not start");
         assert_eq!(
             runtime.state(&identity).await.unwrap(),
             ContainerState::Running
         );
-        let claim = council.desired_state().await;
-        assert_eq!(claim.prerequisite_claims.len(), 1);
-        let (operation_id, held) = claim.prerequisite_claims.iter().next().unwrap();
-        assert!(held.apps_committed);
-        assert_eq!(held.config, ordinary);
-        let footprint = reliaburger::meat::admission::held_job_requests(&claim);
-        assert_eq!(footprint.cpu_millicores, 1000);
-        assert_eq!(footprint.memory_bytes, 128 * 1024 * 1024);
-        let captured = ordinary_record(&records, &namespace);
-        assert_eq!(captured["runtime"], "Runc");
-        assert_eq!(captured["phase"], "Launching");
-        assert_eq!(captured["batch_execution"], serde_json::Value::Null);
-        assert!(captured["generation"].as_u64().unwrap() > 0);
+        let desired = council.desired_state().await;
+        let ordinary_id = desired
+            .task_arrays
+            .jobs()
+            .runs()
+            .find(|(_, run)| run.name == "ordinary" && run.namespace == namespace)
+            .unwrap()
+            .0;
+        assert_eq!(
+            desired
+                .task_arrays
+                .get(ordinary_id)
+                .unwrap()
+                .state
+                .spec
+                .count,
+            1
+        );
+        assert!(
+            !desired
+                .task_arrays
+                .jobs()
+                .run(ordinary_id)
+                .unwrap()
+                .replay_unknown
+        );
+        assert!(
+            desired.prerequisite_claims.is_empty(),
+            "ordinary work must not use the old dispatcher"
+        );
 
         let probe = |name: &str, cpu: &str, memory: &str| {
             Config::parse(&format!(
             "[job.{name}]\nimage='owned-capacity:v1'\nnamespace='{namespace}'\ncommand=['/bin/busybox','true']\ncpu='{cpu}'\nmemory='{memory}'\n"
         )).unwrap().job
         };
-        // Isolate each resource as well as refusing the whole-worker request.
-        // A combined probe alone could conceal a missing CPU or memory charge.
+        // Each request fits the empty node but must wait for the singleton's
+        // exact runtime retirement. Test each resource dimension independently.
+        let mut pending = Vec::new();
         for (name, cpu, memory) in [
             ("full-before-terminal", "8", "16Gi"),
             ("cpu-before-terminal", "8", "128Mi"),
             ("memory-before-terminal", "100m", "16Gi"),
         ] {
             fresh_capacity(&harness, council.current_term());
-            let refused = tokio::time::timeout(
-                Duration::from_secs(20),
-                harness.client.submit_batch(&probe(name, cpu, memory)),
-            )
-            .await
-            .expect("blocked capacity admission did not settle")
-            .unwrap();
-            assert_eq!(refused["assigned"], 0, "{refused}");
-            assert_eq!(refused["unschedulable"], serde_json::json!([name]));
+            let response = harness
+                .client
+                .submit_batch(&probe(name, cpu, memory))
+                .await
+                .unwrap();
             assert_eq!(
-                council
-                    .desired_state()
-                    .await
-                    .prerequisite_claims
-                    .get(operation_id),
-                Some(held)
+                response["assigned"], 1,
+                "admitted work waits locally: {response}"
             );
-            assert_eq!(ordinary_record(&records, &namespace), captured);
+            let id = response["batch_id"].as_u64().unwrap();
+            pending.push(id);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let summary = harness.client.batch_status(id).await.unwrap();
+            assert_eq!(summary["succeeded"], 0);
+            assert_eq!(summary["done"], false);
+            assert!(
+                summary["cohorts"][0]["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|node| node["counters"]["attempts_started"] == 0)
+            );
             assert_eq!(
                 runtime.state(&identity).await.unwrap(),
                 ContainerState::Running
             );
         }
-
-        // No fixture sends JobApplyComplete or an execution callback. This
-        // releases only the actual owned child; Agent must observe its current
-        // zero exit, persist that exact generation and settle its real claim.
         std::fs::write(&release.0, b"release").unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while council
-                .desired_state()
-                .await
-                .prerequisite_claims
-                .contains_key(operation_id)
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("exact real terminal receipt did not settle the held claim");
-        let terminal = ordinary_record(&records, &namespace);
-        assert_eq!(terminal["generation"], captured["generation"]);
-        assert_eq!(terminal["spec"], captured["spec"]);
-        assert_eq!(terminal["runtime"], captured["runtime"]);
-        assert_eq!(terminal["phase"], serde_json::json!({"Exited":{"code":0}}));
-        assert_eq!(terminal["restart_count"], 0);
-        assert_eq!(
-            reliaburger::meat::admission::held_job_requests(&council.desired_state().await),
-            Default::default()
-        );
+        for id in std::iter::once(ordinary_id).chain(pending) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let summary = harness.client.batch_status(id).await.unwrap();
+                    if summary["done"] == true {
+                        assert_eq!(summary["succeeded"], 1, "{summary}");
+                        assert_eq!(summary["failed"], 0);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("positive owned retirement did not free waiting work");
+        }
 
         fresh_capacity(&harness, council.current_term());
         let admitted = tokio::time::timeout(
@@ -1781,7 +1820,7 @@ mod capacity_contract {
             loop {
                 let summary = harness.client.batch_status(batch_id).await.unwrap();
                 if summary["done"] == true {
-                    assert_eq!(summary["completed"], 1, "{summary}");
+                    assert_eq!(summary["succeeded"], 1, "{summary}");
                     assert_eq!(summary["failed"], 0, "{summary}");
                     break;
                 }

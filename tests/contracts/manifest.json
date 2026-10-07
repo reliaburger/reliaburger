@@ -836,63 +836,68 @@
           ]
         },
         {
-          "id": "issue-534-an_admitted_job_only_apply_owns_its_name_before_agent_dispatch",
+          "id": "issue-534-an_admitted_job_only_apply_owns_its_name_before_executor_dispatch",
           "binary": "reliaburger",
-          "test": "bun::api::tests::an_admitted_job_only_apply_owns_its_name_before_agent_dispatch",
+          "test": "bun::api::tests::an_admitted_job_only_apply_owns_its_name_before_executor_dispatch",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "src/bun/api/tests.rs"
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs"
           ]
         },
         {
-          "id": "issue-534-cluster_scheduled_apply_is_refused_before_claim_or_desired_writes",
+          "id": "issue-534-cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immediate_run",
           "binary": "reliaburger",
-          "test": "bun::api::tests::cluster_scheduled_apply_is_refused_before_claim_or_desired_writes",
+          "test": "bun::api::tests::cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immediate_run",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "src/bun/api/tests.rs"
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs"
           ]
         },
         {
-          "id": "issue-534-hung_known_failed_prerequisite_settlement_returns_error_and_retains_claim",
+          "id": "issue-534-hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate",
           "binary": "reliaburger",
-          "test": "bun::api::tests::hung_known_failed_prerequisite_settlement_returns_error_and_retains_claim",
+          "test": "bun::api::tests::hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "src/bun/api/tests.rs"
+            "src/bun/api/tests.rs",
+            "src/meat/job_deploy.rs"
           ]
         },
         {
-          "id": "issue-534-hung_prerequisite_begin_returns_bounded_unavailability_without_publication",
+          "id": "issue-534-hung_common_begin_returns_bounded_unavailability_without_publication",
           "binary": "reliaburger",
-          "test": "bun::api::tests::hung_prerequisite_begin_returns_bounded_unavailability_without_publication",
+          "test": "bun::api::tests::hung_common_begin_returns_bounded_unavailability_without_publication",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "src/bun/api/tests.rs"
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs"
           ]
         },
         {
-          "id": "issue-534-hung_prerequisite_commit_returns_terminal_error_and_retains_exact_claim",
+          "id": "issue-534-hung_common_commit_preserves_the_exact_successful_hook_and_app_gate",
           "binary": "reliaburger",
-          "test": "bun::api::tests::hung_prerequisite_commit_returns_terminal_error_and_retains_exact_claim",
+          "test": "bun::api::tests::hung_common_commit_preserves_the_exact_successful_hook_and_app_gate",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "src/bun/api/tests.rs"
+            "src/bun/api/tests.rs",
+            "src/meat/job_deploy.rs"
           ]
         },
         {
@@ -1260,22 +1265,11 @@
           "binary": "reliaburger::suite",
           "test": "batch::a_new_leader_cannot_repeat_an_uncertain_prerequisite_attempt",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-darwin",
+            "portable-linux"
           ],
           "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-534-a_new_leader_preserves_held_job_footprint_with_fresh_capacity_evidence",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_new_leader_preserves_held_job_footprint_with_fresh_capacity_evidence",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
+            "src/meat/job_deploy.rs",
             "tests/suite/batch.rs"
           ]
         },
@@ -1284,23 +1278,24 @@
           "binary": "reliaburger::suite",
           "test": "batch::a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_on_the_same_node",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-darwin",
+            "portable-linux"
           ],
           "sources": [
+            "src/meat/job_deploy.rs",
             "tests/suite/batch.rs"
           ]
         },
         {
-          "id": "issue-534-actual_ordinary_runtime_settlement_releases_held_capacity_for_batch_http",
-          "binary": "reliaburger::suite",
-          "test": "batch::actual_ordinary_runtime_settlement_releases_held_capacity_for_batch_http",
+          "id": "issue-534-mixed_requests_and_apps_share_all_dimensions",
+          "binary": "reliaburger",
+          "test": "bun::execution_budget::tests::mixed_requests_and_apps_share_all_dimensions",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/execution_budget.rs"
           ]
         },
         {
@@ -1319,18 +1314,6 @@
           "id": "issue-534-an_ordinary_job_apply_cannot_take_over_a_prerequisite_claim_after_handover",
           "binary": "reliaburger::suite",
           "test": "batch::an_ordinary_job_apply_cannot_take_over_a_prerequisite_claim_after_handover",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-534-batch_http_respects_held_jobs_before_reports_and_releases_only_the_completed_migration",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_http_respects_held_jobs_before_reports_and_releases_only_the_completed_migration",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -1482,15 +1465,16 @@
           ]
         },
         {
-          "id": "issue-535-owned_apply_metadata_refuses_a_stalled_agent_before_work",
+          "id": "issue-535-common_apply_refuses_missing_durable_storage_before_agent_work",
           "binary": "reliaburger",
-          "test": "bun::api::tests::owned_apply_metadata_refuses_a_stalled_agent_before_work",
+          "test": "bun::api::tests::common_apply_refuses_missing_durable_storage_before_agent_work",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "src/bun/api/tests.rs"
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs"
           ]
         },
         {
@@ -2891,15 +2875,17 @@
     {
       "id": "issue-543",
       "issue": 543,
-      "promise": "Cluster batch admission requires fresh capacity and retains atomic execution reservations until positive exit evidence.",
+      "promise": "Durably queued batches share live worker resource admission with apps; owned resources remain reserved until positive retirement.",
       "supported_paths": [
-        "Admitted resource commitments remain reserved across submissions and coordinator changes."
+        "Admission can queue runs without global capacity reports; execution requires current worker evidence and shared CPU/memory/FIFO permits.",
+        "Concurrent submissions deduplicate immutable runs and retained worker outcomes survive coordinator changes."
       ],
       "refused_paths": [
-        "Missing/stale capacity, unknown runner exit, canceled watcher and failed dispatch cannot free or invent capacity."
+        "Stale or foreign grants and legacy callbacks cannot fabricate accepted completion.",
+        "Unknown retirement, abandoned attempts and cancelled waiters cannot release another live owner or invent resources."
       ],
       "boundaries": [
-        "Concurrent API admissions; leader handover; unreported app placements; terminal callback identity."
+        "Common public admission versus worker dispatch; shared resource dimensions and FIFO; durable conservative restart fencing."
       ],
       "cases": [
         {
@@ -3071,15 +3057,16 @@
           ]
         },
         {
-          "id": "issue-543-a_closed_capacity_watch_never_admits_from_its_retained_report",
+          "id": "issue-543-common_jobs_execute_with_worker_evidence_independent_of_global_capacity_reports",
           "binary": "reliaburger::suite",
-          "test": "batch::a_closed_capacity_watch_never_admits_from_its_retained_report",
+          "test": "batch::common_jobs_execute_with_worker_evidence_independent_of_global_capacity_reports",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "tests/suite/batch.rs",
+            "src/bun/batch.rs"
           ]
         },
         {
@@ -3095,27 +3082,27 @@
           ]
         },
         {
-          "id": "issue-543-a_new_leader_keeps_a_dispatched_batchs_unconfirmed_capacity_reserved",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_new_leader_keeps_a_dispatched_batchs_unconfirmed_capacity_reserved",
+          "id": "issue-543-an_unfinished_conservative_grant_cannot_restart_without_replay",
+          "binary": "reliaburger",
+          "test": "bun::task_array_node::tests::an_unfinished_conservative_grant_cannot_restart_without_replay",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/task_array_node.rs"
           ]
         },
         {
-          "id": "issue-543-a_new_leader_refuses_previous_term_capacity_until_the_aggregator_publishes",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_new_leader_refuses_previous_term_capacity_until_the_aggregator_publishes",
+          "id": "issue-543-the_first_sync_grants_by_slots_and_skips_nodes_that_cant_run",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::the_first_sync_grants_by_slots_and_skips_nodes_that_cant_run",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/task_array_leader.rs"
           ]
         },
         {
@@ -3131,15 +3118,15 @@
           ]
         },
         {
-          "id": "issue-543-an_exact_execution_callback_with_positive_exit_releases_reserved_capacity",
-          "binary": "reliaburger::suite",
-          "test": "batch::an_exact_execution_callback_with_positive_exit_releases_reserved_capacity",
+          "id": "issue-543-sync_retires_results_before_granting",
+          "binary": "reliaburger",
+          "test": "meat::task_array_store::tests::sync_retires_results_before_granting",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/meat/task_array_store.rs"
           ]
         },
         {
@@ -3155,87 +3142,89 @@
           ]
         },
         {
-          "id": "issue-543-batch_admission_accounts_for_unreported_app_placements",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_admission_accounts_for_unreported_app_placements",
+          "id": "issue-543-positive-runtime-retirement",
+          "binary": "reliaburger",
+          "test": "bun::task_runtime::tests::task_runtime_uncertain_exit_holds_the_slot_until_positive_retirement",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/task_runtime.rs"
           ]
         },
         {
-          "id": "issue-543-callbacks_without_exit_evidence_keep_capacity_reserved",
+          "id": "issue-543-legacy_callbacks_cannot_forge_or_change_common_run_outcomes",
           "binary": "reliaburger::suite",
-          "test": "batch::callbacks_without_exit_evidence_keep_capacity_reserved",
+          "test": "batch::legacy_callbacks_cannot_forge_or_change_common_run_outcomes",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "tests/suite/batch.rs",
+            "src/bun/batch.rs"
           ]
         },
         {
-          "id": "issue-543-cluster_batches_with_stale_capacity_refuse_before_registration",
-          "binary": "reliaburger::suite",
-          "test": "batch::cluster_batches_with_stale_capacity_refuse_before_registration",
+          "id": "issue-543-reducing_capacity_does_not_erase_owned_resources",
+          "binary": "reliaburger",
+          "test": "bun::execution_budget::tests::reducing_capacity_does_not_erase_owned_resources",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/execution_budget.rs"
           ]
         },
         {
-          "id": "issue-543-cluster_batches_without_fresh_capacity_refuse_before_registration",
-          "binary": "reliaburger::suite",
-          "test": "batch::cluster_batches_without_fresh_capacity_refuse_before_registration",
+          "id": "issue-543-large_waiter_is_not_overtaken_by_a_smaller_request",
+          "binary": "reliaburger",
+          "test": "bun::execution_budget::tests::large_waiter_is_not_overtaken_by_a_smaller_request",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/execution_budget.rs"
           ]
         },
         {
-          "id": "issue-543-dropping_a_batch_watcher_keeps_its_unconfirmed_capacity_reserved",
-          "binary": "reliaburger::suite",
-          "test": "batch::dropping_a_batch_watcher_keeps_its_unconfirmed_capacity_reserved",
+          "id": "issue-543-waits_cancel_without_leaking_or_losing_release_notification",
+          "binary": "reliaburger",
+          "test": "bun::execution_budget::tests::waits_cancel_without_leaking_or_losing_release_notification",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/execution_budget.rs"
           ]
         },
         {
-          "id": "issue-543-exhausted_dispatch_keeps_its_unknown_execution_and_capacity_reserved",
-          "binary": "reliaburger::suite",
-          "test": "batch::exhausted_dispatch_keeps_its_unknown_execution_and_capacity_reserved",
+          "id": "issue-543-abandoned_attempt_keeps_its_capacity_and_adoption_never_forgives_an_owner",
+          "binary": "reliaburger",
+          "test": "bun::execution_budget::tests::abandoned_attempt_keeps_its_capacity_and_adoption_never_forgives_an_owner",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "src/bun/execution_budget.rs"
           ]
         },
         {
-          "id": "issue-543-simultaneous_batch_admissions_share_durable_capacity_across_api_processes",
+          "id": "issue-543-simultaneous_api_admission_deduplicates_the_same_durable_batch_request",
           "binary": "reliaburger::suite",
-          "test": "batch::simultaneous_batch_admissions_share_durable_capacity_across_api_processes",
+          "test": "batch::simultaneous_api_admission_deduplicates_the_same_durable_batch_request",
           "requires": [
             "portable-linux",
             "portable-darwin"
           ],
           "sources": [
-            "tests/suite/batch.rs"
+            "tests/suite/batch.rs",
+            "src/bun/batch.rs"
           ]
         }
       ]
@@ -7848,6 +7837,117 @@
       ],
       "boundaries": [
         "These image-backed cases require the warmed-image Linux gate; the network-isolated OCI interruption driver cannot substitute."
+      ]
+    },
+    {
+      "id": "issue-638-a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+      "issue": 638,
+      "promise": "Cron occurrence IDs survive leader replacement without duplicate dispatch.",
+      "supported_paths": [
+        "Common job lifecycle with durable coordinator and worker state."
+      ],
+      "refused_paths": [
+        "No success from admission, stale ownership, or an unaccepted exit."
+      ],
+      "boundaries": [
+        "Real execution in the declared gate is required; synthetic evidence cannot qualify the runtime."
+      ],
+      "cases": [
+        {
+          "id": "common-a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-638-losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+      "issue": 638,
+      "promise": "Lost singleton owners remain unknown until exact acknowledged replay.",
+      "supported_paths": [
+        "Common job lifecycle with durable coordinator and worker state."
+      ],
+      "refused_paths": [
+        "No success from admission, stale ownership, or an unaccepted exit."
+      ],
+      "boundaries": [
+        "Real execution in the declared gate is required; synthetic evidence cannot qualify the runtime."
+      ],
+      "cases": [
+        {
+          "id": "common-losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-638-runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+      "issue": 638,
+      "promise": "Singleton API jobs and hooks execute in real containers with encrypted templates and accepted outcomes.",
+      "supported_paths": [
+        "Common job lifecycle with durable coordinator and worker state."
+      ],
+      "refused_paths": [
+        "No success from admission, stale ownership, or an unaccepted exit."
+      ],
+      "boundaries": [
+        "Real execution in the declared gate is required; synthetic evidence cannot qualify the runtime."
+      ],
+      "cases": [
+        {
+          "id": "common-runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-555-port-leases",
+      "issue": 555,
+      "promise": "Crash fixtures retain per-port ownership while their Bun is offline, without keeping network listeners open.",
+      "supported_paths": [
+        "The original fixture can restart on its unchanged gossip/Raft/reporting/API block."
+      ],
+      "refused_paths": [
+        "Another fixture process cannot reserve any overlapping block while its lifetime lease remains held."
+      ],
+      "boundaries": [
+        "Both TCP and UDP are free at reservation; overlapping per-port file leases survive socket release and release on guard drop."
+      ],
+      "cases": [
+        {
+          "id": "issue-555-offline-port-leases",
+          "binary": "reliaburger::documentation_first_run",
+          "test": "offline_port_leases_exclude_overlapping_blocks_across_processes",
+          "sources": [
+            "tests/documentation_first_run.rs",
+            "tests/support/bun_process.rs",
+            "src/file_lock.rs"
+          ],
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ]
+        }
       ]
     }
   ]

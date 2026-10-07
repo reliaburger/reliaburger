@@ -586,6 +586,17 @@ pub enum AnyGrill {
 }
 
 impl AnyGrill {
+    pub(crate) async fn tail_snapshot(&self, instance: &InstanceId) -> capture::TailSnapshot {
+        if let Self::Process(runtime) = self {
+            return runtime.tail_snapshot(instance).await;
+        }
+        if let Some(stem) = self.log_stem(instance).await {
+            capture::TailSnapshot::files(&stem).await
+        } else {
+            Default::default()
+        }
+    }
+
     /// The runtime's image-store handle, when the runtime pulls OCI
     /// images itself (runc). Lets the binary install the cluster P2P
     /// image source after the cluster subsystems start — the runtime

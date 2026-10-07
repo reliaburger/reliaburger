@@ -2808,7 +2808,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 .with_budget(execution_budget),
             )))
             .with_trust_policy(config.images.trust_policy.clone())
-            .with_signature_source(signature_source.clone()),
+            .with_signature_source(signature_source.clone())
+            .with_storage(&data_base)
+            .await?,
         )),
     );
     let app = match &registry_forwarder {

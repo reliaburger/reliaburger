@@ -46,7 +46,7 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
     Ok(loaded.config)
 }
 
-/// Explicitly rerun a node-local job manifest, including unknown prior outcomes.
+/// Request another common run; unresolved ownership still requires grant-specific replay.
 pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), RelishError> {
     let config = load_manifest(source).await?;
     let result = BunClient::default_local()
@@ -1947,6 +1947,14 @@ pub async fn wait_for_batch(
         if summary["done"].as_bool().unwrap_or(false) {
             return Ok(summary);
         }
+        if summary["status"] == "Unknown" {
+            return Err(RelishError::ApiError {
+                status: 409,
+                body: format!(
+                    "run {batch_id} needs an operator decision; inspect its unknown_owners before acknowledged replay"
+                ),
+            });
+        }
         let last_summary = summary;
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -2104,7 +2112,7 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.submit_batch(&config.job).await?;
     println!(
-        "batch {} submitted: {} assigned",
+        "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
         result["assigned"].as_u64().unwrap_or(0),
     );
@@ -2183,6 +2191,8 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
 /// What `relish run --batch` submits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskArrayRun {
+    /// Durable UTC schedule; omitted means an immediate manual run.
+    pub schedule: Option<String>,
     pub image: Option<String>,
     pub cpu: Option<String>,
     pub memory: Option<String>,
@@ -2233,7 +2243,7 @@ pub fn task_array_request(
         template: crate::config::job::JobSpec {
             image: run.image,
             command: Some(run.args),
-            schedule: None,
+            schedule: run.schedule,
             run_before: Vec::new(),
             memory: run
                 .memory
@@ -2315,6 +2325,14 @@ pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), Re
     loop {
         let summary = client.batch_status(batch_id).await?;
         println!("{}", format_batch_watch(&summary));
+        if summary["status"] == "Unknown" {
+            return Err(RelishError::ApiError {
+                status: 409,
+                body: format!(
+                    "run {batch_id} needs an operator decision; inspect its unknown_owners before acknowledged replay"
+                ),
+            });
+        }
         if summary["done"].as_bool() == Some(true) {
             return Ok(());
         }
@@ -2328,6 +2346,17 @@ pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), Re
 /// A rate is unique accepted successes, while durations describe the final
 /// attempt. Quantiles merge bucket counts and report bucket upper bounds.
 pub fn format_batch_watch(summary: &serde_json::Value) -> String {
+    if summary["kind"] == "schedule" {
+        return format!(
+            "{}/{}: UTC schedule {}, {} tasks per occurrence; revision {}",
+            summary["namespace"].as_str().unwrap_or("default"),
+            summary["name"].as_str().unwrap_or("?"),
+            summary["cron"]["expression"].as_str().unwrap_or("?"),
+            summary["total"],
+            summary["revision"]
+        );
+    }
+
     let rate = summary["rates"]["successes_per_second"]
         .as_f64()
         .map_or("unknown".to_string(), |r| format!("{r:.1}/s"));
@@ -2404,14 +2433,55 @@ pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
     let request = task_array_request(run)?;
     let client = BunClient::default_local();
     let answer = client.submit_task_array(&request).await?;
-    println!(
-        "task array {} submitted: {} tasks in {} chunks",
-        answer.batch_id, answer.count, answer.chunks
-    );
-    println!(
-        "check progress with: relish batch-status {}",
-        answer.batch_id
-    );
+    if let Some(id) = answer["batch_id"].as_u64() {
+        println!(
+            "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
+            answer["count"], answer["chunks"]
+        );
+        println!("check progress with: relish batch-status {id}");
+    } else {
+        println!(
+            "schedule registered for {}/{}; UTC, forbid overlap, skip missed minutes; inspect with relish jobs --definitions",
+            request.namespace.as_deref().unwrap_or("default"),
+            request.name
+        );
+    }
+    Ok(())
+}
+
+/// List bounded runs and rates, or durable definitions, without listing task indices.
+pub async fn jobs(definitions: bool, output: OutputFormat) -> Result<(), RelishError> {
+    let rows = BunClient::default_local()
+        .job_summaries(definitions)
+        .await?;
+    if !matches!(output, OutputFormat::Human) {
+        println!("{}", format_output(&rows, output)?);
+        return Ok(());
+    }
+    if definitions {
+        for row in rows["definitions"].as_array().into_iter().flatten() {
+            println!(
+                "{}/{} revision {}: {} tasks, UTC schedule {}",
+                row["namespace"].as_str().unwrap_or("?"),
+                row["name"].as_str().unwrap_or("?"),
+                row["revision"],
+                row["count"],
+                row["cron"]["expression"].as_str().unwrap_or("disabled")
+            );
+        }
+    } else {
+        for row in rows["batches"].as_array().into_iter().flatten() {
+            println!("{}", format_batch_watch(row));
+        }
+    }
+    Ok(())
+}
+/// Explicitly accept repeating side effects from exactly the named unknown grants.
+pub async fn replay_job(id: u64, node: &str, digest: &str) -> Result<(), RelishError> {
+    BunClient::default_local()
+        .replay_job(id, node, digest)
+        .await?;
+    println!("run {id}: replay acknowledged for {node}; previous side effects may repeat");
     Ok(())
 }
 
@@ -4137,6 +4207,7 @@ mod task_array_tests {
 
     fn run() -> TaskArrayRun {
         TaskArrayRun {
+            schedule: None,
             image: None,
             cpu: None,
             memory: None,

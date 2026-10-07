@@ -15,6 +15,7 @@ pub(super) async fn stop_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -36,6 +37,34 @@ pub(super) async fn stop_handler(
         return resp;
     }
 
+    if let Some(response) = crate::bun::job_api::stop_definition(
+        &state,
+        auth.as_deref(),
+        &app,
+        &namespace,
+        false,
+        &headers,
+    )
+    .await
+    {
+        return response;
+    }
+    let _gate = if state.council.is_none() {
+        Some(state.task_arrays.apply_gate.clone().lock_owned().await)
+    } else {
+        None
+    };
+    if crate::bun::task_array_leader::read_task_arrays(&state)
+        .await
+        .deployment_owner(&app, &namespace)
+        .is_some()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "an unsettled deployment owns this workload",
+        )
+            .into_response();
+    }
     if let Some(council) = state.council.clone() {
         return cluster_app_change(state, council, app, namespace, AppChange::Stop).await;
     }
@@ -52,6 +81,7 @@ pub(super) async fn delete_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -73,6 +103,34 @@ pub(super) async fn delete_handler(
         return resp;
     }
 
+    if let Some(response) = crate::bun::job_api::stop_definition(
+        &state,
+        auth.as_deref(),
+        &app,
+        &namespace,
+        true,
+        &headers,
+    )
+    .await
+    {
+        return response;
+    }
+    let _gate = if state.council.is_none() {
+        Some(state.task_arrays.apply_gate.clone().lock_owned().await)
+    } else {
+        None
+    };
+    if crate::bun::task_array_leader::read_task_arrays(&state)
+        .await
+        .deployment_owner(&app, &namespace)
+        .is_some()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "an unsettled deployment owns this workload",
+        )
+            .into_response();
+    }
     if let Some(council) = state.council.clone() {
         return cluster_app_change(state, council, app, namespace, AppChange::Delete).await;
     }

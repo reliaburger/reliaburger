@@ -342,6 +342,38 @@ pub(super) async fn apply_handler(
             )
         }))
         .collect();
+
+    if lease_id.is_none() && !config.job.is_empty() {
+        return crate::bun::job_apply::apply(
+            state,
+            auth.as_deref(),
+            binder.as_deref(),
+            config,
+            &headers,
+            body,
+            rerun_jobs,
+        )
+        .await;
+    }
+    let _standalone_gate = if state.council.is_none() {
+        Some(state.task_arrays.apply_gate.clone().lock_owned().await)
+    } else {
+        None
+    };
+    let common = crate::bun::task_array_leader::read_task_arrays(&state).await;
+    if config.app.iter().any(|(name, spec)| {
+        common
+            .deployment_owner(name, spec.namespace.as_deref().unwrap_or("default"))
+            .is_some()
+            || common.job_identity_reserved(spec.namespace.as_deref().unwrap_or("default"), name)
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            "app identity belongs to an unsettled deployment, job definition or retained run",
+        )
+            .into_response();
+    }
+
     if !identities.is_empty() {
         let ownership = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             if let Some(council) = &state.council {
@@ -496,13 +528,14 @@ pub(super) async fn apply_handler(
             .into_response();
     }
 
-    let event_rx = if let Some(operation) = lease_operation {
+    let event_rx = {
         let (client_event_tx, client_event_rx) = mpsc::channel::<ApplyEvent>(32);
         // Keep consuming agent progress even when the HTTP client disconnects.
         // The per-lease guard prevents expiry cleanup from overtaking a deploy
         // which the agent has accepted but not completed yet.
         tokio::spawn(async move {
-            let mut operation = Some(operation);
+            let mut operation = lease_operation;
+            let _gate = _standalone_gate;
             while let Some(event) = agent_event_rx.recv().await {
                 let terminal = matches!(
                     event,
@@ -528,8 +561,6 @@ pub(super) async fn apply_handler(
             }
         });
         client_event_rx
-    } else {
-        agent_event_rx
     };
 
     let stream = ReceiverStream::new(event_rx).map(|apply_event| {

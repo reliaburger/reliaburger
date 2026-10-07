@@ -320,7 +320,7 @@ async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
     request.extensions_mut().insert(owner());
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert!(council.desired_state().await.batch_state.get(1).is_some());
+    assert!(council.desired_state().await.task_arrays.get(1).is_some());
     council.shutdown().await.unwrap();
 }
 
@@ -1105,21 +1105,17 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
                 let batch: serde_json::Value = batch.json().await.unwrap();
                 assert_eq!(batch["assigned"], 1);
                 let id = batch["batch_id"].as_u64().unwrap();
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while !leader
-                        .desired_state()
-                        .await
-                        .batch_state
-                        .get(id)
-                        .unwrap()
-                        .is_terminal()
-                    {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("finite authority ACK did not settle the actual batch record");
-                assert_eq!(dispatches.load(Ordering::SeqCst), dispatched_before + 1);
+                let desired = leader.desired_state().await;
+                let parent = desired
+                    .task_arrays
+                    .manifest(id)
+                    .expect("forwarded finite group is durable");
+                assert_eq!(parent.cohorts.len(), 1);
+                let run = desired.task_arrays.jobs().run(parent.cohorts[0].1).unwrap();
+                assert_eq!(run.name, job_name);
+                assert_eq!(run.namespace, namespace);
+                assert!(!run.replay_unknown);
+                assert_eq!(dispatches.load(Ordering::SeqCst), dispatched_before);
                 assert_eq!(
                     observed_principal.load(Ordering::SeqCst),
                     principal_before + 2,
@@ -1160,5 +1156,48 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn common_run_cancellation_and_output_obey_current_permissions() {
+    use reliaburger::council::types::RaftRequest;
+    use reliaburger::meat::task_array_store::TaskArrayWrite;
+    let (council, router) = api_with_capacity(true).await;
+    council
+        .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Register {
+            name: "migration".into(),
+            namespace: "default".into(),
+            template: Box::new(toml::from_str("exec='/bin/true'").unwrap()),
+            spec: reliaburger::meat::task_array::TaskArraySpec::with_count(1),
+            submitted_at_epoch_secs: 1,
+        })))
+        .await
+        .unwrap();
+    for (actions, method, path) in [
+        (vec!["logs"], "POST", "/v1/batch/1/cancel"),
+        (vec!["deploy"], "GET", "/v1/batch/1/tasks/0/logs"),
+    ] {
+        council
+            .write(RaftRequest::PermissionSpec {
+                name: "ci".into(),
+                spec: Box::new(reliaburger::config::PermissionSpec {
+                    actions: actions.into_iter().map(str::to_owned).collect(),
+                    apps: vec!["migration".into()],
+                    namespaces: Some(vec!["default".into()]),
+                }),
+            })
+            .await
+            .unwrap();
+        let before = council.desired_state().await.task_arrays;
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(owner());
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(council.desired_state().await.task_arrays, before);
     }
 }

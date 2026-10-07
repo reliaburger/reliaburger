@@ -1,13 +1,9 @@
-//! Integration tests for batch job submission (Phase 12, F1; made
-//! durable in 12b.2).
-//!
-//! A real agent + API router on an ephemeral port (the TestHarness
-//! pattern), driving `/v1/batch` end to end: submit → schedule →
-//! local dispatch → job completion → tracker summary. The durable
-//! tests add a single-node council so batch records live in the Raft
-//! state machine: reports are transition-validated, lost callbacks are
-//! recovered by the leader's pull watcher, and a "restarted" leader (a
-//! fresh API process over the same council) resumes in-flight batches.
+//! Common finite-job admission through the public API, Raft and owned runtime.
+//! Requests queue durable count-one runs; worker CPU, memory and concurrency
+//! budgets govern physical starts. Accepted worker ledgers determine outcomes.
+//! The retained internal batch protocol has separate migration regressions:
+//! execution aliases, callbacks and app/prerequisite ownership cannot cross
+//! into a common run or erase an uncertain older execution.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -76,7 +72,13 @@ impl Harness {
         let grill = ProcessGrill::new();
         let port_allocator = PortAllocator::new(42000, 43000);
         let agent_shutdown = shutdown.clone();
-        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let mut agent = BunAgent::new(
+            reliaburger::grill::AnyGrill::Process(grill),
+            port_allocator,
+            cmd_rx,
+            agent_shutdown,
+        );
+        agent.set_node_capacity(8000, 16384);
         if let Some(directory) = options.records_dir {
             agent.set_records_dir(directory);
             agent.adopt_recorded_instances().await.unwrap();
@@ -89,6 +91,32 @@ impl Harness {
         let deploy_history = agent.deploy_history_handle();
         let status_reader = agent.status_reader();
 
+        let job_data = tempfile::tempdir().unwrap();
+        let runner = agent.delegated_task_runner(job_data.path()).unwrap();
+        let node = reliaburger::bun::task_array_node::TaskArrayNode::new(
+            reliaburger::bun::task_array_node::TaskArrayNodeConfig {
+                root: job_data.path().join("task-arrays"),
+                policy: reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                    mount_isolation: false,
+                    ..Default::default()
+                },
+                default_concurrency: 8,
+                backoff: (Duration::from_millis(1), Duration::from_millis(5)),
+                group_commit: Default::default(),
+            },
+            reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(runner)),
+        )
+        .with_budget(agent.execution_budget());
+        let task_arrays = Arc::new(
+            reliaburger::bun::task_array_leader::TaskArrayService::with_timings(
+                Some(Arc::new(node)),
+                Duration::from_millis(50),
+                Duration::from_secs(3),
+            )
+            .with_storage(job_data.path())
+            .await
+            .unwrap(),
+        );
         let agent_task = tokio::spawn(async move {
             agent.run().await;
             drop(agent);
@@ -177,7 +205,7 @@ impl Harness {
             None,
             None,
             Some(status_reader),
-            None,
+            Some(task_arrays),
         );
         let app = match options.auth_context {
             Some(auth) => app.layer(axum::middleware::from_fn(
@@ -197,6 +225,7 @@ impl Harness {
                 .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
                 .await
                 .ok();
+            drop(job_data);
         });
 
         let base_url = format!("http://127.0.0.1:{port}");
@@ -326,30 +355,45 @@ async fn assert_pruned_execution_cannot_be_claimed_elsewhere(mode: &str, kind: &
         ..local_capacity_options(nodes[0].clone(), "first-worker")
     })
     .await;
-    let response = first
-        .client
-        .submit_batch(&jobs_from(
-            r#"[job.migration]
-               image = "proc-grill:image-ignored"
-               command = ["true"]"#,
-        ))
+    // This fence belongs to the remaining internal leased-execution protocol.
+    // Seed its replicated records directly; public jobs now use indexed grants.
+    let execution = "migration-legacy-execution".to_string();
+    let submitted_at = epoch_now_secs();
+    let record = BatchRecord {
+        jobs: vec![BatchJobRecord {
+            name: "migration".into(),
+            execution_name: execution.clone(),
+            namespace: "default".into(),
+            spec_digest: "a".repeat(64),
+            resources: reliaburger::meat::Resources::default(),
+            node: Some(reliaburger::meat::NodeId::new("first-worker")),
+            status: JobStatus::Pending,
+        }],
+        submitted_at_epoch_secs: submitted_at,
+    };
+    let response = write_admission_fixture(
+        &nodes[0],
+        RaftRequest::BatchRegister {
+            expected_log_id: None,
+            batch: record,
+        },
+    )
+    .await
+    .unwrap();
+    let reliaburger::council::types::CouncilResponse::BatchRegistered { batch_id } = response
+    else {
+        panic!("{response:?}")
+    };
+    nodes[0]
+        .write(RaftRequest::BatchJobUpdate {
+            batch_id,
+            job_name: execution.clone(),
+            namespace: "default".into(),
+            status: JobStatus::Completed,
+            exit_code: Some(0),
+        })
         .await
         .unwrap();
-    let batch_id = response["batch_id"].as_u64().unwrap();
-    // The fallback makes unchanged production reach the ownership assertion;
-    // absence of the new response field is covered separately.
-    let execution = response["executions"]["migration"]
-        .as_str()
-        .unwrap_or("migration")
-        .to_string();
-    assert_eq!(first.wait_done(batch_id, 15).await["completed"], 1);
-    let submitted_at = nodes[0]
-        .desired_state()
-        .await
-        .batch_state
-        .get(batch_id)
-        .unwrap()
-        .submitted_at_epoch_secs;
     let marker: BatchRecord = serde_json::from_value(serde_json::json!({
         "jobs": [{
             "name": "prune-marker",
@@ -491,27 +535,6 @@ fn jobs_from(toml: &str) -> std::collections::BTreeMap<String, reliaburger::conf
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cluster_batches_without_fresh_capacity_refuse_before_registration() {
-    let council = single_node_leader().await;
-    let harness = Harness::start_with(HarnessOptions {
-        council: Some(council.clone()),
-        node_name: Some("leader".into()),
-        ..Default::default()
-    })
-    .await;
-    let response = reqwest::Client::new()
-        .post(format!("{}/v1/batch", harness.base_url))
-        .json(&serde_json::json!({"jobs":[{"name":"needs-evidence","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
-        .send().await.unwrap();
-    let status = response.status();
-    let record = council.desired_state().await.batch_state.get(1).cloned();
-    drop(harness);
-    council.shutdown().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert!(record.is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retired_worker_in_a_fresh_api_roster_never_receives_new_batch_work() {
     let council = single_node_leader().await;
     let membership_log_id = *council.metrics().borrow().membership_config.log_id();
@@ -545,54 +568,12 @@ async fn a_retired_worker_in_a_fresh_api_roster_never_receives_new_batch_work() 
     let records = council.desired_state().await.batch_state.batches.len();
     drop(harness);
     council.shutdown().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
     assert_eq!(records, 0);
-    assert!(dispatches.try_recv().is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_closed_capacity_watch_never_admits_from_its_retained_report() {
-    let council = single_node_leader().await;
-    let mut options = capacity_options(council.clone());
-    options.close_capacity_channel = true;
-    let harness = Harness::start_with(options).await;
-    let response = reqwest::Client::new().post(format!("{}/v1/batch", harness.base_url))
-        .json(&serde_json::json!({"jobs":[{"name":"closed-publisher","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
-        .send().await.unwrap();
-    let status = response.status();
-    let records = council.desired_state().await.batch_state.batches.len();
-    drop(harness);
-    council.shutdown().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(records, 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cluster_batches_with_stale_capacity_refuse_before_registration() {
-    let council = single_node_leader().await;
-    let mut options = capacity_options(council.clone());
-    options.stale_capacity_nodes = vec!["node-1".into()];
-    let harness = Harness::start_with(options).await;
-    let response = reqwest::Client::new().post(format!("{}/v1/batch", harness.base_url))
-        .json(&serde_json::json!({"jobs":[{"name":"needs-fresh-evidence","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
-        .send().await.unwrap();
-    let status = response.status();
-    let record = council.desired_state().await.batch_state.get(1).cloned();
-    drop(harness);
-    council.shutdown().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert!(record.is_none());
-}
-
-fn full_node_job(name: &str) -> BTreeMap<String, reliaburger::config::job::JobSpec> {
-    jobs_from(&format!(
-        r#"
-        [job.{name}]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "30"]
-        cpu = "8"
-        "#
-    ))
+    assert!(
+        dispatches.try_recv().is_err(),
+        "a retired worker received legacy dispatch"
+    );
 }
 
 fn capacity_options(council: Arc<CouncilNode>) -> HarnessOptions {
@@ -671,457 +652,80 @@ fn remote_capacity_options(
 /// Two API processes share Raft, but have independent handlers and the same
 /// lagging worker report. Their admissions must still share one reservation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn simultaneous_batch_admissions_share_durable_capacity_across_api_processes() {
+async fn simultaneous_api_admission_deduplicates_the_same_durable_batch_request() {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
     let council = single_node_leader().await;
-    let (address, _dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let first = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let second = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let first_jobs = full_node_job("first");
-    let second_jobs = full_node_job("second");
+    let (first_tx, _first_rx) = mpsc::channel(16);
+    let (second_tx, _second_rx) = mpsc::channel(16);
+    // Independent API state, one authoritative council, no synthetic child exit.
+    let first = api::router(
+        first_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let second = api::router(
+        second_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let body = serde_json::json!({"jobs":[{"name":"same-request","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}).to_string();
+    let request = || {
+        Request::post("/v1/batch")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "same-durable-request")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
     let (a, b) = tokio::join!(
-        first.client.submit_batch(&first_jobs),
-        second.client.submit_batch(&second_jobs),
+        first.clone().oneshot(request()),
+        second.clone().oneshot(request())
     );
-    let a = a.unwrap();
-    let b = b.unwrap();
-    let assigned = a["assigned"].as_u64().unwrap() + b["assigned"].as_u64().unwrap();
-    let unschedulable =
-        a["unschedulable"].as_array().unwrap().len() + b["unschedulable"].as_array().unwrap().len();
-    let records = council.desired_state().await.batch_state.batches.len();
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a.status(), 202);
+    assert_eq!(b.status(), 202);
+    let a: serde_json::Value =
+        serde_json::from_slice(&a.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let b: serde_json::Value =
+        serde_json::from_slice(&b.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(a["batch_id"], b["batch_id"]);
+    let before = council.desired_state().await.task_arrays;
+    assert_eq!(before.jobs().runs().count(), 1);
+    assert_eq!(before.manifests().count(), 1);
+    let id = before.jobs().runs().next().unwrap().0;
+    assert_eq!(before.get(id).unwrap().state.summary().queued, 1);
+    let changed = Request::post("/v1/batch")
+        .header("content-type", "application/json")
+        .header("idempotency-key", "same-durable-request")
+        .body(Body::from(body.replace("true", "false")))
+        .unwrap();
+    assert_eq!(second.oneshot(changed).await.unwrap().status(), 409);
+    assert_eq!(council.desired_state().await.task_arrays, before);
     drop(first);
-    drop(second);
     council.shutdown().await.unwrap();
-    assert_eq!(
-        assigned, 1,
-        "independent handlers oversubscribed one node: {a}, {b}"
-    );
-    assert_eq!(unschedulable, 1);
-    assert_eq!(records, 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_new_leader_refuses_previous_term_capacity_until_the_aggregator_publishes() {
-    let network = InMemoryRaftRouter::new();
-    let mut councils = Vec::new();
-    for id in [1, 2] {
-        let node = Arc::new(
-            CouncilNode::new(
-                id,
-                fast_config(),
-                InMemoryRaftNetworkFactory::new(id, network.clone()),
-                MemLogStore::new(),
-                CouncilStateMachine::new(),
-                None,
-            )
-            .await
-            .unwrap(),
-        );
-        network.register(id, node.raft().clone()).await;
-        councils.push(node);
-    }
-    councils[0]
-        .initialize(BTreeMap::from([(
-            1,
-            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "leader"),
-        )]))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !councils[0].is_leader().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    councils[0]
-        .add_learner(
-            2,
-            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "new-leader"),
-        )
-        .await
-        .unwrap();
-    let (address, _dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let old_term = councils[0].current_term();
-    let reporting_network = reliaburger::reporting::transport::InMemoryReportingNetwork::new();
-    let transport = reporting_network
-        .register("127.0.0.1:9010".parse().unwrap())
-        .await;
-    let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(old_term);
-    let (mut aggregator, old_snapshot) = reliaburger::reporting::aggregator::ReportAggregator::new(
-        transport,
-        Default::default(),
-        CancellationToken::new(),
-        None,
-        Some(epoch_rx),
-        None,
-    );
-    aggregator.insert_local_report(reliaburger::reporting::types::StateReport {
-        node_id: reliaburger::meat::NodeId::new("node-1"),
-        timestamp: std::time::SystemTime::UNIX_EPOCH,
-        running_apps: Vec::new(),
-        cached_specs: Vec::new(),
-        resource_usage: reliaburger::reporting::types::ResourceUsage {
-            cpu_total_millicores: 8000,
-            memory_total_mb: 16384,
-            ..Default::default()
-        },
-        event_log: Vec::new(),
-        has_buildah: false,
-    });
-    councils[0]
-        .change_membership(std::collections::BTreeSet::from([2]))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !councils[1].is_leader().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let mut options = remote_capacity_options(councils[1].clone(), address);
-    options.node_name = Some("new-leader".into());
-    options.aggregated_override = Some(old_snapshot.clone());
-    assert!(councils[1].current_term() > old_term);
-    let next_leader = Harness::start_with(options).await;
-    let response = reqwest::Client::new().post(format!("{}/v1/batch", next_leader.base_url))
-        .json(&serde_json::json!({"jobs":[{"name":"second","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
-        .send().await.unwrap();
-    let status = response.status();
-    let records = councils[1].desired_state().await.batch_state.batches.len();
-    drop(next_leader);
-    for council in councils {
-        council.shutdown().await.unwrap();
-    }
-    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(records, 0);
-    assert_eq!(
-        old_snapshot.borrow().reports.len(),
-        1,
-        "the old watch snapshot must remain published throughout the control"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_new_leader_keeps_a_dispatched_batchs_unconfirmed_capacity_reserved() {
-    let network = InMemoryRaftRouter::new();
-    let mut councils = Vec::new();
-    for id in [1, 2] {
-        let node = Arc::new(
-            CouncilNode::new(
-                id,
-                fast_config(),
-                InMemoryRaftNetworkFactory::new(id, network.clone()),
-                MemLogStore::new(),
-                CouncilStateMachine::new(),
-                None,
-            )
-            .await
-            .unwrap(),
-        );
-        network.register(id, node.raft().clone()).await;
-        councils.push(node);
-    }
-    councils[0]
-        .initialize(BTreeMap::from([(
-            1,
-            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "leader"),
-        )]))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !councils[0].is_leader().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    councils[0]
-        .add_learner(
-            2,
-            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "new-leader"),
-        )
-        .await
-        .unwrap();
-    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let first = Harness::start_with(remote_capacity_options(councils[0].clone(), address)).await;
-    let accepted = first
-        .client
-        .submit_batch(&full_node_job("first"))
-        .await
-        .unwrap();
-    assert_eq!(accepted["assigned"], 1);
-    tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let first_id = accepted["batch_id"].as_u64().unwrap();
-    councils[0]
-        .change_membership(std::collections::BTreeSet::from([2]))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !councils[1].is_leader().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    drop(first);
-    let mut options = remote_capacity_options(councils[1].clone(), address);
-    options.node_name = Some("new-leader".into());
-    let next_leader = Harness::start_with(options).await;
-    let next = next_leader
-        .client
-        .submit_batch(&full_node_job("second"))
-        .await
-        .unwrap();
-    let retained = councils[1]
-        .desired_state()
-        .await
-        .batch_state
-        .get(first_id)
-        .unwrap()
-        .clone();
-    drop(next_leader);
-    for council in councils {
-        council.shutdown().await.unwrap();
-    }
-    assert!(!retained.is_terminal());
-    assert_eq!(
-        next["assigned"], 0,
-        "a new leader forgot the in-flight reservation: {next}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_exact_execution_callback_with_positive_exit_releases_reserved_capacity() {
-    let council = single_node_leader().await;
-    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let harness = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let accepted = harness
-        .client
-        .submit_batch(&full_node_job("first"))
-        .await
-        .unwrap();
-    assert_eq!(accepted["assigned"], 1);
-    let dispatch = tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let batch_id = accepted["batch_id"].as_u64().unwrap();
-    let execution = dispatch["jobs"][0]["name"].as_str().unwrap();
-    let response = reqwest::Client::new()
-        .post(format!("{}/v1/batch/{batch_id}/report", harness.base_url))
-        .bearer_auth(TEST_SERVICE_TOKEN)
-        .json(&serde_json::json!({
-            "job_name": execution,
-            "namespace": "default",
-            "exit_code": 0,
-            "status": "completed"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success(), "{response:?}");
-    let summary = harness.client.batch_status(batch_id).await.unwrap();
-    assert_eq!(summary["completed"], 1);
-    let next = harness
-        .client
-        .submit_batch(&full_node_job("second"))
-        .await
-        .unwrap();
-    drop(harness);
-    council.shutdown().await.unwrap();
-    assert_eq!(
-        next["assigned"], 1,
-        "positive exit left stale held capacity: {next}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dropping_a_batch_watcher_keeps_its_unconfirmed_capacity_reserved() {
-    let council = single_node_leader().await;
-    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let first = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let accepted = first
-        .client
-        .submit_batch(&full_node_job("first"))
-        .await
-        .unwrap();
-    assert_eq!(accepted["assigned"], 1);
-    tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    drop(first);
-    let second = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let next = second
-        .client
-        .submit_batch(&full_node_job("second"))
-        .await
-        .unwrap();
-    drop(second);
-    council.shutdown().await.unwrap();
-    assert_eq!(
-        next["assigned"], 0,
-        "watcher disappearance released unconfirmed capacity: {next}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exhausted_dispatch_keeps_its_unknown_execution_and_capacity_reserved() {
-    let council = single_node_leader().await;
-    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = unreachable.local_addr().unwrap();
-    let harness = Harness::start_with(HarnessOptions {
-        council: Some(council.clone()),
-        node_name: Some("leader".into()),
-        membership: Some(vec![NodeMembershipInfo {
-            node_id: reliaburger::meat::NodeId::new("remote"),
-            address,
-            api_advertised: true,
-        }]),
-        capacity_nodes: vec!["remote".into()],
-        ..Default::default()
-    })
-    .await;
-    drop(unreachable);
-    let accepted = harness
-        .client
-        .submit_batch(&full_node_job("first"))
-        .await
-        .unwrap();
-    assert_eq!(accepted["assigned"], 1);
-    let batch_id = accepted["batch_id"].as_u64().unwrap();
-    // Three bounded dispatch attempts and their backoffs must not manufacture
-    // terminal evidence merely because the endpoint remains unavailable.
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    let record = council
-        .desired_state()
-        .await
-        .batch_state
-        .get(batch_id)
-        .unwrap()
-        .clone();
-    let next = harness
-        .client
-        .submit_batch(&full_node_job("second"))
-        .await
-        .unwrap();
-    drop(harness);
-    council.shutdown().await.unwrap();
-    assert!(
-        !record.is_terminal(),
-        "dispatch failure invented a terminal outcome: {record:?}"
-    );
-    assert_eq!(
-        next["assigned"], 0,
-        "uncertain dispatch released reserved capacity: {next}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn callbacks_without_exit_evidence_keep_capacity_reserved() {
-    for status in ["completed", "failed"] {
-        let council = single_node_leader().await;
-        let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
-        let harness = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-        let accepted = harness
-            .client
-            .submit_batch(&full_node_job("first"))
-            .await
-            .unwrap();
-        assert_eq!(accepted["assigned"], 1);
-        tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let batch_id = accepted["batch_id"].as_u64().unwrap();
-        let execution = accepted["executions"]["first"].as_str().unwrap_or("first");
-        let response = reqwest::Client::new()
-            .post(format!("{}/v1/batch/{batch_id}/report", harness.base_url))
-            .bearer_auth(TEST_SERVICE_TOKEN)
-            .json(&serde_json::json!({"job_name": execution, "status": status}))
-            .send()
-            .await
-            .unwrap();
-        assert!(!response.status().is_server_error());
-        let record = council
-            .desired_state()
-            .await
-            .batch_state
-            .get(batch_id)
-            .unwrap()
-            .clone();
-        let next = harness
-            .client
-            .submit_batch(&full_node_job("second"))
-            .await
-            .unwrap();
-        drop(harness);
-        council.shutdown().await.unwrap();
-        assert!(
-            !record.is_terminal(),
-            "callback without exit evidence became terminal: {record:?}"
-        );
-        assert_eq!(
-            next["assigned"], 0,
-            "callback without exit evidence released capacity: {next}"
-        );
-    }
-}
-
-/// A committed app placement reserves capacity before the runtime report
-/// catches up. Batch admission must account for that placement too.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_admission_accounts_for_unreported_app_placements() {
-    use reliaburger::council::types::RaftRequest;
-    use reliaburger::meat::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
-
-    let council = single_node_leader().await;
-    let app_id = AppId::new("web", "default");
-    let app = Config::parse(
-        r#"[app.web]
-        image = "proc-grill:image-ignored"
-        cpu = "8"
-        "#,
-    )
-    .unwrap()
-    .app
-    .remove("web")
-    .unwrap();
-    council
-        .write(RaftRequest::AppSpec {
-            app_id: app_id.clone(),
-            spec: Box::new(app),
-        })
-        .await
-        .unwrap();
-    write_admission_fixture(
-        &council,
-        RaftRequest::SchedulingDecision(SchedulingDecision {
-            app_id,
-            placements: vec![Placement {
-                node_id: NodeId::new("node-1"),
-                resources: Resources::new(8000, 0, 0),
-                ordinal: 0,
-            }],
-        }),
-    )
-    .await
-    .unwrap();
-    let (address, _dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let harness = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let response = harness
-        .client
-        .submit_batch(&full_node_job("migration"))
-        .await
-        .unwrap();
-    drop(harness);
-    council.shutdown().await.unwrap();
-    assert_eq!(response["assigned"].as_u64(), Some(0), "{response}");
-    assert_eq!(response["unschedulable"], serde_json::json!(["migration"]));
 }
 
 /// Losing a runner after the observation deadline doesn't prove that its
@@ -2418,7 +2022,17 @@ async fn committed_remote_ownership_cannot_relabel_a_local_ordinary_log_selector
     let id = reliaburger::grill::InstanceIdentity::new("team", execution, 0)
         .instance_id()
         .0;
-    ordinary.client.apply(&Config::parse(&format!("[job.{execution}]\nnamespace='team'\nimage='proc-grill:image-ignored'\ncommand=['sh','-c','echo ordinary-private-sentinel; sleep 10']")).unwrap()).await.unwrap();
+    // Exercise the remaining legacy node-local selector with an actual legacy
+    // supervisor instance; common runs use run-ID and separate scoped selection.
+    let config = Config::parse(&format!("[job.{execution}]\nnamespace='team'\nimage='proc-grill:image-ignored'\ncommand=['sh','-c','echo ordinary-private-sentinel; sleep 10']")).unwrap();
+    let (events, mut progress) = mpsc::channel(16);
+    ordinary
+        .cmd_tx
+        .send(reliaburger::bun::agent::AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while progress.recv().await.is_some() {}
+
     let record: BatchRecord = serde_json::from_value(serde_json::json!({
         "jobs": [{"name": "migration", "execution_name": execution, "namespace": "team", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
         "submitted_at_epoch_secs": epoch_now_secs()
@@ -2832,8 +2446,22 @@ async fn a_previous_named_run_cannot_complete_a_new_batch_before_dispatch_acknow
             }
         }
     });
+    let council = single_node_leader().await;
     let router = api::router(
-        tx, None, None, None, None, None, None, None, None, None, None, None, 0, None,
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
     );
     let request = axum::http::Request::builder().method("POST").uri("/v1/batch")
         .header("content-type", "application/json").body(axum::body::Body::from(r#"{"jobs":[{"name":"migration","spec":{"image":"busybox","command":["sleep","60"]}}]}"#)).unwrap();
@@ -2842,31 +2470,23 @@ async fn a_previous_named_run_cannot_complete_a_new_batch_before_dispatch_acknow
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let submitted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let id = submitted["batch_id"].as_u64().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    // A second pull proves the first response has been processed. The
-    // broken watcher instead stops pulling once it accepts the old outcome.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            tokio::select! {
-                _ = observed_rx.recv() => break,
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    let request = axum::http::Request::builder()
-                        .uri(format!("/v1/batch/{id}"))
-                        .body(axum::body::Body::empty())
-                        .unwrap();
-                    let response = router.clone().oneshot(request).await.unwrap();
-                    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-                    let summary: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                    if summary["done"] == true { break; }
-                }
-            }
-        }
-    })
-    .await
-    .unwrap();
+    // Explicit status pulls expose the older stopped process. Neither this
+    // inventory nor a legacy callback is proof of the new run's completion.
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("previous-run"));
+        observed_rx.recv().await.unwrap();
+    }
     let request = axum::http::Request::builder()
         .uri(format!("/v1/batch/{id}"))
         .body(axum::body::Body::empty())
@@ -2875,8 +2495,10 @@ async fn a_previous_named_run_cannot_complete_a_new_batch_before_dispatch_acknow
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let summary: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     actor.abort();
-    assert_eq!(summary["completed"], 0, "{summary}");
+    assert_eq!(summary["succeeded"], 0, "{summary}");
     assert_eq!(summary["done"], false, "{summary}");
+    assert_eq!(summary["queued"], 1, "{summary}");
+    council.shutdown().await.unwrap();
 }
 
 /// Roadmap (Phase 12): submit a batch of process jobs; all run to
@@ -2900,7 +2522,7 @@ command = ["sleep", "1"]
         let summary = harness
             .wait_done(response["batch_id"].as_u64().unwrap(), 30)
             .await;
-        assert_eq!(summary["completed"], 1, "{summary}");
+        assert_eq!(summary["succeeded"], 1, "{summary}");
         assert_eq!(summary["failed"], 0, "{summary}");
     }
 }
@@ -2928,7 +2550,7 @@ async fn a_maximum_length_batch_label_gets_a_valid_independent_execution_name() 
     let result = harness
         .wait_done(response["batch_id"].as_u64().unwrap(), 10)
         .await;
-    assert_eq!(result["completed"].as_u64(), Some(1), "{result}");
+    assert_eq!(result["succeeded"].as_u64(), Some(1), "{result}");
 }
 
 /// Roadmap (Phase 12): submit a batch of process jobs; all run to
@@ -2961,7 +2583,7 @@ async fn batch_of_proc_jobs_completes_locally() {
 
     let batch_id = response["batch_id"].as_u64().unwrap();
     let summary = harness.wait_done(batch_id, 30).await;
-    assert_eq!(summary["completed"].as_u64(), Some(3), "{summary}");
+    assert_eq!(summary["succeeded"].as_u64(), Some(3), "{summary}");
     assert_eq!(summary["failed"].as_u64(), Some(0), "{summary}");
 }
 
@@ -2985,7 +2607,7 @@ async fn batch_failing_job_reports_failed() {
     // 3 retries with 1s/2s/4s backoff — well inside 60s.
     let summary = harness.wait_done(batch_id, 60).await;
     assert_eq!(summary["failed"].as_u64(), Some(1), "{summary}");
-    assert_eq!(summary["completed"].as_u64(), Some(0), "{summary}");
+    assert_eq!(summary["succeeded"].as_u64(), Some(0), "{summary}");
 }
 
 /// An empty batch is a client error, not a mysterious empty success.
@@ -3017,7 +2639,7 @@ async fn batch_in_a_non_default_namespace_completes() {
     let response = harness.client.submit_batch(&jobs).await.unwrap();
     let batch_id = response["batch_id"].as_u64().unwrap();
     let summary = harness.wait_done(batch_id, 30).await;
-    assert_eq!(summary["completed"].as_u64(), Some(1), "{summary}");
+    assert_eq!(summary["succeeded"].as_u64(), Some(1), "{summary}");
 }
 
 /// JOB3: a submission whose namespace disagrees with the job spec's is
@@ -3076,18 +2698,28 @@ async fn unschedulable_jobs_appear_in_the_batch() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 202);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["assigned"].as_u64(), Some(1), "{body}");
-    assert_eq!(
-        body["unschedulable"],
-        serde_json::json!(["greedy"]),
-        "{body}"
-    );
-
+    assert_eq!(body["assigned"].as_u64(), Some(2), "{body}");
+    assert_eq!(body["unschedulable"], serde_json::json!([]), "{body}");
     let batch_id = body["batch_id"].as_u64().unwrap();
-    let summary = harness.wait_done(batch_id, 30).await;
-    assert_eq!(summary["unschedulable"].as_u64(), Some(1), "{summary}");
-    assert_eq!(summary["completed"].as_u64(), Some(1), "{summary}");
-    assert_eq!(summary["total"].as_u64(), Some(2), "{summary}");
+    let summary = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let summary = harness.client.batch_status(batch_id).await.unwrap();
+            if summary["succeeded"] == 1 {
+                break summary;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(summary["done"], false, "{summary}");
+    assert_eq!(summary["queued"], 1, "{summary}");
+    assert_eq!(summary["failed"], 0, "{summary}");
+    harness.client.cancel_batch(batch_id).await.unwrap();
+    let summary = harness.wait_done(batch_id, 10).await;
+    assert_eq!(summary["succeeded"], 1, "{summary}");
+    assert_eq!(summary["not_run"], 1, "{summary}");
+    assert_eq!(summary["total"], 2, "{summary}");
 }
 
 /// The node-to-node half of dispatch: `/v1/batch/run` accepts a job
@@ -3153,7 +2785,7 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
 /// are 400, illegal transitions are 409, duplicates are an idempotent
 /// 200 that never double-counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_reports_are_validated_and_idempotent() {
+async fn legacy_callbacks_cannot_forge_or_change_common_run_outcomes() {
     let harness = Harness::start().await;
 
     let jobs = jobs_from(
@@ -3181,7 +2813,7 @@ async fn batch_reports_are_validated_and_idempotent() {
         .unwrap();
     assert_eq!(forged.status().as_u16(), 400);
 
-    // A duplicate of the recorded terminal state is an idempotent 200.
+    // Legacy callback claims cannot alter the common accepted grant.
     let duplicate = http
         .post(&report_url)
         .bearer_auth(TEST_SERVICE_TOKEN)
@@ -3189,13 +2821,11 @@ async fn batch_reports_are_validated_and_idempotent() {
         .send()
         .await
         .unwrap();
-    assert_eq!(duplicate.status().as_u16(), 200);
-    let body: serde_json::Value = duplicate.json().await.unwrap();
-    assert_eq!(body["duplicate"], serde_json::json!(true));
+    assert_eq!(duplicate.status().as_u16(), 404);
     let summary = harness.client.batch_status(batch_id).await.unwrap();
-    assert_eq!(summary["completed"].as_u64(), Some(1), "no double count");
+    assert_eq!(summary["succeeded"].as_u64(), Some(1), "no double count");
 
-    // A conflicting terminal state (completed → failed) is a 409.
+    // A conflicting callback cannot replace the accepted result either.
     let conflict = http
         .post(&report_url)
         .bearer_auth(TEST_SERVICE_TOKEN)
@@ -3203,7 +2833,7 @@ async fn batch_reports_are_validated_and_idempotent() {
         .send()
         .await
         .unwrap();
-    assert_eq!(conflict.status().as_u16(), 409);
+    assert_eq!(conflict.status().as_u16(), 404);
 
     // A job that was never part of the batch is a 404.
     let unknown = http
@@ -3322,7 +2952,7 @@ async fn batch_ids_stay_monotonic_across_an_api_restart() {
     .await;
     // The old batch is still readable after the "restart"…
     let summary = second.client.batch_status(first_id).await.unwrap();
-    assert_eq!(summary["completed"].as_u64(), Some(1), "{summary}");
+    assert_eq!(summary["succeeded"].as_u64(), Some(1), "{summary}");
     // …and a new submission gets a strictly newer id.
     let response = second.client.submit_batch(&jobs).await.unwrap();
     let second_id = response["batch_id"].as_u64().unwrap();
@@ -3396,7 +3026,7 @@ async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
 
     // The pull watcher completes the batch despite the lost callbacks.
     let summary = leader.wait_done(batch_id, 60).await;
-    assert_eq!(summary["completed"].as_u64(), Some(1), "{summary}");
+    assert_eq!(summary["succeeded"].as_u64(), Some(1), "{summary}");
 
     // Leader "restart" mid-history: a fresh process over the same
     // council still serves the batch from the durable record.
@@ -3408,7 +3038,7 @@ async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
     })
     .await;
     let summary = restarted.client.batch_status(batch_id).await.unwrap();
-    assert_eq!(summary["completed"].as_u64(), Some(1), "{summary}");
+    assert_eq!(summary["succeeded"].as_u64(), Some(1), "{summary}");
 }
 
 /// JOB4: a leader restart mid-batch resumes watching from the durable
@@ -4269,7 +3899,7 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
     ]);
     let original_config = config.clone();
     let old_client = old_leader.client.clone();
-    let old_apply = tokio::spawn(async move { old_client.apply(&original_config).await });
+    let mut old_apply = tokio::spawn(async move { old_client.apply(&original_config).await });
     tokio::time::timeout(Duration::from_secs(10), async {
         while !started.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4323,25 +3953,32 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
     // Release before assertions so even unchanged production's erroneous
     // second launch is cleaned up and the original process does not linger.
     std::fs::write(&release, b"release").unwrap();
-    let stale_result = tokio::time::timeout(Duration::from_secs(10), old_apply)
-        .await
-        .unwrap()
-        .unwrap();
+    // The follower's old observer may remain pending: it cannot turn a
+    // vanished owner into success. Cancel the observer, preserving the run.
+    let stale_result = tokio::time::timeout(Duration::from_secs(3), &mut old_apply).await;
+    if stale_result.is_err() {
+        old_apply.abort();
+    }
     let final_state = councils[1].desired_state().await;
     drop(new_leader);
     drop(old_leader);
     for council in councils {
         council.shutdown().await.unwrap();
     }
-    let error = retry
-        .expect("an uncertain replicated claim must refuse promptly")
-        .expect_err(
-            "the new leader admitted another attempt under an uncertain prerequisite claim",
+    if mode == "same" {
+        assert!(
+            retry.is_err(),
+            "an idempotent repeat must observe the same pending operation"
         );
-    assert!(error.to_string().contains("409"), "{mode}: {error}");
+    } else {
+        let error = retry
+            .expect("a conflicting claim must refuse promptly")
+            .expect_err("a different operation stole the uncertain owner");
+        assert!(error.to_string().contains("409"), "{mode}: {error}");
+    }
     assert!(
-        stale_result.is_err(),
-        "the old leader committed its stale worker result: {stale_result:?}"
+        !matches!(stale_result, Ok(Ok(Ok(_)))),
+        "old leader reported success"
     );
     assert_eq!(
         std::fs::read_to_string(attempts).unwrap().lines().count(),
@@ -4414,19 +4051,6 @@ async fn invalid_cluster_prerequisites_are_refused_before_any_app_commit() {
     council.shutdown().await.unwrap();
 }
 
-fn corrected_apply_migration_record(records: &std::path::Path) -> serde_json::Value {
-    let checkpoint: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(records.join("job-attempts.checkpoint")).unwrap())
-            .unwrap();
-    checkpoint["jobs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|job| job["name"] == "migrate" && job["namespace"] == "default")
-        .expect("the actual migration attempt must be durably recorded")
-        .clone()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_on_the_same_node() {
     let council = single_node_leader().await;
@@ -4473,19 +4097,31 @@ async fn a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_
         state.prerequisite_claims.is_empty(),
         "a positively observed and durably settled failure must release its claim"
     );
-    let failed_record = corrected_apply_migration_record(&records);
-    assert_eq!(failed_record["phase"]["Exited"]["code"], 1);
-    assert_eq!(
-        failed_record["spec"]["run_before"],
-        serde_json::json!(["app.api"])
-    );
-    assert_eq!(failed_record["restart_count"], 0);
-    let failed_generation = failed_record["generation"].as_u64().unwrap();
-    assert!(failed_generation > 0);
+    let failed_run = state
+        .task_arrays
+        .jobs()
+        .runs()
+        .find(|(_, run)| run.name == "migrate")
+        .unwrap()
+        .0;
+    let failed_record = state.task_arrays.get(failed_run).unwrap();
+    assert_eq!(failed_record.state.spec.max_attempts, 1);
+    assert_eq!(failed_record.state.summary().failed, 1);
     assert_eq!(std::fs::read_to_string(&attempts).unwrap(), "failed\n");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while council
+            .desired_state()
+            .await
+            .task_arrays
+            .deployment_owner("migrate", "default")
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 
-    // Restart this same node from its durable records before correction.
-    // Adoption must preserve the terminal failed generation and NoRetry spec.
     drop(first);
     let corrected = Harness::start_with(HarnessOptions {
         council: Some(council.clone()),
@@ -4494,13 +4130,17 @@ async fn a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_
         ..Default::default()
     })
     .await;
-    let recovered = corrected_apply_migration_record(&records);
-    assert_eq!(recovered["phase"]["Exited"]["code"], 1);
-    assert_eq!(recovered["generation"], failed_record["generation"]);
-    assert_eq!(recovered["restart_count"], 0);
     assert_eq!(
-        recovered["spec"]["run_before"],
-        failed_record["spec"]["run_before"]
+        council
+            .desired_state()
+            .await
+            .task_arrays
+            .get(failed_run)
+            .unwrap()
+            .state
+            .summary()
+            .failed,
+        1
     );
     config.job.get_mut("migrate").unwrap().command = Some(vec![
         "sh".into(),
@@ -4517,13 +4157,34 @@ async fn a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_
     let state = council.desired_state().await;
     assert_eq!(state.apps[&app_id].image.as_deref(), Some("new"));
     assert!(state.prerequisite_claims.is_empty());
-    let completed = corrected_apply_migration_record(&records);
-    assert_eq!(completed["phase"]["Exited"]["code"], 0);
-    assert!(completed["generation"].as_u64().unwrap() > failed_generation);
-    assert_eq!(completed["restart_count"], 0);
+    let completed_run = state
+        .task_arrays
+        .jobs()
+        .runs()
+        .filter(|(_, run)| run.name == "migrate")
+        .map(|(id, _)| id)
+        .max()
+        .unwrap();
+    assert!(completed_run > failed_run);
     assert_eq!(
-        completed["spec"]["run_before"],
-        serde_json::json!(["app.api"])
+        state
+            .task_arrays
+            .get(completed_run)
+            .unwrap()
+            .state
+            .summary()
+            .succeeded,
+        1
+    );
+    assert_eq!(
+        state
+            .task_arrays
+            .get(completed_run)
+            .unwrap()
+            .state
+            .spec
+            .max_attempts,
+        1
     );
     assert_eq!(
         std::fs::read_to_string(&attempts).unwrap(),
@@ -4595,13 +4256,12 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
 
     let blocked = council.desired_state().await;
     assert_eq!(blocked.apps[&app_id].image.as_deref(), Some("old"));
-    assert_eq!(blocked.prerequisite_claims.len(), 1);
-    let (claim_id, claim) = blocked.prerequisite_claims.into_iter().next().unwrap();
+    assert_eq!(blocked.task_arrays.deployments().count(), 1);
+    let (claim_id, claim) = blocked.task_arrays.deployments().next().unwrap();
+    let claim_id = claim_id.to_owned();
     assert!(!claim.apps_committed);
     assert!(claim.blocks("api", "default"));
 
-    // Discover the observable node-local operation through the real API. Its
-    // deploy ID differs from the replicated prerequisite ownership identity.
     let snapshot = harness.client.deploy_operations().await.unwrap();
     assert_eq!(snapshot.active_deploys.len(), 1);
     let operation = &snapshot.active_deploys[0];
@@ -4616,7 +4276,7 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
             && target.namespace == "default"
     }));
     let deploy_id = operation.id.clone();
-    assert_ne!(deploy_id.as_str(), claim_id);
+    assert_eq!(deploy_id.as_str(), claim_id);
     let cancellation = harness
         .client
         .cancel_deploy(deploy_id.as_str())
@@ -4630,16 +4290,29 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
         "migration gate opened before cancellation"
     );
 
-    // Exit zero after the cancellation was acknowledged. A successful child
-    // exit must not erase accepted cancellation or publish the gated app.
+    // A racing zero exit cannot erase cancellation. Cleanup may kill the process
+    // before it sees this release; either way accepted cancellation wins.
     std::fs::write(&release, b"release").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !finished.exists() {
+        loop {
+            let arrays = council.desired_state().await.task_arrays;
+            let record = arrays
+                .deployments()
+                .find(|(id, _)| *id == claim_id)
+                .unwrap()
+                .1;
+            if record.completed {
+                break;
+            }
+            assert!(
+                record.cancelled,
+                "cancellation intent disappeared before cleanup"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("released migration must reach its successful exit phase");
+    .expect("cancelled owner did not positively settle");
     let result = tokio::time::timeout(Duration::from_secs(10), apply)
         .await
         .expect("cancelled apply must reach a bounded observable outcome")
@@ -4663,10 +4336,17 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
         Some("old"),
         "a cancelled migration published a new desired app after its zero exit"
     );
+    let receipt = after
+        .task_arrays
+        .deployments()
+        .find(|(id, _)| *id == claim_id)
+        .unwrap()
+        .1;
+    assert!(receipt.cancelled && receipt.completed);
+    assert!(!receipt.apps_committed);
     assert_eq!(
-        after.prerequisite_claims.get(&claim_id),
-        Some(&claim),
-        "cancellation must retain the exact uncommitted ownership claim"
+        receipt.outcome,
+        Some(reliaburger::meat::job_deploy::DeploymentOutcome::Cancelled)
     );
     assert!(
         result.is_err(),
@@ -4697,237 +4377,115 @@ async fn write_admission_fixture(
     council.write(request).await
 }
 
-// Append these helpers/tests to tests/suite/batch.rs AFTER root534+actual543 merge.
-// Reuses the existing real-Council Harness, full_node_job, jobs_from,
-// pending_capacity_worker, remote_capacity_options and fast_config helpers unchanged.
-fn held_capacity_config() -> Config {
-    Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nimage='migration:v1'\ncpu='5'\nrun_before=['app.web']\n[job.notify]\nimage='notify:v1'\ncpu='3'\n").unwrap()
-}
-fn held_capacity_probe(
-    name: &str,
-    cpu: &str,
-) -> BTreeMap<String, reliaburger::config::job::JobSpec> {
-    jobs_from(&format!(
-        "[job.{name}]\nimage='proc-grill:image-ignored'\ncommand=['true']\ncpu='{cpu}'\n"
-    ))
-}
-async fn begin_held_capacity(council: &CouncilNode) -> String {
-    let operation_id = "1234567890abcdef1234567890abcdef".to_owned();
-    let result = council
-        .write(reliaburger::council::RaftRequest::PrerequisiteBegin {
-            operation_id: operation_id.clone(),
-            term: council.current_term(),
-            config: Box::new(held_capacity_config()),
-        })
-        .await
-        .unwrap();
-    assert!(
-        !matches!(
-            result,
-            reliaburger::council::CouncilResponse::Refused { .. }
-        ),
-        "{result:?}"
-    );
-    operation_id
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_http_respects_held_jobs_before_reports_and_releases_only_the_completed_migration() {
-    let council = single_node_leader().await;
-    let operation_id = begin_held_capacity(&council).await;
-    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let harness = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let first = harness
-        .client
-        .submit_batch(&held_capacity_probe("precommit-probe", "4"))
-        .await
-        .unwrap();
-    // The established batch API returns 202 with Unschedulable entries when
-    // fresh nodes lack headroom; do not invent a different HTTP error contract.
-    assert_eq!(first["assigned"], 0, "{first}");
-    assert_eq!(
-        first["unschedulable"],
-        serde_json::json!(["precommit-probe"])
+async fn common_run_logs_keep_the_logical_scope_and_select_the_stable_run() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Arc::new(RwLock::new(reliaburger::ketchup::log_store::LogStore::new(
+        scratch.path().to_path_buf(),
+    )));
+    let (sink, mut records) = mpsc::channel(16);
+    let harness = Harness::start_with(HarnessOptions {
+        log_sink: Some(sink),
+        log_store: Some(store.clone()),
+        ..Default::default()
+    })
+    .await;
+    let jobs = jobs_from(
+        "[job.migration]\nimage='proc-grill:image-ignored'\ncommand=['sh','-c','echo selected-output']\nnamespace='team'",
     );
-    assert!(
-        dispatches.try_recv().is_err(),
-        "unschedulable work was dispatched"
-    );
-    let result = council
-        .write(reliaburger::council::RaftRequest::PrerequisiteCommit { operation_id })
-        .await
-        .unwrap();
-    assert!(
-        !matches!(
-            result,
-            reliaburger::council::CouncilResponse::Refused { .. }
-        ),
-        "{result:?}"
-    );
-    let ordinary = harness
-        .client
-        .submit_batch(&held_capacity_probe("ordinary-held-probe", "6"))
-        .await
-        .unwrap();
-    assert_eq!(ordinary["assigned"], 0, "{ordinary}");
-    assert!(dispatches.try_recv().is_err());
-    let freed = harness
-        .client
-        .submit_batch(&held_capacity_probe("migration-released-probe", "4"))
-        .await
-        .unwrap();
-    assert_eq!(freed["assigned"], 1, "{freed}");
-    let dispatch = tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
+    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let run = response["executions"]["migration"].as_str().unwrap();
+    let record = tokio::time::timeout(Duration::from_secs(10), records.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        dispatch["execution_labels"]
-            .as_object()
-            .unwrap()
-            .values()
-            .next()
-            .unwrap()["name"],
-        "migration-released-probe"
-    );
-    drop(harness);
-    council.shutdown().await.unwrap();
+    assert_eq!(record.instance, run);
+    assert_eq!(record.app, "migration");
+    assert_eq!(record.namespace, "team");
+    store.write().await.ingest(&record);
+    let http = reqwest::Client::new();
+    let selected = http
+        .get(format!(
+            "{}/v1/logs/entries/migration/team?instance={run}",
+            harness.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), 200);
+    assert!(selected.text().await.unwrap().contains("selected-output"));
+    let wrong_scope = http
+        .get(format!(
+            "{}/v1/logs/entries/other/team?instance={run}",
+            harness.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(!wrong_scope.status().is_success());
 }
 
+/// Admission is durable queuing; current worker budgets govern physical starts.
+/// Aggregator freshness belongs to app placement, not common job admission.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_ordinary_runtime_settlement_releases_held_capacity_for_batch_http() {
-    let council = single_node_leader().await;
-    let records = tempfile::tempdir().unwrap();
-    let mut options = local_capacity_options(council.clone(), "node-1");
-    options.records_dir = Some(records.path().to_path_buf());
-    let executor = Harness::start_with(options).await;
-    let config = Config::parse(
-        "[job.completed-ordinary]\nimage='proc-grill:image-ignored'\ncommand=['true']\n",
-    )
-    .unwrap();
-    executor.client.apply(&config).await.unwrap();
-    // This portable positive control deliberately has zero resource requests:
-    // ProcessGrill cannot enforce CPU limits. Resourceful reservation release
-    // is verified separately through the real Raft state-machine lifecycle.
-    // Completion is from the real ProcessGrill and owned Agent settlement
-    // watcher. No fixture directly submits JobApplyComplete in this control.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if council.desired_state().await.prerequisite_claims.is_empty() {
-                break;
+async fn common_jobs_execute_with_worker_evidence_independent_of_global_capacity_reports() {
+    for mode in ["absent", "stale", "closed", "previous-term"] {
+        let council = single_node_leader().await;
+        let mut options = HarnessOptions {
+            council: Some(council.clone()),
+            node_name: Some("worker".into()),
+            ..Default::default()
+        };
+        match mode {
+            "stale" => {
+                options.capacity_nodes = vec!["worker".into()];
+                options.stale_capacity_nodes = vec!["worker".into()];
             }
-            tokio::task::yield_now().await;
+            "closed" => options.close_capacity_channel = true,
+            "previous-term" => {
+                let (tx, rx) = tokio::sync::watch::channel(
+                    reliaburger::reporting::aggregator::AggregatedState {
+                        leadership_epoch: Some(council.current_term().saturating_sub(1)),
+                        ..Default::default()
+                    },
+                );
+                options.aggregated_override = Some(rx);
+                drop(tx);
+            }
+            _ => {}
         }
-    })
-    .await
-    .expect("positive actual runtime settlement did not release ownership");
-    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
-    let submitter = Harness::start_with(remote_capacity_options(council.clone(), address)).await;
-    let released = submitter
-        .client
-        .submit_batch(&full_node_job("positive-release-probe"))
-        .await
-        .unwrap();
-    assert_eq!(released["assigned"], 1, "{released}");
-    tokio::time::timeout(Duration::from_secs(5), dispatches.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    drop(submitter);
-    drop(executor);
-    council.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_new_leader_preserves_held_job_footprint_with_fresh_capacity_evidence() {
-    let network = InMemoryRaftRouter::new();
-    let mut councils = Vec::new();
-    for id in [1, 2] {
-        let node = Arc::new(
-            CouncilNode::new(
-                id,
-                fast_config(),
-                InMemoryRaftNetworkFactory::new(id, network.clone()),
-                MemLogStore::new(),
-                CouncilStateMachine::new(),
-                None,
-            )
+        let harness = Harness::start_with(options).await;
+        let response = harness
+            .client
+            .submit_batch(&jobs_from(
+                "[job.worker-proof]\nimage='proc-grill:image-ignored'\ncommand=['/usr/bin/true']",
+            ))
             .await
-            .unwrap(),
+            .unwrap();
+        assert_eq!(response["assigned"], 1, "{mode}: {response}");
+        let id = response["batch_id"].as_u64().unwrap();
+        let summary = harness.wait_done(id, 10).await;
+        assert_eq!(summary["succeeded"], 1, "{mode}: {summary}");
+        let desired = council.desired_state().await;
+        assert!(desired.batch_state.batches.is_empty());
+        let child = desired.task_arrays.manifest(id).unwrap().cohorts[0].1;
+        let record = desired.task_arrays.get(child).unwrap();
+        assert_eq!(record.state.spec.count, 1);
+        assert!(
+            !desired
+                .task_arrays
+                .jobs()
+                .run(child)
+                .unwrap()
+                .replay_unknown
         );
-        network.register(id, node.raft().clone()).await;
-        councils.push(node);
-    }
-    councils[0]
-        .initialize(BTreeMap::from([(
-            1,
-            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "leader"),
-        )]))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !councils[0].is_leader().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let operation_id = begin_held_capacity(&councils[0]).await;
-    let original_term = councils[0].current_term();
-    councils[0]
-        .add_learner(
-            2,
-            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "new-leader"),
-        )
-        .await
-        .unwrap();
-    councils[0]
-        .change_membership(std::collections::BTreeSet::from([2]))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !councils[1].is_leader().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(councils[1].current_term() > original_term);
-    let (address, mut dispatches, _worker_tasks) = pending_capacity_worker().await;
-    // Harness publishes a receive-deadline/leadership epoch for this CURRENT
-    // leader, so a refusal cannot be explained by an old reporting epoch.
-    let mut options = remote_capacity_options(councils[1].clone(), address);
-    options.node_name = Some("new-leader".into());
-    let submitter = Harness::start_with(options).await;
-    let release = councils[1]
-        .write(reliaburger::council::RaftRequest::PrerequisiteFailed {
-            operation_id: operation_id.clone(),
-        })
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            release,
-            reliaburger::council::CouncilResponse::Refused { .. }
-        ),
-        "{release:?}"
-    );
-    let held = submitter
-        .client
-        .submit_batch(&held_capacity_probe("handover-probe", "4"))
-        .await
-        .unwrap();
-    assert_eq!(held["assigned"], 0, "{held}");
-    assert!(dispatches.try_recv().is_err());
-    assert!(
-        councils[1]
-            .desired_state()
-            .await
-            .prerequisite_claims
-            .contains_key(&operation_id)
-    );
-    drop(submitter);
-    for council in councils {
+        assert!(
+            record
+                .state
+                .accepted_grant(reliaburger::meat::task_array::ChunkId(0))
+                .is_some()
+        );
+        drop(harness);
         council.shutdown().await.unwrap();
     }
 }

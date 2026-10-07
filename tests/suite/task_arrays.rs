@@ -113,6 +113,16 @@ impl Harness {
         tokens: Option<reliaburger::sesame::auth::TokenStore>,
         prepare: impl FnOnce(&std::path::Path),
     ) -> Self {
+        let data = tempfile::tempdir().unwrap();
+        prepare(data.path());
+        Self::start_in(options, tokens, data).await
+    }
+
+    async fn start_in(
+        options: Options,
+        tokens: Option<reliaburger::sesame::auth::TokenStore>,
+        data: tempfile::TempDir,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         // No agent: task arrays don't go through it. Holding the receiver
@@ -122,13 +132,16 @@ impl Harness {
             loop {
                 tokio::select! {
                     () = agent_shutdown.cancelled() => return,
-                    command = cmd_rx.recv() => if command.is_none() { return },
+                    command = cmd_rx.recv() => match command {
+                        Some(reliaburger::bun::agent::AgentCommand::BatchOwnedExecutions { response, .. }) => { let _ = response.send(Default::default()); }
+                        Some(reliaburger::bun::agent::AgentCommand::CurrentResources { response }) => { let _ = response.send(Vec::new()); }
+                        Some(reliaburger::bun::agent::AgentCommand::DeployOperations { response }) => { let _ = response.send(reliaburger::bun::deploy_operations::DeployOperationSnapshot { active_deploys: Vec::new(), history: Vec::new() }); }
+                        Some(_) => {}, None => return,
+                    },
                 }
             }
         });
 
-        let data = tempfile::tempdir().unwrap();
-        prepare(data.path());
         let node = TaskArrayNode::new(
             TaskArrayNodeConfig {
                 root: data.path().join("task-arrays"),
@@ -146,11 +159,16 @@ impl Harness {
             },
             options.runner,
         );
-        let service = Arc::new(TaskArrayService::with_timings(
-            Some(Arc::new(node)),
-            Duration::from_millis(50),
-            Duration::from_secs(30),
-        ));
+        let service = Arc::new(
+            TaskArrayService::with_timings(
+                Some(Arc::new(node)),
+                Duration::from_millis(50),
+                Duration::from_secs(30),
+            )
+            .with_storage(data.path())
+            .await
+            .unwrap(),
+        );
         let council = if options.council {
             Some(single_node_leader().await)
         } else {
@@ -710,5 +728,341 @@ async fn manifest_admission_and_summary_views_honour_the_callers_scope() {
             .unwrap()
             .status(),
         403
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_singletons_use_common_runs_and_repeat_requests_keep_the_same_identity() {
+    let harness = Harness::start(Options::processes(true)).await;
+    let body = json!({"name":"single","definition":{"template":{"exec":SHELL,"command":["-c","printf result"]}},"request_id":"same-operation"});
+    let send = || {
+        harness
+            .http
+            .post(format!("{}/v1/jobs/runs", harness.base_url))
+            .json(&body)
+    };
+    let response = send().send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    let response = send().send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    assert_eq!(response.json::<Value>().await.unwrap()["batch_id"], id);
+    let summary = harness.wait_done(id, 30).await;
+    assert_eq!(summary["total"], 1);
+    assert_eq!(summary["succeeded"], 1);
+    assert_eq!(
+        summary["execution_semantics"],
+        "acknowledged_unknown_replay"
+    );
+    assert_eq!(
+        summary["run"]["trigger"]["manual"]["request_id"],
+        "same-operation"
+    );
+    let run = harness
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await
+        .task_arrays;
+    assert_eq!(run.jobs().run(id).unwrap().name, "single");
+    let output = harness
+        .http
+        .get(format!("{}/v1/batch/{id}/tasks/0/logs", harness.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(output.status(), 200);
+    assert_eq!(output.text().await.unwrap(), "result");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cron_registration_is_durable_without_launching_a_manual_run() {
+    let harness = Harness::start(Options::processes(true)).await;
+    let body = json!({"name":"nightly","definition":{"template":{"exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
+    let response = harness
+        .http
+        .post(format!("{}/v1/jobs/runs", harness.base_url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    assert!(response.json::<Value>().await.unwrap()["batch_id"].is_null());
+    let arrays = harness
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await
+        .task_arrays;
+    assert!(
+        arrays
+            .jobs()
+            .definition("default", "nightly")
+            .unwrap()
+            .definition
+            .cron
+            .is_some()
+    );
+    assert!(arrays.ids().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toml_apply_routes_ordinary_jobs_and_hooks_through_common_runs() {
+    let harness = Harness::start(Options::processes(true)).await;
+    let client = reqwest::Client::new();
+    let config = "[app.web]\nimage='web:v1'\n[job.prepare]\nexec='/bin/sh'\ncommand=['-c','exit 0']\nrun_before=['app.web']\n[job.finish]\nexec='/bin/sh'\ncommand=['-c','printf done']";
+    let response = client
+        .post(format!("{}/v1/apply", harness.base_url))
+        .header("idempotency-key", "0123456789abcdef0123456789abcdef")
+        .body(config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let events = tokio::time::timeout(Duration::from_secs(10), response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(events.contains("Complete"), "{events}");
+    let arrays = harness
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await
+        .task_arrays;
+    assert_eq!(arrays.jobs().runs().count(), 2);
+    assert!(arrays.jobs().runs().all(|(_, run)| !run.replay_unknown));
+    let first = arrays
+        .jobs()
+        .runs()
+        .find(|(_, run)| run.name == "prepare")
+        .unwrap()
+        .0;
+    assert_eq!(
+        arrays.get(first).unwrap().state.status(),
+        reliaburger::meat::task_array_state::TaskArrayStatus::Succeeded
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finite_batches_are_common_singletons_and_repeated_submissions_keep_the_parent() {
+    let harness = Harness::start(Options::processes(true)).await;
+    let body = json!({"jobs":[{"name":"alpha","spec":{"exec":SHELL,"command":["-c","printf alpha"]}},{"name":"beta","spec":{"exec":SHELL,"command":["-c","printf beta"]}}]});
+    let response = harness
+        .http
+        .post(format!("{}/v1/batch", harness.base_url))
+        .header("idempotency-key", "finite-parent")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    let arrays = harness
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await
+        .task_arrays;
+    assert!(arrays.manifest(id).is_some());
+    assert_eq!(arrays.jobs().runs().count(), 2);
+    let response = harness
+        .http
+        .post(format!("{}/v1/batch", harness.base_url))
+        .header("idempotency-key", "finite-parent")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.json::<Value>().await.unwrap()["batch_id"], id);
+    let summary = harness.wait_done(id, 30).await;
+    assert_eq!(summary["total"], 2);
+    assert_eq!(summary["succeeded"], 2);
+    assert!(
+        summary["cohorts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["execution_semantics"] == "acknowledged_unknown_replay")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobs_inventory_and_stop_use_durable_schedule_definitions() {
+    let harness = Harness::start(Options::processes(true)).await;
+    let body = json!({"name":"nightly","definition":{"template":{"exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
+    assert_eq!(
+        harness
+            .http
+            .post(format!("{}/v1/jobs/runs", harness.base_url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    let response = harness
+        .http
+        .get(format!("{}/v1/jobs", harness.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let rows = response.json::<Vec<Value>>().await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row["name"] == "nightly" && row["state"] == "scheduled")
+    );
+    let summaries: Value = harness
+        .http
+        .get(format!("{}/v1/batch/summaries", harness.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        summaries["batches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "nightly" && row["status"] == "Scheduled")
+    );
+    let response = harness
+        .http
+        .post(format!("{}/v1/stop/nightly/default", harness.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let arrays = harness
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await
+        .task_arrays;
+    assert!(
+        arrays
+            .jobs()
+            .definition("default", "nightly")
+            .unwrap()
+            .definition
+            .cron
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deployment_inventory_and_cancellation_use_the_durable_hook_operation() {
+    let harness = Harness::start(Options::processes(true)).await;
+    let operation = "0123456789abcdef0123456789abcdef";
+    let response = harness.http.post(format!("{}/v1/apply", harness.base_url)).header("idempotency-key", operation).body("[app.web]\nimage='web:v1'\n[job.prepare]\nexec='/bin/sh'\ncommand=['-c','exec sleep 30']\nrun_before=['app.web']").send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let inventory = harness
+        .http
+        .get(format!("{}/v1/deploys/operations", harness.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inventory.status(), 200);
+    let inventory = inventory.json::<Value>().await.unwrap();
+    assert!(
+        inventory["active_deploys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == operation)
+    );
+    let arrays = harness
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await
+        .task_arrays;
+    let hook = arrays.deployment(operation).unwrap().hook_runs["prepare"];
+    harness
+        .wait_until(hook, 10, |row| row["held"].as_u64().unwrap_or(0) == 1)
+        .await;
+    let cancellation = harness
+        .http
+        .post(format!(
+            "{}/v1/deploys/operations/{operation}/cancel",
+            harness.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancellation.status(), 202);
+    let summary = harness.wait_done(hook, 10).await;
+    assert_eq!(summary["status"], "Cancelled");
+    assert!(
+        harness
+            .council
+            .as_ref()
+            .unwrap()
+            .desired_state()
+            .await
+            .apps
+            .is_empty()
+    );
+    drop(response);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_restart_retains_runs_requests_and_the_next_identity() {
+    let harness = Harness::start(Options::processes(false)).await;
+    let body = json!({"name":"once","request_id":"restarted-request","definition":{"template":{"exec":SHELL,"command":["-c","printf retained"]}}});
+    let response = harness
+        .http
+        .post(format!("{}/v1/jobs/runs", harness.base_url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    harness.wait_done(id, 10).await;
+    let Harness { _data, _tasks, .. } = harness;
+    drop(_tasks);
+    let reopened = Harness::start_in(Options::processes(false), None, _data).await;
+    assert_eq!(reopened.status(id).await["status"], "Succeeded");
+    let response = reopened
+        .http
+        .post(format!("{}/v1/jobs/runs", reopened.base_url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    assert_eq!(response.json::<Value>().await.unwrap()["batch_id"], id);
+    let mut another = body;
+    another["request_id"] = json!("next-request");
+    let response = reopened
+        .http
+        .post(format!("{}/v1/jobs/runs", reopened.base_url))
+        .json(&another)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    assert!(
+        response.json::<Value>().await.unwrap()["batch_id"]
+            .as_u64()
+            .unwrap()
+            > id
     );
 }
