@@ -184,5 +184,5 @@ cat "$work/http.log" || true
     cat "$work/status.txt" 2>/dev/null || true
     grep -a -h -e "reliaburger: bun" -e "reliaburger: counted boot" -e "os update" "$log" || true
     echo '```'
-} >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+} | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}" # the log too, which the API serves
 [ "$result" = pass ]
