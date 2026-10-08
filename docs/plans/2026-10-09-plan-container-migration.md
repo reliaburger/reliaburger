@@ -84,6 +84,41 @@ What the demo asserts follows the stages: stage 1 proves the in-memory data
 survives and reports one reconnect per move; stage 3 also requires the original
 connection to survive. The research's sections 9.1 and 9.2.1 have the detail.
 
+## The laptop cluster comes first
+
+Most people meet Reliaburger through `curl | sh`: three Lima VMs on a laptop,
+usually an Apple-silicon Mac. If the move demo doesn't work there, most people
+will never see it. So **every stage's demo must pass on the default quickstart
+cluster**, on Apple silicon (Lima's VZ driver, arm64 guests) and on Linux (QEMU,
+x86_64 guests), before that stage ships. A bare-metal pass doesn't count
+instead.
+
+What that means in practice:
+
+- **CRIU in the guest image.** `scripts/release/build_guest_image.sh` builds the
+  Ubuntu 24.04 guest from a pinned package list, and the VMs install nothing at
+  first boot. CRIU joins that list at a pinned version of at least 4.2. If
+  Ubuntu's archive doesn't carry a suitable build for 24.04, the image build
+  installs our own pinned, signed one; first boot still installs nothing. The
+  guest-image qualification record gains `criu check --all` from both
+  architectures.
+- **The guest kernel.** S1 runs `criu check --all` in the Lima guest on both
+  architectures and records what's missing: checkpoint/restore support, time
+  namespaces, `userfaultfd`, `TCP_REPAIR`. arm64 mainline kernels have no
+  soft-dirty tracking (research, section 3), so on Apple silicon there's no
+  pre-copy and every checkpoint move is a full stop-and-copy.
+- **The pause on a Mac.** Without pre-copy, the pause is dump, transfer and
+  restore of the whole working set. For the demo's 64 MiB Redis, between two
+  VMs on one laptop, we expect well under a second; S7 measures it and the
+  manual prints the measurement, not this estimate.
+- **Memory.** Quickstart VMs have 2 GiB each. The dump stays in no-swap memory on
+  both nodes, so the demo's Redis stays small, and admission refuses a move
+  whose dump wouldn't fit, naming the shortfall, rather than letting the source
+  get OOM-killed.
+- **What it doesn't prove.** Three VMs on one host share one virtual switch. The
+  laptop demo proves the mechanism and the contract, not behaviour on a real
+  network; release qualification adds bare-metal and multi-host runs.
+
 ## Naming
 
 "Migration" already means three things in Reliaburger. A `run_before` job is a
@@ -249,8 +284,8 @@ Main's release qualification scripts own hardware/soak execution and save record
 in `docs/qualification/`; reuse the versioned conformance manifest so release
 checks cannot drift into a separate weaker demonstration.
 
-**Packaging:** package pinned qualified CRIU/runc in the appliance/managed Linux
-guests, check Ubuntu 26.04 availability before depending on a PPA, and expose
+**Packaging:** package pinned qualified CRIU/runc in the quickstart guest image
+(see "The laptop cluster comes first"), the appliance and managed Linux guests, check Ubuntu 26.04 availability before depending on a PPA, and expose
 runtime capabilities in `wtf`/dry-run. No automatic PPA installation on an existing
 cluster from `relish test`. Verify signed mechanism and Redis/PostgreSQL fixture
 image availability before timing; support existing mirrors/local staging rather

@@ -988,6 +988,11 @@ grows with the stages: in stage 1 the data survives and the client reconnects
 once per move (reported, not hidden); from stage 3 the original connection must
 survive too. These are future tests, not claims that Redis is already qualified.
 
+The demonstration must pass on the default `curl | sh` quickstart cluster on
+Apple silicon and Linux before its stage ships; the delivery plan's
+[laptop section](2026-10-09-plan-container-migration.md#the-laptop-cluster-comes-first)
+covers the guest image, kernel checks, pause and memory budget.
+
 Only qualified nodes run the fixtures. Known absence reports **not demonstrated**
 with actionable reasons; collection failure is unknown. An explicitly requested
 migration demonstration returns nonzero if it cannot exercise its core live
