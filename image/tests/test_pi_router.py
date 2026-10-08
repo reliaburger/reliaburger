@@ -100,9 +100,11 @@ class DnsmasqConfig(unittest.TestCase):
                       DNSMASQ.read_text())
 
     def test_ten_wyse_reservations_below_the_pool(self):
-        lines = re.findall(r"^#dhcp-host=<wyse-(\d\d)-mac>,10\.77\.0\.(\d+),wyse-(\d\d)$",
+        # Named as `relish machines claim --create --name wyse` names the
+        # nodes (bare_metal::node_name): wyse-1, not wyse-01.
+        lines = re.findall(r"^#dhcp-host=<wyse-(\d+)-mac>,10\.77\.0\.(\d+),wyse-(\d+)$",
                            DNSMASQ.read_text(), flags=re.M)
-        self.assertEqual([n for n, _, _ in lines], [f"{i:02d}" for i in range(1, 11)])
+        self.assertEqual([n for n, _, _ in lines], [str(i) for i in range(1, 11)])
         self.assertEqual([int(a) for _, a, _ in lines], list(range(11, 21)))
         self.assertTrue(all(n == name for n, _, name in lines))
         self.assertIn(("dhcp-range", "10.77.0.100,10.77.0.199,255.255.255.0,12h"),
