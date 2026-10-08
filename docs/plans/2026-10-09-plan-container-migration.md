@@ -71,6 +71,43 @@ at-least-once), and single-attempt work such as deployment hooks blocks drain
 until a checkpoint move can carry it. The research's section 5.1 has the
 admission rules.
 
+## Rolling OS updates and mixed kernels
+
+Stage 2 is where this feature pays for itself. 0.3.0's appliance builds a signed
+OS image every week and installs it into the inactive A/B slot
+([roadmap](../roadmap.md), merge train
+[#490](https://github.com/reliaburger/reliaburger/pull/490)). Today, activating
+that slot means rebooting the node and restarting everything on it. With moves,
+the update controller can drain each node with migration intent, wait until
+every workload reports source-independent completion, reboot into the new slot,
+check health and uncordon, one node at a time.
+
+That rollout is also the hardest case for compatibility, and the research
+didn't name it. Halfway through, the cluster runs two kernels (and possibly two
+CRIU builds), and every move crosses between them. So:
+
+- **Restore across kernels is a named, qualified direction.** New spike S20:
+  checkpoint on the current appliance kernel and restore on the next weekly
+  build's kernel, on both architectures, with Redis and the mechanism fixture.
+  The reverse direction (new to old) matters when an A/B update rolls back; it
+  is refused unless S20 qualifies it.
+- **CRIU versions too.** If the weekly image bumps CRIU, a dump from the older
+  CRIU must restore on the newer one. A newer-to-older restore is refused.
+- **The pool fingerprint records the kernel and CRIU versions**, and compatibility
+  is directional (research, section 9.4). Admission refuses a direction that
+  hasn't been qualified, naming it, rather than finding out during restore.
+- **Prefer updated targets.** The planner moves workloads to nodes already on the
+  new image, so most workloads move once per rollout and always old-to-new.
+  Only the first node's workloads move between two old-image nodes.
+- **Stop on doubt.** A move that ends in recovery-required pauses the rollout and
+  leaves the node cordoned. The operator sees which workload and why.
+- **Same hardware.** A rolling update doesn't change CPUs, so the CPU feature check
+  stays defence in depth here, not the main risk.
+
+Stage 2 depends on 0.3.0 shipping the A/B update path. If 0.3.0 slips, stage 2
+still delivers `relish drain` plus a documented manual reboot loop on Ubuntu
+nodes, and the automated rollout follows when the appliance lands.
+
 ## The demonstration
 
 `relish test --filter move` moves **Redis** A to B to A on the operator's own
@@ -163,13 +200,16 @@ as "no" for the stage until someone reopens it on purpose.
 | S1 + S2 + S5: restore on our real spec | 1 week | `runc checkpoint`/`restore` round-trips a container with our rootful user namespace, external network namespace, private overlay, capture files (S2) and owner adoption (S5) on x86_64 and on the arm64 Lima guest. | Checkpoint mode is dropped; stage 1 ships cold moves only. |
 | S4: egress before execution | 3 days | The restored workload can't run an instruction before its cgroup egress policy is enforced. | Workloads with egress policy refuse checkpoint moves. |
 
-### Wave 2: inside stage 1
+### Wave 2: inside stages 1 and 2
 
 S13 (consistent filesystem cut), S15 (no-swap staging and key recovery), S8
 (refusal fixtures), S6 (clocks), S17 (test leases) and S14 (credentials) run as
 the first task of the milestone that needs them, within that milestone's week.
 Until S14 picks a credential path, apps that hold a workload identity
 certificate refuse checkpoint moves rather than restoring a key we then revoke.
+
+S20 (restore across kernel and CRIU versions) runs at the start of stage 2; if
+it fails, stage 2 ships drain with cold moves only for mixed-kernel rollouts.
 
 ### Wave 3: does stage 3 exist? (after stage 2 ships)
 
@@ -241,6 +281,7 @@ stays a TCP_REPAIR test harness only.
 | S17 | Migration under authenticated test leases; expiry/stop/cleanup at every boundary on both nodes. |
 | S18 | Versioned profile completeness, directional pools and recorded evidence; partial/skip/unknown cannot certify conformance. |
 | S19 | Actual drain followed by source VM shutdown/restart under live traffic, with independent entry/observer topology and no resurrection. |
+| S20 | Restore from the current appliance kernel and CRIU to the next weekly build's, on both architectures; new-to-old refused unless qualified. Runs at the start of stage 2. |
 
 ## Tests
 

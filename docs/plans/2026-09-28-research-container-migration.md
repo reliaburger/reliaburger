@@ -897,7 +897,9 @@ separate; a retired source must not mint replacement credentials.
 CPU superset checks (`criu cpuinfo dump`, restore `--cpu-cap=cpu`) are defence in
 depth, not complete portability. Qualify architecture, runtime/image format,
 kernel, namespace/cgroup features, page size and relevant filesystem/device
-support as a migration pool. Runtime feature probes determine optimisations.
+support as a migration pool. A rolling OS update makes the pool mixed by design:
+old-to-new kernel and CRIU restore is a qualified direction of its own (spike S20
+in the [delivery plan](2026-10-09-plan-container-migration.md#rolling-os-updates-and-mixed-kernels)). Runtime feature probes determine optimisations.
 
 ## 8. Operator UX and evidence
 
