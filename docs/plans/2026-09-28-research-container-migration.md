@@ -26,11 +26,12 @@ explicitly identifies an existing capability.
 - [ ] Implement and qualify the full release scope.
 
 Code baseline: `origin/main` at
-[`ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`](https://github.com/reliaburger/reliaburger/commit/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98),
-refetched 6 October 2026. It includes the boot-relative process adoption fix
-(#609). The earlier `ff854cbf` baseline is superseded. Baseline links in section 2
-are pinned to this main commit; subsequent implementation must refresh them.
-The branch incorporates that main commit without rewriting the PR history.
+[`5cfb9b710828f7ef3c5fd820249374e3dad9ac77`](https://github.com/reliaburger/reliaburger/commit/5cfb9b710828f7ef3c5fd820249374e3dad9ac77),
+refetched 9 October 2026. It includes the boot-relative process adoption fix
+(#609) and the common job lifecycle (#642). The earlier `ff854cbf` and
+`ca2c33a2` baselines are superseded. Baseline links in section 2 are pinned to
+this main commit; subsequent implementation must refresh them. On 9 October the
+branch was rebased onto this commit, replacing the earlier merge of main.
 
 ## 1. Recommendation and the continuity contract
 
@@ -106,7 +107,7 @@ crash. Failures after admission follow section 5.6.
 
 ## 2. What main does today
 
-Assertions below were checked by reading fetched main at `ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`.
+Assertions below were checked by reading fetched main at `5cfb9b710828f7ef3c5fd820249374e3dad9ac77`.
 There is no implemented process migration pipeline or migration test group.
 Existing reconciliation checkpoints are not CRIU images.
 
@@ -120,38 +121,40 @@ Existing reconciliation checkpoints are not CRIU images.
 | Managed volumes | Paths remain per namespace/app/mount on each node, with plain-directory, loop-ext4 and Btrfs backends. They are not per logical replica; independent movement cannot split a shared writer group or merge separate target data. |
 | Logical replica identity | `Placement` now includes a cluster-wide replica `ordinal`; `InstanceIdentity` includes namespace, app, generation and ordinal. Preserve the logical replica and change its host/runtime generation, instead of inventing a fresh logical instance on every move. |
 | Scheduling/home | `VolumeHome` uses `last_placed_nodes`; unavailable volume homes wait unless explicitly released. Migration must atomically replace authoritative home information with the ownership cutover. |
-| Jobs | Node-local `RecordedJob` includes run generation, restart count, phase and trusted batch ownership (`spec_digest`). Raft batch records retain execution names/spec digests and replay fences. Migration extends these records rather than creating a parallel attempt-number ledger. |
+| Jobs | Since #642, singleton jobs, task arrays, cron and deployment hooks share one lifecycle. A replicated `RunRecord` fixes the definition revision, trigger identity and task policy; indexed tasks and attempts belong to that run, and node workers keep an fsync'd task ledger. Bulk tasks are documented at-least-once and retry within `max_attempts`; deployment hooks have one attempt, and unknown outcomes hold rather than replay. A job move addresses the exact run, task index and attempt, and extends these records rather than creating a parallel attempt ledger. Node-local `RecordedJob` and Raft batch spec digests remain for the paths not yet folded in. |
 | Discovery | Endpoint withdrawal acknowledgements fence address reuse. Ordinary retirement removes routes; live handoff needs its own publication/withdrawal ordering to avoid destroying retained sessions. |
 | Workload credentials | CSR signing derives workload identity from instance identity and checks placement for apps. Private-key caching in restored memory still requires an explicit credential-mobility/reload design. |
 | Drain/upgrades | Operator drain is still planned. Upgrade cordons and Smoker's simulated drain exist; planned Bun exec upgrades adopt running workloads. Kernel/firmware reboot is the migration maintenance case. |
 | Built-in tests | `relish test` runs client-side public API cases in leased `rbtest-*` namespaces, with pinned OCI fixtures, capability evidence, deadlines and confirmed cleanup. It has development/full-runtime profiles and a separate acknowledged chaos catalogue. |
 | Profile completeness | Current profile rules mark selected cases required by capability. They do not define a versioned complete migration manifest or certify every migration-compatible node pair. |
 | Node fault/shutdown | Smoker's `NodeTransportGate` suppresses cluster transport traffic; it does not remove kernel NAT/proxy state. Managed `relish local` has VM start/stop support with endpoint/quorum safeguards. Source-independence qualification needs actual VM/network loss. |
-| Formats | Current `compatibility::CURRENT` is protocol **40**, state **58**. New incompatible formats bump from the then-current main values; do not pin a future release to these numbers. |
+| Formats | Current `compatibility::CURRENT` is protocol **48**, state **65**. New incompatible formats bump from the then-current main values; do not pin a future release to these numbers. |
 
 ### Main evidence
 
 The following are source entry points, all pinned to the verified main revision:
 
-- [Runtime ownership: `src/grill/runc/owned.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/runc/owned.rs#L752)
-- [Boot/process evidence: `src/grill/records.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/records.rs#L212)
-- [Capture ownership: `src/grill/process_owner.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/process_owner.rs#L55)
-- [Namespace addressing/NAT: `src/grill/netns.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/netns.rs#L166)
-- [Private overlay: `src/grill/rootfs.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/rootfs.rs#L76)
-- [Managed volumes: `src/grill/volume.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/volume.rs#L135)
-- [Replica placement: `src/meat/types.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/meat/types.rs#L202)
-- [Instance identity: `src/grill/mod.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/grill/mod.rs#L95)
-- [Volume homes: `src/cluster/orchestrate.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/cluster/orchestrate.rs#L985)
-- [Job records: `src/bun/jobs.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/bun/jobs.rs#L48)
-- [Raft batch ownership: `src/meat/batch_tracker.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/meat/batch_tracker.rs#L233)
-- [Workload signing: `src/cluster/workload_identity.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/cluster/workload_identity.rs#L89)
-- [Test runner: `src/relish/test_cmd.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/relish/test_cmd.rs#L43)
-- [Test acceptance profiles: `src/testkit/runner.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/testkit/runner.rs#L569)
-- [Evidence/cleanup report: `src/testkit/report.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/testkit/report.rs#L237)
-- [Test resource policy: `src/testkit/safety.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/testkit/safety.rs#L86)
-- [Transport fault: `src/smoker/node_fault.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/smoker/node_fault.rs#L12)
-- [Ingress sessions: `src/wrapper/websocket.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/wrapper/websocket.rs#L61)
-- [Compatibility: `src/compatibility.rs`](https://github.com/reliaburger/reliaburger/blob/ca2c33a25ef7dc8837ca714e20468c2ae17e5d98/src/compatibility.rs#L54)
+- [Runtime ownership: `src/grill/runc/owned.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/grill/runc/owned.rs#L752)
+- [Boot/process evidence: `src/grill/records.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/grill/records.rs#L212)
+- [Capture ownership: `src/grill/process_owner.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/grill/process_owner.rs#L55)
+- [Namespace addressing/NAT: `src/grill/netns.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/grill/netns.rs#L166)
+- [Private overlay: `src/grill/rootfs.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/grill/rootfs.rs#L76)
+- [Managed volumes: `src/grill/volume.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/grill/volume.rs#L135)
+- [Replica placement: `src/meat/types.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/meat/types.rs#L202)
+- [Instance identity: `src/grill/mod.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/grill/mod.rs#L95)
+- [Volume homes: `src/cluster/orchestrate.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/cluster/orchestrate.rs#L985)
+- [Job records: `src/bun/jobs.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/bun/jobs.rs#L48)
+- [Job runs and triggers: `src/meat/job.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/meat/job.rs#L157)
+- [Worker task ledger: `src/bun/task_ledger.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/bun/task_ledger.rs#L94)
+- [Raft batch ownership: `src/meat/batch_tracker.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/meat/batch_tracker.rs#L233)
+- [Workload signing: `src/cluster/workload_identity.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/cluster/workload_identity.rs#L104)
+- [Test runner: `src/relish/test_cmd.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/relish/test_cmd.rs#L43)
+- [Test acceptance profiles: `src/testkit/runner.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/testkit/runner.rs#L569)
+- [Evidence/cleanup report: `src/testkit/report.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/testkit/report.rs#L237)
+- [Test resource policy: `src/testkit/safety.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/testkit/safety.rs#L86)
+- [Transport fault: `src/smoker/node_fault.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/smoker/node_fault.rs#L12)
+- [Ingress sessions: `src/wrapper/websocket.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/wrapper/websocket.rs#L61)
+- [Compatibility: `src/compatibility.rs`](https://github.com/reliaburger/reliaburger/blob/5cfb9b710828f7ef3c5fd820249374e3dad9ac77/src/compatibility.rs#L80)
 
 ## 3. CRIU, runc and ecosystem research
 
@@ -495,7 +498,8 @@ in-memory cache or job with `mode = "checkpoint"`/`"live"` must enter this
 pipeline. Only workloads whose policy allows restart are ordinary reschedules.
 For unspecified app policy, the historical cold default remains; that default
 is not a promise of state continuity. An unspecified job may be restarted only
-when its own retry/restart policy permits it; otherwise it blocks drain.
+when its own retry/restart policy permits it; otherwise it blocks drain. Under #642 that means bulk array tasks with attempts
+left can be requeued, while deployment hooks and single-attempt work block.
 
 The move unit is a logical replica or a declared storage-sharing group. Until
 per-replica volumes exist, the source must have no other instance using those
@@ -820,8 +824,8 @@ pages were replicated; restoring current execution requires current state.
 
 Pre-1.0 policy remains: incompatible changes bump protocol/state from current
 main and require a fresh cluster. There is no dependency on PR #266's old gate.
-Do not use the superseded protocol 27/state 44 numbers. The reviewed main is
-40/58; implementation chooses the next values when it lands.
+Do not use the superseded protocol 27/state 44 or 40/58 numbers. The reviewed
+main is 48/65; implementation chooses the next values when it lands.
 
 Changes include migration/cordon records and ownership epochs in Raft snapshots
 and requests; app/job preservation and fallback policy; held assignments; job
@@ -885,7 +889,7 @@ Proposed commands (none implies an implemented migration verb today):
 relish migrate default/cache --to node-3
 relish migrate default/cache --to node-3 --mode live
 relish migrate default/cache --to node-3 --dry-run
-relish migrate default/render --execution <id> --to node-3
+relish migrate default/render --run <run-id> --task <index> --to node-3
 relish migrate status [<migration-id>]
 relish migrate cancel <migration-id>
 relish drain node-2 [--timeout 30m] [--force]
@@ -893,8 +897,8 @@ relish drain status node-2
 relish uncordon node-2
 ```
 
-Job selection must resolve main's exact namespace/execution/run generation,
-not just an ambiguous attempt number. CLI syntax is finalised with that binding.
+Job selection must resolve main's exact namespace, run id, task index and
+attempt, not just an ambiguous attempt number. CLI syntax is finalised with that binding.
 The following config shape is proposed; parser/schema work remains:
 
 ```toml
@@ -1387,6 +1391,8 @@ to satisfy this release's continuity contract.
 Review completed 5 October against fetched main `ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`.
 CRIU primer and refusal coverage reviewed 6 October against the same freshly
 fetched main and upstream v4.2.1; main has not advanced since the preceding review.
+On 9 October the branch was rebased onto `5cfb9b71`, 112 commits later; section 2,
+the pinned links, the compatibility numbers and the job model were refreshed.
 The same day's database revision makes Redis and PostgreSQL required application
 targets in the demo, strict manifest, source-off qualification and implementation
 order; it does not record completed database migration experiments.
@@ -1415,7 +1421,7 @@ run, and the proposed migration commands/profiles remain unimplemented.
 | CRIU installation or a successful fixture implies arbitrary workloads can move. | Explain dump blockers, conditional resources and external-state boundaries; workload-specific and late-resource qualification with refusal fixtures. Section 3, S8 and strict conformance. |
 | Real database compatibility is deferred behind a synthetic fixture. | Redis first and PostgreSQL second are required targets, with memory-only state, durable data, open transactions, active queries and source-off evidence; 9.2.1 and S16. |
 | Every deadline assumed to yield terminal successful ownership. | Held recovery/unavailability when proof is missing; model tests permit it. |
-| Stale baseline/protocol and job attempt design. | Main 40/58 and existing job generations/spec digests/replay fences, refreshed before implementation. |
+| Stale baseline/protocol and job attempt design. | Main 48/65 and the #642 run/task/attempt model with its worker ledger, refreshed before implementation. |
 
 Remaining design blockers: partition-enforced ownership in each topology;
 portable external NAT and proxy sessions; restore on the real userns/overlay/
@@ -1467,7 +1473,7 @@ and distinguishes historical choices from required new design work:
   lease-owned fixtures must migrate safely. Actual source shutdown and recovery
   are separate acknowledged cases and mandatory full-conformance/release evidence.
 - The old effort estimate is superseded pending the expanded spikes. All code
-  assertions use fetched main, and the merge preserves the PR's existing history.
+  assertions use fetched main. (On 9 October the branch was rebased onto main.)
 
 ### Database demonstration targets, authorised 6 October 2026
 
