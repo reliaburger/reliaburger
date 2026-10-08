@@ -144,7 +144,7 @@ A few options for real networks:
   warns if nothing on this machine holds UDP 67.
 
 Once the files check out, it broadcasts a network-boot request of its own
-and listens for two seconds:
+and listens for five seconds:
 - If another netboot server answers, it refuses to start. Two on one LAN
   race to boot every machine.
 - If your router answers, it says so (`192.168.1.1 hands out addresses on
