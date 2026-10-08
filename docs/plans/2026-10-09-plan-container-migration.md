@@ -145,6 +145,17 @@ Stage 2 depends on 0.3.0 shipping the A/B update path. If 0.3.0 slips, stage 2
 still delivers `relish drain` plus a documented manual reboot loop on Ubuntu
 nodes, and the automated rollout follows when the appliance lands.
 
+## Metrics, logs and alerts
+
+A move must not make a workload's history disappear or page someone for a
+planned pause. Today both Mayo and Ketchup find an app's data through its current
+placement, so they'd do both. The research's section 8 has the design: queries
+fan out to every node that hosted the app within retention, `instance` stays the
+logical replica while `node` changes, the freeze budget is excused from alerts
+and health restarts but an overrun isn't, recovery-required raises a critical
+alert, and every move phase is an event on the dashboard timeline. Each stage's
+exit test checks logs and metrics across the move, not just the workload.
+
 ## The demonstration
 
 `relish test --filter move` moves **Redis** A to B to A on the operator's own

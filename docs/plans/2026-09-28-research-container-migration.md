@@ -987,6 +987,41 @@ unsupported hosts, stale reservations, missing no-swap policy, unresolved epochs
 credential reload requirements and orphaned owned resources. A matching CPU model
 alone neither establishes nor rejects full compatibility.
 
+**Metrics, logs and alerts across a move (added 9 October).** Mayo and Ketchup
+keep their data on the node that produced it, and both find an app's data
+through its *current* placement ([metrics design](../design/metrics-mayo.md),
+[logs design](../design/logs-ketchup.md)). Scraped samples carry `app`,
+`namespace`, `instance` and `node` labels, and Bun samples per-process CPU and
+memory by PID. Without changes, a move makes the workload's history vanish from
+`relish logs` and the dashboard the moment placement points at the target, and
+the freeze looks like an outage to the alert evaluator. So:
+
+- **History follows the workload.** Queries for an app fan out to every node that
+  hosted it within the retention window, not just the current placement. Move
+  records in Raft give that bounded list. Ketchup's cross-node follow already
+  copes with nodes joining and leaving; non-follow queries and
+  `/v1/metrics/app` gain the same. Decommissioning a node that still holds a
+  moved workload's history warns first.
+- **Stable series identity.** `instance` stays the logical replica
+  (namespace, app and ordinal) across moves; only `node` changes. After a
+  checkpoint or live move the app's own counters carry on from where they were,
+  because memory came with it; after a cold move they reset, as after any
+  restart. The manual says which, and per-process sampling follows the new PID
+  from the owner record.
+- **No false alarms, no hidden failures.** While a move owns an instance, a failed
+  scrape or probe inside the declared freeze budget doesn't count towards alerts
+  or health restarts (section 5.4 already holds the restarts). A pause beyond the
+  budget does count. A move stuck in recovery-required raises a built-in
+  critical alert.
+- **Moves are events.** Each phase lands in the event stream and the dashboard's
+  timeline, with the measured pause, so "why did latency spike at 03:12?" has an
+  answer.
+
+Tests: across a move, `relish logs` returns lines from before and after it in
+order; the app's counter series continues under the same `instance` label; a
+move within budget fires no alert; one that overruns, or ends in recovery-required,
+does.
+
 Document the contract and the test command in the manual, quickstart and website,
 and explain the implementation and assertions in the 0.4.0 book chapter. Product
 flows explain preservation and pauses; CRIU plumbing goes in detailed diagnostics.
