@@ -14,7 +14,7 @@ namespace playing the router.
 
 ```
 home Wi-Fi ── wlan0  Raspberry Pi  eth0 10.77.0.1 ── switch ─┬─ Mac (USB Ethernet) 10.77.0.2, relish netboot
-                     NAT, DHCP, DNS, NTP                     ├─ wyse-01 10.77.0.11
+                     NAT, DHCP, DNS, NTP                     ├─ wyse-1  10.77.0.11
                                                              ├─ …
                                                              └─ wyse-10 10.77.0.20
 ```
@@ -110,13 +110,19 @@ Each Wyse has its MAC on the label underneath. Edit
 `/etc/dnsmasq.d/lab.conf`, put each MAC into its line, and remove the `#`:
 
 ```
-dhcp-host=6c:4b:90:12:34:56,10.77.0.11,wyse-01
+dhcp-host=6c:4b:90:12:34:56,10.77.0.11,wyse-1
 ```
 
-Write the node number on the unit as well, so wyse-03 is the third box on the
+Write the node number on the unit as well, so wyse-3 is the third box on the
 shelf and not just the third line in a file. The claim records each machine's
 current address as its node address, which is why the addresses must never
 move.
+
+The names match the cluster's. `relish machines claim --create --name wyse`
+calls the machines `wyse-1`, `wyse-2` and so on, in the order you list them,
+with no leading zero. Claim them in label order and `wyse-3.lab` is node
+`wyse-3`. The release gate runs on three Wyses, so the first three lines are
+the ones it needs; fill in the rest for a full lab run.
 
 Do the same for the Mac's USB Ethernet adapter (`ifconfig en7 | grep ether`,
 with the adapter's name from `networksetup -listallhardwareports`). Its line

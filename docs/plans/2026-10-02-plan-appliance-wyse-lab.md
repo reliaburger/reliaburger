@@ -122,7 +122,7 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 | BIOS, each Wyse | F2, password `Fireport`: BIOS 1.2.5, UEFI with CSM off, UEFI network stack and PXE on, Secure Boot off, power on after AC loss | Manual, ~5 min a unit (S5 runbook step 1) |
 | relish for the Mac | `cargo build --release --bin relish` on `appliance-train` | Real |
 | Images | `gh run download … -n appliance-x86_64` (lab build) | Real, preview signing until 0.3.0 publishes |
-| Serve | `caffeinate -i sudo relish netboot art --key … --interface en7 --mac <10 MACs> --wipe --for 2h` | Real; `--wipe` is PR 1 |
+| Serve | `caffeinate -i sudo relish netboot art --key … --interface en7 --mac <mac> … --wipe <mac> … --for 2h` | Real; `--wipe` is PR 1 |
 | Install | Power on; F12 → the UEFI IPv4 Realtek entry, or network first in the boot order | Real in VMs; never on a Wyse |
 | Claim | `relish machines`, then `relish machines claim ~/wyse --create --name wyse --operator 10.77.0.2 --network 10.77.0.0/24 <mac-1> <mac-2> <mac-3>`, then `relish machines claim ~/wyse <mac-4> … <mac-10>` | Real; CI covers two VMs (`image/tests/claimed-pair.sh`) |
 | Check | `relish nodes`, `relish council`, `relish wtf` | Real |
@@ -130,7 +130,7 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 | Measure | `image/lab/fleet-measure.sh ~/wyse` | Lab script; reads a claim directory or `relish nodes` (PR 6) |
 | OS update | `relish os upgrade --channel http://10.77.0.2:8000/…/os-channel.json --key next/lab-signing-key.pub.pem` | Real; needs a next version from the same run (PR 5); `--key` reads the lab channel |
 
-The claim asks you to compare each machine's claim key with its monitor. With one DisplayPort monitor and ten machines, that's ten cable swaps; `--trust-lan` skips it, which is fine on an isolated switch with nothing else on it.
+The claim asks you to compare each machine's claim key with its monitor. With one DisplayPort monitor and ten machines, that's ten cable swaps; `--trust-lan` skips it, which is fine for day-to-day lab runs on an isolated switch with nothing else on it. The gated run of 7 October compares all three keys instead (the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md), §4).
 
 ### What's still preview or script-only
 
