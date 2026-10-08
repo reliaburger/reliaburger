@@ -100,6 +100,78 @@ None of these are results yet. Run them on the then-current main's generated
 OCI spec, pinned runc and CRIU packages and real kernels. x86_64 and arm64 need
 separate evidence.
 
+The research listed nineteen spikes with no order. Three of them decide whether
+a whole stage exists, so they run first, each with a time box, a written "yes"
+and a stated consequence for "no". Every spike lands as a pull request: a gated
+test (`make test-linux` or `make test-cluster`) that encodes the finding, plus a
+short record in `docs/qualification/`. A spike that overruns its time box counts
+as "no" for the stage until someone reopens it on purpose.
+
+### Wave 1: does stage 1 exist? (before any checkpoint code)
+
+| Spike | Time box | "Yes" means | "No" means |
+|---|---|---|---|
+| S12: partition-safe fencing and activation | 1 week | A model and property test show at most one generation can run across leader change, partition and Bun restart, using main's existing runtime and storage fences. | Nothing ships, cold moves included. Redesign before going further. |
+| S1 + S2 + S5: restore on our real spec | 1 week | `runc checkpoint`/`restore` round-trips a container with our rootful user namespace, external network namespace, private overlay, capture files (S2) and owner adoption (S5) on x86_64 and on the arm64 Lima guest. | Checkpoint mode is dropped; stage 1 ships cold moves only. |
+| S4: egress before execution | 3 days | The restored workload can't run an instruction before its cgroup egress policy is enforced. | Workloads with egress policy refuse checkpoint moves. |
+
+### Wave 2: inside stage 1
+
+S13 (consistent filesystem cut), S15 (no-swap staging and key recovery), S8
+(refusal fixtures), S6 (clocks), S17 (test leases) and S14 (credentials) run as
+the first task of the milestone that needs them, within that milestone's week.
+Until S14 picks a credential path, apps that hold a workload identity
+certificate refuse checkpoint moves rather than restoring a key we then revoke.
+
+### Wave 3: does stage 3 exist? (after stage 2 ships)
+
+| Spike | Time box | "Yes" means | "No" means |
+|---|---|---|---|
+| S11: movable network ownership | 2 weeks | The network design below keeps an established in-cluster TCP session, an outside client's session on the same L2 segment, and an outbound session across A to B to A, with the source switched off afterwards. | Live moves come off the roadmap. Stages 1 and 2 stand. |
+| S7 + S9: interruption envelope | 1 week | On both architectures, a 256 MiB Redis moves with a client-observed pause we're willing to print in the manual (target: under a second on x86_64 with pre-copy, under three on arm64 without it). | Live mode ships only where the envelope holds; elsewhere `live` is refused. |
+
+S10 (lazy pages), S16 (database fixtures), S18 (conformance completeness) and S19
+(source-off) follow inside stage 3's milestones.
+
+### The network design S11 tests
+
+Today an established in-cluster connection isn't addressed to the workload at
+all. Onion's eBPF `connect()` hook rewrites the service VIP to the backend's
+**node IP and host port**, and host-port DNAT forwards it into the container
+([discovery design](../design/discovery-onion.md)). Every client socket
+therefore names the source node's address, and no amount of TCP_REPAIR on the
+target can answer for it. Outbound connections leave through source masquerade,
+so the remote peer sees the source node's IP too. Live moves need the workload
+to own its addresses instead.
+
+Proposed design, which S11 confirms or rejects:
+
+- **A movable workload address.** Each replica with `mode = "live"` gets a
+  cluster-unique `/32` from a dedicated range, recorded in Raft with an
+  ownership generation. Onion's backend map points at that address and the
+  container port, with no host-port DNAT, and every node installs a host route
+  for the address via its current owner. A move updates the route with the
+  activation epoch; nodes acknowledge before the source releases the address.
+- **Clients outside the cluster** reach live workloads through Wrapper, or
+  directly on the same L2 segment, where the owning node answers ARP (NDP for
+  IPv6) for the address and sends a gratuitous announcement at activation.
+- **Outbound traffic** from a live workload uses its own address as the source,
+  without masquerade, so its sessions don't depend on the source node's NAT
+  table. Where the upstream network won't route that address back, outbound
+  sessions aren't preserved and the move reports it.
+- **Ingress.** Wrapper holds the client-side socket, so a live move only keeps
+  an ingress session if Wrapper runs on another node. Drain refuses to call a
+  node source-independent while it still terminates required ingress sessions.
+- **Where it works.** The quickstart's Lima network, a bare-metal LAN (the
+  0.3.0 Wyse cluster) and any routed network the operator controls. Cloud VPCs
+  that drop traffic for unknown `/32`s need the provider's route API; that's out
+  of scope, and a pool on such a network reports live moves as unqualified.
+
+The forwarding-through-the-source prototype from the research (section 5.3)
+stays a TCP_REPAIR test harness only.
+
+### Spike reference
+
 | Spike | Question and consequence |
 |---|---|
 | S1 | Checkpoint/restore with rootful userns, external netns, private overlay, volume backends and resolv.conf. Unsupported combinations block their claimed mode. |
@@ -121,6 +193,8 @@ separate evidence.
 | S17 | Migration under authenticated test leases; expiry/stop/cleanup at every boundary on both nodes. |
 | S18 | Versioned profile completeness, directional pools and recorded evidence; partial/skip/unknown cannot certify conformance. |
 | S19 | Actual drain followed by source VM shutdown/restart under live traffic, with independent entry/observer topology and no resurrection. |
+
+## Tests
 
 **Portable/model tests first:** state transitions and epochs; delayed/duplicate
 messages; target activation uncertainty; stale source rollback forbidden;

@@ -606,6 +606,13 @@ promise. CRIU requires packet locking to prevent transient resets and restoratio
 of the original address ([TCP connection](https://www.criu.org/TCP_connection),
 research accessed 28 September; source requirements rechecked 5 October 2026).
 
+(9 October: established in-cluster connections are addressed to the backend's
+node IP and host port, because Onion rewrites the VIP at `connect()` and host-port
+DNAT forwards it. A live move therefore can't keep them without a workload-owned
+address. The delivery plan's
+[network design](2026-10-09-plan-container-migration.md#the-network-design-s11-tests)
+picks one for S11 to test.)
+
 **Release direction: portable network ownership.** Cluster-unique movable
 workload addresses (`/32`, and `/128` if IPv6 is supported) remove node-pool
 collisions. They need authenticated route ownership, generation fencing and
