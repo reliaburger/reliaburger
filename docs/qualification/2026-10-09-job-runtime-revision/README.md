@@ -106,3 +106,23 @@ never launched, with no held addresses. Its original Bun and service stopped,
 and the ownership API retired only its exact kernel-program owner. The VM,
 unrelated workloads, cached images and journals were preserved. See
 `node-retirement.json`.
+
+### Final recovery-fixture correction
+
+The final publication portable gate caught a pending retry with no PID in
+`job_recovery::killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay`.
+The job summary reports a logical active run; instance status reports `pending`
+until its retry owns a live runtime binding. The fixture previously treated any
+known instance status as running. Its corrected waiter accepts non-running
+transitions while still refusing a known running process without a PID.
+A deterministic API sequence failed before the correction; separate regression
+cases retain unknown-evidence waiting and the immediate missing-PID assertion.
+Runtime code, measurement contracts and frozen binary hashes are unchanged.
+The original portable failure and deterministic regression logs are retained
+in `regressions/`; no deadlines or retries changed.
+
+The next complete portable attempt hit the separately tracked #555 verified-
+upgrade compatibility-query timeout after 5,461 passed cases. Its unchanged
+isolated diagnostic passed in 4.309 seconds. Both logs are retained; that
+diagnostic is not claimed as a complete-suite pass, and no probe deadline,
+retry policy or test exclusion changed.

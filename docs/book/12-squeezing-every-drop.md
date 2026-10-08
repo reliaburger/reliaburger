@@ -1362,3 +1362,14 @@ The achieved host rate remains below the 100m/day target. Both daily throughput
 and overall qualification remain false. A completed hour doesn't substitute
 for matched current-binary baselines, sustained container/cluster scaling,
 headroom, faults and bounded metadata collection. Those remain in #640.
+
+A final recovery check caught a mistake in our test rather than the executor.
+The job summary describes a logical run, which can remain active while its
+retry waits for a runtime binding. The instance status correctly says
+`pending` during that gap, with no PID. Our test read these two endpoints
+separately and treated a known pending answer as a running process missing its
+PID. A scripted pending-then-running response reproduced the failure without
+depending on scheduling. The waiter now waits through non-running states,
+but still fails immediately if a known running process has no PID; unknown
+runtime evidence still waits. We kept those three cases separate so fixing the
+fixture could not hide the earlier missing-PID reporting bug.

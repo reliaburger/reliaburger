@@ -1,0 +1,61 @@
+cargo fmt -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized] target(s) in 0.39s
+cargo clippy --all-targets --no-default-features -- -D warnings
+    Finished `dev` profile [unoptimized] target(s) in 0.30s
+cargo nextest run --profile default --no-tests=fail
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (bin "relish") generated 1 warning
+warning: `reliaburger` (test "integration") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "placement") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "mayo_memory") generated 1 warning (1 duplicate)
+warning: `reliaburger` (lib test) generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_failover") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "council_disaster_recovery") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "suite") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_task_arrays") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_gossip") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "build") generated 1 warning (1 duplicate)
+warning: `reliaburger` (bin "bun") generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized] target(s) in 0.32s
+────────────
+ Nextest run ID 10914af1-c2ff-4a5e-b88b-9d52e89d9b19 with nextest profile: default
+    Starting 6169 tests across 39 binaries (79 tests skipped)
+        SLOW [> 30.000s] (─────────) reliaburger bun::task_ledger::tests::a_million_records_fit_the_disk_budget
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_pooled_client
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_fresh_client
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::pooled_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+────────────
+     Summary [ 196.465s] 6169 tests run: 6169 passed (5 slow), 79 skipped
+        SLOW [  44.156s] (5362/6169) reliaburger bun::task_ledger::tests::a_million_records_fit_the_disk_budget
+        SLOW [  30.023s] (5520/6169) reliaburger wrapper::proxy::tests::fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+        SLOW [  30.022s] (5521/6169) reliaburger wrapper::proxy::tests::pooled_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+        SLOW [  34.112s] (5562/6169) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_fresh_client
+        SLOW [  34.114s] (5563/6169) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_pooled_client
+cargo test --doc
+    Finished `test` profile [unoptimized] target(s) in 0.30s
+   Doc-tests reliaburger
+
+running 2 tests
+test src/relish/client.rs - relish::client::validate_endpoint (line 461) ... ok
+test src/config/mod.rs - config::Config::parse (line 66) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+all doctests ran in 2.90s; merged doctests compilation took 2.42s
+python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+.................................................................................................................................................Manual OCI owner: {"attempt": "1", "authority": "manual", "commit": "0ff5f66dc509e3025f2c0a1d03874eef9962cfae", "host": "linux", "owner": "observed-operator", "run_id": "manual:298009ba-2ca2-4b57-9d16-998050ed6731"}
+Manual OCI evidence: /private/var/folders/2_/8114g2p575n5_8_3x1p7484c0000gn/T/tmpgwsesvrw/checkout/target/contracts/manual-oci/039a726a-25e8-4c85-80bb-341afc0c1bea
+.Manual OCI owner: {"attempt": "1", "authority": "manual", "commit": "9864c035ff4b50052fea07f186988041fbe8a1f2", "host": "linux", "owner": "supplied-operator", "run_id": "manual:explicit"}
+Manual OCI evidence: /private/var/folders/2_/8114g2p575n5_8_3x1p7484c0000gn/T/tmpqxcoh9gy/checkout/target/contracts/manual-oci/61f60c38-9f3d-4c4d-bfd9-7f0f6b5b7857
+.......................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 345 tests in 32.148s
+
+OK
+python3 scripts/ci/ignored_owners.py reasons
+every ignored test has an owner (reasons)

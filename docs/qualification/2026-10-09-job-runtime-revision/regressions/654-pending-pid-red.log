@@ -1,0 +1,36 @@
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (bin "relish") generated 1 warning
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/reusable-job-executors/reliaburger)
+warning: `reliaburger` (bin "bun") generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized] target(s) in 3.37s
+────────────
+ Nextest run ID 20145f9d-bcba-4482-b762-a0697f52a845 with nextest profile: default
+    Starting 3 tests across 1 binary (7 tests skipped)
+        FAIL [   0.025s] (1/3) reliaburger::job_recovery pid_wait_accepts_a_pending_retry_before_its_running_process
+  stdout ───
+
+    running 1 test
+    test pid_wait_accepts_a_pending_retry_before_its_running_process ... FAILED
+
+    failures:
+
+    failures:
+        pid_wait_accepts_a_pending_retry_before_its_running_process
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s
+
+  stderr ───
+
+    thread 'pid_wait_accepts_a_pending_retry_before_its_running_process' (195210632) panicked at tests/job_recovery.rs:163:44:
+    a running job had no pid: InstanceStatus { id: "run-1", app_name: "work", namespace: "default", state: "pending", restart_count: 1, host_port: None, exit_code: None, pid: None, runtime_unknown: false, status_age_ms: None }
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 1 test still running
+────────────
+     Summary [   0.080s] 2/3 tests run: 1 passed, 1 failed, 7 skipped
+        FAIL [   0.025s] (1/3) reliaburger::job_recovery pid_wait_accepts_a_pending_retry_before_its_running_process
+warning: 1/3 tests were not run due to test failure (run with --no-fail-fast to run all tests, or run with --max-fail)
+error: test run failed

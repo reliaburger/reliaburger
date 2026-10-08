@@ -220,7 +220,7 @@ identities; every attempt gets a fresh launch. Singleton container roots are
 writable. Larger arrays use a read-only root, temporary scratch and a 1 MiB limit
 per regular output or scratch file (`RLIMIT_FSIZE`).
 
-On Linux, Bun's `auto` and `runc` modes select the backend per workload.
+On Linux, Bun's `auto` and `mixed` modes select the backend per workload.
 Jobs select `runtime = "runc"` (the default), `runtime = "process"`, or
 `runtime = "shared-runc"`. Process jobs use `exec` or `script` and refuse
 `image`. Container jobs require `image` and refuse host `exec`/`script`.

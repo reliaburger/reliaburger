@@ -1,0 +1,66 @@
+cargo fmt -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/reusable-job-executors/reliaburger)
+    Finished `dev` profile [unoptimized] target(s) in 47.50s
+cargo clippy --all-targets --no-default-features -- -D warnings
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/reusable-job-executors/reliaburger)
+    Finished `dev` profile [unoptimized] target(s) in 47.08s
+cargo nextest run --profile default --no-tests=fail
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/reusable-job-executors/reliaburger)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (test "suite") generated 1 warning
+warning: `reliaburger` (test "placement") generated 1 warning (1 duplicate)
+warning: `reliaburger` (bin "bun") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_gossip") generated 1 warning (1 duplicate)
+warning: `reliaburger` (lib test) generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "build") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "mayo_memory") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "integration") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_failover") generated 1 warning (1 duplicate)
+warning: `reliaburger` (bin "relish") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "cluster_task_arrays") generated 1 warning (1 duplicate)
+warning: `reliaburger` (test "council_disaster_recovery") generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized] target(s) in 3m 16s
+────────────
+ Nextest run ID 4c55de31-6972-4daf-a4d9-11a2370a5ddf with nextest profile: default
+    Starting 6166 tests across 39 binaries (79 tests skipped)
+        SLOW [> 30.000s] (─────────) reliaburger bun::task_ledger::tests::a_million_records_fit_the_disk_budget
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_fresh_client
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_pooled_client
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+        SLOW [> 30.000s] (─────────) reliaburger wrapper::proxy::tests::pooled_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+        FAIL [   3.420s] (5543/6166) reliaburger::job_recovery killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay
+  stdout ───
+
+    running 1 test
+    test killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay ... FAILED
+
+    failures:
+
+    failures:
+        killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 3.41s
+
+  stderr ───
+      operation 70feaf6acc83d7c7e8c0933f33679849
+
+    thread 'killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay' (195198008) panicked at tests/job_recovery.rs:163:44:
+    a running job had no pid: InstanceStatus { id: "run-1", app_name: "work", namespace: "default", state: "pending", restart_count: 1, host_port: None, exit_code: None, pid: None, runtime_unknown: false, status_age_ms: None }
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 11 tests still running
+────────────
+     Summary [ 140.267s] 5554/6166 tests run: 5553 passed (5 slow), 1 failed, 79 skipped
+        SLOW [  43.709s] (5163/6166) reliaburger bun::task_ledger::tests::a_million_records_fit_the_disk_budget
+        SLOW [  30.020s] (5508/6166) reliaburger wrapper::proxy::tests::fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+        SLOW [  30.020s] (5511/6166) reliaburger wrapper::proxy::tests::pooled_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded
+        SLOW [  34.107s] (5548/6166) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_fresh_client
+        SLOW [  34.109s] (5549/6166) reliaburger wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_pooled_client
+        FAIL [   3.420s] (5543/6166) reliaburger::job_recovery killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay
+warning: 612/6166 tests were not run due to test failure (run with --no-fail-fast to run all tests, or run with --max-fail)
+error: test run failed
+make: *** [test] Error 100
