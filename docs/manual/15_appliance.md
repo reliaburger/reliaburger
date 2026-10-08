@@ -33,11 +33,10 @@ from power-on to a working cluster. Other firmware may still have surprises;
   yes at the `relish netboot` terminal, or name the machine with `--wipe`.
 - **A router you control**, with a DHCP reservation for each machine, so each
   keeps the same address. Nodes find each other by address, and they need the
-  router's default route to work out their own. Your home router will do. On
-  an isolated switch, a Raspberry Pi can be the router:
-  [`image/lab/pi/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/pi/README.md)
-  sets one up with DHCP, DNS, NTP and NAT. Leave booting to `relish netboot`:
-  the router must not answer PXE.
+  router's default route to work out their own. Your home router will do.
+  Leave booting to `relish netboot`: the router must not answer PXE. On a
+  switch of its own, the machine running `relish netboot` can be the router
+  too ("The Wyse lab", below).
 - **A machine on that network to serve the netboot**: your laptop (Linux or
   macOS), any spare box, or a VM bridged onto the LAN. It needs `relish` and
   root. A Mac on a USB-C Ethernet adapter does fine (see "Serving from a
@@ -136,6 +135,13 @@ A few options for real networks:
   own driver, which suits odd cards; `full` brings iPXE's drivers, for
   firmware whose network stack misbehaves. It refuses to start if the
   release you serve doesn't have the full build.
+- `--mode-dhcp-proxy` is for a network whose DHCP server runs on the
+  serving machine itself, such as dnsmasq on the Mac in an isolated lab
+  ("The Wyse lab" below). That server owns UDP 67 and puts option 60
+  `PXEClient` in its offers, which sends network-booting machines to UDP
+  4011 on the same address, and relish answers there only. It refuses to
+  start if another machine on the network hands out addresses too, and
+  warns if nothing on this machine holds UDP 67.
 
 Once the files check out, it broadcasts a network-boot request of its own
 and listens for two seconds:
@@ -192,33 +198,62 @@ a USB-C or Thunderbolt Ethernet adapter, and a few things are different:
 - **Internet Sharing** runs its own DHCP server, which holds the port relish
   needs. Turn it off for the adapter (relish says so if it's on). A VM tool
   with shared or host-only networking may run one too.
-  `sudo lsof -nP -iUDP:67` shows who holds the port.
+  `sudo lsof -nP -iUDP:67` shows who holds the port. The one DHCP server
+  that can share the Mac with relish is one you set up for it, with
+  `--mode-dhcp-proxy` (below).
 
-### A lab of its own
+### The Wyse lab
 
-The lab we built this for keeps the machines off the home network: a Mac on a
-USB-C Ethernet adapter, a gigabit switch, Dell Wyse 3040s (three for the
-release gate, ten in the full lab), and a
-Raspberry Pi as the router.
+The lab we built this for is a Mac on a USB-C Ethernet adapter, a gigabit
+switch, and Dell Wyse 3040s (three for the release gate, ten in the full
+lab). It runs either of two ways.
+
+**On the home network.** The switch plugs into the home router, which hands
+out the addresses, with a reservation for each Wyse and one for the Mac's
+adapter, and takes the machines to the internet:
 
 ```
-home Wi-Fi ── Raspberry Pi 10.77.0.1 ── switch ─┬─ Mac, USB-C Ethernet (en7) 10.77.0.2
-              DHCP, DNS, NTP, NAT               ├─ wyse-1  10.77.0.11
-                                                ├─ …
-                                                └─ wyse-10 10.77.0.20
+home router ── switch ─┬─ Mac, USB-C Ethernet (en7) 192.168.1.10, relish netboot
+DHCP, DNS, NAT         ├─ wyse-1  192.168.1.11
+                       ├─ wyse-2  192.168.1.12
+                       └─ wyse-3  192.168.1.13
 ```
 
-The Pi hands out the addresses, one reservation per machine and one for the
-Mac's adapter (with no default route, so the Mac's internet stays on Wi-Fi),
-and routes the machines to the internet through its Wi-Fi. NTP from the Pi
-matters on second-hand machines, whose clock batteries may be flat: a node
-whose clock is years out rejects every certificate.
-[`image/lab/pi/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/pi/README.md)
-sets it up. relish runs on the Mac and does only the boot part:
+Turn the Mac's Wi-Fi off for the run, so the adapter is its only way onto
+the LAN and the nodes always see it at the same address. relish runs on the
+Mac and does only the boot part, for the machines you name:
 
 ```sh
-caffeinate -i sudo relish netboot os --interface en7 --for 3h
+caffeinate -i sudo relish netboot os --interface en7 --for 3h \
+  --mac <mac-1> --mac <mac-2> --mac <mac-3>
 ```
+
+**Isolated, with the Mac as the router.** The switch connects to nothing but
+the Mac and the Wyses. The Mac's adapter gets a fixed address, dnsmasq on it
+hands out the addresses, pf takes the lab out to the internet through the
+Mac's Wi-Fi, and relish answers PXE on UDP 4011 only, beside dnsmasq:
+
+```
+home Wi-Fi ── en0  Mac  en7 10.77.0.1 ── switch ─┬─ wyse-1  10.77.0.11
+                   NAT out through en0           ├─ wyse-2  10.77.0.12
+                   dnsmasq: DHCP on UDP 67       └─ wyse-3  10.77.0.13
+                   relish netboot: UDP 4011 and 69, HTTP
+```
+
+```sh
+caffeinate -i sudo relish netboot os --interface en7 --for 3h --mode-dhcp-proxy \
+  --mac <mac-1> --mac <mac-2> --mac <mac-3>
+```
+
+[`image/lab/mac/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/mac/README.md)
+sets up the address, dnsmasq and pf, and undoes them afterwards. The cluster
+then depends on the Mac for its route out, so keep the Mac awake and
+plugged in. If a machine's firmware takes dnsmasq's address but never asks
+relish on 4011, use the home network instead.
+
+Either way, time comes from Ubuntu's NTP servers through the router. That
+matters on second-hand machines, whose clock batteries may be flat: a node
+whose clock is years out rejects every certificate.
 
 If the switch has spanning tree, turn it off, or turn on its fast-start
 setting for every port (often called PortFast or edge port). A port that

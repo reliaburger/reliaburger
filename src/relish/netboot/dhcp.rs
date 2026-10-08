@@ -409,7 +409,7 @@ pub fn competing_server(reply: &Message, xid: u32, source: Ipv4Addr) -> Option<I
     {
         return None;
     }
-    let pxe = class_identifier(reply).is_some_and(|c| c.starts_with(b"PXEClient"));
+    let pxe = says_pxe_client(reply);
     let boot_file = reply.opts().get(OptionCode::BootfileName).is_some()
         || reply.fname().is_some_and(|f| f.iter().any(|b| *b != 0));
     if !pxe && !boot_file {
@@ -420,8 +420,15 @@ pub fn competing_server(reply: &Message, xid: u32, source: Ipv4Addr) -> Option<I
         .or(Some(source))
 }
 
-/// If `reply` offers our probe `xid` an address, as the LAN's router (or
-/// the lab's Pi) would, the server's address. [`competing_server`]'s
+/// Whether `reply` carries option 60 `PXEClient`: from a DHCP server
+/// that also hands out addresses, it sends PXE clients to its own UDP 4011
+/// for the boot part ([`crate::relish::netboot::DhcpSetup::ThisMachine`]).
+pub fn says_pxe_client(reply: &Message) -> bool {
+    class_identifier(reply).is_some_and(|c| c.starts_with(b"PXEClient"))
+}
+
+/// If `reply` offers our probe `xid` an address, as the LAN's router
+/// would, the server's address. [`competing_server`]'s
 /// sibling: that one looks for a boot server to refuse, this one for the
 /// DHCP server the machines we boot will need. A ProxyDHCP's offer, with
 /// `yiaddr` zero, doesn't count.
@@ -919,7 +926,7 @@ mod tests {
     #[test]
     fn a_router_offering_an_address_is_noticed_but_a_proxydhcp_is_not() {
         let probe = probe_discover(42, MacAddress(MAC));
-        let pi = Ipv4Addr::new(10, 77, 0, 1);
+        let router = Ipv4Addr::new(10, 77, 0, 1);
         let mut router_offer = Message::default();
         router_offer
             .set_opcode(Opcode::BootReply)
@@ -929,23 +936,23 @@ mod tests {
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Offer));
         // No server identifier: the packet's source says who sent it.
-        assert_eq!(address_server(&router_offer, 42, pi), Some(pi));
-        assert_eq!(address_server(&router_offer, 43, pi), None);
+        assert_eq!(address_server(&router_offer, 42, router), Some(router));
+        assert_eq!(address_server(&router_offer, 43, router), None);
         router_offer
             .opts_mut()
             .insert(DhcpOption::ServerIdentifier(Ipv4Addr::new(10, 77, 0, 9)));
         assert_eq!(
-            address_server(&router_offer, 42, pi),
+            address_server(&router_offer, 42, router),
             Some(Ipv4Addr::new(10, 77, 0, 9))
         );
 
         let proxy_offer = answer(&probe, ListenPort::Dhcp, &context()).unwrap().reply;
-        assert_eq!(address_server(&proxy_offer, 42, pi), None);
+        assert_eq!(address_server(&proxy_offer, 42, router), None);
 
         let mut ack = router_offer.clone();
         ack.opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Ack));
-        assert_eq!(address_server(&ack, 42, pi), None);
+        assert_eq!(address_server(&ack, 42, router), None);
     }
 
     fn arbitrary_request() -> impl Strategy<Value = (Message, ListenPort)> {

@@ -139,13 +139,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install dnsmasq and nftables
-        # For test_pi_router.py: it parses the lab Pi's configs with the real
-        # tools (image/lab/pi/). dnsmasq-base is the binary without a service.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsmasq-base nftables
+      - name: Install dnsmasq
+        # For test_mac_router.py: it parses the lab Mac's dnsmasq.conf with
+        # the real tool (image/lab/mac/). dnsmasq-base is the binary
+        # without a service.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsmasq-base
       - name: Script tests
         env:
-          PI_ROUTER_TOOLS: required
+          MAC_ROUTER_TOOLS: required
         run: python3 -m unittest discover -s image/tests -v
 
   image:
@@ -466,6 +467,18 @@ jobs:
           sudo apt-get install -y -qq dnsmasq-base
           chmod +x source-bin/relish-linux-x86_64
           image/tests/relish-netboot-install.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
+      - name: relish netboot install, DHCP on the same machine (x86-64, KVM)
+        # The isolated lab's split: the lab Mac's dnsmasq.conf on the runner
+        # owns UDP 67 and sends option 60 PXEClient, and
+        # `relish netboot --mode-dhcp-proxy` answers on UDP 4011 only.
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/relish-netboot-install.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64 dhcp-proxy
 
       - name: Seeded pair (x86-64, KVM)
         # Two appliances form a cluster from their seeds alone, with the

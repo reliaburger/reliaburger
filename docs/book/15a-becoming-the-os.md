@@ -271,12 +271,12 @@ chain --autofree http://192.168.1.20:8080/boot.ipxe?mac=${netX/mac}&uuid=${uuid}
 
 The HTTP handler reads the MAC and SMBIOS UUID from the query and answers with the install script, or with `exit 1` if that machine has fetched the installer before. It remembers machines in a small JSON file next to the artefacts, and only once the whole installer has streamed out, so a download that dies halfway doesn't count. `exit 1` rather than `exit`: UEFI firmware may stop at its boot menu when a boot option returns success, but it moves on to the next one, the disk, after a failure.
 
-The safety rails are small. `--mac` limits who gets answered, `--for` (an hour by default) stops a forgotten server, and before binding anything it broadcasts a PXE DISCOVER of its own and listens for two seconds. Another boot server answering stops the start, because two ProxyDHCPs race for every machine. The router answering is what we want. Nothing answering gets a warning but no refusal: "nothing hands out addresses on en7". A ProxyDHCP with no DHCP server beside it boots nothing, and the most likely reason in the lab is a Raspberry Pi that's still booting or a cable in the wrong port.
+The safety rails are small. `--mac` limits who gets answered, `--for` (an hour by default) stops a forgotten server, and before binding anything it broadcasts a PXE DISCOVER of its own and listens for two seconds. Another boot server answering stops the start, because two ProxyDHCPs race for every machine. The router answering is what we want. Nothing answering gets a warning but no refusal: "nothing hands out addresses on en7". A ProxyDHCP with no DHCP server beside it boots nothing, and the most likely reason in the lab is a switch that isn't plugged into the router, or a cable in the wrong port.
 
 The listening loop reads well once you know two small idioms:
 
 ```rust
-let mut address_server = None;
+let mut address_servers: Vec<AddressServer> = Vec::new();
 let deadline = tokio::time::Instant::now() + wait;
 while let Ok(received) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
 {
@@ -287,16 +287,65 @@ while let Ok(received) = tokio::time::timeout_at(deadline, socket.recv_from(&mut
     {
         return Ok(Network::BootServer(server));
     }
-    if let Some(server) = dhcp::address_server(&reply, xid, *source.ip()) {
-        address_server.get_or_insert(server);
+    if let Some(address) = dhcp::address_server(&reply, xid, *source.ip())
+        && !address_servers.iter().any(|s| s.address == address)
+    {
+        address_servers.push(AddressServer {
+            address,
+            pxe_client: dhcp::says_pxe_client(&reply),
+        });
     }
 }
-Ok(address_server.map_or(Network::Silent, Network::AddressServer))
 ```
 
-`timeout_at` wraps a future and returns `Err(Elapsed)` if the deadline passes first, so `while let Ok(…)` keeps reading until time's up, and the deadline is fixed once rather than restarted by every packet. `get_or_insert` keeps the first router we hear. `map_or` turns the `Option` into the answer: `Silent` for `None`, and for `Some(server)` the enum variant itself, used as a function. In Rust a tuple variant like `Network::AddressServer` *is* a function from `Ipv4Addr` to `Network`, which reads better than `|s| Network::AddressServer(s)`. The probe takes its socket and its target as arguments, so the tests run it on loopback against a fake router, a fake competitor and silence, without root or a LAN.
+`timeout_at` wraps a future and returns `Err(Elapsed)` if the deadline passes first, so `while let Ok(…)` keeps reading until time's up, and the deadline is fixed once rather than restarted by every packet. Afterwards an empty list means `Network::Silent`, and anything else is `Network::AddressServers(address_servers)`. The probe takes its socket and its target as arguments, so the tests run it on loopback against a fake router, a fake competitor and silence, without root or a LAN.
+
+The first version kept only the first DHCP server it heard, which was all a ProxyDHCP beside a router needs: `address_server.get_or_insert(server)` in the loop, then `address_server.map_or(Network::Silent, Network::AddressServer)`. That last call shows a small Rust trick. A tuple variant like `Network::AddressServer` *is* a function from its field to the enum, so it can go where a closure would, in place of `|s| Network::AddressServer(s)`. The list came later, with the isolated lab below, which needs to know every DHCP server on the wire and whether each one said `PXEClient`.
 
 Making it work on a Mac taught us two things about BSD sockets. The probe listens on UDP 68, the DHCP client port, which the machine's own DHCP client may hold. On macOS, `configd` didn't hold it at all on our M2 while idle, but it may open it to renew a lease. Linux's `SO_REUSEADDR` lets two UDP sockets share a port loosely; BSD's doesn't, and the flag that does is `SO_REUSEPORT`, which both sockets must set. When they do, a broadcast goes to both, so the probe gets its copy of the router's offer without stealing it from anyone. The probe sets both flags. The servers' own sockets on 67, 69 and 4011 set neither: two netboot servers sharing port 67 would split the requests between them instead of the second one failing to start, which is the race we refuse elsewhere. They used to set `SO_REUSEADDR` out of habit, which is harmless on a Mac. CI caught it on the first Linux run: there, two sockets that both set it share the port, and a test that expected the second bind to fail watched it succeed. UDP has no `TIME_WAIT`, so the flag was buying nothing anyway.
+
+### A lab with no router
+
+All of this assumes a router: something on the LAN that hands out addresses, for as long as the cluster lives. The lab first planned a Raspberry Pi for that job, on a switch isolated from the home network. On 8 October 2026 we dropped the Pi and asked whether the Mac running `relish netboot` could be the router too, with dnsmasq for DHCP.
+
+The obvious version fails at once. dnsmasq needs UDP 67, relish's ProxyDHCP needs UDP 67, and relish's server socket is exclusive on purpose. We could have let the two share it: on BSD both sockets set `SO_REUSEPORT` and each gets a copy of every broadcast. But that's exactly the loose sharing we'd just removed, because it lets two netboot servers run side by side without either noticing.
+
+The PXE specification has a better answer, in section 2.2.4. A DHCP server can put option 60, the vendor class, in its offer, set to `PXEClient`. To PXE firmware that means "I gave you an address but no boot file; ask me for the boot part on UDP 4011". And 4011 is the port relish already answers for firmware that sends its ProxyDHCP a direct request. So dnsmasq keeps 67, and relish answers on 4011 alone. Neither shares a port, and relish needed only two changes: one flag, `--mode-dhcp-proxy`, and a different reading of the probe.
+
+dnsmasq's side is two lines in `image/lab/mac/dnsmasq.conf`:
+
+```
+dhcp-vendorclass=set:pxe,PXEClient
+dhcp-option-force=tag:pxe,60,PXEClient
+```
+
+The first tags any client whose own vendor class contains `PXEClient`: the firmware, and iPXE after it. The second sends option 60 to those clients only, so an installed node renewing its lease gets an ordinary offer. pf on the Mac takes the lab's traffic out through the Wi-Fi. It loads into an anchor under `com.apple`, because macOS's own `/etc/pf.conf` already has a `nat-anchor "com.apple/*"`, and the lab's rule can then be flushed without touching the system's.
+
+On the Rust side, the flag becomes an enum, not a `bool` that travels through the code:
+
+```rust
+pub enum DhcpSetup {
+    Router,
+    ThisMachine,
+}
+```
+
+and `run` skips the port-67 socket for `ThisMachine`. The servers run under one `tokio::select!`, which finishes when any of its branches does, so a missing server still needs a branch that never finishes:
+
+```rust
+let dhcp_task = async move {
+    match dhcp_socket {
+        Some(socket) => dhcp_loop(socket, ListenPort::Dhcp, dhcp_context, dhcp_log).await,
+        None => std::future::pending().await,
+    }
+};
+```
+
+`std::future::pending()` is a future that never completes. Both arms of the `match` must have the same type, and `pending()` takes whatever type it's asked for (here `std::io::Result<()>`), so the branch type-checks and `select!` never picks it. `async move` makes the block own the socket and its own clones of the context and the log, so the original `context` can still go to the 4011 server on the next line.
+
+The probe's reading changes with the setup. Beside a router, any DHCP server is welcome. Beside our own dnsmasq, a DHCP server at any *other* address is a refusal: machines that take its offer never learn about port 4011, and two DHCP servers on one switch is a fault in its own right. An offer from our own address without `PXEClient` gets a warning that names the two dnsmasq lines. And silence is ambiguous, because a server on the same machine doesn't always hear its own broadcasts. So the probe asks the kernel instead: it tries to bind UDP 67 with the same exclusive socket the servers use. If the bind fails with "address in use", something here is serving DHCP. If it succeeds, nothing is, and relish says to start dnsmasq first.
+
+CI runs both setups on every lab build. `relish-netboot-install.sh` takes a mode. In `router` mode it runs the router in a network namespace, as before. In `dhcp-proxy` mode it runs the lab Mac's own `dnsmasq.conf` on the runner, with the bridge and subnet swapped in, and starts relish with `--mode-dhcp-proxy`. A VM installs from them, and the test checks relish's log for an `ack on 4011` to the firmware, another to iPXE, and no `offer` from port 67. OVMF follows section 2.2.4; whether the Wyse's firmware does is one of the things the lab's dry run finds out.
 
 The second thing: since Mojave, macOS lets any user bind a port below 1024 on `0.0.0.0`, but not on a specific address. So DHCP binds without sudo on a Mac, and TFTP, which listens on the interface's own address, is what asks for root.
 
@@ -918,7 +967,7 @@ We read Sidero Labs' Omni bare-metal provider (`siderolabs/omni-infra-provider-b
 
 The spike's interim record is a pass for everything that can be proven without hardware. Turning it into part of Reliaburger is the [product plan](../plans/2026-10-01-plan-appliance-product.md) for 0.3.0, and these are the big pieces:
 
-- **S5, three Dell Wyse 3040s.** The lab has ten, but on 7 October 2026 we decided the release gate needs only three. The go/no-go is 3 of 3 claimed, a working cluster within an hour of power-on, 1.0 GB free per node under the tour, five years of eMMC life, and a fallback within ten minutes. The run covers BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds. The run uses only the real commands: `relish netboot` on an M2 MacBook over a USB-C Ethernet adapter, a Raspberry Pi as the lab's router, and `relish machines claim` for the cluster ([the S5 runbook](../plans/2026-10-01-plan-appliance-s5-wyse.md)).
+- **S5, three Dell Wyse 3040s.** The lab has ten, but on 7 October 2026 we decided the release gate needs only three. The go/no-go is 3 of 3 claimed, a working cluster within an hour of power-on, 1.0 GB free per node under the tour, five years of eMMC life, and a fallback within ten minutes. The run covers BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds. The run uses only the real commands: `relish netboot` on an M2 MacBook over a USB-C Ethernet adapter, either the home router or the Mac itself for addresses, and `relish machines claim` for the cluster ([the S5 runbook](../plans/2026-10-01-plan-appliance-s5-wyse.md)). We first planned a Raspberry Pi as the lab's own router, to keep the lab off the home network, and dropped it on 8 October 2026 for two setups that need no extra box. On the home network, the rails relish already has protect the rest of the LAN: `--mac`, the yes before a used disk is wiped, and the refusal to start beside another boot server. Isolated, the Mac runs dnsmasq and relish answers on port 4011 beside it ("A lab with no router", above). The Pi will come back as an arm64 worker, for a cluster that mixes architectures.
 - **`relish netboot` on real firmware.** It's written and CI installs through it, but never yet on a Wyse, and never with a Mac serving real hardware rather than a VM.
 - **Smaller things with known answers:** dropping the lab's credential-gated SSH, now that bun stages OS updates itself; and a way for the installer to find its server under Secure Boot, which drops the command line iPXE passes.
 

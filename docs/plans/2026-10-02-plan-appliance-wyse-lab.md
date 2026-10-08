@@ -7,13 +7,13 @@
 - An **M2 MacBook Pro** (macOS, arm64) with a **USB-C Ethernet adapter**, running `relish`.
 - A **16-port gigabit switch** off eBay.
 - **Ten Dell Wyse 3040s**: x86_64 (Atom x5-Z8350), 2 GB RAM, 8 GB eMMC, UEFI PXE through a Realtek RTL8111/8168, no serial port (research §9.1).
-- A **Raspberry Pi**.
+- A **Raspberry Pi**, no longer part of the lab since [8 October 2026](#decisions-8-october-2026).
 
-Everything on the switch, isolated from the home LAN. The Wyses netboot into the appliance and form one cluster with the real commands: `relish image download`, `relish netboot`, `relish machines claim`. The lab has ten, and the 0.3.0 exit test gates on three of them ([decisions, 7 October 2026](#decisions-7-october-2026)).
+Until 8 October, everything was on the switch, isolated from the home LAN, with the Pi as its router. Now the lab runs either on the home network, beside the home router, or isolated with the Mac as its router ([decisions, 8 October 2026](#decisions-8-october-2026)). The Wyses netboot into the appliance and form one cluster with the real commands: `relish image download`, `relish netboot`, `relish machines claim`. The lab has ten, and the 0.3.0 exit test gates on three of them ([decisions, 7 October 2026](#decisions-7-october-2026)).
 
 ## The short answer
 
-1. **Make the Pi the lab's router**: DHCP with a reservation per Wyse, DNS, NTP and NAT out through its Wi-Fi. Then `relish netboot` on the Mac is a ProxyDHCP beside an ordinary DHCP server, which is exactly the topology CI already tests (`image/tests/relish-netboot-install.sh`). No DHCP code is needed for the lab.
+1. *(Superseded on 8 October 2026: the home router or the Mac does this job.)* **Make the Pi the lab's router**: DHCP with a reservation per Wyse, DNS, NTP and NAT out through its Wi-Fi. Then `relish netboot` on the Mac is a ProxyDHCP beside an ordinary DHCP server, which is exactly the topology CI already tests (`image/tests/relish-netboot-install.sh`). No DHCP code is needed for the lab.
 2. **Don't build `relish netboot --dhcp` for the lab.** The cluster needs DHCP for its whole life, not for the hour netboot runs, and it needs a default route (`appliance::address::detect`). A DHCP server inside a one-hour CLI is the wrong home for that. The design is below in case we want it later for a Pi-less setup.
 3. **Four small fixes block the lab**, about 4–6 days in all: `relish netboot --wipe` (used Wyses aren't blank), `relish image download` picking aarch64 on a Mac, a pre-flight in `relish netboot` that says when nothing hands out addresses, and a macOS qualification of `relish netboot` and `relish machines`. Two more make the S5 measurements possible: CI uploading the next OS version, and `fleet-measure.sh` reading a claimed fleet.
 4. Most of it can be done **before the switch arrives**: the code, the CI changes, and a dry run with the Pi and one Wyse on any spare switch or directly cabled.
@@ -47,6 +47,8 @@ Two more facts shape the choice:
 | What CI already tests | Exactly this (dnsmasq router in a netns, relish beside it) | Nothing | Nothing |
 
 **Recommendation: the Pi as the router.** It's what the product targets (a home router does DHCP, relish does the boot part), it's what CI tests, and it keeps the cluster up when the Mac sleeps or leaves.
+
+**8 October 2026:** the Pi is gone, and two setups replace it. The home router has every advantage in the first column, without a box to set up. For an isolated lab, the Mac itself is the router: dnsmasq owns UDP 67 and sends option 60 `PXEClient`, and `relish netboot --mode-dhcp-proxy` answers on 4011 only, which gets round the port clash in the Internet Sharing column. See the [8 October decisions](#decisions-8-october-2026). The Pi setup below was removed with `image/lab/pi/`; the repository's history keeps it.
 
 The Pi's setup goes in `image/lab/pi/` (PR 4 below): Raspberry Pi OS Lite 64-bit, `eth0` on the switch at `10.77.0.1/24`, `wlan0` on the home Wi-Fi, and dnsmasq with:
 
@@ -118,7 +120,7 @@ What's never been run on macOS (the W4 PR says the Mac-lab run wasn't done; the 
 
 | Step | Command | State |
 |---|---|---|
-| Pi up as router | dnsmasq, nftables, chrony (`image/lab/pi/`, PR 4) | Written and parse-checked in CI; not yet run on a Pi |
+| Addresses | A: one reservation per Wyse and one for the Mac's adapter, in the home router's admin page. B: the Mac as the router, `image/lab/mac/` (the Pi router of PR 4 until 8 October 2026) | A manual; B written, CI-tested on Linux, not yet run on the Mac |
 | BIOS, each Wyse | F2, password `Fireport`: BIOS 1.2.5, UEFI with CSM off, UEFI network stack and PXE on, Secure Boot off, power on after AC loss | Manual, ~5 min a unit (S5 runbook step 1) |
 | relish for the Mac | `cargo build --release --bin relish` on `appliance-train` | Real |
 | Images | `gh run download … -n appliance-x86_64` (lab build) | Real, preview signing until 0.3.0 publishes |
@@ -185,15 +187,17 @@ Most of this needs no Wyse:
 ### Hardware and setup checklist
 
 - **Switch:** a Netgear JGS524E (24-port gigabit, "Smart Managed Plus"). Those switches act unmanaged out of the box. If spanning tree is on, turn it off in the web UI, because STP's 30-second listening delay makes PXE's DHCP time out **[unverified: whether STP is on by default on this model]**. Turn off "green Ethernet" (EEE) if links flap. Its VLANs can later separate the lab from anything else plugged in.
-- **Cables:** 12 patch leads (ten Wyses, the Mac, the Pi), Cat5e or better.
+- **Cables:** 12 patch leads (ten Wyses, the Mac, and in setup A the switch's uplink to the home router), Cat5e or better.
 - **Power:** ten Wyse supplies. Batches differ, 5 V or 12 V barrel (research §9.1), so use each unit's own supply and don't mix them up. Two 6-way strips or one 12-way. Ten 3040s draw well under 100 W in total **[estimate]**. A switched strip makes the S5 cord-pull and power-loss tests repeatable.
 - **Console:** a DisplayPort monitor (or a DP-to-HDMI adapter) and a USB keyboard. The 3040 has no serial port, so this is the only console, and it's where the claim key shows.
 - **The Mac's adapter:** gigabit, on a chipset macOS drives natively (Realtek RTL8153 or ASIX AX88179A are the common ones **[unverified for your adapter: check it shows up in `networksetup -listallhardwareports` without a driver]**). It doesn't need PXE support itself: the Mac never netboots. Plug it straight into the Mac, not through a USB hub dock that might sleep it.
-- **The Pi:** to buy. A **Pi 5 with 4 GB**, or a Pi 4 with 4 GB if that's cheaper: gigabit Ethernet for the switch and Wi-Fi for the uplink. The official power supply, a 32 GB microSD card, and a case with a fan for a Pi 5. Raspberry Pi OS Lite 64-bit. If its Wi-Fi doesn't reach the home router, a second USB Ethernet adapter on the Pi does the same job.
+- **The Pi:** not needed since 8 October 2026; what follows is the 3 October advice. To buy. A **Pi 5 with 4 GB**, or a Pi 4 with 4 GB if that's cheaper: gigabit Ethernet for the switch and Wi-Fi for the uplink. The official power supply, a 32 GB microSD card, and a case with a fan for a Pi 5. Raspberry Pi OS Lite 64-bit. If its Wi-Fi doesn't reach the home router, a second USB Ethernet adapter on the Pi does the same job.
 - **Labels:** each Wyse's MAC (on the label underneath), its reservation and its node number, on the unit.
 - **A USB stick** for the BIOS 1.2.5 update, if any unit is older **[unverified: how Dell ships the 3040 BIOS update outside ThinOS]**.
 
 ## The Raspberry Pi's role
+
+*Superseded on 8 October 2026: the Pi has no role in the lab for now; the home router or the Mac routes it. The Pi comes back later as an arm64 worker.*
 
 | Role | Verdict |
 |---|---|
@@ -236,3 +240,14 @@ The maintainer scoped the 0.3.0 milestone to the OS, netboot and appliance work 
 11. **The lab's Mac** is a maintainer's M1 or M2 MacBook Pro.
 
 Decision 7 of 3 October (comparing all ten claim keys on the formal run) now means all three of the gated machines.
+
+## Decisions, 8 October 2026
+
+1. **No Raspberry Pi in the lab.** `image/lab/pi/` and its CI test are gone. The Pi comes back later as an arm64 worker, to show a mixed-architecture cluster; that needs the aarch64 image to boot on the Pi's UEFI firmware, which nothing tests yet, so it isn't part of 0.3.0.
+2. **Two setups, both supported and both tested in CI.**
+   - **A, the home network:** the lab switch plugs into the home router, which hands out the addresses (a reservation per Wyse and one for the Mac's adapter), DNS and NAT. The Mac's Wi-Fi is off for the run. `relish netboot` runs as before, a ProxyDHCP on UDP 67 and 4011 beside the router.
+   - **B, isolated, the Mac as the router** (`image/lab/mac/`): the adapter gets `10.77.0.1`, dnsmasq on it hands out the addresses, and pf NATs the lab out through the Mac's Wi-Fi from an anchor under `com.apple`. dnsmasq owns UDP 67 and sends option 60 `PXEClient` to PXE clients (and only them), which sends the firmware and iPXE to UDP 4011 on the same address (PXE specification 2.1, section 2.2.4). `relish netboot --mode-dhcp-proxy` answers there only, and refuses to start if another machine on the switch also hands out addresses.
+3. **Why B works where "macOS Internet Sharing" in the table above didn't:** the trouble there was two servers on one machine both wanting UDP 67. In B relish doesn't bind 67 at all, so its socket stays exclusive (#499) and nothing needs `SO_REUSEPORT`. And unlike `relish netboot --dhcp` (decision 5 of 3 October stands), the addresses come from a DHCP server that lives as long as the cluster, not as long as the netboot.
+4. **What isolation protected, A covers in relish:** `--mac`, the yes before a used disk is wiped (or `--wipe`), and the refusal to start beside another boot server. The gated run compares every claim key on the monitor in both; `--trust-lan` is for runs where you trust everything on the network.
+5. **Which for the gated run:** B, if a dry run with one Wyse shows its firmware asking relish on 4011 (`ack on 4011` in relish's log). Nothing has tested option 60 from a DHCP server on the 3040's firmware; OVMF follows it, and CI runs it on every lab build. If the Wyse ignores it, A.
+6. **Losing the backup netboot server:** if `relish netboot` on the Mac hits a wall, the fallback is the other maintainer's Mac or, in A, any Linux machine on the LAN.

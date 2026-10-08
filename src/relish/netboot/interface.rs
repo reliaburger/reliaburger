@@ -113,7 +113,7 @@ pub fn pick(
 fn self_assigned(interface: &Interface) -> NetbootError {
     NetbootError::Interface(format!(
         "{} has only {}, a self-assigned address, so no DHCP server answered it and the machines you boot couldn't reach this one. \
-         Check the cable and that the LAN's DHCP server (your router, or the lab's Pi) is up, then reconnect the interface; \
+         Check the cable and that the LAN's DHCP server (usually your router) is up, then reconnect the interface; \
          or give it a fixed address on the LAN and pass that with --address",
         interface.name, interface.address
     ))
@@ -201,7 +201,7 @@ pub fn bind_error(what: &'static str, port: u16, error: std::io::Error) -> Netbo
             port,
             hint: match port {
                 67 => {
-                    ": another DHCP server runs here (dnsmasq, or macOS Internet Sharing's bootpd?)"
+                    ": another DHCP server runs here (dnsmasq, or macOS Internet Sharing's bootpd?); if it's the lab's own, pass --mode-dhcp-proxy"
                 }
                 68 => {
                     ": this machine's own DHCP client holds it (configd on macOS, dhclient on Linux)"

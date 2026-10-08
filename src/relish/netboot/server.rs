@@ -16,7 +16,7 @@ use super::installed::{InstalledRecord, RECORD_FILE, chain_script};
 use super::interface::{self, Interface, udp_socket};
 use super::tftp::{self, Outcome, TftpFiles, TftpSettings};
 use super::wipe::{self, DiskSession, Question};
-use super::{IpxeBuild, Log, MacAddress, NetbootError, NetbootOptions};
+use super::{DhcpSetup, IpxeBuild, Log, MacAddress, NetbootError, NetbootOptions};
 
 /// How long to listen for the LAN's DHCP server and another ProxyDHCP
 /// before starting.
@@ -35,14 +35,19 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         server,
         options.http_port,
     )?);
-    check_the_network(&interface).await?;
+    check_the_network(&interface, options.dhcp).await?;
 
     let any = Ipv4Addr::UNSPECIFIED;
-    let dhcp_socket = udp_socket(
-        "DHCP",
-        SocketAddrV4::new(any, dhcp::DHCP_SERVER_PORT),
-        Some(&interface),
-    )?;
+    // With the DHCP server on this machine, it owns UDP 67 and sends PXE
+    // clients to 4011, so there's nothing for us to hear on 67.
+    let dhcp_socket = match options.dhcp {
+        DhcpSetup::Router => Some(udp_socket(
+            "DHCP",
+            SocketAddrV4::new(any, dhcp::DHCP_SERVER_PORT),
+            Some(&interface),
+        )?),
+        DhcpSetup::ThisMachine => None,
+    };
     let proxy_socket = udp_socket(
         "ProxyDHCP",
         SocketAddrV4::new(any, dhcp::PROXY_DHCP_PORT),
@@ -76,7 +81,14 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         log: log.clone(),
     });
 
-    let dhcp_task = dhcp_loop(dhcp_socket, ListenPort::Dhcp, context.clone(), log.clone());
+    let (dhcp_context, dhcp_log) = (context.clone(), log.clone());
+    let dhcp_task = async move {
+        match dhcp_socket {
+            Some(socket) => dhcp_loop(socket, ListenPort::Dhcp, dhcp_context, dhcp_log).await,
+            // Never finishes, so the select! below never picks it.
+            None => std::future::pending().await,
+        }
+    };
     let proxy_task = dhcp_loop(proxy_socket, ListenPort::ProxyDhcp, context, log.clone());
     let tftp_log = log.clone();
     let tftp_task = tftp::serve(
@@ -146,18 +158,35 @@ async fn check_artefacts(options: &NetbootOptions) -> Result<Artefacts, NetbootE
 enum Network {
     /// Another PXE boot server: the two would race for every machine.
     BootServer(Ipv4Addr),
-    /// A DHCP server handing out addresses, and no other boot server:
-    /// exactly what a ProxyDHCP needs beside it.
-    AddressServer(Ipv4Addr),
+    /// DHCP servers handing out addresses, in the order they answered, and
+    /// no other boot server: what a ProxyDHCP needs beside it.
+    AddressServers(Vec<AddressServer>),
     /// Nothing at all.
     Silent,
+}
+
+/// A DHCP server that offered the probe an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AddressServer {
+    address: Ipv4Addr,
+    /// Its offer carried option 60 `PXEClient`, sending PXE clients to its
+    /// UDP 4011 ([`DhcpSetup::ThisMachine`]).
+    pxe_client: bool,
+}
+
+/// What to print about the network before serving.
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    Fine(String),
+    Warning(String),
 }
 
 /// Broadcast a PXE DHCPDISCOVER on `interface` and act on what answers:
 /// refuse to start beside another boot server, and warn when nothing hands
 /// out addresses, since the machines we boot need one before they ask us
-/// anything.
-async fn check_the_network(interface: &Interface) -> Result<(), NetbootError> {
+/// anything. With `setup` [`DhcpSetup::ThisMachine`], the DHCP server must
+/// be this machine's alone.
+async fn check_the_network(interface: &Interface, setup: DhcpSetup) -> Result<(), NetbootError> {
     let skipped = |error: &dyn std::fmt::Display| {
         eprintln!(
             "relish netboot: warning: can't check the network ({error}); make sure no other netboot server runs on it, and that its DHCP server is up"
@@ -172,12 +201,35 @@ async fn check_the_network(interface: &Interface) -> Result<(), NetbootError> {
         }
     };
     let broadcast = SocketAddrV4::new(Ipv4Addr::BROADCAST, dhcp::DHCP_SERVER_PORT);
-    match probe(&socket, broadcast, interface.address, PROBE_WAIT).await {
-        Ok(Network::Silent) => eprintln!("{}", verdict(Network::Silent, interface)?),
-        Ok(network) => println!("{}", verdict(network, interface)?),
-        Err(error) => skipped(&error),
+    let network = match probe(&socket, broadcast, interface.address, PROBE_WAIT).await {
+        Ok(network) => network,
+        Err(error) => {
+            skipped(&error);
+            return Ok(());
+        }
+    };
+    let report = match setup {
+        DhcpSetup::Router => verdict(network, interface)?,
+        DhcpSetup::ThisMachine => {
+            verdict_beside_local_dhcp(network, interface, local_dhcp_server_runs())?
+        }
+    };
+    match report {
+        Report::Fine(line) => println!("{line}"),
+        Report::Warning(line) => eprintln!("{line}"),
     }
     Ok(())
+}
+
+/// Whether something on this machine holds UDP 67, as a DHCP server does.
+/// Our own server socket is exclusive, so binding it fails if anything
+/// else has the port.
+fn local_dhcp_server_runs() -> bool {
+    let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, dhcp::DHCP_SERVER_PORT);
+    matches!(
+        udp_socket("DHCP", any, None),
+        Err(NetbootError::PortInUse { .. })
+    )
 }
 
 /// Send a PXE-looking DHCPDISCOVER from `socket` to `target`, then listen
@@ -199,7 +251,7 @@ async fn probe(
         dhcp::encode(&discover).ok_or_else(|| std::io::Error::other("can't encode the probe"))?;
     socket.send_to(&bytes, target).await?;
 
-    let mut address_server = None;
+    let mut address_servers: Vec<AddressServer> = Vec::new();
     let mut buffer = vec![0u8; 1500];
     let deadline = tokio::time::Instant::now() + wait;
     // `timeout_at` gives up at the deadline: `Err` means the wait is over.
@@ -217,27 +269,87 @@ async fn probe(
         {
             return Ok(Network::BootServer(server));
         }
-        if let Some(server) = dhcp::address_server(&reply, xid, *source.ip()) {
-            address_server.get_or_insert(server);
+        if let Some(address) = dhcp::address_server(&reply, xid, *source.ip())
+            && !address_servers.iter().any(|s| s.address == address)
+        {
+            address_servers.push(AddressServer {
+                address,
+                pxe_client: dhcp::says_pxe_client(&reply),
+            });
         }
     }
-    Ok(address_server.map_or(Network::Silent, Network::AddressServer))
+    if address_servers.is_empty() {
+        Ok(Network::Silent)
+    } else {
+        Ok(Network::AddressServers(address_servers))
+    }
 }
 
-/// The line to print about what the probe found, or the refusal to start.
-fn verdict(network: Network, interface: &Interface) -> Result<String, NetbootError> {
+/// The line to print about what the probe found beside the LAN's router,
+/// or the refusal to start.
+fn verdict(network: Network, interface: &Interface) -> Result<Report, NetbootError> {
     let name = &interface.name;
     match network {
         Network::BootServer(server) => Err(NetbootError::CompetingServer { server }),
-        Network::AddressServer(server) => Ok(format!(
-            "relish netboot: {server} hands out addresses on {name}, and no other netboot server answers"
-        )),
-        Network::Silent => Ok(format!(
+        Network::AddressServers(servers) => {
+            let addresses: Vec<String> = servers.iter().map(|s| s.address.to_string()).collect();
+            Ok(Report::Fine(format!(
+                "relish netboot: {} hands out addresses on {name}, and no other netboot server answers",
+                addresses.join(" and ")
+            )))
+        }
+        Network::Silent => Ok(Report::Warning(format!(
             "relish netboot: warning: nothing hands out addresses on {name}; no DHCP server answered within {}s. \
              Machines that network-boot need an address before they ask relish anything. \
-             Is the router (the Pi, in the lab) up, and on the same switch? Serving anyway",
+             Is your router up, and on the same switch? Serving anyway",
             PROBE_WAIT.as_secs()
-        )),
+        ))),
+    }
+}
+
+/// The same for `--mode-dhcp-proxy`, where this machine's own DHCP server
+/// hands out the addresses and sends PXE clients to our UDP 4011.
+/// `local_dhcp` says whether anything here holds UDP 67: the probe can't
+/// always hear a server on its own machine.
+fn verdict_beside_local_dhcp(
+    network: Network,
+    interface: &Interface,
+    local_dhcp: bool,
+) -> Result<Report, NetbootError> {
+    let name = &interface.name;
+    let own = interface.address;
+    let servers = match network {
+        Network::BootServer(server) => return Err(NetbootError::CompetingServer { server }),
+        Network::AddressServers(servers) => servers,
+        Network::Silent if local_dhcp => {
+            return Ok(Report::Fine(format!(
+                "relish netboot: a DHCP server on this machine holds UDP 67 (the probe heard no offer on {name}, \
+                 which happens when the server answers from the same machine); answering PXE on UDP 4011 only"
+            )));
+        }
+        Network::Silent => {
+            return Ok(Report::Warning(format!(
+                "relish netboot: warning: --mode-dhcp-proxy, but nothing on this machine holds UDP 67 and nothing answered on {name}. \
+                 Start the DHCP server (dnsmasq, image/lab/mac/README.md) before the machines boot. Serving anyway"
+            )));
+        }
+    };
+    if let Some(other) = servers.iter().find(|s| s.address != own) {
+        return Err(NetbootError::AnotherDhcpServer {
+            server: other.address,
+            interface: name.clone(),
+        });
+    }
+    if servers.iter().any(|s| s.pxe_client) {
+        Ok(Report::Fine(format!(
+            "relish netboot: this machine's DHCP server ({own}) hands out addresses on {name} and sends PXE clients to UDP 4011; answering there only"
+        )))
+    } else {
+        Ok(Report::Warning(format!(
+            "relish netboot: warning: this machine's DHCP server answers on {name} without option 60 PXEClient, \
+             so PXE firmware won't ask relish on UDP 4011. For dnsmasq: dhcp-vendorclass=set:pxe,PXEClient \
+             and dhcp-option-force=tag:pxe,60,PXEClient (image/lab/mac/dnsmasq.conf). Serving anyway"
+        )))
     }
 }
 
@@ -333,6 +445,11 @@ fn print_summary(
             arch.boot_file(),
             options.ipxe,
             arch.ipxe_name(),
+        );
+    }
+    if options.dhcp == DhcpSetup::ThisMachine {
+        println!(
+            "  --mode-dhcp-proxy: answering PXE on UDP 4011 only; this machine's DHCP server owns UDP 67"
         );
     }
     if options.allowed.is_empty() {
@@ -432,11 +549,11 @@ mod tests {
         assert!(tftp_files(&artefacts, IpxeBuild::Snp, dir.path(), server, 8081).is_ok());
     }
 
-    const PI: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
+    const ROUTER: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
     const OWN: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 2);
     const OTHER_PROXY: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 3);
 
-    /// The Pi's dnsmasq: an address and nothing about booting.
+    /// A home router's DHCP server: an address and nothing about booting.
     fn router_offer(request: &Message) -> Message {
         let mut offer = Message::default();
         offer
@@ -447,8 +564,28 @@ mod tests {
         offer
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Offer));
-        offer.opts_mut().insert(DhcpOption::ServerIdentifier(PI));
         offer
+            .opts_mut()
+            .insert(DhcpOption::ServerIdentifier(ROUTER));
+        offer
+    }
+
+    /// The lab Mac's dnsmasq: an address from this machine, with option 60
+    /// `PXEClient` sending PXE clients to its UDP 4011.
+    fn local_dhcp_offer(request: &Message) -> Message {
+        let mut offer = router_offer(request);
+        offer.opts_mut().insert(DhcpOption::ServerIdentifier(OWN));
+        offer
+            .opts_mut()
+            .insert(DhcpOption::ClassIdentifier(b"PXEClient".to_vec()));
+        offer
+    }
+
+    fn served_by(address: Ipv4Addr, pxe_client: bool) -> Network {
+        Network::AddressServers(vec![AddressServer {
+            address,
+            pxe_client,
+        }])
     }
 
     /// A ProxyDHCP at `server`: a boot file and no address.
@@ -496,7 +633,36 @@ mod tests {
     #[tokio::test]
     async fn the_probe_finds_the_router_handing_out_addresses() {
         let network = probe_on_loopback(|request| vec![router_offer(request)]).await;
-        assert_eq!(network, Network::AddressServer(PI));
+        assert_eq!(network, served_by(ROUTER, false));
+    }
+
+    #[tokio::test]
+    async fn the_probe_finds_this_machines_dhcp_server_and_its_pxeclient_option() {
+        let network = probe_on_loopback(|request| vec![local_dhcp_offer(request)]).await;
+        assert_eq!(network, served_by(OWN, true));
+    }
+
+    #[tokio::test]
+    async fn the_probe_lists_every_dhcp_server_once() {
+        let network = probe_on_loopback(|request| {
+            vec![
+                local_dhcp_offer(request),
+                router_offer(request),
+                router_offer(request),
+            ]
+        })
+        .await;
+        let both = Network::AddressServers(vec![
+            AddressServer {
+                address: OWN,
+                pxe_client: true,
+            },
+            AddressServer {
+                address: ROUTER,
+                pxe_client: false,
+            },
+        ]);
+        assert_eq!(network, both);
     }
 
     #[tokio::test]
@@ -534,24 +700,92 @@ mod tests {
 
     #[test]
     fn what_the_probe_found_decides_whether_to_start() {
-        let line = verdict(Network::AddressServer(PI), &en7()).unwrap();
+        let Ok(Report::Fine(line)) = verdict(served_by(ROUTER, false), &en7()) else {
+            panic!("a router should be fine");
+        };
         assert!(
             line.contains("10.77.0.1 hands out addresses on en7"),
             "{line}"
         );
 
-        let line = verdict(Network::Silent, &en7()).unwrap();
+        let Ok(Report::Warning(line)) = verdict(Network::Silent, &en7()) else {
+            panic!("silence should warn");
+        };
         assert!(line.contains("warning"), "{line}");
         assert!(
             line.contains("nothing hands out addresses on en7"),
             "{line}"
         );
-        assert!(line.contains("router (the Pi"), "{line}");
+        assert!(line.contains("Is your router up"), "{line}");
 
         assert!(matches!(
             verdict(Network::BootServer(OTHER_PROXY), &en7()),
             Err(NetbootError::CompetingServer { server }) if server == OTHER_PROXY
         ));
+    }
+
+    #[test]
+    fn beside_its_own_dhcp_server_relish_wants_option_60_and_no_other_dhcp_server() {
+        let Ok(Report::Fine(line)) = verdict_beside_local_dhcp(served_by(OWN, true), &en7(), true)
+        else {
+            panic!("this machine's dnsmasq with option 60 should be fine");
+        };
+        assert!(line.contains("sends PXE clients to UDP 4011"), "{line}");
+
+        let Ok(Report::Warning(line)) =
+            verdict_beside_local_dhcp(served_by(OWN, false), &en7(), true)
+        else {
+            panic!("a local DHCP server without option 60 should warn");
+        };
+        assert!(line.contains("without option 60 PXEClient"), "{line}");
+        assert!(
+            line.contains("dhcp-option-force=tag:pxe,60,PXEClient"),
+            "{line}"
+        );
+
+        let both = Network::AddressServers(vec![
+            AddressServer {
+                address: OWN,
+                pxe_client: true,
+            },
+            AddressServer {
+                address: ROUTER,
+                pxe_client: false,
+            },
+        ]);
+        let error = verdict_beside_local_dhcp(both, &en7(), true).unwrap_err();
+        assert!(
+            matches!(&error, NetbootError::AnotherDhcpServer { server, interface }
+                if *server == ROUTER && interface == "en7"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("Drop --mode-dhcp-proxy"),
+            "{error}"
+        );
+
+        assert!(matches!(
+            verdict_beside_local_dhcp(Network::BootServer(OTHER_PROXY), &en7(), true),
+            Err(NetbootError::CompetingServer { server }) if server == OTHER_PROXY
+        ));
+    }
+
+    #[test]
+    fn beside_its_own_dhcp_server_silence_is_fine_only_if_something_holds_port_67() {
+        let Ok(Report::Fine(line)) = verdict_beside_local_dhcp(Network::Silent, &en7(), true)
+        else {
+            panic!("a held UDP 67 should be fine");
+        };
+        assert!(line.contains("answering PXE on UDP 4011 only"), "{line}");
+
+        let Ok(Report::Warning(line)) = verdict_beside_local_dhcp(Network::Silent, &en7(), false)
+        else {
+            panic!("nothing on UDP 67 should warn");
+        };
+        assert!(
+            line.contains("nothing on this machine holds UDP 67"),
+            "{line}"
+        );
     }
 
     #[test]
