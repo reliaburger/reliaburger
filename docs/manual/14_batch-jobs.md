@@ -1,7 +1,7 @@
 # Batch jobs
 
 Development preview for 0.2.0. Build matching development binaries and start a
-fresh cluster: protocol 48 and state 65 change control messages and durable
+fresh cluster: protocol 49 and state 66 change control messages and durable
 state. Published 0.1.5 binaries don't have this lifecycle. A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.
@@ -220,7 +220,7 @@ identities; every attempt gets a fresh launch. Singleton container roots are
 writable. Larger arrays use a read-only root, temporary scratch and a 1 MiB limit
 per regular output or scratch file (`RLIMIT_FSIZE`).
 
-#On Linux, Bun's `auto` and `runc` modes select the backend per workload.
+On Linux, Bun's `auto` and `runc` modes select the backend per workload.
 Image jobs use runc; authorised `exec` or `script` jobs use the owned process
 backend on the same node. They share scheduling capacity with applications.
 Host commands run with Bun's account privileges and require the existing
@@ -382,3 +382,70 @@ incomplete observations when its bounded traversal is exhausted. This harness
 measures full dispatch; use the same workload, limits and concurrency for the
 separate bare-process, direct-container and direct-durable baselines. The report
 never qualifies 100m/day from a short recording.
+
+`--observe-pid PID` records Linux RSS and peak RSS for at most eight original
+process identities. A changed start time or unavailable process produces an
+incomplete observation. These are selected processes, not total node or
+container memory; record cgroup working sets separately when qualifying limits.
+Storage observations also become incomplete when atomic renames race the scan.
+
+For the direct baselines, build the rootful Linux example with the same profile
+as Bun and run each mode in a fresh directory on the qualification node:
+
+```sh
+cargo build --release --features ebpf --example job-throughput --bin bun --bin relish
+sudo target/release/examples/job-throughput --path durable-reused \
+  --root /tmp/job-baseline --bun "$PWD/target/release/bun" \
+  --image registry.example.com/busybox@sha256:DIGEST \
+  --count 10000 --concurrency 27 --service-url http://app.example/health
+```
+
+Use `bare`, `fresh`, `reused`, `durable-fresh` and `durable-reused` with the same
+image, command, count and resource inputs. This driver uses `/bin/busybox true`
+from that pinned image, including the same unpacked binary in its process
+floor. Bare processes have no container limits or ownership/durability contract.
+Direct runtime and durable worker modes omit Bun's live namespace supervision;
+the public cluster includes it. Disclose those differences when interpreting
+the gap. Run independent runtime allocators on separate qualification nodes or
+with distinct node subnet identities; they cannot share one node address pool.
+The directory and its ancestors must be traversable by the container user
+namespace. Every original runtime owner is positively retired after timing.
+
+For a separately provisioned task-owned persistent cluster, the recovery probe
+uses a mixed-profile reusable manifest and a running application:
+
+```sh
+python3 scripts/demo/verify-job-recovery.py mixed-jobs.toml \
+  --bun /opt/qualification/bun --relish /opt/qualification/relish \
+  --config /opt/qualification/node.toml --pid-file /opt/qualification/bun.pid \
+  --node-name worker-1 --service-name web --service-url http://app.example/health \
+  --output recovery-proof
+```
+
+Set the ordinary `RELIABURGER_ENDPOINT`, `RELIABURGER_CA_CERT` and
+`RELIABURGER_TOKEN` environment variables. The probe checks the original binary
+and configuration before using a Linux PID handle to kill Bun during partially
+accepted completion. It starts the same binary/configuration, updates the PID
+file, verifies the application's original PID, resumed accepted outcomes and
+selected indexes, and rejects a stale control version over verified node TLS.
+The replacement remains running. Preserve its binary and ownership journals
+until normal workload retirement. This proves a single-node crash; separate
+multi-node and sustained fault cases remain necessary.
+
+
+## Measured development results
+
+The standalone landing-page recording runs 50,000 pinned BusyBox commands
+through the public CLI on a four-vCPU, 8 GiB Linux VM, with optimised development
+binaries. It accepted all successes in 100.73 seconds (496.4/s), with no failures
+or retries, beside an application returning HTTP 200. Real pauses are preserved.
+The separately measured bare-process floor completed 100,000 commands in 6.27
+seconds; bare processes have fewer isolation and durability guarantees.
+
+These results miss the suggested 500,000/minute recording target and do not
+qualify 100m/day. The fresh-container comparisons retain actual startup failures;
+whole-directory storage observations exceeded their bounded traversal budget.
+Read the [raw evidence and reproduction](../qualification/2026-10-08-job-measurements/README.md)
+for contracts, resource/RSS observations, failures and the outstanding 24-hour,
+headroom and metadata-collection work. Separate real Bun-crash and three-worker
+loss proofs cover mixed resource profiles and the application's original PID.

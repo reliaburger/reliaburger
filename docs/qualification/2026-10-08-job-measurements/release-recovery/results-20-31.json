@@ -1,0 +1,18 @@
+{
+  "batch_id": 20,
+  "rows": [
+    {
+      "grant_attempt": 1,
+      "index": 31,
+      "attempts": 1,
+      "succeeded": true,
+      "not_run": false,
+      "exit_code": 0,
+      "run_ms": 202
+    }
+  ],
+  "truncated": false,
+  "next_after": null,
+  "retention_seconds": 3600,
+  "unreachable": []
+}

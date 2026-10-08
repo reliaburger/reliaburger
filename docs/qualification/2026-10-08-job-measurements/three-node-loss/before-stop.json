@@ -1,0 +1,294 @@
+{
+  "batch_id": 7,
+  "kind": "manifest",
+  "name": "three-node-loss",
+  "namespace": "default",
+  "total": 384,
+  "succeeded": 8,
+  "failed": 0,
+  "not_run": 0,
+  "retried": 0,
+  "queued": 312,
+  "held": 64,
+  "done": false,
+  "status": "Running",
+  "active_commands": 2,
+  "other_in_flight_attempts": 6,
+  "elapsed_seconds": 28,
+  "whole_run_successes_per_second": 0.2857142857142857,
+  "activity_semantics": "last_node_sync_verified_start_to_positive_cleanup",
+  "cohorts": [
+    {
+      "batch_id": 8,
+      "kind": "array",
+      "name": "three-node-loss",
+      "namespace": "default",
+      "status": "Running",
+      "done": false,
+      "total": 256,
+      "succeeded": 8,
+      "failed": 0,
+      "not_run": 0,
+      "retried": 0,
+      "queued": 200,
+      "held": 48,
+      "active_commands": 2,
+      "other_in_flight_attempts": 4,
+      "activity_semantics": "last_node_sync_verified_start_to_positive_cleanup",
+      "elapsed_seconds": 28,
+      "whole_run_successes_per_second": 0.2857142857142857,
+      "chunks": 32,
+      "chunks_done": 1,
+      "failed_indices": [],
+      "failed_overflow": 0,
+      "submitted_at_epoch_secs": 1791438704,
+      "nodes": [
+        {
+          "node": "rb-88f1997db44d-1",
+          "slots": 2,
+          "counters": {
+            "running": 2,
+            "active_commands": 1,
+            "attempts_started": 15,
+            "succeeded": 13,
+            "failed": 0,
+            "retried": 0
+          }
+        },
+        {
+          "node": "rb-88f1997db44d-2",
+          "slots": 2,
+          "counters": {
+            "running": 2,
+            "active_commands": 0,
+            "attempts_started": 9,
+            "succeeded": 7,
+            "failed": 0,
+            "retried": 0
+          }
+        },
+        {
+          "node": "rb-88f1997db44d-3",
+          "slots": 2,
+          "counters": {
+            "running": 2,
+            "active_commands": 1,
+            "attempts_started": 14,
+            "succeeded": 12,
+            "failed": 0,
+            "retried": 0
+          }
+        }
+      ],
+      "nodes_truncated": false,
+      "duration_final_attempt_ms": {
+        "bounds": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192,
+          16384,
+          null
+        ],
+        "counts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          4,
+          2,
+          0,
+          0
+        ]
+      },
+      "cpu_request_millicores": 100,
+      "memory_request_bytes": 33554432,
+      "age_seconds": 28,
+      "details_retention_seconds": 3600,
+      "execution_semantics": "at_least_once",
+      "isolation": "reusable-container",
+      "idle_executor_reservation": {
+        "cpu_millicores": 110,
+        "memory_bytes": 41943040
+      },
+      "profile": "small"
+    },
+    {
+      "batch_id": 9,
+      "kind": "array",
+      "name": "three-node-loss",
+      "namespace": "default",
+      "status": "Running",
+      "done": false,
+      "total": 128,
+      "succeeded": 0,
+      "failed": 0,
+      "not_run": 0,
+      "retried": 0,
+      "queued": 112,
+      "held": 16,
+      "active_commands": 0,
+      "other_in_flight_attempts": 2,
+      "activity_semantics": "last_node_sync_verified_start_to_positive_cleanup",
+      "elapsed_seconds": 28,
+      "whole_run_successes_per_second": 0.0,
+      "chunks": 16,
+      "chunks_done": 0,
+      "failed_indices": [],
+      "failed_overflow": 0,
+      "submitted_at_epoch_secs": 1791438704,
+      "nodes": [
+        {
+          "node": "rb-88f1997db44d-1",
+          "slots": 0,
+          "counters": {
+            "running": 0,
+            "active_commands": 0,
+            "attempts_started": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "retried": 0
+          }
+        },
+        {
+          "node": "rb-88f1997db44d-2",
+          "slots": 2,
+          "counters": {
+            "running": 2,
+            "active_commands": 0,
+            "attempts_started": 9,
+            "succeeded": 7,
+            "failed": 0,
+            "retried": 0
+          }
+        },
+        {
+          "node": "rb-88f1997db44d-3",
+          "slots": 0,
+          "counters": {
+            "running": 0,
+            "active_commands": 0,
+            "attempts_started": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "retried": 0
+          }
+        }
+      ],
+      "nodes_truncated": false,
+      "duration_final_attempt_ms": {
+        "bounds": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192,
+          16384,
+          null
+        ],
+        "counts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "cpu_request_millicores": 1000,
+      "memory_request_bytes": 67108864,
+      "age_seconds": 28,
+      "details_retention_seconds": 3600,
+      "execution_semantics": "at_least_once",
+      "isolation": "reusable-container",
+      "idle_executor_reservation": {
+        "cpu_millicores": 1010,
+        "memory_bytes": 75497472
+      },
+      "profile": "large"
+    }
+  ],
+  "duration_final_attempt_ms": {
+    "bounds": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384,
+      null
+    ],
+    "counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      4,
+      2,
+      0,
+      0
+    ]
+  },
+  "rates": {
+    "successes_per_second": 0.0,
+    "failures_per_second": 0.0,
+    "interval_seconds": 1.055997917,
+    "sampled_at_epoch_ms": 1791438732649
+  },
+  "details_retention_seconds": 3600,
+  "execution_semantics": "at_least_once"
+}

@@ -44,6 +44,29 @@ impl NamespaceLease {
     }
 }
 impl TaskNamespacePolicy {
+    /// Preflight authority for namespace-only bindings before application adoption.
+    /// This does not remove a source: old delegated owners still need retirement.
+    pub(crate) async fn recorded_sources(data: &Path) -> std::io::Result<BTreeMap<u64, u32>> {
+        let path = data.join("batch-namespaces.json");
+        tokio::task::spawn_blocking(move || {
+            let journal = crate::durable::read_json_if_exists::<Journal>(
+                &path,
+                64 << 10,
+                crate::durable::Access::Exclusive,
+            )?;
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+            let Some(journal) = journal else {
+                return Ok(BTreeMap::new());
+            };
+            recorded_sources(journal, boot.trim(), |namespace| {
+                crate::sesame::egress::cgroup_id_of_path(
+                    &Path::new("/sys/fs/cgroup/reliaburger").join(namespace),
+                )
+            })
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
     /// Startup must first retire old delegated owners. Never erase a live source.
     pub async fn recover(kernel: Arc<Mutex<OnionEbpf>>, data: &Path) -> std::io::Result<Arc<Self>> {
         let path = data.join("batch-namespaces.json");
@@ -217,4 +240,70 @@ fn remove_binding(kernel: &mut OnionEbpf, namespace: &str, cgroup: u64) -> std::
             .map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+/// Namespace roots cannot authorise application firewall rules or other inodes.
+fn recorded_sources(
+    journal: Journal,
+    boot: &str,
+    lookup: impl Fn(&str) -> Option<u64>,
+) -> std::io::Result<BTreeMap<u64, u32>> {
+    if journal.namespaces.len() > MAX_NAMESPACES
+        || !crate::grill::process_owner::valid_boot_id(&journal.boot)
+        || journal
+            .namespaces
+            .keys()
+            .any(|name| !crate::config::valid_workload_label(name))
+        || journal.namespaces.values().any(|id| *id == 0)
+    {
+        return Err(std::io::Error::other("invalid delegated namespace journal"));
+    }
+    if journal.boot != boot {
+        return Ok(BTreeMap::new());
+    }
+    let mut sources = BTreeMap::new();
+    for (namespace, recorded) in journal.namespaces {
+        if lookup(&namespace) != Some(recorded)
+            || sources
+                .insert(recorded, crate::onion::vip::name_to_id(&namespace))
+                .is_some()
+        {
+            return Err(std::io::Error::other(
+                "delegated namespace ownership conflicts with its original cgroup",
+            ));
+        }
+    }
+    Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const BOOT: &str = "ac8a4519-2725-482c-844a-1aadb1d673de";
+    fn journal() -> Journal {
+        Journal {
+            boot: BOOT.into(),
+            namespaces: BTreeMap::from([("default".into(), 42)]),
+        }
+    }
+    #[test]
+    fn recorded_delegated_sources_require_the_original_namespace_inode_and_boot() {
+        assert_eq!(
+            recorded_sources(journal(), BOOT, |_| Some(42)).unwrap(),
+            BTreeMap::from([(42, crate::onion::vip::name_to_id("default"))])
+        );
+        assert!(recorded_sources(journal(), BOOT, |_| Some(43)).is_err());
+        assert!(recorded_sources(journal(), BOOT, |_| None).is_err());
+        assert!(
+            recorded_sources(journal(), "11111111-2222-3333-4444-555555555555", |_| None)
+                .unwrap()
+                .is_empty()
+        );
+        let mut duplicate = journal();
+        duplicate.namespaces.insert("other".into(), 42);
+        assert!(recorded_sources(duplicate, BOOT, |_| Some(42)).is_err());
+        let mut malformed = journal();
+        malformed.boot = "unknown".into();
+        assert!(recorded_sources(malformed, BOOT, |_| Some(42)).is_err());
+    }
 }

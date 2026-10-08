@@ -752,15 +752,36 @@ impl TaskArrayNode {
         ArrayProgress {
             batch_id: assignment.batch_id,
             slots: {
+                let reusable = assignment.template.as_deref().filter(|template| {
+                    template.isolation == crate::config::job::ContainerIsolation::ReusableContainer
+                });
+                let resources = reusable
+                    .and_then(|template| {
+                        super::reusable_executor::ExecutorProfile::new(template).ok()
+                    })
+                    .map_or(assignment.resources, |profile| profile.reservation);
                 let available = self.budget.available();
-                let fits = (available.cpu_millicores / assignment.resources.cpu_millicores)
-                    .min(available.memory_bytes / assignment.resources.memory_bytes);
-                self.concurrency(&assignment.spec)
-                    .min(u32::try_from(fits).unwrap_or(u32::MAX))
+                let fits = (available.cpu_millicores / resources.cpu_millicores)
+                    .min(available.memory_bytes / resources.memory_bytes);
+                #[cfg(target_os = "linux")]
+                let fits = match (reusable, self.runner.as_ref()) {
+                    (Some(template), NodeRunner::Owned(runner)) => {
+                        u64::from(runner.reusable_capacity(template).await)
+                    }
+                    _ => fits,
+                };
+                let cap = self
+                    .concurrency(&assignment.spec)
+                    .min(if reusable.is_some() {
+                        super::reusable_executor::MAX_EXECUTOR_SLOTS as u32
+                    } else {
+                        u32::MAX
+                    });
+                cap.min(u32::try_from(fits).unwrap_or(u32::MAX))
                     .saturating_add(
                         u32::try_from(counters.running.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
                     )
-                    .min(self.concurrency(&assignment.spec))
+                    .min(cap)
             },
             refused: None,
             finished,
@@ -1393,6 +1414,33 @@ mod tests {
         capped.spec.per_node_concurrency = Some(3);
         let progress = node.sync(&request(vec![capped])).await.arrays.remove(0);
         assert_eq!(progress.slots, 3);
+    }
+
+    #[tokio::test]
+    async fn reusable_advertisement_accounts_for_helper_overhead_and_pool_bound() {
+        for (capacity, expected) in [
+            (crate::meat::Resources::new(300, 96 << 20, 0), 2),
+            (crate::meat::Resources::new(256_000, 16 << 30, 0), 32),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut options = config(root.path(), policy(&[BINARY], false));
+            options.default_concurrency = 256;
+            let node = TaskArrayNode::new(options, NodeRunner::Fake(FakeRunner::always_succeeds()))
+                .with_budget(super::super::execution_budget::ExecutionBudget::new(
+                    capacity,
+                ));
+            let mut array = assignment(1, 1000, &[]);
+            array.resources = crate::meat::Resources::new(100, 32 << 20, 0);
+            array.template = Some(Box::new(toml::from_str(
+                "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nisolation='reusable-container'\ncpu='100m'\nmemory='32Mi'"
+            ).unwrap()));
+            let progress = node.sync(&request(vec![array])).await.arrays.remove(0);
+            assert_eq!(progress.refused, None);
+            assert_eq!(
+                progress.slots, expected,
+                "advertisement must include helper requests and the bounded executor count"
+            );
+        }
     }
 
     #[tokio::test]

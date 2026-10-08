@@ -2,12 +2,15 @@
 #[cfg(target_os = "linux")]
 mod pool;
 #[cfg(target_os = "linux")]
-pub(crate) use pool::ReusablePool;
+pub(crate) use pool::{CommandReporting, ReusablePool};
 #[cfg(any(target_os = "linux", test))]
 mod protocol;
 use crate::config::job::JobSpec;
 use crate::config::types::ResourceRange;
 use crate::meat::Resources;
+
+/// Upper bound on retained helpers per node-local owned executor pool.
+pub(crate) const MAX_EXECUTOR_SLOTS: usize = 32;
 
 /// Explicit reservation for the container's idle command helper.
 pub const HELPER_CPU_REQUEST: u64 = 10;

@@ -1,0 +1,36 @@
+{
+  "path": "Bare",
+  "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+  "executable_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
+  "command": [
+    "/bin/busybox",
+    "true"
+  ],
+  "count": 100000,
+  "concurrency": 27,
+  "image_preparation_seconds_excluded": 0.158514017,
+  "warmth": "warm-images-cold-executors",
+  "elapsed_seconds": 6.267481074,
+  "verified_successes": 100000,
+  "failures": 0,
+  "retries": 0,
+  "verified_successes_per_second": 15955.373270266376,
+  "container_cpu_request_millicores": 100,
+  "container_cpu_limit_millicores": 1000,
+  "container_memory_bytes": 33554432,
+  "bare_process_resource_limits": "none; container profile fields are comparison inputs only",
+  "node_job_budget_cpu_millicores": 3000,
+  "service_probe_latency_ms": [
+    12.602366,
+    1.547484,
+    2.423224,
+    2.071478,
+    1.8211060000000001,
+    1.416652,
+    1.8071059999999999
+  ],
+  "durability": "exit statuses only; no isolation, limits, ownership journal or task ledger",
+  "optimised_build": true,
+  "namespace_policy_hook": "not injected in direct runner; full Bun dispatch includes live namespace supervision",
+  "qualified_100m_per_day": false
+}

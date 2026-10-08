@@ -1,0 +1,27 @@
+{
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "operator_declared_warmth": "warm-images-cold-executors",
+  "workload_sha256": "0503af30a60291a3e0cf14d0508fa0e8f212f6d43e2c32336de35157ac770b86",
+  "command": [
+    "/Users/miko/github/reliaburger/target/linux-delegated/debug/relish",
+    "--output",
+    "json",
+    "batch",
+    "submit",
+    "/tmp/rb-639-demo-20261008/public-reused-1000.toml"
+  ],
+  "execution_path": "public full dispatch; runtime/isolation as admitted",
+  "host_process_contract": "Owned host execution has no hard CPU/memory enforcement",
+  "timing": "Monotonic clock before submit process launch through observed accepted terminal summary",
+  "qualified_100m_per_day": false,
+  "accepted_elapsed_seconds": 20.698589192936197,
+  "unique_accepted_successes": 1000,
+  "accepted_successes_per_second": 48.31247147710288,
+  "terminal_failures": 0,
+  "not_run": 0,
+  "accepted_retries": 0,
+  "all_tasks_succeeded": true,
+  "qualification_boundary": "Requires matched baselines, 24-hour headroom, concurrent apps, recovery/fault and bounded-cost evidence"
+}

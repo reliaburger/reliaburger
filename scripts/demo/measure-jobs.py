@@ -79,7 +79,9 @@ def display(summary, elapsed):
     recent = summary.get('rates', {}).get('successes_per_second')
     interval = summary.get('rates', {}).get('interval_seconds')
     active = summary.get('active_commands')
-    mode = summary.get('isolation', 'mixed' if summary.get('kind') == 'manifest' else 'unknown')
+    modes = {cohort.get('isolation', 'unknown') for cohort in summary.get('cohorts', [])}
+    mode = summary.get('isolation', next(iter(modes)) if len(modes) == 1 else
+                       'mixed' if modes else 'unknown')
     return (f"{summary['succeeded']:,}/{summary['total']:,} unique accepted successes in {elapsed:.2f}s "
             f"({summary['succeeded'] / max(elapsed, 1e-9):.1f}/s whole run); "
             f"{summary['failed']} failures, {summary['retried']} retries\n"
@@ -87,6 +89,35 @@ def display(summary, elapsed):
             f"queued {summary.get('queued', 'unknown')}, held {summary.get('held', 'unknown')}; "
             f"recent {recent if recent is not None else 'unknown'}/s over "
             f"{interval if interval is not None else 'unknown'}s")
+
+
+
+def indexed_queries(summary):
+    # A manifest has no worker ledger of its own. Indexes are local to each
+    # admitted cohort; use its stable identity rather than the parent's ID.
+    rows = summary.get('cohorts') if summary.get('kind') == 'manifest' else [summary]
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 32:
+        raise ValueError('indexed verification requires 1–32 admitted cohorts')
+    queries = []
+    seen = set()
+    for row in rows:
+        batch_id, total = row.get('batch_id'), row.get('total')
+        if type(batch_id) is not int or batch_id <= 0 or batch_id in seen:
+            raise ValueError('indexed verification requires distinct admitted identities')
+        if type(total) is not int or total <= 0:
+            raise ValueError('indexed verification requires a positive cohort count')
+        seen.add(batch_id)
+        queries.extend((batch_id, index) for index in sorted({0, total // 2, total - 1}))
+    return queries
+
+
+
+def check_indexed_result(result, batch_id, index):
+    rows = result.get('rows')
+    if (result.get('batch_id') != batch_id or result.get('unreachable') or
+            not isinstance(rows, list) or len(rows) != 1 or
+            rows[0].get('index') != index or rows[0].get('succeeded') is not True):
+        raise ValueError('selected indexed outcome is unavailable, mismatched or unsuccessful')
 
 
 def cli(prefix, *args):
@@ -105,25 +136,60 @@ def probe(url):
 
 
 def bounded_storage(path, max_files=4096):
-    size = entries = files = 0
+    size = entries = files = raced = 0
     pending = [pathlib.Path(path)]
     seen = set()
     while pending:
-        with os.scandir(pending.pop()) as children:
-            for entry in children:
-                if entries >= max_files:
-                    return dict(allocated_bytes_observed=size, files_observed=files, complete=False)
-                entries += 1
-                metadata = entry.stat(follow_symlinks=False)
-                identity = metadata.st_dev, metadata.st_ino
-                if identity not in seen:
-                    seen.add(identity)
-                    size += metadata.st_blocks * 512
-                if entry.is_dir(follow_symlinks=False):
-                    pending.append(pathlib.Path(entry.path))
-                else:
-                    files += 1
-    return dict(allocated_bytes_observed=size, files_observed=files, complete=True)
+        try:
+            with os.scandir(pending.pop()) as children:
+                for entry in children:
+                    if entries >= max_files:
+                        return dict(allocated_bytes_observed=size, files_observed=files,
+                                    raced_entries=raced, complete=False)
+                    entries += 1
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                        directory = entry.is_dir(follow_symlinks=False)
+                    except FileNotFoundError:
+                        raced += 1
+                        continue
+                    identity = metadata.st_dev, metadata.st_ino
+                    if identity not in seen:
+                        seen.add(identity)
+                        size += metadata.st_blocks * 512
+                    if directory:
+                        pending.append(pathlib.Path(entry.path))
+                    else:
+                        files += 1
+        except FileNotFoundError:
+            raced += 1
+    # Atomic writes/retirement can change the tree while it is read. That
+    # observation is partial evidence, never proof of a complete storage bound.
+    return dict(allocated_bytes_observed=size, files_observed=files,
+                raced_entries=raced, complete=raced == 0)
+
+
+def process_start(pid, proc=pathlib.Path('/proc')):
+    # The command name may contain spaces and parentheses. Fields after its
+    # final closing parenthesis start with state; starttime is field 22.
+    fields = (proc / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+    return int(fields[19])
+
+
+def process_observation(pid, start, proc=pathlib.Path('/proc')):
+    row = dict(pid=pid, start_ticks=start, complete=False)
+    try:
+        if process_start(pid, proc) != start:
+            return row
+        fields = dict(line.split(':', 1) for line in
+                      (proc / str(pid) / 'status').read_text().splitlines() if ':' in line)
+        rss = int(fields['VmRSS'].split()[0]) * 1024
+        peak = int(fields['VmHWM'].split()[0]) * 1024
+        if process_start(pid, proc) == start:
+            row.update(rss_bytes=rss, peak_rss_bytes=peak, complete=True)
+    except (OSError, ValueError, IndexError, KeyError):
+        pass
+    return row
 
 
 def main():
@@ -136,7 +202,12 @@ def main():
     parser.add_argument('--warmth', required=True, choices=['cold-images-and-executors', 'warm-images-cold-executors', 'warm-images-and-executors'])
     parser.add_argument('--observe-dir', action='append', default=[], type=pathlib.Path,
                         help='Node-local storage; traversal stops at 4096 files, reporting incomplete bounds')
+    parser.add_argument('--observe-pid', action='append', default=[], type=int,
+                        help='Node-local process RSS/peak RSS, fenced by its original start time (at most eight)')
     options = parser.parse_args()
+    if len(options.observe_pid) > 8 or any(pid <= 1 for pid in options.observe_pid):
+        parser.error('observe at most eight positive process identities')
+    process_starts = {pid: process_start(pid) for pid in options.observe_pid}
     if options.timeout < 1:
         parser.error('timeout must be positive')
     options.output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -175,7 +246,8 @@ def main():
             for cohort in summary.get('cohorts', []):
                 cohort.pop('nodes', None)
             observation = dict(elapsed_seconds=elapsed, summary=summary, service_latency_ms=latency,
-                               storage={str(path): bounded_storage(path) for path in options.observe_dir})
+                               storage={str(path): bounded_storage(path) for path in options.observe_dir},
+                               processes=[process_observation(pid, start) for pid, start in process_starts.items()])
             samples.write(json.dumps(observation) + '\n')
             samples.flush()
             text = display(summary, elapsed) + f'\napplication 200 in {latency:.2f}ms'
@@ -183,9 +255,13 @@ def main():
             cast.emit(text, time.monotonic())
             if terminal:
                 details = []
-                for index in sorted({0, summary['total'] // 2, summary['total'] - 1}):
-                    if index >= 0:
-                        details.append(cli(prefix, 'batch', 'results', str(batch_id), '--index', str(index), '--limit', '1'))
+                for result_id, index in indexed_queries(summary):
+                    query = ('batch', 'results', str(result_id), '--index', str(index), '--limit', '1')
+                    result = cli(prefix, *query)
+                    check_indexed_result(result, result_id, index)
+                    details.append(result)
+                    cast.emit('$ ' + shlex.join(prefix + list(query)), time.monotonic())
+                    cast.emit(json.dumps(result, separators=(',', ':')), time.monotonic())
                 (options.output / 'indexed-results.json').write_text(json.dumps(details, indent=2) + '\n')
                 break
             if elapsed >= options.timeout:

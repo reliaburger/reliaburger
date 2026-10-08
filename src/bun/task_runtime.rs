@@ -96,6 +96,57 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             namespace_policy: None,
         }
     }
+    async fn resolve_template(
+        &self,
+        template: &crate::config::job::JobSpec,
+    ) -> Result<crate::config::job::JobSpec, String> {
+        let resolved = template.clone();
+        if !resolved.env.values().any(|value| value.is_encrypted()) {
+            return Ok(resolved);
+        }
+        let identities = match &self.secrets {
+            Some((council, ikm)) => crate::sesame::secret::namespace_identities(
+                &council.security_state().await,
+                resolved.namespace.as_deref().unwrap_or("default"),
+                ikm,
+            ),
+            None => Vec::new(),
+        };
+        tokio::task::spawn_blocking(move || decrypt_template(resolved, identities))
+            .await
+            .map_err(|_| "namespace secret resolution stopped".to_string())?
+    }
+    /// Compatible idle contexts already own their complete resource request.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn reusable_capacity(&self, template: &crate::config::job::JobSpec) -> u32
+    where
+        G: 'static,
+    {
+        use super::reusable_executor::{ExecutorKey, ExecutorProfile, MAX_EXECUTOR_SLOTS};
+        let Ok(profile) = ExecutorProfile::new(template) else {
+            return 0;
+        };
+        if let Some(pool) = self.reusable.get() {
+            let key = self
+                .resolve_template(template)
+                .await
+                .ok()
+                .and_then(|resolved| ExecutorKey::new(&resolved).ok());
+            return pool.available_slots(key, profile.reservation).await;
+        }
+        let budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if budget.has_waiters() {
+            return 0;
+        }
+        let available = budget.available();
+        (available.cpu_millicores / profile.reservation.cpu_millicores)
+            .min(available.memory_bytes / profile.reservation.memory_bytes)
+            .min(MAX_EXECUTOR_SLOTS as u64) as u32
+    }
     /// Share application and idle executor commitments on this node.
     pub fn with_budget(
         self,
@@ -332,29 +383,17 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 output: CapturedOutput::default(),
             };
         };
-        let mut resolved = template.as_ref().clone();
-        if resolved.env.values().any(|value| value.is_encrypted()) {
-            let identities = match &self.secrets {
-                Some((council, ikm)) => crate::sesame::secret::namespace_identities(
-                    &council.security_state().await,
-                    resolved.namespace.as_deref().unwrap_or("default"),
-                    ikm,
-                ),
-                None => Vec::new(),
-            };
-            match tokio::task::spawn_blocking(move || decrypt_template(resolved, identities)).await
-            {
-                Ok(Ok(template)) => resolved = template,
-                _ => {
-                    return Attempt {
-                        outcome: AttemptOutcome::SpawnFailed {
-                            reason: "cannot decrypt this job's namespace secrets".into(),
-                        },
-                        output: CapturedOutput::default(),
-                    };
-                }
+        let resolved = match self.resolve_template(template).await {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                return Attempt {
+                    outcome: AttemptOutcome::SpawnFailed {
+                        reason: "cannot decrypt this job's namespace secrets".into(),
+                    },
+                    output: CapturedOutput::default(),
+                };
             }
-        }
+        };
         if resolved.isolation == crate::config::job::ContainerIsolation::ReusableContainer {
             #[cfg(target_os = "linux")]
             if let Some(runtime) = self.runtime.reusable_runtime() {
@@ -382,8 +421,15 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         resolved,
                         timeout,
                         cancel,
-                        self.log_sink.as_ref(),
-                        &self.singletons,
+                        template
+                            .env
+                            .values()
+                            .any(|value| value.is_encrypted())
+                            .then_some(|| self.resolve_template(template)),
+                        super::reusable_executor::CommandReporting {
+                            sink: self.log_sink.as_ref(),
+                            singletons: &self.singletons,
+                        },
                     )
                     .await;
                 if task
@@ -543,6 +589,14 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         crate::grill::GrillError::StartFailed {
                             instance: id.clone(),
                             reason: error.to_string(),
+                        }
+                    })?;
+                }
+                if template.env.values().any(|value| value.is_encrypted()) {
+                    self.resolve_template(template).await.map_err(|_| {
+                        crate::grill::GrillError::StartFailed {
+                            instance: id.clone(),
+                            reason: "namespace credentials no longer authorise this command".into(),
                         }
                     })?;
                 }

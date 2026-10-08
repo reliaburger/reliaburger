@@ -1,0 +1,20 @@
+{
+  "total": 384,
+  "accepted_successes": 384,
+  "failed": 0,
+  "retried": 0,
+  "victim": "rb-88f1997db44d-3",
+  "service_original": {
+    "node": "rb-88f1997db44d-1",
+    "id": "default__hello-0",
+    "app_name": "hello",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 40576,
+    "pid": 2629,
+    "status_age_ms": 640
+  },
+  "service_retained": true,
+  "qualified_100m_per_day": false
+}

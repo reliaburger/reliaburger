@@ -14,6 +14,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(directory) = self.records_dir.clone() else {
             return Ok(());
         };
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        let delegated_sources = if let Some(data) = directory.parent() {
+            crate::bun::task_namespace::TaskNamespacePolicy::recorded_sources(data)
+                .await
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?
+        } else {
+            std::collections::BTreeMap::new()
+        };
         let owners =
             tokio::task::spawn_blocking(move || crate::bun::egress_owners::load(&directory))
                 .await
@@ -122,7 +130,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .map_err(|error| BunError::AdoptionState(error.to_string()))?;
                 let rules = crate::sesame::firewall::list_firewall_keys(&mut handle.bpf)
                     .map_err(|error| BunError::AdoptionState(error.to_string()))?;
-                if !namespaces.is_subset(&sources)
+                for (cgroup, namespace) in &delegated_sources {
+                    let observed =
+                        crate::sesame::firewall::read_firewall_state(&mut handle.bpf, *cgroup, 0)
+                            .map_err(|error| BunError::AdoptionState(error.to_string()))?
+                            .source_namespace_id;
+                    if observed.is_some_and(|observed| observed != *namespace) {
+                        return Err(BunError::AdoptionState(
+                            "delegated namespace kernel source conflicts with original ownership"
+                                .into(),
+                        ));
+                    }
+                }
+                let known_sources: std::collections::HashSet<_> = sources
+                    .iter()
+                    .copied()
+                    .chain(delegated_sources.keys().copied())
+                    .collect();
+                if !namespaces.is_subset(&known_sources)
                     || rules
                         .iter()
                         .any(|key| !sources.contains(&key.src_cgroup_id))

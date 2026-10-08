@@ -1008,6 +1008,42 @@ leaves retired runtime and routing journals to account for. Qualification must
 measure that growth across restarts and prove safe collection, rather than
 multiply the live slot count by one container's footprint.
 
+#### Admission after we retained a container
+
+A warm helper already owns its command request and helper overhead. Dividing
+only unreserved memory by the command request made a fully occupied node
+advertise zero capacity even though its compatible helper was idle. Conversely,
+ignoring the helper's extra 8 MiB let another node advertise three slots where
+only two complete profiles fitted. Worker offers now count compatible idle
+helpers separately, include overhead for new helpers, and stop at the pool's
+32-context bound. These offers guide placement; the shared ledger still decides
+whether a command can actually start.
+
+The immediate executor reservation also has to respect queued owners. Checking
+for waiters and reserving in separate operations leaves a race. Our new budget
+method does both under the same mutex. A regression queues a large owner while
+a smaller reservation would fit, checks that the executor cannot overtake it,
+then cancels the owner and proves the available reservation wasn't leaked.
+The application supervisor retains its existing immediate admission policy;
+this change prevents new executors from jumping already-queued work.
+
+Secrets exposed another boundary. We decrypted a queued command's environment,
+then waited for a compatible helper. The namespace's old key was retired during
+that wait, but the plaintext snapshot still let the command run. The real Linux
+test reproduced exactly that sequence. Encrypted commands now resolve the
+original template against live keys again after queueing and preparation,
+before submitting a command to the helper. The result must still match the
+helper's compatibility key. Failure retires that helper and launches no command.
+Fresh containers also check live decryption before starting their payload.
+Plain environments take the existing direct path.
+
+We share one resolver rather than maintaining separate decryption rules for
+capacity offers and execution. The reusable path receives a closure: a small
+function which borrows the runner and original template and returns the future
+for a fresh resolution. Rust's `Fn` bound means it can be called without
+consuming those borrowed inputs; the `Future` bound makes the result awaitable.
+No plaintext enters the replicated template or the worker's durable ledger.
+
 #### When cleanup killed the next command
 
 The real Linux regression ran two commands through one executor. The first
@@ -1097,3 +1133,104 @@ reading an old completed run doesn't keep changing its average. Those UTC
 timestamps have one-second precision. Benchmark evidence still needs an
 independent monotonic timer beginning before submission and ending after the
 coordinator has accepted all unique successes.
+
+### The restart that refused our own source bindings
+
+A real Bun crash exposed a handoff we had missed in the isolated executor tests.
+The test ran two reusable resource profiles beside a live application, waited
+for partial accepted completion and verified command activity, then killed Bun.
+The replacement refused startup with `kernel source entries have no original
+ownership`. Application adoption checked the kernel namespace map against its
+application policy journal. Delegated jobs publish a namespace ancestor into the
+same map, with their authority in `batch-namespaces.json`. The application
+preflight did not consult that second journal.
+
+The fix preserves the refusal for unknown sources. Before mutating runtime
+owners, startup reads the delegated journal, validates its bounded namespace
+names and boot identity, and checks that every recorded namespace still names
+its original cgroup inode. The observed kernel namespace value must match that
+namespace. Those keys can explain namespace-only map entries; they cannot
+explain application firewall allow rules. They are also kept out of the
+application reconciler's key set, so an application update cannot accidentally
+erase a delegated binding.
+
+Only after startup has positively retired the old delegated runtime owners may
+`TaskNamespacePolicy::recover` remove their bindings and admit new command
+processes. Recognising a journal is not permission to clear its map entries or
+replay its work. The pure source-authority test checks matching and changed
+inodes, missing paths, prior boots, malformed boot IDs and duplicated inode
+claims. The real crash fixture supplies the behaviour those isolated checks
+could not establish: persistent cluster state, an original live application,
+partially completed worker ledgers and surviving owned runtime helpers.
+
+### An inventory read queued behind every container
+
+The first matched public fresh-container run failed to finish 1,000 commands
+within ten minutes. Its concurrent service stayed available, but Bun repeatedly
+reported `consumer runtime inventory timed out`. Its application loop spent
+roughly half a second per snapshot. The direct fresh runner was already costly;
+the mixed-runtime wrapper added another problem.
+
+An inventory operation is a read, but we had routed every entry through the
+same exclusive lifecycle claim used by create, start and retirement. A live
+container mutation could therefore make a read wait. That claim deliberately
+outlives an abandoned caller, because cancelling an HTTP request must not drop
+a mutation's ownership. Using it for a snapshot meant timed-out inventory reads
+could continue queueing work as new snapshots arrived.
+
+The regression holds a known owner's lifecycle operation open and asks for its
+inventory. It must return the validated original backend and generation without
+waiting for that mutation. Matching routes can be read from their atomically
+published durable files in one blocking worker. They do not change the route or
+retire an owner. A different backend still needs the original exclusive claim
+and positive retirement proof before its old entry can be omitted. All actual
+runtime mutations keep their original claim. A snapshot is observation;
+changing execution authority needs the stronger fence.
+
+
+### What the complete-path measurements actually showed
+
+The longer process floor ran 100,000 identical BusyBox commands in 6.27 seconds.
+Retaining containers clearly helped: 1,000 optimised direct commands took 4.87
+seconds, and the same volume with worker-ledger durability took 5.24 seconds.
+Public dispatch includes persistent coordination and live namespace supervision;
+its 1,000-command run took 13.05 seconds. You cannot subtract the entire
+bare-process gap and call it scheduler overhead. Isolation has work to do too.
+
+At a larger volume, the same public path accepted 50,000 successes in 100.73
+seconds, without retries or failures, beside the original application. That is
+the standalone recording before installation on the landing page. Every pause
+is real. The final chunk can show a recent rate much higher than the whole-run
+rate because accepted outcomes arrive in chunks; the recording displays both.
+Selected indexed outcomes make the completion claim checkable without listing
+50,000 jobs. This was ordinary BusyBox work, not a model-throughput benchmark.
+
+The fresh paths still reported startup failures, and every whole-directory disk
+observation exhausted its bounded scan. Both facts stay in the evidence. A live
+pool bound doesn't collect years of retired ownership journals. Before claiming
+100 million daily successes, we need measured scaling and headroom, retirement-
+authorised collection and a real 24-hour run with apps and failures. The [raw
+reports and reproduction commands](../qualification/2026-10-08-job-measurements/README.md)
+make those limits visible alongside the result.
+
+### A mixed runtime still has a container backend
+
+The final Linux gate found one more seam. Our public secrets/configuration
+catalogue skipped all three real-container probes on a node running runc.
+The node now called its runtime `runc+process`; the capability classifier only
+recognised `runc` and `apple`. Neither the container nor its encryption was at
+fault. The report was wrong.
+
+The classifier now recognises the container backend on a mixed node and reports
+its process backend only when the executable allowlist is configured. The
+runtime version probe also queries runc for this combined mode. A portable
+regression exercises both allowlisted and image-only mixed nodes; the real
+catalogue checks encryption, configuration mounting and cleanup through the
+public API.
+
+One distinction remains deliberate. Older `testapp` catalogue cases submit a
+placeholder image and assume a dedicated ProcessGrill. We don't reinterpret
+that image as a host executable on a mixed node. Those cases keep their
+`ProcessRuntime` gate, while explicit host commands use `exec` or `script` and
+the `ProcessWorkloads` capability. A capability must describe the contract its
+caller actually needs.

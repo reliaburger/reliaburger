@@ -339,6 +339,47 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
             ContainerState::Stopped
         );
     }
+    // These two host backends were published directly by this fixture, without
+    // application discovery owners. Retire only those known keys before testing
+    // application adoption; unknown kernel backends must still be refused.
+    {
+        let mut kernel = kernel.lock().await;
+        for service in services.resolve_all() {
+            BpfServiceMap::new()
+                .remove_backends_bpf(&mut kernel, service.vip, service.port)
+                .unwrap();
+        }
+    }
+    // A delegated source has its own journal, not an application policy owner.
+    // Republish the recorded identity after positive retirement: application
+    // preflight must recognise it without deleting it or claiming its firewall.
+    reliaburger::sesame::firewall::write_cgroup_namespace_entry(
+        &mut kernel.lock().await.bpf,
+        cgroup,
+        reliaburger::onion::vip::name_to_id(&namespace),
+    )
+    .unwrap();
+    let (_commands, commands) = tokio::sync::mpsc::channel(8);
+    let mut adopter = reliaburger::bun::agent::BunAgent::new(
+        runtime.clone(),
+        reliaburger::grill::PortAllocator::new(43000, 44000),
+        commands,
+        CancellationToken::new(),
+    );
+    adopter.set_records_dir(root.join("instances"));
+    adopter.set_onion_ebpf(kernel.clone()).await;
+    adopter
+        .recover_discovery_ownership(&root.join("discovery"))
+        .await
+        .unwrap();
+    adopter.adopt_recorded_instances().await.unwrap();
+    assert_eq!(
+        reliaburger::sesame::firewall::read_firewall_state(&mut kernel.lock().await.bpf, cgroup, 0)
+            .unwrap()
+            .source_namespace_id,
+        Some(reliaburger::onion::vip::name_to_id(&namespace)),
+        "application preflight removed the delegated owner's source",
+    );
     // The startup pass clears only recorded, same-boot ancestry after owners retire.
     drop(runner);
     drop(policy);
@@ -1108,5 +1149,295 @@ async fn runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_origin
         recovered.launch_inventory().await.unwrap().unwrap().len(),
         2
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Warm capacity remains usable while its reservation is retained; queued
+/// commands must resolve secrets again after that wait, before execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_array_node::{
+            ArrayAssignment, ControlVersion, HeldChunk, NodeRunner, NodeSyncRequest, TaskArrayNode,
+            TaskArrayNodeConfig,
+        },
+        task_executor::{AttemptOutcome, TaskInvocation, TaskRunner},
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::council::{
+        log_store::MemLogStore,
+        network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter},
+        node::CouncilNode,
+        state_machine::CouncilStateMachine,
+        types::{CouncilConfig, CouncilNodeInfo, RaftRequest},
+    };
+    use reliaburger::{
+        config::process_workloads::ProcessWorkloadsConfig,
+        grill::AnyGrill,
+        meat::{
+            Resources,
+            task_array::{ChunkId, TaskArraySpec},
+        },
+        sesame::{
+            secret,
+            types::{AgeKeyScope, SecurityState},
+        },
+    };
+    use std::{
+        collections::BTreeMap,
+        future::{Future, poll_fn},
+        sync::Arc,
+        task::Poll,
+    };
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-639-executor-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("admission and revocation fixture: {}", root.display());
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = RuncGrill::new(
+        root.join("bundles"),
+        images,
+        false,
+        root.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let capacity = Resources::new(110, 40 << 20, 0);
+    let budget = ExecutionBudget::new(capacity);
+    let mut template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+        "image='{image}'\nnamespace='rbtest-reuse'\nisolation='reusable-container'\ncpu='100m'\nmemory='32Mi'"
+    )).unwrap();
+    let node = TaskArrayNode::new(
+        TaskArrayNodeConfig::for_data_dir(&root, ProcessWorkloadsConfig::default()),
+        NodeRunner::Owned(Box::new(
+            OwnedRunner::for_data_dir(AnyGrill::Runc(runtime.clone()), &root).unwrap(),
+        )),
+    )
+    .with_budget(budget.clone());
+    let mut spec = TaskArraySpec::with_count(2);
+    spec.chunk_size = 1;
+    spec.max_attempts = 1;
+    let request = NodeSyncRequest {
+        version: ControlVersion {
+            index: 1,
+            ..Default::default()
+        },
+        known: vec![1],
+        arrays: vec![ArrayAssignment {
+            template: Some(Box::new(template.clone())),
+            resources: Resources::new(100, 32 << 20, 0),
+            batch_id: 1,
+            spec,
+            program: "/unused".into(),
+            args: vec!["/bin/true".into()],
+            env: vec![],
+            held: vec![HeldChunk {
+                chunk: ChunkId(0),
+                attempt: 1,
+            }],
+            stopping: false,
+            replay_unknown: true,
+        }],
+    };
+    let progress = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let progress = node.sync(&request).await.arrays.remove(0);
+            if !progress.finished.is_empty() {
+                break progress;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(progress.finished[0].succeeded, 1);
+    assert_eq!(
+        budget.available(),
+        Resources::default(),
+        "the warm helper owns the whole profile"
+    );
+    assert_eq!(
+        progress.slots, 1,
+        "zero unreserved resources must not strand compatible warm capacity"
+    );
+    let cancel_owner = CancellationToken::new();
+    let owner = budget.acquire(capacity, &cancel_owner);
+    tokio::pin!(owner);
+    poll_fn(|cx| {
+        assert!(owner.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(
+        node.sync(&request).await.arrays[0].slots,
+        0,
+        "warm capacity must yield to a queued owner"
+    );
+    let lease = tokio::time::timeout(Duration::from_secs(10), owner)
+        .await
+        .unwrap()
+        .unwrap();
+    for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        assert_eq!(
+            runtime.state(&launch.instance_id).await.unwrap(),
+            ContainerState::Stopped
+        );
+    }
+    drop(lease);
+    drop(node);
+    assert_eq!(budget.available(), capacity);
+
+    let network = InMemoryRaftRouter::new();
+    let council = Arc::new(
+        CouncilNode::new(
+            1,
+            CouncilConfig {
+                heartbeat_interval_ms: 50,
+                election_timeout_min_ms: 150,
+                election_timeout_max_ms: 400,
+                snapshot_threshold: 1000,
+                max_in_snapshot_log_to_keep: 500,
+            },
+            InMemoryRaftNetworkFactory::new(1, network.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    network.register(1, council.raft().clone()).await;
+    council
+        .initialize(BTreeMap::from([(
+            1,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "worker"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !council.is_leader().await {
+            tokio::time::sleep(Duration::from_millis(10)).await
+        }
+    })
+    .await
+    .unwrap();
+    let ikm = [42u8; 32];
+    let scope = AgeKeyScope::Namespace("rbtest-reuse".into());
+    let (keypair, _) = secret::generate_age_keypair(scope.clone(), &ikm, 0).unwrap();
+    let sealed = secret::encrypt_secret("proof-value", &keypair.public_key).unwrap();
+    council
+        .write(RaftRequest::SecurityStateInit(Box::new(SecurityState {
+            age_keypairs: vec![keypair],
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+    template.env.insert(
+        "TOKEN".into(),
+        reliaburger::config::types::EnvValue::Encrypted(sealed.clone()),
+    );
+    let runner = Arc::new(
+        OwnedRunner::for_data_dir(runtime.clone(), &root)
+            .unwrap()
+            .with_budget(budget.clone())
+            .with_secrets(council.clone(), ikm),
+    );
+    let mut task = TaskInvocation {
+        template: Some(Box::new(template.clone())),
+        index: 0,
+        attempt: 1,
+        program: "/unused".into(),
+        args: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "test \"$TOKEN\" = proof-value && sleep 60".into(),
+        ],
+        env: vec![
+            ("RELIABURGER_TASK_COUNT".into(), "2".into()),
+            ("RELIABURGER_BATCH_ID".into(), "42".into()),
+        ],
+    };
+    let active_cancel = CancellationToken::new();
+    let active = tokio::spawn({
+        let runner = runner.clone();
+        let cancel = active_cancel.clone();
+        let task = task.clone();
+        async move { runner.run(&task, Duration::from_secs(30), &cancel).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runner.active_commands(42, Some(&template)).await != Some(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await
+        }
+    })
+    .await
+    .unwrap();
+    task.index = 1;
+    task.args = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "test \"$TOKEN\" = proof-value && printf revoked-secret-launched".into(),
+    ];
+    let queued = tokio::spawn({
+        let runner = runner.clone();
+        async move {
+            runner
+                .run(&task, Duration::from_secs(20), &CancellationToken::new())
+                .await
+        }
+    });
+    // Leave the original, verified command running while the second caller
+    // decrypts and waits for the only profile that fits this node.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(!queued.is_finished());
+    let (replacement, _) = secret::generate_age_keypair(scope.clone(), &ikm, 1).unwrap();
+    council
+        .write(RaftRequest::RotateSecretKey {
+            scope: scope.clone(),
+            new_keypair: replacement,
+            resealed: vec![],
+        })
+        .await
+        .unwrap();
+    council
+        .write(RaftRequest::FinalizeSecretRotation { scope })
+        .await
+        .unwrap();
+    let identities =
+        secret::namespace_identities(&council.security_state().await, "rbtest-reuse", &ikm);
+    assert!(
+        identities
+            .iter()
+            .all(|identity| secret::decrypt_secret(&sealed, identity).is_err()),
+        "old ciphertext must really be revoked"
+    );
+    active_cancel.cancel();
+    assert_eq!(active.await.unwrap().outcome, AttemptOutcome::Cancelled);
+    let result = tokio::time::timeout(Duration::from_secs(20), queued)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result.outcome, AttemptOutcome::SpawnFailed { .. }),
+        "queued command used a revoked decryption snapshot: {result:?}"
+    );
+    assert_eq!(result.output.total_bytes, 0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while budget.available() != capacity {
+            tokio::time::sleep(Duration::from_millis(20)).await
+        }
+    })
+    .await
+    .unwrap();
+    council.shutdown().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

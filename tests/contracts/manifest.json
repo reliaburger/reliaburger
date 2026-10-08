@@ -8003,6 +8003,33 @@
       "boundaries": [
         "Run through the real Linux gate; protocol mocks do not prove cgroup or namespace isolation."
       ]
+    },
+    {
+      "id": "issue-639-runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
+      "issue": 639,
+      "promise": "Compatible warm capacity remains available with helper-inclusive reservations, yields to queued owners and refuses revoked queued credentials.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "reusable-runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A retired namespace key cannot authorise a queued command."
+      ],
+      "boundaries": [
+        "Real runtime and worker-ledger regression, not throughput or production Raft durability qualification."
+      ]
     }
   ]
 }

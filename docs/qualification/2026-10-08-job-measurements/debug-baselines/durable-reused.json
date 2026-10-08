@@ -1,0 +1,38 @@
+{
+  "path": "DurableReused",
+  "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+  "executable_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
+  "command": [
+    "/bin/busybox",
+    "true"
+  ],
+  "count": 1000,
+  "concurrency": 27,
+  "image_preparation_seconds_excluded": 0.297169289,
+  "warmth": "warm-images-cold-executors",
+  "elapsed_seconds": 9.544132387,
+  "verified_successes": 1000,
+  "failures": 0,
+  "retries": 0,
+  "verified_successes_per_second": 104.77641753608673,
+  "cpu_request_millicores": 100,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "node_job_budget_cpu_millicores": 3000,
+  "service_probe_latency_ms": [
+    0.5467510000000001,
+    1.793339,
+    1.552171,
+    2.0455069999999997,
+    1.417962,
+    1.67188,
+    0.665918,
+    0.8226699999999999,
+    0.865544,
+    0.6532519999999999
+  ],
+  "durability": "worker grant fence, per-task ledger/index, verified chunk receipts; no Raft admission",
+  "optimised_build": false,
+  "namespace_policy_hook": "not injected in direct runner; full Bun dispatch includes live namespace supervision",
+  "qualified_100m_per_day": false
+}

@@ -1,0 +1,14 @@
+name = "release-reused-50000"
+namespace = "default"
+[[cohort]]
+name = "commands"
+count = 50000
+chunk_size = 1000
+max_attempts = 1
+per_node_concurrency = 27
+[cohort.template]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+isolation = "reusable-container"
+cpu = "100m-1000m"
+memory = "32Mi"

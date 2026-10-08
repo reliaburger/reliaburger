@@ -8,6 +8,7 @@ import pathlib
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -43,6 +44,12 @@ class ExecutorProtocol(unittest.TestCase):
         subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
                         '-DRB_EXECUTOR_HOST_FIXTURE', str(ROOT / 'src/bun/reusable_executor/helper.c'),
                         '-o', str(cls.binary)], check=True, capture_output=True)
+        if sys.platform == 'darwin':
+            # macOS checks a newly written executable before its first launch.
+            # Keep that cold-file check outside the socket receipt deadline.
+            warm = subprocess.run([str(cls.binary)], capture_output=True, timeout=30)
+            if warm.returncode != 125:
+                raise RuntimeError(f'helper argument refusal failed: {warm.returncode}, {warm.stderr!r}')
 
     @classmethod
     def tearDownClass(cls):
@@ -59,7 +66,14 @@ class ExecutorProtocol(unittest.TestCase):
         self.listener.settimeout(2)
         self.process = subprocess.Popen([str(self.binary), self.path], stderr=subprocess.PIPE)
         self.addCleanup(self.stop_process)
-        self.connection, _ = self.listener.accept()
+        try:
+            self.connection, _ = self.listener.accept()
+        except socket.timeout as error:
+            status = self.process.poll()
+            if status is not None:
+                detail = self.process.stderr.read().decode(errors='replace')
+                raise RuntimeError(f'helper exited before handshake: {status}, {detail}') from error
+            raise RuntimeError(f'helper {self.process.pid} did not connect within the receipt deadline') from error
         self.addCleanup(self.connection.close)
         self.connection.settimeout(2)
         self.assertEqual(exact(self.connection, 8), b'RBEX0001')

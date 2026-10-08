@@ -293,7 +293,10 @@ migration and no feature gate
   singleton jobs, arrays, cron and deployment hooks share durable runs, resource
   admission and accepted outcomes ([plan](plans/2026-10-07-plan-common-job-lifecycle.md),
   [qualification](qualification/2026-10-07-common-jobs/README.md)). This tick
-  records implementation; 0.2.0 isn't released. Reusable executors
+  records implementation; 0.2.0 isn't released. [#654](https://github.com/reliaburger/reliaburger/pull/654)
+  adds bounded reusable executors and a measured 50,000-container-job demonstration
+  ([raw results](qualification/2026-10-08-job-measurements/README.md)); it doesn't
+  qualify the daily target. Reusable executors
   [#639](https://github.com/reliaburger/reliaburger/issues/639), throughput
   qualification and the high-volume demo
   [#640](https://github.com/reliaburger/reliaburger/issues/640), and resident model

@@ -59,21 +59,39 @@ not claim the container backend's resource or isolation capabilities.
 
 ## Current evidence and remaining work
 
-The local implementation and regression fixes are in the draft snapshot. The
-common real Linux API case accepts 1,000 reused-container commands without
-retries. The real Linux resource/cleanup case proves an OOM kill followed by
-successful reuse and all eight queued short commands succeeding on one attempt.
-Those fixtures prove correctness, not the throughput target. The kernel cleanup
-bug, upstream fix and workaround are explained in Chapter 12.
+The bounded executor and mixed-runtime implementation is complete locally.
+Admission fairness, helper-inclusive advertised capacity, compatible warm slots
+and queued credential revocation have failing-then-passing regressions. Real
+Linux tests prove scratch/child-tree cleanup, actual OOM evidence and subsequent
+reuse, timeout, cancellation and one-attempt queueing. Chapter 12 documents the
+kernel cleanup bug and the startup/source-authority and inventory fixes found
+by public runtime experiments.
 
-Admission fairness, advertised helper/warm capacity and queued credential
-revocation still need correction and regression coverage before #639 is complete.
-Existing fake-runner cluster tests exercise real coordination but do not replace
-combined reusable-container runtime/cluster evidence. Historical namespace
-metadata growth needs measured bounds and retirement-authorised collection;
-a live pool bound alone is insufficient. Final full gates remain required.
+Persistent single-node SIGKILL recovery accepted all 96 commands across two
+resource profiles, preserved the application's original PID and refused stale
+TLS control. A three-VM worker-loss experiment accepted all 384 mixed-profile
+commands beside the original application. The returned worker positively
+retired its five old-boot executor owners before clearing delegated bindings.
+Raw evidence and reproduction commands are checked into the qualification
+record. Final portable CI and the complete 159-case Linux runtime gate passed.
+Earlier matching rootless, cluster and upgrade gates passed; final pushed
+GitHub CI remains required.
 
-The four-path comparison, headline landing-page recording and sustained
-qualification have not been delivered. #640 remains open and unqualified. See
-[development evidence](../qualification/2026-10-07-reusable-job-executors.md)
-for the actual environment, test results, failures and measurement limits.
+Matched debug and optimised execution paths now have actual measurements;
+fresh paths expose startup failures and are retained as failed evidence.
+The longer optimised process floor launched 100,000 commands successfully.
+Full public retained-container dispatch accepted 50,000 successes without
+failures or retries in 100.73 seconds on one four-vCPU, 8 GiB VM. The recording
+uses achieved completion, not an extrapolated target. The recording and raw
+evidence are published in this PR.
+
+The proposed 500,000/minute or million/two-minute recording and the sustained
+100m/day qualification remain unmet. #640 stays open: measure and reduce runtime
+startup/cleanup and durability costs, establish 24-hour headroom, and cover
+concurrent applications, delayed messages and disk faults. Historical namespace
+metadata needs measured bounds and collection authorised by original retirement
+receipts; a bounded live pool does not bound all retired journals. Resident AI
+model workers remain #641, and GPU support remains #359.
+
+See [development evidence](../qualification/2026-10-07-reusable-job-executors.md)
+for actual hardware, raw reports, failures and the limits of each comparison.

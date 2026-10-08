@@ -1038,7 +1038,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         AnyGrill::Mixed(runtime) if runtime.container().is_rootless() => {
             if cli.cluster {
                 anyhow::bail!(
-                    "rootless runc clusters are unsupported; use rootful Linux runc with eBPF for a container cluster"
+                    "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
+                     or use rootful Linux Runc with eBPF for a container cluster \
+                     (relish setup --quickstart provisions a managed Linux VM on macOS)"
                 );
             }
             (true, false)
@@ -3553,7 +3555,7 @@ fn create_runc_runtime(
 async fn runtime_version(runtime: &str) -> Option<String> {
     match runtime {
         "process" => Some(env!("CARGO_PKG_VERSION").to_string()),
-        "runc" => bounded_version_command("runc", &["--version"]).await,
+        "runc" | "runc+process" => bounded_version_command("runc", &["--version"]).await,
         "apple" => bounded_version_command("container", &["--version"]).await,
         _ => None,
     }

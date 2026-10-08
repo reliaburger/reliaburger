@@ -53,7 +53,7 @@ pub struct StaticCapabilities {
     /// Descriptive `[cluster] environment` metadata. Safety decisions use
     /// `test_policy`, never this free-form string.
     pub environment: Option<String>,
-    /// `"process"`, `"runc"` or `"apple"`.
+    /// `"process"`, `"runc"`, `"runc+process"` or `"apple"`.
     pub container_runtime: String,
     /// Runtime version reported by the selected implementation.
     pub runtime_version: Option<String>,
@@ -493,7 +493,9 @@ impl ClusterCapabilities {
             (Capability::RuntimeApple, "apple"),
             (Capability::RuntimeProcessGrill, "process"),
         ] {
-            let selected = self.container_runtime == runtime;
+            let selected = self.container_runtime == runtime
+                || self.container_runtime == "runc+process"
+                    && matches!(runtime, "runc" | "process");
             let usable = if runtime == "process" {
                 selected && statics.process_workloads
             } else {
@@ -508,11 +510,15 @@ impl ClusterCapabilities {
         add(
             Capability::ProcessRuntime,
             known(self.container_runtime == "process" && statics.process_workloads),
-            "ProcessGrill selected with an executable allowlist".to_string(),
+            "legacy process catalogue needs dedicated ProcessGrill with an executable allowlist"
+                .to_string(),
         );
         add(
             Capability::ContainerRuntime,
-            known(matches!(self.container_runtime.as_str(), "runc" | "apple")),
+            known(matches!(
+                self.container_runtime.as_str(),
+                "runc" | "runc+process" | "apple"
+            )),
             format!("selected runtime is {}", self.container_runtime),
         );
         add(
@@ -857,7 +863,9 @@ pub enum Capability {
     /// The node runs the `process` runtime (ProcessGrill), so the `testapp`
     /// workload can be launched directly from the installed `bun` binary
     /// without a container image. Cases built on `testapp_spec` need this;
-    /// they skip on a runc/apple cluster.
+    /// they skip on runc/apple and mixed nodes: the placeholder image does not
+    /// select a host backend. Explicit host exec/script support is reported by
+    /// `ProcessWorkloads` and `RuntimeProcessGrill`.
     ProcessRuntime,
     /// The node runs a *container* runtime (runc/apple), so cases that need a
     /// real container — mount namespaces for volumes, eBPF for firewall
@@ -920,6 +928,40 @@ mod tests {
         StaticCapabilities {
             container_runtime: "process".to_string(),
             ..StaticCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn mixed_nodes_report_container_and_allowlisted_host_backends() {
+        for allowed in [false, true] {
+            let report = ClusterCapabilities::derive(
+                &StaticCapabilities {
+                    container_runtime: "runc+process".into(),
+                    process_workloads: allowed,
+                    ..StaticCapabilities::default()
+                },
+                &WiredSubsystems::default(),
+            );
+            for capability in [Capability::ContainerRuntime, Capability::RuntimeRunc] {
+                assert_eq!(report.state(capability), CapabilityState::Available);
+            }
+            assert_eq!(
+                report.state(Capability::RuntimeApple),
+                CapabilityState::Unavailable
+            );
+            let host = if allowed {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            };
+            assert_eq!(report.state(Capability::RuntimeProcessGrill), host);
+            assert_eq!(report.state(Capability::ProcessWorkloads), host);
+            // Legacy testapp image placeholders are process-only; mixed nodes
+            // require explicit exec/script rather than an image fallback.
+            assert_eq!(
+                report.state(Capability::ProcessRuntime),
+                CapabilityState::Unavailable
+            );
         }
     }
 

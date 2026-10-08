@@ -15,6 +15,7 @@
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
+        <a href="#job-throughput">Jobs</a>
         <a href="#install">Install</a>
         <a href="#tour">Try it</a>
         <a href="#start">Build it</a>
@@ -51,6 +52,45 @@
           </video>
           <img class="burger burger-still" src="./assets/burger-still.webp" alt="" width="720" height="892">
         </figure>
+      </section>
+
+      <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
+        <div class="section-head">
+          <h2 id="job-throughput-title">50,000 container jobs. One submission.
+            <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
+        </div>
+        <p>Short jobs use the same scheduling and durable outcomes as ordinary jobs.
+          Opt into retained containers to amortise setup: each command gets its own
+          process, resource limits and clean scratch space. Requests still decide
+          what fits beside your applications.</p>
+        <p>Measured on one Linux VM: 100,000 bare processes in 6.27 seconds;
+          50,000 accepted container successes in 100.73 seconds (496.4/s)
+          through the public CLI. Bare processes have fewer isolation and durability
+          guarantees; the whole difference is not scheduler overhead.</p>
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:25">
+          <div class="recording-screen"></div>
+          <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
+            <a href="./assets/job-throughput.cast">Download the recording</a> and play it
+            with <code>asciinema play job-throughput.cast</code>.</p></noscript>
+          <figcaption>
+            <span>Optimised 0.2.0 development binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
+              aarch64. Pinned BusyBox commands, warm images and cold executors;
+              100m / 32 MiB requests, concurrency 27. Zero failures or retries;
+              the concurrent application kept returning HTTP 200. Actual pauses
+              are preserved. Activity reflects the last worker report; recent rates include chunk-report bursts.
+              This run does not establish 24-hour throughput or 100 million jobs/day.</span>
+            <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
+              <button type="button" data-speed="1" aria-pressed="true">1×</button>
+              <button type="button" data-speed="2" aria-pressed="false">2×</button>
+              <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
+          </figcaption>
+        </figure>
+        <p><a href="./assets/job-throughput-report.json">Measured report</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-08-job-measurements">Raw results and reproduction</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
+        <p>Use indexed inputs for data preparation, offline evaluation and independent
+          inference commands. Container reuse still starts a process for every job;
+          keeping an AI model resident is a separate planned executor.</p>
       </section>
 
       <section id="install" class="section install" aria-labelledby="install-title">

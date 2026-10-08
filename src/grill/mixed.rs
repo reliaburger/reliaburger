@@ -444,35 +444,57 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
                 "host inventory is unavailable",
             )
         })?;
+        // A matching inventory entry is observation, not a lifecycle mutation.
+        // Holding its claim would queue detached readers behind create/cleanup
+        // when the caller's snapshot deadline expires. Atomic route files and
+        // backend generation receipts remain authoritative; actual mutations
+        // still revalidate under the exclusive claim.
+        let launches: Vec<_> = container
+            .into_iter()
+            .map(|launch| (false, launch))
+            .chain(host.into_iter().map(|launch| (true, launch)))
+            .collect();
+        let this = self.clone();
+        let snapshots = tokio::task::spawn_blocking(move || {
+            launches
+                .into_iter()
+                .map(|(is_host, launch)| {
+                    let route = this.selected(&launch.instance_id)?;
+                    Ok((is_host, launch, route))
+                })
+                .collect::<Result<Vec<_>, GrillError>>()
+        })
+        .await
+        .map_err(|error| Self::error(&InstanceId("inventory".into()), error))??;
         let mut result = Vec::new();
-        for (is_host, launches) in [(false, container), (true, host)] {
-            for launch in launches {
-                let id = launch.instance_id.clone();
-                let selected = self
-                    .operation(&id, move |this, id| async move {
-                        let route = this.selected(&id)?;
-                        if (route.runtime == RuntimeKind::Process) != is_host {
-                            this.prove_retired(&id, is_host, false).await?;
-                            return Ok(None);
-                        }
-                        if launch.spec.host_process != is_host
-                            || launch
-                                .network_reference
-                                .as_ref()
-                                .is_some_and(|r| matches!(r, NetworkReferenceState::Held(_)))
-                                && is_host
-                        {
-                            return Err(Self::error(
-                                &id,
-                                "runtime launch conflicts with its selected backend",
-                            ));
-                        }
-                        Ok(Some(launch))
+        for (is_host, launch, route) in snapshots {
+            let id = launch.instance_id.clone();
+            let selected = if (route.runtime == RuntimeKind::Process) != is_host {
+                // An old backend may still retain positive retirement metadata.
+                // Omitting it needs the same original-owner proof as replacement.
+                self.operation(&id, move |this, id| async move {
+                    if (this.selected(&id)?.runtime == RuntimeKind::Process) == is_host {
+                        return Ok(Some(launch));
+                    }
+                    this.prove_retired(&id, is_host, false).await?;
+                    Ok(None)
+                })
+                .await?
+            } else {
+                Some(launch)
+            };
+            if let Some(launch) = selected {
+                if launch.spec.host_process != is_host
+                    || launch.network_reference.as_ref().is_some_and(|reference| {
+                        matches!(reference, NetworkReferenceState::Held(_)) && is_host
                     })
-                    .await?;
-                if let Some(launch) = selected {
-                    result.push(launch);
+                {
+                    return Err(Self::error(
+                        &id,
+                        "runtime launch conflicts with its selected backend",
+                    ));
                 }
+                result.push(launch);
             }
         }
         Ok(Some(result))
@@ -578,6 +600,51 @@ mod tests {
         result.host_process = host;
         result
     }
+    #[tokio::test]
+    async fn inventory_reads_do_not_wait_for_a_running_lifecycle_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let id = InstanceId("default__worker-0".into());
+        runtime.create(&id, &spec(false)).await.unwrap();
+        runtime
+            .container
+            .set_launch_inventory(vec![RuntimeLaunch {
+                generation: super::super::RuntimeGeneration::try_from("a".repeat(64)).unwrap(),
+                instance_id: id.clone(),
+                spec: spec(false),
+                network_reference: None,
+            }])
+            .await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = tokio::spawn({
+            let runtime = runtime.clone();
+            let id = id.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                runtime
+                    .operation(&id, move |_, _| async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+        let snapshot =
+            tokio::time::timeout(Duration::from_millis(200), runtime.launch_inventory()).await;
+        release.notify_one();
+        held.await.unwrap().unwrap();
+        let snapshot = snapshot
+            .expect("read-only inventory waited for runtime mutation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].instance_id, id);
+    }
+
     #[tokio::test]
     async fn missing_route_cannot_replace_an_original_backend_owner() {
         for (original, replacement) in [(false, true), (true, false), (false, false), (true, true)]

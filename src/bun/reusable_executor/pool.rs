@@ -15,6 +15,13 @@ use tokio_util::sync::CancellationToken;
 
 const HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rb-executor-helper"));
 const IDLE: Duration = Duration::from_secs(1);
+pub(crate) struct CommandReporting<'a> {
+    pub sink: Option<&'a tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
+    pub singletons: &'a std::sync::Mutex<
+        std::collections::BTreeMap<u64, Arc<crate::bun::task_runtime::SingletonRuntime>>,
+    >,
+}
+
 struct Slot {
     busy: bool,
     active_run: Option<u64>,
@@ -62,7 +69,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             prefix,
             budget,
             slots: Mutex::new(
-                (0..count.clamp(1, 32))
+                (0..count.clamp(1, super::MAX_EXECUTOR_SLOTS))
                     .map(|_| Slot {
                         busy: false,
                         active_run: None,
@@ -125,6 +132,33 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .filter(|slot| slot.active_run == Some(run))
             .count() as u64
     }
+    pub(crate) async fn available_slots(
+        &self,
+        key: Option<ExecutorKey>,
+        reservation: crate::meat::Resources,
+    ) -> u32 {
+        let slots = self.slots.lock().await;
+        if self.budget.has_waiters() {
+            return 0;
+        }
+        let idle = slots.iter().filter(|slot| !slot.busy).count();
+        let warm = slots
+            .iter()
+            .filter(|slot| {
+                !slot.busy
+                    && key.is_some_and(|key| {
+                        slot.context
+                            .as_ref()
+                            .is_some_and(|context| context.key == key)
+                    })
+            })
+            .count();
+        let available = self.budget.available();
+        let cold = (available.cpu_millicores / reservation.cpu_millicores)
+            .min(available.memory_bytes / reservation.memory_bytes)
+            .min((idle - warm) as u64);
+        (warm as u64 + cold) as u32
+    }
     async fn slot(
         &self,
         key: ExecutorKey,
@@ -157,7 +191,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 // context is already charged or preparing, wait for it rather
                 // than enqueueing a self-inflicted budget waiter that evicts it.
                 let lease = if slots[index].context.is_none() {
-                    match self.budget.try_acquire(reservation) {
+                    match self.budget.try_acquire_executor(reservation) {
                         Some(lease) => Some(lease),
                         None if slots.iter().any(|slot| slot.busy && slot.key == Some(key)) => {
                             drop(slots);
@@ -376,17 +410,19 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         context.connection = Some(UnixStream::from_std(native)?);
         Ok(())
     }
-    pub(crate) async fn run(
+    pub(crate) async fn run<F>(
         &self,
         task: &TaskInvocation,
         mut template: JobSpec,
         timeout: Duration,
         cancel: &CancellationToken,
-        sink: Option<&tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
-        singletons: &std::sync::Mutex<
-            std::collections::BTreeMap<u64, Arc<crate::bun::task_runtime::SingletonRuntime>>,
-        >,
-    ) -> Attempt {
+        refresh: Option<impl Fn() -> F + Send + Sync>,
+        reporting: CommandReporting<'_>,
+    ) -> Attempt
+    where
+        F: std::future::Future<Output = Result<JobSpec, String>> + Send,
+    {
+        let CommandReporting { sink, singletons } = reporting;
         let failed = |error: ExecutorError| Attempt {
             outcome: AttemptOutcome::SpawnFailed {
                 reason: error.to_string(),
@@ -486,6 +522,19 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             self.release(index, None).await;
             return failed(ExecutorError::Configuration("missing executor context"));
         };
+        if let Some(refresh) = refresh {
+            let refreshed = refresh().await.ok().filter(|template| {
+                ExecutorKey::new(template).is_ok_and(|live| live == context.key)
+            });
+            let Some(refreshed) = refreshed else {
+                self.retire(&mut context).await;
+                self.release(index, None).await;
+                return failed(ExecutorError::Configuration(
+                    "namespace credentials no longer authorise this command",
+                ));
+            };
+            template = refreshed;
+        }
         let mut output = CapturedOutput::default();
         template.command = Some(task.args.clone());
         for (key, value) in &task.env {

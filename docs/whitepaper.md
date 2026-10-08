@@ -1124,6 +1124,13 @@ avoids container setup, but currently cannot enforce hard CPU/memory limits.
 Neither path removes process creation, durable outcomes or external-effect
 idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
 
+The initial optimised development measurement accepted 50,000 container-command
+successes in 100.73 seconds on one four-vCPU, 8 GiB Linux VM, without retries or
+failures. The [raw comparison and recovery evidence](qualification/2026-10-08-job-measurements/README.md)
+includes failed fresh-container starts and incomplete whole-directory storage
+observations. This is a measured implementation result, not 100m/day qualification;
+scaling, sustained headroom and safe historical metadata collection remain work.
+
 ### AI workloads: resident models and coordinated training
 
 Preparing a million dataset records, running a hundred training experiments
