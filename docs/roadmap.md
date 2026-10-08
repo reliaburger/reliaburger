@@ -315,13 +315,18 @@ migration and no feature gate
   ten Dell Wyse 3040s from power-on to a cluster.
   Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
   which waits for 0.1.6.
-- [ ] **0.4.0: "Full container migration"**
+- [ ] **0.4.0 and 0.4.1: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
-  [#268](https://github.com/reliaburger/reliaburger/pull/268)). Drain and
-  uncordon, cold moves that carry volumes, CRIU checkpoint and restore,
-  pre-dump iterations, lazy pages and TCP handoff, for apps and jobs. Also
-  managed-volume retirement and the Apple runtime (F10,
-  [#367](https://github.com/reliaburger/reliaburger/issues/367)).
+  [plan](plans/2026-10-09-plan-container-migration.md),
+  [#268](https://github.com/reliaburger/reliaburger/pull/268)). 0.4.0 is planned
+  maintenance: cordon, drain and uncordon, cold moves that carry volumes, and
+  checkpoint moves that keep memory while connections reconnect, with a Redis
+  demo. 0.4.1 is maintenance without downtime: moves across appliance builds,
+  and 0.3.0's A/B OS updates draining and rebooting each node in turn. Moves join
+  the V02 soak's fault kinds rather than getting a soak of their own.
+  Managed-volume retirement and the Apple runtime (F10,
+  [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.x,
+  outside the migration plan.
 - [ ] **After 0.4.0: book v2 and the full CLI tour.** Book v2: a distilled
   rewrite alongside v1; v1 keeps collecting until then. The rewrite reads
   properly from beginning to end: it cuts the fluff, keeps the design
@@ -332,6 +337,13 @@ migration and no feature gate
   exercises every `relish` command) and a searchable command reference on the
   landing page that ctrl-F can find, generated from the CLI
   ([#315](https://github.com/reliaburger/reliaburger/issues/315)).
+- [ ] **0.5.0: "Live moves"**
+  ([plan](plans/2026-10-09-plan-container-migration.md#050-live-moves)). Moves
+  that keep established connections within a stated pause: workload-owned
+  addresses, live TCP handoff, pre-copy, and PostgreSQL keeping an open
+  transaction across a move with the source switched off afterwards. It happens
+  only if the network-ownership spike (S11) passes; otherwise it comes off this
+  page.
 - [ ] **Later**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/9)). The
   fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265));
