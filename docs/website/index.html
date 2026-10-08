@@ -192,13 +192,13 @@
                   backend that cooked it, found by its service name.</p>
               </li>
               <li>
-                <p><strong>Development preview (0.2.0 / PR #266):</strong> queue
-                  1,000 small and 64 larger jobs beside the burger service.</p>
                 <pre><code data-tour>relish --output json batch submit burger/jobs.toml</code>
 <code data-tour>relish batch watch 1</code>
 <code data-tour>relish batch results 2 --failed --limit 20</code>
 <code data-tour>relish manual batch</code></pre>
-                <p>Use the returned manifest ID instead of <code>1</code> and the
+                <p><strong>Development preview (0.2.0 / PR #266):</strong> queue
+                  1,000 small and 64 larger jobs beside the burger service.
+                  Use the returned manifest ID instead of <code>1</code> and the
                   small profile’s child ID instead of <code>2</code>. CPU and memory
                   requests decide what fits; chunk size decides how much is queued.
                   Watch rates, backlog and duration distributions, then inspect a
