@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:9117")]
     listen: String,
 
-    /// Runtime to use: auto, process, runc (Linux).
+    /// Runtime to use: auto, process, runc or mixed (Linux).
     #[arg(long, default_value = "auto")]
     runtime: String,
 
@@ -2705,7 +2705,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .is_some(),
         // Host execution is deny-by-default: an empty allowlist refuses
         // every process workload.
-        process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
+        process_workloads: host_workloads_enabled(runtime_kind, &config.process_workloads),
         // CPU/memory/disk faults need writable cgroup v2 control files.
         cgroup_faults: {
             #[cfg(target_os = "linux")]
@@ -3515,17 +3515,20 @@ async fn select_runtime(
             )))
         }
         #[cfg(target_os = "linux")]
-        "runc" => {
+        "runc" | "mixed" => {
             let is_rootless = reliaburger::grill::rootless::is_rootless();
             let mode = if is_rootless { "rootless" } else { "root" };
-            println!("bun: using runc runtime ({mode})");
-
+            println!("bun: using {name} runtime ({mode})");
             let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
-            Ok(AnyGrill::with_host_processes(
-                grill,
-                instances_dir,
-                std::env::current_exe()?,
-            ))
+            if name == "mixed" {
+                Ok(AnyGrill::with_host_processes(
+                    grill,
+                    instances_dir,
+                    std::env::current_exe()?,
+                ))
+            } else {
+                Ok(AnyGrill::Runc(grill))
+            }
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
         other => anyhow::bail!("unknown runtime: {other}"),
@@ -3550,6 +3553,13 @@ fn create_runc_runtime(
         runtime_directory.join("state"),
         std::env::current_exe()?,
     )?)
+}
+
+fn host_workloads_enabled(
+    runtime: &str,
+    policy: &reliaburger::config::process_workloads::ProcessWorkloadsConfig,
+) -> bool {
+    matches!(runtime, "process" | "runc+process") && !policy.allowed_binaries.is_empty()
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -3763,6 +3773,36 @@ mod tests {
         assert!(message.contains("0.1.0"), "{message}");
         assert!(message.contains("managed Linux VM"), "{message}");
         assert!(message.contains("relish setup --quickstart"), "{message}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn explicit_runc_disables_host_execution_and_mixed_enables_both() {
+        use reliaburger::grill::{Grill, records::RuntimeKind};
+        let root = tempfile::tempdir().unwrap();
+        for (mode, host) in [("runc", false), ("mixed", true)] {
+            let runtime = select_runtime(
+                mode,
+                &root.path().join(mode),
+                &root.path().join("images"),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                runtime.supports_runtime(RuntimeKind::Process),
+                host,
+                "{mode}"
+            );
+            assert!(runtime.supports_runtime(RuntimeKind::Runc));
+            let policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/true".into()],
+                ..Default::default()
+            };
+            let name = if host { "runc+process" } else { "runc" };
+            assert_eq!(host_workloads_enabled(name, &policy), host);
+            assert!(!host_workloads_enabled(name, &Default::default()));
+        }
     }
 
     #[cfg(target_os = "linux")]

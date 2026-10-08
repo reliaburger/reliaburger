@@ -101,10 +101,10 @@ pub fn export_kubernetes(config: &Config) -> Result<ExportResult, RelishError> {
     }
 
     for (name, job) in &config.job {
-        if job.isolation == crate::config::job::ContainerIsolation::ReusableContainer {
+        if job.runtime == crate::config::job::JobRuntime::SharedRunc {
             return Err(RelishError::UnsupportedExport {
                 reason: format!(
-                    "job {name} selects reusable-container; a Kubernetes Job or CronJob cannot express that execution contract"
+                    "job {name} selects shared-runc; a Kubernetes Job or CronJob cannot express that execution contract"
                 ),
             });
         }
@@ -830,13 +830,12 @@ mod tests {
 
     #[test]
     fn export_refuses_to_silently_replace_reusable_commands_with_fresh_pods() {
-        let config =
-            parse_config("[job.worker]\nimage='fixture:v1'\nisolation='reusable-container'");
+        let config = parse_config("[job.worker]\nimage='fixture:v1'\nruntime='shared-runc'");
         assert!(
             export_kubernetes(&config)
                 .unwrap_err()
                 .to_string()
-                .contains("reusable-container")
+                .contains("shared-runc")
         );
     }
 

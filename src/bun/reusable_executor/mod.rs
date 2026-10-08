@@ -30,7 +30,7 @@ pub(crate) struct ExecutorProfile {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExecutorError {
-    #[error("reusable-container refused: {0}")]
+    #[error("shared-runc refused: {0}")]
     Configuration(&'static str),
     #[cfg(any(target_os = "linux", test))]
     #[error("cannot encode executor configuration: {0}")]
@@ -51,9 +51,7 @@ impl ExecutorKey {
     pub(crate) fn new(template: &JobSpec) -> Result<Self, ExecutorError> {
         use sha2::{Digest, Sha256};
         if template.exec.is_some() || template.script.is_some() {
-            return Err(ExecutorError::Configuration(
-                "reusable-container is image-only",
-            ));
+            return Err(ExecutorError::Configuration("shared-runc is image-only"));
         }
         let image = template
             .image
@@ -197,7 +195,7 @@ impl CommandLogStream {
 mod tests {
     use super::*;
     fn template() -> JobSpec {
-        toml::from_str("image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nisolation='reusable-container'\ncpu='100m-1000m'\nmemory='32Mi-64Mi'\n[env]\nTOKEN='first'").unwrap()
+        toml::from_str("image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m-1000m'\nmemory='32Mi-64Mi'\n[env]\nTOKEN='first'").unwrap()
     }
     #[test]
     fn compatible_commands_share_a_slot_but_trust_and_profiles_do_not() {

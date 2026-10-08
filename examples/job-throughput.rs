@@ -103,13 +103,9 @@ mod linux {
             ExecutionPath::DurableFresh | ExecutionPath::DurableReused
         );
         let template: JobSpec = toml::from_str(&format!(
-            "image='{}'\nnamespace='default'\nisolation='{}'\ncpu='100m-1000m'\nmemory='32Mi'",
+            "image='{}'\nnamespace='default'\nruntime='{}'\ncpu='100m-1000m'\nmemory='32Mi'",
             options.image,
-            if reused {
-                "reusable-container"
-            } else {
-                "fresh-container"
-            }
+            if reused { "shared-runc" } else { "runc" }
         ))?;
         let runner = Arc::new(
             OwnedRunner::for_data_dir(AnyGrill::Runc(runtime.clone()), &options.root)?

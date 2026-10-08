@@ -198,7 +198,7 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
         ))
         .json(&json!({
             "name": "survivor",
-            "template": { "exec": BINARY, "command": ["{index}"] },
+            "template": { "runtime":"process","exec": BINARY, "command": ["{index}"] },
             "spec": { "count": TASKS },
         }))
         .send()
@@ -288,8 +288,8 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     // Mixed resource profiles follow the same follower-to-leader admission path.
     let mixed = http.post(format!("http://127.0.0.1:{}/v1/batch/manifest", nodes[follower].api_port))
         .json(&json!({"name":"mixed-survivor","namespace":"default","cohort":[
-            {"name":"small","count":20,"template":{"exec":BINARY,"command":["{index}"],"cpu":"100m","memory":"32Mi"}},
-            {"name":"large","count":12,"template":{"exec":BINARY,"command":["{index}"],"cpu":"1000m","memory":"64Mi"}}
+            {"name":"small","count":20,"template":{"runtime":"process","exec":BINARY,"command":["{index}"],"cpu":"100m","memory":"32Mi"}},
+            {"name":"large","count":12,"template":{"runtime":"process","exec":BINARY,"command":["{index}"],"cpu":"1000m","memory":"64Mi"}}
         ]})).send().await.unwrap();
     assert_eq!(mixed.status(), 202);
     let mixed_id = mixed.json::<Value>().await.unwrap()["batch_id"]
@@ -442,7 +442,7 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
         u8::from(next.month())
     );
     let response = http.post(format!("http://127.0.0.1:{}/v1/jobs/runs", nodes[follower].api_port)).bearer_auth(&token)
-        .json(&json!({"name":"scheduled-singleton","definition":{"template":{"exec":BINARY},"cron":{"expression":expression}}})).send().await.unwrap();
+        .json(&json!({"name":"scheduled-singleton","definition":{"template":{"runtime":"process","exec":BINARY},"cron":{"expression":expression}}})).send().await.unwrap();
     assert_eq!(response.status(), 202);
     let mut id = None;
     wait_until(
@@ -568,7 +568,7 @@ async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another
     let follower = (leader + 1) % 3;
     let http = reqwest::Client::new();
     let response = http.post(format!("http://127.0.0.1:{}/v1/jobs/runs", nodes[follower].api_port)).bearer_auth(&token)
-        .json(&json!({"name":"side-effects","request_id":"first","definition":{"template":{"exec":BINARY},"tasks":{"max_attempts":1},"replay_unknown":false}})).send().await.unwrap();
+        .json(&json!({"name":"side-effects","request_id":"first","definition":{"template":{"runtime":"process","exec":BINARY},"tasks":{"max_attempts":1},"replay_unknown":false}})).send().await.unwrap();
     assert_eq!(response.status(), 202);
     let id = response.json::<Value>().await.unwrap()["batch_id"]
         .as_u64()

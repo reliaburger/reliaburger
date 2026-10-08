@@ -137,7 +137,7 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root, runc, eBPF, pinned test image, ip and nft; run with make test-linux"]
 async fn runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner() {
-    for isolation in ["fresh-container", "reusable-container"] {
+    for isolation in ["runc", "shared-runc"] {
         delegated_namespace_isolation_and_policy_loss(isolation).await;
     }
 }
@@ -246,7 +246,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     let invocation = |command| TaskInvocation {
         template: Some(Box::new(
             toml::from_str(&format!(
-                "image='{image}'\nnamespace='{namespace}'\nisolation='{isolation}'"
+                "image='{image}'\nnamespace='{namespace}'\nruntime='{isolation}'"
             ))
             .unwrap(),
         )),
@@ -618,12 +618,12 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
     for (name, template, count) in [
         (
             "host-job",
-            json!({"exec":"/usr/bin/printf","command":["host:%s", "{index}"]}),
+            json!({"runtime":"process","exec":"/usr/bin/printf","command":["host:%s", "{index}"]}),
             1,
         ),
         (
             "reused-jobs",
-            json!({"image":image,"isolation":"reusable-container","cpu":"100m","memory":"32Mi","command":["/bin/sh","-c","test ! -e /tmp/previous && echo state >/tmp/previous && test \"$1\" -ge 0","task","{index}"]}),
+            json!({"image":image,"runtime":"shared-runc","cpu":"100m","memory":"32Mi","command":["/bin/sh","-c","test ! -e /tmp/previous && echo state >/tmp/previous && test \"$1\" -ge 0","task","{index}"]}),
             1000,
         ),
     ] {
@@ -649,7 +649,7 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
                     assert_eq!(summary["retried"], 0, "{summary}");
                     assert_eq!(summary["active_commands"], 0, "{summary}");
                     if count > 1 {
-                        assert_eq!(summary["isolation"], "reusable-container");
+                        assert_eq!(summary["runtime"], "shared-runc");
                     }
                     eprintln!(
                         "real common API {name}: {count} unique accepted successes in {:.3}s",
@@ -771,7 +771,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     let prefix = std::fs::read_to_string(root.as_path().join("batch-executor-id")).unwrap();
     let id =
         InstanceIdentity::new("rbtest-reuse", format!("executor-{prefix}-reuse"), 0).instance_id();
-    let template: reliaburger::config::job::JobSpec = toml::from_str(&format!("image='{image}'\nnamespace='rbtest-reuse'\nisolation='reusable-container'\ncpu='100m'\nmemory='32Mi'")).unwrap();
+    let template: reliaburger::config::job::JobSpec = toml::from_str(&format!("image='{image}'\nnamespace='rbtest-reuse'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'")).unwrap();
     let command = "test ! -e /tmp/previous && test ! -e /dev/shm/previous && echo state >/tmp/previous && echo state >/dev/shm/previous && printf complete";
     let task = TaskInvocation {
         template: Some(Box::new(template.clone())),
@@ -1058,7 +1058,7 @@ async fn runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_origin
     let host = InstanceId("rbtest-mixed__host-0".into());
     let container = InstanceId("rbtest-mixed__image-0".into());
     let host_job: reliaburger::config::job::JobSpec =
-        toml::from_str("exec='/usr/bin/sleep'\ncommand=['60']").unwrap();
+        toml::from_str("runtime='process'\nexec='/usr/bin/sleep'\ncommand=['60']").unwrap();
     let image_job: reliaburger::config::job::JobSpec =
         toml::from_str(&format!("image='{image}'\ncommand=['/bin/sleep','60']")).unwrap();
     let host_spec = reliaburger::grill::generate_job_oci_spec(
@@ -1215,7 +1215,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
     let capacity = Resources::new(110, 40 << 20, 0);
     let budget = ExecutionBudget::new(capacity);
     let mut template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
-        "image='{image}'\nnamespace='rbtest-reuse'\nisolation='reusable-container'\ncpu='100m'\nmemory='32Mi'"
+        "image='{image}'\nnamespace='rbtest-reuse'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
     )).unwrap();
     let node = TaskArrayNode::new(
         TaskArrayNodeConfig::for_data_dir(&root, ProcessWorkloadsConfig::default()),

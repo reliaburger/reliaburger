@@ -4539,7 +4539,12 @@ async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and
                 &["app", "job"]
             };
             for kind in kinds {
-                let manifest = format!("[{kind}.work]\n{fragment}\n");
+                let runtime = if *kind == "job" && !fragment.starts_with("image") {
+                    "runtime = 'process'\n"
+                } else {
+                    ""
+                };
+                let manifest = format!("[{kind}.work]\n{runtime}{fragment}\n");
                 assert_eq!(
                     apply_as_context(&app, deployer_context(), &manifest).await,
                     expected,

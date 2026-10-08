@@ -464,3 +464,56 @@ selector, test, ownership rule or evidence consumer changed. A local source
 identity check reproduced all three refusals before correction and none after.
 The next pushed run must still pass every selected owner and final aggregation;
 this failed aggregate is retained as a failure, not counted as a qualified run.
+
+## Explicit runtime revision (9 October, Singapore)
+
+Tests first replaced the development isolation selector with an explicit
+`runtime` field and removed image-to-host inference. Contradictory image/host
+fields are refused at config, submission, node admission and execution
+boundaries. The Linux selector regression also proved that an allowlist alone
+must not make a container-only Bun advertise host execution. It failed before
+correction and passed afterwards. Formats advance to protocol 50/state 67.
+
+The complete Linux gate passed **159/159 cases in 784.960 seconds** after
+retiring the task-owned pilot fixture through public commands and then
+positively detaching its exact retired kernel owner. Two preceding runs
+failed: the first collided with the live fixture's subnet allocation, and the
+second encountered its attached root-cgroup service hook. The originals and
+logs were retained. A private hostname gives the gate a distinct subnet; the
+live service and kernel owner were retired before the successful full run.
+This is fixture contamination and correction, not clean first-pass evidence.
+
+The portable revision passed all Rust cases and 342 script checks before the
+last container-only capability correction and new four-part publication
+contract. Final checks still need to cover those last changes and the actual
+new recording. Earlier GitHub runs apply to their recorded heads, not to this
+uncommitted revision.
+
+The attempted overlapping optimised rebuild was killed by the VM's global
+OOM handler while another Rust test compiler was active. Kernel diagnostics
+identify the release compiler as PID 2767448; this is a build failure, not a
+job result. The already completed optimised runtime-v2 binaries have protocol
+50/state 67 and the same mixed execution implementation. Their actual hashes
+will identify the new measurements. They precede the later explicit-runc
+capability-advertisement correction, which is separately covered by its
+failing-then-passing selector regression.
+
+The first rootless run lacked Ubuntu's AppArmor user-namespace provision and
+failed two cases before stopping. Its log records `failed to unshare remaining
+namespaces: Operation not permitted`, and the kernel records transition into
+`unprivileged_userns`. The corrected invocation temporarily applies the same
+setting as `.github/workflows/ci.yml`, restoring its original value on exit.
+The final result remains required; no product behaviour or test deadline was
+changed. The intermittent portable upgrade-answer failure is recorded in
+[the flakes register](../flakes.md) under its existing owner #555.
+
+The corrected rootless invocation passed all **11 cases in 53.654 seconds**
+and restored the original AppArmor setting (value 1). Both Linux Clippy
+configurations passed. Native cluster acceptance passed **46/46 selected
+cases in 407.428 seconds** and upgrades passed **18/18 in 1,550.170 seconds**.
+After those heavy gates finished, an unchanged sequential portable `make ci`
+passed both Clippy modes, all **6,163 Rust cases**, two doctests, **342 script
+checks** and ignored-test ownership. No retries or exclusions were introduced.
+The existing published 50,000-job recording remains valid in this interim
+commit; the test-first replacement contract and actual four-part evidence are
+still pending. Final-head GitHub checks are still required.

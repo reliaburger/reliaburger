@@ -156,7 +156,7 @@ mod tests {
         TaskArrayWrite::Register {
             name: "test".into(),
             namespace: "default".into(),
-            template: Box::new(toml::from_str("exec='/bin/true'").unwrap()),
+            template: Box::new(toml::from_str("runtime='process'\nexec='/bin/true'").unwrap()),
             spec: TaskArraySpec::with_count(1),
             submitted_at_epoch_secs: 10,
         }

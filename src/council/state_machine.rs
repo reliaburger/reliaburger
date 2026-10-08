@@ -7645,7 +7645,7 @@ mod tests {
                 name: "render".to_string(),
                 namespace: "default".to_string(),
                 template: Box::new(crate::config::job::JobSpec {
-                    isolation: Default::default(),
+                    runtime: crate::config::job::JobRuntime::Process,
                     image: None,
                     command: None,
                     schedule: None,
@@ -7681,7 +7681,7 @@ mod tests {
             name: "render".into(),
             namespace: "default".into(),
             definition: Box::new(JobDefinition::from_spec(
-                toml::from_str("exec='/bin/true'").unwrap(),
+                toml::from_str("runtime='process'\nexec='/bin/true'").unwrap(),
             )),
             trigger: None,
             now_epoch_secs: 1,
@@ -7715,7 +7715,7 @@ mod tests {
             name: "reserved".into(),
             namespace: "default".into(),
             definition: Box::new(JobDefinition::from_spec(
-                toml::from_str("exec='/bin/true'").unwrap(),
+                toml::from_str("runtime='process'\nexec='/bin/true'").unwrap(),
             )),
             trigger: Some(RunTrigger::Manual {
                 request_id: "one".into(),
@@ -7818,7 +7818,7 @@ mod tests {
         let mut sm = CouncilStateMachine::new();
         let op = "0123456789abcdef0123456789abcdef".to_string();
         let config = crate::config::Config::parse(
-            "[app.web]\nimage='web:v1'\n[job.migrate]\nexec='/bin/true'\nrun_before=['app.web']",
+            "[app.web]\nimage='web:v1'\n[job.migrate]\nruntime='process'\nexec='/bin/true'\nrun_before=['app.web']",
         )
         .unwrap();
         sm.apply(vec![normal_entry(

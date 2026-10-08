@@ -13369,7 +13369,7 @@ async fn assert_preparation_refuses_predictable_job_policy(config: Config, proce
 #[tokio::test]
 async fn prerequisite_preparation_refuses_denied_host_job_before_claiming_migration() {
     let mut config = run_before_config();
-    let mut denied = Config::parse("[job.denied]\nexec='/bin/sh'\n").unwrap();
+    let mut denied = Config::parse("[job.denied]\nruntime='process'\nexec='/bin/sh'\n").unwrap();
     config.job.append(&mut denied.job);
     assert_preparation_refuses_predictable_job_policy(config, false).await;
 }

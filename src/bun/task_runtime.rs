@@ -321,9 +321,12 @@ impl OwnedRunner<AnyGrill> {
     }
     /// A singleton preserves the configured runtime's existing workload contract.
     pub fn supports_singleton_image(&self, template: &crate::config::job::JobSpec) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        let _ = template;
+        #[cfg(target_os = "linux")]
         let limits = template.cpu.is_some() || template.memory.is_some();
         match &self.runtime {
-            AnyGrill::Process(_) => !limits,
+            AnyGrill::Process(_) => false,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => !runtime.is_rootless() || !limits,
             #[cfg(target_os = "linux")]
@@ -348,9 +351,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         batch_id: u64,
         template: Option<&crate::config::job::JobSpec>,
     ) -> Option<u64> {
-        if template.is_none_or(|job| {
-            job.isolation != crate::config::job::ContainerIsolation::ReusableContainer
-        }) {
+        if template.is_none_or(|job| job.runtime != crate::config::job::JobRuntime::SharedRunc) {
             return None;
         }
         #[cfg(target_os = "linux")]
@@ -365,9 +366,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         None
     }
     fn owns_admission(&self, task: &TaskInvocation) -> bool {
-        task.template.as_ref().is_some_and(|job| {
-            job.isolation == crate::config::job::ContainerIsolation::ReusableContainer
-        })
+        task.template
+            .as_ref()
+            .is_some_and(|job| job.runtime == crate::config::job::JobRuntime::SharedRunc)
     }
     async fn run(
         &self,
@@ -394,7 +395,29 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 };
             }
         };
-        if resolved.isolation == crate::config::job::ContainerIsolation::ReusableContainer {
+        let backend = match resolved.runtime {
+            crate::config::job::JobRuntime::Process => crate::grill::records::RuntimeKind::Process,
+            crate::config::job::JobRuntime::Runc | crate::config::job::JobRuntime::SharedRunc => {
+                crate::grill::records::RuntimeKind::Runc
+            }
+        };
+        if let Err(reason) = resolved.validate_runtime() {
+            return Attempt {
+                outcome: AttemptOutcome::SpawnFailed {
+                    reason: reason.into(),
+                },
+                output: CapturedOutput::default(),
+            };
+        }
+        if !self.runtime.supports_runtime(backend) {
+            return Attempt {
+                outcome: AttemptOutcome::SpawnFailed {
+                    reason: "selected job runtime is unavailable on this node".into(),
+                },
+                output: CapturedOutput::default(),
+            };
+        }
+        if resolved.runtime == crate::config::job::JobRuntime::SharedRunc {
             #[cfg(target_os = "linux")]
             if let Some(runtime) = self.runtime.reusable_runtime() {
                 let pool = self.reusable.get_or_init(|| {
@@ -451,7 +474,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             }
             return Attempt {
                 outcome: AttemptOutcome::SpawnFailed {
-                    reason: "reusable-container requires the owned rootful Linux runtime".into(),
+                    reason: "shared-runc requires the owned rootful Linux runtime".into(),
                 },
                 output: CapturedOutput::default(),
             };
@@ -839,7 +862,7 @@ mod tests {
     fn invocation() -> TaskInvocation {
         TaskInvocation {
             template: Some(Box::new(
-                toml::from_str("image='fixture:v1'\nnamespace='tenant-a'").unwrap(),
+                toml::from_str("runtime='process'\nexec='/unused'\nnamespace='tenant-a'").unwrap(),
             )),
             index: 0,
             attempt: 1,
@@ -854,13 +877,9 @@ mod tests {
         let runner = std::sync::Arc::new(OwnedRunner::new(runtime));
         let mut task = invocation();
         task.template = Some(Box::new(
-            toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+            toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
-        task.args = vec![
-            "sh".into(),
-            "-c".into(),
-            "printf live; exec sleep 30".into(),
-        ];
+        task.args = vec!["-c".into(), "printf live; exec sleep 30".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
@@ -902,13 +921,9 @@ mod tests {
         ));
         let mut task = invocation();
         task.template = Some(Box::new(
-            toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+            toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
-        task.args = vec![
-            "sh".into(),
-            "-c".into(),
-            "echo original; exec sleep 30".into(),
-        ];
+        task.args = vec!["-c".into(), "echo original; exec sleep 30".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
@@ -967,9 +982,9 @@ mod tests {
         for id in [1, 2] {
             let mut task = invocation();
             task.template = Some(Box::new(
-                toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+                toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
             ));
-            task.args = vec!["sh".into(), "-c".into(), format!("echo output-{id}")];
+            task.args = vec!["-c".into(), format!("echo output-{id}")];
             task.env = vec![
                 ("RELIABURGER_TASK_COUNT".into(), "1".into()),
                 ("RELIABURGER_BATCH_ID".into(), id.to_string()),
@@ -991,13 +1006,9 @@ mod tests {
         let runner = std::sync::Arc::new(OwnedRunner::new(crate::grill::ProcessGrill::new()));
         let mut task = invocation();
         task.template = Some(Box::new(
-            toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+            toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
-        task.args = vec![
-            "sh".into(),
-            "-c".into(),
-            "printf 'live-output\n'; sleep 30".into(),
-        ];
+        task.args = vec!["-c".into(), "printf 'live-output\n'; sleep 30".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
@@ -1040,8 +1051,8 @@ mod tests {
         let runtime = crate::grill::ProcessGrill::new();
         let runner = OwnedRunner::new(runtime).with_log_sink(Some(sink), Default::default());
         let mut task = invocation();
-        task.template = Some(Box::new(toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'\ncommand=['sh','-c','echo output']").unwrap()));
-        task.args = vec!["sh".into(), "-c".into(), "echo output".into()];
+        task.template = Some(Box::new(toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'\ncommand=['-c','echo output']").unwrap()));
+        task.args = vec!["-c".into(), "echo output".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
@@ -1067,7 +1078,7 @@ mod tests {
         )
         .unwrap();
         let mut spec: crate::config::job::JobSpec =
-            toml::from_str("exec='/bin/true'\nnamespace='team-a'").unwrap();
+            toml::from_str("runtime='process'\nexec='/bin/true'\nnamespace='team-a'").unwrap();
         spec.env.insert(
             "TOKEN".into(),
             crate::config::types::EnvValue::Encrypted(sealed),

@@ -274,8 +274,14 @@ async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
             vec!["logs"],
             serde_json::json!({"image":"busybox","command":["true"]}),
         ),
-        (vec!["deploy"], serde_json::json!({"script":"echo denied"})),
-        (vec!["deploy"], serde_json::json!({"exec":"/bin/true"})),
+        (
+            vec!["deploy"],
+            serde_json::json!({"runtime":"process","script":"echo denied"}),
+        ),
+        (
+            vec!["deploy"],
+            serde_json::json!({"runtime":"process","exec":"/bin/true"}),
+        ),
     ] {
         council
             .write(reliaburger::council::types::RaftRequest::PermissionSpec {
@@ -313,7 +319,7 @@ async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
     let mut request = Request::post("/v1/batch")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"jobs":[{"name":"migration","spec":{"exec":"/bin/true"}}]})
+            serde_json::json!({"jobs":[{"name":"migration","spec":{"runtime":"process","exec":"/bin/true"}}]})
                 .to_string(),
         ))
         .unwrap();
@@ -1089,8 +1095,13 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
                 .unwrap();
             let apply_status = apply.status();
             let apply_body = apply.text().await.unwrap();
+            let runtime = if fragment.starts_with("image") {
+                ""
+            } else {
+                "runtime='process'\n"
+            };
             let parsed = reliaburger::config::Config::parse(&format!(
-                "[job.{job_name}]\nnamespace='{namespace}'\n{fragment}\n"
+                "[job.{job_name}]\nnamespace='{namespace}'\n{runtime}{fragment}\n"
             ))
             .unwrap();
             let batch = client.post(format!("http://{follower_address}/v1/batch")).bearer_auth(&created.plaintext).json(&serde_json::json!({"jobs":[{"name":job_name,"namespace":namespace,"spec":parsed.job[&job_name]}]})).send().await.unwrap();
@@ -1168,7 +1179,7 @@ async fn common_run_cancellation_and_output_obey_current_permissions() {
         .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Register {
             name: "migration".into(),
             namespace: "default".into(),
-            template: Box::new(toml::from_str("exec='/bin/true'").unwrap()),
+            template: Box::new(toml::from_str("runtime='process'\nexec='/bin/true'").unwrap()),
             spec: reliaburger::meat::task_array::TaskArraySpec::with_count(1),
             submitted_at_epoch_secs: 1,
         })))

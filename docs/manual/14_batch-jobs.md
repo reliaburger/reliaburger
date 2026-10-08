@@ -221,22 +221,40 @@ writable. Larger arrays use a read-only root, temporary scratch and a 1 MiB limi
 per regular output or scratch file (`RLIMIT_FSIZE`).
 
 On Linux, Bun's `auto` and `runc` modes select the backend per workload.
-Image jobs use runc; authorised `exec` or `script` jobs use the owned process
-backend on the same node. They share scheduling capacity with applications.
-Host commands run with Bun's account privileges and require the existing
-`[process_workloads]` allowlist. Bulk host work also requires
+Jobs select `runtime = "runc"` (the default), `runtime = "process"`, or
+`runtime = "shared-runc"`. Process jobs use `exec` or `script` and refuse
+`image`. Container jobs require `image` and refuse host `exec`/`script`.
+`relish run` exposes the same choice with `--runtime`.
+
+On Linux, `bun --runtime mixed` enables both owned backends. `--runtime auto`
+can detect both when runc is available. Explicit `--runtime runc` is
+container-only and refuses host jobs; `--runtime process` is host-only.
+Host commands still need the executable allowlist and
 `mount_isolation = false`. Explicit host CPU/memory limits remain refused;
 container capabilities do not enforce limits or isolation on host commands.
 
+For example, after allowing `/usr/bin/printf` on a process-enabled node:
+
+```sh
+relish run --runtime process --batch hello --count 1000 \
+  --exec /usr/bin/printf -- 'task %s\n' '{index}'
+```
+
+Omitting `--runtime process` refuses the host command. A process job's default
+request reserves one CPU and 64 MiB beside applications. This is admission
+accounting; host commands have no hard CPU or memory limit. The raw VM baseline
+bypasses this reservation as well as durable task ownership and outcomes.
+
+
 ## Reusable containers
 
-For short image commands, select `isolation = "reusable-container"` explicitly
-in the job or profile template. The default remains `fresh-container`.
+For short image commands, select `runtime = "shared-runc"` explicitly
+in the job or profile template. The default remains `runc`.
 
 ```toml
 [job.prepare-record]
 image = "registry.example.com/dataset-tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-isolation = "reusable-container"
+runtime = "shared-runc"
 command = ["/usr/local/bin/prepare-record", "{index}"]
 cpu = "100m-500m"
 memory = "64Mi-256Mi"
@@ -270,8 +288,8 @@ quarantined until recovery retires the original generation. Host execution,
 rootless runtimes and GPU requests cannot select this mode. Kubernetes export
 refuses it because an ordinary Job cannot preserve this contract.
 
-Summaries include `isolation` and `idle_executor_reservation`. Host jobs report
-`host-process`. On rootful Linux runc, memory-limited image jobs disable swap
+Summaries include `runtime` and `idle_executor_reservation`. Host jobs report
+`process`. On rootful Linux runc, memory-limited image jobs disable swap
 in both fresh and reused execution. A job exceeding its RAM limit can be OOM-killed; it cannot silently
 spill into swap and consume unaccounted disk I/O. Choose the memory range for
 the actual working set, including model weights.
@@ -343,12 +361,12 @@ separate definition per index.
 
 ```sh
 relish run --batch frames --image registry.example/frames@sha256:DIGEST \
-  --isolation reusable-container --count 100000 --cpu 100m --memory 32Mi \
+  --runtime shared-runc --count 100000 --cpu 100m --memory 32Mi \
   -- /app/frame '{index}'
 ```
 
 Replace `DIGEST` with the image's full SHA-256 digest. The default is
-`fresh-container`. Host `--exec` commands cannot select container reuse.
+`runc`. Host `--exec` commands cannot select container reuse.
 
 The watch summary names the execution mode and separates verified active
 commands from other in-flight attempts (waiting for resources, preparing or
@@ -388,6 +406,43 @@ process identities. A changed start time or unavailable process produces an
 incomplete observation. These are selected processes, not total node or
 container memory; record cgroup working sets separately when qualifying limits.
 Storage observations also become incomplete when atomic renames race the scan.
+
+The three-tier landing-page recorder adds a separate million-process VM
+baseline, then submits 1,000 fresh containers, 10,000 shared containers and
+1,000,000 host jobs. Run it only on a task-owned Linux measurement node with
+matching optimised `bun`, `relish` and `job-throughput` binaries:
+
+```sh
+python3 scripts/demo/record-job-tiers.py \
+  --binaries /absolute/immutable-binaries --relish /absolute/immutable-binaries/relish \
+  --image registry.example/busybox@sha256:DIGEST \
+  --host-binary /absolute/matching-unpacked-rootfs/bin/busybox \
+  --service-url http://application/health --observe-pid BUN_PID \
+  --observe-dir /absolute/node-data --output /absolute/new-recording
+```
+
+The recorder verifies that the host binary matches the pinned-image baseline.
+Provide CLI credentials privately. Enable `mixed` on Bun, allowlist that binary,
+and set `mount_isolation = false` for these host jobs. Give the baseline its
+own node subnet identity, as with the direct driver below. The casts retain
+actual pauses, including warm-up and indexed verification. Per-tier reports
+time submission through accepted completion. The host tier's default request
+can reduce concurrency below the requested 27; it doesn't bypass admission.
+
+You can observe an hour of an existing tier without submitting competing work:
+
+```sh
+python3 scripts/demo/qualify-jobs.py /absolute/new-recording/process.toml \
+  --existing-batch BATCH_ID --seconds 3600 \
+  --relish /absolute/immutable-binaries/relish --app-url http://application/health \
+  --observe-pid BUN_PID --observe-dir /absolute/node-data \
+  --output /absolute/new-hour-measurement
+```
+
+This observer subtracts accepted results from before its window and leaves the
+submission running afterwards. It reports service latency, selected process
+memory and bounded storage observations. A complete hour can still miss the
+rate target; it never passes the separate 24-hour qualification.
 
 For the direct baselines, build the rootful Linux example with the same profile
 as Bun and run each mode in a fresh directory on the qualification node:

@@ -78,9 +78,9 @@ pub struct Compatibility {
 /// Reusable job definitions, immutable run provenance and atomic schedule
 /// occurrence claims in the common execution store (48/65, #638).
 pub const CURRENT: Compatibility = Compatibility {
-    // Explicit container isolation and the internal reusable helper OCI contract (#639).
-    protocol: 49,
-    state: 66,
+    // Explicit per-job runtime replaces inferred execution and container isolation (#639).
+    protocol: 50,
+    state: 67,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

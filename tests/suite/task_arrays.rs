@@ -291,7 +291,7 @@ impl Harness {
 fn shell_array(count: u32, chunk_size: u32, script: &str) -> Value {
     json!({
         "name": "render",
-        "template": { "exec": SHELL, "command": ["-c", script] },
+        "template": { "runtime":"process","exec": SHELL, "command": ["-c", script] },
         "spec": { "count": count, "chunk_size": chunk_size },
     })
 }
@@ -393,7 +393,7 @@ async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
     let batch_id = harness
         .submit_ok(json!({
             "name": "many",
-            "template": { "exec": SHELL, "command": ["{index}"] },
+            "template": { "runtime":"process","exec": SHELL, "command": ["{index}"] },
             "spec": { "count": 100_000 },
         }))
         .await;
@@ -572,7 +572,7 @@ async fn invalid_profile_refuses_the_whole_manifest_and_parent_cancel_drains_all
         slots: 2,
     })
     .await;
-    let profile = |name: &str, count: u32| json!({"name":name,"count":count,"chunk_size":10,"template":{"exec":SHELL,"command":["-c","exit 0"]}});
+    let profile = |name: &str, count: u32| json!({"name":name,"count":count,"chunk_size":10,"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]}});
     let invalid = json!({"name":"mixed","cohort":[profile("small",100),profile("large",0)]});
     let response = harness
         .http
@@ -660,7 +660,7 @@ async fn manifest_admission_and_summary_views_honour_the_callers_scope() {
         Some(tokens),
     )
     .await;
-    let request = |name: &str, namespace: &str| json!({"name":name,"namespace":namespace,"cohort":[{"name":"small","count":1,"template":{"exec":SHELL,"command":["-c","true"]}}]});
+    let request = |name: &str, namespace: &str| json!({"name":name,"namespace":namespace,"cohort":[{"name":"small","count":1,"template":{"runtime":"process","exec":SHELL,"command":["-c","true"]}}]});
     let submit = |name: &str, namespace: &str, token: &str| {
         harness
             .http
@@ -734,7 +734,7 @@ async fn manifest_admission_and_summary_views_honour_the_callers_scope() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_singletons_use_common_runs_and_repeat_requests_keep_the_same_identity() {
     let harness = Harness::start(Options::processes(true)).await;
-    let body = json!({"name":"single","definition":{"template":{"exec":SHELL,"command":["-c","printf result"]}},"request_id":"same-operation"});
+    let body = json!({"name":"single","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","printf result"]}},"request_id":"same-operation"});
     let send = || {
         harness
             .http
@@ -781,7 +781,7 @@ async fn manual_singletons_use_common_runs_and_repeat_requests_keep_the_same_ide
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cron_registration_is_durable_without_launching_a_manual_run() {
     let harness = Harness::start(Options::processes(true)).await;
-    let body = json!({"name":"nightly","definition":{"template":{"exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
+    let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     let response = harness
         .http
         .post(format!("{}/v1/jobs/runs", harness.base_url))
@@ -814,7 +814,7 @@ async fn cron_registration_is_durable_without_launching_a_manual_run() {
 async fn toml_apply_routes_ordinary_jobs_and_hooks_through_common_runs() {
     let harness = Harness::start(Options::processes(true)).await;
     let client = reqwest::Client::new();
-    let config = "[app.web]\nimage='web:v1'\n[job.prepare]\nexec='/bin/sh'\ncommand=['-c','exit 0']\nrun_before=['app.web']\n[job.finish]\nexec='/bin/sh'\ncommand=['-c','printf done']";
+    let config = "[app.web]\nimage='web:v1'\n[job.prepare]\nruntime='process'\nexec='/bin/sh'\ncommand=['-c','exit 0']\nrun_before=['app.web']\n[job.finish]\nruntime='process'\nexec='/bin/sh'\ncommand=['-c','printf done']";
     let response = client
         .post(format!("{}/v1/apply", harness.base_url))
         .header("idempotency-key", "0123456789abcdef0123456789abcdef")
@@ -852,7 +852,7 @@ async fn toml_apply_routes_ordinary_jobs_and_hooks_through_common_runs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finite_batches_are_common_singletons_and_repeated_submissions_keep_the_parent() {
     let harness = Harness::start(Options::processes(true)).await;
-    let body = json!({"jobs":[{"name":"alpha","spec":{"exec":SHELL,"command":["-c","printf alpha"]}},{"name":"beta","spec":{"exec":SHELL,"command":["-c","printf beta"]}}]});
+    let body = json!({"jobs":[{"name":"alpha","spec":{"runtime":"process","exec":SHELL,"command":["-c","printf alpha"]}},{"name":"beta","spec":{"runtime":"process","exec":SHELL,"command":["-c","printf beta"]}}]});
     let response = harness
         .http
         .post(format!("{}/v1/batch", harness.base_url))
@@ -898,7 +898,7 @@ async fn finite_batches_are_common_singletons_and_repeated_submissions_keep_the_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jobs_inventory_and_stop_use_durable_schedule_definitions() {
     let harness = Harness::start(Options::processes(true)).await;
-    let body = json!({"name":"nightly","definition":{"template":{"exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
+    let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     assert_eq!(
         harness
             .http
@@ -967,7 +967,7 @@ async fn jobs_inventory_and_stop_use_durable_schedule_definitions() {
 async fn deployment_inventory_and_cancellation_use_the_durable_hook_operation() {
     let harness = Harness::start(Options::processes(true)).await;
     let operation = "0123456789abcdef0123456789abcdef";
-    let response = harness.http.post(format!("{}/v1/apply", harness.base_url)).header("idempotency-key", operation).body("[app.web]\nimage='web:v1'\n[job.prepare]\nexec='/bin/sh'\ncommand=['-c','exec sleep 30']\nrun_before=['app.web']").send().await.unwrap();
+    let response = harness.http.post(format!("{}/v1/apply", harness.base_url)).header("idempotency-key", operation).body("[app.web]\nimage='web:v1'\n[job.prepare]\nruntime='process'\nexec='/bin/sh'\ncommand=['-c','exec sleep 30']\nrun_before=['app.web']").send().await.unwrap();
     assert_eq!(response.status(), 200);
     let inventory = harness
         .http
@@ -1023,7 +1023,7 @@ async fn deployment_inventory_and_cancellation_use_the_durable_hook_operation() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_restart_retains_runs_requests_and_the_next_identity() {
     let harness = Harness::start(Options::processes(false)).await;
-    let body = json!({"name":"once","request_id":"restarted-request","definition":{"template":{"exec":SHELL,"command":["-c","printf retained"]}}});
+    let body = json!({"name":"once","request_id":"restarted-request","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","printf retained"]}}});
     let response = harness
         .http
         .post(format!("{}/v1/jobs/runs", harness.base_url))

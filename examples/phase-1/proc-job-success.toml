@@ -6,5 +6,7 @@
 # Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-job-success.toml
 
 [job.migrate]
-image = "proc-grill:image-ignored"
-command = ["echo", "migration complete"]
+runtime = "process"
+exec = "/bin/echo"
+command = ["migration complete"]
+# Authorise this binary in process_workloads.allowed_binaries on Bun.

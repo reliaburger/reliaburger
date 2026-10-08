@@ -191,6 +191,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -204,9 +207,9 @@ registry_port = 0
     let release = root.path().join("release");
     let start_retry = root.path().join("start-retry");
     let _release = ReleaseJob(release.clone());
-    let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    let mut config = Config::parse("[job.work]\nruntime = 'process'\nexec = '/bin/sh'\n").unwrap();
     let job = config.job.get_mut("work").unwrap();
-    job.command = Some(vec!["/bin/sh".into(), "-c".into(),
+    job.command = Some(vec!["-c".into(),
         "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 2400 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 2400 ]; do if [ -f \"$RELEASE_FILE\" ]; then if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 2 ]; then kill -TERM $$; else exit 0; fi; fi; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
     job.env.insert(
         "RUN_FILE".into(),
@@ -305,6 +308,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -316,9 +322,10 @@ registry_port = 0
         .unwrap();
         let release = root.path().join("release");
         let _release = ReleaseJob(release.clone());
-        let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+        let mut config =
+            Config::parse("[job.work]\nruntime = 'process'\nexec = '/bin/sh'\n").unwrap();
         let job = config.job.get_mut("work").unwrap();
-        job.command = Some(vec!["/bin/sh".into(), "-c".into(),
+        job.command = Some(vec!["-c".into(),
             "i=0; while [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; [ -f \"$RELEASE_FILE\" ]".into()]);
         job.env.insert(
             "RELEASE_FILE".into(),
@@ -372,6 +379,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -484,6 +494,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0

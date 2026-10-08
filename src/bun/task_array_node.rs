@@ -467,6 +467,9 @@ impl TaskArrayNode {
 
     /// Whether this node may run the array's binary at all.
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
+        if let Some(template) = assignment.template.as_ref() {
+            template.validate_runtime().map_err(str::to_owned)?;
+        }
         if assignment
             .template
             .as_ref()
@@ -488,7 +491,7 @@ impl TaskArrayNode {
             return Err("task requests exceed this node's allocatable resources".into());
         }
         if let Some(template) = assignment.template.as_ref()
-            && template.isolation == crate::config::job::ContainerIsolation::ReusableContainer
+            && template.runtime == crate::config::job::JobRuntime::SharedRunc
         {
             let profile = super::reusable_executor::ExecutorProfile::new(template)
                 .map_err(|error| error.to_string())?;
@@ -498,7 +501,7 @@ impl TaskArrayNode {
             return match self.runner.as_ref() {
                 NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
                 NodeRunner::Fake(_) => Ok(()),
-                _ => Err("reusable-container requires the rootful owned Linux runtime".into()),
+                _ => Err("shared-runc requires the rootful owned Linux runtime".into()),
             };
         }
         if assignment
@@ -753,7 +756,7 @@ impl TaskArrayNode {
             batch_id: assignment.batch_id,
             slots: {
                 let reusable = assignment.template.as_deref().filter(|template| {
-                    template.isolation == crate::config::job::ContainerIsolation::ReusableContainer
+                    template.runtime == crate::config::job::JobRuntime::SharedRunc
                 });
                 let resources = reusable
                     .and_then(|template| {
@@ -1169,7 +1172,10 @@ mod tests {
             TaskArrayNodeConfig::for_data_dir(dir.path(), ProcessWorkloadsConfig::default()),
             NodeRunner::Owned(Box::new(runner)),
         );
-        assert!(node.admit(&task).is_ok());
+        assert!(
+            node.admit(&task).is_err(),
+            "an image singleton must not fall back to the host backend"
+        );
         task.template.as_mut().unwrap().cpu = Some(crate::config::types::ResourceRange {
             request: 100,
             limit: 100,
@@ -1432,7 +1438,7 @@ mod tests {
             let mut array = assignment(1, 1000, &[]);
             array.resources = crate::meat::Resources::new(100, 32 << 20, 0);
             array.template = Some(Box::new(toml::from_str(
-                "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nisolation='reusable-container'\ncpu='100m'\nmemory='32Mi'"
+                "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
             ).unwrap()));
             let progress = node.sync(&request(vec![array])).await.arrays.remove(0);
             assert_eq!(progress.refused, None);

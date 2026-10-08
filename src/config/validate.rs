@@ -428,13 +428,6 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
 }
 
 pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
-    if job.isolation == super::job::ContainerIsolation::ReusableContainer && job.image.is_none() {
-        return Err(ConfigError::Validation {
-            field: "isolation".into(),
-            context: format!("job {name:?}"),
-            reason: "reusable-container requires an image and the rootful Linux runtime".into(),
-        });
-    }
     validate_label(name, "job", "name")?;
     validate_label(
         job.namespace.as_deref().unwrap_or("default"),
@@ -484,7 +477,12 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
         });
     }
 
-    Ok(())
+    job.validate_runtime()
+        .map_err(|reason| ConfigError::Validation {
+            field: "runtime".into(),
+            context: format!("job {name:?}"),
+            reason: reason.into(),
+        })
 }
 
 impl NodeConfig {
@@ -1652,8 +1650,11 @@ mod tests {
 
     #[test]
     fn validate_job_exec_only_passes() {
-        let job: crate::config::job::JobSpec =
-            toml::from_str(r#"exec = "/usr/bin/python3""#).unwrap();
+        let job: crate::config::job::JobSpec = toml::from_str(
+            r#"runtime = "process"
+exec = "/usr/bin/python3""#,
+        )
+        .unwrap();
         let mut config = Config::default();
         config.job.insert("test-job".to_string(), job);
         config.validate().unwrap();

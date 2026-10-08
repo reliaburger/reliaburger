@@ -34,13 +34,15 @@ backups use each backend's standard credential variables.
 |------|---------|---------|
 | `--config PATH` | none (all defaults) | node config file |
 | `--listen ADDR` | `127.0.0.1:9117` | API listen address |
-| `--runtime NAME` | `auto` | `auto`, `process`, or `runc` (Linux) |
+| `--runtime NAME` | `auto` | `auto`, `process`, `runc`, or `mixed` (Linux) |
 | `--cluster` | off | form or join a cluster using `[cluster]` |
 | `--compatibility` | | print the protocol and state formats this binary supports |
 
-On Linux with runc, `auto` and `runc` run both backends: `image` selects a
-container and authorised `exec`/`script` selects an owned host process.
-`process` selects the process-only runtime; `auto` uses it when runc is absent.
+Linux `--runtime mixed` enables both container and host backends. Auto may
+select both; explicit `--runtime runc` selects containers only. Jobs choose
+`runtime="runc"` (default), `runtime="process"` or `runtime="shared-runc"`.
+Process jobs refuse images and container jobs refuse host exec/script fields.
+
 Host workloads require an explicit allowlist and `mount_isolation = false`;
 CPU/memory limits and container egress enforcement remain unavailable to them.
 While no API token exists, Bun refuses any `--listen` address that isn't a

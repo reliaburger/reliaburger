@@ -30,17 +30,21 @@ class JobMeasurement(unittest.TestCase):
         self.assertFalse(measurement.finish_report(self.summary(failed=1,succeeded=999),10,29)['all_tasks_succeeded'])
 
     def test_manifest_indexes_use_each_cohort_identity_and_local_index_range(self):
-        summary = self.summary(kind='manifest',cohorts=[dict(batch_id=8,total=10,isolation='reusable-container'),dict(batch_id=9,total=4,isolation='fresh-container')])
+        summary = self.summary(kind='manifest',cohorts=[dict(batch_id=8,total=10,runtime='shared-runc'),dict(batch_id=9,total=4,runtime='runc')])
         self.assertEqual(measurement.indexed_queries(summary),[(8,0),(8,5),(8,9),(9,0),(9,2),(9,3)])
         self.assertEqual(measurement.indexed_queries(self.summary(total=1)),[(7,0)])
         with self.assertRaises(ValueError): measurement.indexed_queries(self.summary(kind='manifest',cohorts=[]))
         with self.assertRaises(ValueError): measurement.indexed_queries(self.summary(kind='manifest',cohorts=[dict(batch_id=8,total=1)]*33))
 
     def test_homogeneous_manifest_displays_the_actual_container_mode(self):
-        summary = self.summary(kind='manifest',cohorts=[dict(isolation='reusable-container')])
-        self.assertIn('mode reusable-container;',measurement.display(summary,5))
-        summary['cohorts'].append(dict(isolation='fresh-container'))
-        self.assertIn('mode mixed;',measurement.display(summary,5))
+        summary = self.summary(kind='manifest',cohorts=[dict(runtime='shared-runc')])
+        self.assertIn('runtime shared-runc;',measurement.display(summary,5))
+        summary['cohorts'].append(dict(runtime='runc'))
+        self.assertIn('runtime mixed;',measurement.display(summary,5))
+
+    def test_explicit_runtime_is_reported_for_host_and_shared_jobs(self):
+        for mode in ['process', 'shared-runc', 'runc']:
+            self.assertIn('runtime ' + mode + ';', measurement.display(self.summary(runtime=mode), 5))
 
     def test_selected_results_must_match_the_requested_identity_and_index(self):
         result=dict(batch_id=8,rows=[dict(index=5,succeeded=True,attempts=1)])

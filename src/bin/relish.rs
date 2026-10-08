@@ -404,9 +404,9 @@ enum Command {
         /// OCI image executed by the owned Linux runtime.
         #[arg(long, required_unless_present = "exec", conflicts_with = "exec")]
         image: Option<String>,
-        /// Fresh container per attempt, or a compatible reusable command container.
-        #[arg(long, value_enum, default_value_t = reliaburger::config::job::ContainerIsolation::FreshContainer)]
-        isolation: reliaburger::config::job::ContainerIsolation,
+        /// Job backend: runc (default), process (requires --exec), or shared-runc.
+        #[arg(long, value_enum, default_value_t = reliaburger::config::job::JobRuntime::Runc)]
+        runtime: reliaburger::config::job::JobRuntime,
         /// CPU request-limit range, such as 250m-500m.
         #[arg(long)]
         cpu: Option<String>,
@@ -1929,7 +1929,7 @@ async fn main() -> ExitCode {
         },
         Command::Jobs { definitions } => commands::jobs(definitions, cli.output).await,
         Command::Run {
-            isolation,
+            runtime,
             schedule,
             batch,
             count,
@@ -1947,7 +1947,7 @@ async fn main() -> ExitCode {
             args,
         } => {
             commands::run_task_array(commands::TaskArrayRun {
-                isolation,
+                runtime,
                 schedule,
                 name: batch,
                 namespace,
@@ -4119,8 +4119,8 @@ mod tests {
             "many",
             "--image",
             "fixture",
-            "--isolation",
-            "reusable-container",
+            "--runtime",
+            "shared-runc",
             "--",
             "/bin/true",
         ])
@@ -4128,7 +4128,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Run {
-                isolation: reliaburger::config::job::ContainerIsolation::ReusableContainer,
+                runtime: reliaburger::config::job::JobRuntime::SharedRunc,
                 ..
             }
         ));
@@ -4140,7 +4140,7 @@ mod tests {
                 "many",
                 "--image",
                 "fixture",
-                "--isolation",
+                "--runtime",
                 "unknown"
             ])
             .is_err()

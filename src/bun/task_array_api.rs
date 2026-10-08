@@ -568,8 +568,8 @@ pub fn array_summary(
         "age_seconds": epoch_now_secs().saturating_sub(state.submitted_at_epoch_secs),
         "details_retention_seconds": crate::meat::task_array_store::TERMINAL_RETENTION_SECS,
         "execution_semantics": "at_least_once",
-        "isolation": if record.template.image.is_none() { serde_json::json!("host-process") } else { serde_json::json!(record.template.isolation) },
-        "idle_executor_reservation": if record.template.isolation == crate::config::job::ContainerIsolation::ReusableContainer {
+        "runtime": record.template.runtime,
+        "idle_executor_reservation": if record.template.runtime == crate::config::job::JobRuntime::SharedRunc {
             super::reusable_executor::ExecutorProfile::new(&record.template).ok().map(|profile| serde_json::json!({"cpu_millicores":profile.reservation.cpu_millicores,"memory_bytes":profile.reservation.memory_bytes}))
         } else { None },
     })
@@ -1190,7 +1190,7 @@ mod tests {
 
     fn template() -> JobSpec {
         JobSpec {
-            isolation: Default::default(),
+            runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: Some(vec!["{index}".to_string()]),
             schedule: None,

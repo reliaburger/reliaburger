@@ -1571,11 +1571,11 @@ mod tests {
     #[test]
     fn image_jobs_with_memory_limits_cannot_spill_into_swap() {
         for isolation in [
-            crate::config::job::ContainerIsolation::FreshContainer,
-            crate::config::job::ContainerIsolation::ReusableContainer,
+            crate::config::job::JobRuntime::Runc,
+            crate::config::job::JobRuntime::SharedRunc,
         ] {
             let mut spec = minimal_job();
-            spec.isolation = isolation;
+            spec.runtime = isolation;
             spec.memory = Some(crate::config::types::ResourceRange {
                 request: 16 << 20,
                 limit: 32 << 20,

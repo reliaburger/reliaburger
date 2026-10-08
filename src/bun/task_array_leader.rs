@@ -834,7 +834,7 @@ mod tests {
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: JobSpec {
-                isolation: Default::default(),
+                runtime: crate::config::job::JobRuntime::Process,
                 image: None,
                 command: Some(vec!["frame".to_string(), "{index}".to_string()]),
                 schedule: None,

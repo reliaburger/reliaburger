@@ -724,7 +724,7 @@ auto_rollback = false
         write_file(
             dir.path(),
             "native.toml",
-            "[app.worker]\nexec='/usr/bin/true'\n[job.migrate]\nexec='/usr/bin/true'\n",
+            "[app.worker]\nexec='/usr/bin/true'\n[job.migrate]\nruntime='process'\nexec='/usr/bin/true'\n",
         );
         let result = compile(dir.path()).unwrap();
         let app = &result.config.app["worker"];

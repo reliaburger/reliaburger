@@ -234,3 +234,26 @@ Both used `CARGO_TARGET_DIR=/tmp/reliaburger-review2-network-target`,
 configurations passed before the full run. Since Make stopped at the failed
 test target, doctests 2/2, CI scripts 52/52, ignored-owner checks and final
 formatting were run separately and passed.
+
+## 9 October: upgrade-answer probe before the four-part job measurement
+
+The local explicit-runtime revision of #654 hit the existing
+`bun::agent::tests::upgrade_answer::an_upgrade_execs_only_after_its_answer_is_delivered`
+timeout while the separate real-binary upgrade gate was also running.
+`/private/tmp/654-runtime-api-tooling-ci.log` records signature verification
+reaching `probe-begin` in 1.2 ms, then the initial answer timing out after
+10.161 seconds with `candidate-probe-reached=false`. The run stopped at
+950/6,163 cases: 949 passed and one failed. The earlier complete portable run
+of the same execution revision passed all 6,163 cases; its later script gate
+failed on the intentionally pending new recording contract.
+
+This does not establish the timeout's cause. #555 still owns the bounded
+subprocess/phase diagnostics. No deadline, retry or exclusion was changed.
+The final portable gate will run after the heavy upgrade gate completes,
+and its result will be recorded separately.
+
+The unchanged sequential full `make ci` subsequently passed all 6,163 Rust
+cases, two doctests, 342 script checks and ignored owners, with retries zero.
+Its log is `/private/tmp/654-runtime-api-tooling-ci-sequential.log`. That result
+is separate from the failed overlapping run and does not establish its cause
+or close #555.

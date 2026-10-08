@@ -2191,8 +2191,8 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
 /// What `relish run --batch` submits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskArrayRun {
-    /// Image attempt isolation; host commands cannot select reuse.
-    pub isolation: crate::config::job::ContainerIsolation,
+    /// Explicit job backend; host execution requires process.
+    pub runtime: crate::config::job::JobRuntime,
     /// Durable UTC schedule; omitted means an immediate manual run.
     pub schedule: Option<String>,
     pub image: Option<String>,
@@ -2217,13 +2217,12 @@ pub struct TaskArrayRun {
 pub fn task_array_request(
     run: TaskArrayRun,
 ) -> Result<crate::bun::task_array_api::TaskArraySubmitRequest, RelishError> {
-    if run.isolation == crate::config::job::ContainerIsolation::ReusableContainer
-        && (run.image.is_none() || run.exec.is_some())
+    if (run.runtime == crate::config::job::JobRuntime::Process
+        && (run.image.is_some() || run.exec.is_none()))
+        || (run.runtime != crate::config::job::JobRuntime::Process
+            && (run.image.is_none() || run.exec.is_some()))
     {
-        return Err(RelishError::InvalidFlag {
-            flag: "isolation".into(),
-            reason: "reusable-container requires an image workload".into(),
-        });
+        return Err(RelishError::InvalidFlag { flag: "runtime".into(), reason: "process requires --exec and refuses --image; runc/shared-runc require --image and refuse --exec".into() });
     }
     if run.exec.as_ref().is_some_and(|path| !path.is_absolute()) {
         return Err(RelishError::InvalidFlag {
@@ -2251,7 +2250,7 @@ pub fn task_array_request(
         name: run.name,
         namespace: Some(run.namespace),
         template: crate::config::job::JobSpec {
-            isolation: run.isolation,
+            runtime: run.runtime,
             image: run.image,
             command: Some(run.args),
             schedule: run.schedule,
@@ -2397,7 +2396,7 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     };
     output.push_str(&format!(
         " | mode {} | {} active commands, {} other in-flight attempts",
-        summary["isolation"]
+        summary["runtime"]
             .as_str()
             .unwrap_or(if summary["kind"] == "manifest" {
                 "mixed"
@@ -4243,7 +4242,7 @@ mod task_array_tests {
 
     fn run() -> TaskArrayRun {
         TaskArrayRun {
-            isolation: Default::default(),
+            runtime: crate::config::job::JobRuntime::Process,
             schedule: None,
             image: None,
             cpu: None,
@@ -4259,23 +4258,20 @@ mod task_array_tests {
 
     #[test]
     fn run_flags_preserve_explicit_container_isolation_and_refuse_host_reuse() {
-        use crate::config::job::ContainerIsolation;
+        use crate::config::job::JobRuntime;
         let mut image = run();
         image.exec = None;
         image.image = Some(
             "fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .into(),
         );
-        image.isolation = ContainerIsolation::ReusableContainer;
+        image.runtime = JobRuntime::SharedRunc;
         let request = task_array_request(image).unwrap();
-        assert_eq!(
-            request.template.isolation,
-            ContainerIsolation::ReusableContainer
-        );
+        assert_eq!(request.template.runtime, JobRuntime::SharedRunc);
         let mut host = run();
-        host.isolation = ContainerIsolation::ReusableContainer;
+        host.runtime = JobRuntime::SharedRunc;
         assert!(
-            matches!(task_array_request(host), Err(RelishError::InvalidFlag {flag,..}) if flag == "isolation")
+            matches!(task_array_request(host), Err(RelishError::InvalidFlag {flag,..}) if flag == "runtime")
         );
     }
 
@@ -4348,10 +4344,10 @@ mod task_array_tests {
 
     #[test]
     fn watch_distinguishes_started_commands_preparation_and_observation_rates() {
-        let value = serde_json::json!({"kind":"array","batch_id":9,"succeeded":1000,"total":2000,"failed":0,"not_run":0,"retried":0,"queued":500,"held":500,"status":"Running","isolation":"reusable-container","active_commands":3,"other_in_flight_attempts":5,"whole_run_successes_per_second":100.0,"rates":{"successes_per_second":500.0,"interval_seconds":2.0}});
+        let value = serde_json::json!({"kind":"array","batch_id":9,"succeeded":1000,"total":2000,"failed":0,"not_run":0,"retried":0,"queued":500,"held":500,"status":"Running","runtime":"shared-runc","active_commands":3,"other_in_flight_attempts":5,"whole_run_successes_per_second":100.0,"rates":{"successes_per_second":500.0,"interval_seconds":2.0}});
         let rendered = format_batch_watch(&value);
         for phrase in [
-            "mode reusable-container",
+            "mode shared-runc",
             "3 active commands",
             "5 other in-flight attempts",
             "since admission 100.0/s",

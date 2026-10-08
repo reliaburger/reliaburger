@@ -280,9 +280,10 @@ blue-green switches, autoscaling on metrics, jobs, cron and batch. Task arrays
 (`relish run --batch`, 0.2.0 development preview) keep repeated image or host
 tasks compact, pack CPU and memory beside apps, and report grouped outcomes
 through Raft. Mixed-profile manifests, rates and indexed detail are described
-in [the batch manual](docs/manual/14_batch-jobs.md). On Linux, runc nodes also
-run allowlisted host commands alongside images. Image jobs can explicitly choose
-bounded reusable containers, retaining their own command process and limits;
+in [the batch manual](docs/manual/14_batch-jobs.md). On Linux, `bun --runtime mixed` enables both owned backends; auto may detect
+both, while explicit `--runtime runc` stays container-only. Jobs use
+`runtime="runc"` by default, `runtime="process"` for allowlisted host commands,
+or `runtime="shared-runc"` for bounded reused containers, retaining their own command process and limits;
 fresh containers remain the default. The [measured container demo](https://reliaburger.com/#job-throughput)
 shows 50,000 accepted successes in 100.73 seconds; [raw evidence](docs/qualification/2026-10-08-job-measurements/README.md)
 records the hardware, failures and limits. Sustained 100m/day throughput still needs

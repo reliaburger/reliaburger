@@ -95,3 +95,24 @@ model workers remain #641, and GPU support remains #359.
 
 See [development evidence](../qualification/2026-10-07-reusable-job-executors.md)
 for actual hardware, raw reports, failures and the limits of each comparison.
+
+
+## Review revision (8 October)
+
+Use a single explicit job `runtime`: `runc` by default, `process` for
+allowlisted host commands, and `shared-runc` for a reused OCI executor.
+Reject process jobs with an image and container jobs with host exec/script
+fields. Remove the earlier `isolation` API; bump incompatible protocol/state
+formats. Explicit Bun `--runtime runc` selects only runc; `--runtime mixed`
+selects both, and auto may detect both.
+
+Record a real three-tier demonstration: 1,000 fresh container jobs, 10,000
+shared-runc jobs, then 1,000,000 public process jobs, plus a separately measured raw VM
+fork/exec baseline, with their distinct
+contracts labelled and real elapsed pauses retained. Run one hour of public
+dispatch beside a real application, recording accepted successes/failures,
+retries, service latency, resource profiles and memory/storage observations.
+Report missed targets and incomplete bounds. One hour is useful measurement
+evidence, not a 24-hour qualification. Complete the matching runtime gates,
+portable CI and final GitHub checks, update the PR description, then mark
+#654 ready for review as requested.

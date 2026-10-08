@@ -1108,7 +1108,7 @@ establish that result.
 
 ### Short commands in reusable containers
 
-`isolation = "reusable-container"` selects bounded, built-in image executors
+`runtime = "shared-runc"` selects bounded, built-in image executors
 beneath the common job path. Containers are compatible only within a pinned
 image, namespace, credentials and resource profile. Each command starts a
 separate process, born inside its own limited cgroup. Private scratch and IPC

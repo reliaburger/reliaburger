@@ -198,8 +198,9 @@ async fn job_runs_to_completion() {
     let config = Config::parse(
         r#"
         [job.migrate]
-        image = "test:v1"
-        command = ["echo", "migration complete"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = [ "migration complete"]
     "#,
     )
     .unwrap();
@@ -240,8 +241,9 @@ async fn tui_jobs_endpoint_lists_supervisor_job_state() {
     let config = Config::parse(
         r#"
         [job.listed]
-        image = "test:v1"
-        command = ["echo", "done"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = [ "done"]
     "#,
     )
     .unwrap();
@@ -368,8 +370,8 @@ async fn job_failed_retries_then_fails() {
     let config = Config::parse(
         r#"
         [job.broken]
-        image = "test:v1"
-        command = ["false"]
+        runtime = "process"
+        exec = "/bin/false"
     "#,
     )
     .unwrap();
@@ -613,8 +615,9 @@ async fn logs_follow_returns_output_for_completed_job() {
     let config = Config::parse(
         r#"
         [job.echoer2]
-        image = "test:v1"
-        command = ["sh", "-c", "echo follow-line1; echo follow-line2"]
+        runtime = "process"
+        exec = "/bin/sh"
+        command = [ "-c", "echo follow-line1; echo follow-line2"]
     "#,
     )
     .unwrap();
@@ -968,9 +971,8 @@ async fn common_live_follow_tails_the_selected_run_without_replaying_earlier_lin
     let root = tempfile::tempdir().unwrap();
     let ready = root.path().join("ready");
     let release = root.path().join("release");
-    let mut config = Config::parse("[job.live-run]\nimage='test:v1'").unwrap();
+    let mut config = Config::parse("[job.live-run]\nruntime='process'\nexec='/bin/sh'").unwrap();
     config.job.get_mut("live-run").unwrap().command = Some(vec![
-        "/bin/sh".into(),
         "-c".into(),
         format!(
             "echo old-first; echo old-last; touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; echo live-next",
@@ -1031,7 +1033,7 @@ async fn common_live_follow_tails_the_selected_run_without_replaying_earlier_lin
 async fn selected_common_run_logs_are_available_without_a_log_store() {
     let harness = TestHarness::start().await;
     let config = Config::parse(
-        "[job.selected]\nimage='test:v1'\ncommand=['sh','-c','echo selected-output']",
+        "[job.selected]\nruntime='process'\nexec='/bin/sh'\ncommand=['-c','echo selected-output']",
     )
     .unwrap();
     harness.client.apply(&config).await.unwrap();
@@ -1065,9 +1067,7 @@ async fn standalone_apps_and_common_definitions_cannot_share_a_logical_identity(
         .unwrap();
     let result = harness
         .client
-        .apply(
-            &Config::parse("[job.app-first]\nimage='test:v1'\ncommand=['/usr/bin/true']").unwrap(),
-        )
+        .apply(&Config::parse("[job.app-first]\nruntime='process'\nexec='/usr/bin/true'").unwrap())
         .await;
     assert!(
         result.is_err(),
@@ -1075,9 +1075,7 @@ async fn standalone_apps_and_common_definitions_cannot_share_a_logical_identity(
     );
     harness
         .client
-        .apply(
-            &Config::parse("[job.job-first]\nimage='test:v1'\ncommand=['/usr/bin/true']").unwrap(),
-        )
+        .apply(&Config::parse("[job.job-first]\nruntime='process'\nexec='/usr/bin/true'").unwrap())
         .await
         .unwrap();
     harness

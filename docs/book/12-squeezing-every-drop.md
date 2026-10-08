@@ -928,7 +928,7 @@ The roadmap's milestone for this phase reads: port mapping uses O(1) nftables ma
 
 A short command can finish before its container has finished starting. Caching
 image layers helps, but it doesn't remove namespace, network and runtime-owner
-setup. `isolation = "reusable-container"` keeps that setup around for compatible
+setup. `runtime = "shared-runc"` keeps that setup around for compatible
 commands. It's an explicit choice. Ordinary jobs still get a fresh container.
 
 The compatibility key binds the pinned image, namespace, live credentials and
@@ -1084,11 +1084,13 @@ wouldn't have caught this.
 
 ### Selecting the runtime per workload
 
-A node with runc can run host commands alongside containers. The validated
-manifest supplies an internal `host_process` discriminator: `exec` and `script`
-select the owned process backend, while an image selects runc. Routing never
-interprets an image name as a host path and never falls back after a failed
-container launch. Both backends use the node's existing scheduling budget.
+A mixed node can run host commands alongside containers. Jobs first validate
+an explicit `runtime` against their fields: process jobs require `exec` or
+`script` and refuse an image; runc jobs require an image and refuse host fields.
+OCI construction then supplies the internal `host_process` discriminator used
+by the adapter. Routing never interprets an image name as a host path and never
+falls back after a failed container launch. Both backends use the node's
+existing scheduling budget.
 
 The `MixedGrill<C, H>` adapter is generic over the two concrete runtime types.
 Rust monomorphises that type for runc and ProcessGrill in production; portable
@@ -1234,3 +1236,46 @@ that image as a host executable on a mixed node. Those cases keep their
 `ProcessRuntime` gate, while explicit host commands use `exec` or `script` and
 the `ProcessWorkloads` capability. A capability must describe the contract its
 caller actually needs.
+
+
+### Choosing the runtime before interpreting the fields
+
+A job with `runtime = "process"` and an image is contradictory. We now reject
+it before admission. `JobRuntime` is a Rust enum with three alternatives:
+`Runc` (the default), `Process`, and `SharedRunc`. Serde serialises them as
+`runc`, `process`, and `shared-runc`. The selected backend defines which fields
+are valid; the presence of an image no longer chooses the backend. A host job
+needs an explicit process selection and exactly one exec or script. A container
+job needs an image and refuses those host fields. Worker admission and the
+owned runner check that same contract, so a control message cannot bypass it.
+
+Bun's own selection is a separate node policy. Explicit `--runtime runc` now
+constructs `AnyGrill::Runc`; `--runtime mixed` constructs the owned adapter for
+both backends. Auto can still detect the mixed configuration. The regression
+first demonstrated that explicit runc advertised host execution, then checked
+both policies. The job schema and stored definitions changed, so the protocol
+and durable-state generations advance together; pre-1.0 nodes require fresh
+state rather than interpreting an old definition differently.
+
+
+### A baseline and three public job paths
+
+The revised demonstration keeps four measurements separate. First, launch a
+million matching BusyBox `true` processes directly in the VM and count their
+exit statuses. Then submit 1,000 `runc` jobs, 10,000 `shared-runc` jobs and
+1,000,000 `process` jobs through the public API. The process tier still uses
+durable owners, admitted resources, task ledgers, accepted chunk receipts and
+indexed results. It isn't the same contract as the raw baseline.
+
+`record-job-tiers.py` uses one monotonic recording clock across preparation,
+submission, observation and verification. It retains every real pause. Each
+public tier has its own raw manifest, cast, accepted counters, service probes
+and first/middle/last indexed checks. Its aggregate report counts only the
+three public tiers as accepted job successes; the baseline is a separate row.
+The script contract test refuses reordered or missing tiers and an incomplete
+million-task result. Synthetic test records only check the report logic.
+
+The one-hour sustained driver separately records unique accepted outcomes
+while a real application serves requests. A completed hour and a qualified
+100-million-job day are separate booleans. Missing the target remains useful
+evidence; completing an hour cannot satisfy the 24-hour qualification gate.

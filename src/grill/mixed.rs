@@ -591,7 +591,7 @@ mod tests {
         let mut result = crate::grill::oci::generate_job_oci_spec(
             "test",
             "default",
-            &crate::config::Config::parse("[job.worker]\nscript='true'")
+            &crate::config::Config::parse("[job.worker]\nruntime='process'\nscript='true'")
                 .unwrap()
                 .job["worker"],
             "/sys/fs/cgroup/reliaburger/test",

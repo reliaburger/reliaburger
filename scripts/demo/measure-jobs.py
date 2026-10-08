@@ -79,13 +79,13 @@ def display(summary, elapsed):
     recent = summary.get('rates', {}).get('successes_per_second')
     interval = summary.get('rates', {}).get('interval_seconds')
     active = summary.get('active_commands')
-    modes = {cohort.get('isolation', 'unknown') for cohort in summary.get('cohorts', [])}
-    mode = summary.get('isolation', next(iter(modes)) if len(modes) == 1 else
+    modes = {cohort.get('runtime', 'unknown') for cohort in summary.get('cohorts', [])}
+    mode = summary.get('runtime', next(iter(modes)) if len(modes) == 1 else
                        'mixed' if modes else 'unknown')
     return (f"{summary['succeeded']:,}/{summary['total']:,} unique accepted successes in {elapsed:.2f}s "
             f"({summary['succeeded'] / max(elapsed, 1e-9):.1f}/s whole run); "
             f"{summary['failed']} failures, {summary['retried']} retries\n"
-            f"mode {mode}; commands {active if active is not None else 'unknown'}; "
+            f"runtime {mode}; commands {active if active is not None else 'unknown'}; "
             f"queued {summary.get('queued', 'unknown')}, held {summary.get('held', 'unknown')}; "
             f"recent {recent if recent is not None else 'unknown'}/s over "
             f"{interval if interval is not None else 'unknown'}s")

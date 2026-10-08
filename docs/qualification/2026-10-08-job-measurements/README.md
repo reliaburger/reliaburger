@@ -1,5 +1,11 @@
 # Raw job measurements and runtime recovery evidence
 
+These raw measurements use development protocol 49/state 66 and the previous
+`isolation` field. Keep the evidence unchanged. For protocol 50/state 67, use
+[the explicit runtime revision](../2026-10-09-job-runtime-revision/README.md)
+and its current recorder manifests.
+
+
 These are development results from 8 October 2026, not daily throughput
 qualification. Every report retains actual accepted counts and failures. No
 recording compresses wall-clock pauses. See the [evidence narrative](../2026-10-07-reusable-job-executors.md)
