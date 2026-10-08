@@ -62,17 +62,20 @@ of how we got here (28 September, 5 and 6 October).
    holds the workload as recovery-required (research, section 5.6).
 5. Plaintext process dumps stay in bounded no-swap memory and never reach disk.
    Transfers are authenticated and encrypted.
-6. Pre-1.0 rules apply: an incompatible format bumps the compatibility
+6. CRIU runs without root if S21 shows it can, and otherwise in a confined
+   helper that can't see Bun's state or keys. Checkpointing is opt-in per
+   workload and can be switched off per node (research, section 7).
+7. Pre-1.0 rules apply: an incompatible format bumps the compatibility
    generation from the then-current main, with a fresh cluster and no migration
    code.
-7. Host-path apps block drain. `--force` stops them with their data left in
+8. Host-path apps block drain. `--force` stops them with their data left in
    place, and says so.
-8. GPUs, rootless runtimes, automatic rebalancing and cross-architecture restore
+9. GPUs, rootless runtimes, automatic rebalancing and cross-architecture restore
    are out of scope.
-9. The work ships in stages, not as one release (9 October, below). A spike
+10. The work ships in stages, not as one release (9 October, below). A spike
    that fails removes its mode from the series; it never holds back the modes
    that already work.
-10. The book gets a new chapter for this work, written alongside each step.
+11. The book gets a new chapter for this work, written alongside each step.
 
 ## Scope: three stages, each shippable
 
@@ -236,6 +239,9 @@ as "no" for the stage until someone reopens it on purpose.
 
 ### Wave 2: inside stages 1 and 2
 
+S21 (CRIU without root, or a confined helper; research, section 7) runs in the
+same week as S1, because it changes how every dump and restore is invoked.
+
 S13 (consistent filesystem cut), S15 (no-swap staging and key recovery), S8
 (refusal fixtures), S6 (clocks), S17 (test leases) and S14 (credentials) run as
 the first task of the milestone that needs them, within that milestone's week.
@@ -315,6 +321,7 @@ stays a TCP_REPAIR test harness only.
 | S17 | Migration under authenticated test leases; expiry/stop/cleanup at every boundary on both nodes. |
 | S18 | Versioned profile completeness, directional pools and recorded evidence; partial/skip/unknown cannot certify conformance. |
 | S19 | Actual drain followed by source VM shutdown/restart under live traffic, with independent entry/observer topology and no resurrection. |
+| S21 | Can runc drive CRIU unprivileged in the container's user namespace with `CAP_CHECKPOINT_RESTORE` on our spec? If not, prove the confined helper: reduced capabilities, private mount namespace masking Bun's state and keys, cgroup limits, no inherited descriptors. |
 | S20 | Restore from the current appliance kernel and CRIU to the next weekly build's, on both architectures; new-to-old refused unless qualified. Runs at the start of stage 2. |
 
 ## Tests

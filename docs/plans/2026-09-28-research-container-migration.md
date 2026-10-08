@@ -873,6 +873,37 @@ extraction and digest validation. CRIU is new privileged attack surface even
 though Bun already runs rootful runc. Pin/qualify packaging, keep opt-in workload
 scope, and test sandbox/profile compatibility when profiles are added.
 
+**Containing CRIU (added 9 October).** Borg's audit found that a malicious task
+could hijack a root CRIU, which is why Borg ran CRIU as the task's user inside a
+user namespace (section 4). CRIU walks `/proc`, ptraces the task and parses
+state the task arranged, so the workload being dumped is the attacker. The
+stakes are high here: every clustered node currently holds the cluster master
+key and can unwrap the intermediate CA keys
+([security design](../design/security-sesame.md)), so a root escape through CRIU
+is a cluster compromise, not a node compromise. The design:
+
+1. **Prefer CRIU without root.** Spike S21 tests whether runc can drive CRIU in
+   `--unprivileged` mode inside the container's own user namespace, holding only
+   `CAP_CHECKPOINT_RESTORE` (Linux 5.9 and later) plus what TCP repair needs. If it
+   works on our spec, that's the only mode we ship.
+2. **Otherwise, a confined helper.** Each dump or restore runs in a short-lived
+   helper process with its own cgroup (memory and pid limits), a capability
+   bounding set reduced to what CRIU needs, and a private mount namespace that
+   shows the bundle, the no-swap staging directory and `/proc`, and masks Bun's
+   state directory, Raft data and key material. The helper never inherits Bun's
+   file descriptors or credentials.
+3. **Images only from us.** A restore accepts an image only from an
+   authenticated transfer bound to the move manifest and a committed source
+   fence. Images never come from users, registries or Pickle.
+4. **Opt-in, and switchable per node.** CRIU only ever touches workloads whose
+   policy asks for `checkpoint` or `live`. `node.toml` can turn checkpointing off
+   for a node; that node then refuses such moves and reports it in `wtf`.
+5. **Audited and patched.** Every dump and restore is an audit event naming the
+   principal and the move. CRIU is pinned in the guest and appliance images and
+   updated with them; a CRIU CVE is a reason to cut a patch release.
+
+The residual risk of option 2 goes in the manual's security page, in plain words.
+
 `migrate` needs app-scoped deploy permission; both checkpoint **and live** require
 memory/exec-equivalent authority. Drain, node-state faults, force-stop and
 cancelling another principal's move require their current administrative grants.
