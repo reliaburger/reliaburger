@@ -213,6 +213,7 @@ sudo ip netns exec rbdemo dnsmasq --interface=rbdemoveth1 --bind-interfaces --po
     --dhcp-range=10.42.0.100,10.42.0.200,12h --dhcp-option=3,10.42.0.1 \
     --dhcp-host="${MACS[0]},${IPS[0]}" --dhcp-host="${MACS[1]},${IPS[1]}" \
     --dhcp-host="${MACS[2]},${IPS[2]}" \
+    --dhcp-leasefile="${DEMO_WORK}/dnsmasq.leases" \
     --pid-file="${DEMO_WORK}/dnsmasq.pid" --log-dhcp --log-facility="${DEMO_WORK}/dnsmasq.log"
 
 # What `relish image download --dir os` would have saved, from the lab build.
