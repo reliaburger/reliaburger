@@ -523,6 +523,11 @@ enum Command {
         /// for firmware whose network stack misbehaves.
         #[arg(long, value_name = "BUILD", default_value = "snp", value_parser = parse_ipxe)]
         ipxe: reliaburger::relish::netboot::IpxeBuild,
+        /// A DHCP server on this machine hands out the addresses (dnsmasq
+        /// on a lab Mac, image/lab/mac/): answer PXE on UDP 4011 only and
+        /// leave UDP 67 to it. It must send option 60 PXEClient.
+        #[arg(long)]
+        mode_dhcp_proxy: bool,
         /// Trust only this key (ed25519:BASE64) instead of the release keys.
         /// Debug builds only, for tests.
         #[arg(long, hide = true)]
@@ -1132,6 +1137,7 @@ async fn netboot(
     reinstall: bool,
     wipe: Vec<reliaburger::relish::netboot::MacAddress>,
     ipxe: reliaburger::relish::netboot::IpxeBuild,
+    dhcp: reliaburger::relish::netboot::DhcpSetup,
     trust_key: Option<String>,
 ) -> Result<(), reliaburger::relish::RelishError> {
     use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
@@ -1152,6 +1158,7 @@ async fn netboot(
         reinstall,
         wipe,
         ipxe,
+        dhcp,
     })
     .await?;
     Ok(())
@@ -2537,11 +2544,17 @@ async fn main() -> ExitCode {
             reinstall,
             wipe,
             ipxe,
+            mode_dhcp_proxy,
             trust_key,
         } => {
+            let dhcp = if mode_dhcp_proxy {
+                reliaburger::relish::netboot::DhcpSetup::ThisMachine
+            } else {
+                reliaburger::relish::netboot::DhcpSetup::Router
+            };
             netboot(
                 dir, interface, address, http_port, macs, duration, key, reinstall, wipe, ipxe,
-                trust_key,
+                dhcp, trust_key,
             )
             .await
         }
@@ -4219,6 +4232,7 @@ mod tests {
             reinstall,
             wipe,
             ipxe,
+            mode_dhcp_proxy,
             trust_key,
         } = cli.command
         else {
@@ -4232,6 +4246,22 @@ mod tests {
         assert_eq!((key, reinstall, trust_key), (None, false, None));
         assert!(wipe.is_empty());
         assert_eq!(ipxe, reliaburger::relish::netboot::IpxeBuild::Snp);
+        assert!(
+            !mode_dhcp_proxy,
+            "serves beside the LAN's router by default"
+        );
+    }
+
+    #[test]
+    fn netboot_leaves_port_67_to_a_dhcp_server_on_this_machine_when_asked() {
+        let cli = parse(&["relish", "netboot", "os", "--mode-dhcp-proxy"]).unwrap();
+        let Command::Netboot {
+            mode_dhcp_proxy, ..
+        } = cli.command
+        else {
+            panic!("expected netboot");
+        };
+        assert!(mode_dhcp_proxy);
     }
 
     #[test]

@@ -5,7 +5,9 @@
 //! Three small servers share one verified set of files:
 //! - [`dhcp`], a ProxyDHCP on UDP 67 and 4011. It never hands out
 //!   addresses (the LAN's router keeps doing that); it only tells PXE
-//!   firmware which boot file to fetch, and from where.
+//!   firmware which boot file to fetch, and from where. With a DHCP server
+//!   on the same machine ([`DhcpSetup::ThisMachine`]), it answers on 4011
+//!   alone.
 //! - [`tftp`], a read-only TFTP server on UDP 69 for iPXE and a two-line
 //!   `boot.ipxe` that hands over to HTTP.
 //! - [`http`], which serves the installer and the signed disk image, and
@@ -185,6 +187,23 @@ pub enum InterfaceChoice {
     Address(Ipv4Addr),
 }
 
+/// Where the machines get their addresses, which decides the ports the
+/// ProxyDHCP answers on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DhcpSetup {
+    /// Another machine on the LAN, usually its router. The ProxyDHCP
+    /// answers the firmware's broadcasts on UDP 67 beside it, and requests
+    /// on 4011.
+    #[default]
+    Router,
+    /// A DHCP server on this machine, such as dnsmasq on the lab's Mac
+    /// (`--mode-dhcp-proxy`). It owns UDP 67 and puts option 60 `PXEClient`
+    /// in its offers, which sends PXE firmware and iPXE to UDP 4011 on the
+    /// same address (PXE specification 2.1, section 2.2.4), so the
+    /// ProxyDHCP answers on 4011 alone.
+    ThisMachine,
+}
+
 /// Everything `relish netboot` needs to start.
 #[derive(Debug, Clone)]
 pub struct NetbootOptions {
@@ -206,6 +225,8 @@ pub struct NetbootOptions {
     pub wipe: Vec<MacAddress>,
     /// The iPXE build PXE firmware gets.
     pub ipxe: IpxeBuild,
+    /// Where the machines get their addresses.
+    pub dhcp: DhcpSetup,
 }
 
 /// Why `relish netboot` refused to start or stopped.
@@ -225,6 +246,10 @@ pub enum NetbootError {
         "another netboot server ({server}) already answers PXE requests on this network; stop it first, or the two race to boot every machine"
     )]
     CompetingServer { server: Ipv4Addr },
+    #[error(
+        "--mode-dhcp-proxy expects this machine's DHCP server to be the only one on {interface}, but {server} hands out addresses there too, and machines that take its offer never ask relish. Drop --mode-dhcp-proxy to serve beside that router, or take the lab off its network"
+    )]
+    AnotherDhcpServer { server: Ipv4Addr, interface: String },
     #[error("{0}")]
     Interface(String),
     #[error(
