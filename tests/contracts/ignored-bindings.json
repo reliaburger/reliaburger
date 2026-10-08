@@ -1430,19 +1430,19 @@
   {
     "source": "tests/owned_task_arrays.rs",
     "function": "runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
-    "binary": "owned_task_arrays",
+    "binary": "reliaburger::owned_task_arrays",
     "test": "runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources"
   },
   {
     "source": "tests/owned_task_arrays.rs",
     "function": "runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
-    "binary": "owned_task_arrays",
+    "binary": "reliaburger::owned_task_arrays",
     "test": "runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners"
   },
   {
     "source": "tests/owned_task_arrays.rs",
     "function": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
-    "binary": "owned_task_arrays",
+    "binary": "reliaburger::owned_task_arrays",
     "test": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets"
   }
 ]

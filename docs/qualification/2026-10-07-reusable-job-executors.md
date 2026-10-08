@@ -447,3 +447,20 @@ recorded optimised throughput binaries precede this final capability-reporting
 correction; executor, admission, inventory and recovery execution code is
 unchanged. Their actual binary hashes and timing reports remain the evidence,
 not a new measurement attributed to the later report-only fix.
+
+
+## Final GitHub evidence binding correction (8 October)
+
+[Run 37748296010](https://github.com/reliaburger/reliaburger/actions/runs/37748296010)
+passed all execution owners: Linux portable coverage (86.08% lines), macOS,
+rootless adoption, strict OCI interruptions, the complete privileged Linux
+gate, cluster, acceptance, both upgrade gates and standard registry clients.
+Its final ignored-test evidence aggregation failed because three newly added
+executor cases used `owned_task_arrays` in the reviewed binding table instead
+of Cargo's exact `reliaburger::owned_task_arrays` binary ID. The uploaded
+Linux owner's actual discovery and successful completion include all three
+cases under the latter ID. The table now matches that observed identity; no
+selector, test, ownership rule or evidence consumer changed. A local source
+identity check reproduced all three refusals before correction and none after.
+The next pushed run must still pass every selected owner and final aggregation;
+this failed aggregate is retained as a failure, not counted as a qualified run.
