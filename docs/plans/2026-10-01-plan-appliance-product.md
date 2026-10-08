@@ -122,7 +122,7 @@ What was built, and (in italics) what the original plan had that wasn't:
 - **Tests:**
   - unit tests for every rollout transition, the slot (a signed release staged end to end from a local server, a wrongly signed one refused, fallback detection), the Raft guards, the scheduler cordon, the routes' authz and the renderers;
   - `image/tests/os-update.sh` in the appliance workflow: lab builds build a second image one version on, and a seeded node updates to it through `relish os upgrade`.
-  - *Not built yet, and in scope since 7 October 2026:* a CI fallback test with a broken image. The lab did it by hand (book, "Three tries, then fall back"), and `after_boot` is unit-tested. `os-stage` stays for the runbook's hand-staged test.
+  - `image/tests/os-update.sh --fallback` in the same job (in scope since 7 October 2026): lab builds also build a broken version, two on, whose bun never starts, signed with the run's key. A seeded node is rolled onto it, fails three counted boots, falls back by itself, and the rollout pauses on the fallback bun reports. The step summary records how long the fallback took. `os-stage` stays for the runbook's hand-staged test, which now stages the same run's broken version.
 
 ### W7. Docs, lab and the exit test (~1.5 weeks, then the hardware), [#407](https://github.com/reliaburger/reliaburger/issues/407)
 

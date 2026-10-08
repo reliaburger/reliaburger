@@ -146,15 +146,17 @@ Stage the next build with `--update`, then roll it node by node, leader last:
 
 Then it reboots the node and waits until the node is back on the new version with `boot-complete.target` reached. That's when `systemd-bless-boot` marks the new UKI good.
 
-For the bad update, build an image whose bun never starts, stage it the same way, and don't wait:
+For the bad update, build an image whose bun never starts, stage it the same way, and don't wait. A dispatch needs the workflow on `main`; until then, a throwaway draft pull request that adds an empty `image/spike-broken-bun` does the same. The broken run must come at least two runs after the one the nodes run, so its version sorts above that run's next version:
 
 ```sh
-gh workflow run appliance.yml --ref feat/appliance-image -f broken_bun=true
+gh workflow run appliance.yml --ref main -f broken_bun=true
 ./stage-artefacts.sh <broken-run-id> aarch64 <broken-version> --update
 NOWAIT=1 ./os-update.sh 192.168.105.105 <broken-version>
 ```
 
-Each of its three tries waits up to 300 s for bun before the boot check reboots it. After the third, systemd-boot falls back to the previous UKI and slot. Watch it with `./show.sh rb5.serial.log`.
+`stage-artefacts.sh --update` serves the broken run's own key beside it, which `os-update.sh` hands to `os-stage`. Each of the three tries waits up to 120 s for bun before the boot check reboots it. After the third, systemd-boot falls back to the previous UKI and slot. Watch it with `./show.sh rb5.serial.log`.
+
+On x86_64 there's no need for a second run: every lab build carries a broken version of its own in `appliance-x86_64-next`, signed with its key, and CI's "OS fallback" step rolls it out and times the fallback (`image/tests/os-update.sh --fallback`).
 
 `keeper.toml` is a small app with a managed volume that appends a line every time it starts. Deploy it before an update to check that volume data survives.
 

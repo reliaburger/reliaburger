@@ -1,35 +1,61 @@
 #!/bin/bash
 # bun rolls an OS update (x86-64, KVM): run by .github/workflows/appliance.yml
-# on lab builds, which build a second, newer version for it.
+# on lab builds, which build a second, newer version for it, and a third,
+# broken one for the fallback.
 #
-#   os-update.sh <artefact dir> <version> <release tree> <next version> <relish>
+#   os-update.sh <artefact dir> <version> <release tree> <target> <relish> [--fallback]
 #
 # One appliance on the bridge LAN forms a cluster from its seed, on
 # <version>, on a 7.25 GiB disk (disk.sh). The runner serves <release tree>,
-# which lab-release.sh laid out like GitHub releases: <next version> in
+# which lab-release.sh laid out like GitHub releases: the next version in
 # …/releases/download/os-<next>-x86_64/ beside the lab channel in
-# …/os-channel/, all signed with the throwaway key both images carry. It's
-# what the run uploads as appliance-x86_64-next, so the test serves exactly
-# what the lab gets. `relish os upgrade` starts the rollout; the node
-# drains, stages the release, lets systemd-sysupdate write the spare slot,
-# reboots into it and passes its boot checks. The test passes when the
-# rollout completes and the node is healthy on <next version>.
+# …/os-channel/ (and the broken version beside it), all signed with the
+# throwaway key the images carry. It's what the run uploads as
+# appliance-x86_64-next, so the test serves exactly what the lab gets.
+# `relish os upgrade <target>` starts the rollout; the node drains, stages
+# the release, lets systemd-sysupdate write the spare slot and reboots into
+# it.
+#
+# Without --fallback, <target> is the next version, which the channel names:
+# the test passes when the rollout completes and the node is healthy on it.
+#
+# With --fallback, <target> is the broken version, whose bun never starts
+# (image/tests/broken-bun). Each of its three counted boots fails the boot
+# check and reboots; then systemd-boot falls back to <version> by itself.
+# The test passes when the node is healthy on <version> again, never was on
+# <target>, and the rollout has paused on the fallback bun reported. It
+# records how long the fallback took, from the reboot into <target> to bun
+# healthy on <version>: the Wyse exit test needs 10 minutes or less (S5).
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
 # shellcheck source=image/tests/disk.sh
 . "$(dirname "$0")/disk.sh"
-usage="usage: os-update.sh <artefact dir> <version> <release tree> <next version> <relish>"
+usage="usage: os-update.sh <artefact dir> <version> <release tree> <target> <relish> [--fallback]"
 out=$(cd "${1:?$usage}" && pwd)
 version=${2:?$usage}
 tree=$(cd "${3:?$usage}" && pwd)
-next=${4:?$usage}
+target=${4:?$usage}
 relish=$(readlink -f "${5:?$usage}")
-# The lab channel names the version the node updates to, signed with the
-# run's throwaway key (lab-signing-key.pub.pem, beside it). relish reads it
-# with --key, so `relish os list` must name $next as the newest, and the
-# upgrade takes the newest without naming it, as the Wyse lab does.
-grep -q "\"version\":\"$next\"" "$tree/releases/download/os-channel/os-channel.json" \
-    || { echo "os-update.sh: the lab channel doesn't name $next" >&2; exit 1; }
+mode=update
+case "${6:-}" in
+    "") ;;
+    --fallback) mode=fallback ;;
+    *) echo "$usage" >&2; exit 2 ;;
+esac
+if [ "$mode" = update ]; then
+    # The lab channel names the version the node updates to, signed with the
+    # run's throwaway key (lab-signing-key.pub.pem, beside it). relish reads
+    # it with --key, so `relish os list` must name it as the newest, and the
+    # upgrade takes the newest without naming it, as the Wyse lab does.
+    grep -q "\"version\":\"$target\"" "$tree/releases/download/os-channel/os-channel.json" \
+        || { echo "os-update.sh: the lab channel doesn't name $target" >&2; exit 1; }
+else
+    # The channel doesn't name the broken version, so the upgrade names it,
+    # and a named version takes no --key: relish reads no channel for it,
+    # and the node checks the release against its own image's key.
+    [ -f "$tree/releases/download/os-$target-x86_64/reliaburger-os_$target.SHA256SUMS.sig" ] \
+        || { echo "os-update.sh: no signed release for $target in $tree" >&2; exit 1; }
+fi
 key="$tree/lab-signing-key.pub.pem"
 work=$(mktemp -d)
 mac=52:54:00:42:00:31
@@ -84,20 +110,68 @@ wait_for() {
     until "$@" >/dev/null 2>&1; do
         [ "$(date +%s)" -lt "$deadline" ] || return 1
         kill -0 "$qemu" 2>/dev/null || return 1
-        sleep 5
+        sleep 2
     done
 }
-healthy_on() { grep -a -q "reliaburger: bun healthy .* on OS $1" "$log"; }
-on_next() { "$relish" os list --channel "$channel" --key "$key" 2>/dev/null | grep -q "solo-1 *$next"; }
-newest_is_next() { "$relish" os list --channel "$channel" --key "$key" | grep -x "Newest OS release: $next" >/dev/null; }
-finished() { "$relish" os status 2>/dev/null | tee "$work/status.txt" | grep -q "to $next: complete"; }
-if wait_for healthy_on "$version" \
-    && newest_is_next \
-    && "$relish" os upgrade --channel "$channel" --key "$key" \
-    && wait_for healthy_on "$next" \
-    && wait_for on_next \
-    && wait_for finished; then
-    result=pass
+# How many times the serial console shows a line matching $1.
+seen() { grep -a -c -e "$1" "$log" 2>/dev/null || true; }
+at_least() { [ "$(seen "$1")" -ge "$2" ]; }
+healthy="reliaburger: bun healthy .* on OS"
+# Unanchored: the serial console ends its lines with \r\n.
+healthy_on() { at_least "$healthy $1" "${2:-1}"; }
+on_next() { "$relish" os list --channel "$channel" --key "$key" 2>/dev/null | grep -q "solo-1 *$target"; }
+newest_is_next() { "$relish" os list --channel "$channel" --key "$key" | grep -x "Newest OS release: $target" >/dev/null; }
+finished() { "$relish" os status 2>/dev/null | tee "$work/status.txt" | grep -q "to $target: complete"; }
+# bun on <version> reads os-update.json, finds it isn't on <target> and says
+# so; the leader (the same node) pauses the rollout on it.
+paused() {
+    "$relish" os status 2>/dev/null | tee "$work/status.txt" \
+        | grep -q "paused: solo-1: booted $version instead"
+}
+
+if [ "$mode" = update ]; then
+    if wait_for healthy_on "$version" \
+        && newest_is_next \
+        && "$relish" os upgrade --channel "$channel" --key "$key" \
+        && wait_for healthy_on "$target" \
+        && wait_for on_next \
+        && wait_for finished; then
+        result=pass
+    fi
+    outcome="$result"
+    title="OS update $version → $target"
+else
+    # Each boot starts the kernel afresh, so its banner counts them: one
+    # before the update, three tries of <target>, one back on <version>.
+    t_upgrade='' t_reboot='' t_back=''
+    if wait_for healthy_on "$version" \
+        && "$relish" os list --channel "$channel" --key "$key" \
+        && "$relish" os upgrade "$target" --channel "$channel" \
+        && t_upgrade=$(date +%s) \
+        && wait_for at_least "Linux version" 2 \
+        && t_reboot=$(date +%s) \
+        && wait_for healthy_on "$version" 2 \
+        && t_back=$(date +%s) \
+        && wait_for paused; then
+        result=pass
+    fi
+    tries=$(seen "reliaburger: bun not healthy after [0-9]* s on OS $target")
+    on_broken=$(seen "$healthy $target")
+    boots=$(seen "Linux version")
+    # Three failed tries, never healthy on the broken version: anything
+    # else isn't the fallback this test is for.
+    if [ "$result" = pass ] && { [ "$tries" -ne 3 ] || [ "$on_broken" -ne 0 ]; }; then
+        result=fail
+    fi
+    outcome="$result: $tries failed tries, $boots boots"
+    if [ -n "$t_back" ]; then
+        fallback=$((t_back - t_reboot))
+        outcome="$outcome, fell back in ${fallback} s ($((fallback / 60)) min $((fallback % 60)) s) from the reboot into $target, $((t_back - t_upgrade)) s from \`relish os upgrade\`"
+        if [ "$fallback" -gt 600 ]; then
+            echo "::warning::the fallback took ${fallback} s, more than the 10 minutes the Wyse exit test allows"
+        fi
+    fi
+    title="OS fallback $version → $target → $version"
 fi
 elapsed=$(( $(date +%s) - start ))
 echo "--- serial console ---"
@@ -105,10 +179,10 @@ cat "$log" || true
 echo "--- release server ---"
 cat "$work/http.log" || true
 {
-    echo "### OS update $version → $next: $result after ${elapsed} s"
+    echo "### $title: $outcome; ${elapsed} s in all"
     echo '```'
     cat "$work/status.txt" 2>/dev/null || true
-    grep -a -h -e "reliaburger:" -e "os update" "$log" | grep -v "reliaburger: journal:" || true
+    grep -a -h -e "reliaburger: bun" -e "reliaburger: counted boot" -e "os update" "$log" || true
     echo '```'
-} >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+} | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}" # the log too, which the API serves
 [ "$result" = pass ]
