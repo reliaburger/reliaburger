@@ -197,7 +197,8 @@ a USB-C or Thunderbolt Ethernet adapter, and a few things are different:
 ### A lab of its own
 
 The lab we built this for keeps the machines off the home network: a Mac on a
-USB-C Ethernet adapter, a gigabit switch, ten Dell Wyse 3040s, and a
+USB-C Ethernet adapter, a gigabit switch, Dell Wyse 3040s (three for the
+release gate, ten in the full lab), and a
 Raspberry Pi as the router.
 
 ```
