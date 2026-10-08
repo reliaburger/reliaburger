@@ -1,7 +1,8 @@
 # Research: moving a running container between nodes (0.4.0)
 
 28 September 2026; revised 6 and 9 October 2026. Research and the design
-reference, with no product code. Release: **0.4.0, "Full container migration"**.
+reference, with no product code. Releases: **0.4.0 and 0.4.1, "Full container
+migration"**, and **0.5.0, live moves** (9 October).
 
 **What to build, and in what order, is in the delivery plan:
 [Plan: moving running workloads](2026-10-09-plan-container-migration.md).**
@@ -639,7 +640,7 @@ addresses and fence flows, use authenticated/protected inter-node transport, and
 prove packet-lock ordering. It does not meet source independence: source failure
 breaks sessions, and expiring a ten-minute window resets survivors. It may be
 reported as a weaker experimental outcome if explicitly requested, but cannot
-pass live conformance or unblock the 0.4.0 continuity release gate. Test second
+pass live conformance or unblock the 0.5.0 live-move release gate. Test second
 and subsequent moves to rule out forwarding chains and stale tuple leases.
 
 **Publication and withdrawal.** Prepare target network/firewall state before
@@ -1306,7 +1307,7 @@ The normal migration profile establishes planned-move behaviour while the source
 is available and validates dependency receipts. **Full cluster migration conformance
 also requires the recovery/source-shutdown qualification below**; a normal-profile
 pass alone must say source shutdown was not exercised. Fold non-disruptive cases
-into 0.4.0's `full-runc` acceptance and include all tiers in the release gate.
+into the release's `full-runc` acceptance and include all tiers in the release gate.
 
 ### 9.5 Recovery conformance and the source-off test
 

@@ -1,7 +1,7 @@
 # Plan: moving running workloads between nodes
 
-9 October 2026. Release series: 0.4. Pull request:
-[#268](https://github.com/reliaburger/reliaburger/pull/268). Milestone:
+9 October 2026. Releases: 0.4.0, 0.4.1 and 0.5.0. Pull request:
+[#268](https://github.com/reliaburger/reliaburger/pull/268). GitHub milestone:
 [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7).
 
 This is the delivery plan: what we'll build, in what order, and which tests
@@ -72,7 +72,8 @@ of how we got here (28 September, 5 and 6 October).
    place, and says so.
 9. GPUs, rootless runtimes, automatic rebalancing and cross-architecture restore
    are out of scope.
-10. The work ships in stages, not as one release (9 October, below). A spike
+10. The work ships in three stages and releases, 0.4.0, 0.4.1 and 0.5.0, not as
+   one release (9 October, below). A spike
    that fails removes its mode from the series; it never holds back the modes
    that already work.
 11. The book gets a new chapter for this work, written alongside each step.
@@ -92,11 +93,11 @@ rather than preserve them.
 So we ship in three stages. Each stage is useful on its own, has its own exit
 test, and never weakens the contract of the stage before it.
 
-| Stage | What the operator gets | Modes | Exit test |
+| Stage (release) | What the operator gets | Modes | Exit test |
 |---|---|---|---|
-| 1. Planned maintenance | Cordon, drain and uncordon. Restartable workloads reschedule; volume apps carry their data; memory-only apps keep their memory. Connections close and clients reconnect. | `cold`, `checkpoint` | Drain a node running a memory-only Redis and a volume app; both come back on another node with every acknowledged write, and the drained node holds nothing. |
-| 2. Maintenance without downtime | The appliance's A/B OS update drains, reboots and uncordons each node in turn, moving workloads ahead of the reboot. | `cold`, `checkpoint` | A rolling OS update of a three-node cluster keeps Redis's data and a volume app's data across every reboot. |
-| 3. Live moves | Moves that keep established connections and meet an interruption budget, with no dependency left on the source. | `live` | The research's source-off test (section 9.5) with Redis and PostgreSQL. |
+| 1. Planned maintenance (0.4.0) | Cordon, drain and uncordon. Restartable workloads reschedule; volume apps carry their data; memory-only apps keep their memory. Connections close and clients reconnect. | `cold`, `checkpoint` | Drain a node running a memory-only Redis and a volume app; both come back on another node with every acknowledged write, and the drained node holds nothing. |
+| 2. Maintenance without downtime (0.4.1) | The appliance's A/B OS update drains, reboots and uncordons each node in turn, moving workloads ahead of the reboot. | `cold`, `checkpoint` | A rolling OS update of a three-node cluster keeps Redis's data and a volume app's data across every reboot. |
+| 3. Live moves (0.5.0) | Moves that keep established connections and meet an interruption budget, with no dependency left on the source. | `live` | The research's source-off test (section 9.5) with Redis and PostgreSQL. |
 
 Stage 3 starts only after spike S11 says yes (see the go/no-go rules in the
 spikes). If they say no, live moves come off the roadmap rather than holding
@@ -244,23 +245,23 @@ as "no" for the stage until someone reopens it on purpose.
 
 | Spike | Time box | "Yes" means | "No" means |
 |---|---|---|---|
-| S12: partition-safe fencing and activation (built as milestone 0.4.1) | 1 week | A model and property test show at most one generation can run across leader change, partition and Bun restart, using main's existing runtime and storage fences. | No moves ship beyond 0.4.0's drain of restartable workloads. Redesign before going further. |
+| S12: partition-safe fencing and activation (built as the first step of Cold moves) | 1 week | A model and property test show at most one generation can run across leader change, partition and Bun restart, using main's existing runtime and storage fences. | No moves ship beyond the Drain milestone. Redesign before going further. |
 | S-A: S1 + S5 + S21, restore on our real spec | 1 week | `runc checkpoint`/`restore` round-trips a container with our rootful user namespace, external network namespace and private overlay, the runtime owner adopts it (S5), and CRIU runs unprivileged or in the confined helper (S21), on x86_64 and on the arm64 Lima guest. | Checkpoint mode is dropped; stage 1 ships cold moves only. |
 | S-B: S2 + S4, capture streams and egress ordering | 1 week | Capture files keep ingesting across restore (S2), and the restored workload can't run an instruction before its cgroup egress policy is enforced (S4). | S2: checkpoint waits for owner-managed pipes. S4: workloads with egress policy refuse checkpoint moves. |
 
 ### Wave 2: inside stages 1 and 2
 
-S13 (consistent filesystem cut, 0.4.2 and 0.4.3), S15 (no-swap staging and key
-recovery, 0.4.6), S8 (refusal fixtures, 0.4.7), S6 (clocks, 0.4.5), S17 (test
-leases, 0.4.8) and S14 (credentials, 0.4.12) run as the first task of the
-milestone named, within that milestone's week.
+S13 (consistent filesystem cut, Cold moves), S15 (no-swap staging and key
+recovery), S8 (refusal fixtures) and S6 (clocks, all Checkpoint moves), S17 (test
+leases, Drain that keeps state) and S14 (credentials, Moves across updates) run
+as the first task of the step that needs them, within that step's week.
 Until S14 picks a credential path, apps that hold a workload identity
 certificate refuse checkpoint moves rather than restoring a key we then revoke.
 
 S20 (restore across kernel and CRIU versions) runs at the start of stage 2; if
 it fails, stage 2 ships drain with cold moves only for mixed-kernel rollouts.
 
-### Wave 3: does stage 3 exist? (after stage 2 ships)
+### Wave 3: does stage 3 (0.5.0) exist? (after 0.4.1 ships)
 
 | Spike | Time box | "Yes" means | "No" means |
 |---|---|---|---|
@@ -268,7 +269,7 @@ it fails, stage 2 ships drain with cold moves only for mixed-kernel rollouts.
 | S7 + S9: interruption envelope | 1 week | On both architectures, a 256 MiB Redis moves with a client-observed pause we're willing to print in the manual (target: under a second on x86_64 with pre-copy, under three on arm64 without it). | Live mode ships only where the envelope holds; elsewhere `live` is refused. |
 
 S10 (lazy pages), S16 (database fixtures), S18 (conformance completeness) and S19
-(source-off) follow inside stage 3's milestones.
+(source-off) follow inside 0.5.0's milestones.
 
 ### The network design S11 tests
 
@@ -364,9 +365,11 @@ cases share observations but use explicit chaos selection and node-state authori
 Wire catalogue, capabilities, lease/authz routes, reports and built-in manual
 consistently; verify the documented commands select real required cases.
 
-**Release/soak:** repeat A->B->A under load with the volume writer, memory-only
-counter and the required Redis/PostgreSQL fixtures; exercise main's recovery
-faults and each database's source-off case. Cover both architectures, every claimed
+**Release/soak:** no separate move soak. "Move" and "drain" become fault kinds
+in the V02 sustained schedule, so the release's existing soak repeats A->B->A
+under load with the volume writer, memory-only counter and the required
+Redis/PostgreSQL fixtures (see "Keeping qualification affordable"); exercise
+main's recovery faults and each database's source-off case. Cover both architectures, every claimed
 backend, ingress/egress
 paths, jobs and credential continuity. Retain acknowledgement/session ledgers,
 per-cutover latencies, generation transitions, fingerprints and cleanup outcomes.
@@ -382,264 +385,291 @@ cluster from `relish test`. Verify signed mechanism and Redis/PostgreSQL fixture
 image availability before timing; support existing mirrors/local staging rather
 than depending on a mutable tag.
 
-## Milestones
+## Releases and milestones
 
-Each milestone is one pull request, sized at about a week for a developer who
-knows the codebase, and each leaves main releasable with a feature someone can
-use or a refusal that's honest. Spike PRs (marked S) carry no version: they land
-a gated test and a qualification record, and their answer decides whether the
-milestones after them go ahead.
+Three releases, one per stage. Inside each release, **milestones** are things
+an operator can use, each with its own exit test, and each milestone is built as
+a few **steps**: pull requests of about a week for a developer who knows the
+codebase, so reviews stay small. Spike PRs carry no release of their own; they
+land a gated test and a qualification record, and decide whether the milestone
+they open goes ahead.
 
-Every milestone follows the project rules: failing tests first, `make ci` plus
-the gated target it touches, the manual (`docs/manual/12_operations.md` for drain
-and moves) and README updated, a compatibility bump from the then-current main
-where formats change, and the new book chapter (working title "Moving day",
-before the Rust appendix) extended in the same PR.
+| Release | Stage | Milestones |
+|---|---|---|
+| 0.4.0 | 1. Planned maintenance | Drain; Cold moves; Checkpoint moves; Drain that keeps state |
+| 0.4.1 | 2. Maintenance without downtime | Moves across updates; Rolling OS updates |
+| 0.5.0 | 3. Live moves | Movable addresses; Live sessions; Live qualification |
 
-| # | Milestone | Stage | Depends on |
-|---|---|---|---|
-| 0.4.0 | Cordon, drain and uncordon for restartable workloads | 1 | — |
-| 0.4.1 | Move records, fencing and cold moves of stateless replicas (S12) | 1 | 0.4.0 |
-| 0.4.2 | Cold moves that carry plain-directory volumes | 1 | 0.4.1 |
-| 0.4.3 | Cold moves for loop-ext4 and Btrfs volumes | 1 | 0.4.2 |
-| S-A | Restore on our real spec, CRIU without root (S1, S5, S21) | 1 | — |
-| S-B | Capture streams and egress ordering on restore (S2, S4) | 1 | S-A |
-| 0.4.4 | CRIU in the images, node capabilities and dry-run | 1 | S-A |
-| 0.4.5 | Checkpoint and restore in place under runtime owners | 1 | 0.4.4, S-B |
-| 0.4.6 | Cross-node checkpoint moves for apps without volumes | 1 | 0.4.1, 0.4.5 |
-| 0.4.7 | Checkpoint moves with volumes, and safe refusals | 1 | 0.4.3, 0.4.6 |
-| 0.4.8 | Drain with migration intent, and the Redis demo | 1 | 0.4.7 |
-| 0.4.9 | Metrics, logs and alerts across moves | 1 | 0.4.8 |
-| 0.4.10 | Checkpoint moves for single-attempt job tasks | 1 | 0.4.8 |
-| 0.4.11 | Recovery and source-off for checkpoint moves | 1 | 0.4.9, 0.4.10 |
-| S-C | Restore across kernel and CRIU versions (S20) | 2 | 0.4.11 |
-| 0.4.12 | Credential continuity (S14) | 2 | 0.4.11 |
-| 0.4.13 | Rolling OS updates with moves | 2 | S-C, 0.4.12, 0.3.0 |
-| 0.4.14 | Conformance profile with PostgreSQL (S18) | 2 | 0.4.13 |
-| S-D | Movable network ownership (S11), two weeks | 3 | 0.4.14 |
-| S-E | Interruption envelope on both architectures (S7, S9) | 3 | S-D |
-| 0.4.15 | Movable workload addresses | 3 | S-D says yes |
-| 0.4.16 | Live moves with inbound sessions | 3 | 0.4.15, S-E |
-| 0.4.17 | Outbound and ingress sessions | 3 | 0.4.16 |
-| 0.4.18 | Pre-copy and interruption budgets | 3 | 0.4.17 |
-| 0.4.19 | Live PostgreSQL and source-off qualification (S16, S19) | 3 | 0.4.18 |
+Live moves get their own minor release because "connections survive" is a
+headline of its own, and because 0.5.0 simply doesn't happen if S11 says no. On
+GitHub, each release is a milestone, each named milestone below is an issue,
+and each step's pull request says "Fixes #N" against it.
 
-That's about 26 developer-weeks in sequence: 14 for stage 1, 4 for stage 2 and 8
-for stage 3. S-A and S-B can run alongside 0.4.0 to 0.4.3 with a second person,
-which brings stage 1 to about 10 weeks. Treat the total as a plan to check
-against, not a promise: the research's estimate was withdrawn for good reasons,
-and the spikes exist to find out what we don't know.
+That's about 26 developer-weeks in sequence: 14 for 0.4.0, 4 for 0.4.1 and 8
+for 0.5.0. With a second person on the spikes, 0.4.0 comes down to about 10.
+Treat the total as a plan to check against, not a promise: the research's
+estimate was withdrawn for good reasons, and the spikes exist to find out what
+we don't know.
 
-Each versioned milestone is release-ready, and the maintainer decides whether
-to tag it. A tag runs the full [release runbook](../releasing.md), including
-the 8-hour soak tier, which is a lot per week. If that's too heavy, merge each
-milestone to main as it lands and tag at the end of each stage (0.4.11, 0.4.14,
-0.4.19), plus any milestone a user is waiting for. Stage exit tests from "Scope"
-run at those tags.
+### Keeping qualification affordable
 
-### Stage 1: planned maintenance
+A release runs the full [release runbook](../releasing.md): a staged install on
+Apple silicon, the V02 fast tier (about 90 minutes) after every round of fixes,
+and one 8-hour final tier. That's affordable three times, not twenty. So:
 
-**0.4.0: cordon, drain and uncordon for restartable workloads.** An operator
-cordon becomes a Raft record, generalising today's upgrade cordon
-(`apply_upgrade_cordon`). `relish cordon`, `relish uncordon`, `relish drain
-<node> [--timeout] [--force]` and `relish drain status` land, behind the
-administrative node-state grant. Drain reschedules replicas that may restart,
-surging before stopping where the app has more than one replica, and requeues
-bulk array tasks with attempts left. Everything it can't move yet (host-path
-apps, managed volumes, single-attempt jobs, `mode = "checkpoint"` or `"live"`)
-blocks the drain with a named reason, and `--force` stops it and says so. Tests
-first: the scheduler places nothing on a cordoned node across leader change; a
-property test shows the drain planner never drops an app below its availability
-budget; a cluster test drains one node of three and uncordons it. Exit: `relish
-drain` empties a quickstart node of restartable workloads and leaves the rest
-named.
+- **A step merges on its tests.** Failing tests first, `make ci` plus the gated
+  target it touches, and anything unfinished refused with a named reason, so main
+  stays releasable as it is today.
+- **The compressed soak runs on main after each step merges**, through the
+  existing `soak.yml` workflow on a hosted runner (90 minutes, no human time).
+  Slow regressions surface while the change is fresh, so a release needs fewer
+  rounds of fixes and fast-tier reruns.
+- **Moves join the V02 soak instead of getting their own.** "Move" and "drain"
+  become fault kinds in the sustained schedule, with Redis and a volume writer
+  among the workloads. The release's existing soak then covers repeated moves
+  under load; the research's separate move soak goes away.
+- **The laptop demo is a release check**, run once per release on the quickstart
+  cluster on Apple silicon and on Linux, not after every step.
 
-**0.4.1: move records, fencing and cold moves of stateless replicas.** This is
-spike S12 done as product code. A `MoveRecord` in Raft carries the move id,
-ownership epoch, logical replica (namespace, app, ordinal), source and target
-generations and phase, following the research's state machine (section 5.6).
-Targets hold an incoming assignment that ordinary reconciliation can't
-duplicate; the source persists a retirement fence in its node journal before it
-reports. `relish move <ns>/<app> --to <node> --mode cold`, `relish move status`
-and `relish move cancel` work for replicas without volumes. Tests first: a
-property test interleaves leader changes, partitions, duplicate and late
-messages and Bun restarts, and checks at most one generation runs and no stale
-replay happens; `tests/suite/` covers a mock restore that runs and then reports
-an error. Exit: a cold move keeps the replica's ordinal and service name. **Go
-or no-go:** if the property test can't be made to hold with main's fences, stop
-and redesign.
+Every step still follows the project rules: the manual
+(`docs/manual/12_operations.md` for drain and moves) and README updated, a
+compatibility bump from the then-current main where formats change, and the new
+book chapter (working title "Moving day", before the Rust appendix) extended in
+the same PR.
 
-**0.4.2: cold moves that carry plain-directory volumes.** Node-to-node chunked
-transfer over the existing node mTLS identity, bound to the move manifest;
-import into a private staging path with path-traversal and link confinement;
-fsync, rename and durable receipt before the volume home switches, atomically
-with activation; a source tombstone labelled with its cut and epoch, kept until
-retention allows deletion. Ownership, modes, xattrs, ACLs, hardlinks, sparse
-files and deletions survive (the plain-directory half of S13). Drain now moves
-cold volume apps. Tests first: crash between each write, rename and
-acknowledgement; a path-traversal manifest is refused. Exit: drain a node running
-a volume app that journals writes; every acknowledged write is on the target.
+### 0.4.0: planned maintenance
 
-**0.4.3: cold moves for loop-ext4 and Btrfs volumes.** Loop-ext4 re-provisions
-the target image and quota bookkeeping; Btrfs uses snapshot and incremental
-`send`/`receive` for pre-sync, then a final send after the stop. Tests first: the
-target quota is enforced after the move; a same-size, same-mtime change is
-caught. Exit: `make test-linux` moves a volume on each backend.
+#### Drain
 
-**S-A: restore on our real spec, and CRIU without root.** `runc checkpoint` and
-`restore` of a container built by today's `RuncGrill`, with the rootful user
-namespace, external network namespace and private overlay (S1), adopted by the
-runtime owner afterwards (S5), on x86_64 and in the arm64 Lima guest. In the
-same week, S21: can CRIU run unprivileged in the container's user namespace? The
-answer picks the invocation for everything after. **Go or no-go** for checkpoint
-mode (see "Spikes").
+`relish cordon`, `relish uncordon`, `relish drain <node> [--timeout] [--force]`
+and `relish drain status`, for workloads that can restart. One step.
 
-**S-B: capture streams and egress ordering on restore.** S2 decides between
-CRIU inherited descriptors and owner-managed pipes for move-enabled apps' stdout
-and stderr. S4 proves the restored workload can't execute before its cgroup
-egress policy is in place, or names the workloads that must refuse.
+An operator cordon becomes a Raft record, generalising today's upgrade cordon
+(`apply_upgrade_cordon`), behind the administrative node-state grant. Drain
+reschedules replicas that may restart, surging before stopping where the app has
+more than one replica, and requeues bulk array tasks with attempts left.
+Everything it can't move yet (host-path apps, managed volumes, single-attempt
+jobs, `mode = "checkpoint"` or `"live"`) blocks the drain with a named reason,
+and `--force` stops it and says so. Tests first: the scheduler places nothing on
+a cordoned node across leader change; a property test shows the drain planner
+never drops an app below its availability budget; a cluster test drains one node
+of three and uncordons it.
 
-**0.4.4: CRIU in the images, node capabilities and dry-run.** A pinned CRIU of
-at least 4.2 joins the guest image and the Linux packages. Each node probes and
-reports its move capabilities (CRIU and runc versions, `criu check`, kernel,
-page size, CPU features, soft-dirty, `userfaultfd`, time namespaces, TCP
-repair) as a pool fingerprint. `node.toml` can switch checkpointing off. `relish
-wtf` shows the capabilities, and `relish move --dry-run` explains, for a given
-app and target, what would move and what refuses. Exit: every quickstart node
-reports its capabilities, and dry-run names the reason for a refused pair.
+**Exit:** `relish drain` empties a quickstart node of restartable workloads and
+names the rest.
 
-**0.4.5: checkpoint and restore in place under runtime owners.** Runtime owners
-learn to checkpoint and restore through the invocation S-A chose, with S-B's
-capture and egress results, time namespaces created at launch for move-enabled
-apps (with S6's cross-host timer checks), adoption after a Bun restart mid-restore, and an audit event per dump and
-restore. No new user command: this is the mechanism the next milestones use.
-Exit: `make test-linux` checkpoints a counter app, restores it on the same node,
-and the counter carries on; a Bun restart during restore resolves to exactly one
-running generation.
+#### Cold moves
 
-**0.4.6: cross-node checkpoint moves for apps without volumes.** The dump goes
-into reserved no-swap staging (S15), travels encrypted and bound to the move
-manifest with the overlay upper directory, and restores on the target at
-activation. TCP connections close, as the checkpoint contract declares. Apps
-holding a workload identity certificate refuse until 0.4.12. `relish move
---mode checkpoint` ships. Tests first: admission refuses a move whose dump
-wouldn't fit in memory; a lost transfer key before activation re-keys rather
-than restarting. Exit: a memory-only counter moves A to B to A on the quickstart
-cluster on both architectures and keeps counting.
+`relish move <ns>/<app> --to <node> --mode cold`, `relish move status` and
+`relish move cancel`, and drain of apps with managed volumes on every backend.
+Three steps.
 
-**0.4.7: checkpoint moves with volumes, and safe refusals.** The final volume cut
-and the memory image share one frozen cut and generation. S8's refusal fixtures
-(io_uring, an attached tracer, a packet-mode pipe, a corked UDP socket) refuse
-with the blocking resource named and the source still running, including a
-resource that appears after admission and is caught at dump time. Exit: a
-volume app with an open file descriptor moves and its writes and file offset
-survive; every refusal fixture leaves its source healthy.
+1. **Move records and fencing** (spike S12 built as product code). A
+   `MoveRecord` in Raft carries the move id, ownership epoch, logical replica
+   (namespace, app, ordinal), source and target generations and phase, following
+   the research's state machine (section 5.6). Targets hold an incoming
+   assignment that ordinary reconciliation can't duplicate; the source persists a
+   retirement fence in its node journal before it reports. Cold moves of replicas
+   without volumes work. Tests first: a property test interleaves leader changes,
+   partitions, duplicate and late messages and Bun restarts, and checks that at
+   most one generation runs and no stale replay happens; `tests/suite/` covers a
+   mock restore that runs and then reports an error. **Go or no-go:** if the
+   property test can't be made to hold with main's fences, stop and redesign;
+   0.4.0 then ships Drain alone.
+2. **Plain-directory volumes.** Node-to-node chunked transfer over the existing
+   node mTLS identity, bound to the move manifest; import into a private staging
+   path with path-traversal and link confinement; fsync, rename and a durable
+   receipt before the volume home switches, atomically with activation; a source
+   tombstone labelled with its cut and epoch, kept until retention allows
+   deletion. Ownership, modes, xattrs, ACLs, hardlinks, sparse files and
+   deletions survive (S13). Tests first: a crash between each write, rename and
+   acknowledgement; a path-traversal manifest is refused.
+3. **Loop-ext4 and Btrfs.** Loop-ext4 re-provisions the target image and quota
+   bookkeeping; Btrfs uses snapshot and incremental `send`/`receive` for
+   pre-sync, then a final send after the stop. Tests first: the target quota is
+   enforced after the move; a same-size, same-mtime change is caught.
 
-**0.4.8: drain with migration intent, and the Redis demo.** Drain follows each
-workload's move policy: checkpoint apps move by checkpoint, memory-only apps
-with no volume included; `live` apps block until stage 3 unless their fallback
-allows checkpoint. Singletons need an explicit availability budget for the
-pause. `relish test --filter move` ships with the Redis fixture, under test
-leases (S17), asserting stage 1's contract: every acknowledged write survives,
-one reconnect per move is reported. Exit: the Redis demo passes on the
-quickstart cluster on Apple silicon and Linux.
+**Exit:** drain a node running a volume app that journals its writes; every
+acknowledged write is on the target, on each backend (`make test-linux`).
 
-**0.4.9: metrics, logs and alerts across moves.** The research's section 8
-design: queries fan out to every node that hosted the app within retention,
-`instance` stays the logical replica, only the declared freeze is excused from
-alerts and health restarts, recovery-required raises a critical alert, and
-move phases appear on the dashboard timeline. Exit: across a move, `relish logs`
-shows lines from both nodes in order and the app's counter series continues; an
-overrunning move fires an alert.
+#### Checkpoint moves
 
-**0.4.10: checkpoint moves for single-attempt job tasks.** A running task moves
-with its run id, task index and attempt intact, and the worker ledgers on both
-nodes record the handover without consuming a retry (#642's model). Drain stops
-blocking on hooks and single-attempt jobs whose policy allows checkpoint.
-Exit: a long-running job task moves mid-computation and finishes once, with one
-accepted result.
+`relish move --mode checkpoint`: memory, execution and filesystem move; TCP
+connections close, as the checkpoint contract declares. Two spikes, then four
+steps.
 
-**0.4.11: recovery and source-off for checkpoint moves.** `relish test --chaos
---profile move-recovery --yes` ships: Bun crashes at each phase, a leader
-change, partition at activation, target loss after acknowledged writes, a late
-duplicate instruction, and the decisive case: drain, stop the source VM, check
-the workload, restart the source and confirm the retired generation can't come
-back. Recovery-required gets its operator view and action. Exit: stage 1's exit
-test, plus the recovery profile on the quickstart cluster. **Tag 0.4.11 as the
-end of stage 1.**
+1. **Spike S-A: restore on our real spec, and CRIU without root.** `runc
+   checkpoint` and `restore` of a container built by today's `RuncGrill`, with
+   the rootful user namespace, external network namespace and private overlay
+   (S1), adopted by the runtime owner afterwards (S5), on x86_64 and in the arm64
+   Lima guest. In the same week, S21: can CRIU run unprivileged in the
+   container's user namespace? **Go or no-go** for this milestone: if it fails,
+   Checkpoint moves drops out and Drain that keeps state uses cold moves only.
+2. **Spike S-B: capture streams and egress ordering.** S2 picks CRIU inherited
+   descriptors or owner-managed pipes for move-enabled apps' stdout and stderr.
+   S4 proves the restored workload can't execute before its cgroup egress policy
+   is in place, or names the workloads that must refuse.
+3. **CRIU in the images, capabilities and dry-run.** A pinned CRIU of at least
+   4.2 joins the guest image and the Linux packages. Each node probes and reports
+   its move capabilities (CRIU and runc versions, `criu check`, kernel, page
+   size, CPU features, soft-dirty, `userfaultfd`, time namespaces, TCP repair) as
+   a pool fingerprint. `node.toml` can switch checkpointing off. `relish wtf`
+   shows the capabilities, and `relish move --dry-run` explains what would move
+   and what refuses.
+4. **Checkpoint and restore in place under runtime owners.** Through the
+   invocation S-A chose, with S-B's capture and egress results, time namespaces
+   created at launch for move-enabled apps (with S6's cross-host timer checks),
+   adoption after a Bun restart mid-restore, and an audit event per dump and
+   restore. Test: `make test-linux` checkpoints a counter app, restores it on the
+   same node and the counter carries on; a Bun restart during restore resolves
+   to exactly one running generation.
+5. **Cross-node, without volumes.** The dump goes into reserved no-swap staging
+   (S15), travels encrypted and bound to the move manifest with the overlay upper
+   directory, and restores on the target at activation. Apps holding a workload
+   identity certificate refuse until Moves across updates. Tests first: admission
+   refuses a move whose dump wouldn't fit in memory; a lost transfer key before
+   activation re-keys rather than restarting.
+6. **Volumes and safe refusals.** The final volume cut and the memory image share
+   one frozen cut and generation. S8's refusal fixtures (io_uring, an attached
+   tracer, a packet-mode pipe, a corked UDP socket) refuse with the blocking
+   resource named and the source still running, including a resource that
+   appears after admission and is caught at dump time.
 
-### Stage 2: maintenance without downtime
+**Exit:** a memory-only counter app moves A to B to A on the quickstart cluster
+on both architectures and keeps counting; a volume app keeps its writes and file
+offset; every refusal fixture leaves its source healthy.
 
-**S-C: restore across kernel and CRIU versions (S20).** Checkpoint on the
-current appliance kernel and CRIU, restore on the next weekly build's, on both
-architectures. The result sets which directions admission allows.
+#### Drain that keeps state
 
-**0.4.12: credential continuity (S14).** Pick and build one path: moving the
-workload's credential with the fenced source, or a reload hook that fetches a
-fresh certificate before the old serial is revoked. The 0.4.6 refusal for apps
-with workload identity lifts. Exit: after a move, the app's existing session
-still works and a fresh authenticated connection succeeds with the new
-certificate.
+Drain follows each workload's move policy, and you can watch it work. Four
+steps.
 
-**0.4.13: rolling OS updates with moves.** The appliance's A/B update drains each
-node with migration intent, prefers targets already on the new image, waits for
-source-independent completion, reboots, checks health and uncordons. A
-recovery-required move pauses the rollout. Directional pool admission from S-C
-applies. Off the appliance, `relish drain` and `relish uncordon` around a manual
-reboot do the same, and the manual shows the loop. Exit: stage 2's exit test.
-Depends on 0.3.0's A/B updates; if they haven't landed, this milestone ships the
-manual loop and the controller follows them.
+1. **Drain with migration intent, and the Redis demo.** Checkpoint apps move by
+   checkpoint, memory-only apps with no volume included; `live` apps block until
+   0.5.0 unless their fallback allows checkpoint. Singletons need an explicit
+   availability budget for the pause. `relish test --filter move` ships with the
+   Redis fixture under test leases (S17), asserting stage 1's contract: every
+   acknowledged write survives and one reconnect per move is reported.
+2. **Metrics, logs and alerts across moves.** The research's section 8 design:
+   queries fan out to every node that hosted the app within retention, `instance`
+   stays the logical replica, only the declared freeze is excused from alerts and
+   health restarts, recovery-required raises a critical alert, and move phases
+   appear on the dashboard timeline.
+3. **Job tasks.** A running single-attempt task moves with its run id, task index
+   and attempt intact, and the worker ledgers on both nodes record the handover
+   without consuming a retry (#642's model). Drain stops blocking on hooks and
+   single-attempt jobs whose policy allows checkpoint.
+4. **Recovery and source-off.** `relish test --chaos --profile move-recovery
+   --yes` ships: Bun crashes at each phase, a leader change, a partition at
+   activation, target loss after acknowledged writes, a late duplicate
+   instruction, and the decisive case: drain, stop the source VM, check the
+   workload, restart the source and confirm the retired generation can't come
+   back. Recovery-required gets its operator view and action. "Move" and "drain"
+   join the V02 soak's fault kinds.
 
-**0.4.14: conformance profile with PostgreSQL.** `relish test --profile move`
-ships with a versioned required-case manifest (S18): a filtered run is reported
-as partial, and missing, skipped or unknown cases fail it. PostgreSQL 18 in
-worker I/O mode joins as a required case: committed writes survive a checkpoint
-move, and clients reconnect. Exit: the profile passes on the quickstart cluster
-and the release lane. **Tag 0.4.14 as the end of stage 2.**
+**Exit, and the 0.4.0 release gate:** stage 1's exit test, the Redis demo and
+the recovery profile on the quickstart cluster on Apple silicon and Linux,
+`relish logs` showing lines from both nodes across a move, a job task finishing
+once after moving mid-computation, and the release runbook's soak with moves in
+its schedule.
 
-### Stage 3: live moves
+### 0.4.1: maintenance without downtime
 
-Stage 3 starts only if S-D says yes.
+#### Moves across updates
 
-**S-D: movable network ownership (S11), two weeks.** Prototype the network design
-above: a routed `/32` per replica with ownership generations, ARP on the L2
-segment, no masquerade, then TCP_REPAIR with packet locking across A to B to A
-with the source switched off. **Go or no-go** for stage 3.
+Moves work between nodes on different appliance builds, and apps with workload
+identity can move. A spike, then one step.
 
-**S-E: interruption envelope (S7, S9).** Measure the client-observed pause for a
-256 MiB Redis on x86_64 with pre-copy and on arm64 without it, and set the
-envelopes the manual will print.
+1. **Spike S-C: restore across kernel and CRIU versions (S20).** Checkpoint on
+   the current appliance kernel and CRIU, restore on the next weekly build's, on
+   both architectures. The result sets which directions admission allows; if it
+   fails, mixed-kernel rollouts use cold moves only.
+2. **Credential continuity (S14).** Pick and build one path: moving the
+   workload's credential with the fenced source, or a reload hook that fetches a
+   fresh certificate before the old serial is revoked. The refusal for apps with
+   workload identity lifts.
 
-**0.4.15: movable workload addresses.** Live-mode replicas get a cluster-unique
-address with a Raft ownership generation; Onion's backend map points at it
-directly instead of node IP and host port; every node routes it via its current
-owner and acknowledges route changes; the owner answers ARP on the L2 segment.
-Exit: with a cold move, the address follows the replica and new connections
+**Exit:** a checkpoint move from an old-build node to a new-build node succeeds,
+the reverse is refused by name, and a moved app's fresh authenticated connection
+succeeds with its new certificate.
+
+#### Rolling OS updates
+
+The appliance updates itself node by node without restarting its singletons.
+Two steps.
+
+1. **The rollout.** The A/B update drains each node with migration intent,
+   prefers targets already on the new image, waits for source-independent
+   completion, reboots, checks health and uncordons. A recovery-required move
+   pauses the rollout. Off the appliance, `relish drain` and `relish uncordon`
+   around a manual reboot do the same, and the manual shows the loop. Depends on
+   0.3.0's A/B updates; if they haven't landed, this step ships the manual loop
+   and the controller follows them.
+2. **The conformance profile, with PostgreSQL.** `relish test --profile move`
+   ships with a versioned required-case manifest (S18): a filtered run is
+   reported as partial, and missing, skipped or unknown cases fail it.
+   PostgreSQL 18 in worker I/O mode joins as a required case: committed writes
+   survive a checkpoint move, and clients reconnect.
+
+**Exit, and the 0.4.1 release gate:** stage 2's exit test, and `--profile move`
+passing on the quickstart cluster.
+
+### 0.5.0: live moves
+
+0.5.0 starts only if S11 says yes.
+
+#### Movable addresses
+
+Live-mode replicas own an address that follows them. A spike, then one step.
+
+1. **Spike S-D: movable network ownership (S11), two weeks.** Prototype the
+   network design above: a routed `/32` per replica with ownership generations,
+   ARP on the L2 segment, no masquerade, then TCP_REPAIR with packet locking
+   across A to B to A with the source switched off. **Go or no-go** for 0.5.0.
+2. **Workload addresses.** A cluster-unique address with a Raft ownership
+   generation; Onion's backend map points at it directly instead of node IP and
+   host port; every node routes it via its current owner and acknowledges route
+   changes; the owner answers ARP on the L2 segment.
+
+**Exit:** with a cold move, the address follows the replica and new connections
 reach it from every node.
 
-**0.4.16: live moves with inbound sessions.** `--tcp-established` with packet
-locking from freeze to activation, and the route switch at activation. `mode =
-"live"` ships for workloads whose sessions are all inbound. The Redis demo adds
-stage 3's assertion: the original connection survives. Exit: the demo passes on
-the quickstart cluster with the same client socket throughout.
+#### Live sessions
 
-**0.4.17: outbound and ingress sessions.** Live workloads send from their own
-address without masquerade, so outbound sessions don't depend on the source's
-NAT table; drain won't call a node source-independent while it still terminates
-required ingress sessions. Exit: an outbound session and an ingress WebSocket
-survive a move followed by switching the source off.
+`mode = "live"`: established connections survive. Two steps.
 
-**0.4.18: pre-copy and interruption budgets.** Iterative pre-dump on hosts with
-soft-dirty tracking, stopping when the dirty set fits the budget, stops
-shrinking or hits a round limit; `max_interruption` in the app's move policy,
-admission against measured throughput, and the observed pause in status and
-events. `relish bench` gains move envelopes. Exit: the S-E Redis meets its
-envelope on x86_64, and arm64 reports its full-copy pause honestly.
+1. **Inbound sessions.** `--tcp-established` with packet locking from freeze to
+   activation, and the route switch at activation, for workloads whose sessions
+   are all inbound. The Redis demo adds stage 3's assertion: the original
+   connection survives.
+2. **Outbound and ingress sessions.** Live workloads send from their own address
+   without masquerade, so outbound sessions don't depend on the source's NAT
+   table; drain won't call a node source-independent while it still terminates
+   required ingress sessions.
 
-**0.4.19: live PostgreSQL and source-off qualification.** PostgreSQL's open
-transaction and in-flight query survive A to B to A on their original sessions,
-and the full recovery profile runs against live moves, source-off included.
-Exit: stage 3's exit test. **Tag 0.4.19 as the end of the series.**
+**Exit:** the Redis demo keeps the same client socket across A to B to A on the
+quickstart cluster, and an outbound session and an ingress WebSocket survive a
+move followed by switching the source off.
+
+#### Live qualification
+
+Live moves meet a stated pause, and PostgreSQL proves the contract. A spike,
+then two steps.
+
+1. **Spike S-E: interruption envelope (S7, S9).** Measure the client-observed
+   pause for a 256 MiB Redis on x86_64 with pre-copy and on arm64 without it,
+   and set the envelopes the manual will print.
+2. **Pre-copy and interruption budgets.** Iterative pre-dump on hosts with
+   soft-dirty tracking, stopping when the dirty set fits the budget, stops
+   shrinking or hits a round limit; `max_interruption` in the app's move policy,
+   admission against measured throughput, and the observed pause in status and
+   events. `relish bench` gains move envelopes.
+3. **Live PostgreSQL and source-off (S16, S19).** PostgreSQL's open transaction
+   and in-flight query survive A to B to A on their original sessions, and the
+   full recovery profile runs against live moves, source-off included.
+
+**Exit, and the 0.5.0 release gate:** stage 3's exit test, the S-E Redis within
+its envelope on x86_64 with arm64's full-copy pause reported honestly.
 
 Lazy pages (S10) aren't scheduled. They only help when pre-copy can't converge,
 and they leave the workload depending on the source until every page arrives,
