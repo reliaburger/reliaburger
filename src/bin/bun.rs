@@ -1034,6 +1034,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             (true, false)
         }
         AnyGrill::Runc(_) => (config.ebpf.enabled, config.ebpf.enabled),
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(runtime) if runtime.container().is_rootless() => {
+            if cli.cluster {
+                anyhow::bail!(
+                    "rootless runc clusters are unsupported; use rootful Linux runc with eBPF for a container cluster"
+                );
+            }
+            (true, false)
+        }
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(_) => (config.ebpf.enabled, config.ebpf.enabled),
         _ => (false, false),
     };
     #[cfg(not(target_os = "linux"))]
@@ -1056,6 +1067,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         AnyGrill::Process(_) => "process",
         #[cfg(target_os = "linux")]
         AnyGrill::Runc(_) => "runc",
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(_) => "runc+process",
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
@@ -3474,17 +3487,18 @@ async fn select_runtime(
                     std::env::current_exe()?,
                 )),
                 #[cfg(target_os = "linux")]
-                DetectedRuntime::Runc { rootless } => AnyGrill::Runc(create_runc_runtime(
+                DetectedRuntime::Runc { rootless } => AnyGrill::with_host_processes(
+                    create_runc_runtime(instances_dir, image_directory, rootless, mirrors)?,
                     instances_dir,
-                    image_directory,
-                    rootless,
-                    mirrors,
-                )?),
+                    std::env::current_exe()?,
+                ),
             };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
                 #[cfg(target_os = "linux")]
                 AnyGrill::Runc(_) => "runc",
+                #[cfg(target_os = "linux")]
+                AnyGrill::Mixed(_) => "runc+process",
                 #[cfg(target_os = "macos")]
                 AnyGrill::Apple(_) => "apple-container",
             };
@@ -3505,7 +3519,11 @@ async fn select_runtime(
             println!("bun: using runc runtime ({mode})");
 
             let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
-            Ok(AnyGrill::Runc(grill))
+            Ok(AnyGrill::with_host_processes(
+                grill,
+                instances_dir,
+                std::env::current_exe()?,
+            ))
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
         other => anyhow::bail!("unknown runtime: {other}"),
@@ -3596,7 +3614,7 @@ async fn prepare_dns_runtime(
 
     let (runtime, nameserver, freebind) = configure_workload_dns(runtime, config.listen_addr)?;
     #[cfg(target_os = "linux")]
-    if let AnyGrill::Runc(grill) = &runtime {
+    if let Some(grill) = runtime.runc_runtime() {
         config.source_namespaces = grill.dns_source_namespaces();
     }
     if config.listen_addr.ip().is_unspecified() {
@@ -3636,6 +3654,18 @@ fn configure_workload_dns(
     use std::net::IpAddr;
 
     match runtime {
+        AnyGrill::Mixed(grill) => {
+            let (configured, nameserver, freebind) =
+                configure_workload_dns(AnyGrill::Runc(grill.container().clone()), listen_addr)?;
+            let AnyGrill::Runc(container) = configured else {
+                anyhow::bail!("DNS changed the selected container backend");
+            };
+            Ok((
+                AnyGrill::Mixed(grill.with_container(container)),
+                nameserver,
+                freebind,
+            ))
+        }
         AnyGrill::Runc(grill) => {
             let Some(gateway) = grill.dns_gateway_address() else {
                 anyhow::bail!(

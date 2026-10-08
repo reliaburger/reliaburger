@@ -220,6 +220,66 @@ identities; every attempt gets a fresh launch. Singleton container roots are
 writable. Larger arrays use a read-only root, temporary scratch and a 1 MiB limit
 per regular output or scratch file (`RLIMIT_FSIZE`).
 
+#On Linux, Bun's `auto` and `runc` modes select the backend per workload.
+Image jobs use runc; authorised `exec` or `script` jobs use the owned process
+backend on the same node. They share scheduling capacity with applications.
+Host commands run with Bun's account privileges and require the existing
+`[process_workloads]` allowlist. Bulk host work also requires
+`mount_isolation = false`. Explicit host CPU/memory limits remain refused;
+container capabilities do not enforce limits or isolation on host commands.
+
+## Reusable containers
+
+For short image commands, select `isolation = "reusable-container"` explicitly
+in the job or profile template. The default remains `fresh-container`.
+
+```toml
+[job.prepare-record]
+image = "registry.example.com/dataset-tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+isolation = "reusable-container"
+command = ["/usr/local/bin/prepare-record", "{index}"]
+cpu = "100m-500m"
+memory = "64Mi-256Mi"
+```
+
+Image admission still pins the image and verifies its trust policy. A worker
+keeps at most 32 compatible containers. The compatibility key includes the
+pinned image, namespace, live credentials and resource profile. Each container
+runs one command at a time, as a separate process. Jobs, arrays, schedules and
+hooks keep their common run identities, retries and durable results.
+
+The command is born in its task cgroup, with independent CPU and memory limits.
+It receives its own mount and IPC namespaces, empty environment before explicit
+image/job variables, and fresh 16 MiB `/tmp` and `/dev/shm` filesystems. Its root
+is read-only; regular files have a 1 MiB size limit. No command receives the
+helper's control descriptors, delegation identity or capabilities. The verified PID-1 helper kills and reaps every descendant; Bun then proves
+the task cgroup empty before another command can use the slot.
+
+PID and network namespaces remain shared with the executor. Use fresh
+containers when that stronger separation matters. Reuse does not keep your
+Python interpreter, model or application process alive between commands.
+Resident inference workers are a separate feature (#641).
+
+An idle container retains its profile request plus 10 millicores and 8 MiB for
+the helper. It yields to waiting requests and expires after one idle second.
+A timeout, cancellation, lost policy or uncertain receipt retires the whole
+container before its resources can be used again. Waiting for a compatible
+slot or resource admission does not consume the command's attempt timeout;
+cold preparation counts after the full profile is reserved. Abandoned ownership remains
+quarantined until recovery retires the original generation. Host execution,
+rootless runtimes and GPU requests cannot select this mode. Kubernetes export
+refuses it because an ordinary Job cannot preserve this contract.
+
+Summaries include `isolation` and `idle_executor_reservation`. Host jobs report
+`host-process`. On rootful Linux runc, memory-limited image jobs disable swap
+in both fresh and reused execution. A job exceeding its RAM limit can be OOM-killed; it cannot silently
+spill into swap and consume unaccounted disk I/O. Choose the memory range for
+the actual working set, including model weights.
+
+Compare accepted-success rates over the whole run and service
+latency alongside launch rates; container reuse alone does not qualify the
+100 million jobs/day target.
+
 Authorised scripts and encrypted environment values use the common path. Workers
 decrypt with live keys for the job's namespace. Decrypted configuration stays
 execution-local; captured output uses normal scoped retention. Host jobs require the owned process runtime, an absolute
@@ -278,3 +338,47 @@ separate definition per index.
 `POST /v1/jobs/definitions/NAME/NAMESPACE/disable` disables future occurrences.
 `POST /v1/jobs/runs/ID/replay` requires `node`, `grant_digest` and
 `acknowledged=true`, under a user credential with current workload permissions.
+
+`relish run --batch` exposes the same choice as manifests:
+
+```sh
+relish run --batch frames --image registry.example/frames@sha256:DIGEST \
+  --isolation reusable-container --count 100000 --cpu 100m --memory 32Mi \
+  -- /app/frame '{index}'
+```
+
+Replace `DIGEST` with the image's full SHA-256 digest. The default is
+`fresh-container`. Host `--exec` commands cannot select container reuse.
+
+The watch summary names the execution mode and separates verified active
+commands from other in-flight attempts (waiting for resources, preparing or
+settling). Reusable executors count a command from its authenticated start
+receipt until positive descendant cleanup. Counts reflect the last node sync;
+unsupported backends show `unknown`, rather than treating a runtime launcher
+or a resource waiter as a running command. A mixed summary is unknown if any
+executing profile cannot supply that receipt. Detail remains indexed and bounded.
+
+Recent accepted-success rates include their observation interval: a completed
+chunk can produce a reporting burst. The since-admission average includes the
+whole admitted run and freezes at its accepted terminal timestamp. It uses UTC
+timestamps at one-second precision; sub-second runs have no such rate. Throughput
+qualification separately times submission through accepted completion with a
+monotonic clock, including work before admission acknowledgement.
+
+To measure and record an actual submission beside a live application:
+
+```sh
+python3 scripts/demo/measure-jobs.py jobs.toml \
+  --relish 'relish --endpoint https://node.example:9443' \
+  --service-url https://app.example/health \
+  --warmth warm-images-cold-executors --output job-measurement
+```
+
+The command writes the submitted manifest, raw summary/service samples, selected
+indexed outcomes, a report and an asciinema recording with the actual pauses.
+The warm/cold label is an operator declaration: record cache preparation beside
+the evidence. `--observe-dir` takes node-local storage directories and reports
+incomplete observations when its bounded traversal is exhausted. This harness
+measures full dispatch; use the same workload, limits and concurrency for the
+separate bare-process, direct-container and direct-durable baselines. The report
+never qualifies 100m/day from a short recording.

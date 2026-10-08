@@ -1441,6 +1441,7 @@ fn pod_to_jobspec(
     };
 
     JobSpec {
+        isolation: Default::default(),
         image: container.and_then(|c| c.image.clone()),
         command,
         schedule: None,

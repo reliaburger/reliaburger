@@ -69,6 +69,16 @@ impl ExecutionBudget {
         let state = self.state.lock().expect("budget poisoned");
         state.capacity.saturating_sub(&state.used)
     }
+    /// Idle executors yield their reservations to queued attempts.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_waiters(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .is_empty()
+    }
     /// Commit all dimensions atomically, or leave the ledger unchanged.
     pub fn try_acquire(self: &Arc<Self>, resources: Resources) -> Option<ResourceLease> {
         let mut state = self.state.lock().expect("budget poisoned");

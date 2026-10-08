@@ -26,6 +26,7 @@ pub mod namespace_keys;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
+pub mod reusable_executor;
 mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;

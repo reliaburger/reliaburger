@@ -1,18 +1,18 @@
 //! The node-side executor for task arrays.
 //!
-//! A task array's tasks are short and numerous, so they skip everything
-//! the ordinary job path does per job: no owner helper, no checkpoint
-//! rewrite, no per-job log files. A [`TaskPool`] runs the tasks of the
+//! A task array checkpoints bounded grant progress and indexed outcomes. Its
+//! production runner retains durable runtime ownership; bulk output is bounded
+//! rather than persisted as ordinary per-job log files. A [`TaskPool`] runs the tasks of the
 //! chunks this node holds through a shared set of slots (a semaphore),
 //! retries failures inside the pool, and hands back per-task
 //! [`TaskRecord`]s plus a per-chunk [`ChunkResult`] for the leader.
 //!
 //! Running a task is behind the [`TaskRunner`] trait, with two
-//! implementations: [`ProcessRunner`] spawns a real host process, and
+//! fixtures: [`ProcessRunner`] spawns a real host process, and
 //! [`FakeRunner`] computes an outcome from the index, for tests and
 //! in-process benchmarks.
 //!
-//! Nothing here is wired into the agent yet; see the million-jobs plan.
+//! The agent uses the owned runtime runner for both singleton and array jobs.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -127,6 +127,22 @@ pub struct Attempt {
 /// A trait because there are two real implementations: the process
 /// runner the node uses, and the fake the tests and benchmarks use.
 pub trait TaskRunner: Send + Sync + 'static {
+    /// Reusable slots retain a profile reservation, including idle time.
+    fn owns_admission(&self, _task: &TaskInvocation) -> bool {
+        false
+    }
+
+    /// Commands whose start was verified and whose cleanup is not yet proved.
+    /// Unknown on backends without a command-level receipt; callers include
+    /// resource wait and preparation, so their count cannot substitute for this.
+    fn active_commands(
+        &self,
+        _batch_id: u64,
+        _template: Option<&crate::config::job::JobSpec>,
+    ) -> impl Future<Output = Option<u64>> + Send {
+        async { None }
+    }
+
     /// Run `task`, killing it after a nonzero `timeout` or when `cancel` fires.
     fn run(
         &self,
@@ -725,7 +741,9 @@ impl<R: TaskRunner> TaskAttempts<R> {
                     ..not_run(index)
                 };
             };
+            let invocation = self.invocation(index, attempt);
             let mut resource_lease = match &self.budget {
+                _ if self.runner.owns_admission(&invocation) => None,
                 Some(budget) => match budget.acquire(self.resources, &self.cancel).await {
                     Some(lease) => Some(lease.quarantine_on_drop()),
                     None => {
@@ -737,7 +755,6 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 },
                 None => None,
             };
-            let invocation = self.invocation(index, attempt);
             self.counters
                 .attempts_started
                 .fetch_add(1, Ordering::Relaxed);

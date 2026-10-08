@@ -1106,6 +1106,24 @@ throughput target remains unqualified until real workloads sustain at least
 failure recovery and bounded memory and storage. A short simulated burst doesn't
 establish that result.
 
+### Short commands in reusable containers
+
+`isolation = "reusable-container"` selects bounded, built-in image executors
+beneath the common job path. Containers are compatible only within a pinned
+image, namespace, credentials and resource profile. Each command starts a
+separate process, born inside its own limited cgroup. Private scratch and IPC
+namespaces disappear with the task; descendants must retire before reuse.
+Fresh containers remain the default. PID and network namespace reuse is an
+explicit trade-off, rather than a new application worker protocol.
+
+Warm executors retain their resource requests and helper overhead while idle.
+They expire quickly and yield to waiting profiles, preserving application
+capacity and FIFO admission. Cancellation or uncertainty retires the original
+container before replacement. The existing allowlisted host-process path also
+avoids container setup, but currently cannot enforce hard CPU/memory limits.
+Neither path removes process creation, durable outcomes or external-effect
+idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
+
 ### AI workloads: resident models and coordinated training
 
 Preparing a million dataset records, running a hundred training experiments

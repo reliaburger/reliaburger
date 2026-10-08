@@ -923,3 +923,177 @@ don't establish 100m accepted successes/day.
 **Say what you didn't do.** Cached upstream images are unsigned and exempt from trust policy — written at the exemption. The registry has no auth, so the loopback warning explains the firewall posture. Rootless proxies don't survive adoption; local-origin traffic bypasses the DNAT map; the whitepaper still describes synchronous replication. Each gap is recorded where a maintainer will trip over it. Honest edges are cheaper than surprises.
 
 The roadmap's milestone for this phase reads: port mapping uses O(1) nftables maps, images download from multiple peers in parallel, logs compress 5× with random-access reads. All true. The truer summary: the paths those words describe now actually exist, end to end, with tests standing on each one.
+
+### Amortising container setup without keeping the application process
+
+A short command can finish before its container has finished starting. Caching
+image layers helps, but it doesn't remove namespace, network and runtime-owner
+setup. `isolation = "reusable-container"` keeps that setup around for compatible
+commands. It's an explicit choice. Ordinary jobs still get a fresh container.
+
+The compatibility key binds the pinned image, namespace, live credentials and
+resource ranges. Commands and indexes don't belong in that key: two commands
+can share the same trusted environment. A credential rotation or a different
+memory limit needs another executor. The pool has at most 32 containers, each
+with one active command. A chunk of a thousand indexes remains a queue.
+
+Bun embeds a small static PID-1 helper, so the image doesn't need another worker
+framework or a particular libc. Rust owns admission, credentials, outcomes and
+retirement. The private Unix connection carries bounded, sequence-bound command
+receipts. Bun verifies the socket peer against the original runtime owner and
+its container init, rather than trusting a PID supplied in a message.
+
+Linux `clone3(CLONE_INTO_CGROUP)` puts a child in its task cgroup at birth. That
+avoids a fork-then-move window in which the command could run outside its limits.
+The helper occupies a sibling cgroup and a separate internal uid. Commands lose
+its capabilities and descriptors, get private mount and IPC namespaces, and
+start with fresh scratch filesystems and explicit environment values. The image
+root stays read-only. PID and network namespaces are shared, which is why this
+mode remains a conscious isolation trade-off.
+
+An exit receipt isn't enough to reuse a slot. The verified container PID 1
+kills and reaps its remaining descendants, then acknowledges cleanup. Bun
+proves the task cgroup empty before reuse. Cancellation or a missing receipt
+retires the entire owned container. Recovery keeps that obligation in the
+original launch intent, including the sibling task cgroup, before another grant
+may replay the work.
+
+Concurrent cold starts found another boundary: runc tried to create a file
+mountpoint for the helper in the shared unpacked image. Two initialisations
+could race, leaving the first jobs failed with `file exists`. The helper now
+executes from an already-populated private bootstrap-directory bind. Runc can
+stat that public static executable before granting its process capabilities;
+the control directory keeps its separate protected uid and mode 0700. The image
+doesn't need a shared helper-file mountpoint. The thousand-command
+common API regression uses zero retries so a startup failure remains visible.
+
+The memory regression found another misleading success. A command allocated
+128 MiB under a 32 MiB `memory.max` and still exited successfully: the VM had
+swap. That limit bounds resident memory, not RAM plus swap. Memory-limited image
+jobs now set `memory.swap.max = 0` in both fresh and reused paths. The per-task
+OOM regression requires a real `memory.events` kill counter, then verifies the
+next command can reuse the surviving helper. This trades swap-assisted survival
+for predictable memory and disk costs, which matters when thousands of tiny
+jobs share capacity with a latency-sensitive service.
+
+There is also a scheduling cost to keeping a container warm. Its profile request
+plus the helper's 10 millicores and 8 MiB stays reserved while idle. The outer
+attempt pool skips its own reservation for this mode, avoiding double charging.
+Idle executors expire after a second and yield when the shared admission queue
+has waiters. Otherwise a busy stream of tiny jobs could keep a large request
+waiting forever while the containers appeared to have no idle cost.
+
+Queueing isn't command execution time. A real regression queued eight 300 ms
+commands for one fitting profile, each with a one-second timeout. Only three
+succeeded when the timer started before borrowing a compatible slot. The timer
+now starts after slot/admission waiting, just as on the fresh path; cold image
+and executor preparation still counts once its profile is reserved. The
+regression requires all eight successes with one attempt each.
+
+Host `exec` and `script` jobs already provide another useful comparison. They
+avoid container setup and keep the common durable lifecycle, but their current
+owned process runtime cannot enforce hard CPU/memory limits. Requests still
+reserve scheduling capacity. The qualification harness must disclose that
+contract rather than present the fastest bare-process number as a container
+result. Reusing a container also doesn't keep a model resident: each command
+still starts a process and loads its own model. That is the separate #641 path.
+
+The [qualification plan](../plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+requires matched launch, durability and dispatch measurements, service latency,
+bounded storage, and a real 24-hour run before claiming 100 million successes
+per day. A fast helper loop can identify overhead. It cannot establish that
+cluster result. The live pool bound also doesn't bound all historical metadata:
+slot identities include the tenant namespace. Rotating through new namespaces
+leaves retired runtime and routing journals to account for. Qualification must
+measure that growth across restarts and prove safe collection, rather than
+multiply the live slot count by one container's footprint.
+
+#### When cleanup killed the next command
+
+The real Linux regression ran two commands through one executor. The first
+finished successfully. The second died with SIGKILL before it could do its
+work. Our cleanup had written `1` to `cgroup.kill`, then reused the empty task
+cgroup. An empty cgroup looked safe. The kernel remembered something we couldn't
+see. We observed it on Ubuntu's `6.8.0-139-generic` kernel with rootful
+runc 1.4.0. Those are the tested versions, not an exhaustive affected range.
+
+Linux uses an internal `kill_seq` counter to catch children born during a
+`cgroup.kill` sweep. On affected kernels, `clone3(CLONE_INTO_CGROUP)` snapshots
+the parent's counter before resolving the destination cgroup, then compares it
+with the destination's counter after the fork. Killing our task cgroup changed
+only one of those counters. Later children could therefore receive SIGKILL even
+though no cleanup raced with their birth. Emptying the group didn't reset the
+counter.
+
+The [upstream fix, `8e3599202166`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/tip/tip/+/8e359920216689b3b79e0fe8961a77fe312a511f),
+committed on 31 August 2026, snapshots the resolved destination's counter. We
+can't assume every deployment has that fix or a distribution backport. A kernel
+version string alone wouldn't establish that either.
+
+Normal reuse now asks our authenticated container PID 1 to call
+`kill(-1, SIGKILL)` inside its verified private PID namespace. Linux excludes
+PID 1 itself; the helper's namespace-local signalling capability covers the
+command's descendants, including a background child which changed its process
+group. The helper reaps them with `waitpid`, acknowledges the matching command
+sequence, and Bun checks `cgroup.events` for `populated 0` before releasing the
+slot. We keep atomic cgroup placement at birth and the independent resource
+limits.
+
+Timeouts, cancellation and uncertain cleanup retire the entire owned container.
+That final retirement may use `cgroup.kill`, but removes the task cgroup before
+any replacement can run. We never reuse a group killed that way. The real
+regression checks that the next command succeeds through the same owned
+container, alongside scratch cleanup and resource limits. A mocked launch
+wouldn't have caught this.
+
+### Selecting the runtime per workload
+
+A node with runc can run host commands alongside containers. The validated
+manifest supplies an internal `host_process` discriminator: `exec` and `script`
+select the owned process backend, while an image selects runc. Routing never
+interprets an image name as a host path and never falls back after a failed
+container launch. Both backends use the node's existing scheduling budget.
+
+The `MixedGrill<C, H>` adapter is generic over the two concrete runtime types.
+Rust monomorphises that type for runc and ProcessGrill in production; portable
+tests use two independent mocks. Its private route journal records the original
+backend before creation. A file lock serialises changes across both backends.
+The adapter moves that lock into a spawned operation, so dropping its caller's
+future does not release authority while a runtime operation can still finish.
+Status and recovery consult the original journal rather than guessing from a
+PID. Changing backend requires positive retirement, including withdrawal of
+any retained container address. Missing or conflicting evidence refuses work.
+A missing route isn't permission to recreate: both original runtime inventories
+must prove the identity absent or positively retired before the adapter writes
+a new selection. The regression deletes that journal while an original owner
+is running and tries all four source/destination combinations. An inventory
+entry whose state is unavailable also refuses replacement.
+
+Host commands still run with the Bun account's authority. The existing allowlist
+and mount-isolation admission rules apply, and explicit CPU or memory limits
+are refused: reserving scheduler capacity does not make ProcessGrill enforce a
+cgroup limit. A mixed node's container capabilities must never be reported as
+isolation or resource enforcement for one of its host workloads.
+
+### Counting commands instead of callers
+
+A task-pool caller can be pulling an image or waiting for resources. Counting it
+as a running command makes a large submission look busier than it is. Reusable
+slots now record the run identity only after the helper's authenticated start
+receipt. They clear it after positive task cleanup or whole-container retirement;
+dropping a future leaves an uncertain slot quarantined and counted. This needs
+only one optional run ID per bounded slot, with no metric label for every index.
+
+The node reports that count alongside its existing in-flight callers. The API
+aggregates known counts; a backend without command-level receipts makes the
+aggregate unknown. That includes fresh containers, whose launcher PID alone
+doesn't prove that the application command started. `relish batch watch` shows
+the mode, verified commands, other in-flight attempts, and the interval of its
+recent accepted-success rate. A chunk-report burst is visible as an observation,
+not silently presented as a sustained rate.
+
+The since-admission rate uses the existing replicated terminal timestamp, so
+reading an old completed run doesn't keep changing its average. Those UTC
+timestamps have one-second precision. Benchmark evidence still needs an
+independent monotonic timer beginning before submission and ending after the
+coordinator has accepted all unique successes.

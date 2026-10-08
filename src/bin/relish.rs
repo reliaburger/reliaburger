@@ -404,6 +404,9 @@ enum Command {
         /// OCI image executed by the owned Linux runtime.
         #[arg(long, required_unless_present = "exec", conflicts_with = "exec")]
         image: Option<String>,
+        /// Fresh container per attempt, or a compatible reusable command container.
+        #[arg(long, value_enum, default_value_t = reliaburger::config::job::ContainerIsolation::FreshContainer)]
+        isolation: reliaburger::config::job::ContainerIsolation,
         /// CPU request-limit range, such as 250m-500m.
         #[arg(long)]
         cpu: Option<String>,
@@ -1926,6 +1929,7 @@ async fn main() -> ExitCode {
         },
         Command::Jobs { definitions } => commands::jobs(definitions, cli.output).await,
         Command::Run {
+            isolation,
             schedule,
             batch,
             count,
@@ -1943,6 +1947,7 @@ async fn main() -> ExitCode {
             args,
         } => {
             commands::run_task_array(commands::TaskArrayRun {
+                isolation,
                 schedule,
                 name: batch,
                 namespace,
@@ -4102,6 +4107,43 @@ mod tests {
         assert!(
             parse(&["relish", "run", "--count", "3", "--exec", "/bin/true"]).is_err(),
             "--batch is required"
+        );
+    }
+
+    #[test]
+    fn parse_run_container_isolation() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "many",
+            "--image",
+            "fixture",
+            "--isolation",
+            "reusable-container",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                isolation: reliaburger::config::job::ContainerIsolation::ReusableContainer,
+                ..
+            }
+        ));
+        assert!(
+            parse(&[
+                "relish",
+                "run",
+                "--batch",
+                "many",
+                "--image",
+                "fixture",
+                "--isolation",
+                "unknown"
+            ])
+            .is_err()
         );
     }
 

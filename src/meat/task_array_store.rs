@@ -1422,6 +1422,7 @@ mod tests {
 
     fn template() -> Box<JobSpec> {
         Box::new(JobSpec {
+            isolation: Default::default(),
             image: None,
             command: None,
             schedule: None,

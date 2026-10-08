@@ -25,7 +25,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
         let require_source = false;
         for record in records {
-            if (require_source
+            if ((require_source
+                && self
+                    .supervisor
+                    .grill()
+                    .honours_cgroup_path_for(&record.oci_spec))
                 || record
                     .app_spec
                     .as_ref()
@@ -45,7 +49,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     "source owner {id} has no original namespace identity"
                 )));
             }
-            if owner.runtime != self.supervisor.grill().runtime_kind() {
+            if owner.runtime
+                != self
+                    .supervisor
+                    .grill()
+                    .runtime_kind_for(&owner.original_spec)
+            {
                 return Err(BunError::AdoptionState(format!(
                     "egress owner {id} belongs to another runtime"
                 )));
@@ -247,7 +256,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if binding.phase != PolicyPhase::Owned
             || binding.boot_id != boot_id
             || cgroup != Some(binding.cgroup_id)
-            || !self.supervisor.grill().honours_cgroup_path()
+            || !self
+                .supervisor
+                .grill()
+                .honours_cgroup_path_for(&binding.original_spec)
         {
             return Err(fail("original runtime cgroup identity is unavailable"));
         }

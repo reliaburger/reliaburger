@@ -7949,6 +7949,60 @@
           ]
         }
       ]
+    },
+    {
+      "id": "issue-639-runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
+      "issue": 639,
+      "promise": "Compatible commands reuse one limited container, clean task state and return idle reservations beside application capacity.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "reusable-runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Conflicting or uncertain original ownership cannot authorise reuse or cross-backend replacement."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate; protocol mocks do not prove cgroup or namespace isolation."
+      ]
+    },
+    {
+      "id": "issue-639-runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
+      "issue": 639,
+      "promise": "One node runs host and image workloads simultaneously and recovers each original backend before a positively retired backend change.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "reusable-runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Conflicting or uncertain original ownership cannot authorise reuse or cross-backend replacement."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate; protocol mocks do not prove cgroup or namespace isolation."
+      ]
     }
   ]
 }

@@ -20,6 +20,12 @@ use crate::grill::cgroup;
 /// are added as later phases require them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OciSpec {
+    /// Internal owned PID-1 executor contract; never an application capability override.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reusable_executor: bool,
+    /// Trusted execution discriminator generated from exec/script, never an image name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_process: bool,
     pub root: OciRoot,
     pub process: OciProcess,
     pub mounts: Vec<OciMount>,
@@ -334,6 +340,8 @@ pub fn generate_oci_spec_with_decryptor(
     let resources = build_resources(spec);
 
     Ok(OciSpec {
+        reusable_executor: false,
+        host_process: spec.exec.is_some() || spec.script.is_some(),
         root: OciRoot {
             // Process workloads (exec/script) use the host root filesystem.
             // Container workloads use the image reference (Apple Container)
@@ -699,9 +707,23 @@ pub fn generate_job_oci_spec(
         spec.command.clone().unwrap_or_default()
     };
 
-    let resources = build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref());
+    let mut resources = build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref());
+    if spec.image.is_some()
+        && spec.exec.is_none()
+        && spec.script.is_none()
+        && spec.memory.is_some()
+        && let Some(resources) = &mut resources
+    {
+        // A command's memory budget must not turn into unaccounted swap I/O.
+        // Use the same contract for fresh and reused image execution.
+        resources
+            .unified
+            .insert("memory.swap.max".into(), "0".into());
+    }
 
     OciSpec {
+        reusable_executor: false,
+        host_process: spec.exec.is_some() || spec.script.is_some(),
         root: OciRoot {
             path: if spec.exec.is_some() || spec.script.is_some() {
                 "proc-grill:host".to_string()
@@ -756,6 +778,8 @@ pub fn generate_init_oci_spec(
     netns_path: Option<&str>,
 ) -> OciSpec {
     OciSpec {
+        reusable_executor: false,
+        host_process: false,
         root: OciRoot {
             path: image.map(String::from).unwrap_or_else(|| {
                 format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
@@ -1542,6 +1566,34 @@ mod tests {
         assert!(json.contains("\"process\""));
         assert!(json.contains("\"linux\""));
         assert!(json.contains("\"namespaces\""));
+    }
+
+    #[test]
+    fn image_jobs_with_memory_limits_cannot_spill_into_swap() {
+        for isolation in [
+            crate::config::job::ContainerIsolation::FreshContainer,
+            crate::config::job::ContainerIsolation::ReusableContainer,
+        ] {
+            let mut spec = minimal_job();
+            spec.isolation = isolation;
+            spec.memory = Some(crate::config::types::ResourceRange {
+                request: 16 << 20,
+                limit: 32 << 20,
+            });
+            let generated = generate_job_oci_spec("work", "default", &spec, "/cg", None);
+            assert_eq!(
+                generated
+                    .linux
+                    .resources
+                    .unwrap()
+                    .unified
+                    .get("memory.swap.max")
+                    .map(String::as_str),
+                Some("0")
+            );
+        }
+        let generated = generate_job_oci_spec("work", "default", &minimal_job(), "/cg", None);
+        assert!(generated.linux.resources.is_none());
     }
 
     // -- generate_job_oci_spec ------------------------------------------------

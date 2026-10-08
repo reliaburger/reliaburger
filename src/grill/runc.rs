@@ -170,6 +170,11 @@ impl RuncGrill {
     /// The image store this runtime pulls through. Clones share the
     /// cluster-source slot, so installing a source on the returned
     /// handle affects this grill's pulls.
+    /// Bounded private helper/socket sources alongside owned bundles.
+    pub(crate) fn executor_directory(&self) -> PathBuf {
+        self.bundle_base.join(".executors")
+    }
+
     pub fn image_store(&self) -> &ImageStore {
         &self.image_store
     }
@@ -618,6 +623,10 @@ impl super::Grill for RuncGrill {
     /// Root-mode runc joins the exact cgroup v2 path from the OCI spec's
     /// `cgroupsPath`, so the agent can program egress before `start`.
     /// Rootless runc may not own the cgroup tree — decline there.
+    fn reusable_runtime(&self) -> Option<Self> {
+        (!self.rootless).then(|| self.clone())
+    }
+
     fn honours_cgroup_path(&self) -> bool {
         !self.rootless
     }
@@ -806,6 +815,8 @@ mod tests {
         .unwrap();
         let id = InstanceId("rootless-writable".to_string());
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "invalid.example/reliaburger/no-pull:latest".to_string(),
@@ -866,6 +877,8 @@ mod tests {
         ).unwrap()).unwrap();
         let id = InstanceId(format!("capacity-{}", std::process::id()));
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "./rootfs".into(),
@@ -929,6 +942,8 @@ mod tests {
         .unwrap();
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 // Use a path (not an image ref) to skip the image pull step
@@ -1021,6 +1036,8 @@ mod tests {
         }
         let _network_cleanup = TestNetworkCleanup(ids.to_vec());
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1179,6 +1196,8 @@ mod tests {
 
         let spec_for =
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
+                reusable_executor: false,
+                host_process: false,
                 port_mapping: None,
                 root: crate::grill::oci::OciRoot {
                     path: ALPINE_IMAGE.to_string(),
@@ -1343,6 +1362,8 @@ mod tests {
         )
         .unwrap();
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1401,6 +1422,8 @@ mod tests {
         remove_test_network(&id);
         let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1594,6 +1617,8 @@ mod tests {
         .unwrap();
         let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),

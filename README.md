@@ -280,8 +280,11 @@ blue-green switches, autoscaling on metrics, jobs, cron and batch. Task arrays
 (`relish run --batch`, 0.2.0 development preview) keep repeated image or host
 tasks compact, pack CPU and memory beside apps, and report grouped outcomes
 through Raft. Mixed-profile manifests, rates and indexed detail are described
-in [the batch manual](docs/manual/14_batch-jobs.md). Point the cluster at a Git
-repository and the leader keeps it in sync, verifying commit signatures if you
+in [the batch manual](docs/manual/14_batch-jobs.md). On Linux, runc nodes also
+run allowlisted host commands alongside images. Image jobs can explicitly choose
+bounded reusable containers, retaining their own command process and limits;
+fresh containers remain the default. Sustained 100m/day throughput still needs
+qualification. Point the cluster at a Git repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.
 
 Batch jobs retain distinct execution identities and their original scoped

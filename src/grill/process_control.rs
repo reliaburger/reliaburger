@@ -765,6 +765,8 @@ mod tests {
     fn spec() -> OciSpec {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
+            reusable_executor: false,
+            host_process: false,
             root: OciRoot {
                 path: "/".into(),
                 readonly: false,

@@ -1457,7 +1457,7 @@ manifests, app/job resource accounting, watch summaries, indexed detail, retries
 and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
 homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
 a service. Build matching development binaries and use a fresh cluster (protocol
-48 / state 65); the published 0.1.4 recording predates this step. The
+49 / state 66); the published 0.1.4 recording predates this step. The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.
 
@@ -1465,5 +1465,15 @@ The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
 describes #638: ordinary singleton jobs, arrays, durable UTC cron and deployment
 hooks share the definition/run/task/attempt lifecycle, resource admission and
 accepted-result machinery. Standalone admission persists before acknowledgement;
-conservative jobs retain unknown ownership until acknowledged replay. Executor reuse (#639), sustained throughput/demo (#640)
-and resident model workers (#641) follow separately.
+conservative jobs retain unknown ownership until acknowledged replay.
+
+Linux image jobs can choose `isolation = "reusable-container"` to retain bounded,
+compatible owned containers while starting a separate limited process for each
+command. Idle profiles and helper resources stay charged to the application/task
+budget; uncertain cleanup retires the whole container before reuse. Fresh
+containers remain the default. Linux runc nodes accept authorised host
+`exec`/`script` workloads simultaneously through the owned process backend;
+host CPU/memory limits remain refused. The
+[executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+tracks #639 and the still-unqualified measured demo and sustained target (#640).
+Resident model workers (#641) remain separate.

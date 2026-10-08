@@ -943,6 +943,8 @@ mod tests {
             .container_command(&["rm", "-f", &id.0], &id)
             .await;
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
@@ -1014,6 +1016,8 @@ mod tests {
 
         let id = InstanceId("apple-adopt-0".to_string());
         let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),

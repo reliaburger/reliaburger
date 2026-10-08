@@ -350,6 +350,8 @@ mod tests {
 
     fn oci_spec() -> OciSpec {
         OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),

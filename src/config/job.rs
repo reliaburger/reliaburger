@@ -10,9 +10,29 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{EnvValue, ResourceRange};
 
+/// Whether each attempt receives a new OCI container or a command slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerIsolation {
+    /// A new owned container generation for each attempt.
+    #[default]
+    FreshContainer,
+    /// A separate command process inside a compatible reusable container.
+    ReusableContainer,
+}
+
+impl ContainerIsolation {
+    fn is_fresh(&self) -> bool {
+        *self == Self::FreshContainer
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobSpec {
+    /// Container isolation; reuse is explicit and image-only.
+    #[serde(default, skip_serializing_if = "ContainerIsolation::is_fresh")]
+    pub isolation: ContainerIsolation,
     /// OCI image reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -56,6 +76,32 @@ pub struct JobSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_reuse_is_explicit_and_fresh_is_the_default() {
+        let fresh: JobSpec = toml::from_str("image='fixture:v1'").unwrap();
+        assert_eq!(fresh.isolation, ContainerIsolation::FreshContainer);
+        let reused: JobSpec = toml::from_str(
+            "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nisolation='reusable-container'",
+        ).unwrap();
+        assert_eq!(reused.isolation, ContainerIsolation::ReusableContainer);
+        let encoded = toml::to_string(&reused).unwrap();
+        assert!(encoded.contains("isolation = \"reusable-container\""));
+        assert!(!toml::to_string(&fresh).unwrap().contains("isolation"));
+        assert!(
+            toml::from_str::<JobSpec>("image='fixture:v1'\nisolation='resident-worker'").is_err()
+        );
+    }
+
+    #[test]
+    fn container_reuse_refuses_host_execution_before_admission() {
+        let source = "[job.worker]\nexec='/bin/true'\nisolation='reusable-container'";
+        let error = crate::config::Config::parse(source)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(error.to_string().contains("reusable-container"));
+    }
 
     #[test]
     fn parse_minimal_job() {

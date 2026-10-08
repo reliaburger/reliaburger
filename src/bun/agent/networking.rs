@@ -140,7 +140,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     connect_ipv6: handle.connect6_attached(),
                     udp_ipv4: handle.sendmsg4_attached(),
                     udp_ipv6: handle.sendmsg6_attached(),
-                    pre_start: self.supervisor.grill().honours_cgroup_path(),
+                    pre_start: self.supervisor.grill().honours_cgroup_path()
+                        && !spec.is_some_and(|s| s.exec.is_some() || s.script.is_some()),
                 }
             }
             None => Default::default(),
@@ -158,8 +159,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             None
         };
 
-        let require_source =
-            self.onion_ebpf.is_some() && self.supervisor.grill().honours_cgroup_path();
+        let require_source = self.onion_ebpf.is_some()
+            && self.supervisor.grill().honours_cgroup_path()
+            && !spec.is_some_and(|s| s.exec.is_some() || s.script.is_some());
         match egress::plan_pre_start_egress(has_allowlist, capability, cgroup_id) {
             PreStartEgress::NoPolicy if require_source => {
                 let cgroup_id = cgroup_id.ok_or_else(|| BunError::DeployFailed {
@@ -451,8 +453,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 source_namespace: Some(source_namespace),
                 allow: allow.to_vec(),
                 resolved,
-                original_spec,
-                runtime: self.supervisor.grill().runtime_kind(),
+                original_spec: original_spec.clone(),
+                runtime: self.supervisor.grill().runtime_kind_for(&original_spec),
                 boot_id,
             },
         );
@@ -664,13 +666,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .list_instances()
             .into_iter()
             .filter(|instance| {
-                !matches!(
-                    instance.state,
-                    ContainerState::Pending
-                        | ContainerState::Preparing
-                        | ContainerState::Stopped
-                        | ContainerState::Failed
-                )
+                instance
+                    .oci_spec
+                    .as_ref()
+                    .is_some_and(|spec| self.supervisor.grill().honours_cgroup_path_for(spec))
+                    && !matches!(
+                        instance.state,
+                        ContainerState::Pending
+                            | ContainerState::Preparing
+                            | ContainerState::Stopped
+                            | ContainerState::Failed
+                    )
             })
             .map(|instance| instance.id.clone())
             .collect();

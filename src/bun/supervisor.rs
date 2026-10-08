@@ -240,8 +240,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
-        self.admit_rootless_limits(app_name, spec.memory.is_some() || spec.cpu.is_some())?;
-        self.admit_egress(app_name, spec.egress.as_ref())?;
+        self.admit_rootless_limits(
+            app_name,
+            spec.memory.is_some() || spec.cpu.is_some(),
+            spec.exec.is_some() || spec.script.is_some(),
+        )?;
+        self.admit_egress(
+            app_name,
+            spec.egress.as_ref(),
+            spec.exec.is_some() || spec.script.is_some(),
+        )?;
         self.admit_dns(app_name)?;
         Ok(())
     }
@@ -269,6 +277,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         &self,
         app_name: &str,
         policy: Option<&crate::config::app::EgressSpec>,
+        host: bool,
     ) -> Result<(), BunError> {
         let Some(policy) = policy else {
             return Ok(());
@@ -280,7 +289,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                     .to_string(),
             });
         }
-        if policy.allow.is_empty() || self.capabilities.egress.can_enforce_allowlist() {
+        if policy.allow.is_empty() || (!host && self.capabilities.egress.can_enforce_allowlist()) {
             return Ok(());
         }
         Err(BunError::DeployFailed {
@@ -379,7 +388,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// - a ProcessGrill node (the process runtime never reads
     ///   `spec.linux.resources` at all — a rootful node without runc falls back
     ///   to it and would otherwise accept and ignore the limit).
-    fn admit_rootless_limits(&self, app_name: &str, has_limits: bool) -> Result<(), BunError> {
+    fn admit_rootless_limits(
+        &self,
+        app_name: &str,
+        has_limits: bool,
+        host: bool,
+    ) -> Result<(), BunError> {
         if !has_limits {
             return Ok(());
         }
@@ -391,7 +405,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                     .to_string(),
             });
         }
-        if self.grill.runtime_kind() == crate::grill::records::RuntimeKind::Process {
+        if self.grill.runtime_kind_for_host(host) == crate::grill::records::RuntimeKind::Process {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
                 reason: "workload declares cpu/memory limits but this node runs the process \
@@ -667,7 +681,11 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // Same admission gate as apps (jobs have no GPU field, so only the
         // host-exec/script allowlist and rootless-limit checks apply).
         self.admit_process_workload(job_name, spec.exec.as_deref(), spec.script.as_deref())?;
-        self.admit_rootless_limits(job_name, spec.memory.is_some() || spec.cpu.is_some())?;
+        self.admit_rootless_limits(
+            job_name,
+            spec.memory.is_some() || spec.cpu.is_some(),
+            spec.exec.is_some() || spec.script.is_some(),
+        )?;
 
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
         self.admit_instance_identity(&instance_id, job_name, namespace)?;
@@ -1847,5 +1865,78 @@ mod tests {
 
         assert!(matches!(err, BunError::DeployFailed { .. }));
         assert!(sup.list_instances().is_empty());
+    }
+    #[test]
+    fn mixed_admission_keeps_the_host_allowlist_and_limit_refusals() {
+        let root = tempfile::tempdir().unwrap();
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runtime = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mut sup = WorkloadSupervisor::new(runtime, PortAllocator::new(30000, 31000));
+        let mut host = basic_app_spec(None);
+        host.image = None;
+        host.exec = Some("/bin/sh".into());
+        assert!(sup.admit_app("host", &host).is_err());
+        sup.set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/sh".into()],
+            mount_isolation: false,
+            script_dir: root.path().join("scripts"),
+        });
+        sup.admit_app("host", &host).unwrap();
+        host.memory = Some(crate::config::types::ResourceRange::parse_memory("64Mi").unwrap());
+        assert!(
+            sup.admit_app("host", &host)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot enforce")
+        );
+        let mut image = basic_app_spec(None);
+        image.memory = host.memory;
+        sup.admit_app("image", &image).unwrap();
+    }
+    #[test]
+    fn mixed_admission_does_not_promise_container_egress_enforcement_for_host_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runtime = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mut sup = WorkloadSupervisor::with_process_config(
+            runtime,
+            PortAllocator::new(30000, 31000),
+            crate::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                script_dir: root.path().join("scripts"),
+            },
+        );
+        sup.set_capabilities(PlatformCapabilities {
+            egress: crate::sesame::egress::EgressEnforcementCapability {
+                connect_ipv4: true,
+                connect_ipv6: true,
+                udp_ipv4: true,
+                udp_ipv6: true,
+                pre_start: true,
+            },
+            ..Default::default()
+        });
+        let mut host = crate::config::Config::parse(
+            "[app.host]\nexec='/bin/sh'\n[app.host.egress]\nallow=['example.com:443']",
+        )
+        .unwrap()
+        .app
+        .remove("host")
+        .unwrap();
+        assert!(sup.admit_app("host", &host).is_err());
+        host.exec = None;
+        host.image = Some("fixture:v1".into());
+        sup.admit_app("image", &host).unwrap();
     }
 }

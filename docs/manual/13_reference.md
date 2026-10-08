@@ -38,7 +38,11 @@ backups use each backend's standard credential variables.
 | `--cluster` | off | form or join a cluster using `[cluster]` |
 | `--compatibility` | | print the protocol and state formats this binary supports |
 
-`auto` picks runc on Linux when it's on the `PATH`, and ProcessGrill otherwise.
+On Linux with runc, `auto` and `runc` run both backends: `image` selects a
+container and authorised `exec`/`script` selects an owned host process.
+`process` selects the process-only runtime; `auto` uses it when runc is absent.
+Host workloads require an explicit allowlist and `mount_isolation = false`;
+CPU/memory limits and container egress enforcement remain unavailable to them.
 While no API token exists, Bun refuses any `--listen` address that isn't a
 loopback IP.
 

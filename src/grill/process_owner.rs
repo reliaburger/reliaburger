@@ -756,6 +756,8 @@ mod tests {
             launch: ProcessLaunch {
                 instance_id: super::super::InstanceId("default__web-0".into()),
                 spec: OciSpec {
+                    reusable_executor: false,
+                    host_process: false,
                     root: OciRoot {
                         path: "/".into(),
                         readonly: false,

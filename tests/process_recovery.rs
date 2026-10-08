@@ -13,6 +13,8 @@ fn runtime(directory: &Path) -> ProcessGrill {
 
 fn spec(script: &str) -> OciSpec {
     OciSpec {
+        reusable_executor: false,
+        host_process: false,
         root: OciRoot {
             path: "/".into(),
             readonly: false,

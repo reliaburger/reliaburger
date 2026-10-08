@@ -21,6 +21,10 @@ fn main() {
         println!("cargo:rustc-env=RELIABURGER_GIT_SHA={commit}");
     }
 
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        compile_executor();
+    }
+
     // Select the target OS: the build script itself runs on the host.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && cfg!(feature = "ebpf") {
         compile_ebpf();
@@ -132,4 +136,37 @@ fn compile_ebpf() {
     // Expose the build directory for development tooling. Runtime loading
     // uses embedded bytes unless the operator explicitly overrides it.
     println!("cargo:rustc-env=RELIABURGER_BPF_DIR={out_dir}");
+}
+
+/// Embed an image-independent static PID-1 helper; cross builds supply CC.
+fn compile_executor() {
+    println!("cargo:rerun-if-changed=src/bun/reusable_executor/helper.c");
+    println!("cargo:rerun-if-env-changed=CC");
+    let target = std::env::var("TARGET").expect("Cargo target");
+    let target_key = format!("CC_{}", target.replace('-', "_"));
+    println!("cargo:rerun-if-env-changed={target_key}");
+    let compiler = std::env::var(&target_key)
+        .or_else(|_| std::env::var("CC"))
+        .unwrap_or_else(|_| "cc".into());
+    let output =
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output directory"))
+            .join("rb-executor-helper");
+    let result = Command::new(compiler)
+        .args([
+            "-O2",
+            "-static",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "src/bun/reusable_executor/helper.c",
+            "-o",
+        ])
+        .arg(output)
+        .status()
+        .expect("failed to execute static Linux C compiler");
+    assert!(
+        result.success(),
+        "static reusable executor helper compilation failed"
+    );
 }

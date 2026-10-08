@@ -105,8 +105,11 @@ pub struct NodeSyncRequest {
 /// Counters for one array on one node, since the node started it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeArrayCounters {
-    /// Attempts running now.
+    /// Executor callers, including preparation and resource wait.
     pub running: u64,
+    /// Last observed verified command starts awaiting positive cleanup.
+    /// Absent for runtimes without command-level start receipts.
+    pub active_commands: Option<u64>,
     /// Attempts started.
     pub attempts_started: u64,
     /// Tasks that succeeded.
@@ -192,6 +195,19 @@ pub enum NodeRunner {
 }
 
 impl TaskRunner for NodeRunner {
+    async fn active_commands(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        match self {
+            Self::Owned(runner) => runner.active_commands(batch_id, template).await,
+            Self::Process(_) | Self::Fake(_) => None,
+        }
+    }
+    fn owns_admission(&self, task: &TaskInvocation) -> bool {
+        matches!(self, Self::Owned(runner) if runner.owns_admission(task))
+    }
     async fn run(
         &self,
         task: &TaskInvocation,
@@ -279,6 +295,9 @@ impl TaskArrayNode {
             u64::MAX,
             0,
         ));
+        if let NodeRunner::Owned(runner) = &runner {
+            runner.set_budget(budget.clone());
+        }
         Self {
             config,
             slots,
@@ -291,6 +310,9 @@ impl TaskArrayNode {
 
     /// Use the exact admission ledger the node's supervisor uses for apps.
     pub fn with_budget(mut self, budget: Arc<super::execution_budget::ExecutionBudget>) -> Self {
+        if let NodeRunner::Owned(runner) = self.runner.as_ref() {
+            runner.set_budget(budget.clone());
+        }
         self.budget = budget;
         self
     }
@@ -464,6 +486,20 @@ impl TaskArrayNode {
         }
         if !self.budget.capacity().fits(&assignment.resources) {
             return Err("task requests exceed this node's allocatable resources".into());
+        }
+        if let Some(template) = assignment.template.as_ref()
+            && template.isolation == crate::config::job::ContainerIsolation::ReusableContainer
+        {
+            let profile = super::reusable_executor::ExecutorProfile::new(template)
+                .map_err(|error| error.to_string())?;
+            if !self.budget.capacity().fits(&profile.reservation) {
+                return Err("reusable profile plus helper exceeds node capacity".into());
+            }
+            return match self.runner.as_ref() {
+                NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
+                NodeRunner::Fake(_) => Ok(()),
+                _ => Err("reusable-container requires the rootful owned Linux runtime".into()),
+            };
         }
         if assignment
             .template
@@ -730,6 +766,10 @@ impl TaskArrayNode {
             finished,
             counters: NodeArrayCounters {
                 running: counters.running.load(Ordering::Relaxed),
+                active_commands: self
+                    .runner
+                    .active_commands(assignment.batch_id, assignment.template.as_deref())
+                    .await,
                 attempts_started: counters.attempts_started.load(Ordering::Relaxed),
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
                 failed: counters.failed.load(Ordering::Relaxed),

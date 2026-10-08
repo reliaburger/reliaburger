@@ -7645,6 +7645,7 @@ mod tests {
                 name: "render".to_string(),
                 namespace: "default".to_string(),
                 template: Box::new(crate::config::job::JobSpec {
+                    isolation: Default::default(),
                     image: None,
                     command: None,
                     schedule: None,
