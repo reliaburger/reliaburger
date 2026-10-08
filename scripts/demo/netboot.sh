@@ -31,6 +31,9 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 IDLE_LIMIT=2
+# The operator's home in the recording, so paths read as a person's would.
+# It must not exist yet: the script makes it, and removes it at the end.
+DEMO_HOME=/home/operator
 MACS=(52:54:00:00:00:01 52:54:00:00:00:02 52:54:00:00:00:03)
 # The router reserves these, but nothing below relies on it: relish machines finds them.
 IPS=(10.42.0.11 10.42.0.12 10.42.0.13)
@@ -93,20 +96,17 @@ wait_for() {
     say "done after ${elapsed} s"
 }
 
-# The scene: what the recording shows. It runs in ${DEMO_WORK}/stage, with
-# HOME in the work directory, so paths read as a person's would.
+# The scene: what the recording shows. It runs in ${DEMO_HOME}.
 scene() {
-    cd "${DEMO_WORK}/stage"
-    export HOME="${DEMO_WORK}/home"
+    export HOME="${DEMO_HOME}"
+    cd "${HOME}"
     local netboot started
     netboot="sudo relish netboot os --interface lan0 --key lab.pem \\
     --mac ${MACS[0]} --mac ${MACS[1]} --mac ${MACS[2]} &"
 
     say "Three machines on one switch (lan0), disks blank, network boot on in their firmware."
     say "The router hands out their addresses. relish adds only the boot part."
-    sleep 1
-    show "ls os/x86_64"
-    say "A lab build of the OS, signed with this run's own key, lab.pem."
+    say "os/ holds a lab build of the OS, signed with this run's own key, lab.pem."
     say "From a release, relish image download --dir os fetches it, checked against the release key."
     sleep 1
     type_command "${netboot}"
@@ -126,6 +126,7 @@ scene() {
     --operator 10.42.0.1 --network 10.42.0.0/24 ${MACS[0]} ${MACS[1]} ${MACS[2]}"
     wait_for "three nodes alive" 600 alive 3
     show "relish nodes"
+    wait_for "the council to reach all three" 300 council_reaches 3
     show "relish council"
     say "From power-on to a three-node cluster in $(( $(date +%s) - started )) s, no USB stick, no OS install."
     sleep 3
@@ -147,6 +148,11 @@ listed() {
 
 alive() {
     [[ "$(relish nodes 2>/dev/null | grep -c alive)" -ge "$1" ]]
+}
+
+# `relish council` reaches $1 nodes: its last column, REACHABLE, says yes.
+council_reaches() {
+    [[ "$(relish council 2>/dev/null | grep -cE ' yes *$')" -ge "$1" ]]
 }
 
 # Start the three VMs, quietly: the recording is about the operator's side.
@@ -179,6 +185,7 @@ version=${2:?usage: netboot.sh [--record CAST] <artefact dir> <version>}
 command -v relish >/dev/null || { echo "relish isn't on PATH" >&2; exit 1; }
 sudo -n sh -c 'command -v relish' >/dev/null || { echo "relish isn't on root's PATH" >&2; exit 1; }
 [[ -z "${CAST}" ]] || command -v asciinema >/dev/null || { echo "asciinema isn't installed" >&2; exit 1; }
+[[ ! -e "${DEMO_HOME}" ]] || { echo "${DEMO_HOME} exists already; the demo makes it and removes it" >&2; exit 1; }
 # shellcheck source=image/tests/disk.sh
 . "${REPO_DIR}/image/tests/disk.sh"
 
@@ -195,6 +202,7 @@ cleanup() {
     sudo ip netns del rbdemo 2>/dev/null || true
     sudo ip link del rbdemoveth0 2>/dev/null || true
     sudo ip link del lan0 2>/dev/null || true
+    sudo rm -rf "${DEMO_HOME}"
 }
 trap cleanup EXIT
 
@@ -217,9 +225,11 @@ sudo ip netns exec rbdemo dnsmasq --interface=rbdemoveth1 --bind-interfaces --po
     --pid-file="${DEMO_WORK}/dnsmasq.pid" --log-dhcp --log-facility="${DEMO_WORK}/dnsmasq.log"
 
 # What `relish image download --dir os` would have saved, from the lab build.
-mkdir -p "${DEMO_WORK}/stage/os" "${DEMO_WORK}/home"
-ln -s "${artefacts}" "${DEMO_WORK}/stage/os/x86_64"
-cp "${artefacts}/spike-signing-key.pub.pem" "${DEMO_WORK}/stage/lab.pem"
+sudo mkdir -p "${DEMO_HOME}"
+sudo chown "$(id -un)" "${DEMO_HOME}"
+mkdir -p "${DEMO_HOME}/os"
+ln -s "${artefacts}" "${DEMO_HOME}/os/x86_64"
+cp "${artefacts}/spike-signing-key.pub.pem" "${DEMO_HOME}/lab.pem"
 
 for i in 0 1 2; do
     sudo ip tuntap add "rbdemo$i" mode tap user "$(id -un)"
@@ -255,7 +265,7 @@ if [[ "${status}" -ne 0 ]]; then
         cat "${DEMO_WORK}/node$i.log" 2>/dev/null || true
     done
     echo "--- relish netboot ---"
-    cat "${DEMO_WORK}/stage/netboot.log" 2>/dev/null || true
+    cat "${DEMO_HOME}/netboot.log" 2>/dev/null || true
     echo "--- relish machines ---"
     relish machines --wait 5 2>&1 || true
     echo "--- the router's dnsmasq ---"
