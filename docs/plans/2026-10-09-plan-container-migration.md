@@ -71,6 +71,19 @@ at-least-once), and single-attempt work such as deployment hooks blocks drain
 until a checkpoint move can carry it. The research's section 5.1 has the
 admission rules.
 
+## The demonstration
+
+`relish test --filter move` moves **Redis** A to B to A on the operator's own
+cluster and passes or fails on Redis alone. PostgreSQL, with its open
+transaction and in-flight query, is required in `relish test --profile move` and
+in release qualification, but it doesn't gate the demo. Redis is the case
+people recognise and the cheapest one to make work everywhere, including the
+arm64 laptop cluster; PostgreSQL is the case that proves the contract.
+
+What the demo asserts follows the stages: stage 1 proves the in-memory data
+survives and reports one reconnect per move; stage 3 also requires the original
+connection to survive. The research's sections 9.1 and 9.2.1 have the detail.
+
 ## Naming
 
 "Migration" already means three things in Reliaburger. A `run_before` job is a
@@ -189,7 +202,7 @@ stays a TCP_REPAIR test harness only.
 | S13 | Consistent frozen filesystem cut, metadata/whiteouts/unlinked files, same-size/mtime modifications, quota and loop/Btrfs provisioning. |
 | S14 | Credential mobility or tested reload/rotation, fresh authenticated sessions and source retirement authority. |
 | S15 | No-swap reservations, protected transfer-key recovery across Bun/owner/node loss, staged import confinement and interruption cleanup. |
-| S16 | Tiny signed/pinned mechanism fixture plus Redis first and PostgreSQL worker-mode second, on both architectures. Prove memory-only/persistent data, original sessions, open SQL transactions and active queries with independent ledgers and no reconnection/retry masking (research, section 9.2.1). |
+| S16 | Tiny signed/pinned mechanism fixture plus Redis (the demo gate) and PostgreSQL worker-mode (conformance), on both architectures. Prove memory-only/persistent data, original sessions, open SQL transactions and active queries with independent ledgers and no reconnection/retry masking (research, section 9.2.1). |
 | S17 | Migration under authenticated test leases; expiry/stop/cleanup at every boundary on both nodes. |
 | S18 | Versioned profile completeness, directional pools and recorded evidence; partial/skip/unknown cannot certify conformance. |
 | S19 | Actual drain followed by source VM shutdown/restart under live traffic, with independent entry/observer topology and no resurrection. |

@@ -965,25 +965,28 @@ Proposed front door:
 relish test --filter move
 ```
 
+(9 October: the demonstration gate is **Redis alone**. PostgreSQL moved to the
+`--profile move` conformance suite, section 9.4. A demo whose pass depends on an
+open SQL transaction surviving A to B to A on arm64 would put the hardest case
+in front of every first-time user.)
+
 Reuse `src/testkit` rather than a second demonstration engine. Add a short
-`move` group whose first two application targets are **Redis, then PostgreSQL**
-(section 9.2.1). It checks fresh capabilities, chooses a compatible pair, stages
-digest-pinned database images through existing image infrastructure, leases an
-isolated namespace, creates state, opens real client traffic, moves each database
-A to B and back, observes the outcome and confirms cleanup. Run the targets
-sequentially; serialise their moves and bound
+`move` group whose application target is **Redis** (section 9.2.1). It checks
+fresh capabilities, chooses a compatible pair, stages the digest-pinned image
+through existing image infrastructure, leases an isolated namespace, creates
+state, opens real client traffic, moves Redis A to B and back, observes the
+outcome and confirms cleanup. Serialise the moves and bound
 resource use; default execution does not cordon/drain real nodes, restart Bun or
 inject faults. Small bounded heap/disk data and a few minutes are targets to
 measure, not a promised runtime. No operator TOML, Redis/SQL scripts, SSH, image
 builder or external load generator is required.
 
-The command automatically provisions both databases, credentials, schema/data
-and built-in client observations, and removes its owned resources afterward.
-Print separate Redis and PostgreSQL verdicts and the combined result. If either
-required target is unavailable, refused or untested, the two-target demonstration
-cannot pass. A later target-specific selection is explicitly partial, not the
-default demonstration or strict conformance. These are future tests, not claims
-that either database is already qualified.
+The command automatically provisions Redis, its data and built-in client
+observations, and removes its owned resources afterward. If Redis is
+unavailable, refused or untested, the demonstration can't pass. What it asserts
+grows with the stages: in stage 1 the data survives and the client reconnects
+once per move (reported, not hidden); from stage 3 the original connection must
+survive too. These are future tests, not claims that Redis is already qualified.
 
 Only qualified nodes run the fixtures. Known absence reports **not demonstrated**
 with actionable reasons; collection failure is unknown. An explicitly requested
@@ -997,7 +1000,7 @@ before timed migration.
 Illustrative human output (these are not measurements):
 
 ```text
-Testing migration: Redis, then PostgreSQL
+Testing moves: Redis (live)
   Source: worker-2   Target: worker-3
 
 Redis:
@@ -1014,13 +1017,8 @@ Moving worker-3 -> worker-2...
   Connection preserved; no reconnection
   Longest response pause: 201 ms
 
-PostgreSQL:
-  Committed rows preserved across both moves
-  Open transactions committed on their original sessions
-  Active queries completed without resubmission
-  Longest response pause: <measured per move>
-
-PASS: Redis and PostgreSQL preserved their required state and sessions.
+PASS: Redis kept its data and its connection across both moves.
+PostgreSQL and the full contract: relish test --profile move
 Cleanup confirmed.
 ```
 
@@ -1081,6 +1079,9 @@ are Redis and PostgreSQL below. A custom-fixture pass cannot substitute for eith
 database or establish general compatibility.
 
 ### 9.2.1 First two application targets: Redis and PostgreSQL
+
+Redis is the demonstration (section 9.1). PostgreSQL is required in the
+`--profile move` conformance suite and release qualification, not in the demo.
 
 Pin actual Redis and PostgreSQL server images for arm64 and x86_64, with exact
 version, digest and tested configuration in a versioned fixture manifest.
