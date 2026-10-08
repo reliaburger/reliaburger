@@ -38,6 +38,7 @@ trap cleanup EXIT
 sudo dnsmasq --interface=rbbr0 --bind-interfaces --port=0 \
     --dhcp-range=10.42.0.100,10.42.0.200,12h --dhcp-option=3,10.42.0.1 \
     --dhcp-host="${macs[0]},${ips[0]}" --dhcp-host="${macs[1]},${ips[1]}" \
+    --dhcp-leasefile="$work/dnsmasq.leases" \
     --pid-file="$work/dnsmasq.pid" --log-facility="$work/dnsmasq.log"
 
 export RELIABURGER_HOME="$work/home"
@@ -73,10 +74,12 @@ wait_for() {
 }
 answering() { curl -fsSk --max-time 3 "https://$1:9119/v1/claim"; }
 alive() { [ "$("$relish" nodes 2>>"$work/relish.err" | grep -c alive)" = "$1" ]; }
+# Both MACs, each with its IPv4 address: claiming by MAC connects to the
+# announced address, and an IPv6 link-local one can't be reached.
 listed() {
     "$relish" machines --wait 3 >"$work/machines.txt" \
-        && grep -q "${macs[0]}" "$work/machines.txt" \
-        && grep -q "${macs[1]}" "$work/machines.txt"
+        && grep -q "^${ips[0]} .*${macs[0]}" "$work/machines.txt" \
+        && grep -q "^${ips[1]} .*${macs[1]}" "$work/machines.txt"
 }
 # The council size --create defaults to: in fleet.json, and in council state.
 sized() { grep -q '"council_size": 5' "$work/cluster/fleet.json" \
@@ -94,7 +97,7 @@ if wait_for answering "${ips[0]}" && wait_for answering "${ips[1]}"; then
     deadline=$full
 fi
 if "$relish" machines claim "$work/cluster" --create --name pair --operator 10.42.0.1 \
-        --trust-lan --yes "${ips[0]}" \
+        --trust-lan --yes "${macs[0]}" \
     && wait_for alive 1 \
     && wait_for sized \
     && "$relish" machines claim "$work/cluster" --trust-lan "${ips[1]}" \

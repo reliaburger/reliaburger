@@ -14,9 +14,10 @@
 //! on its console with what relish shows; that's what the interactive
 //! claim does.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -31,6 +32,10 @@ use super::seed::Seed;
 
 /// The claim API's port.
 pub const CLAIM_PORT: u16 = 9119;
+
+/// How long an unclaimed machine waits for its IPv4 address before it
+/// announces itself without one.
+const ADDRESS_WAIT: Duration = Duration::from_secs(60);
 
 /// The mDNS service an unclaimed machine announces. RFC 6763 §7.2 allows
 /// a service name of at most 15 bytes, and mdns-sd silently drops a
@@ -167,18 +172,49 @@ pub async fn serve_until_claimed(
 ) -> std::io::Result<()> {
     let listener =
         tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], CLAIM_PORT))).await?;
-    let announcement = match announce(&info) {
-        Ok(daemon) => Some(daemon),
-        Err(error) => {
-            eprintln!("reliaburger: not announcing over mDNS ({error}); claim by address");
-            None
+    // The claim API serves at once; the announcement waits for the address
+    // relish will connect to, in its own task.
+    let announced_info = info.clone();
+    let announcing = tokio::spawn(async move {
+        let address = wait_for_address(ADDRESS_WAIT).await;
+        if address.is_none() {
+            eprintln!(
+                "reliaburger: no IPv4 address after {}s; announcing without one",
+                ADDRESS_WAIT.as_secs()
+            );
         }
-    };
+        match announce(&announced_info, address) {
+            Ok(daemon) => Some(daemon),
+            Err(error) => {
+                eprintln!("reliaburger: not announcing over mDNS ({error}); claim by address");
+                None
+            }
+        }
+    });
     let served = serve(listener, key, info, seed_path).await;
-    if let Some(daemon) = announcement {
-        let _ = daemon.shutdown();
+    if announcing.is_finished() {
+        if let Ok(Some(daemon)) = announcing.await {
+            let _ = daemon.shutdown();
+        }
+    } else {
+        announcing.abort();
     }
     served
+}
+
+/// The IPv4 address on the default-route interface, once DHCP has given
+/// one, or `None` after `limit`.
+async fn wait_for_address(limit: Duration) -> Option<IpAddr> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if let Some(address) = super::address::detect() {
+            return Some(address);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Serve the claim API over TLS with `key` on `listener` until a seed has
@@ -221,8 +257,24 @@ pub async fn serve(
 /// Announce `_rb-unclaimed._tcp` with the machine's MACs,
 /// architecture and short fingerprint. Best effort: claiming by address
 /// works without it.
-fn announce(info: &MachineInfo) -> mdns_sd::Result<mdns_sd::ServiceDaemon> {
+fn announce(
+    info: &MachineInfo,
+    address: Option<IpAddr>,
+) -> mdns_sd::Result<mdns_sd::ServiceDaemon> {
     let daemon = mdns_sd::ServiceDaemon::new()?;
+    daemon.register(service_info(info, address)?)?;
+    Ok(daemon)
+}
+
+/// The announcement itself. `address`, the machine's IPv4 address, is in
+/// it from the first packet: relish connects to the address it hears, and
+/// mdns-sd's automatic addresses alone left only IPv6 link-local ones,
+/// which relish can't reach without an interface scope. Automatic
+/// addresses still follow the interfaces as they change.
+fn service_info(
+    info: &MachineInfo,
+    address: Option<IpAddr>,
+) -> mdns_sd::Result<mdns_sd::ServiceInfo> {
     let instance = info
         .macs
         .first()
@@ -234,17 +286,16 @@ fn announce(info: &MachineInfo) -> mdns_sd::Result<mdns_sd::ServiceDaemon> {
         ("arch", info.arch.clone()),
         ("fp", short_fingerprint(&info.fingerprint)),
     ];
-    let service = mdns_sd::ServiceInfo::new(
+    let addresses: Vec<IpAddr> = address.into_iter().collect();
+    Ok(mdns_sd::ServiceInfo::new(
         SERVICE_TYPE,
         &instance,
         &host,
-        "",
+        &addresses[..],
         CLAIM_PORT,
         &properties[..],
     )?
-    .enable_addr_auto();
-    daemon.register(service)?;
-    Ok(daemon)
+    .enable_addr_auto())
 }
 
 #[cfg(test)]
@@ -261,6 +312,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_announcement_carries_the_machines_ipv4_address() {
+        let service = service_info(&info(), Some("10.42.0.11".parse().unwrap())).unwrap();
+        let ipv4: Vec<String> = service
+            .get_addresses_v4()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(ipv4, ["10.42.0.11"]);
+        assert!(
+            service.is_addr_auto(),
+            "addresses still follow the interfaces"
+        );
+        assert_eq!(service.get_port(), CLAIM_PORT);
+    }
+
+    #[test]
+    fn without_an_ipv4_address_the_announcement_relies_on_automatic_ones() {
+        let service = service_info(&info(), None).unwrap();
+        assert!(service.get_addresses().is_empty());
+        assert!(service.is_addr_auto());
+    }
     #[test]
     fn the_short_fingerprint_is_four_groups_of_four() {
         assert_eq!(
@@ -291,7 +364,7 @@ mod tests {
     fn an_announced_machine_is_found_by_browsing() {
         let mut machine = info();
         machine.macs = vec!["02:00:5e:10:00:01".into()];
-        let daemon = announce(&machine).unwrap();
+        let daemon = announce(&machine, None).unwrap();
         let found = crate::relish::machines::browse(std::time::Duration::from_secs(4)).unwrap();
         let _ = daemon.shutdown();
         let ours = crate::relish::machines::find(&found, "02:00:5e:10:00:01")

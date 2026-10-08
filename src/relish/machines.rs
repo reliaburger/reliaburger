@@ -66,14 +66,37 @@ pub fn browse(wait: Duration) -> Result<Vec<Discovered>, RelishError> {
                 arch: property("arch"),
                 short_fingerprint: property("fp"),
             };
-            if !found.iter().any(|m| m.macs == machine.macs) {
-                found.push(machine);
+            // A machine answers more than once, and a later answer may
+            // carry an address an earlier one didn't (its IPv4 one, once
+            // DHCP has given it).
+            match found.iter_mut().find(|m| m.macs == machine.macs) {
+                Some(known) => {
+                    for address in machine.addresses {
+                        if !known.addresses.contains(&address) {
+                            known.addresses.push(address);
+                        }
+                    }
+                }
+                None => found.push(machine),
             }
         }
     }
     let _ = daemon.shutdown();
     found.sort_by(|a, b| a.addresses.cmp(&b.addresses));
     Ok(found)
+}
+
+/// The address to reach `machine` at: its IPv4 one, else a routable IPv6
+/// one. Never an IPv6 link-local address, which can't be reached without
+/// naming the interface, and mDNS doesn't say which.
+pub fn reachable_address(machine: &Discovered) -> Option<IpAddr> {
+    let addresses = &machine.addresses;
+    addresses.iter().find(|a| a.is_ipv4()).copied().or_else(|| {
+        addresses
+            .iter()
+            .find(|a| matches!(a, IpAddr::V6(v6) if !v6.is_unicast_link_local()))
+            .copied()
+    })
 }
 
 /// Find the machine `target` (a MAC or an IP) among `machines`.
@@ -94,12 +117,11 @@ pub fn render(machines: &[Discovered]) -> String {
         "ADDRESS", "MAC", "ARCH", "CLAIM KEY"
     );
     for machine in machines {
-        let address = machine
-            .addresses
-            .iter()
-            .find(|a| a.is_ipv4())
-            .or(machine.addresses.first())
-            .map(ToString::to_string)
+        // Show the link-local address rather than nothing: it's still a
+        // sign of life, though relish can't claim by it.
+        let address = reachable_address(machine)
+            .or(machine.addresses.first().copied())
+            .map(|a| a.to_string())
             .unwrap_or_else(|| "-".into());
         out.push_str(&format!(
             "{address:<17} {:<17} {:<8} {}\n",
@@ -347,13 +369,11 @@ pub fn resolve(
                     "no unclaimed machine with MAC {target} answered over mDNS; give its address instead"
                 ))
             })?;
-            let address = machine
-                .addresses
-                .iter()
-                .find(|a| a.is_ipv4())
-                .or(machine.addresses.first())
-                .copied()
-                .ok_or_else(|| failed(&format!("{target} announced no address")))?;
+            let address = reachable_address(machine).ok_or_else(|| {
+                failed(&format!(
+                    "{target} announced no address relish can reach (only IPv6 link-local ones, or none); give its IPv4 address instead"
+                ))
+            })?;
             Ok((address, announced))
         })
         .collect()
@@ -539,6 +559,28 @@ mod tests {
             arch: "x86_64".into(),
             short_fingerprint: "3f9a-12bc-77de-0a41".into(),
         }
+    }
+
+    #[test]
+    fn a_machine_is_reached_at_its_ipv4_address_never_a_link_local_one() {
+        let mut both = machine("fe80::5054:ff:fe00:1", "52:54:00:00:00:01");
+        both.addresses.push("10.42.0.11".parse().unwrap());
+        assert_eq!(
+            reachable_address(&both),
+            Some("10.42.0.11".parse().unwrap())
+        );
+
+        let routable = machine("2001:db8::11", "52:54:00:00:00:02");
+        assert_eq!(
+            reachable_address(&routable),
+            Some("2001:db8::11".parse().unwrap())
+        );
+
+        let link_local_only = machine("fe80::5054:ff:fe00:3", "52:54:00:00:00:03");
+        assert_eq!(reachable_address(&link_local_only), None);
+        // The table still shows it, as a sign of life.
+        assert!(render(&[link_local_only]).contains("fe80::5054:ff:fe00:3"));
+        assert!(render(&[both]).contains("10.42.0.11"));
     }
 
     #[test]
