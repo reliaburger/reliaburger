@@ -10,6 +10,40 @@ design live in
 [Research: moving a running container between nodes](2026-09-28-research-container-migration.md),
 which we cite as "the research" below. Nothing here is implemented yet.
 
+## Who this is for
+
+Picture a team of three running a dozen apps on four machines in a cupboard, or
+a shop with one small cluster per site. They have a PostgreSQL that isn't
+replicated, because running Patroni for one database is more work than the
+database. They have a Redis that's "just a cache" until it's cold on a Monday
+morning. A kernel CVE lands. Today they schedule downtime, warn their users and
+reboot one box at a time at 7 a.m.
+
+That's the user. Small clusters, stateful singletons, nobody on call for the
+orchestrator, and nodes that need patching every week. Reliaburger already
+targets them: one binary, a laptop cluster from one command, and bare metal in
+an hour (0.3.0). What they lack is a way to take a node down without taking
+their singletons down with it.
+
+The pitch we're building towards is **"your nodes patch and reboot themselves
+every week, and your database doesn't notice."** Stage 2 delivers that with a
+short pause and reconnecting clients; stage 3 removes the reconnect.
+
+Who it isn't for:
+
+- Workloads that are already replicated with their own failover. A rolling
+  restart serves them better, and drain does exactly that for them.
+- Large cloud fleets on VPC networking, where nodes are cattle and workloads
+  are built to die. Live moves are out of scope there (see the network design).
+- GPU workloads and fast LLM warm starts, which want a snapshot store, not
+  migration (research, section 4).
+
+Kubernetes doesn't move a running container between nodes today; the
+checkpoint/restore KEP excludes cross-node restore from its initial scope
+(research, section 1). That's a useful contrast, but it isn't the reason to
+build this. The reason is that our users can't patch their nodes without an
+outage.
+
 ## Decisions
 
 These are the decisions in force. The research's section 12 keeps the history

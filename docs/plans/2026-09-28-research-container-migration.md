@@ -58,7 +58,10 @@ agent restarts; and eligibility, egress, stdio and failure testing need proving
 on the actual generated OCI spec. Use the runc CLI under existing owners rather
 than reconstructing its namespace and mount handling through a new CRIU client.
 
-The advantage to demonstrate over **core Kubernetes** is a native, integrated
+The delivery plan says
+[who this is for](2026-10-09-plan-container-migration.md#who-this-is-for): small
+clusters with stateful singletons that need weekly node patching. The advantage
+to demonstrate over **core Kubernetes** is a native, integrated
 planned evacuation of qualified stateful workloads that retains execution,
 acknowledged state and sessions within a measured interruption budget. It is
 not a claim of superiority on every workload or reliability dimension. The
