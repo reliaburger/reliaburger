@@ -315,15 +315,18 @@ migration and no feature gate
   ten Dell Wyse 3040s from power-on to a cluster.
   Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
   which waits for 0.1.6.
-- [ ] **0.4.0: "Full container migration"**
+- [ ] **0.4: "Full container migration", in stages**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
-  [#268](https://github.com/reliaburger/reliaburger/pull/268)). Drain and
-  uncordon, cold moves that carry volumes, CRIU checkpoint and restore,
-  pre-dump iterations, lazy pages and TCP handoff, for apps and jobs.
-  Required continuity and explicit fallback policy, a built-in migration
-  demonstration, versioned conformance and source-shutdown qualification. Also
-  managed-volume retirement and the Apple runtime (F10,
-  [#367](https://github.com/reliaburger/reliaburger/issues/367)).
+  [plan](plans/2026-10-09-plan-container-migration.md),
+  [#268](https://github.com/reliaburger/reliaburger/pull/268)). One headline
+  delivered in three stages, so each one ships on its own. First, planned
+  maintenance: cordon, drain and uncordon, cold moves that carry volumes, and
+  checkpoint moves that keep memory while connections reconnect. Then
+  maintenance without downtime on top of 0.3.0's A/B OS updates. Last, live
+  moves that keep connections open, only if the network-ownership spikes pass.
+  Managed-volume retirement and the Apple runtime (F10,
+  [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in the same
+  series, outside the migration plan.
 - [ ] **After 0.4.0: book v2 and the full CLI tour.** Book v2: a distilled
   rewrite alongside v1; v1 keeps collecting until then. The rewrite reads
   properly from beginning to end: it cuts the fluff, keeps the design

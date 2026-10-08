@@ -35,7 +35,41 @@ of how we got here (28 September, 5 and 6 October).
    place, and says so.
 8. GPUs, rootless runtimes, automatic rebalancing and cross-architecture restore
    are out of scope.
-9. The book gets a new chapter for this work, written alongside each step.
+9. The work ships in stages, not as one release (9 October, below). A spike
+   that fails removes its mode from the series; it never holds back the modes
+   that already work.
+10. The book gets a new chapter for this work, written alongside each step.
+
+## Scope: three stages, each shippable
+
+The 28 September decision put everything into one 0.4.0: drain, cold moves,
+checkpoint, pre-copy, post-copy, TCP handoff, movable addresses, NAT and ingress
+ownership, credential mobility, recoverable keys, a conformance framework, and
+Redis and PostgreSQL on both architectures. The research's old estimate for a
+weaker version of that was 23 to 29 weeks, and the 5 October contract withdrew
+it without a replacement. A release whose gate depends on open research can
+stall indefinitely. Incus, which has shipped CRIU moves for years, still says
+only "very basic containers" move reliably, and Borg chose to drop connections
+rather than preserve them.
+
+So we ship in three stages. Each stage is useful on its own, has its own exit
+test, and never weakens the contract of the stage before it.
+
+| Stage | What the operator gets | Modes | Exit test |
+|---|---|---|---|
+| 1. Planned maintenance | Cordon, drain and uncordon. Restartable workloads reschedule; volume apps carry their data; memory-only apps keep their memory. Connections close and clients reconnect. | `cold`, `checkpoint` | Drain a node running a memory-only Redis and a volume app; both come back on another node with every acknowledged write, and the drained node holds nothing. |
+| 2. Maintenance without downtime | The appliance's A/B OS update drains, reboots and uncordons each node in turn, moving workloads ahead of the reboot. | `cold`, `checkpoint` | A rolling OS update of a three-node cluster keeps Redis's data and a volume app's data across every reboot. |
+| 3. Live moves | Moves that keep established connections and meet an interruption budget, with no dependency left on the source. | `live` | The research's source-off test (section 9.5) with Redis and PostgreSQL. |
+
+Stage 3 starts only after spikes S11 and S12 say yes (see the go/no-go rules in
+the spikes). If they say no, live moves come off the roadmap rather than holding
+up stages 1 and 2, and the manual says connections reconnect.
+
+Jobs follow the same stages. In stage 1, bulk array tasks with attempts left
+requeue under their own retry policy (#642 already documents them as
+at-least-once), and single-attempt work such as deployment hooks blocks drain
+until a checkpoint move can carry it. The research's section 5.1 has the
+admission rules.
 
 ## Naming
 
@@ -143,8 +177,9 @@ network/NAT/ingress ownership, partition-safe activation, key/credential recover
 lease integration and conformance add material work. Re-estimate after S1-S19
 resolve the architecture; do not mechanically add a few weeks to the old total.
 
-Work in dependency order, behind meaningful tests, while keeping the full 0.4.0
-release acceptance scope:
+Work in dependency order, behind meaningful tests, stage by stage (see
+"Scope" above). The list below is the old single-release order; the milestones
+replace it:
 
 1. Refresh main evidence; implement fixture/observer and ownership/policy/model
    tests; prepare Redis then PostgreSQL fixtures and run their feasibility spikes

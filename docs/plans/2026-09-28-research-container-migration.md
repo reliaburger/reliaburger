@@ -41,6 +41,11 @@ branch was rebased onto this commit, replacing the earlier merge of main.
 
 ## 1. Recommendation and the continuity contract
 
+(9 October: the delivery plan ships this in three stages, planned maintenance,
+maintenance without downtime and then live moves; see its
+[scope](2026-10-09-plan-container-migration.md#scope-three-stages-each-shippable).
+The contract below still applies to each mode when it ships.)
+
 Build one coordinated stateful-move pipeline: cordon/drain, cold relocation,
 checkpoint/restore, filesystem pre-sync, memory pre-copy where supported,
 post-copy where its risk is accepted, and connection-preserving network
