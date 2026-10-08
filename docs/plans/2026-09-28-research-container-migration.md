@@ -1,9 +1,15 @@
 # Research: moving a running container between nodes (0.4.0)
 
-28 September 2026; revised 6 October 2026. Research and an implementation
-proposal, with no product code. Release: **0.4.0, "Full container migration"**.
+28 September 2026; revised 6 and 9 October 2026. Research and the design
+reference, with no product code. Release: **0.4.0, "Full container migration"**.
 
-The original maintainer decisions are retained in section 13. The 5 October
+**What to build, and in what order, is in the delivery plan:
+[Plan: moving running workloads](2026-10-09-plan-container-migration.md).**
+This document is the long-form reference behind it: the CRIU research
+(sections 3 and 4), the continuity contract (section 1), the design (sections
+5 to 9) and the review history (sections 11 and 12).
+
+The original maintainer decisions are retained in section 12. The 5 October
 review strengthens the outcome contract, recovery rules, built-in demonstration
 and conformance gates. The full apps-and-jobs scope stays. A failed spike changes
 the design or blocks the release; it does not silently weaken the contract.
@@ -21,9 +27,9 @@ explicitly identifies an existing capability.
 - [x] Design a built-in demonstration and versioned conformance cases.
 - [x] Select Redis first and PostgreSQL second, with concrete database assertions.
 - [x] Review the revised document for cross-section consistency.
-- [ ] Run the integration and design spikes in section 10.
-- [ ] Set measured interruption envelopes and re-estimate after the spikes.
-- [ ] Implement and qualify the full release scope.
+- [x] Move spikes, tests and implementation order into the delivery plan (9 October).
+
+The remaining work is tracked in the [delivery plan](2026-10-09-plan-container-migration.md).
 
 Code baseline: `origin/main` at
 [`5cfb9b710828f7ef3c5fd820249374e3dad9ac77`](https://github.com/reliaburger/reliaburger/commit/5cfb9b710828f7ef3c5fd820249374e3dad9ac77),
@@ -164,7 +170,7 @@ from 28 September, with the Kubernetes proposal corrected on 5 October. Version,
 architecture and support claims below are research inputs, not a qualification
 of our generated spec. Recheck upstream releases and actual node capabilities
 before packaging. "Unverified" means a spike must establish it. Sections 1 and
-5-10 define the revised contract and override the old research's suggestions
+5-9 define the revised contract and override the old research's suggestions
 about fallback, matching CPUs and dropping connections.
 
 ### CRIU for newcomers: what a checkpoint includes, and what it cannot capture
@@ -355,7 +361,7 @@ work, not evidence that these behaviours are implemented today.
     containing `pipe:` become `InheritFd`). Our stdout/stderr are regular
     files, so CRIU will try to reopen the *source's* capture file paths on the
     target, and its default file validation checks size. This is the most
-    concrete integration gap we found (spike S2 in section 10).
+    concrete integration gap we found (spike S2 in the [delivery plan](2026-10-09-plan-container-migration.md#spikes)).
   - The CLI warns checkpoint is untested with rootless containers, and a
     non-root restore "is unlikely to work".
 
@@ -1274,119 +1280,14 @@ SSH/hypervisor setup prerequisite for the ordinary demonstration. A retained
 source-forwarding window cannot pass this scenario by sleeping until sessions end
 or resetting them before power-off. Recovery evidence continues beyond the shutdown.
 
-## 10. Spikes, tests and qualification
+## 10. Spikes, tests and implementation order (moved)
 
-None of the following are implementation results. Run them on the then-current
-main generated OCI spec, qualified runc/CRIU packages and real kernels. Do not
-assume the September soak still owns particular VMs; acquire suitable disposable
-resources. x86_64 pre-copy and arm64 methods need separate hardware evidence.
+These moved to the delivery plan,
+[Plan: moving running workloads](2026-10-09-plan-container-migration.md), on
+9 October 2026. This document keeps the research, the design reference and the
+review history.
 
-| Spike | Question and consequence |
-|---|---|
-| S1 | Checkpoint/restore with rootful userns, external netns, private overlay, volume backends and resolv.conf. Unsupported combinations block their claimed mode. |
-| S2 | Inherited/file/pipe stdio and capture ingestion across restore. Resolve owner changes before checkpoint ships. |
-| S3 | Preserve logical ordinal/job execution with new runtime/host identity, time namespaces and declared checkpoint TCP closure. |
-| S4 | Enforce cgroup egress before any restored workload executes; reject unsupported ordering. |
-| S5 | Restored init parentage, boot/start-tick evidence, Bun adoption, stop/exit receipts and stale-generation rejection. |
-| S6 | Cross-host timers/monotonic time and remote timeout/lease behaviour within a declared budget. |
-| S7 | Memory/volume/rootfs payload and client-observed pause for realistic sizes/rates; set envelopes from results. |
-| S8 | Release-specific resource matrix and refusal fixtures for io_uring, devices, attached tracers, packet pipes, corked UDP and unsupported IPC/socket/exec dependencies; supported-counterpart round trips. Exercise late resource acquisition, actual dump rejection and source continuation/state/session correctness; no implicit cold fallback. |
-| S9 | Actual dirty tracking/pre-copy and convergence on qualified x86_64/arm64 hosts; select from capabilities. |
-| S10 | Lazy-page TLS/manifest binding, source/provider loss, fault stalls, provider independence and optional redundant-page recovery. |
-| S11 | TCP_REPAIR with packet locking, borrowed-address prototype and source-independent address/NAT ownership, ingress and repeated moves. Prototype success alone cannot pass the release gate. |
-| S12 | Partition-safe source retirement and target activation with current main's runtime/storage/recovery fences; no timeout-authorised second writer or stale replay. |
-| S13 | Consistent frozen filesystem cut, metadata/whiteouts/unlinked files, same-size/mtime modifications, quota and loop/Btrfs provisioning. |
-| S14 | Credential mobility or tested reload/rotation, fresh authenticated sessions and source retirement authority. |
-| S15 | No-swap reservations, protected transfer-key recovery across Bun/owner/node loss, staged import confinement and interruption cleanup. |
-| S16 | Tiny signed/pinned mechanism fixture plus Redis first and PostgreSQL worker-mode second, on both architectures. Prove memory-only/persistent data, original sessions, open SQL transactions and active queries with independent ledgers and no reconnection/retry masking (9.2.1). |
-| S17 | Migration under authenticated test leases; expiry/stop/cleanup at every boundary on both nodes. |
-| S18 | Versioned profile completeness, directional pools and recorded evidence; partial/skip/unknown cannot certify conformance. |
-| S19 | Actual drain followed by source VM shutdown/restart under live traffic, with independent entry/observer topology and no resurrection. |
-
-**Portable/model tests first:** state transitions and epochs; delayed/duplicate
-messages; target activation uncertainty; stale source rollback forbidden;
-capability/policy refusal; job execution/retry binding; manifests/encryption/
-metadata import; reservation concurrency; lease expiry/cancel; profile completeness
-and verdict aggregation. A property test interleaves leader changes, partitions
-and crashes and checks exclusive ownership and acknowledged-state monotonicity.
-It must allow recovery-required unavailability: universal terminal success by a
-deadline is not an invariant.
-
-**Portable integration:** use the existing in-process cluster/public API harness
-in `tests/suite/` with mock runtime outcomes, including restore that executes then
-returns an error and an isolated target that is still running. These tests protect
-orchestration; they do not count as real CRIU or connection-preservation evidence.
-
-**Gated Linux/cluster:** real runc/CRIU with current owners on one host for runtime
-integration, then actual cross-node movement and data paths on both architectures.
-Match `make test-linux`/`make test-cluster` and add a migration gate only if ownership
-and discoverability need it. Once selected, missing prerequisites fail/refuse;
-never return early as a passing gated test. CI initially proves which hosted
-runners can support CRIU; unavailable hardware gets an explicit owner and release
-qualification lane, not a green mock substitute.
-
-**Built-in operator cases:** short demonstration and complete migration profile
-run the same Redis/PostgreSQL fixtures/scenarios/assertions with different
-coverage/load, alongside mechanism fixtures in conformance. Recovery
-cases share observations but use explicit chaos selection and node-state authority.
-Wire catalogue, capabilities, lease/authz routes, reports and built-in manual
-consistently; verify the documented commands select real required cases.
-
-**Release/soak:** repeat A->B->A under load with the volume writer, memory-only
-counter and the required Redis/PostgreSQL fixtures; exercise main's recovery
-faults and each database's source-off case. Cover both architectures, every claimed
-backend, ingress/egress
-paths, jobs and credential continuity. Retain acknowledgement/session ledgers,
-per-cutover latencies, generation transitions, fingerprints and cleanup outcomes.
-Retries must not erase first failures. No pass on an empty run or skipped-only lane.
-Main's release qualification scripts own hardware/soak execution and save records
-in `docs/qualification/`; reuse the versioned conformance manifest so release
-checks cannot drift into a separate weaker demonstration.
-
-**Packaging:** package pinned qualified CRIU/runc in the appliance/managed Linux
-guests, check Ubuntu 26.04 availability before depending on a PPA, and expose
-runtime capabilities in `wtf`/dry-run. No automatic PPA installation on an existing
-cluster from `relish test`. Verify signed mechanism and Redis/PostgreSQL fixture
-image availability before timing; support existing mirrors/local staging rather
-than depending on a mutable tag.
-
-## 11. Implementation order and effort
-
-The old **23-29 focused weeks** was for the source-forwarding/automatic-cold-fallback
-design. It is historical, not the estimate for this revised contract. Portable
-network/NAT/ingress ownership, partition-safe activation, key/credential recovery,
-lease integration and conformance add material work. Re-estimate after S1-S19
-resolve the architecture; do not mechanically add a few weeks to the old total.
-
-Work in dependency order, behind meaningful tests, while keeping the full 0.4.0
-release acceptance scope:
-
-1. Refresh main evidence; implement fixture/observer and ownership/policy/model
-   tests; prepare Redis then PostgreSQL fixtures and run their feasibility spikes
-   before locking the transport/network design.
-2. Cordon/drain ownership and status, held assignments, exclusive source fencing,
-   activation and safe recovery. Cold managed-data moves provide the first path.
-3. Stable logical/storage/job identities, consistent copy and capacity reservations.
-4. Checkpoint runtime/stdio/time/egress, secure no-swap transfer and recoverable
-   journals/keys; credential continuity. Establish real Redis and PostgreSQL
-   checkpoint/state/session results before extending live guarantees.
-5. Qualified memory/filesystem pre-copy and optional post-copy with honest failure
-   envelope; interruption measurements.
-6. Source-independent addresses, egress mapping and ingress ownership; actual
-   source-off acceptance and repeated moves.
-7. Demonstration/catalogue/lease ownership, versioned conformance, capability/pool
-   evidence, JSON reports and benchmark envelopes throughout the work, not bolted
-   on after the mechanisms.
-8. Required Redis/PostgreSQL recovery/soak on both architectures/backends,
-   documentation and the new 0.4.0 book chapter; final release qualification.
-
-Intermediate mechanisms can land with their actual weaker guarantees, but cannot
-be advertised as live-conformant or used to declare a seamless drain complete.
-GPU warm starts, non-runc/rootless migration and automatic rebalancing remain later
-projects. Source-independent network ownership is no longer deferred if needed
-to satisfy this release's continuity contract.
-
-## 12. Consistency review and unresolved feasibility
+## 11. Review history and unresolved feasibility
 
 Review completed 5 October against fetched main `ca2c33a25ef7dc8837ca714e20468c2ae17e5d98`.
 CRIU primer and refusal coverage reviewed 6 October against the same freshly
@@ -1433,7 +1334,11 @@ workload cannot meet its timeout/credential contract, refuse that combination
 and state the scope. The full release promise waits for passing source-off and
 conformance evidence rather than rewriting the success criteria around a demo.
 
-## 13. Decisions and revisions
+## 12. Decisions and revisions (history)
+
+The current decisions are in the
+[delivery plan](2026-10-09-plan-container-migration.md#decisions). The records
+below are kept as history.
 
 ### Original maintainer decisions, 28 September 2026
 
