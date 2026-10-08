@@ -19,8 +19,9 @@ use super::wipe::{self, DiskSession, Question};
 use super::{DhcpSetup, IpxeBuild, Log, MacAddress, NetbootError, NetbootOptions};
 
 /// How long to listen for the LAN's DHCP server and another ProxyDHCP
-/// before starting.
-const PROBE_WAIT: Duration = Duration::from_secs(2);
+/// before starting. dnsmasq, which many home routers run, pings an address
+/// for about three seconds before offering it, so two seconds missed it.
+const PROBE_WAIT: Duration = Duration::from_secs(5);
 
 /// Check the artefacts, make sure no other netboot server is answering,
 /// then serve until `options.duration` passes or Ctrl-C.
