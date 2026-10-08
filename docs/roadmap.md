@@ -324,6 +324,7 @@ migration and no feature gate
   checkpoint moves that keep memory while connections reconnect. Then
   maintenance without downtime on top of 0.3.0's A/B OS updates. Last, live
   moves that keep connections open, only if the network-ownership spikes pass.
+  The plan splits the stages into week-sized milestones, 0.4.0 to 0.4.19.
   Managed-volume retirement and the Apple runtime (F10,
   [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in the same
   series, outside the migration plan.
