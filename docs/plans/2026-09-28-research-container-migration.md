@@ -889,15 +889,16 @@ support as a migration pool. Runtime feature probes determine optimisations.
 
 ## 8. Operator UX and evidence
 
-Proposed commands (none implies an implemented migration verb today):
+Proposed commands (none implies an implemented verb today). The operator-facing
+name is "move", not "migration"; the [delivery plan](2026-10-09-plan-container-migration.md#naming) says why.
 
 ```text
-relish migrate default/cache --to node-3
-relish migrate default/cache --to node-3 --mode live
-relish migrate default/cache --to node-3 --dry-run
-relish migrate default/render --run <run-id> --task <index> --to node-3
-relish migrate status [<migration-id>]
-relish migrate cancel <migration-id>
+relish move default/cache --to node-3
+relish move default/cache --to node-3 --mode live
+relish move default/cache --to node-3 --dry-run
+relish move default/render --run <run-id> --task <index> --to node-3
+relish move status [<move-id>]
+relish move cancel <move-id>
 relish drain node-2 [--timeout 30m] [--force]
 relish drain status node-2
 relish uncordon node-2
@@ -908,7 +909,7 @@ attempt, not just an ambiguous attempt number. CLI syntax is finalised with that
 The following config shape is proposed; parser/schema work remains:
 
 ```toml
-[app.cache.migration]
+[app.cache.move]
 mode = "live"                     # cold | checkpoint | live
 fallback = "abort"                # default for checkpoint/live; restart is explicit
 max_interruption = "500ms"        # illustrative qualified budget, not a measurement
@@ -949,11 +950,11 @@ flows explain preservation and pauses; CRIU plumbing goes in detailed diagnostic
 Proposed front door:
 
 ```sh
-relish test --filter migration
+relish test --filter move
 ```
 
 Reuse `src/testkit` rather than a second demonstration engine. Add a short
-`migration` group whose first two application targets are **Redis, then PostgreSQL**
+`move` group whose first two application targets are **Redis, then PostgreSQL**
 (section 9.2.1). It checks fresh capabilities, chooses a compatible pair, stages
 digest-pinned database images through existing image infrastructure, leases an
 isolated namespace, creates state, opens real client traffic, moves each database
@@ -1161,12 +1162,12 @@ and resource identifiers without secrets for follow-up.
 Proposed strict command:
 
 ```sh
-relish test --profile migration
-relish --output json test --profile migration
+relish test --profile move
+relish --output json test --profile move
 ```
 
 Add a versioned **required-case manifest** and profile expansion, not just another
-`profile_requires_case` branch. `--profile migration` selects the complete required
+`profile_requires_case` branch. `--profile move` selects the complete required
 non-disruptive set. A filter excluding a required case either refuses the conformance
 request or produces an explicitly partial/non-conformant report; all selected cases
 passing is insufficient. The strict profile fails on required skips, unknown or
@@ -1230,14 +1231,14 @@ into 0.4.0's `full-runc` acceptance and include all tiers in the release gate.
 Proposed recovery entry point:
 
 ```sh
-relish test --chaos --profile migration-recovery --yes
+relish test --chaos --profile move-recovery --yes
 ```
 
 Extend the existing chaos catalogue with named migration scenarios and that
 versioned manifest. The profile expands to the complete required recovery and
 source-off selection. Existing chaos filters select scenario names, not integration
 group names; a filtered recovery run is partial and cannot certify the manifest.
-The ordinary `--profile migration` result and this recovery report are combined
+The ordinary `--profile move` result and this recovery report are combined
 only when their contract/build/pool fingerprints match. Consent cannot widen
 server policy. Serialize faults and select node sets that preserve required quorum and independent observers. Never drain or shut
 down an arbitrary practitioner node as part of the short demo.

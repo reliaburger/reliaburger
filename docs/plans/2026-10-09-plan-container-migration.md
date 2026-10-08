@@ -37,6 +37,29 @@ of how we got here (28 September, 5 and 6 October).
    are out of scope.
 9. The book gets a new chapter for this work, written alongside each step.
 
+## Naming
+
+"Migration" already means three things in Reliaburger. A `run_before` job is a
+schema migration in the manual (`docs/manual/01_deploy-an-app.md`), the
+Kubernetes importer prints a "migration report", and the cluster apply plan for
+prerequisite jobs is called cluster migration
+([plan](2026-10-04-cluster-migration-prerequisites.md)). Adding a fourth would
+make `relish test --filter migration` and every error message ambiguous.
+
+So everything the operator types or reads says **move**:
+
+| Surface | Name |
+|---|---|
+| Command | `relish move <namespace>/<app> --to <node>`, `relish move status`, `relish move cancel` |
+| App and job policy | `[app.<name>.move]` and `[job.<name>.move]`, with `mode = "cold" \| "checkpoint" \| "live"` |
+| Built-in tests | `relish test --filter move`, `--profile move`, `--chaos --profile move-recovery` |
+| Records and metrics | `MoveRecord`, `move_id`, `reliaburger_moves_total` |
+
+Prose can still call the feature "container migration" or "live migration",
+because that's what people search for. The roadmap headline keeps it. Drain,
+cordon and uncordon keep their usual names; `relish fault node-drain` stays the
+simulated Smoker fault and the manual says how it differs from a real drain.
+
 ## Spikes
 
 None of these are results yet. Run them on the then-current main's generated
@@ -81,7 +104,7 @@ orchestration; they do not count as real CRIU or connection-preservation evidenc
 
 **Gated Linux/cluster:** real runc/CRIU with current owners on one host for runtime
 integration, then actual cross-node movement and data paths on both architectures.
-Match `make test-linux`/`make test-cluster` and add a migration gate only if ownership
+Match `make test-linux`/`make test-cluster` and add a `test-move` gate only if ownership
 and discoverability need it. Once selected, missing prerequisites fail/refuse;
 never return early as a passing gated test. CI initially proves which hosted
 runners can support CRIU; unavailable hardware gets an explicit owner and release
