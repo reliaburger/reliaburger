@@ -1,0 +1,13 @@
+E
+======================================================================
+ERROR: test_visible_demo_precedes_install_and_matches_accepted_evidence (test_654_publication_contract.JobDemo)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/test_654_publication_contract.py", line 22, in test_visible_demo_precedes_install_and_matches_accepted_evidence
+    self.assertAlmostEqual(recording[-1][0], report['recording_elapsed_seconds'], delta=1)
+KeyError: 'recording_elapsed_seconds'
+
+----------------------------------------------------------------------
+Ran 1 test in 0.002s
+
+FAILED (errors=1)

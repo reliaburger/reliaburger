@@ -72,8 +72,9 @@ benchmark evidence.
 `release-baselines/` contains optimised matched 1,000-command paths and a
 separate 100,000-process repetition. `release-public/` contains actual full
 public retained runs at 1,000, 10,000 and 50,000 commands, plus the failed fresh
-comparison. The published 50,000 recording is copied byte-for-byte from that
-last directory. Selected Bun RSS reached 225,705,984 bytes; whole-data scans were
+comparison. The historical 50,000 recording is retained unchanged in that
+last directory. The current landing page uses the explicit-runtime four-part
+recording linked above. Selected Bun RSS reached 225,705,984 bytes; whole-data scans were
 all incomplete at their 4,096-entry cap and cannot prove disk bounds.
 
 The 50,000-command manifest can be submitted on a task-owned rootful Linux

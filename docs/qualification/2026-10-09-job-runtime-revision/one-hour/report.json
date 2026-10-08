@@ -1,0 +1,2617 @@
+{
+  "qualification_pass": false,
+  "reason": "Requires separate recovery, fault and bounded-cost evidence",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "workload_sha256": "1130c2b760f0d52cb3a7e808291aabd64fd046c8bb0a26928939248c23490d49",
+  "command_prefix": [
+    "/Users/miko/github/reliaburger/target/654-runtime-v4-release/relish"
+  ],
+  "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
+  "elapsed_seconds": 3600.000120534096,
+  "requested_seconds": 3600,
+  "measurement_complete": true,
+  "unique_accepted_successes": 182000,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "successes_per_second": 50.555553862870006,
+  "target_with_headroom": 1388.888888888889,
+  "throughput_pass": false,
+  "application_probes": 3490,
+  "application_failures": 0,
+  "completed_submissions": 18,
+  "active_submissions": [
+    43
+  ],
+  "requires_evidence": [
+    "hardware/runtime/image-warmth",
+    "resource and storage bounds",
+    "worker loss",
+    "leader failover",
+    "delayed control",
+    "storage failure"
+  ],
+  "service_latency_ms": {
+    "samples": 3490,
+    "maximum": 12.485858984291553,
+    "p95": 0.9943949989974499
+  },
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.04163264110684395,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 19656704,
+          "files_observed": 2356,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5312376832,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 200257536,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.954400236951187,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 20381696,
+          "files_observed": 2355,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5311561728,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 184471552,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 61.87777236988768,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 20520960,
+          "files_observed": 2356,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5311361024,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 184389632,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 92.80299438000657,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 20647936,
+          "files_observed": 2356,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5311156224,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 181293056,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 123.75380862411112,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 20774912,
+          "files_observed": 2357,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5310963712,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 181649408,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 154.72744746296667,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 20918272,
+          "files_observed": 2357,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5310742528,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 179490816,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 185.7386567229405,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 21073920,
+          "files_observed": 2357,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5310525440,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 180666368,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 216.63940045889467,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 21794816,
+          "files_observed": 2356,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5309726720,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 188203008,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 247.56419438798912,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 21917696,
+          "files_observed": 2356,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5309550592,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 181248000,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 278.51033335202374,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 22061056,
+          "files_observed": 2357,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5309337600,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 201080832,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 309.5258063459769,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 22183936,
+          "files_observed": 2357,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5309145088,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 187215872,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 340.40448808600195,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 22323200,
+          "files_observed": 2358,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5308928000,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 187527168,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 371.2875694190152,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 22446080,
+          "files_observed": 2358,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5308739584,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 187420672,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 402.2556166029535,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 23150592,
+          "files_observed": 2359,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5307949056,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 195330048,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 433.1641370400321,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 23306240,
+          "files_observed": 2359,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5307736064,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 182784000,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 464.1038311331067,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 23441408,
+          "files_observed": 2359,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5307531264,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 193826816,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 495.0461543139536,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 23568384,
+          "files_observed": 2359,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5307342848,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 196382720,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 525.9799646539614,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 23711744,
+          "files_observed": 2359,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5307129856,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 191352832,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 556.895073124906,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 23859200,
+          "files_observed": 2359,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5306916864,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 184225792,
+          "peak_rss_bytes": 219119616
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 587.8106606549118,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 24002560,
+          "files_observed": 2359,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5306712064,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 189292544,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 618.7405739359092,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 24707072,
+          "files_observed": 2360,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5305917440,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 188792832,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 649.63465180411,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 24842240,
+          "files_observed": 2360,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5305720832,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 186564608,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 680.5590912729967,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 24969216,
+          "files_observed": 2360,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5305528320,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 197046272,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 711.4291123100556,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 25116672,
+          "files_observed": 2360,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5305298944,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 189652992,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 742.357363793999,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 25239552,
+          "files_observed": 2360,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5305131008,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 194433024,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 773.2922388459556,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 25382912,
+          "files_observed": 2360,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5304913920,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 197013504,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 804.1809679369908,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 26095616,
+          "files_observed": 2361,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5304127488,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 188350464,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 835.0731454859488,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 26243072,
+          "files_observed": 2362,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5303910400,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 186986496,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 866.016422216082,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 26365952,
+          "files_observed": 2362,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5303717888,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 190922752,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 896.9726810129359,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 26501120,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5303517184,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 191373312,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 927.924379712902,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 26624000,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5303320576,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 190226432,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 958.8242194240447,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 26767360,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5303115776,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 188198912,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 989.752588015981,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 26898432,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5302898688,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 199266304,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1020.6855782330967,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 27623424,
+          "files_observed": 2362,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5302112256,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 192073728,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1051.6523786031175,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 27750400,
+          "files_observed": 2362,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5301923840,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 196722688,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1082.635015831096,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 27877376,
+          "files_observed": 2362,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5301727232,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 191000576,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1113.5747891170904,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 28016640,
+          "files_observed": 2362,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5301514240,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 188862464,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1144.594184923917,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 28151808,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5301313536,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 192737280,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1175.5369451490697,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 28299264,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5301096448,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 189161472,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1206.5460900270846,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 29024256,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5300310016,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 190238720,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1237.4404076559003,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 29167616,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5300088832,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 194420736,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1268.4520471859723,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 29290496,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5299904512,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 189923328,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1299.4401957308874,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 29437952,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5299679232,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 194084864,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1329.4478287659585,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 29556736,
+          "files_observed": 2363,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5299499008,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 192344064,
+          "peak_rss_bytes": 226119680
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1360.423710821895,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 29696000,
+          "files_observed": 2364,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5299281920,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 196440064,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1391.3720525230747,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 29835264,
+          "files_observed": 2364,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5299073024,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 195653632,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1422.3635796899907,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 30560256,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5298262016,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 192086016,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1453.3111142760608,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 30683136,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5298077696,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 196575232,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1484.23958538007,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 30826496,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5297864704,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 198090752,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1515.179986879928,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 30953472,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5297684480,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 192925696,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1546.1113373299595,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 31109120,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5297455104,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 200859648,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1577.0246221830603,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 31244288,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5297258496,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 198348800,
+          "peak_rss_bytes": 227258368
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1607.9808884530794,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 31969280,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5296443392,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 197058560,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1638.8920840509236,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 32092160,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5296250880,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 202539008,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1669.809370225994,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 32231424,
+          "files_observed": 2368,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5296054272,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 217305088,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1700.7015826569404,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 32366592,
+          "files_observed": 2368,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5295849472,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 198127616,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1731.6162853820715,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 32514048,
+          "files_observed": 2368,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5295628288,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 198160384,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1762.5335999799427,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 32653312,
+          "files_observed": 2368,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5295427584,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 202088448,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1792.5617522920948,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 33370112,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5294645248,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 195166208,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1823.5242174570449,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 33517568,
+          "files_observed": 2367,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5294428160,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 196734976,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1854.3990527018905,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 33648640,
+          "files_observed": 2368,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5294227456,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 196710400,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1885.3519558289554,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 33783808,
+          "files_observed": 2368,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5294022656,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 202444800,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1916.2774907520507,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 33918976,
+          "files_observed": 2369,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5293817856,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 197107712,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1947.231881119078,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 34050048,
+          "files_observed": 2369,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5293613056,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 199995392,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 1978.1685435790569,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 34193408,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5293408256,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 197095424,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2009.1434900038876,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 34902016,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5292613632,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 197967872,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2040.0551894858945,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 35049472,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5292408832,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 200232960,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2071.000976182986,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 35180544,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5292204032,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 199544832,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2101.9628292820416,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 35328000,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5291999232,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 218738688,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2132.8294087219983,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 35454976,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5291782144,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210374656,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2163.796652718913,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 35594240,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5291593728,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 204746752,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2194.7617241840344,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 36306944,
+          "files_observed": 2371,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5290795008,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 198127616,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2225.6957498879638,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 36433920,
+          "files_observed": 2371,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5290610688,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 203149312,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2256.6082633300684,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 36589568,
+          "files_observed": 2371,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5290377216,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 195444736,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2287.534583853092,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 36712448,
+          "files_observed": 2371,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5290196992,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 199933952,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2318.4301256251056,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 36847616,
+          "files_observed": 2371,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5289992192,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 204849152,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2349.40102055599,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 36970496,
+          "files_observed": 2371,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5289807872,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 200593408,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2380.326230901992,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 37117952,
+          "files_observed": 2371,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5289582592,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 201928704,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2411.3160131000914,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 37838848,
+          "files_observed": 2373,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5288796160,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 197943296,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2442.2397510930896,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 37969920,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5288574976,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 198541312,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2473.121895885095,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 38092800,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5288390656,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 202690560,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2504.0414525319356,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 38236160,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5288177664,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 221650944,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2534.951564132003,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 38367232,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5287976960,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 201588736,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2565.898933152901,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 38506496,
+          "files_observed": 2375,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5287755776,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 200859648,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2596.9137077070773,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 39227392,
+          "files_observed": 2373,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5286981632,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 202502144,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2627.889631144004,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 39358464,
+          "files_observed": 2373,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5286772736,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 204050432,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2658.84388184594,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 39497728,
+          "files_observed": 2373,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5286567936,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 202727424,
+          "peak_rss_bytes": 230203392
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2689.8337288680486,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 39636992,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5286359040,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 207134720,
+          "peak_rss_bytes": 231297024
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2720.7760519830044,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 39763968,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5286162432,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 211734528,
+          "peak_rss_bytes": 231297024
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2751.731911046896,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 39899136,
+          "files_observed": 2375,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5285961728,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 200962048,
+          "peak_rss_bytes": 231297024
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2781.8165771409404,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 40022016,
+          "files_observed": 2375,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5285781504,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 223956992,
+          "peak_rss_bytes": 231297024
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2812.7363475789316,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 40775680,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5284945920,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210575360,
+          "peak_rss_bytes": 231297024
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2843.741983476095,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 40910848,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5284749312,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 205418496,
+          "peak_rss_bytes": 231297024
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2874.6989377699792,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 41054208,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5284532224,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 200314880,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2905.6632146080956,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 41193472,
+          "files_observed": 2374,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5284331520,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 211169280,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2936.627698708093,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 41336832,
+          "files_observed": 2375,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5284118528,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 208429056,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2967.6177453659475,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 41476096,
+          "files_observed": 2375,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5283897344,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210391040,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 2998.5880806860514,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 42184704,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5283110912,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 205393920,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3029.5216826200485,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 42315776,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5282906112,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 207699968,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3060.416178345913,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 42455040,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5282713600,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 203534336,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3091.3622434008867,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 42586112,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5282512896,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 203198464,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3122.317616217071,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 42737664,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5282295808,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210046976,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3153.2523984799627,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 42872832,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5282086912,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 203436032,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3184.2276843199506,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 43606016,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5281271808,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 206462976,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3215.141988791991,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 43741184,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5281067008,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 206409728,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3246.0821373220533,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 43872256,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5280870400,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210829312,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3277.0371633050963,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 44023808,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5280653312,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210935808,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3307.954418162117,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 44163072,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5280452608,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 202686464,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3338.938720562961,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 44302336,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5280239616,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210010112,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3369.92212203308,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 45031424,
+          "files_observed": 2378,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5279453184,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 205512704,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3400.8623594651,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 45162496,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5279236096,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 206520320,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3431.8060104229953,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 45305856,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5279031296,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 220524544,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3462.764488480054,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 45445120,
+          "files_observed": 2380,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5278818304,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 205152256,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3493.68372582295,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 45584384,
+          "files_observed": 2380,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5278621696,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210862080,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3524.6656162729487,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 45715456,
+          "files_observed": 2381,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5278404608,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 210178048,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3555.6431236919016,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 44314624,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5279780864,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 228139008,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 3586.64118509111,
+      "storage": {
+        "/tmp/rb654-runtime-v4/data": {
+          "allocated_bytes_observed": 44503040,
+          "files_observed": 2379,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 5279502336,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "processes": [
+        {
+          "pid": 934331,
+          "start_ticks": 112272783,
+          "complete": true,
+          "rss_bytes": 212471808,
+          "peak_rss_bytes": 240988160
+        }
+      ]
+    }
+  ],
+  "cleanup_failed_submissions": []
+}

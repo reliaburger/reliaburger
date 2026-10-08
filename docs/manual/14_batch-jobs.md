@@ -433,20 +433,26 @@ separately from unique accepted successes. Failed diagnostics stay in the raw
 evidence. Chapter jumps and labelled faster playback use the original cast;
 measured durations always refer to real elapsed time.
 
-You can observe an hour of an existing tier without submitting competing work:
+For a continuous one-hour run after the demo, submit one bounded batch at a
+time beside the same service:
 
 ```sh
 python3 scripts/demo/qualify-jobs.py /absolute/new-recording/process.toml \
-  --existing-batch BATCH_ID --seconds 3600 \
+  --seconds 3600 --window 1 \
   --relish /absolute/immutable-binaries/relish --app-url http://application/health \
   --observe-pid BUN_PID --observe-dir /absolute/node-data \
   --output /absolute/new-hour-measurement
 ```
 
-This observer subtracts accepted results from before its window and leaves the
-submission running afterwards. It reports service latency, selected process
-memory and bounded storage observations. A complete hour can still miss the
-rate target; it never passes the separate 24-hour qualification.
+The runner counts unique accepted outcomes, starts another batch when one
+finishes, and cancels its own remaining work at the cutoff. It reports service
+latency, selected process memory and bounded storage observations. Keep other
+benchmarks, builds and test traffic stopped. A complete hour can still miss the
+rate target; it never passes the separate 24-hour qualification. To observe an
+already-running submission without creating or cancelling work, use
+`--existing-batch BATCH_ID`; that read-only mode subtracts earlier accepted
+results and leaves the submission running afterwards. An idle remainder of the
+window isn't continuous throughput evidence.
 
 For the direct baselines, build the rootful Linux example with the same profile
 as Bun and run each mode in a fresh directory on the qualification node:
@@ -494,17 +500,58 @@ multi-node and sustained fault cases remain necessary.
 
 ## Measured development results
 
-The standalone landing-page recording runs 50,000 pinned BusyBox commands
-through the public CLI on a four-vCPU, 8 GiB Linux VM, with optimised development
-binaries. It accepted all successes in 100.73 seconds (496.4/s), with no failures
-or retries, beside an application returning HTTP 200. Real pauses are preserved.
-The separately measured bare-process floor completed 100,000 commands in 6.27
-seconds; bare processes have fewer isolation and durability guarantees.
+The standalone landing-page recording measures a raw VM baseline and three
+public job tiers on a four-vCPU, 8 GiB Ubuntu 24.04 aarch64 VM, with matching
+optimised development binaries and pinned BusyBox `true` commands:
 
-These results miss the suggested 500,000/minute recording target and do not
-qualify 100m/day. The fresh-container comparisons retain actual startup failures;
-whole-directory storage observations exceeded their bounded traversal budget.
-Read the [raw evidence and reproduction](../qualification/2026-10-08-job-measurements/README.md)
-for contracts, resource/RSS observations, failures and the outstanding 24-hour,
-headroom and metadata-collection work. Separate real Bun-crash and three-worker
-loss proofs cover mixed resource profiles and the application's original PID.
+| Path | Completed work | Elapsed | Rate | Accepted retries |
+|---|---:|---:|---:|---:|
+| Raw VM processes | 1,000,000 exit statuses | 63.87s | 15656.6/s | Not applicable |
+| Fresh containers | 1,000 accepted successes | 256.01s | 3.9/s | 0 |
+| Shared containers | 10,000 accepted successes | 21.76s | 459.5/s | 0 |
+| Owned host jobs | 10,000 accepted successes | 200.56s | 49.9/s | 0 |
+
+All 21,000 public jobs completed. The separate million-process baseline counts
+exit statuses; it omits admission, limits, durable ownership and task ledgers.
+The whole rate gap cannot be called scheduling overhead. Real pauses remain in
+the cast; chapter jumps and labelled playback speeds only change the view.
+Container profiles request 100m CPU and 32 MiB with a one-core CPU limit. Host
+jobs retain the default one-CPU/64-MiB reservation without enforced resource
+limits, so admission can reduce actual concurrency below the requested 27.
+The normal maximum of three attempts applies, and accepted retries remain
+visible. The image is warm and shared executors start cold.
+
+These results don't qualify 100m/day. Initial startup and inventory failures
+remain in the diagnostics, and bounded storage scans cannot prove a global
+bound when incomplete. Read the [raw evidence and reproduction](../qualification/2026-10-09-job-runtime-revision/README.md)
+for the one-hour run, resource observations and remaining 24-hour, headroom,
+fault and metadata-collection work. [Historical measurements and recovery proofs](../qualification/2026-10-08-job-measurements/README.md)
+retain the earlier 50,000-job recording, real Bun crash and three-worker loss
+experiments, including mixed profiles and the original application's PID.
+
+### Continuous one-hour host run
+
+The separate host runner completed 3600.00 seconds of continuous
+public dispatch with one active 10,000-job batch at a time. It observed
+**182,000 unique accepted successes (50.6/s)**,
+0 terminal failures and 0 accepted retries.
+The original service passed 3,490 probes with
+0 failures; p95 latency was
+0.99 ms and the maximum was
+12.49 ms. Its original process start time and
+durable generation still matched after the window. The runner cancelled only
+its own remaining batch at the cutoff, with no cleanup failure.
+
+Selected Bun RSS was 191.0 MiB at the first observation and
+202.6 MiB at the last; its recorded peak reached 229.8 MiB. This
+isn't total node/container memory. 117 bounded storage observations
+were incomplete, so this run cannot prove a global storage bound. The node
+logged 4 transient inventory-publication timeouts;
+the raw warnings remain beside the samples. No timeout was counted as a
+terminal task failure, and service probes continued, but that doesn't make
+control-loop responsiveness fully qualified.
+
+The achieved host rate remains below the 100m/day target. Both daily throughput
+and overall qualification remain false. A completed hour doesn't substitute
+for matched current-binary baselines, sustained container/cluster scaling,
+headroom, faults and bounded metadata collection. Those remain in #640.

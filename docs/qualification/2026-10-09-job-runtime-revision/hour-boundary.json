@@ -1,0 +1,7 @@
+{
+  "source_commit": "c066d69842b05c432b530d6137480375a150f768",
+  "started_utc": "2026-10-08T19:07:59.781591+00:00",
+  "window": 1,
+  "seconds": 3600,
+  "note": "Continuously submits separate host batches after the four-part demo; no concurrent build or test traffic"
+}

@@ -1,0 +1,15 @@
+{
+  "original_bun_pid": 934331,
+  "original_service_payload_pid": 934484,
+  "bun_gone": true,
+  "service_gone": true,
+  "runc_intents": 284,
+  "runc_all_retired": true,
+  "held_addresses": 0,
+  "host_owners": 256,
+  "host_all_retired_or_never_launched": true,
+  "cleanup_scope": "Only the original rb654-runtime-v4 node and its measurement fixture; no VM stop, unrelated process signal or journal deletion",
+  "kernel_retirement_pending": false,
+  "kernel_phase": "Retired",
+  "kernel_pin_directory": "/sys/fs/bpf/reliaburger-8fceb676d50aee91d084e77eec43ceebeacfdc368bfb5395edc6309fac92ddeb"
+}

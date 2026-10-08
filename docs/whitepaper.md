@@ -1000,7 +1000,7 @@ The Reliaburger column describes 0.1.6. Rows marked *Target* are design goals fr
 | **Non-container apps** | No | No | Yes (exec/raw_exec drivers) | No | **Yes (allowlisted host exec; sandboxing planned)** |
 | **Scheduling constraints** | nodeSelector, affinity/anti-affinity, taints/tolerations | Same | constraints, affinities | N/A | **Node labels with required/preferred (AND logic)** |
 | **Daemon mode** | DaemonSet (separate resource type) | Same | system scheduler | N/A | **replicas = "*" (same App resource)** |
-| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **Target: 100M+ per day (unmeasured; task arrays planned for 0.2.0)** |
+| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **Target: 100M+ per day (unqualified; task arrays implemented for 0.2.0)** |
 | **Leader recovery** | Automatic within quorum; backup for quorum loss | Same | Automatic within quorum; backup for quorum loss | N/A | **Automatic within quorum; operator restore from a sealed backup for quorum loss (§8.3)** |
 | **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Planned (Franchise — WAN gossip + Wrapper ingress; not yet implemented, see §21)** |
 | **K8s migration** | N/A | N/A | N/A | N/A | **Built-in (relish import/export with migration reports)** |
@@ -1130,6 +1130,18 @@ failures. The [raw comparison and recovery evidence](qualification/2026-10-08-jo
 includes failed fresh-container starts and incomplete whole-directory storage
 observations. This is a measured implementation result, not 100m/day qualification;
 scaling, sustained headroom and safe historical metadata collection remain work.
+
+The revised [four-part recording](qualification/2026-10-09-job-runtime-revision/README.md)
+keeps one million raw process exits separate from 1,000 fresh-container,
+10,000 shared-container and 10,000 host jobs. All 21,000 public jobs completed;
+its reports retain actual elapsed times, retries and resource contracts. Jobs
+select `runtime = "runc"` by default, or explicitly opt into `shared-runc` or
+`process`; a process definition with an image is refused. Explicit Bun
+`--runtime runc` permits containers, while `mixed` and Linux auto-detection can
+enable both backends. The one-hour measurement and the 24-hour qualification
+are separate gates. Host jobs retain admission reservations without hard
+CPU/memory enforcement, which limits this comparison as well as its rate.
+
 
 ### AI workloads: resident models and coordinated training
 

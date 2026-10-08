@@ -567,3 +567,43 @@ All repaired local correctness gates have completed; the source revision is
 frozen before the fresh optimised build and measurement. The initial pushed explicit-runtime
 head `8e44908e` also passed GitHub CI and Build & Release; those checks don't
 cover the new inventory repairs until their source is pushed.
+
+The repaired source `c066d698` passed every GitHub CI owner and aggregate
+([run 37827060107](https://github.com/reliaburger/reliaburger/actions/runs/37827060107))
+and Build & Release ([run 37827060531](https://github.com/reliaburger/reliaburger/actions/runs/37827060531)).
+Its fresh sequential optimised Linux build finished in 9m 40s. Immutable
+binary hashes identify the actual four-part demo and continuous hour; the
+later publication changes documentation, evidence, website assets and the
+publication contract; runtime code remains unchanged.
+
+The separate host runner completed 3600.00 seconds of continuous
+public dispatch with one active 10,000-job batch at a time. It observed
+**182,000 unique accepted successes (50.6/s)**,
+0 terminal failures and 0 accepted retries.
+The original service passed 3,490 probes with
+0 failures; p95 latency was
+0.99 ms and the maximum was
+12.49 ms. Its original process start time and
+durable generation still matched after the window. The runner cancelled only
+its own remaining batch at the cutoff, with no cleanup failure.
+
+Selected Bun RSS was 191.0 MiB at the first observation and
+202.6 MiB at the last; its recorded peak reached 229.8 MiB. This
+isn't total node/container memory. 117 bounded storage observations
+were incomplete, so this run cannot prove a global storage bound. The node
+logged 4 transient inventory-publication timeouts;
+the raw warnings remain beside the samples. No timeout was counted as a
+terminal task failure, and service probes continued, but that doesn't make
+control-loop responsiveness fully qualified.
+
+The achieved host rate remains below the 100m/day target. Both daily throughput
+and overall qualification remain false. A completed hour doesn't substitute
+for matched current-binary baselines, sustained container/cluster scaling,
+headroom, faults and bounded metadata collection. Those remain in #640.
+
+Final publication `make ci` passed both Clippy configurations, formatting,
+**6,166 Rust cases in 196.561 seconds**, two doctests, **345 script checks**
+and ignored-test ownership. Its full log is retained in the runtime revision's
+`regressions/`. Main subsequently added only migration plans and roadmap
+changes; rebase preserves the recorded runtime code and original binary hashes.
+Final pushed-head GitHub checks remain required before ready-for-review status.

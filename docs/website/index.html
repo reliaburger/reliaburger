@@ -56,40 +56,54 @@
 
       <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
         <div class="section-head">
-          <h2 id="job-throughput-title">50,000 container jobs. One submission.
+          <h2 id="job-throughput-title">Three job runtimes. One built-in job path.
             <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
         </div>
-        <p>Short jobs use the same scheduling and durable outcomes as ordinary jobs.
-          Opt into retained containers to amortise setup: each command gets its own
-          process, resource limits and clean scratch space. Requests still decide
-          what fits beside your applications.</p>
-        <p>Measured on one Linux VM: 100,000 bare processes in 6.27 seconds;
-          50,000 accepted container successes in 100.73 seconds (496.4/s)
-          through the public CLI. Bare processes have fewer isolation and durability
-          guarantees; the whole difference is not scheduler overhead.</p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:25">
+        <p>Submit indexed work directly, with resource admission, durable ownership,
+          retries and accepted outcomes. Choose a fresh container, opt into a shared
+          container for short commands, or explicitly select an allowlisted host
+          binary. Watch rates and backlog; query the indexes you need.</p>
+        <div class="throughput-comparison" role="region" aria-label="Measured job runtimes" tabindex="0">
+        <table><caption>One Linux VM, matching BusyBox commands. Real elapsed time;
+          accepted retries shown separately.</caption>
+          <thead><tr><th scope="col">Execution</th><th scope="col">Completed work</th><th scope="col">Time</th><th scope="col">Rate</th><th scope="col">Retries</th></tr></thead>
+          <tbody><tr><th scope="row">VM baseline</th><td>1,000,000 raw process exits</td><td>63.87s</td><td>15656.6/s</td><td>0</td></tr><tr><th scope="row">Fresh containers</th><td>1,000 accepted jobs</td><td>256.01s</td><td>3.9/s</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>10,000 accepted jobs</td><td>21.76s</td><td>459.5/s</td><td>0</td></tr><tr><th scope="row">Owned host jobs</th><td>10,000 accepted jobs</td><td>200.56s</td><td>49.9/s</td><td>0</td></tr></tbody>
+        </table></div>
+        <p>The three public tiers accepted 21,000 unique successes.
+          The million-process VM baseline measures exit statuses without admission,
+          resource enforcement, durable ownership or task ledgers. Its rate gap
+          includes those costs; it isn't a measurement of scheduling overhead alone.</p>
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:343.922666">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
             with <code>asciinema play job-throughput.cast</code>.</p></noscript>
           <figcaption>
             <span>Optimised 0.2.0 development binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
-              aarch64. Pinned BusyBox commands, warm images and cold executors;
-              100m / 32 MiB requests, concurrency 27. Zero failures or retries;
-              the concurrent application kept returning HTTP 200. Actual pauses
-              are preserved. Activity reflects the last worker report; recent rates include chunk-report bursts.
-              This run does not establish 24-hour throughput or 100 million jobs/day.</span>
+              aarch64. Pinned BusyBox commands, warm images and cold executors.
+              Container requests: 100m CPU / 32 MiB, one-core limit;
+              host defaults: one CPU / 64 MiB reservation, without hard resource limits.
+              Requested concurrency 27 remains subject to admission.
+              Real pauses are preserved; chapter jumps and playback speed change only
+              your view. Activity reflects the last worker report; chunk reports
+              produce bursts in recent rates. This demonstration does not establish
+              24-hour throughput or 100 million jobs/day.</span>
+            <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
+              <button type="button" data-start="0.000101">VM baseline</button>
+              <button type="button" data-start="65.914696">Fresh containers</button>
+              <button type="button" data-start="322.036698">Shared containers</button>
+              <button type="button" data-start="343.922764">Host jobs</button></span>
             <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
               <button type="button" data-speed="1" aria-pressed="true">1×</button>
-              <button type="button" data-speed="2" aria-pressed="false">2×</button>
-              <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
+              <button type="button" data-speed="4" aria-pressed="false">4×</button>
+              <button type="button" data-speed="20" aria-pressed="false">20×</button></span>
           </figcaption>
         </figure>
         <p><a href="./assets/job-throughput-report.json">Measured report</a> ·
-          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-08-job-measurements">Raw results and reproduction</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-job-runtime-revision">Raw results and reproduction</a> ·
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
         <p>Use indexed inputs for data preparation, offline evaluation and independent
-          inference commands. Container reuse still starts a process for every job;
+          inference commands. Shared containers still start a process for every job;
           keeping an AI model resident is a separate planned executor.</p>
       </section>
 

@@ -1293,6 +1293,23 @@ while a real application serves requests. A completed hour and a qualified
 100-million-job day are separate booleans. Missing the target remains useful
 evidence; completing an hour cannot satisfy the 24-hour qualification gate.
 
+The completed repeat on the repaired runtime produced these actual results:
+
+| Path | Completed work | Elapsed | Rate | Accepted retries |
+|---|---:|---:|---:|---:|
+| Raw VM processes | 1,000,000 exit statuses | 63.87s | 15656.6/s | Not applicable |
+| Fresh containers | 1,000 accepted successes | 256.01s | 3.9/s | 0 |
+| Shared containers | 10,000 accepted successes | 21.76s | 459.5/s | 0 |
+| Owned host jobs | 10,000 accepted successes | 200.56s | 49.9/s | 0 |
+
+The host path's default one-CPU reservation admits fewer concurrent jobs than
+the requested 27. That reservation and the per-attempt durable owner work both
+matter when interpreting its rate. We don't lower the reservation just to make
+the recording faster. The [raw reports](../qualification/2026-10-09-job-runtime-revision/README.md)
+keep binary hashes, manifests, accepted outcomes, retries and failed diagnostics
+beside the separate sustained measurement. More throughput work remains in
+#640; these numbers don't establish 100 million successes per day.
+
 ### Inventory after a backend switch
 
 The four-part experiment found another read waiting behind a mutation. An owned
@@ -1318,3 +1335,30 @@ An existing staging symlink, file or insecure directory still refuses, and a
 published record still uses the strict ownership reader. The focused regression
 renames the directory between enumeration and validation; it doesn't hope to
 win a probabilistic race.
+
+### What an hour establishes
+
+The separate host runner completed 3600.00 seconds of continuous
+public dispatch with one active 10,000-job batch at a time. It observed
+**182,000 unique accepted successes (50.6/s)**,
+0 terminal failures and 0 accepted retries.
+The original service passed 3,490 probes with
+0 failures; p95 latency was
+0.99 ms and the maximum was
+12.49 ms. Its original process start time and
+durable generation still matched after the window. The runner cancelled only
+its own remaining batch at the cutoff, with no cleanup failure.
+
+Selected Bun RSS was 191.0 MiB at the first observation and
+202.6 MiB at the last; its recorded peak reached 229.8 MiB. This
+isn't total node/container memory. 117 bounded storage observations
+were incomplete, so this run cannot prove a global storage bound. The node
+logged 4 transient inventory-publication timeouts;
+the raw warnings remain beside the samples. No timeout was counted as a
+terminal task failure, and service probes continued, but that doesn't make
+control-loop responsiveness fully qualified.
+
+The achieved host rate remains below the 100m/day target. Both daily throughput
+and overall qualification remain false. A completed hour doesn't substitute
+for matched current-binary baselines, sustained container/cluster scaling,
+headroom, faults and bounded metadata collection. Those remain in #640.

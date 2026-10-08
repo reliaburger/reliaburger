@@ -1477,7 +1477,10 @@ explicit `--runtime runc` stays container-only;
 host CPU/memory limits remain refused. The
 [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
 tracks #639 and the still-unqualified sustained target (#640). The standalone
-[measured recording](https://reliaburger.com/#job-throughput) shows 50,000 accepted
-container successes in 100.73 seconds. [Raw comparison and recovery evidence](qualification/2026-10-08-job-measurements/README.md)
-records the actual hardware, failures and remaining qualification work.
+[four-part recording](https://reliaburger.com/#job-throughput) shows a million raw
+VM process exits, followed by 1,000 fresh-container, 10,000 shared-container and
+10,000 owned host jobs. All 21,000 public jobs completed. [Raw measurements](qualification/2026-10-09-job-runtime-revision/README.md)
+retain the actual hardware, retries, resource contracts and separate continuous
+hour. [Earlier comparisons and recovery evidence](qualification/2026-10-08-job-measurements/README.md)
+retain failed experiments and remaining qualification work.
 Resident model workers (#641) remain separate.

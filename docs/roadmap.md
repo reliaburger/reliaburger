@@ -294,11 +294,11 @@ migration and no feature gate
   admission and accepted outcomes ([plan](plans/2026-10-07-plan-common-job-lifecycle.md),
   [qualification](qualification/2026-10-07-common-jobs/README.md)). This tick
   records implementation; 0.2.0 isn't released. [#654](https://github.com/reliaburger/reliaburger/pull/654)
-  adds bounded reusable executors and a measured 50,000-container-job demonstration
-  ([raw results](qualification/2026-10-08-job-measurements/README.md)); it doesn't
+  adds bounded reusable executors and a four-part VM/process/container demonstration
+  ([raw results](qualification/2026-10-09-job-runtime-revision/README.md)); it doesn't
   qualify the daily target. Reusable executors
-  [#639](https://github.com/reliaburger/reliaburger/issues/639), throughput
-  qualification and the high-volume demo
+  [#639](https://github.com/reliaburger/reliaburger/issues/639) are implemented in
+  #654, pending merge. Sustained throughput qualification
   [#640](https://github.com/reliaburger/reliaburger/issues/640), and resident model
   workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
   The million-task release gate and sustained 100m/day claim still require

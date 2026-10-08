@@ -131,3 +131,15 @@ replacement claims while checking old container retirement, plus a possible
 staging-directory publication race. Prove each correction with a deterministic
 regression, keep strict published ownership and positive retirement checks,
 then repeat the completed demonstration and a full hour on the repaired runtime.
+
+### Completed revised demonstration
+
+The repaired-source recording completed the million-process raw baseline and
+all 21,000 public jobs across the 1,000/10,000/10,000 tiers. The landing page
+uses its original cast with chapter jumps and labelled playback speeds; the
+manual and book retain actual elapsed times, resource contracts and retries.
+See [raw results](../qualification/2026-10-09-job-runtime-revision/README.md).
+The separate continuous hour completed 182,000 accepted
+successes at 50.6/s, without terminal failures or retries.
+Final publication checks remain required before marking the PR ready; the
+daily throughput and bounded-cost qualification remain in #640.
