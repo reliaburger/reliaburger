@@ -25,11 +25,14 @@
 # .github/workflows/appliance.yml runs it on a pull request labelled
 # record-netboot-demo and uploads the recording.
 
+# wait_for and trap call functions by name.
+# shellcheck disable=SC2329
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 IDLE_LIMIT=2
 MACS=(52:54:00:00:00:01 52:54:00:00:00:02 52:54:00:00:00:03)
+# The router reserves these, but nothing below relies on it: relish machines finds them.
 IPS=(10.42.0.11 10.42.0.12 10.42.0.13)
 
 CAST=""
@@ -115,7 +118,7 @@ scene() {
     power_on
     wait_for "all three to install" 600 installed 3
     say "Each one reboots into Reliaburger, unclaimed, its claim key on its screen."
-    wait_for "the three to boot and wait to be claimed" 600 all_answering
+    wait_for "relish machines to hear all three" 600 listed
     show "relish machines"
     say "--trust-lan: this switch is ours, so skip comparing each claim key on the machine's screen."
     say "--yes: skip the master-key backup prompt. Back up ~/lab/secrets for real clusters."
@@ -129,15 +132,16 @@ scene() {
 }
 
 # The checks below run by name, through wait_for.
-# shellcheck disable=SC2329
 installed() {
     [[ "$(grep -c "has the installer" netboot.log 2>/dev/null)" -ge "$1" ]]
 }
 
-all_answering() {
-    local ip
-    for ip in "${IPS[@]}"; do
-        curl -fsSk --max-time 3 "https://${ip}:9119/v1/claim" >/dev/null 2>&1 || return 1
+# All three machines announce themselves as unclaimed over mDNS.
+listed() {
+    local list mac
+    list=$(relish machines --wait 3 2>/dev/null) || return 1
+    for mac in "${MACS[@]}"; do
+        grep -q "${mac}" <<<"${list}" || return 1
     done
 }
 
@@ -209,7 +213,7 @@ sudo ip netns exec rbdemo dnsmasq --interface=rbdemoveth1 --bind-interfaces --po
     --dhcp-range=10.42.0.100,10.42.0.200,12h --dhcp-option=3,10.42.0.1 \
     --dhcp-host="${MACS[0]},${IPS[0]}" --dhcp-host="${MACS[1]},${IPS[1]}" \
     --dhcp-host="${MACS[2]},${IPS[2]}" \
-    --pid-file="${DEMO_WORK}/dnsmasq.pid" --log-facility="${DEMO_WORK}/dnsmasq.log"
+    --pid-file="${DEMO_WORK}/dnsmasq.pid" --log-dhcp --log-facility="${DEMO_WORK}/dnsmasq.log"
 
 # What `relish image download --dir os` would have saved, from the lab build.
 mkdir -p "${DEMO_WORK}/stage/os" "${DEMO_WORK}/home"
@@ -251,5 +255,9 @@ if [[ "${status}" -ne 0 ]]; then
     done
     echo "--- relish netboot ---"
     cat "${DEMO_WORK}/stage/netboot.log" 2>/dev/null || true
+    echo "--- relish machines ---"
+    relish machines --wait 5 2>&1 || true
+    echo "--- the router's dnsmasq ---"
+    sudo cat "${DEMO_WORK}/dnsmasq.log" 2>/dev/null || true
 fi
 exit "${status}"
