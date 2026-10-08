@@ -1,0 +1,34 @@
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/reusable-job-executors/reliaburger)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized] target(s) in 2m 25s
+────────────
+ Nextest run ID bb7b96f1-555a-48a1-9291-43b0adabfe97 with nextest profile: default
+    Starting 2 tests across 1 binary (5377 tests skipped)
+        FAIL [   0.126s] (2/2) reliaburger grill::runc_intent::inventory_tests::vanished_prepublication_directory_has_never_authorised_a_launch
+  stdout ───
+
+    running 1 test
+    test grill::runc_intent::inventory_tests::vanished_prepublication_directory_has_never_authorised_a_launch ... FAILED
+
+    failures:
+
+    failures:
+        grill::runc_intent::inventory_tests::vanished_prepublication_directory_has_never_authorised_a_launch
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5378 filtered out; finished in 0.10s
+
+  stderr ───
+
+    thread 'grill::runc_intent::inventory_tests::vanished_prepublication_directory_has_never_authorised_a_launch' (194212817) panicked at src/grill/runc_intent.rs:607:72:
+    called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 
+────────────
+     Summary [   0.170s] 2 tests run: 1 passed, 1 failed, 5377 skipped
+        FAIL [   0.126s] (2/2) reliaburger grill::runc_intent::inventory_tests::vanished_prepublication_directory_has_never_authorised_a_launch
+error: test run failed

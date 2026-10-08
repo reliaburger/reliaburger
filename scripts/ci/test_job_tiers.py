@@ -13,13 +13,24 @@ class JobTiers(unittest.TestCase):
         baseline = dict(path='Bare',count=1000000,verified_successes=1000000,failures=0,elapsed_seconds=60)
         rows = [dict(runtime=mode, total=count, unique_accepted_successes=count,
                      accepted_elapsed_seconds=100, all_tasks_succeeded=True)
-                for mode,count in [('runc',1000),('shared-runc',10000),('process',1000000)]]
+                for mode,count in [('runc',1000),('shared-runc',10000),('process',10000)]]
         report = tiers.build_report(baseline,rows,400)
-        self.assertEqual(report['unique_accepted_successes'],1011000)
+        self.assertEqual(report['unique_accepted_successes'],21000)
         self.assertEqual(report['baseline']['verified_successes'],1000000)
         self.assertEqual(report['recording_elapsed_seconds'],400)
         self.assertFalse(report['qualified_100m_per_day'])
         self.assertTrue(report['all_tasks_succeeded'])
         with self.assertRaises(ValueError): tiers.build_report(baseline,list(reversed(rows)),400)
-        rows[-1]['unique_accepted_successes']=999999
+        rows[-1]['unique_accepted_successes']=9999
         self.assertFalse(tiers.build_report(baseline,rows,400)['all_tasks_succeeded'])
+
+    def test_demo_uses_the_default_three_attempt_policy_and_reports_it(self):
+        spec = importlib.util.spec_from_file_location('tiers_default', ROOT / 'scripts/demo/record-job-tiers.py')
+        tiers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tiers)
+        for runtime, count in tiers.TIERS:
+            cohort = tiers.build_manifest(runtime, count, 'image@sha256:digest', '/bin/busybox')
+            self.assertIn('max_attempts = 3\n', cohort)
+            self.assertIn(f'count = {count}\n', cohort)
+            self.assertIn(f'runtime = "{runtime}"\n', cohort)
+            self.assertEqual('image = ' in cohort, runtime != 'process')

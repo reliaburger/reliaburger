@@ -1,6 +1,6 @@
 # Reusable container executors and measured job throughput
 
-Date: 7 October 2026. Updated: 8 October 2026. Issues:
+Date: 7 October 2026. Updated: 9 October 2026. Issues:
 [#639](https://github.com/reliaburger/reliaburger/issues/639) and
 [#640](https://github.com/reliaburger/reliaburger/issues/640), milestone 0.2.0.
 Branch: `codex/reusable-job-executors`, based on main `5cfb9b71`.
@@ -107,7 +107,7 @@ formats. Explicit Bun `--runtime runc` selects only runc; `--runtime mixed`
 selects both, and auto may detect both.
 
 Record a real three-tier demonstration: 1,000 fresh container jobs, 10,000
-shared-runc jobs, then 1,000,000 public process jobs, plus a separately measured raw VM
+shared-runc jobs, then 10,000 public process jobs, plus a separately measured raw VM
 fork/exec baseline, with their distinct
 contracts labelled and real elapsed pauses retained. Run one hour of public
 dispatch beside a real application, recording accepted successes/failures,
@@ -116,3 +116,18 @@ Report missed targets and incomplete bounds. One hour is useful measurement
 evidence, not a 24-hour qualification. Complete the matching runtime gates,
 portable CI and final GitHub checks, update the PR description, then mark
 #654 ready for review as requested.
+
+### Measurement revision (9 October)
+
+Keep the million-process VM baseline, 1,000 fresh-container and 10,000 shared-
+container tiers. The public host tier measured roughly 50 accepted successes/s
+with its one-CPU default reservation, so a completed million would take hours.
+The user selected a smaller completed host tier: use 10,000 jobs, retain the
+cancelled million-job diagnostic, and report the achieved rate. Add chapter
+jumps and labelled faster playback without rewriting the raw timeline.
+
+The diagnostic also exposed discovery inventory reads waiting for host
+replacement claims while checking old container retirement, plus a possible
+staging-directory publication race. Prove each correction with a deterministic
+regression, keep strict published ownership and positive retirement checks,
+then repeat the completed demonstration and a full hour on the repaired runtime.

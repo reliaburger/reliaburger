@@ -254,9 +254,8 @@ impl IntentJournal {
                     .file_name()
                     .into_string()
                     .map_err(|_| io::Error::other("non-UTF-8 runtime intent identity"))?;
-                if name.starts_with(".preparing-") && entry.file_type()?.is_dir() {
+                if unpublished_entry(&name, &entry.path())? {
                     // No caller may allocate resources until atomic publication.
-                    validate_directory(&entry.path())?;
                     continue;
                 }
                 inventory.push(journal.load(&InstanceId(name))?.ok_or_else(|| {
@@ -591,4 +590,63 @@ fn create_directory(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     validate_directory(path)
+}
+
+// A staging name may disappear between enumeration and atomic publication.
+// It has never authorised resource allocation. Every surviving entry still
+// needs the same private-directory checks, and published names never take this
+// exception.
+fn unpublished_entry(name: &str, path: &Path) -> io::Result<bool> {
+    if !name.starts_with(".preparing-") {
+        return Ok(false);
+    }
+    match validate_directory(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    #[test]
+    fn vanished_prepublication_directory_has_never_authorised_a_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".preparing-fixture");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&staging)
+            .unwrap();
+        let entry = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // A reader has enumerated this entry while publication renames it.
+        std::fs::rename(&staging, root.path().join("published")).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &entry.path()).unwrap());
+        assert!(!unpublished_entry("published", &entry.path()).unwrap());
+    }
+
+    #[test]
+    fn prepublication_entries_still_refuse_corrupt_privacy_and_file_types() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".preparing-fixture");
+        std::fs::write(&staging, b"not a directory").unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).is_err());
+        std::fs::remove_file(&staging).unwrap();
+        std::os::unix::fs::symlink(root.path().join("missing-target"), &staging).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).is_err());
+        std::fs::remove_file(&staging).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&staging)
+            .unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).is_err());
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).unwrap());
+    }
 }

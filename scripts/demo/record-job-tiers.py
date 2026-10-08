@@ -19,7 +19,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('measurement', HERE / 'measure-jobs.py')
 measurement = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(measurement)
-TIERS = [('runc', 1000), ('shared-runc', 10000), ('process', 1000000)]
+TIERS = [('runc', 1000), ('shared-runc', 10000), ('process', 10000)]
 
 
 def build_report(baseline, tiers, elapsed):
@@ -34,6 +34,15 @@ def build_report(baseline, tiers, elapsed):
                 all_tasks_succeeded=succeeded, qualified_100m_per_day=False,
                 comparison_boundary='Raw exit statuses omit admission, durable ownership, task ledgers and accepted outcomes. Differences are not pure scheduling overhead.',
                 timing='One monotonic recording clock; includes preparation, submission, observation and indexed verification pauses')
+
+
+
+def build_manifest(runtime, count, image, host_binary):
+    template = (f'exec = {json.dumps(str(host_binary))}\ncommand = ["true"]\n' if runtime == 'process' else
+                f'image = {json.dumps(image)}\ncommand = ["/bin/busybox", "true"]\ncpu = "100m-1000m"\nmemory = "32Mi"\n')
+    return (f'name = "demo-{runtime}-{count}"\nnamespace = "default"\n[[cohort]]\nname = "commands"\n'
+            f'count = {count}\nchunk_size = 1000\nmax_attempts = 3\nper_node_concurrency = 27\n'
+            f'[cohort.template]\nruntime = "{runtime}"\n' + template)
 
 
 def main():
@@ -56,9 +65,10 @@ def main():
     rows = []
     baseline = None
     report = dict(all_tasks_succeeded=False, qualified_100m_per_day=False,
-                  kernel=platform.release(), architecture=platform.machine())
+                  kernel=platform.release(), architecture=platform.machine(),
+                  retry_policy='Default: at most three attempts per task; accepted retries are reported')
     try:
-        cast.emit('Raw VM baseline + 3 Reliaburger job tiers\nSame BusyBox true command; actual pauses preserved.', time.monotonic())
+        cast.emit('Raw VM baseline + 3 Reliaburger job tiers\nSame BusyBox true command; actual pauses preserved.\nDefault policy: up to three attempts; accepted retries remain visible.', time.monotonic())
         command = [str(options.binaries / 'job-throughput'), '--path', 'bare', '--root', str(options.output / 'baseline'),
                    '--bun', str(options.binaries / 'bun'), '--image', options.image, '--count', '1000000',
                    '--concurrency', '27', '--service-url', options.service_url, '--timeout', str(options.timeout)]
@@ -73,11 +83,7 @@ def main():
                   'Exit statuses only; no ownership journal, resource enforcement or accepted task ledger.', time.monotonic())
         for runtime, count in TIERS:
             manifest = options.output / (runtime + '.toml')
-            template = (f'exec = {json.dumps(str(options.host_binary))}\ncommand = ["true"]\n' if runtime == 'process' else
-                        f'image = {json.dumps(options.image)}\ncommand = ["/bin/busybox", "true"]\ncpu = "100m-1000m"\nmemory = "32Mi"\n')
-            manifest.write_text(f'name = "demo-{runtime}-{count}"\nnamespace = "default"\n[[cohort]]\nname = "commands"\n'
-                                f'count = {count}\nchunk_size = 1000\nmax_attempts = 1\nper_node_concurrency = 27\n'
-                                f'[cohort.template]\nruntime = "{runtime}"\n' + template)
+            manifest.write_text(build_manifest(runtime, count, options.image, options.host_binary))
             destination = options.output / runtime
             command = ['python3', str(HERE / 'measure-jobs.py'), str(manifest), '--relish', options.relish,
                        '--service-url', options.service_url, '--output', str(destination), '--timeout', str(options.timeout),

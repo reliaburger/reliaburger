@@ -517,3 +517,53 @@ checks** and ignored-test ownership. No retries or exclusions were introduced.
 The existing published 50,000-job recording remains valid in this interim
 commit; the test-first replacement contract and actual four-part evidence are
 still pending. Final-head GitHub checks are still required.
+
+## Revised measurement and inventory repairs (9 October)
+
+The first new recorder ran the raw million-process baseline successfully, then
+accepted only 998 of 1,000 fresh-container jobs with its explicitly one-attempt
+diagnostic policy. The two failures were a launcher-startup timeout and a
+missing file during inventory. The repeat used the normal maximum of three
+attempts, accepted all 1,000 container jobs with one retry, and all 10,000
+shared-container jobs with no retries. These are retained under
+`2026-10-09-job-runtime-revision/`; retry success doesn't establish the cause of
+the launcher timeout.
+
+The public host tier accepted 33,579 successes before the user chose a smaller
+completed recording. Cancelling its stable parent through the public API left
+966,421 indexes not run, with no terminal failure or retry counted in that tier.
+Its read-only observer was stopped before a full hour. The original samples,
+cutoff and failed/incomplete reports remain diagnostic evidence, not publication
+or sustained qualification.
+
+That diagnostic retained 287 discovery-inventory timeout/route warnings. The
+mixed adapter checked old container retirement under the current host owner's
+lifecycle claim; a deterministic regression failed while the replacement held
+that claim. The corrected read retains positive original-backend retirement
+and address checks, and recovery still revalidates generations before mutation.
+Another regression renamed a private staging directory after enumeration and
+failed with `NotFound`; only unpublished staging disappearance is now skipped.
+Existing corrupt privacy, file types and published ownership still refuse.
+The focused eleven-case set passed after both repairs.
+
+The first subsequent portable/Linux rebuilds exhausted host disk before tests
+started. Both failures are retained. Cleanup reclaimed old rebuildable library
+and object cache files, preserving executables, logs, source, runtime journals
+and recordings. Heavy builds now run sequentially; final repaired gates and the
+fresh optimised measurement remain required.
+
+The repaired sequential portable `make ci` passed both Clippy configurations,
+all **6,166 Rust cases**, two doctests, **345 script checks** and ignored-test
+ownership. The cluster gate passed **46/46 in 360.908 seconds**. The provisioned
+Linux runtime gate passed **159/159 in 725.300 seconds**, followed by
+**11/11 rootless adoption cases in 47.941 seconds**. The original AppArmor
+setting was restored to 1. The new recording and hour still need the
+optimised build.
+
+Both repaired Linux Clippy configurations passed (all features in 2m 09s;
+no default features in 2m 01s). The original AppArmor setting remains 1.
+The matched native upgrade gate passed **18/18 in 1,445.181 seconds**.
+All repaired local correctness gates have completed; the source revision is
+frozen before the fresh optimised build and measurement. The initial pushed explicit-runtime
+head `8e44908e` also passed GitHub CI and Build & Release; those checks don't
+cover the new inventory repairs until their source is pushed.

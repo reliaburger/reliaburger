@@ -1,0 +1,726 @@
+0/1,000 unique accepted successes in 0.08s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 1000, held 0; recent unknown/s over unknowns
+application 200 in 12.98ms
+0/1,000 unique accepted successes in 1.15s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.065615399s
+application 200 in 0.99ms
+0/1,000 unique accepted successes in 2.26s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.097360751s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 3.39s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.138868292s
+application 200 in 2.85ms
+0/1,000 unique accepted successes in 4.49s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.10427815s
+application 200 in 1.82ms
+0/1,000 unique accepted successes in 5.59s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.09886161s
+application 200 in 1.31ms
+0/1,000 unique accepted successes in 6.64s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.048104778s
+application 200 in 1.01ms
+0/1,000 unique accepted successes in 7.72s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.077026916s
+application 200 in 0.75ms
+0/1,000 unique accepted successes in 8.81s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.092504309s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 9.90s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.09748938s
+application 200 in 0.99ms
+0/1,000 unique accepted successes in 11.05s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.145347224s
+application 200 in 1.37ms
+0/1,000 unique accepted successes in 12.14s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.079193852s
+application 200 in 0.87ms
+0/1,000 unique accepted successes in 13.22s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.094890038s
+application 200 in 0.56ms
+0/1,000 unique accepted successes in 14.26s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.045594168s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 15.37s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.090950324s
+application 200 in 5.52ms
+0/1,000 unique accepted successes in 16.48s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.099244068s
+application 200 in 12.08ms
+0/1,000 unique accepted successes in 17.60s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.136491914s
+application 200 in 3.59ms
+0/1,000 unique accepted successes in 18.71s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.117973181s
+application 200 in 0.70ms
+0/1,000 unique accepted successes in 19.81s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.096295535s
+application 200 in 0.77ms
+0/1,000 unique accepted successes in 20.92s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.104511501s
+application 200 in 0.73ms
+0/1,000 unique accepted successes in 22.02s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.10127761s
+application 200 in 3.50ms
+0/1,000 unique accepted successes in 23.10s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.086143714s
+application 200 in 0.67ms
+0/1,000 unique accepted successes in 24.22s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.118851483s
+application 200 in 7.25ms
+0/1,000 unique accepted successes in 25.36s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.140880908s
+application 200 in 0.77ms
+0/1,000 unique accepted successes in 26.51s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.152279558s
+application 200 in 0.57ms
+0/1,000 unique accepted successes in 27.63s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.116002686s
+application 200 in 1.54ms
+0/1,000 unique accepted successes in 28.76s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.139126922s
+application 200 in 1.05ms
+0/1,000 unique accepted successes in 29.88s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.114192438s
+application 200 in 0.52ms
+0/1,000 unique accepted successes in 31.10s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.206881447s
+application 200 in 4.37ms
+0/1,000 unique accepted successes in 32.24s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.147993659s
+application 200 in 0.56ms
+0/1,000 unique accepted successes in 33.34s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.108831994s
+application 200 in 1.76ms
+0/1,000 unique accepted successes in 34.45s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.109597365s
+application 200 in 1.19ms
+0/1,000 unique accepted successes in 35.57s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.112883148s
+application 200 in 0.74ms
+0/1,000 unique accepted successes in 36.72s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.143201229s
+application 200 in 2.67ms
+0/1,000 unique accepted successes in 37.84s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.132789785s
+application 200 in 1.06ms
+0/1,000 unique accepted successes in 39.00s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.149087305s
+application 200 in 0.68ms
+0/1,000 unique accepted successes in 40.11s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.116137501s
+application 200 in 0.90ms
+0/1,000 unique accepted successes in 41.22s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.1146971s
+application 200 in 0.86ms
+0/1,000 unique accepted successes in 42.35s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.12177909s
+application 200 in 0.75ms
+0/1,000 unique accepted successes in 43.47s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.125400479s
+application 200 in 2.43ms
+0/1,000 unique accepted successes in 44.61s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.13782371s
+application 200 in 7.06ms
+0/1,000 unique accepted successes in 45.75s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.143589134s
+application 200 in 0.44ms
+0/1,000 unique accepted successes in 46.85s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.102622177s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 48.01s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.137484216s
+application 200 in 0.72ms
+0/1,000 unique accepted successes in 49.14s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.149481263s
+application 200 in 0.62ms
+0/1,000 unique accepted successes in 50.25s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.111960083s
+application 200 in 1.77ms
+0/1,000 unique accepted successes in 51.44s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.180884104s
+application 200 in 1.42ms
+0/1,000 unique accepted successes in 52.55s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.11567942s
+application 200 in 0.64ms
+0/1,000 unique accepted successes in 53.67s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.122983238s
+application 200 in 0.65ms
+0/1,000 unique accepted successes in 54.87s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.198218916s
+application 200 in 1.90ms
+0/1,000 unique accepted successes in 56.05s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.18134686s
+application 200 in 1.00ms
+0/1,000 unique accepted successes in 57.16s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.108573949s
+application 200 in 0.93ms
+0/1,000 unique accepted successes in 58.28s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.122099257s
+application 200 in 0.71ms
+0/1,000 unique accepted successes in 59.43s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.146978707s
+application 200 in 0.61ms
+0/1,000 unique accepted successes in 60.54s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.10755945s
+application 200 in 0.60ms
+0/1,000 unique accepted successes in 61.63s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.096595549s
+application 200 in 0.78ms
+0/1,000 unique accepted successes in 62.75s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.097660241s
+application 200 in 1.49ms
+0/1,000 unique accepted successes in 63.86s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.134729294s
+application 200 in 1.14ms
+0/1,000 unique accepted successes in 64.99s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.11525542s
+application 200 in 0.78ms
+0/1,000 unique accepted successes in 66.15s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.164082862s
+application 200 in 1.08ms
+0/1,000 unique accepted successes in 67.31s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.160337662s
+application 200 in 0.67ms
+0/1,000 unique accepted successes in 68.39s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.076048817s
+application 200 in 0.72ms
+0/1,000 unique accepted successes in 69.50s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.119044974s
+application 200 in 4.82ms
+0/1,000 unique accepted successes in 70.61s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.113495935s
+application 200 in 1.96ms
+0/1,000 unique accepted successes in 71.73s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.119230937s
+application 200 in 0.59ms
+0/1,000 unique accepted successes in 72.87s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.132055444s
+application 200 in 1.17ms
+0/1,000 unique accepted successes in 74.02s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.153112168s
+application 200 in 1.51ms
+0/1,000 unique accepted successes in 75.12s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.09889133s
+application 200 in 0.62ms
+0/1,000 unique accepted successes in 76.19s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.073188172s
+application 200 in 0.85ms
+0/1,000 unique accepted successes in 77.31s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.113713835s
+application 200 in 0.65ms
+0/1,000 unique accepted successes in 78.41s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.10399476s
+application 200 in 0.99ms
+0/1,000 unique accepted successes in 79.58s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.164858468s
+application 200 in 3.20ms
+0/1,000 unique accepted successes in 80.69s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.111448917s
+application 200 in 4.10ms
+0/1,000 unique accepted successes in 81.86s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.177093553s
+application 200 in 0.60ms
+0/1,000 unique accepted successes in 82.98s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.120199604s
+application 200 in 0.75ms
+0/1,000 unique accepted successes in 84.14s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.155656728s
+application 200 in 1.56ms
+0/1,000 unique accepted successes in 85.29s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.146650693s
+application 200 in 0.69ms
+0/1,000 unique accepted successes in 86.42s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.128964213s
+application 200 in 1.19ms
+0/1,000 unique accepted successes in 87.53s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.118736558s
+application 200 in 2.43ms
+0/1,000 unique accepted successes in 88.67s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.140250955s
+application 200 in 0.77ms
+0/1,000 unique accepted successes in 89.81s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.130058339s
+application 200 in 1.47ms
+0/1,000 unique accepted successes in 90.94s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.13438997s
+application 200 in 0.56ms
+0/1,000 unique accepted successes in 92.08s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.141454279s
+application 200 in 0.49ms
+0/1,000 unique accepted successes in 93.22s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.129048894s
+application 200 in 1.22ms
+0/1,000 unique accepted successes in 94.29s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.086567977s
+application 200 in 1.52ms
+0/1,000 unique accepted successes in 95.39s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.088590503s
+application 200 in 1.33ms
+0/1,000 unique accepted successes in 96.50s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.113087383s
+application 200 in 0.56ms
+0/1,000 unique accepted successes in 97.60s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.102254429s
+application 200 in 0.85ms
+0/1,000 unique accepted successes in 98.70s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.088916973s
+application 200 in 0.67ms
+0/1,000 unique accepted successes in 99.81s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.123783408s
+application 200 in 0.76ms
+0/1,000 unique accepted successes in 100.92s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.109726907s
+application 200 in 0.60ms
+0/1,000 unique accepted successes in 102.02s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.096857853s
+application 200 in 3.25ms
+0/1,000 unique accepted successes in 103.14s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.111697723s
+application 200 in 1.76ms
+0/1,000 unique accepted successes in 104.30s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.167690329s
+application 200 in 5.60ms
+0/1,000 unique accepted successes in 105.41s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.112325889s
+application 200 in 0.79ms
+0/1,000 unique accepted successes in 106.52s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.112506096s
+application 200 in 0.83ms
+0/1,000 unique accepted successes in 107.65s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.131030751s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 108.82s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.159628951s
+application 200 in 1.01ms
+0/1,000 unique accepted successes in 109.97s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.146067368s
+application 200 in 1.64ms
+0/1,000 unique accepted successes in 111.05s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.096256802s
+application 200 in 0.62ms
+0/1,000 unique accepted successes in 112.20s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.12691374s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 113.29s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.102416536s
+application 200 in 0.78ms
+0/1,000 unique accepted successes in 114.38s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.091010926s
+application 200 in 0.95ms
+0/1,000 unique accepted successes in 115.51s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.116950899s
+application 200 in 0.73ms
+0/1,000 unique accepted successes in 116.65s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.150737172s
+application 200 in 0.65ms
+0/1,000 unique accepted successes in 117.75s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.110491593s
+application 200 in 0.68ms
+0/1,000 unique accepted successes in 118.86s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.101521104s
+application 200 in 1.78ms
+0/1,000 unique accepted successes in 119.96s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.099843553s
+application 200 in 1.25ms
+0/1,000 unique accepted successes in 121.10s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.141608652s
+application 200 in 5.99ms
+0/1,000 unique accepted successes in 122.25s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.148591241s
+application 200 in 1.60ms
+0/1,000 unique accepted successes in 123.34s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.09238707s
+application 200 in 1.18ms
+0/1,000 unique accepted successes in 124.49s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.151280281s
+application 200 in 0.71ms
+0/1,000 unique accepted successes in 125.68s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.18374443s
+application 200 in 2.52ms
+0/1,000 unique accepted successes in 126.84s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.169773265s
+application 200 in 1.25ms
+0/1,000 unique accepted successes in 128.01s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.145183595s
+application 200 in 0.68ms
+0/1,000 unique accepted successes in 129.17s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.178744939s
+application 200 in 0.97ms
+0/1,000 unique accepted successes in 130.31s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.13634373s
+application 200 in 2.08ms
+0/1,000 unique accepted successes in 131.43s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.125485303s
+application 200 in 0.97ms
+0/1,000 unique accepted successes in 132.54s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.112672416s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 133.67s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.130352097s
+application 200 in 0.80ms
+0/1,000 unique accepted successes in 134.75s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.077154111s
+application 200 in 0.84ms
+0/1,000 unique accepted successes in 136.00s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.256476362s
+application 200 in 0.60ms
+0/1,000 unique accepted successes in 137.16s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.153130787s
+application 200 in 0.71ms
+0/1,000 unique accepted successes in 138.28s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.111687079s
+application 200 in 1.23ms
+0/1,000 unique accepted successes in 139.44s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.167440008s
+application 200 in 0.55ms
+0/1,000 unique accepted successes in 140.54s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.106479896s
+application 200 in 0.66ms
+0/1,000 unique accepted successes in 141.71s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.166431573s
+application 200 in 1.00ms
+0/1,000 unique accepted successes in 142.84s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.130540967s
+application 200 in 0.92ms
+0/1,000 unique accepted successes in 143.94s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.097450678s
+application 200 in 0.65ms
+0/1,000 unique accepted successes in 145.06s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.118289388s
+application 200 in 1.67ms
+0/1,000 unique accepted successes in 146.17s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.105913393s
+application 200 in 0.67ms
+0/1,000 unique accepted successes in 147.26s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.101312557s
+application 200 in 3.70ms
+0/1,000 unique accepted successes in 148.42s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.152105067s
+application 200 in 2.52ms
+0/1,000 unique accepted successes in 149.57s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.152202087s
+application 200 in 0.71ms
+0/1,000 unique accepted successes in 150.71s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.142805965s
+application 200 in 4.95ms
+0/1,000 unique accepted successes in 151.93s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.208099029s
+application 200 in 1.31ms
+0/1,000 unique accepted successes in 153.07s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.12428864s
+application 200 in 1.63ms
+0/1,000 unique accepted successes in 154.16s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.125226365s
+application 200 in 1.92ms
+0/1,000 unique accepted successes in 155.27s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.099552977s
+application 200 in 1.54ms
+0/1,000 unique accepted successes in 156.40s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.130851146s
+application 200 in 0.62ms
+0/1,000 unique accepted successes in 157.57s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.177032428s
+application 200 in 5.26ms
+0/1,000 unique accepted successes in 158.67s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.099454329s
+application 200 in 0.56ms
+0/1,000 unique accepted successes in 159.82s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.148586661s
+application 200 in 2.96ms
+0/1,000 unique accepted successes in 160.91s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.08452631s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 162.02s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.105563547s
+application 200 in 1.44ms
+0/1,000 unique accepted successes in 163.16s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.139450568s
+application 200 in 3.35ms
+0/1,000 unique accepted successes in 164.26s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.105589798s
+application 200 in 5.82ms
+0/1,000 unique accepted successes in 165.39s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.131123155s
+application 200 in 0.68ms
+0/1,000 unique accepted successes in 166.55s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.156146711s
+application 200 in 1.68ms
+0/1,000 unique accepted successes in 167.76s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.204665187s
+application 200 in 1.85ms
+0/1,000 unique accepted successes in 168.92s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.171973241s
+application 200 in 0.75ms
+0/1,000 unique accepted successes in 170.03s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.105356241s
+application 200 in 4.74ms
+0/1,000 unique accepted successes in 171.15s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.121790182s
+application 200 in 3.25ms
+0/1,000 unique accepted successes in 172.35s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.185806252s
+application 200 in 1.18ms
+0/1,000 unique accepted successes in 173.50s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.165126101s
+application 200 in 1.09ms
+0/1,000 unique accepted successes in 174.65s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.130819917s
+application 200 in 2.19ms
+0/1,000 unique accepted successes in 175.79s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.162052599s
+application 200 in 0.61ms
+0/1,000 unique accepted successes in 176.92s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.121681423s
+application 200 in 0.48ms
+0/1,000 unique accepted successes in 178.02s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.104563654s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 179.09s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.075276528s
+application 200 in 0.57ms
+0/1,000 unique accepted successes in 180.17s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.07545962s
+application 200 in 1.44ms
+0/1,000 unique accepted successes in 181.33s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.150215987s
+application 200 in 0.89ms
+0/1,000 unique accepted successes in 182.50s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.179311784s
+application 200 in 0.71ms
+0/1,000 unique accepted successes in 183.63s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.130855984s
+application 200 in 2.83ms
+0/1,000 unique accepted successes in 184.86s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.229667356s
+application 200 in 5.22ms
+0/1,000 unique accepted successes in 185.96s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.098709149s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 187.10s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.127593384s
+application 200 in 0.89ms
+0/1,000 unique accepted successes in 188.23s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.141853314s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 189.32s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.09633964s
+application 200 in 0.99ms
+0/1,000 unique accepted successes in 190.43s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.10535504s
+application 200 in 0.59ms
+0/1,000 unique accepted successes in 191.54s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.096477081s
+application 200 in 0.79ms
+0/1,000 unique accepted successes in 192.63s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.10846767s
+application 200 in 0.59ms
+0/1,000 unique accepted successes in 193.77s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.124411539s
+application 200 in 0.62ms
+0/1,000 unique accepted successes in 194.87s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.108970227s
+application 200 in 1.21ms
+0/1,000 unique accepted successes in 195.98s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.106348087s
+application 200 in 1.59ms
+0/1,000 unique accepted successes in 197.19s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.212101321s
+application 200 in 1.49ms
+0/1,000 unique accepted successes in 198.29s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.105571414s
+application 200 in 0.72ms
+0/1,000 unique accepted successes in 199.41s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.102994264s
+application 200 in 0.74ms
+0/1,000 unique accepted successes in 200.55s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.15396782s
+application 200 in 0.64ms
+0/1,000 unique accepted successes in 201.69s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.129847749s
+application 200 in 0.71ms
+0/1,000 unique accepted successes in 202.82s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.135255081s
+application 200 in 0.57ms
+0/1,000 unique accepted successes in 203.93s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.102258045s
+application 200 in 3.63ms
+0/1,000 unique accepted successes in 205.10s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.178814623s
+application 200 in 1.20ms
+0/1,000 unique accepted successes in 206.22s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.12506003s
+application 200 in 0.72ms
+0/1,000 unique accepted successes in 207.37s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.153995663s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 208.47s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.09902679s
+application 200 in 0.70ms
+0/1,000 unique accepted successes in 209.62s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.13367361s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 210.78s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.169887434s
+application 200 in 0.56ms
+0/1,000 unique accepted successes in 211.88s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.099884572s
+application 200 in 1.41ms
+0/1,000 unique accepted successes in 213.02s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.150413526s
+application 200 in 0.84ms
+0/1,000 unique accepted successes in 214.15s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.124531798s
+application 200 in 2.49ms
+0/1,000 unique accepted successes in 215.27s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.113331829s
+application 200 in 0.68ms
+0/1,000 unique accepted successes in 216.42s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.144782659s
+application 200 in 0.95ms
+0/1,000 unique accepted successes in 217.59s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.147769074s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 218.73s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.169542726s
+application 200 in 0.58ms
+0/1,000 unique accepted successes in 219.87s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.135655018s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 221.00s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.136207264s
+application 200 in 0.99ms
+0/1,000 unique accepted successes in 222.12s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.110447913s
+application 200 in 2.91ms
+0/1,000 unique accepted successes in 223.29s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.162462004s
+application 200 in 1.73ms
+0/1,000 unique accepted successes in 224.41s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.128874384s
+application 200 in 0.94ms
+0/1,000 unique accepted successes in 225.50s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.091929145s
+application 200 in 1.43ms
+0/1,000 unique accepted successes in 226.59s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.095204159s
+application 200 in 0.95ms
+0/1,000 unique accepted successes in 227.68s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.083803038s
+application 200 in 2.84ms
+0/1,000 unique accepted successes in 228.80s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.127950516s
+application 200 in 3.61ms
+0/1,000 unique accepted successes in 229.95s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.14447014s
+application 200 in 1.04ms
+0/1,000 unique accepted successes in 231.09s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.138225261s
+application 200 in 0.62ms
+0/1,000 unique accepted successes in 232.18s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.091874392s
+application 200 in 2.48ms
+0/1,000 unique accepted successes in 233.29s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.113515943s
+application 200 in 0.82ms
+0/1,000 unique accepted successes in 234.44s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.156695947s
+application 200 in 3.51ms
+0/1,000 unique accepted successes in 235.56s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.111345783s
+application 200 in 0.59ms
+0/1,000 unique accepted successes in 236.65s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.087979707s
+application 200 in 0.93ms
+0/1,000 unique accepted successes in 237.79s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.145134227s
+application 200 in 0.57ms
+0/1,000 unique accepted successes in 238.92s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.131922274s
+application 200 in 2.52ms
+0/1,000 unique accepted successes in 240.04s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.107468984s
+application 200 in 1.35ms
+0/1,000 unique accepted successes in 241.15s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.122504581s
+application 200 in 0.95ms
+0/1,000 unique accepted successes in 242.26s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.10792086s
+application 200 in 0.69ms
+0/1,000 unique accepted successes in 243.38s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.119161815s
+application 200 in 0.69ms
+0/1,000 unique accepted successes in 244.54s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.156416745s
+application 200 in 1.23ms
+0/1,000 unique accepted successes in 245.68s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.134277988s
+application 200 in 1.44ms
+0/1,000 unique accepted successes in 246.81s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.142455038s
+application 200 in 1.06ms
+0/1,000 unique accepted successes in 248.03s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.214796598s
+application 200 in 0.83ms
+0/1,000 unique accepted successes in 249.17s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.142969693s
+application 200 in 0.63ms
+0/1,000 unique accepted successes in 250.26s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.098009381s
+application 200 in 1.54ms
+0/1,000 unique accepted successes in 251.36s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.084946134s
+application 200 in 0.54ms
+0/1,000 unique accepted successes in 252.48s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.105928864s
+application 200 in 1.46ms
+0/1,000 unique accepted successes in 253.62s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.158192125s
+application 200 in 1.52ms
+0/1,000 unique accepted successes in 254.71s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.0973006s
+application 200 in 1.03ms
+0/1,000 unique accepted successes in 255.82s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.100485446s
+application 200 in 6.02ms
+0/1,000 unique accepted successes in 256.95s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.113751854s
+application 200 in 2.99ms
+0/1,000 unique accepted successes in 258.04s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.104120308s
+application 200 in 0.55ms
+0/1,000 unique accepted successes in 259.12s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.088408408s
+application 200 in 1.73ms
+0/1,000 unique accepted successes in 260.20s (0.0/s whole run); 0 failures, 0 retries
+runtime runc; commands unknown; queued 0, held 1000; recent 0.0/s over 1.084600436s
+application 200 in 0.93ms
+998/1,000 unique accepted successes in 261.27s (3.8/s whole run); 2 failures, 0 retries
+runtime runc; commands 0; queued 0, held 0; recent 935.6577097163528/s over 1.066629377s
+application 200 in 0.91ms
+{
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "operator_declared_warmth": "warm-images-cold-executors",
+  "workload_sha256": "bfd9b35b4fb535b04b25c31f66e08405c1cdb0662c640446742b5fe8ad5c2dde",
+  "command": [
+    "/Users/miko/github/reliaburger/target/654-runtime-v3-release/relish",
+    "--output",
+    "json",
+    "batch",
+    "submit",
+    "/tmp/rb654-runtime-v3/three-tiers/runc.toml"
+  ],
+  "execution_path": "public full dispatch; runtime/isolation as admitted",
+  "host_process_contract": "Owned host execution has no hard CPU/memory enforcement",
+  "timing": "Monotonic clock before submit process launch through observed accepted terminal summary",
+  "qualified_100m_per_day": false,
+  "accepted_elapsed_seconds": 261.2686623309273,
+  "unique_accepted_successes": 998,
+  "accepted_successes_per_second": 3.8198228256549047,
+  "terminal_failures": 2,
+  "not_run": 0,
+  "accepted_retries": 0,
+  "all_tasks_succeeded": false,
+  "qualification_boundary": "Requires matched baselines, 24-hour headroom, concurrent apps, recovery/fault and bounded-cost evidence"
+}

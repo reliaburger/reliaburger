@@ -409,7 +409,7 @@ Storage observations also become incomplete when atomic renames race the scan.
 
 The three-tier landing-page recorder adds a separate million-process VM
 baseline, then submits 1,000 fresh containers, 10,000 shared containers and
-1,000,000 host jobs. Run it only on a task-owned Linux measurement node with
+10,000 host jobs. Run it only on a task-owned Linux measurement node with
 matching optimised `bun`, `relish` and `job-throughput` binaries:
 
 ```sh
@@ -428,6 +428,10 @@ own node subnet identity, as with the direct driver below. The casts retain
 actual pauses, including warm-up and indexed verification. Per-tier reports
 time submission through accepted completion. The host tier's default request
 can reduce concurrency below the requested 27; it doesn't bypass admission.
+The recorder uses the default maximum of three attempts and reports retries
+separately from unique accepted successes. Failed diagnostics stay in the raw
+evidence. Chapter jumps and labelled faster playback use the original cast;
+measured durations always refer to real elapsed time.
 
 You can observe an hour of an existing tier without submitting competing work:
 

@@ -1,0 +1,56 @@
+[
+  {
+    "batch_id": 2,
+    "rows": [
+      {
+        "grant_attempt": 1,
+        "index": 0,
+        "attempts": 1,
+        "succeeded": true,
+        "not_run": false,
+        "exit_code": 0,
+        "run_ms": 4897
+      }
+    ],
+    "truncated": false,
+    "next_after": null,
+    "retention_seconds": 3600,
+    "unreachable": []
+  },
+  {
+    "batch_id": 2,
+    "rows": [
+      {
+        "grant_attempt": 1,
+        "index": 500,
+        "attempts": 1,
+        "succeeded": true,
+        "not_run": false,
+        "exit_code": 0,
+        "run_ms": 7056
+      }
+    ],
+    "truncated": false,
+    "next_after": null,
+    "retention_seconds": 3600,
+    "unreachable": []
+  },
+  {
+    "batch_id": 2,
+    "rows": [
+      {
+        "grant_attempt": 1,
+        "index": 999,
+        "attempts": 1,
+        "succeeded": true,
+        "not_run": false,
+        "exit_code": 0,
+        "run_ms": 3827
+      }
+    ],
+    "truncated": false,
+    "next_after": null,
+    "retention_seconds": 3600,
+    "unreachable": []
+  }
+]

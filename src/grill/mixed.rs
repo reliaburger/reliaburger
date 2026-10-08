@@ -470,16 +470,13 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         for (is_host, launch, route) in snapshots {
             let id = launch.instance_id.clone();
             let selected = if (route.runtime == RuntimeKind::Process) != is_host {
-                // An old backend may still retain positive retirement metadata.
-                // Omitting it needs the same original-owner proof as replacement.
-                self.operation(&id, move |this, id| async move {
-                    if (this.selected(&id)?.runtime == RuntimeKind::Process) == is_host {
-                        return Ok(Some(launch));
-                    }
-                    this.prove_retired(&id, is_host, false).await?;
-                    Ok(None)
-                })
-                .await?
+                // This is still an observation of the original backend, not
+                // permission to mutate its replacement. Check positive original
+                // retirement without waiting on the other backend's lifecycle
+                // claim. Generation receipts are revalidated before recovery
+                // mutates anything, just as for matching-route snapshots.
+                self.prove_retired(&id, is_host, false).await?;
+                None
             } else {
                 Some(launch)
             };
@@ -643,6 +640,86 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].instance_id, id);
+    }
+
+    #[tokio::test]
+    async fn inventory_omits_a_retired_backend_without_waiting_for_its_replacement() {
+        for original_host in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = pair(root.path()).await;
+            let id = InstanceId("default__worker-0".into());
+            runtime.create(&id, &spec(original_host)).await.unwrap();
+            runtime.start(&id).await.unwrap();
+            runtime.kill(&id).await.unwrap();
+            runtime.create(&id, &spec(!original_host)).await.unwrap();
+            runtime.start(&id).await.unwrap();
+            for (host, generation) in [(false, "a"), (true, "b")] {
+                let launches = vec![RuntimeLaunch {
+                    generation: super::super::RuntimeGeneration::try_from(generation.repeat(64))
+                        .unwrap(),
+                    instance_id: id.clone(),
+                    spec: spec(host),
+                    network_reference: None,
+                }];
+                if host {
+                    runtime.host.set_launch_inventory(launches).await;
+                } else {
+                    runtime.container.set_launch_inventory(launches).await;
+                }
+            }
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let held = tokio::spawn({
+                let runtime = runtime.clone();
+                let id = id.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    runtime
+                        .operation(&id, move |_, _| async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok(())
+                        })
+                        .await
+                }
+            });
+            entered.notified().await;
+            let snapshot =
+                tokio::time::timeout(Duration::from_millis(200), runtime.launch_inventory()).await;
+            release.notify_one();
+            held.await.unwrap().unwrap();
+            let launches = snapshot
+                .expect("retired inventory waited for the other backend's lifecycle claim")
+                .unwrap()
+                .unwrap();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(launches[0].instance_id, id);
+            assert_eq!(launches[0].spec.host_process, !original_host);
+            // A route alone cannot hide a backend which still owns work.
+            if original_host {
+                runtime.host.set_state(&id, ContainerState::Running);
+            } else {
+                runtime.container.set_state(&id, ContainerState::Running);
+            }
+            assert!(runtime.launch_inventory().await.is_err());
+            if !original_host {
+                runtime.container.set_state(&id, ContainerState::Stopped);
+                runtime
+                    .container
+                    .set_network_reference(NetworkReference {
+                        instance_id: id.clone(),
+                        generation: serde_json::from_value(serde_json::json!("a".repeat(32)))
+                            .unwrap(),
+                        container_index: 1,
+                    })
+                    .await;
+                assert!(
+                    runtime.launch_inventory().await.is_err(),
+                    "stopped work with a held address is not positively retired"
+                );
+            }
+        }
     }
 
     #[tokio::test]

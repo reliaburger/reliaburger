@@ -474,7 +474,7 @@ Options:
 |------|---------|-------------|
 | `--config <path>` | (none) | Path to node config TOML file |
 | `--listen <addr>` | `127.0.0.1:9117` | API listen address |
-| `--runtime <name>` | `auto` | Runtime: `auto`, `process`, `runc` (Linux) |
+| `--runtime <name>` | `auto` | Runtime: `auto`, `process`, `runc` or `mixed` (Linux development) |
 
 Examples:
 

@@ -96,6 +96,11 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .recording-speed button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; padding: 2px 8px; cursor: pointer; }
 .recording-speed button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .recording-speed button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.recording-chapters { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; font-family: var(--mono); font-size: .8125rem; }
+.recording-chapters[hidden] { display: none; }
+.recording-chapters button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px; cursor: pointer; }
+.recording-chapters button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
 .install-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 44px; align-items: start; }
 .install-copy p { color: var(--muted); }
 .install-copy p:first-child { color: var(--ink); }

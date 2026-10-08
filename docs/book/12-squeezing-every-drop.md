@@ -1263,7 +1263,7 @@ state rather than interpreting an old definition differently.
 The revised demonstration keeps four measurements separate. First, launch a
 million matching BusyBox `true` processes directly in the VM and count their
 exit statuses. Then submit 1,000 `runc` jobs, 10,000 `shared-runc` jobs and
-1,000,000 `process` jobs through the public API. The process tier still uses
+10,000 `process` jobs through the public API. The process tier still uses
 durable owners, admitted resources, task ledgers, accepted chunk receipts and
 indexed results. It isn't the same contract as the raw baseline.
 
@@ -1273,9 +1273,48 @@ public tier has its own raw manifest, cast, accepted counters, service probes
 and first/middle/last indexed checks. Its aggregate report counts only the
 three public tiers as accepted job successes; the baseline is a separate row.
 The script contract test refuses reordered or missing tiers and an incomplete
-million-task result. Synthetic test records only check the report logic.
+host-tier result. Synthetic test records only check the report logic.
+
+The recorder uses the normal maximum of three attempts and reports accepted
+retries separately. The initial diagnostic used one attempt; its two container
+failures remain in the evidence rather than disappearing behind the successful
+repeat. A retry can restore an accepted outcome, but it doesn't prove we fixed
+its original cause.
+
+The website player offers chapters for the VM baseline and each public tier.
+A chapter seeks the same raw cast, while faster playback changes only the
+viewer's playback speed. Neither rewrites timestamps or measured durations.
+The browser regression checks that a chapter keeps the selected speed,
+starts the selected stage and refuses invalid offsets. Each recording retains
+its own controls.
 
 The one-hour sustained driver separately records unique accepted outcomes
 while a real application serves requests. A completed hour and a qualified
 100-million-job day are separate booleans. Missing the target remains useful
 evidence; completing an hour cannot satisfy the 24-hour qualification gate.
+
+### Inventory after a backend switch
+
+The four-part experiment found another read waiting behind a mutation. An owned
+slot first ran containers, then switched to host jobs. The container journal
+still retained its original retirement receipt. Inventory correctly checked
+that receipt before omitting the old backend, but it took the mixed lifecycle
+claim first. That claim now belonged to the running host replacement. Repeating
+this for hundreds of reused slots exhausted discovery's turn deadline, even
+while the application kept serving requests.
+
+The read now asks the original backend for positive retirement without taking
+the replacement's claim. This is an observation, like a matching-route inventory
+entry; it doesn't authorise a new execution. Recovery still revalidates the
+original generation before mutation. The regression holds the replacement's
+claim and requires inventory to finish in both switch directions. It also
+refuses an old backend which is still running, or still holds an address.
+
+A separate directory race concerns unpublished intent. Registration writes a
+private `.preparing-*` directory and atomically renames it before it may launch
+anything. Inventory can enumerate that staging name just before the rename.
+Its disappearance is safe to skip because it never granted execution authority.
+An existing staging symlink, file or insecure directory still refuses, and a
+published record still uses the strict ownership reader. The focused regression
+renames the directory between enumeration and validation; it doesn't hope to
+win a probabilistic race.

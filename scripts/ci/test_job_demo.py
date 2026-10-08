@@ -36,6 +36,46 @@ class JobDemo(unittest.TestCase):
         self.assertRegex(text, r'data-cast="\./assets/job-throughput\.cast"')
         self.assertIn('./assets/job-throughput-report.json', text)
 
+    def test_chapter_controls_stay_hidden_without_javascript_and_have_keyboard_focus(self):
+        css = (ROOT / 'docs/website/style.css').read_text()
+        self.assertIn('.recording-chapters[hidden] { display: none; }', css)
+        self.assertIn('.recording-chapters button:focus-visible', css)
+
+    @unittest.skipUnless(shutil.which('node'), 'requires Node for the browser script contract')
+    def test_chapters_seek_the_same_recording_and_preserve_playback_speed(self):
+        program = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const calls = [], speedButton = {getAttribute: () => '100', setAttribute: () => {}};
+const speeds = {hidden:true,querySelectorAll:()=>[speedButton],addEventListener:(_,callback)=>speeds.click=callback};
+const chapters = {hidden:true,addEventListener:(_,callback)=>chapters.click=callback};
+const screen = {addEventListener:()=>{}};
+const figure = {classList:{add:()=>{}},getAttribute:key=>key==='data-cast'?'throughput.cast':null,
+ querySelector:selector=>selector==='.recording-speed'?speeds:selector==='.recording-chapters'?chapters:screen};
+const document = {querySelectorAll:()=>[figure],createElement:()=>({setAttribute:()=>{}}),
+ head:{appendChild:element=>queueMicrotask(()=>element.onload())}};
+const window = {AsciinemaPlayer:{create:(cast,screen,options)=>{
+ calls.push({cast,options});return {dispose:()=>{},addEventListener:()=>{},getCurrentTime:()=>250};
+}}};
+vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),{document,window,Promise,Number,Object,String});
+setImmediate(async()=>{
+ assert.strictEqual(chapters.hidden,false);
+ speeds.click({target:{closest:()=>speedButton}});await Promise.resolve();
+ chapters.click({target:{closest:()=>({getAttribute:()=> '350.25'})}});
+ assert.strictEqual(calls.length,3);
+ assert.strictEqual(calls[2].cast,'throughput.cast');
+ assert.strictEqual(calls[2].options.startAt,350.25);
+ assert.strictEqual(calls[2].options.speed,100);
+ assert.strictEqual(calls[2].options.autoPlay,true);
+ for (const bad of ['-1','NaN','Infinity'])
+  chapters.click({target:{closest:()=>({getAttribute:()=>bad})}});
+ assert.strictEqual(calls.length,3);
+ speeds.click({target:{closest:()=>speedButton}});await Promise.resolve();
+ assert.strictEqual(calls[3].options.startAt,250);
+ assert.strictEqual(calls[3].options.autoPlay,true);
+});
+"""
+        subprocess.run(['node', '-e', program, str(ROOT / 'docs/website/assets/tour-player.js')], check=True)
+
     @unittest.skipUnless(shutil.which('node'), 'requires Node for the browser script contract')
     def test_all_recordings_load_once_and_keep_independent_speed_controls(self):
         program = r"""
@@ -45,7 +85,7 @@ const calls = [], loads = [], figures = ['tour','jobs','throughput'].map(name =>
   const speeds = {hidden:true,querySelectorAll: () => buttons,addEventListener: (_, callback) => speeds.click=callback};
   const screen = {name,addEventListener:(event,callback)=>screen[event]=callback};
   const figure = {name, classList:{add:()=>{}},getAttribute: key => key==='data-cast'? name+'.cast':null,
-    querySelector: selector => selector==='.recording-speed'?speeds:screen,speeds,buttons,screen};
+    querySelector: selector => selector==='.recording-speed'?speeds:selector==='.recording-chapters'?null:screen,speeds,buttons,screen};
   return figure;
 });
 const document = {getElementById: id => figures.find(f => id===f.name+'-recording'),

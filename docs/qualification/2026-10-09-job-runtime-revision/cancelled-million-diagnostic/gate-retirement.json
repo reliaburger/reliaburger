@@ -1,0 +1,8 @@
+{
+  "all_runtime_owners_retired": true,
+  "bun_pid": 2776741,
+  "service_payload_pid": 2776930,
+  "original_processes_absent": true,
+  "exact_pin_directory": "/sys/fs/bpf/reliaburger-eac73091e801bc6aa98a95a0fb8ad7e33a8a6589913aa66ee56ac29b52e022f7",
+  "kernel_owner_phase": "Retired"
+}

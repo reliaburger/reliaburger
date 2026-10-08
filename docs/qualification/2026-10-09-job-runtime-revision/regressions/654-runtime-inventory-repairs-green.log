@@ -1,0 +1,12 @@
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/reusable-job-executors/reliaburger)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized] target(s) in 2m 29s
+────────────
+ Nextest run ID cd1acb6a-5f80-46d4-84e7-67020b61b5e6 with nextest profile: default
+    Starting 11 tests across 1 binary (5368 tests skipped)
+────────────
+     Summary [   0.422s] 11 tests run: 11 passed, 5368 skipped

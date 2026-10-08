@@ -1,0 +1,28 @@
+{
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "operator_declared_warmth": "warm-images-cold-executors",
+  "workload_sha256": "404ff686693766497fef3947dde8e35e2d86537c89b085a9c024c4719788fad0",
+  "command": [
+    "/Users/miko/github/reliaburger/target/654-runtime-v3-release/relish",
+    "--output",
+    "json",
+    "batch",
+    "submit",
+    "/tmp/rb654-runtime-v3/three-tiers-default-retries/process.toml"
+  ],
+  "execution_path": "public full dispatch; runtime/isolation as admitted",
+  "host_process_contract": "Owned host execution has no hard CPU/memory enforcement",
+  "timing": "Monotonic clock before submit process launch through observed accepted terminal summary",
+  "qualified_100m_per_day": false,
+  "accepted_elapsed_seconds": 668.8847976999823,
+  "unique_accepted_successes": 33579,
+  "accepted_successes_per_second": 50.201469842735655,
+  "terminal_failures": 0,
+  "not_run": 966421,
+  "accepted_retries": 0,
+  "all_tasks_succeeded": false,
+  "qualification_boundary": "Requires matched baselines, 24-hour headroom, concurrent apps, recovery/fault and bounded-cost evidence",
+  "error": "selected indexed outcome is unavailable, mismatched or unsuccessful"
+}

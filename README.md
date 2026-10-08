@@ -286,8 +286,9 @@ both, while explicit `--runtime runc` stays container-only. Jobs use
 or `runtime="shared-runc"` for bounded reused containers, retaining their own command process and limits;
 fresh containers remain the default. The [measured container demo](https://reliaburger.com/#job-throughput)
 shows 50,000 accepted successes in 100.73 seconds; [raw evidence](docs/qualification/2026-10-08-job-measurements/README.md)
-records the hardware, failures and limits. Sustained 100m/day throughput still needs
-qualification. Point the cluster at a Git repository and the leader keeps it in sync, verifying commit signatures if you
+records the hardware, failures and limits. The [runtime revision](docs/qualification/2026-10-09-job-runtime-revision/README.md)
+retains failed diagnostics and tracks the revised VM-baseline-plus-three-tier
+recording. Sustained 100m/day throughput still needs qualification. Point the cluster at a Git repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.
 
 Batch jobs retain distinct execution identities and their original scoped
