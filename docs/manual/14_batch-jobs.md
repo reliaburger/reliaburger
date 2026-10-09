@@ -319,7 +319,9 @@ allowlisted binary (or `/bin/sh` for scripts) and disabled mount isolation.
 Rootful Linux process jobs use bounded native executors and accept explicit
 CPU/memory ranges. Each fresh command is born inside its limited task cgroup;
 helper overhead stays reserved while its executor is idle. Commands retain
-Bun's user and host filesystem access, so use trusted allowlisted workloads.
+Bun's user, privileges and host filesystem access: under a root Bun they run
+as root with every capability, and nothing sets `no_new_privs`. Use trusted
+allowlisted workloads.
 Every host command, on every backend, starts with only `PATH`, `HOME`, `LANG`,
 `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun's
 environment, then the job's own `env`. Other Bun variables, such as cloud

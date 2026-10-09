@@ -1414,6 +1414,17 @@ it doesn't consume the command's memory allowance. Host commands retain Bun's
 user and host filesystem access. This is trusted host execution, with resource
 controls, rather than a container sandbox.
 
+The helper itself runs as a reserved uid with a few capabilities, set with
+`capset`. The container helper needs `CAP_SYS_ADMIN` and `CAP_SETPCAP` to give
+each command private mounts and to empty its bounding set, but inside a user
+namespace those are harmless. Our first host helper kept them too, and on the
+host they are real: `CAP_SYS_ADMIN` alone allows mounting filesystems.
+The host helper only switches to Bun's user (`CAP_SETUID`, `CAP_SETGID`) and
+kills leftover descendants (`CAP_KILL`). `CLONE_INTO_CGROUP` needs no
+capability, only write access to the `cgroup.procs` files that Bun hands to the
+helper's uid. The gated test now reads `CapEff` and `CapPrm` from
+`/proc/<pid>/status` and expects exactly those three bits, `0xe0`.
+
 The helper `exec`s with exactly the environment it is sent. Our first version
 sent only the job's own variables, so `/usr/bin/env` printed nothing on a
 rootful Linux node, while the same job on macOS saw everything Bun had: `PATH`,

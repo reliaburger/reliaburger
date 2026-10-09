@@ -376,8 +376,13 @@ int main(int argc, char **argv) {
         setgid(HELPER_UID) || setuid(HELPER_UID)) return 125;
     struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
     struct __user_cap_data_struct capabilities[2] = {{0}, {0}};
-    uint32_t mask = (1U << CAP_KILL) | (1U << CAP_SETUID) | (1U << CAP_SETGID) |
-                    (1U << CAP_SETPCAP) | (1U << CAP_SYS_ADMIN);
+    uint32_t mask = (1U << CAP_KILL) | (1U << CAP_SETUID) | (1U << CAP_SETGID);
+#ifndef RB_EXECUTOR_HOST
+    /* Only the container child mounts its scratch and drops its bounding set.
+     * On the host these would be real initial-namespace privileges, and
+     * CLONE_INTO_CGROUP needs only the cgroup.procs files Bun chowned to us. */
+    mask |= (1U << CAP_SETPCAP) | (1U << CAP_SYS_ADMIN);
+#endif
     capabilities[0].effective = capabilities[0].permitted = mask;
     if (syscall(SYS_capset, &header, capabilities) || prctl(PR_SET_DUMPABLE, 0)) return 125;
 #endif

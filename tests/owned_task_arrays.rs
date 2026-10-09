@@ -1615,6 +1615,16 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
             .unwrap()
             .contains("/helper")
     );
+    // Host helpers keep only CAP_KILL (5), CAP_SETGID (6) and CAP_SETUID (7).
+    let status = std::fs::read_to_string(format!("/proc/{alive}/status")).unwrap();
+    for set in ["CapEff", "CapPrm"] {
+        assert!(
+            status
+                .lines()
+                .any(|line| line == format!("{set}:\t00000000000000e0")),
+            "{status}"
+        );
+    }
     let cancel_command = CancellationToken::new();
     let task = TaskInvocation {
         template: Some(Box::new(template)),
