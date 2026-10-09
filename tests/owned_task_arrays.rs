@@ -2082,3 +2082,118 @@ async fn cgroup_host_executor_sockets_cannot_be_blocked_by_other_users() {
     })
     .await;
 }
+
+/// Callers waiting inside a reusable pool for a slot or admission aren't
+/// running anything; advertising them as slots inflates the leader's grants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_array_node::{
+            ArrayAssignment, ControlVersion, HeldChunk, NodeRunner, NodeSyncRequest, TaskArrayNode,
+            TaskArrayNodeConfig,
+        },
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::{
+        config::process_workloads::ProcessWorkloadsConfig,
+        grill::{AnyGrill, ProcessGrill},
+        meat::{
+            Resources,
+            task_array::{ChunkId, TaskArraySpec},
+        },
+    };
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-slots-")
+        .tempdir()
+        .unwrap();
+    let runtime =
+        ProcessGrill::with_owner(root.path().join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    // Exactly two executors: 100m/32 MiB each plus 10m/8 MiB for the helper.
+    let capacity = Resources::new(220, 80 << 20, 0);
+    let budget = ExecutionBudget::new(capacity);
+    let template: reliaburger::config::job::JobSpec = toml::from_str(
+        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-slots'\ncpu='100m'\nmemory='32Mi'",
+    )
+    .unwrap();
+    let mut config = TaskArrayNodeConfig::for_data_dir(
+        root.path(),
+        ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/sh".into()],
+            mount_isolation: false,
+            script_dir: root.path().join("scripts"),
+        },
+    );
+    config.default_concurrency = 32;
+    let node = TaskArrayNode::new(
+        config,
+        NodeRunner::Owned(Box::new(
+            OwnedRunner::for_data_dir(AnyGrill::Process(runtime), root.path()).unwrap(),
+        )),
+    )
+    .with_budget(budget.clone());
+    let mut spec = TaskArraySpec::with_count(64);
+    spec.chunk_size = 64;
+    spec.max_attempts = 1;
+    let assignment = |stopping| NodeSyncRequest {
+        version: ControlVersion {
+            index: 1,
+            ..Default::default()
+        },
+        known: vec![1],
+        arrays: vec![ArrayAssignment {
+            template: Some(Box::new(template.clone())),
+            resources: Resources::new(100, 32 << 20, 0),
+            batch_id: 1,
+            spec: spec.clone(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 2".into()],
+            env: vec![],
+            held: vec![HeldChunk {
+                chunk: ChunkId(0),
+                attempt: 1,
+            }],
+            stopping,
+            replay_unknown: true,
+        }],
+    };
+    // Wait until both executors are busy and the other callers are queued.
+    let progress = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let progress = node.sync(&assignment(false)).await.arrays.remove(0);
+            if progress.counters.active_commands == Some(2) && progress.counters.running > 2 {
+                break progress;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("two native commands never started");
+    assert!(
+        progress.slots <= 2,
+        "advertised {} slots with {} callers but room for two executors",
+        progress.slots,
+        progress.counters.running
+    );
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while node.sync(&assignment(true)).await.arrays[0]
+            .finished
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the stopped array never finished");
+    drop(node);
+    let mut retired = false;
+    for _ in 0..300 {
+        if budget.available() == capacity {
+            retired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(retired, "executors never returned their reservations");
+}

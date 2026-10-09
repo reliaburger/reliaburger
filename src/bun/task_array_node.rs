@@ -775,6 +775,10 @@ impl TaskArrayNode {
             );
         }
         let counters = run.pool.counters();
+        let active_commands = self
+            .runner
+            .active_commands(assignment.batch_id, assignment.template.as_deref())
+            .await;
         ArrayProgress {
             batch_id: assignment.batch_id,
             slots: {
@@ -805,20 +809,21 @@ impl TaskArrayNode {
                     } else {
                         u32::MAX
                     });
+                // A pool-run caller counts as running while it still waits
+                // for a slot or admission; only started commands use one.
+                let busy = match (reusable, active_commands) {
+                    (Some(_), Some(active)) => active,
+                    _ => counters.running.load(Ordering::Relaxed),
+                };
                 cap.min(u32::try_from(fits).unwrap_or(u32::MAX))
-                    .saturating_add(
-                        u32::try_from(counters.running.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
-                    )
+                    .saturating_add(u32::try_from(busy).unwrap_or(u32::MAX))
                     .min(cap)
             },
             refused: None,
             finished,
             counters: NodeArrayCounters {
                 running: counters.running.load(Ordering::Relaxed),
-                active_commands: self
-                    .runner
-                    .active_commands(assignment.batch_id, assignment.template.as_deref())
-                    .await,
+                active_commands,
                 attempts_started: counters.attempts_started.load(Ordering::Relaxed),
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
                 failed: counters.failed.load(Ordering::Relaxed),

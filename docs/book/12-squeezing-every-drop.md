@@ -1537,6 +1537,14 @@ explicit value rather than a zero that would look like a very fast command.
 
 Queued grants don't reserve sixteen thousand simultaneous processes. Every
 command still waits for the existing concurrency and CPU/memory admission gates.
+That only holds if a node's advertised slots are honest. A node reports the
+work it could start now, plus what it's already running. For a reusable pool,
+our first version counted every caller inside `runner.run` as running,
+including callers still waiting there for a pool slot or for admission. A node
+whose budget fit two executors advertised 32 slots, and the leader granted on
+that basis. Pool-run arrays now count only the commands the pool has started.
+The regression test fills a two-executor budget with 64 two-second commands
+and checks that the node advertises two slots, not 32.
 The cost is ownership: more granted work may need reconciliation or explicit
 replay after worker loss. That window is bounded, and stale attempts keep their
 existing fences. We retain the first measurement rather than relabelling it as
