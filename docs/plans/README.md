@@ -56,4 +56,4 @@ and the fleet control plane ([#265](https://github.com/reliaburger/reliaburger/p
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
 is the summary of how that ended.
 
-- [Equal-window job demonstrations and hourly saturation runs](2026-10-09-plan-timed-job-scenarios.md)
+- [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)

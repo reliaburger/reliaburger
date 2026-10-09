@@ -1362,7 +1362,7 @@ control-loop responsiveness fully qualified.
 The achieved host rate remains below the 100m/day target. Both daily throughput
 and overall qualification remain false. A completed hour doesn't substitute
 for matched current-binary baselines, sustained container/cluster scaling,
-headroom, faults and bounded metadata collection. Those remain in #640.
+headroom, faults and bounded metadata collection. Those remain in #668.
 
 A final recovery check caught a mistake in our test rather than the executor.
 The job summary describes a logical run, which can remain active while its
@@ -1530,12 +1530,12 @@ storage scans were incomplete, so they don't establish a global storage bound.
 No inventory timeout appeared across the fixture lifetime. The
 [raw hour, resource observations and positive cleanup proofs](../qualification/2026-10-09-host-job-executors/README.md)
 retain these limits. This completed hour does not qualify 100m/day; 24-hour,
-fault and historical namespace/profile/cardinality work remains in #640.
+fault and historical namespace/profile/cardinality work remains in #668.
 
 ### Comparing equal windows
 
 A fixed million processes and a fixed thousand containers take different lengths
-of time. The next demonstration gives each path sixty seconds instead. The raw
+of time. The demonstration now gives each path sixty seconds instead. The raw
 runner records each child's completion instant, stops creating children at the
 deadline, and drains its remaining children without counting their late exits.
 The public harness credits only accepted summary responses received before the
@@ -1561,15 +1561,56 @@ submission caps each public mode at 27 commands; a large queued count keeps it
 busy. Empty accepted windows now fail the harness. We retain the first recording
 and interrupted raw soak instead of presenting them as completed qualification.
 
-The repaired minute windows accepted 196 fresh-container jobs, 23,000 shared-
-container jobs and 246,000 host jobs, all without failures or retries. The raw
-reference completed 876,671 successful exits. The fresh stage now reports real
-progress, and the shared result is lower than the initial two-submission run: we
-keep one active submission to make total concurrency comparable. These are cold
+The repaired minute windows accepted 213 fresh-container jobs, 58,000 shared-
+container jobs and 294,000 host jobs, all without failures or retries. The raw
+reference completed 993,718 successful exits. The fresh stage now reports real
+progress. One active submission makes total concurrency comparable; the
+recording uses the packaged CLI rather than repeated CLI subprocesses. These are cold
 executor/public acceptance measurements, not the fully warmed direct runner.
 The landing page shows daily projections explicitly and keeps the raw guarantees
 separate. The [timed record](../qualification/2026-10-09-timed-job-scenarios/README.md)
 retains both attempts and the interrupted first soak.
+
+### Four hours at admitted speed
+
+The packaged hour runs completed 55,407,709 raw exits, 14,199 fresh-container
+jobs, 11,799,000 shared-container jobs and 19,145,000 host jobs. Every path used
+concurrency 27. The public modes kept the same resource profile and BusyBox bytes,
+and the original application served all 14,361 probes successfully. Fresh
+containers recorded four recovered retries; no path recorded a terminal failure.
+The [hourly evidence](../qualification/2026-10-09-timed-job-scenarios/README.md#hourly-sequence)
+retains the complete reports and positive owner retirement.
+
+The host hour also exercised renewal. Its first 16-million-task submission
+finished inside the window; Relish credited its accepted total, verified drain
+and submitted the next owner. At the deadline, it cancelled that owner's remaining
+work and verified zero held tasks and active commands. One active owner at a time
+kept the total cap at 27 across the transition. Submission and renewal costs
+remain inside the measured hour.
+
+The hour explains why the cold minute needs its own label. Shared containers
+accepted 966.7 jobs/s in the recording's first minute and averaged 3,277.5/s over
+the hour. Native host jobs averaged 5,318.1/s. Aggregate VM CPU busy was about
+60.2% for shared and 54.1% for host, compared with 91.2% for the raw baseline.
+These sampled VM counters include unrelated retained workloads. They leave
+room to investigate work supply and receipt acceptance; raising concurrency
+alone didn't remove that gap in the sweep.
+
+Storage is the unfinished part. Free VM disk fell to a sampled 209.6 MiB by
+the end of the host hour. The last bounded fixture scan observed at least
+2.35 GiB of allocated data, but every scan was incomplete. A sampled Bun RSS
+range of 175.5–234.1 MiB across public hours doesn't prove historical memory or
+storage bounds. We retained the data throughout measurement, positively retired
+only the original fixture's runtime/network/kernel owners, then privately archived
+its inactive state. Complete accounting, collection and daily fault qualification
+remain in #668.
+
+There is also a diagnostic lesson in the four recovered retries. A bulk success
+record keeps the final outcome and attempt count; it doesn't keep an earlier
+failed attempt's reason. Later normal runc retirement records can't recover that
+missing evidence. We cannot assign those retries to the documented kernel bug.
+High throughput needs bounded failure-cause summaries, not millions of successful
+job log lines; that operational follow-up belongs with #668.
 
 ### Find the concurrency knee
 
@@ -1620,6 +1661,15 @@ or concurrency arguments. Its defaults are 60 seconds, concurrency 27 and the
 same 25m–1000m / 32 MiB job profile used by the curve. Fresh containers, trusted
 host processes and the local Linux raw baseline have separate scenario names;
 the ordinary `relish bench` suite still works without `--scenario`.
+
+The new flags also found a Rust parser problem. Putting all benchmark options
+inline in the command enum made the generated Clap parser overflow the standard
+test-thread stack, including tests for unrelated commands. We split the options
+into their own `#[derive(clap::Args)]` struct and used `Bench(Box<BenchOptions>)`.
+`Box<T>` owns a value on the heap; the enum stores its pointer rather than the
+whole argument structure. The normal parser tests then passed without increasing
+thread stack limits. Keep testing the ordinary commands when adding a specialised
+one: generated code can change their stack use too.
 
 The public runner submits a single compact manifest, reads bounded summaries
 and cancels only the identities it owns. `AcceptedCounts` holds the submission

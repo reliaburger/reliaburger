@@ -42,7 +42,7 @@ class JobDemo(unittest.TestCase):
         for row in [report['baseline'],*report['tiers']]:
             self.assertEqual(row['requested_seconds'],60)
             self.assertTrue(row['measurement_complete'])
-            count=row.get('unique_accepted_successes',row.get('verified_successes'))
+            count=row['verified_successes'] if row.get('path')=='Bare' else row['unique_accepted_successes']
             self.assertEqual(row['extrapolated_runs_per_day'],count*1440)
             self.assertIn(f'{count:,}',text)
             self.assertIn(tiers.human_count(round(count*1440)),text)
@@ -50,7 +50,7 @@ class JobDemo(unittest.TestCase):
             self.assertEqual(row['terminal_failures'],0)
             self.assertEqual(row['cleanup_failed_submissions'],[])
             self.assertEqual(len(row['post_cutoff_drain_proofs']),len(row['active_submissions']))
-        raw=ROOT/'docs/qualification/2026-10-09-timed-job-scenarios/current-build/sixty-second-windows'
+        raw=ROOT/'docs/qualification/2026-10-09-timed-job-scenarios/current-build/packaged-bench-windows'
         for asset,evidence in [('job-throughput.cast','jobs.cast'),('job-throughput-report.json','report.json')]:
             self.assertEqual((ROOT/'docs/website/assets'/asset).read_bytes(),(raw/evidence).read_bytes())
         self.assertEqual(recording[0]['version'],2)
@@ -59,6 +59,46 @@ class JobDemo(unittest.TestCase):
             self.assertIn(phrase,text)
         self.assertRegex(text,r'data-cast="\./assets/job-throughput\.cast"')
         self.assertIn('./assets/job-throughput-report.json',text)
+
+    def test_published_demo_executes_the_packaged_default_commands(self):
+        report=json.loads((ROOT/'docs/website/assets/job-throughput-report.json').read_text())
+        self.assertEqual(report['source'],'packaged relish bench scenarios')
+        scenarios=['jobs-vm-baseline','jobs-containers','jobs-shared-containers','jobs-host-processes']
+        self.assertEqual([row['scenario'] for row in report['chapters']],scenarios)
+        recording=[json.loads(line) for line in (ROOT/'docs/website/assets/job-throughput.cast').read_text().splitlines()]
+        commands=[row[2].strip() for row in recording[1:] if row[2].startswith('$ ')]
+        self.assertEqual(commands,['$ relish bench --scenario '+scenario for scenario in scenarios])
+        for row in [report['baseline'],*report['tiers']]:
+            self.assertEqual(row['concurrency'],27)
+            self.assertTrue(row['cleanup_verified'])
+            self.assertIsNone(row['error'])
+
+    def test_all_four_packaged_hours_complete_with_matched_profiles_and_drain(self):
+        folder=ROOT/'docs/qualification/2026-10-09-timed-job-scenarios/current-build/packaged-bench-hours'
+        report=json.loads((folder/'report.json').read_text())
+        self.assertTrue(report['all_windows_healthy'])
+        self.assertFalse(report['qualified_100m_per_day'])
+        rows=[report['baseline'],*report['tiers']]
+        self.assertEqual([row['scenario'] for row in rows],['jobs-vm-baseline','jobs-containers','jobs-shared-containers','jobs-host-processes'])
+        for row in rows:
+            self.assertEqual(row['requested_seconds'],3600)
+            self.assertEqual(row['concurrency'],27)
+            self.assertTrue(row['measurement_complete'])
+            self.assertTrue(row['cleanup_verified'])
+            self.assertFalse(row['interrupted'])
+            self.assertIsNone(row['error'])
+            self.assertEqual(row['terminal_failures'],0)
+            self.assertEqual(row['application_failures'],0)
+            self.assertGreater(row['application_probes'],0)
+            self.assertGreaterEqual(len(row['resource_observations']),100)
+            self.assertGreater(row['unique_accepted_successes']+row['verified_successes'],0)
+        for row in report['tiers']:
+            self.assertEqual(row['cpu_request_millicores'],25)
+            self.assertEqual(row['cpu_limit_millicores'],1000)
+            self.assertEqual(row['memory_bytes'],32<<20)
+            proofs={proof['batch_id']:proof for proof in row['drain_proofs']}
+            self.assertEqual(set(row['batch_ids']),set(proofs))
+            self.assertTrue(all(proof['done'] is True and proof['held']==0 and proof['active_commands']==0 for proof in proofs.values()))
 
     def test_results_identify_local_vm_rig_and_workload_limits(self):
         page=(ROOT/'docs/website/index.html').read_text()

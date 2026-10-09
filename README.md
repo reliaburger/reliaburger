@@ -287,12 +287,14 @@ or `runtime="shared-runc"` for bounded reused containers, retaining their own co
 rootful Linux process jobs also reuse bounded native executors and enforce
 explicit CPU/memory limits before execution. Fresh containers remain the default.
 The [four-part demo](https://reliaburger.com/#job-throughput) gives each scenario
-60 seconds: 876,671 raw process exits, 196 fresh-container jobs, 23,000 shared-
-container jobs and 246,000 host jobs. The public counts are unique accepted
+60 seconds: 993,718 raw process exits, 213 fresh-container jobs, 58,000 shared-
+container jobs and 294,000 host jobs. The public counts are unique accepted
 successes, with no failures or retries. [Raw evidence](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
 records hardware, limits, receipt granularity and the measured VM reference.
-Daily totals on the landing page are explicitly extrapolated; the qualification
-plan measures each scenario for an hour beside the original application.
+Daily totals on the landing page are explicitly extrapolated. All four sequential
+one-hour soaks completed beside the original application; host jobs accepted
+19,145,000 successes and shared containers 11,799,000. Global storage bounds and
+a real daily qualification remain in #668.
 Point the cluster at a Git repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.
 Verified duration summaries let fast workers queue bounded lookahead across
@@ -424,4 +426,4 @@ matching update to the book.
 
 [Apache 2.0](LICENSE)
 
-The [equal-window measurement plan](docs/plans/2026-10-09-plan-timed-job-scenarios.md) compares all four scenarios for 60 seconds, then one hour each. Daily counts are labelled extrapolations.
+The [equal-window measurement plan](docs/plans/archive/2026-10-09-plan-timed-job-scenarios.md) compares all four scenarios for 60 seconds, then one hour each. Daily counts are labelled extrapolations.

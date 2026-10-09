@@ -1,0 +1,16 @@
+jobs-host-processes: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.1s: 8000 unique accepted successes, 0 failures, 0 retries; 1573.2/s
+10.2s: 20000 unique accepted successes, 0 failures, 0 retries; 1966.9/s
+15.2s: 52000 unique accepted successes, 0 failures, 0 retries; 3414.2/s
+20.3s: 84000 unique accepted successes, 0 failures, 0 retries; 4140.7/s
+25.3s: 102000 unique accepted successes, 0 failures, 0 retries; 4026.0/s
+30.4s: 134000 unique accepted successes, 0 failures, 0 retries; 4407.8/s
+35.5s: 166000 unique accepted successes, 0 failures, 0 retries; 4681.9/s
+40.5s: 182000 unique accepted successes, 0 failures, 0 retries; 4492.4/s
+45.6s: 214000 unique accepted successes, 0 failures, 0 retries; 4696.1/s
+50.6s: 246000 unique accepted successes, 0 failures, 0 retries; 4859.4/s
+55.7s: 262000 unique accepted successes, 0 failures, 0 retries; 4703.4/s
+jobs-host-processes: 294000 unique accepted successes in 60 seconds (4900.0/s)
+0 failures, 0 retries; cleanup verified
+423.4M runs/day extrapolated — not an observed daily total

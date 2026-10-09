@@ -1144,8 +1144,8 @@ observations. This is a measured implementation result, not 100m/day qualificati
 scaling, sustained headroom and safe historical metadata collection remain work.
 
 The [equal-window recording](qualification/2026-10-09-timed-job-scenarios/README.md)
-gives each path 60 seconds at concurrency 27: 876,671 raw exits, 196 fresh-
-container jobs, 23,000 shared-container jobs and 246,000 host jobs. Public
+gives each path 60 seconds at concurrency 27: 993,718 raw exits, 213 fresh-
+container jobs, 58,000 shared-container jobs and 294,000 host jobs. Public
 counts are unique accepted successes, with no failures or retries. The landing
 page multiplies these minute counts by 1,440 for readable daily projections;
 it labels them as extrapolations. The raw VM baseline is a measured reference
@@ -1162,8 +1162,13 @@ All public paths request 25m CPU / 32 MiB and enforce a one-core limit, with
 native/shared helper overhead reserved. Fresh containers use one-job receipt
 chunks; fast modes use thousand-job chunks. This choice affects reporting and
 its overhead, not bin packing or execution concurrency. The requested saturation
-check is now one hour per scenario, run sequentially beside the same application;
-it measures health and growth without requiring a 24-hour soak for this review.
+check completed one hour per scenario, sequentially beside the same application.
+Host jobs accepted 19,145,000 successes and shared containers 11,799,000, with
+zero terminal failures; all 14,361 application probes succeeded. Fresh containers
+accepted 14,199 successes with four recovered retries, while the raw baseline
+completed 55,407,709 exits. Disk growth was material and all capped storage scans
+were incomplete. These hours establish saturation observations; complete
+metadata bounds and an observed daily total remain qualification work in #668.
 
 
 ### AI workloads: resident models and coordinated training

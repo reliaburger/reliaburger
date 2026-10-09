@@ -1,0 +1,16 @@
+jobs-containers: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.1s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+10.2s: 12 unique accepted successes, 0 failures, 0 retries; 1.2/s
+15.4s: 36 unique accepted successes, 0 failures, 0 retries; 2.3/s
+20.4s: 53 unique accepted successes, 0 failures, 0 retries; 2.6/s
+25.6s: 76 unique accepted successes, 0 failures, 0 retries; 3.0/s
+30.7s: 97 unique accepted successes, 0 failures, 0 retries; 3.2/s
+35.9s: 118 unique accepted successes, 0 failures, 0 retries; 3.3/s
+41.1s: 138 unique accepted successes, 0 failures, 0 retries; 3.4/s
+46.2s: 156 unique accepted successes, 0 failures, 0 retries; 3.4/s
+51.4s: 176 unique accepted successes, 0 failures, 0 retries; 3.4/s
+56.5s: 198 unique accepted successes, 0 failures, 0 retries; 3.5/s
+jobs-containers: 213 unique accepted successes in 60 seconds (3.5/s)
+0 failures, 0 retries; cleanup verified
+306.7k runs/day extrapolated — not an observed daily total

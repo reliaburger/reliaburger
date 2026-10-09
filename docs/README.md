@@ -1485,14 +1485,17 @@ unsupported limits. Host applications retain their existing runtime contract.
 Verified duration summaries let fast workers queue bounded lookahead across
 control-report rounds; execution still waits for concurrency and resources.
 The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
-tracks #639 and the still-unqualified sustained target (#640). The standalone [four-part recording](https://reliaburger.com/#job-throughput)
-measures each scenario for 60 seconds: 876,671 raw exits, 196 fresh-container,
-23,000 shared-container and 246,000 native host accepted successes. Public
+tracks reusable executors (#639), the demonstration (#640), and the still-
+unqualified sustained target (#668). The standalone [four-part recording](https://reliaburger.com/#job-throughput)
+measures each scenario for 60 seconds: 993,718 raw exits, 213 fresh-container,
+58,000 shared-container and 294,000 native host accepted successes. Public
 windows have no failures or retries. [Raw measurements](qualification/2026-10-09-timed-job-scenarios/README.md)
 retain the actual hardware, concurrency, receipt policy, daily extrapolations
-and sequential one-hour saturation runs.
+and four completed sequential one-hour saturation runs. The host hour accepted
+19,145,000 successes and the shared hour 11,799,000; all application probes
+succeeded. Global storage bounds and a real daily qualification remain in #668.
 [Earlier comparisons and recovery evidence](qualification/2026-10-08-job-measurements/README.md)
 retain failed experiments and remaining qualification work.
 Resident model workers (#641) remain separate.
 
-The [equal-window measurement plan](plans/2026-10-09-plan-timed-job-scenarios.md) compares all four scenarios for 60 seconds, then one hour each. Daily counts are labelled extrapolations.
+The [equal-window measurement plan](plans/archive/2026-10-09-plan-timed-job-scenarios.md) compares all four scenarios for 60 seconds, then one hour each. Daily counts are labelled extrapolations.

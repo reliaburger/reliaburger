@@ -9,8 +9,9 @@ projections are the minute count times 1,440, explicitly labelled extrapolations
 
 Keep the pinned BusyBox executable, concurrency 27 and public CPU/memory profile
 identical. On this four-vCPU VM, 500m is reserved for the node and 500m for the
-concurrent application; 27 helper-inclusive 110m reservations fill the 3,000m
-job budget. Keep one active submission to cap total requested concurrency at 27. Large
+concurrent application. The initial 100m job request plus 10m helper overhead
+admitted 27 slots in the 3,000m job budget; the wider review below lowers the
+common request to 25m while retaining the one-core limit. Keep one active submission to cap total requested concurrency at 27. Large
 submissions avoid rollover gaps; renew immediately when one completes. Fresh
 containers use single-job receipt chunks so a minute can show accepted progress;
 fast paths use 1,000-job chunks to amortise receipts. Disclose that difference. Measure short pilots and
@@ -39,8 +40,8 @@ running commands. For each point, submit once with cold executors and observe
 accepted counters subtracted. Cancel and positively drain before the next point.
 Repeat close candidates and retain the full curve, then select a common cap for
 the recorded comparison and document any scenario-specific optimum separately.
-Preserve the already-running raw hour as a 27-concurrency reference; redo it if
-the selected cap differs. No competing builds or tests during timed windows.
+Preserve the earlier raw hour as historical evidence. Repeat it if the selected
+cap, executable or raw supervisor changes. No competing builds or tests during timed windows.
 
 Add a short rig note next to the landing-page results: a local Lima VM on an
 Apple M2 Max host (12 physical cores, 32 GiB host RAM), allocating 4 vCPU and
@@ -52,12 +53,10 @@ The completed curve selects 27 as a common comparison point, not a universal
 optimum. Native host throughput reaches the same second-minute 5,333.3/s plateau
 at 8, 16, 27 and 32; 48/64 are worse. Shared second-minute throughput at 27 won
 all three runs, while 8–16 often improved its cold minute. Fresh containers are
-near their observed plateau from 16 upwards. Preserve those trade-offs, confirm
-the raw 16/27 plateau with equal-minute windows, then re-record at common 27 and
-25m-1000m / 32 MiB. Reuse the completed raw hour only at its unchanged 27 cap and
-executable; raw CPU profile inputs are ignored, so their nominal request isn't
-an enforced limit or admission setting. Run public hours at common 27 with the
-new matched positive request. The rig note and curve belong beside the results.
+near their observed plateau from 16 upwards. Preserve those trade-offs and re-record at common 27 and
+25m-1000m / 32 MiB. Raw CPU profile inputs are ignored, so their nominal request
+isn't an enforced limit or admission setting. Run public hours at common 27 with
+the new matched positive request. The rig note and curve belong beside the results.
 
 Package the four timed scenarios in `relish bench`, using `--scenario
 jobs-containers`, `jobs-shared-containers`, `jobs-host-processes` and
@@ -72,10 +71,36 @@ on the Linux machine where Relish executes. Document these prerequisites and
 report the executable/image boundary rather than silently claiming unlike
 binaries or different machines form a matched comparison.
 
-After the current frozen runtime soaks finish, test the packaged commands
-against the real node and re-record the landing-page demo with those commands.
-The soak evidence remains attached to its original runtime binary hashes and
-harness; any changed runtime implementation would require new soaks. Remove the
+Test the packaged commands against the real node and re-record the landing-page
+demo with those commands. The packaged raw supervisor differs from the earlier
+Python driver, so repeat all four hours using the frozen Relish build. The soak
+evidence remains attached to its original binary hashes and harness; any changed
+measurement or runtime implementation requires new measurements. Remove the
 superseded 1,064-job development preview, place the new numbered section
 immediately after the five-minute tour, keep its player visible and fold the
 results, use cases and rig details into a closed disclosure.
+
+## Implementation and review evidence
+
+The packaged command and publication observer are implemented and tested. The
+clean measurement source is commit `006aca5f9157a3b9432752470d507ca6ecb7e0d5`;
+Bun retains its earlier frozen runtime bytes. A fresh recording of the four
+default commands completed 993,718 raw exits, 213 container jobs, 58,000 shared
+container jobs and 294,000 native host jobs within their respective 60-second
+windows. No failures, retries or application probe failures occurred. All public
+submissions positively drained after cancellation.
+
+All four packaged hours completed sequentially with builds, tests and preview
+playback stopped: 55,407,709 raw exits, 14,199 fresh-container jobs, 11,799,000
+shared-container jobs and 19,145,000 host jobs. There were no terminal failures;
+fresh containers recovered four retries. All 14,361 application probes succeeded.
+Every public owner positively drained, and the original fixture's runtime,
+network and exact kernel owner retired after measurement. The landing-page
+recording and the book/manual/whitepaper now use these measured boundaries.
+
+The [qualification record](../../qualification/2026-10-09-timed-job-scenarios/README.md)
+retains the minute recording, concurrency sweep, full hours, storage growth,
+incomplete scans and earlier interrupted diagnostics. Remaining 24-hour and
+global cost/cardinality qualification belongs to #668. A completed hour does not
+resolve that issue. Final portable CI, the Linux benchmark gate, publication contracts and browser
+verification passed. The implementation and requested measurement work are complete.

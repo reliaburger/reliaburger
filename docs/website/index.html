@@ -251,20 +251,20 @@
         <div class="tour">
         <p class="tour-note">Four ways to run the same command, measured on the same
           VM with the same concurrency. Pick the isolation your work needs.</p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:259.912789">
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:258.78089525790324">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
             with <code>asciinema play job-throughput.cast</code>.</p></noscript>
           <figcaption>
-            <span>Four real 60-second windows: VM baseline, fresh containers,
+            <span>0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers,
               shared containers and host jobs. Chapter jumps and playback speed
               change only your view; preparation and cleanup stay visible.</span>
             <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
-              <button type="button" data-start="0.007836">VM baseline</button>
-              <button type="button" data-start="62.124512">Fresh containers</button>
-              <button type="button" data-start="128.702376">Shared containers</button>
-              <button type="button" data-start="195.283696">Host jobs</button></span>
+              <button type="button" data-start="0.012144">VM baseline</button>
+              <button type="button" data-start="60.047066">Fresh containers</button>
+              <button type="button" data-start="127.788773">Shared containers</button>
+              <button type="button" data-start="195.142933">Host jobs</button></span>
             <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
               <button type="button" data-speed="1" aria-pressed="true">1×</button>
               <button type="button" data-speed="4" aria-pressed="false">4×</button>
@@ -282,7 +282,7 @@
         <table><caption>Four scenarios, 60 seconds each. Same VM, BusyBox command
           and concurrency cap of 27. Daily figures are extrapolated.</caption>
           <thead><tr><th scope="col">Execution</th><th scope="col">Best for</th><th scope="col">Completed in 60 seconds</th><th scope="col">Rate</th><th scope="col">Extrapolated runs/day</th><th scope="col">Retries</th></tr></thead>
-          <tbody><tr><th scope="row">VM baseline</th><td>Measured raw-process ceiling on this VM</td><td>876,671 raw exits</td><td>14,611.2/s</td><td>1.3B</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>Fully isolated, independent jobs</td><td>196 accepted jobs</td><td>3.3/s</td><td>282.2k</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>Repeatable tasks; amortised container startup</td><td>23,000 accepted jobs</td><td>383.3/s</td><td>33.1M</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>Maximum speed for trusted commands; no isolation</td><td>246,000 accepted jobs</td><td>4,100.0/s</td><td>354.2M</td><td>0</td></tr></tbody>
+          <tbody><tr><th scope="row">VM baseline</th><td>Measured raw-process ceiling on this VM</td><td>993,718 raw exits</td><td>16,562.0/s</td><td>1.4B</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>Fully isolated, independent jobs</td><td>213 accepted jobs</td><td>3.55/s</td><td>306.7k</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>Repeatable tasks; amortised container startup</td><td>58,000 accepted jobs</td><td>966.7/s</td><td>83.5M</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>Maximum speed for trusted commands; no isolation</td><td>294,000 accepted jobs</td><td>4,900.0/s</td><td>423.4M</td><td>0</td></tr></tbody>
         </table></div>
         <p>Testing rig: a local Lima VM on an Apple M2 Max host (12 physical cores,
           32 GiB host RAM), with 4 vCPU and 8 GiB allocated to Ubuntu 24.04 aarch64,
@@ -436,7 +436,7 @@ target/debug/relish</code></pre>
       <span>Reliaburger · by Miko Pawlikowski</span>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
       <span class="footer-note">HTML and CSS. Two small scripts: one adds the copy buttons, one
-        plays the tour’s recording with a copy of the asciinema player served from this site.
+        plays the recordings with a copy of the asciinema player served from this site.
         No tracking, no third-party requests.</span>
     </footer>
   </div>

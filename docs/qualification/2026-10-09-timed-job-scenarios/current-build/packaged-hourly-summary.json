@@ -1,0 +1,103 @@
+{
+  "qualified_100m_per_day": false,
+  "source": "packaged-bench-hours/report.json",
+  "cpu_scope": "aggregate VM across first-to-last sampled interval, including unrelated retained workloads; excludes idle and iowait",
+  "scenarios": [
+    {
+      "scenario": "jobs-vm-baseline",
+      "seconds": 3600,
+      "concurrency": 27,
+      "successes": 55407709,
+      "rate_per_second": 15391.030277777778,
+      "terminal_failures": 0,
+      "accepted_retries": 0,
+      "application_probes": 3592,
+      "application_failures": 0,
+      "service_latency_ms": {
+        "samples": 3592,
+        "maximum": 14.185369946062565,
+        "p95": 1.7986809834837914
+      },
+      "vm_sampled_busy_percent": 91.2,
+      "bun_sampled_rss_min_mib": 189.7,
+      "bun_sampled_rss_max_mib": 219.0,
+      "free_disk_first_mib": 2651.0,
+      "free_disk_last_mib": 2649.5,
+      "free_disk_min_mib": 2649.5,
+      "incomplete_storage_scans": 120,
+      "resource_samples": 120
+    },
+    {
+      "scenario": "jobs-containers",
+      "seconds": 3600,
+      "concurrency": 27,
+      "successes": 14199,
+      "rate_per_second": 3.944166666666667,
+      "terminal_failures": 0,
+      "accepted_retries": 4,
+      "application_probes": 3586,
+      "application_failures": 0,
+      "service_latency_ms": {
+        "samples": 3586,
+        "maximum": 52.467870991677046,
+        "p95": 6.144913844764233
+      },
+      "vm_sampled_busy_percent": 88.0,
+      "bun_sampled_rss_min_mib": 175.5,
+      "bun_sampled_rss_max_mib": 219.0,
+      "free_disk_first_mib": 2649.4,
+      "free_disk_last_mib": 2613.6,
+      "free_disk_min_mib": 2613.6,
+      "incomplete_storage_scans": 120,
+      "resource_samples": 120
+    },
+    {
+      "scenario": "jobs-shared-containers",
+      "seconds": 3600,
+      "concurrency": 27,
+      "successes": 11799000,
+      "rate_per_second": 3277.5,
+      "terminal_failures": 0,
+      "accepted_retries": 0,
+      "application_probes": 3593,
+      "application_failures": 0,
+      "service_latency_ms": {
+        "samples": 3593,
+        "maximum": 10.792353888973594,
+        "p95": 3.175832098349929
+      },
+      "vm_sampled_busy_percent": 60.2,
+      "bun_sampled_rss_min_mib": 181.4,
+      "bun_sampled_rss_max_mib": 232.7,
+      "free_disk_first_mib": 2613.5,
+      "free_disk_last_mib": 1689.5,
+      "free_disk_min_mib": 1689.5,
+      "incomplete_storage_scans": 120,
+      "resource_samples": 120
+    },
+    {
+      "scenario": "jobs-host-processes",
+      "seconds": 3600,
+      "concurrency": 27,
+      "successes": 19145000,
+      "rate_per_second": 5318.055555555556,
+      "terminal_failures": 0,
+      "accepted_retries": 0,
+      "application_probes": 3590,
+      "application_failures": 0,
+      "service_latency_ms": {
+        "samples": 3590,
+        "maximum": 11.252043070271611,
+        "p95": 3.822116181254387
+      },
+      "vm_sampled_busy_percent": 54.1,
+      "bun_sampled_rss_min_mib": 188.2,
+      "bun_sampled_rss_max_mib": 234.1,
+      "free_disk_first_mib": 1703.1,
+      "free_disk_last_mib": 209.6,
+      "free_disk_min_mib": 209.6,
+      "incomplete_storage_scans": 120,
+      "resource_samples": 120
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "original_bun_pid": 2960485,
+  "original_service_payload_pid": 2960635,
+  "bun_gone": true,
+  "service_gone": true,
+  "runc_intents": 289,
+  "runc_all_retired": true,
+  "held_addresses": 0,
+  "host_owners": 32,
+  "host_all_retired_or_never_launched": true,
+  "cleanup_scope": "Only the original rb-host-executor-v4 node and its measurement fixture; no VM stop, unrelated process signal or journal deletion",
+  "kernel_retirement_pending": false,
+  "kernel_owner_phase": "Retired",
+  "original_kernel_owner_retired": true,
+  "retired_utc": "2026-10-09T22:38:58.428564+00:00"
+}
