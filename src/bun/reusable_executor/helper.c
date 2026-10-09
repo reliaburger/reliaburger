@@ -281,6 +281,9 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
     int truncated = 0;
     for (;;) {
         if (failed) break;
+        /* Both streams already at EOF when the exit is seen is the normal
+         * case: stop now rather than wait out another poll. */
+        if (exited && outputs[0][0] < 0 && outputs[1][0] < 0) break;
         struct pollfd observed[4] = {{control, 0, 0},
             {outputs[0][0], POLLIN, 0}, {outputs[1][0], POLLIN, 0},
             {child_events[0], POLLIN, 0}};
@@ -312,7 +315,6 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
         }
         if (failed) break;
         if (exited) {
-            if (outputs[0][0] < 0 && outputs[1][0] < 0) break;
             if (!progressed) break;
             if (drained_after_exit >= DRAIN_AFTER_EXIT_LIMIT) { truncated = 1; break; }
             continue;

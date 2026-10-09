@@ -2287,3 +2287,45 @@ async fn wait_until_async<F: std::future::Future<Output = bool>>(mut ready: impl
     .await
     .expect("condition never held");
 }
+
+/// A command whose output streams are both at EOF when its exit is seen must
+/// not wait out the post-exit drain poll; that 10 ms per command cut native
+/// throughput to a third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_adds_no_drain_wait_to_quiet_commands() {
+    use reliaburger::bun::task_executor::TaskRunner;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-latency-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, _) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let warm = runner
+        .run(
+            &shell_task(&template, 0, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(warm.outcome.succeeded(), "{warm:?}");
+    let started = std::time::Instant::now();
+    for index in 1..=200 {
+        let outcome = runner
+            .run(
+                &shell_task(&template, index, "true"),
+                Duration::from_secs(10),
+                &cancel,
+            )
+            .await;
+        assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    }
+    let elapsed = started.elapsed();
+    eprintln!("200 sequential quiet commands took {elapsed:?}");
+    // A 10 ms wait per command alone would take 2 seconds.
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}

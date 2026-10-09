@@ -1419,6 +1419,17 @@ quiet for 10 ms or after 16 MiB, and appends a visible
 race deterministic: it sends `SIGSTOP` to the helper while the command fills
 its pipe and exits.
 
+That fix had a bug of its own, and only a benchmark found it. Each loop pass
+reads the pipes and then checks whether the command has exited. For a quiet
+command both pipes are already at end-of-file in the pass that sees the exit,
+but the "both streams closed" check ran only after the next `poll`. With the
+command gone, that `poll` waits its full 10 ms. Ten milliseconds sounds
+harmless, but a `busybox true` takes well under one, so every command now cost
+about 11 ms. Host jobs fell from the roughly 4,000 a second we'd measured
+before to 1,233 a second, the same in every round. The check now runs before
+polling. A gated test times 200 quiet commands on one warm executor: 2.35
+seconds with the bug, 0.17 seconds without, against a two-second limit.
+
 None of this keeps a *model* loaded. Each command is still a new process that
 loads whatever it loads. Keeping a model resident between requests is a
 separate piece of work, #641.
@@ -1496,11 +1507,11 @@ still waiting for a pool slot. A node whose budget fitted two executors
 advertised 32 slots.
 
 The first fix swung too far the other way. It counted commands between the
-helper's start and exit receipts, and a `busybox true` lives for about a
-millisecond, so a node running 27 executors flat out sampled close to zero
-busy slots. The leader granted the baseline two chunks per control round, and
-our benchmark rerun came back with exactly 74,000 host jobs a minute, round
-after round: one chunk per tick. The right count sits between the two. Each
+helper's start and exit receipts. A `busybox true` lives for about a
+millisecond, so a node running 27 executors flat out would sample only the few
+commands caught mid-flight, and advertise far less than it was doing. (We first
+blamed this for a benchmark plateau; the drain bug above was the real cause, but
+the under-count is real too.) The right count sits between the two. Each
 pool slot records which run's caller has checked it out, from checkout to
 release, setup and cleanup included, so a waiting caller doesn't count and a
 millisecond command does. One regression fills a two-executor budget with 64
