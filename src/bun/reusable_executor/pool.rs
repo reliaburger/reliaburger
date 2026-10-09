@@ -390,7 +390,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         profile: ExecutorProfile,
     ) -> Result<(), ExecutorError> {
         use sha2::{Digest, Sha256};
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
@@ -407,15 +407,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         std::fs::create_dir_all(&context.directory)?;
         std::fs::set_permissions(&context.directory, std::fs::Permissions::from_mode(0o700))?;
         let helper = context.directory.join("helper");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o555)
-            .open(&helper)?;
-        std::io::Write::write_all(&mut file, HOST_HELPER)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::File::open(&context.directory)?.sync_all()?;
+        install_helper(helper.clone(), HOST_HELPER).await?;
         // Socket credentials and the durable owner's unreaped helper identity
         // authenticate this short address. Hash the executor directory too,
         // so two Buns on one host never share a name.
@@ -520,7 +512,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             return Err(ExecutorError::Configuration("container backend missing"));
         };
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
@@ -545,14 +537,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         std::fs::create_dir(&bootstrap)?;
         std::fs::set_permissions(&bootstrap, std::fs::Permissions::from_mode(0o755))?;
         let helper = bootstrap.join("helper");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o555)
-            .open(&helper)?;
-        std::io::Write::write_all(&mut file, HELPER)?;
-        file.sync_all()?;
-        drop(file);
+        install_helper(helper.clone(), HELPER).await?;
         let source = std::fs::File::open(&context.directory)?;
         // A /proc/fd alias keeps AF_UNIX's address bounded, independent of the
         // configured data-directory length. The source descriptor stays open.
@@ -1012,6 +997,29 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             ran,
         }
     }
+}
+
+/// Write an executor helper binary and make it and its directory entry
+/// durable. The write and both fsyncs are blocking file I/O, so they run on
+/// the blocking pool, not an async worker thread.
+async fn install_helper(path: PathBuf, bytes: &'static [u8]) -> Result<(), ExecutorError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o555)
+            .open(&path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| ExecutorError::Protocol(error.to_string()))??;
+    Ok(())
 }
 
 /// Where host helpers' control sockets live. The helper's reserved uid can
