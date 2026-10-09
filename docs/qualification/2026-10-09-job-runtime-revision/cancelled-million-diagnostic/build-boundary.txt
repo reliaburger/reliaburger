@@ -1,1 +1,0 @@
-Optimised runtime-v2 binaries, protocol 50/state 67. Mixed execution matches this revision; the later explicit-runc capability-advertisement correction is separately tested.

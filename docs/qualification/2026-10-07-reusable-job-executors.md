@@ -273,7 +273,7 @@ creation is included. All recorded service probes returned 200. The reports
 include every probe latency, rather than presenting a sparse sample as a
 service latency guarantee.
 
-Raw reports: [debug comparison](2026-10-08-job-measurements/debug-baselines/).
+Raw reports: [debug comparison](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-08-job-measurements/debug-baselines/).
 The matching driver is `examples/job-throughput.rs`. These debug development
 results establish the benefit of retaining containers and expose fresh runtime
 startup/durability costs. They do not qualify production binaries or a cluster
@@ -283,7 +283,7 @@ The public retained 1,000-command run completed in 20.699 seconds with zero
 failures/retries and verified selected indexes. The matching public fresh run
 reached its 600-second observation deadline without accepted chunk completion
 and was cancelled through its public identity. It is failed evidence, preserved
-with its raw samples in [public debug observations](2026-10-08-job-measurements/public-debug/).
+with its raw samples in [public debug observations](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-08-job-measurements/public-debug/).
 Its log repeatedly recorded `consumer runtime inventory timed out` and roughly
 500 ms application-loop snapshots. Inspection found inventory reads taking
 mixed-runtime mutation locks and retaining detached work after their caller
@@ -357,8 +357,8 @@ owners and container working sets. Every whole-data-directory sample exhausted
 the 4,096-entry observation budget, so all those storage observations are
 explicitly incomplete. They cannot establish bounded disk growth. Raw samples,
 workloads, reports and failure output are in
-[optimised public evidence](2026-10-08-job-measurements/release-public/);
-[direct reports](2026-10-08-job-measurements/release-baselines/) disclose each
+[optimised public evidence](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-08-job-measurements/release-public/);
+[direct reports](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-08-job-measurements/release-baselines/) disclose each
 path's execution contract.
 
 The achieved 496.38 accepted successes/s is below both the suggested recording
@@ -379,7 +379,7 @@ Bun. It SIGKILLed Bun with partial accepted completion and active commands,
 then restarted its exact original arguments. All 96 mixed-profile indexes were
 accepted without failures or retries. It retained the application's original
 PID, verified selected results and rejected stale control over CA/DNS/SPIFFE
-verified TLS. Raw evidence: [single-node proof](2026-10-08-job-measurements/release-recovery/).
+verified TLS. Raw evidence: [single-node proof](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-08-job-measurements/release-recovery/).
 
 Three actual Linux VMs (each 2 vCPU / 2 GiB) then ran 256 small and 128 large
 reusable jobs through persistent Raft, gossip, TLS and eBPF. Worker 3 stopped
@@ -389,7 +389,7 @@ failures. The original `hello` application kept PID 2629 on worker 1 and every
 sampled request returned HTTP 200. Both cohorts' first, middle and last outcomes
 were verified. On return, worker 3 had a new boot ID, five positively retired
 old-boot executor intents and an empty delegated namespace journal. No original
-ownership evidence was deleted. [Raw loss evidence and reproduction](2026-10-08-job-measurements/three-node-loss/)
+ownership evidence was deleted. [Raw loss evidence and reproduction](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-08-job-measurements/three-node-loss/)
 record the at-least-once boundary and fixture hardware. This proves a real
 worker loss, not every partition or delayed-message case and not sustained
 throughput. Two earlier probe attempts did not stop a worker: one missed its
@@ -419,7 +419,7 @@ runtime intents were positively retired and no matching owner process remained.
 Calling `OnionEbpf::retire_owned_state` for that exact manifest retired only
 those links and retained the journals; the unchanged routing case passed.
 This is fixture contamination, not successful first-pass evidence.
-The [original-owner proof and terminal manifest](2026-10-08-job-measurements/gate-fixture-retirement/)
+The [original-owner proof and terminal manifest](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-08-job-measurements/gate-fixture-retirement/)
 record the exact retirement boundary.
 
 The focused namespace adoption extension then correctly refused its two

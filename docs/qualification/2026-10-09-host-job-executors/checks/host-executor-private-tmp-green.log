@@ -1,7 +1,0 @@
-   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/host-job-executor/reliaburger)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 50s
-────────────
- Nextest run ID 4df26994-6d88-4509-b354-370515d02073 with nextest profile: default
-    Starting 2 tests across 1 binary (6 tests and 38 binaries skipped)
-────────────
-     Summary [   1.538s] 2 tests run: 2 passed, 6 skipped

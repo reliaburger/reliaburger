@@ -1,5 +1,10 @@
 # Equal-minute job demonstrations and hourly saturation runs
 
+The tree keeps this record's READMEs, reports, manifests, binary hashes and
+build boundaries. The raw samples, logs, casts, patches and copied tooling
+(about 39 MB) were removed to keep the repository small; they're still in the
+repository history at [006aca5f](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-09-timed-job-scenarios).
+
 The repaired recording measures four genuine 60-second windows on one four-vCPU,
 8 GiB Ubuntu 24.04 aarch64 Lima VM (Linux 6.8.0-139, runc 1.4), running locally
 on an Apple M2 Max host with 12 physical cores and 32 GiB RAM. The VM receives
