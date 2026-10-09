@@ -1833,6 +1833,7 @@ async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
         .unwrap();
     let (runner, budget, template, _) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
+    let cold = std::time::Instant::now();
     let first = runner
         .run(
             &shell_task(&template, 0, "cat /proc/self/cgroup"),
@@ -1841,6 +1842,11 @@ async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
         )
         .await;
     assert!(first.outcome.succeeded(), "{first:?}");
+    // The pool reports the command alone, not the cold helper start.
+    assert!(
+        first.ran.is_some_and(|ran| ran < cold.elapsed()),
+        "{first:?}"
+    );
     let task = task_cgroup(&first.output.head);
     wait_until("idle eviction retires the executor", || {
         !task.exists() && budget.available() == budget.capacity()

@@ -434,6 +434,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: "owned tasks require a runtime template".into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         };
         let resolved = match self.resolve_template(template).await {
@@ -444,6 +445,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         reason: "cannot decrypt this job's namespace secrets".into(),
                     },
                     output: CapturedOutput::default(),
+                    ran: None,
                 };
             }
         };
@@ -459,6 +461,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: reason.into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         }
         if !self.runtime.supports_runtime(backend) {
@@ -467,6 +470,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: "selected job runtime is unavailable on this node".into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         }
         if resolved.runtime == crate::config::job::JobRuntime::SharedRunc
@@ -555,12 +559,14 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: "shared-runc requires the owned rootful Linux runtime".into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         }
         let Some(slot) = self.slot(cancel).await else {
             return Attempt {
                 outcome: AttemptOutcome::Cancelled,
                 output: CapturedOutput::default(),
+                ran: None,
             };
         };
         let namespace = template.namespace.as_deref().unwrap_or("default");
@@ -896,7 +902,11 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             .expect("executor slots poisoned")
             .push_back(slot);
         self.available.notify_one();
-        Attempt { outcome, output }
+        Attempt {
+            outcome,
+            output,
+            ran: None,
+        }
     }
 }
 

@@ -120,6 +120,10 @@ pub struct Attempt {
     pub outcome: AttemptOutcome,
     /// What it wrote.
     pub output: CapturedOutput,
+    /// How long the command itself ran, when the runner can tell that apart
+    /// from waiting for a slot, admission and setup. `None` means the caller's
+    /// own measurement around [`TaskRunner::run`] is the best available.
+    pub ran: Option<Duration>,
 }
 
 /// Runs one attempt of one task.
@@ -199,6 +203,7 @@ impl TaskRunner for ProcessRunner {
                         reason: error.to_string(),
                     },
                     output: CapturedOutput::default(),
+                    ran: None,
                 };
             }
         };
@@ -233,7 +238,11 @@ impl TaskRunner for ProcessRunner {
         .await;
         readers.abort_all();
         let output = output.lock().await.clone();
-        Attempt { outcome, output }
+        Attempt {
+            outcome,
+            output,
+            ran: None,
+        }
     }
 }
 
@@ -360,6 +369,7 @@ impl TaskRunner for FakeRunner {
         Attempt {
             outcome,
             output: CapturedOutput::default(),
+            ran: None,
         }
     }
 }
@@ -761,7 +771,10 @@ impl<R: TaskRunner> TaskAttempts<R> {
             self.counters.running.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
             let result = self.runner.run(&invocation, timeout, &self.cancel).await;
-            let run_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            // A pool-run task waits for its slot and admission inside `run`, so
+            // prefer the runner's own measurement of the command.
+            let ran = result.ran.unwrap_or_else(|| started.elapsed());
+            let run_ms = u32::try_from(ran.as_millis()).unwrap_or(u32::MAX);
             self.counters.running.fetch_sub(1, Ordering::Relaxed);
             if let Some(lease) = resource_lease.as_mut() {
                 lease.confirm_retired();
@@ -1046,6 +1059,7 @@ mod tests {
                         tail: vec![b'y'; OUTPUT_KEEP_BYTES],
                         total_bytes: (OUTPUT_KEEP_BYTES * 2) as u64,
                     },
+                    ran: None,
                 }
             }
         }
@@ -1073,6 +1087,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_run_tasks_record_the_command_time_not_their_slot_wait() {
+        // A reusable pool waits for a slot and admission inside `run`.
+        struct Queued;
+        impl TaskRunner for Queued {
+            fn owns_admission(&self, _: &TaskInvocation) -> bool {
+                true
+            }
+            async fn run(&self, _: &TaskInvocation, _: Duration, _: &CancellationToken) -> Attempt {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 0 },
+                    output: CapturedOutput::default(),
+                    ran: Some(Duration::from_millis(5)),
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(Queued), fast(1));
+        let result = pool
+            .run_chunk(&work(1, 1, 0), &CancellationToken::new())
+            .await;
+        assert_eq!(result.records[0].run_ms, 5);
+    }
+
+    #[tokio::test]
     async fn singleton_success_preserves_selected_output() {
         struct Writes;
         impl TaskRunner for Writes {
@@ -1084,6 +1122,7 @@ mod tests {
                         tail: vec![],
                         total_bytes: 6,
                     },
+                    ran: None,
                 }
             }
         }

@@ -1515,6 +1515,18 @@ The calculation uses `u128` intermediates so multiplying counters cannot
 truncate the estimate. This is pure planning from committed state, with no new
 wire or durable fields.
 
+The estimate is only as good as the durations it learns from. The task executor
+used to time the whole `runner.run` call. For fresh containers, that's the
+contract: the clock starts once resources are charged, and starting a container
+is part of the cost. But a reusable pool waits for one of its 32 slots, for
+admission and, on a cold start, for an image pull inside `run`. So a 5 ms
+command queued behind 256 callers reported 50 to 200 ms, both in the
+user-visible `duration_final_attempt_ms` and in the histogram. `Attempt` now
+carries an optional `ran: Option<Duration>`. The pool fills it from the helper's
+start receipt to its exit receipt, and the executor uses it when present,
+falling back to its own clock. An `Option` makes "this runner can't tell" an
+explicit value rather than a zero that would look like a very fast command.
+
 Queued grants don't reserve sixteen thousand simultaneous processes. Every
 command still waits for the existing concurrency and CPU/memory admission gates.
 The cost is ownership: more granted work may need reconciliation or explicit

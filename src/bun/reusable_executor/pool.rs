@@ -694,6 +694,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 reason: error.to_string(),
             },
             output: CapturedOutput::default(),
+            ran: None,
         };
         let key = match ExecutorKey::new(&template) {
             Ok(key) => key,
@@ -715,6 +716,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             return Attempt {
                 outcome: AttemptOutcome::Cancelled,
                 output: CapturedOutput::default(),
+                ran: None,
             };
         };
         let mut context = match existing {
@@ -743,6 +745,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 return Attempt {
                     outcome: AttemptOutcome::Cancelled,
                     output: CapturedOutput::default(),
+                    ran: None,
                 };
             };
             deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
@@ -880,6 +883,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .rev()
             .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
             .and_then(|(_, value)| value.parse().ok());
+        // Only the command's own run time, from the helper's start receipt to
+        // its exit: not slot queueing, admission, image pulls or cleanup.
+        let mut ran = None;
         let observe = async {
             let socket = context
                 .connection
@@ -896,6 +902,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             // The encoded buffer holds live secrets only during submission.
             bytes.fill(0);
             let mut started = false;
+            let mut began = tokio::time::Instant::now();
             let mut logs = CommandLogs::new(task, &template, sink);
             if task
                 .env
@@ -932,6 +939,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 match event {
                     protocol::Event::Started if !started => {
                         started = true;
+                        began = tokio::time::Instant::now();
                         self.slots.lock().await[index].active_run = run_id;
                     }
                     protocol::Event::Output { stream, bytes } if started => {
@@ -939,6 +947,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                         logs.push(stream, &bytes).await;
                     }
                     protocol::Event::Exited(code) if started => {
+                        ran = Some(began.elapsed());
                         logs.finish().await;
                         drop(command_timer.take());
                         let _cleanup_timer = self.timings.start(Phase::Cleanup);
@@ -1009,7 +1018,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             context.idle_since = tokio::time::Instant::now();
             self.release(index, Some(context)).await;
         }
-        Attempt { outcome, output }
+        Attempt {
+            outcome,
+            output,
+            ran,
+        }
     }
 }
 
