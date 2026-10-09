@@ -12,13 +12,13 @@
     {
       "name": "true-bare-c27-n10000-warm100000",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/job-throughput",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/job-throughput",
         "--path",
         "bare",
         "--root",
         "/tmp/rb-host-executor-v1/matched-steady/true-bare-c27-n10000-warm100000",
         "--bun",
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/bun",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/bun",
         "--image",
         "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
         "--count",
@@ -30,7 +30,7 @@
         "--workload",
         "true",
         "--service-url",
-        "http://10.202.142.2:8080/",
+        "http://192.0.2.10:8080/",
         "--timeout",
         "1200"
       ],
@@ -76,13 +76,13 @@
     {
       "name": "true-bare-limited-c27-n10000-warm100000",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/job-throughput",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/job-throughput",
         "--path",
         "bare-limited",
         "--root",
         "/tmp/rb-host-executor-v1/matched-steady/true-bare-limited-c27-n10000-warm100000",
         "--bun",
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/bun",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/bun",
         "--image",
         "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
         "--count",
@@ -94,7 +94,7 @@
         "--workload",
         "true",
         "--service-url",
-        "http://10.202.142.2:8080/",
+        "http://192.0.2.10:8080/",
         "--timeout",
         "1200"
       ],
@@ -142,13 +142,13 @@
     {
       "name": "true-host-c27-n10000-warm100000",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/job-throughput",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/job-throughput",
         "--path",
         "host",
         "--root",
         "/tmp/rb-host-executor-v1/matched-steady/true-host-c27-n10000-warm100000",
         "--bun",
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/bun",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/bun",
         "--image",
         "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
         "--count",
@@ -160,7 +160,7 @@
         "--workload",
         "true",
         "--service-url",
-        "http://10.202.142.2:8080/",
+        "http://192.0.2.10:8080/",
         "--timeout",
         "1200"
       ],
@@ -392,13 +392,13 @@
     {
       "name": "true-reused-c27-n10000-warm100000",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/job-throughput",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/job-throughput",
         "--path",
         "reused",
         "--root",
         "/tmp/rb-host-executor-v1/matched-steady/true-reused-c27-n10000-warm100000",
         "--bun",
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/bun",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/bun",
         "--image",
         "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
         "--count",
@@ -410,7 +410,7 @@
         "--workload",
         "true",
         "--service-url",
-        "http://10.202.142.2:8080/",
+        "http://192.0.2.10:8080/",
         "--timeout",
         "1200"
       ],
@@ -643,13 +643,13 @@
     {
       "name": "true-durable-host-c27-n10000-warm100000",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/job-throughput",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/job-throughput",
         "--path",
         "durable-host",
         "--root",
         "/tmp/rb-host-executor-v1/matched-steady/true-durable-host-c27-n10000-warm100000",
         "--bun",
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/bun",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/bun",
         "--image",
         "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
         "--count",
@@ -661,7 +661,7 @@
         "--workload",
         "true",
         "--service-url",
-        "http://10.202.142.2:8080/",
+        "http://192.0.2.10:8080/",
         "--timeout",
         "1200"
       ],
@@ -894,13 +894,13 @@
     {
       "name": "true-durable-reused-c27-n10000-warm100000",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/job-throughput",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/job-throughput",
         "--path",
         "durable-reused",
         "--root",
         "/tmp/rb-host-executor-v1/matched-steady/true-durable-reused-c27-n10000-warm100000",
         "--bun",
-        "/Users/miko/github/reliaburger/target/host-executor-v1-release/bun",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v1-release/bun",
         "--image",
         "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
         "--count",
@@ -912,7 +912,7 @@
         "--workload",
         "true",
         "--service-url",
-        "http://10.202.142.2:8080/",
+        "http://192.0.2.10:8080/",
         "--timeout",
         "1200"
       ],

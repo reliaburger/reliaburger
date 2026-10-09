@@ -6,7 +6,7 @@
   "logical_cpus": 4,
   "workload_sha256": "1c25b26dc8bde54cad26787295cb8fb7bfb71760447a3aaf55956fd939f43ef5",
   "command_prefix": [
-    "/Users/miko/github/reliaburger/target/host-executor-v6-release/relish"
+    "$HOST_HOME/github/reliaburger/target/host-executor-v6-release/relish"
   ],
   "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
   "last_accepted_sample_seconds": 59.926518969004974,

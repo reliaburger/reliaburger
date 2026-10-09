@@ -7,7 +7,7 @@
   "node_data_filesystem": "ext2/ext3",
   "bun_pid": 3595893,
   "service_payload_pid": 3596041,
-  "service_url": "http://10.202.142.2:8080/",
+  "service_url": "http://192.0.2.10:8080/",
   "apparmor_restrict_unprivileged_userns": "1",
   "execution_binaries": "Frozen native host executor implementation; no concurrent tests or builds during measurements",
   "bun_start_ticks": 117933283,
