@@ -137,7 +137,8 @@ Each prints its version and the commit it was built from, such as
 `bun 0.1.6 (82fa78e)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
-`clang llvm libbpf-dev` and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
+`build-essential clang llvm libbpf-dev` (the static job executor helpers need a
+C compiler and a static libc) and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
 from a repository checkout, the same build the release uses. Then install
 `target/release/bun` and `target/release/relish` as above.)*
 

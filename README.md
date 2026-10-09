@@ -387,8 +387,10 @@ detail in GitHub milestones and issues.
 
 ## Run it from source
 
-You'll need Rust 1.97 or later. This runs a process workload with no container
-runtime, on macOS or Linux:
+You'll need Rust 1.97 or later. On Linux the build also compiles two small
+static C helpers, so it needs a C compiler and a static libc (`build-essential`
+on Debian and Ubuntu, `gcc glibc-static` on Fedora). This runs a process
+workload with no container runtime, on macOS or Linux:
 
 ```sh
 git clone https://github.com/reliaburger/reliaburger
