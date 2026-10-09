@@ -327,11 +327,16 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
         AttemptOutcome::Unknown { reason } => reason.as_str(),
         _ => "",
     };
+    // A fresh container's owner reports the loss in its output; a reusable
+    // executor's pool reports it as the attempt's reason.
+    let reported = if isolation == "shared-runc" {
+        reason.to_string()
+    } else {
+        String::from_utf8_lossy(&retired.output.head).into_owned()
+    };
     assert!(
-        reason.contains("namespace enforcement was lost")
-            || String::from_utf8_lossy(&retired.output.head)
-                .contains("namespace enforcement was lost"),
-        "{retired:?}"
+        reported.contains("namespace enforcement was lost"),
+        "{isolation}: {retired:?}"
     );
     for owner in runtime.launch_inventory().await.unwrap().unwrap() {
         assert_eq!(

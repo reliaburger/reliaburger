@@ -1188,8 +1188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn singleton_images_use_the_configured_owned_runtime_without_claiming_unsupported_limits()
-    {
+    async fn image_tasks_are_refused_on_a_process_only_node_with_or_without_limits() {
         let dir = tempfile::tempdir().unwrap();
         let mut task = assignment(1, 1, &[(0, 1)]);
         task.template = Some(Box::new(
