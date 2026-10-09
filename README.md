@@ -280,23 +280,20 @@ blue-green switches, autoscaling on metrics, jobs, cron and batch. Task arrays
 (`relish run --batch`, 0.2.0 development preview) keep repeated image or host
 tasks compact, pack CPU and memory beside apps, and report grouped outcomes
 through Raft. Mixed-profile manifests, rates and indexed detail are described
-in [the batch manual](docs/manual/14_batch-jobs.md). On Linux, `bun --runtime mixed` enables both owned backends; auto may detect
-both, while explicit `--runtime runc` stays container-only. Jobs use
-`runtime="runc"` by default, `runtime="process"` for allowlisted host commands,
-or `runtime="shared-runc"` for bounded reused containers, retaining their own command process and limits;
-rootful Linux process jobs also reuse bounded native executors and enforce
-explicit CPU/memory limits before execution. Fresh containers remain the default.
-The [four-part demo](https://reliaburger.com/#job-throughput) gives each scenario
-60 seconds: 876,671 raw process exits, 196 fresh-container jobs, 23,000 shared-
-container jobs and 246,000 host jobs. The public counts are unique accepted
-successes, with no failures or retries. [Raw evidence](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
-records hardware, limits, receipt granularity and the measured VM reference.
-Daily totals on the landing page are explicitly extrapolated; the qualification
-plan measures each scenario for an hour beside the original application.
-Point the cluster at a Git repository and the leader keeps it in sync, verifying commit signatures if you
+in [the batch manual](docs/manual/14_batch-jobs.md). Point the cluster at a Git
+repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.
-Verified duration summaries let fast workers queue bounded lookahead across
-control-report rounds; execution still waits for concurrency and resources.
+
+Jobs choose how they run. `runtime = "runc"`, the default, starts a fresh
+container for every attempt. `runtime = "shared-runc"` reuses a bounded pool of
+containers, with each command still in its own process under its own limits.
+`runtime = "process"` runs an allowlisted host command; on rootful Linux, host
+batches reuse native executors that enforce CPU and memory limits. `bun
+--runtime mixed`, or `auto` when runc is installed, enables both kinds. The
+[job throughput demo](https://reliaburger.com/#job-throughput) runs each kind
+for 60 seconds on a small VM, and the
+[qualification record](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
+gives the rig, the limits and what the numbers do and don't show.
 
 Batch jobs retain distinct execution identities and their original scoped
 labels across retries and recovery. Finite durable history keeps replay fences;
@@ -316,10 +313,11 @@ between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.
 
-Run a built-in timed job comparison with `relish bench --scenario jobs-shared-containers`
-(defaults: 60 seconds, concurrency 27). Fresh-container, trusted host-process
-and local Linux VM-baseline scenarios are also available; see the batch manual
-for prerequisites, resource profiles and matched comparisons.
+`relish bench --scenario jobs-shared-containers` runs a timed job comparison
+(60 seconds at concurrency 27 by default), with fresh-container, host-process
+and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
+it measures per-job overhead rather than real work; see the batch manual for
+prerequisites and resource profiles.
 
 **Tested like it has to survive a bad day.** Beyond thousands of unit, property
 and snapshot tests, there are crash-recovery suites that kill the agent at every
@@ -425,5 +423,3 @@ matching update to the book.
 ## Licence
 
 [Apache 2.0](LICENSE)
-
-The [equal-window measurement plan](docs/plans/2026-10-09-plan-timed-job-scenarios.md) compares all four scenarios for 60 seconds, then one hour each. Daily counts are labelled extrapolations.
