@@ -681,14 +681,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // Same admission gate as apps (jobs have no GPU field, so only the
         // host-exec/script allowlist and rootless-limit checks apply).
         self.admit_process_workload(job_name, spec.exec.as_deref(), spec.script.as_deref())?;
-        #[cfg(target_os = "linux")]
-        let native = spec.runtime == crate::config::job::JobRuntime::Process
-            && self.grill.host_executor_runtime().is_some();
-        #[cfg(not(target_os = "linux"))]
-        let native = false;
+        // Every caller launches through `Grill::create`, never a native
+        // executor, so host limits are refused here even on a node whose
+        // task arrays can enforce them (`task_array_node` admits those).
         self.admit_rootless_limits(
             job_name,
-            !native && (spec.memory.is_some() || spec.cpu.is_some()),
+            spec.memory.is_some() || spec.cpu.is_some(),
             spec.exec.is_some() || spec.script.is_some(),
         )?;
 
@@ -1902,6 +1900,54 @@ mod tests {
         let mut image = basic_app_spec(None);
         image.memory = host.memory;
         sup.admit_app("image", &image).unwrap();
+    }
+
+    /// A rootful owned process node: the only kind that can run native
+    /// executors, so the only kind where admission could think limits apply.
+    #[cfg(target_os = "linux")]
+    fn rootful_process_supervisor(
+        root: &std::path::Path,
+    ) -> WorkloadSupervisor<crate::grill::ProcessGrill> {
+        use crate::grill::Grill;
+        let grill = crate::grill::ProcessGrill::with_owner(
+            root.join("owners"),
+            root.join("bun-is-never-started"),
+        );
+        assert!(
+            grill.host_executor_runtime().is_some(),
+            "this test needs root and cgroup v2"
+        );
+        WorkloadSupervisor::with_process_config(
+            grill,
+            PortAllocator::new(30000, 31000),
+            crate::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/true".into()],
+                mount_isolation: false,
+                script_dir: root.join("scripts"),
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    fn cgroup_rootful_process_node_refuses_limited_ordinary_host_jobs() {
+        // Native executors only run task-array work. Ordinary and batch jobs
+        // reach `ProcessGrill::create`, which never reads cgroup limits.
+        let root = tempfile::tempdir().unwrap();
+        let sup = rootful_process_supervisor(root.path());
+        let mut job: crate::config::job::JobSpec = toml::from_str(
+            r#"
+            runtime = "process"
+            exec = "/bin/true"
+            memory = "64Mi-128Mi"
+        "#,
+        )
+        .unwrap();
+        let refused = sup.admit_job("limited", "default", &job).unwrap_err();
+        assert!(refused.to_string().contains("cannot enforce"), "{refused}");
+        job.memory = None;
+        sup.admit_job("unlimited", "default", &job).unwrap();
     }
     #[test]
     fn mixed_admission_does_not_promise_container_egress_enforcement_for_host_commands() {

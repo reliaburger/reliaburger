@@ -234,9 +234,10 @@ On Linux, `bun --runtime mixed` enables both owned backends. `--runtime auto`
 can detect both when runc is available. Explicit `--runtime runc` is
 container-only and refuses host jobs; `--runtime process` is host-only.
 Host commands still need the executable allowlist and
-`mount_isolation = false`. Rootful Linux process jobs use native executors and
-enforce CPU/memory limits before execution. Other platforms retain the original
-owned process backend and refuse explicit limits. Containers and native jobs
+`mount_isolation = false`. On rootful Linux, process batches (`relish run
+--batch`) use native executors and enforce CPU/memory limits before execution.
+Ordinary `[job]` host commands, and every host command on other platforms, use
+the original owned process backend and refuse explicit limits. Containers and native jobs
 keep separate execution capabilities.
 
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
