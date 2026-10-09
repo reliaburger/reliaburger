@@ -37,6 +37,8 @@ def exact(connection, count):
 
 
 class ExecutorProtocol(unittest.TestCase):
+    helper_uid = 65536
+
     @classmethod
     def setUpClass(cls):
         cls.root = tempfile.TemporaryDirectory(prefix='rb-executor-protocol-')
@@ -138,7 +140,7 @@ class ExecutorProtocol(unittest.TestCase):
         self.assertEqual(self.connection.recv(1), b'')
 
     def test_privileged_helper_uid_is_refused(self):
-        data = struct.pack('!QIIII', 1, 1, 0, 65536, 0) + text('/') + text('/bin/true')
+        data = struct.pack('!QIIII', 1, 1, 0, self.helper_uid, 0) + text('/') + text('/bin/true')
         self.connection.sendall(struct.pack('!I', len(data)) + data)
         self.assertEqual(self.connection.recv(1), b'')
 
@@ -149,6 +151,8 @@ class ExecutorProtocol(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == 'linux', 'host child ownership requires Linux')
 class NativeHostExecutorProtocol(ExecutorProtocol):
+    helper_uid = 2100000000
+
     @classmethod
     def setUpClass(cls):
         cls.root = tempfile.TemporaryDirectory(prefix='rb-host-executor-protocol-')
