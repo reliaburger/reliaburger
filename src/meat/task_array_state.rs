@@ -29,6 +29,10 @@ pub const MAX_CHUNK_FAILED_RANGES: usize = 256;
 /// Fewest chunks the grant policy keeps queued on a node, so a node that
 /// finishes one chunk always has the next one ready.
 pub const MIN_GRANT_DEPTH: u64 = 2;
+/// Cap extra prefetch learned from verified command durations. This queues work,
+/// not resource reservations; the original two-slot-round floor still applies.
+pub const MAX_LEARNED_GRANT_DEPTH: u64 = 16;
+const LOOKAHEAD_MILLISECONDS: u128 = 2000;
 
 /// Why an array stopped before running every task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,8 +585,35 @@ pub fn grant_depth(slots: u32, chunk_size: u32) -> u64 {
     wanted.max(MIN_GRANT_DEPTH)
 }
 
+impl TaskArrayState {
+    fn observed_grant_depth(&self, slots: u32) -> u64 {
+        let baseline = grant_depth(slots, self.spec.chunk_size);
+        // The overflow bucket has no finite upper bound. Unknown/slow work
+        // retains the small window rather than inventing a throughput estimate.
+        if self.duration_counts[15] != 0 {
+            return baseline;
+        }
+        let mut samples = 0u128;
+        let mut milliseconds = 0u128;
+        for (bucket, count) in self.duration_counts[..15].iter().enumerate() {
+            samples += u128::from(*count);
+            milliseconds += u128::from(*count) * (1u128 << bucket);
+        }
+        if milliseconds == 0 {
+            return baseline;
+        }
+        // u32 slots, sixteen u64 counts and these fixed bounds fit in u128.
+        // Use upper bucket bounds: estimates stay conservative. Two seconds
+        // cover receipt acceptance and delivery of the committed next grant.
+        let tasks = u128::from(slots) * LOOKAHEAD_MILLISECONDS * samples / milliseconds;
+        let chunks = tasks.div_ceil(u128::from(self.spec.chunk_size.max(1)));
+        baseline.max(chunks.min(u128::from(MAX_LEARNED_GRANT_DEPTH)) as u64)
+    }
+}
+
 /// Decide which queued chunks to hand to which node. Each node is topped
-/// up to its [`grant_depth`], the emptiest nodes first (ties by name), and
+/// up to its baseline [`grant_depth`] or learned bounded lookahead, the
+/// emptiest nodes first (ties by name), and
 /// always with the lowest queued chunk ids. It's pull-shaped load
 /// balancing: a fast node empties its chunks sooner and gets more, so
 /// there's no up-front split to go wrong. The state isn't changed; the
@@ -607,7 +638,7 @@ pub fn plan_grants(state: &TaskArrayState, nodes: &[NodeSlots]) -> Vec<(NodeId, 
         if queue.is_empty() {
             break;
         }
-        let depth = grant_depth(candidate.slots, state.spec.chunk_size);
+        let depth = state.observed_grant_depth(candidate.slots);
         let wanted = depth.saturating_sub(held(&candidate.node));
         let chunks = queue.take_first(wanted);
         if !chunks.is_empty() {
@@ -643,6 +674,36 @@ mod tests {
         assert_eq!(grant_depth(512, 1024), MIN_GRANT_DEPTH);
         assert_eq!(grant_depth(2048, 1024), 4);
         assert_eq!(grant_depth(10, 3), 7);
+    }
+
+    #[test]
+    fn fast_receipts_keep_a_bounded_report_round_of_work_ready() {
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        state.grant(&node("a"), &chunks(0..=1)).unwrap();
+        for chunk in 0..2 {
+            let mut result = all_ok(&state, chunk);
+            result.duration_counts[0] = 1000;
+            state.complete(&node("a"), &result).unwrap();
+        }
+        let plan = plan_grants(&state, &slots(&[("a", 27), ("blocked", 0)]));
+        assert_eq!(plan, vec![(node("a"), chunks(2..=17))]);
+        apply(&mut state, &plan);
+        assert!(plan_grants(&state, &slots(&[("a", 27)])).is_empty());
+    }
+
+    #[test]
+    fn slow_or_overflow_receipts_keep_the_original_small_grant_window() {
+        for bucket in [10, 15] {
+            let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+            state.grant(&node("a"), &chunks(0..=0)).unwrap();
+            let mut result = all_ok(&state, 0);
+            result.duration_counts[bucket] = 1000;
+            state.complete(&node("a"), &result).unwrap();
+            assert_eq!(
+                plan_grants(&state, &slots(&[("a", 27)])),
+                vec![(node("a"), chunks(1..=2))]
+            );
+        }
     }
 
     #[test]

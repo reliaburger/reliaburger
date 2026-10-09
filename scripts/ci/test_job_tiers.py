@@ -34,3 +34,18 @@ class JobTiers(unittest.TestCase):
             self.assertIn(f'count = {count}\n', cohort)
             self.assertIn(f'runtime = "{runtime}"\n', cohort)
             self.assertEqual('image = ' in cohort, runtime != 'process')
+
+    def test_host_demo_volume_is_explicit_and_verified_against_the_recording(self):
+        spec = importlib.util.spec_from_file_location('tiers_volume', ROOT / 'scripts/demo/record-job-tiers.py')
+        tiers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tiers)
+        baseline = dict(path='Bare', count=1000000, verified_successes=1000000, failures=0)
+        rows = [dict(runtime=mode, total=count, unique_accepted_successes=count, all_tasks_succeeded=True)
+                for mode, count in [('runc',1000), ('shared-runc',10000), ('process',500000)]]
+        report = tiers.build_report(baseline, rows, 400, process_count=500000)
+        self.assertTrue(report['all_tasks_succeeded'])
+        self.assertEqual(report['unique_accepted_successes'], 511000)
+        with self.assertRaises(ValueError): tiers.build_report(baseline, rows, 400)
+        for invalid in [0, -1, True]:
+            with self.assertRaises(ValueError):
+                tiers.build_report(baseline, rows, 400, process_count=invalid)

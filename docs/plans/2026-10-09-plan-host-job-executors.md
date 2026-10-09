@@ -49,3 +49,15 @@ Compare old/new at identical concurrency where both support the same reservation
 label unsupported legacy host limits rather than calling them matched. Real
 commands and indexed accepted outcomes are required; synthetic runner rates are
 not throughput evidence. Add short-command, CPU, output and mixed-profile cases.
+
+## Dispatch follow-through
+
+The first matched native build completed durable worker work at 9,295/s, but
+100,000 public jobs reached only 992/s. Two queued chunks and separate receipt
+acceptance/grant-delivery ticks limited fast workers to about 1,000/s. Learn a
+bounded grant lookahead from already verified duration histograms, covering the
+two control rounds and capping extra prefetch at sixteen chunks. Unknown, slow
+or overflow-duration work keeps the original small window. This adds no wire or
+state fields and never increases execution concurrency or reserves resources for
+queued tasks. Retain the first measurements, repeat public measurements and the
+hour on a fresh frozen build, and document the larger ownership/replay window.

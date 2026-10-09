@@ -8030,6 +8030,60 @@
       "boundaries": [
         "Real runtime and worker-ledger regression, not throughput or production Raft durability qualification."
       ]
+    },
+    {
+      "id": "issue-639-cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+      "issue": 639,
+      "promise": "Native helpers reuse durable ownership while fresh host commands enforce CPU, memory and process-tree cleanup.",
+      "supported_paths": [
+        "Rootful Linux native executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "native-cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Uncertain original ownership cannot authorise reuse or release capacity."
+      ],
+      "boundaries": [
+        "Real runtime regression; this does not qualify sustained production throughput."
+      ]
+    },
+    {
+      "id": "issue-639-cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+      "issue": 639,
+      "promise": "Dropped native callers quarantine capacity and require positive original retirement before replacement.",
+      "supported_paths": [
+        "Rootful Linux native executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "native-cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Uncertain original ownership cannot authorise reuse or release capacity."
+      ],
+      "boundaries": [
+        "Real runtime regression; this does not qualify sustained production throughput."
+      ]
     }
   ]
 }

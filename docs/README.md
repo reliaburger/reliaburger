@@ -1476,8 +1476,10 @@ containers remain the default. Linux `--runtime mixed` or auto-selected mixed no
 explicit `--runtime runc` stays container-only;
 rootful Linux process jobs use bounded native executors and enforce explicit
 CPU/memory limits before each fresh command starts. Other platforms refuse
-unsupported limits. Host applications retain their existing runtime contract. The
-[executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+unsupported limits. Host applications retain their existing runtime contract.
+Verified duration summaries let fast workers queue bounded lookahead across
+control-report rounds; execution still waits for concurrency and resources.
+The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
 tracks #639 and the still-unqualified sustained target (#640). The standalone
 [four-part recording](https://reliaburger.com/#job-throughput) shows a million raw
 VM process exits, followed by 1,000 fresh-container, 10,000 shared-container and

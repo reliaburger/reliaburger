@@ -90,7 +90,11 @@ receipts to be pruned before reusing that identity for an app.
 
 A task array is a template and a count. The cluster assigns chunks to eligible
 nodes; each node starts tasks as CPU and memory become available. A chunk of
-1,000 tasks does not reserve 1,000 simultaneous executions. Applications and
+1,000 tasks does not reserve 1,000 simultaneous executions. Fast verified
+completions can raise queued lookahead to sixteen chunks to bridge control-report
+rounds. This changes queued ownership, not running concurrency or per-command
+resource admission. More granted work may require reconciliation or acknowledged
+replay after worker loss; unknown and slow durations retain the small window. Applications and
 batch attempts share the same node resource accounting. Existing app commitments
 remain reserved while an app starts, runs or retires.
 

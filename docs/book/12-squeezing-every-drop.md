@@ -1434,3 +1434,26 @@ runs record their warmup separately. Direct exits, owned outcomes, worker-ledger
 completion and public Raft acceptance remain separate measurements. Rotating
 through new namespaces still creates historical ownership and routing records;
 a fixed live pool doesn't prove that history is bounded.
+
+The first native measurements exposed another limit. Durable worker completion
+reached 9,295/s, but 100,000 public jobs took about 101 seconds. The controller
+kept two 1,000-task chunks queued. It accepted their receipts on one tick and
+delivered the newly committed grants on the next. A fast worker spent most of
+that two-second cycle waiting.
+
+We keep the one-second control interval and learn a bounded lookahead from the
+verified final-attempt duration histogram. Each bucket's upper bound gives a
+conservative duration estimate. Two control rounds of work are enough to bridge
+receipt acceptance and grant delivery; extra prefetch stops at sixteen chunks.
+No samples, slow commands or an unbounded overflow bucket retain the original
+window. The existing two-round concurrency floor still applies to tiny chunks.
+The calculation uses `u128` intermediates so multiplying counters cannot
+truncate the estimate. This is pure planning from committed state, with no new
+wire or durable fields.
+
+Queued grants don't reserve sixteen thousand simultaneous processes. Every
+command still waits for the existing concurrency and CPU/memory admission gates.
+The cost is ownership: more granted work may need reconciliation or explicit
+replay after worker loss. That window is bounded, and stale attempts keep their
+existing fences. We retain the first measurement rather than relabelling it as
+evidence for the revised dispatch policy.

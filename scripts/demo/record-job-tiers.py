@@ -22,8 +22,14 @@ spec.loader.exec_module(measurement)
 TIERS = [('runc', 1000), ('shared-runc', 10000), ('process', 10000)]
 
 
-def build_report(baseline, tiers, elapsed):
-    if [(row['runtime'], row['total']) for row in tiers] != TIERS:
+def tier_counts(process_count):
+    if type(process_count) is not int or process_count <= 0:
+        raise ValueError('process count must be a positive integer')
+    return TIERS[:2] + [('process', process_count)]
+
+
+def build_report(baseline, tiers, elapsed, process_count=10000):
+    if [(row['runtime'], row['total']) for row in tiers] != tier_counts(process_count):
         raise ValueError('requires exactly the three declared public-dispatch tiers in order')
     succeeded = (baseline.get('path') == 'Bare' and baseline['count'] == 1000000 and
                  baseline['verified_successes'] == 1000000 and baseline['failures'] == 0 and
@@ -55,10 +61,13 @@ def main():
     parser.add_argument('--output', required=True, type=pathlib.Path)
     parser.add_argument('--observe-pid', required=True, type=int)
     parser.add_argument('--observe-dir', required=True, type=pathlib.Path)
+    parser.add_argument('--process-count', type=int, default=10000, help='Host tier size selected from measured capacity')
     parser.add_argument('--timeout', type=int, default=86400)
     options = parser.parse_args()
     if '@sha256:' not in options.image or not options.host_binary.is_absolute():
         parser.error('requires a digest-pinned image and absolute allowlisted matching BusyBox binary')
+    if options.process_count <= 0:
+        parser.error('process count must be positive')
     options.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     cast = measurement.Recording(options.output / 'jobs.cast', started)
@@ -81,7 +90,7 @@ def main():
         cast.emit(f"Raw baseline: {baseline['verified_successes']:,} successful exits in {baseline['elapsed_seconds']:.2f}s "
                   f"({baseline['verified_successes_per_second']:.1f}/s); {baseline['failures']} failures.\n"
                   'Exit statuses only; no ownership journal, resource enforcement or accepted task ledger.', time.monotonic())
-        for runtime, count in TIERS:
+        for runtime, count in tier_counts(options.process_count):
             manifest = options.output / (runtime + '.toml')
             manifest.write_text(build_manifest(runtime, count, options.image, options.host_binary))
             destination = options.output / runtime
@@ -105,7 +114,7 @@ def main():
             rows.append(row)
             cast.emit(f"Verified {runtime}: {row['unique_accepted_successes']:,} accepted successes; selected indexes 0, middle and last succeeded.", time.monotonic())
         cast.emit('All three public tiers complete. The VM baseline remains a separate comparison.\nA short demonstration does not qualify 100 million jobs/day.', time.monotonic())
-        report.update(build_report(baseline, rows, time.monotonic() - started))
+        report.update(build_report(baseline, rows, time.monotonic() - started, process_count=options.process_count))
     except Exception as error:
         report.update(error=str(error), baseline=baseline, tiers=rows, recording_elapsed_seconds=time.monotonic() - started)
         raise

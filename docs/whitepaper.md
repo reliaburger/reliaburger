@@ -1130,6 +1130,12 @@ Host commands retain host access and Bun's user; they require trusted workloads.
 Neither path removes process creation, durable outcomes or external-effect
 idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
 
+Fast delegated jobs use bounded grant lookahead derived from verified duration
+summaries, covering receipt acceptance and grant delivery without increasing
+control polling. Extra prefetch is capped at sixteen chunks; actual execution
+remains gated by per-node concurrency and resource admission. The trade-off is
+more granted work to reconcile after worker loss, with unchanged attempt fences.
+
 The initial optimised development measurement accepted 50,000 container-command
 successes in 100.73 seconds on one four-vCPU, 8 GiB Linux VM, without retries or
 failures. The [raw comparison and recovery evidence](qualification/2026-10-08-job-measurements/README.md)

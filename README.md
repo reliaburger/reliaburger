@@ -293,6 +293,8 @@ baseline has fewer guarantees. [Raw evidence](docs/qualification/2026-10-09-job-
 records actual elapsed time, retries, hardware and limits. Sustained 100m/day
 throughput still needs qualification. Point the cluster at a Git repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.
+Verified duration summaries let fast workers queue bounded lookahead across
+control-report rounds; execution still waits for concurrency and resources.
 
 Batch jobs retain distinct execution identities and their original scoped
 labels across retries and recovery. Finite durable history keeps replay fences;
