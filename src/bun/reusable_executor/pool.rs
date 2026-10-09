@@ -53,6 +53,9 @@ pub(crate) struct CommandReporting<'a> {
 
 struct Slot {
     busy: bool,
+    /// The run whose caller has this slot checked out, from checkout to
+    /// release, including setup and cleanup.
+    holder: Option<u64>,
     active_run: Option<u64>,
     key: Option<ExecutorKey>,
     context: Option<Context>,
@@ -146,6 +149,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 (0..count.clamp(1, super::MAX_EXECUTOR_SLOTS))
                     .map(|_| Slot {
                         busy: false,
+                        holder: None,
                         active_run: None,
                         key: None,
                         context: None,
@@ -214,8 +218,21 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         slots[index].key = context.as_ref().map(|context| context.key);
         slots[index].context = context;
         slots[index].busy = false;
+        slots[index].holder = None;
         slots[index].active_run = None;
         self.changed.notify_waiters();
+    }
+    /// Slots this run's callers have checked out. Unlike
+    /// [`Self::active_commands`], it doesn't miss commands that start and exit
+    /// between samples, and unlike the executor's own running count, it leaves
+    /// out callers still waiting for a slot or for admission.
+    pub(crate) async fn busy_slots(&self, run: u64) -> u64 {
+        self.slots
+            .lock()
+            .await
+            .iter()
+            .filter(|slot| slot.holder == Some(run))
+            .count() as u64
     }
     pub(crate) async fn active_commands(&self, run: u64) -> u64 {
         self.slots
@@ -256,6 +273,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         &self,
         key: ExecutorKey,
         reservation: crate::meat::Resources,
+        holder: Option<u64>,
         cancel: &CancellationToken,
     ) -> Option<(usize, Option<Context>, Option<ResourceLease>)> {
         loop {
@@ -297,6 +315,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     None
                 };
                 slots[index].busy = true;
+                slots[index].holder = holder;
                 slots[index].key = Some(key);
                 return Some((index, slots[index].context.take(), lease));
             }
@@ -381,7 +400,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             context.id.0,
             RETIREMENT_DEADLINE.as_secs()
         );
-        self.slots.lock().await[index].retiring = Some(context);
+        let mut slots = self.slots.lock().await;
+        slots[index].holder = None;
+        slots[index].retiring = Some(context);
     }
     async fn start_host(
         &self,
@@ -695,8 +716,14 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             ));
         }
         let mut admission_timer = Some(self.timings.start(Phase::Admission));
-        let Some((index, existing, reservation)) =
-            self.slot(key, profile.reservation, cancel).await
+        let Some((index, existing, reservation)) = self
+            .slot(
+                key,
+                profile.reservation,
+                task.run.as_ref().map(|run| run.batch_id),
+                cancel,
+            )
+            .await
         else {
             return Attempt {
                 outcome: AttemptOutcome::Cancelled,

@@ -205,6 +205,16 @@ impl TaskRunner for NodeRunner {
             Self::Process(_) | Self::Fake(_) => None,
         }
     }
+    async fn busy_slots(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        match self {
+            Self::Owned(runner) => runner.busy_slots(batch_id, template).await,
+            Self::Process(_) | Self::Fake(_) => None,
+        }
+    }
     fn owns_admission(&self, task: &TaskInvocation) -> bool {
         matches!(self, Self::Owned(runner) if runner.owns_admission(task))
     }
@@ -779,6 +789,10 @@ impl TaskArrayNode {
             .runner
             .active_commands(assignment.batch_id, assignment.template.as_deref())
             .await;
+        let busy_slots = self
+            .runner
+            .busy_slots(assignment.batch_id, assignment.template.as_deref())
+            .await;
         ArrayProgress {
             batch_id: assignment.batch_id,
             slots: {
@@ -810,9 +824,11 @@ impl TaskArrayNode {
                         u32::MAX
                     });
                 // A pool-run caller counts as running while it still waits
-                // for a slot or admission; only started commands use one.
-                let busy = match (reusable, active_commands) {
-                    (Some(_), Some(active)) => active,
+                // for a slot or admission; only a checked-out slot is in use.
+                // Started commands alone would miss millisecond commands
+                // that begin and end between samples.
+                let busy = match (reusable, busy_slots) {
+                    (Some(_), Some(held)) => held,
                     _ => counters.running.load(Ordering::Relaxed),
                 };
                 cap.min(u32::try_from(fits).unwrap_or(u32::MAX))

@@ -1498,5 +1498,11 @@
     "function": "cgroup_host_arrays_advertise_running_commands_not_queued_callers",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_arrays_advertise_running_commands_not_queued_callers"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts"
   }
 ]

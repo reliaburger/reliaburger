@@ -154,6 +154,23 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         }
         .map(|pool| pool.timings())
     }
+    /// The reusable pool that runs `template`: `Some(None)` before that pool
+    /// exists, `None` when the template doesn't run through a pool here.
+    #[cfg(target_os = "linux")]
+    fn pool_for(
+        &self,
+        template: &crate::config::job::JobSpec,
+    ) -> Option<Option<&std::sync::Arc<super::reusable_executor::ReusablePool<G>>>> {
+        use crate::config::job::JobRuntime;
+        if template.runtime == JobRuntime::SharedRunc && self.runtime.reusable_runtime().is_some() {
+            Some(self.reusable.get())
+        } else if template.runtime == JobRuntime::Process && self.supports_host_limits() {
+            Some(self.host.get())
+        } else {
+            None
+        }
+    }
+
     /// Compatible idle contexts already own their complete resource request.
     #[cfg(target_os = "linux")]
     pub(crate) async fn reusable_capacity(&self, template: &crate::config::job::JobSpec) -> u32
@@ -394,20 +411,26 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         batch_id: u64,
         template: Option<&crate::config::job::JobSpec>,
     ) -> Option<u64> {
-        let template = template?;
         #[cfg(target_os = "linux")]
-        if (template.runtime == crate::config::job::JobRuntime::SharedRunc
-            && self.runtime.reusable_runtime().is_some())
-            || (template.runtime == crate::config::job::JobRuntime::Process
-                && self.supports_host_limits())
-        {
-            let pool = if template.runtime == crate::config::job::JobRuntime::Process {
-                self.host.get()
-            } else {
-                self.reusable.get()
-            };
+        if let Some(pool) = self.pool_for(template?) {
             return Some(match pool {
                 Some(pool) => pool.active_commands(batch_id).await,
+                None => 0,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (batch_id, template);
+        None
+    }
+    async fn busy_slots(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = self.pool_for(template?) {
+            return Some(match pool {
+                Some(pool) => pool.busy_slots(batch_id).await,
                 None => 0,
             });
         }

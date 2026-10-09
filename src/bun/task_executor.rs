@@ -169,6 +169,16 @@ pub trait TaskRunner: Send + Sync + 'static {
         async { None }
     }
 
+    /// Reusable-pool slots this run's callers hold, from checkout to release.
+    /// `None` when the runner doesn't run this template through a pool.
+    fn busy_slots(
+        &self,
+        _batch_id: u64,
+        _template: Option<&crate::config::job::JobSpec>,
+    ) -> impl Future<Output = Option<u64>> + Send {
+        async { None }
+    }
+
     /// Run `task`, killing it after a nonzero `timeout` or when `cancel` fires.
     fn run(
         &self,

@@ -2228,3 +2228,62 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
     }
     assert!(retired, "executors never returned their reservations");
 }
+
+/// A slot counts as busy from checkout, before the helper confirms the start,
+/// so millisecond commands that start and exit between samples still count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts() {
+    use nix::sys::signal::{Signal, kill};
+    use reliaburger::bun::task_executor::TaskRunner;
+    use reliaburger::grill::Grill;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-busy-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut warm = shell_task(&template, 0, "true");
+    warm.run = Some(reliaburger::bun::task_executor::RunIdentity {
+        batch_id: 9,
+        task_count: 2,
+        job_name: None,
+    });
+    let first = runner.run(&warm, Duration::from_secs(10), &cancel).await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
+        .instance_id
+        .clone();
+    let helper = nix::unistd::Pid::from_raw(runtime.pid(&id).await.unwrap().unwrap() as i32);
+    // A stopped helper never confirms the start, but the slot is checked out.
+    kill(helper, Signal::SIGSTOP).unwrap();
+    let second = reliaburger::bun::task_executor::TaskInvocation {
+        index: 1,
+        ..warm.clone()
+    };
+    let held = runner.run(&second, Duration::from_secs(10), &cancel);
+    let sample = async {
+        wait_until_async(|| async { runner.busy_slots(9, Some(&template)).await == Some(1) }).await;
+        let active = runner.active_commands(9, Some(&template)).await;
+        kill(helper, Signal::SIGCONT).unwrap();
+        active
+    };
+    let (outcome, active) = tokio::join!(held, sample);
+    assert_eq!(active, Some(0), "the command hadn't started yet");
+    assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    assert_eq!(runner.busy_slots(9, Some(&template)).await, Some(0));
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
+async fn wait_until_async<F: std::future::Future<Output = bool>>(mut ready: impl FnMut() -> F) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ready().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("condition never held");
+}

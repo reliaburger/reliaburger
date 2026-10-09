@@ -1486,19 +1486,32 @@ you want near a replicated state machine. `&mut self.recent_duration_counts`
 iterates over mutable references to the array's elements, and `*recent`
 dereferences each to update it in place. The planner's arithmetic then runs in
 `u128`, so multiplying sixteen `u64` counts by durations can't overflow. This
-is pure planning from committed state, with no new wire or durable fields.
+is pure planning from committed state. The decaying histogram is the one new
+durable field, so it rode on this release's existing state-format bump.
 
 Lookahead only works if nodes advertise honest capacity, since queued grants
 still wait for the node's concurrency and CPU/memory admission. Our first
 version counted every caller inside `runner.run` as running, including callers
 still waiting for a pool slot. A node whose budget fitted two executors
-advertised 32 slots. Pool slots now record a run identity only after the
-helper's authenticated start receipt, and nodes report those verified commands
-separately from other in-flight callers. The regression fills a two-executor
-budget with 64 two-second commands and checks the node advertises two. The
-same count feeds `relish batch watch`, which shows verified commands beside
-other attempts. A backend without start receipts, including fresh containers,
-reports the count as unknown rather than guessing from a launcher PID.
+advertised 32 slots.
+
+The first fix swung too far the other way. It counted commands between the
+helper's start and exit receipts, and a `busybox true` lives for about a
+millisecond, so a node running 27 executors flat out sampled close to zero
+busy slots. The leader granted the baseline two chunks per control round, and
+our benchmark rerun came back with exactly 74,000 host jobs a minute, round
+after round: one chunk per tick. The right count sits between the two. Each
+pool slot records which run's caller has checked it out, from checkout to
+release, setup and cleanup included, so a waiting caller doesn't count and a
+millisecond command does. One regression fills a two-executor budget with 64
+two-second commands and checks the node advertises two. Another stops the
+helper with `SIGSTOP` so a submitted command holds its slot without starting,
+and checks the slot counts as busy while no command counts as started.
+
+The started-command count still has a job: it feeds `relish batch watch`,
+which shows verified commands beside other attempts. A backend without start
+receipts, including fresh containers, reports it as unknown rather than
+guessing from a launcher PID.
 
 The price of lookahead is ownership. More granted work may need reconciliation
 or replay after a worker is lost. That window is bounded, and stale attempts
