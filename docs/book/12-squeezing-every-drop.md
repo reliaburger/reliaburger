@@ -1394,6 +1394,17 @@ it doesn't consume the command's memory allowance. Host commands retain Bun's
 user and host filesystem access. This is trusted host execution, with resource
 controls, rather than a container sandbox.
 
+The helper `exec`s with exactly the environment it is sent. Our first version
+sent only the job's own variables, so `/usr/bin/env` printed nothing on a
+rootful Linux node, while the same job on macOS saw everything Bun had: `PATH`,
+`HOME`, and any cloud credentials in Bun's environment. Neither is a good
+contract. Now every host backend calls one function, `host_environment`, which
+keeps a short allowlist of Bun's variables (`PATH`, `HOME`, the locale and a
+few more) and lays the job's `env` over it. The in-memory backend calls
+`Command::env_clear()` first, since `std::process::Command` otherwise inherits
+the parent's whole environment. The owned backend records the result, so a
+command started after a Bun upgrade sees the same variables.
+
 The native helper connects through a short socket address under `/tmp`. Its
 peer credentials and the owner's unreaped process identity authenticate the
 connection. We use this fixed directory because a private `TMPDIR` can become

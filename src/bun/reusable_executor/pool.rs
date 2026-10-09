@@ -781,6 +781,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             // effective user, while the helper has a separate protected identity.
             process.user.uid = nix::unistd::geteuid().as_raw();
             process.user.gid = nix::unistd::getegid().as_raw();
+            // The helper execs with exactly this environment.
+            process.env = crate::grill::process::host_environment(&process.env)
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
         }
         let preparation = match &context.image {
             Some(image) => crate::grill::image_config::resolve_process(

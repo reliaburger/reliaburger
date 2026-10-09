@@ -33,6 +33,46 @@ use super::records::{self, InstanceRecord};
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
+/// Variables a host command inherits from Bun, plus every `LC_*`.
+///
+/// Anything else in Bun's environment (cloud credentials, `RELIABURGER_*`
+/// settings) stays private to Bun. The workload's own `env` is applied on top.
+pub const HOST_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "LANG", "LANGUAGE", "TZ", "USER", "LOGNAME", "SHELL", "TMPDIR",
+];
+
+/// Whether a host command inherits this variable from Bun.
+pub fn inherited_by_host_commands(key: &str) -> bool {
+    HOST_ENVIRONMENT_ALLOWLIST.contains(&key) || key.starts_with("LC_")
+}
+
+/// The complete environment of a host command: Bun's allowlisted variables
+/// overlaid with the workload's `KEY=value` entries.
+///
+/// Every host backend (in-memory, owned and native executors) uses this, so a
+/// command sees the same environment wherever it runs.
+pub fn host_environment(workload: &[String]) -> std::collections::BTreeMap<String, String> {
+    host_environment_from(std::env::vars_os(), workload)
+}
+
+fn host_environment_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    workload: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut environment: std::collections::BTreeMap<String, String> = inherited
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| inherited_by_host_commands(key))
+        .collect();
+    environment.extend(
+        workload
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned())),
+    );
+    environment
+}
+
 #[cfg(test)]
 struct CaptureGate {
     entered: tokio::sync::watch::Sender<usize>,
@@ -544,12 +584,8 @@ impl super::Grill for ProcessGrill {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        // Set environment variables from OCI spec
-        for env_str in &entry.spec.process.env {
-            if let Some((key, value)) = env_str.split_once('=') {
-                cmd.env(key, value);
-            }
-        }
+        cmd.env_clear();
+        cmd.envs(host_environment(&entry.spec.process.env));
 
         // File-backed mode: append to log files that outlive this process
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
@@ -1642,6 +1678,64 @@ mod tests {
         let logs = grill.logs(&id).await.unwrap();
         assert!(logs.contains("to-out"), "{logs:?}");
         assert!(logs.contains("to-err"), "{logs:?}");
+    }
+
+    #[test]
+    fn host_environment_keeps_the_allowlist_and_lets_the_workload_override_it() {
+        let inherited = [
+            ("PATH", "/usr/local/bin:/usr/bin"),
+            ("HOME", "/root"),
+            ("LC_ALL", "C.UTF-8"),
+            ("AWS_SECRET_ACCESS_KEY", "bun-only"),
+            ("RELIABURGER_JOIN_TOKEN", "bun-only"),
+        ]
+        .map(|(key, value)| (key.into(), value.into()));
+        let environment =
+            super::host_environment_from(inherited, &["PATH=/opt/job/bin".into(), "JOB=1".into()]);
+        assert_eq!(
+            environment.into_iter().collect::<Vec<_>>(),
+            [
+                ("HOME", "/root"),
+                ("JOB", "1"),
+                ("LC_ALL", "C.UTF-8"),
+                ("PATH", "/opt/job/bin"),
+            ]
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        );
+    }
+
+    /// One variable in this test process's environment that host commands
+    /// must not inherit (nextest sets `CARGO_*`, sudo sets `SUDO_*`).
+    pub(crate) fn private_variable() -> String {
+        std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .find(|key| !super::inherited_by_host_commands(key))
+            .expect("the test environment has a variable outside the allowlist")
+    }
+
+    #[tokio::test]
+    async fn host_commands_see_the_allowlisted_environment_only() {
+        let private = private_variable();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("env-1".to_string());
+        let mut spec = spec_with_args(vec!["env".to_string()]);
+        spec.process.env = vec!["JOB=1".into()];
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        let logs = grill.logs(&id).await.unwrap();
+        let path = std::env::var("PATH").unwrap();
+        assert!(
+            logs.lines().any(|line| line == format!("PATH={path}")),
+            "{logs}"
+        );
+        assert!(logs.lines().any(|line| line == "JOB=1"), "{logs}");
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.starts_with(&format!("{private}="))),
+            "{private} leaked: {logs}"
+        );
     }
 
     /// Read the first `count` lines `follow_logs` produces for `id`, as a

@@ -425,6 +425,7 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
     }
     let error = Command::new(&record.command[0])
         .args(&record.command[1..])
+        .env_clear()
         .envs(&record.environment)
         .stdin(Stdio::null())
         .exec();

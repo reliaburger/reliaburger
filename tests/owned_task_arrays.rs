@@ -1524,13 +1524,45 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         }
     }
     eprintln!("native repeated commands complete");
+    // Same environment contract as the other host backends: Bun's allowlisted
+    // variables plus the job's own, and nothing else of Bun's.
+    let private = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .find(|key| {
+            // The shell itself sets these.
+            !["PWD", "OLDPWD", "SHLVL", "_"].contains(&key.as_str())
+                && !reliaburger::grill::process::inherited_by_host_commands(key)
+        })
+        .expect("the test environment has a variable outside the allowlist");
+    let environment = TaskInvocation {
+        template: Some(Box::new(template.clone())),
+        index: 128,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exec /usr/bin/env".into()],
+        env: vec![("JOB".into(), "1".into())],
+    };
+    let outcome = runner
+        .run(&environment, Duration::from_secs(10), &cancel)
+        .await;
+    assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    let text = String::from_utf8_lossy(&outcome.output.head);
+    let path = format!("PATH={}", std::env::var("PATH").unwrap());
+    assert!(text.lines().any(|line| line == path), "{text}");
+    assert!(text.lines().any(|line| line == "JOB=1"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with(&format!("{private}="))),
+        "{private} leaked: {text}"
+    );
     let timings = runner.executor_timings(JobRuntime::Process).unwrap();
     assert_eq!(
         timings.startup.samples, 1,
         "one owner per command regressed"
     );
-    assert_eq!(timings.command.samples, 128);
-    assert_eq!(timings.cleanup.samples, 128);
+    assert_eq!(timings.command.samples, 129);
+    assert_eq!(timings.cleanup.samples, 129);
     let memory_hog = TaskInvocation {
         template: Some(Box::new(template.clone())),
         index: 128,

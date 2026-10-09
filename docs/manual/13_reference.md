@@ -142,7 +142,7 @@ startup instead of being ignored.
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
 | `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |
-| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none) |
+| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none); host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
 | `[runtime]` | `stop_confirmation_timeout_secs` |
 
 ### Shorter certificates for soak runs

@@ -320,6 +320,10 @@ Rootful Linux process jobs use bounded native executors and accept explicit
 CPU/memory ranges. Each fresh command is born inside its limited task cgroup;
 helper overhead stays reserved while its executor is idle. Commands retain
 Bun's user and host filesystem access, so use trusted allowlisted workloads.
+Every host command, on every backend, starts with only `PATH`, `HOME`, `LANG`,
+`LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun's
+environment, then the job's own `env`. Other Bun variables, such as cloud
+credentials, never reach a command.
 Other platforms retain the original owned process backend and refuse explicit
 resource ranges. This change applies to jobs; host applications keep their
 existing runtime contract. GPU jobs remain refused;
