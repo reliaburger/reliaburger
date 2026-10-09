@@ -68,4 +68,7 @@ relish import -f deployment.yaml --strict      # non-zero exit on any warning
 DaemonSets), Services, Ingresses, HPAs, Jobs, CronJobs and Namespaces as
 multi-document YAML. It reports what it can't express: firewall and egress
 rules, process workloads, `run_before`, and for now health checks, metrics,
-volumes, init containers, config files and placement.
+volumes, init containers, config files and placement. A `runtime = "process"`
+job produces no Job at all, since Kubernetes needs an image. A
+`runtime = "shared-runc"` job becomes an ordinary Job, which starts a fresh Pod
+for every attempt.
