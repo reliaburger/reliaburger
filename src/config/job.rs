@@ -76,7 +76,6 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
-    /// Refuse fields that contradict the explicitly selected execution backend.
     /// Whether this job runs a host command rather than a container.
     ///
     /// For a validated spec that is exactly `runtime = "process"`. An
@@ -87,6 +86,7 @@ impl JobSpec {
         self.runtime == JobRuntime::Process || self.exec.is_some() || self.script.is_some()
     }
 
+    /// Refuse fields that contradict the explicitly selected execution backend.
     pub fn validate_runtime(&self) -> Result<(), &'static str> {
         match self.runtime {
             JobRuntime::Process if self.image.is_some() => {
