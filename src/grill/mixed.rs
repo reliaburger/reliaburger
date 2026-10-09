@@ -935,7 +935,7 @@ mod tests {
         runtime.host.set_exec_outputs(["first".to_string()]);
         runtime.host.block_execs();
         let command = ["sleep".to_string(), "3600".to_string()];
-        let mut exec = std::pin::pin!(runtime.exec(&id, &command));
+        let mut exec = Box::pin(runtime.exec(&id, &command));
         tokio::select! {
             _ = &mut exec => panic!("blocked exec returned"),
             () = runtime.host.wait_for_execs(1) => {}
