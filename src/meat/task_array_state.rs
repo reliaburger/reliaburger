@@ -33,6 +33,14 @@ pub const MIN_GRANT_DEPTH: u64 = 2;
 /// not resource reservations; the original two-slot-round floor still applies.
 pub const MAX_LEARNED_GRANT_DEPTH: u64 = 16;
 const LOOKAHEAD_MILLISECONDS: u128 = 2000;
+/// Lookahead learns from roughly this many recent final attempts: once the
+/// recent histogram holds more, every bucket halves. A slow start (cold image
+/// pulls) is eventually forgotten, so an array that turns fast regains its
+/// lookahead; cumulative counts would remember the slow start for ever.
+const RECENT_DURATION_SAMPLES: u64 = 4096;
+/// Recent work counts as slow, keeping the baseline grant window, when more
+/// than one in this many recent samples overflowed the finite buckets.
+const SLOW_OVERFLOW_RATIO: u128 = 16;
 
 /// Why an array stopped before running every task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +189,8 @@ pub struct TaskArrayState {
     retried: u64,
     stopped: Option<StopReason>,
     duration_counts: [u64; 16],
+    /// [`Self::duration_counts`], decayed; grant lookahead learns from this.
+    recent_duration_counts: [u64; 16],
 }
 
 fn valid_node_id(node: &NodeId) -> bool {
@@ -262,6 +272,14 @@ impl TaskArrayState {
         {
             return Err("duration counts exceed executed tasks".into());
         }
+        if self
+            .recent_duration_counts
+            .iter()
+            .zip(&self.duration_counts)
+            .any(|(recent, total)| recent > total)
+        {
+            return Err("recent duration counts exceed all duration counts".into());
+        }
         if self.stopped.is_some() && !self.queued.is_empty() {
             return Err("stopped run retains queued work".into());
         }
@@ -291,6 +309,7 @@ impl TaskArrayState {
             retried: 0,
             stopped: None,
             duration_counts: [0; 16],
+            recent_duration_counts: [0; 16],
         })
     }
 
@@ -447,6 +466,18 @@ impl TaskArrayState {
         for (total, count) in self.duration_counts.iter_mut().zip(result.duration_counts) {
             *total += count;
         }
+        for (recent, count) in self
+            .recent_duration_counts
+            .iter_mut()
+            .zip(result.duration_counts)
+        {
+            *recent += count;
+        }
+        while self.recent_duration_counts.iter().sum::<u64>() > RECENT_DURATION_SAMPLES {
+            for recent in &mut self.recent_duration_counts {
+                *recent /= 2;
+            }
+        }
         self.succeeded += u64::from(result.succeeded);
         self.failed += failed;
         self.not_run += u64::from(result.not_run);
@@ -588,14 +619,18 @@ pub fn grant_depth(slots: u32, chunk_size: u32) -> u64 {
 impl TaskArrayState {
     fn observed_grant_depth(&self, slots: u32) -> u64 {
         let baseline = grant_depth(slots, self.spec.chunk_size);
-        // The overflow bucket has no finite upper bound. Unknown/slow work
-        // retains the small window rather than inventing a throughput estimate.
-        if self.duration_counts[15] != 0 {
+        // The overflow bucket has no finite upper bound. Mostly slow recent
+        // work retains the small window rather than inventing a throughput
+        // estimate; a rare slow task (a cold pull, one timeout) doesn't.
+        let recent = &self.recent_duration_counts;
+        let overflow = u128::from(recent[15]);
+        let all: u128 = recent.iter().map(|count| u128::from(*count)).sum();
+        if overflow * SLOW_OVERFLOW_RATIO > all {
             return baseline;
         }
         let mut samples = 0u128;
         let mut milliseconds = 0u128;
-        for (bucket, count) in self.duration_counts[..15].iter().enumerate() {
+        for (bucket, count) in recent[..15].iter().enumerate() {
             samples += u128::from(*count);
             milliseconds += u128::from(*count) * (1u128 << bucket);
         }
@@ -704,6 +739,78 @@ mod tests {
                 vec![(node("a"), chunks(1..=2))]
             );
         }
+    }
+
+    /// Complete each chunk in `range` on node "a" with all its tasks in `bucket`.
+    fn complete_in_bucket(
+        state: &mut TaskArrayState,
+        range: std::ops::RangeInclusive<u32>,
+        bucket: usize,
+    ) {
+        state.grant(&node("a"), &chunks(range.clone())).unwrap();
+        for chunk in range {
+            let mut result = all_ok(state, chunk);
+            result.duration_counts[bucket] = u64::from(result.succeeded);
+            state.complete(&node("a"), &result).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_slow_task_does_not_disable_lookahead_for_the_whole_array() {
+        // A cold image pull or a single timeout lands in the overflow bucket.
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        state.grant(&node("a"), &chunks(0..=1)).unwrap();
+        for chunk in 0..2 {
+            let mut result = all_ok(&state, chunk);
+            result.duration_counts[0] = 999;
+            result.duration_counts[15] = u64::from(chunk == 0);
+            state.complete(&node("a"), &result).unwrap();
+        }
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27)])),
+            vec![(node("a"), chunks(2..=17))]
+        );
+    }
+
+    #[test]
+    fn an_array_that_turns_slow_returns_to_the_small_grant_window() {
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        complete_in_bucket(&mut state, 0..=7, 0);
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27)])),
+            vec![(node("a"), chunks(8..=23))]
+        );
+        // Ten-second tasks from now on: the fast history decays away.
+        complete_in_bucket(&mut state, 8..=19, 14);
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27)])),
+            vec![(node("a"), chunks(20..=21))]
+        );
+        assert!(
+            state.duration_counts()[0] == 8000,
+            "summaries keep everything"
+        );
+    }
+
+    #[test]
+    fn an_array_that_starts_slow_regains_lookahead_once_it_runs_fast() {
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        // Two-second first chunks: cold image pulls.
+        complete_in_bucket(&mut state, 0..=3, 11);
+        complete_in_bucket(&mut state, 4..=39, 0);
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27)])),
+            vec![(node("a"), chunks(40..=55))]
+        );
+    }
+
+    #[test]
+    fn recent_durations_stay_bounded_and_never_exceed_the_totals() {
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        complete_in_bucket(&mut state, 0..=49, 3);
+        assert!(state.recent_duration_counts.iter().sum::<u64>() <= RECENT_DURATION_SAMPLES);
+        assert_eq!(state.duration_counts()[3], 50_000);
+        state.validate_snapshot().unwrap();
     }
 
     #[test]

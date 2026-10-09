@@ -94,7 +94,9 @@ nodes; each node starts tasks as CPU and memory become available. A chunk of
 completions can raise queued lookahead to sixteen chunks to bridge control-report
 rounds. This changes queued ownership, not running concurrency or per-command
 resource admission. More granted work may require reconciliation or acknowledged
-replay after worker loss; unknown and slow durations retain the small window. Applications and
+replay after worker loss. Lookahead learns from roughly the last 4,096
+completions; arrays without samples, with slow recent work, or with more than
+one in sixteen recent tasks over 16 seconds keep the small window. Applications and
 batch attempts share the same node resource accounting. Existing app commitments
 remain reserved while an app starts, runs or retires.
 

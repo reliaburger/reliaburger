@@ -1509,8 +1509,16 @@ We keep the one-second control interval and learn a bounded lookahead from the
 verified final-attempt duration histogram. Each bucket's upper bound gives a
 conservative duration estimate. Two control rounds of work are enough to bridge
 receipt acceptance and grant delivery; learned grant depth stops at sixteen chunks.
-No samples, slow commands or an unbounded overflow bucket retain the original
-window. The existing two-round concurrency floor still applies to tiny chunks.
+No samples or slow commands retain the original window. Our first version
+also fell back whenever the last bucket, which has no upper bound, held even
+one sample. A single cold image pull or timed-out task then switched lookahead
+off for the rest of the array, and because the counts only ever grew, a slow
+start was never forgotten either. The planner now learns from a second,
+decaying histogram: when it holds more than 4,096 samples every bucket is
+halved, which is exponential decay done with integer division, so every
+replica computes the same result. The array keeps the small window only when
+more than one in sixteen recent samples overflowed. The cumulative histogram
+still feeds the duration summaries. The existing two-round concurrency floor still applies to tiny chunks.
 The calculation uses `u128` intermediates so multiplying counters cannot
 truncate the estimate. This is pure planning from committed state, with no new
 wire or durable fields.
