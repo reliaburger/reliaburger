@@ -1518,7 +1518,17 @@ decaying histogram: when it holds more than 4,096 samples every bucket is
 halved, which is exponential decay done with integer division, so every
 replica computes the same result. The array keeps the small window only when
 more than one in sixteen recent samples overflowed. The cumulative histogram
-still feeds the duration summaries. The existing two-round concurrency floor still applies to tiny chunks.
+still feeds the duration summaries.
+
+Two more limits keep lookahead from hurting. `plan_grants` tops up the emptiest
+node first, so near the end of an array the first fast node could take sixteen
+of the last twenty chunks while another node sat idle. The learned part is now
+capped at the remaining queue divided by the number of nodes with free slots.
+And a run that doesn't replay unknown outcomes automatically turns every chunk
+a lost node held into work an operator has to acknowledge and replay. Those
+runs keep the baseline window, so a lost node leaves about two chunks to
+replay, not sixteen. `plan_grants` takes that choice as a plain `bool`, and the
+leader passes the run's policy through. The existing two-round concurrency floor still applies to tiny chunks.
 The calculation uses `u128` intermediates so multiplying counters cannot
 truncate the estimate. This is pure planning from committed state, with no new
 wire or durable fields.

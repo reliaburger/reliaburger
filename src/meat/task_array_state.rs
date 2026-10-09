@@ -617,7 +617,9 @@ pub fn grant_depth(slots: u32, chunk_size: u32) -> u64 {
 }
 
 impl TaskArrayState {
-    fn observed_grant_depth(&self, slots: u32) -> u64 {
+    /// `fair_share` caps the learned part: near the tail, one node mustn't
+    /// take all the remaining chunks while another idles.
+    fn observed_grant_depth(&self, slots: u32, fair_share: u64) -> u64 {
         let baseline = grant_depth(slots, self.spec.chunk_size);
         // The overflow bucket has no finite upper bound. Mostly slow recent
         // work retains the small window rather than inventing a throughput
@@ -642,19 +644,29 @@ impl TaskArrayState {
         // cover receipt acceptance and delivery of the committed next grant.
         let tasks = u128::from(slots) * LOOKAHEAD_MILLISECONDS * samples / milliseconds;
         let chunks = tasks.div_ceil(u128::from(self.spec.chunk_size.max(1)));
-        baseline.max(chunks.min(u128::from(MAX_LEARNED_GRANT_DEPTH)) as u64)
+        let learned = chunks.min(u128::from(MAX_LEARNED_GRANT_DEPTH.min(fair_share))) as u64;
+        baseline.max(learned)
     }
 }
 
 /// Decide which queued chunks to hand to which node. Each node is topped
-/// up to its baseline [`grant_depth`] or learned bounded lookahead, the
+/// up to its baseline [`grant_depth`] or, with `lookahead`, a learned
+/// bounded lookahead no bigger than its fair share of the queue, the
 /// emptiest nodes first (ties by name), and
 /// always with the lowest queued chunk ids. It's pull-shaped load
 /// balancing: a fast node empties its chunks sooner and gets more, so
 /// there's no up-front split to go wrong. The state isn't changed; the
 /// caller applies the plan with [`TaskArrayState::grant`] (through Raft,
 /// once wired).
-pub fn plan_grants(state: &TaskArrayState, nodes: &[NodeSlots]) -> Vec<(NodeId, IndexRangeSet)> {
+///
+/// Arrays whose unknown outcomes need acknowledged replay pass `lookahead =
+/// false`: every chunk a lost node held must be replayed by hand, so they keep
+/// the small window.
+pub fn plan_grants(
+    state: &TaskArrayState,
+    nodes: &[NodeSlots],
+    lookahead: bool,
+) -> Vec<(NodeId, IndexRangeSet)> {
     if state.stop_reason().is_some() {
         return Vec::new();
     }
@@ -668,12 +680,17 @@ pub fn plan_grants(state: &TaskArrayState, nodes: &[NodeSlots]) -> Vec<(NodeId, 
     order.sort_by(|a, b| held(&a.node).cmp(&held(&b.node)).then(a.node.cmp(&b.node)));
 
     let mut queue = state.queued().clone();
+    let fair_share = queue.len().div_ceil(order.len().max(1) as u64);
     let mut plan = Vec::new();
     for candidate in order {
         if queue.is_empty() {
             break;
         }
-        let depth = state.observed_grant_depth(candidate.slots);
+        let depth = if lookahead {
+            state.observed_grant_depth(candidate.slots, fair_share)
+        } else {
+            grant_depth(candidate.slots, state.spec.chunk_size)
+        };
         let wanted = depth.saturating_sub(held(&candidate.node));
         let chunks = queue.take_first(wanted);
         if !chunks.is_empty() {
@@ -720,10 +737,10 @@ mod tests {
             result.duration_counts[0] = 1000;
             state.complete(&node("a"), &result).unwrap();
         }
-        let plan = plan_grants(&state, &slots(&[("a", 27), ("blocked", 0)]));
+        let plan = plan_grants(&state, &slots(&[("a", 27), ("blocked", 0)]), true);
         assert_eq!(plan, vec![(node("a"), chunks(2..=17))]);
         apply(&mut state, &plan);
-        assert!(plan_grants(&state, &slots(&[("a", 27)])).is_empty());
+        assert!(plan_grants(&state, &slots(&[("a", 27)]), true).is_empty());
     }
 
     #[test]
@@ -735,7 +752,7 @@ mod tests {
             result.duration_counts[bucket] = 1000;
             state.complete(&node("a"), &result).unwrap();
             assert_eq!(
-                plan_grants(&state, &slots(&[("a", 27)])),
+                plan_grants(&state, &slots(&[("a", 27)]), true),
                 vec![(node("a"), chunks(1..=2))]
             );
         }
@@ -767,7 +784,7 @@ mod tests {
             state.complete(&node("a"), &result).unwrap();
         }
         assert_eq!(
-            plan_grants(&state, &slots(&[("a", 27)])),
+            plan_grants(&state, &slots(&[("a", 27)]), true),
             vec![(node("a"), chunks(2..=17))]
         );
     }
@@ -777,13 +794,13 @@ mod tests {
         let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
         complete_in_bucket(&mut state, 0..=7, 0);
         assert_eq!(
-            plan_grants(&state, &slots(&[("a", 27)])),
+            plan_grants(&state, &slots(&[("a", 27)]), true),
             vec![(node("a"), chunks(8..=23))]
         );
         // Ten-second tasks from now on: the fast history decays away.
         complete_in_bucket(&mut state, 8..=19, 14);
         assert_eq!(
-            plan_grants(&state, &slots(&[("a", 27)])),
+            plan_grants(&state, &slots(&[("a", 27)]), true),
             vec![(node("a"), chunks(20..=21))]
         );
         assert!(
@@ -799,8 +816,32 @@ mod tests {
         complete_in_bucket(&mut state, 0..=3, 11);
         complete_in_bucket(&mut state, 4..=39, 0);
         assert_eq!(
-            plan_grants(&state, &slots(&[("a", 27)])),
+            plan_grants(&state, &slots(&[("a", 27)]), true),
             vec![(node("a"), chunks(40..=55))]
+        );
+    }
+
+    #[test]
+    fn near_the_tail_two_fast_nodes_split_the_remaining_chunks() {
+        // 100 chunks, 80 done fast: lookahead alone would hand node "a" 16 of
+        // the last 20 and leave "b" four.
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        complete_in_bucket(&mut state, 0..=79, 0);
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27), ("b", 27)]), true),
+            vec![(node("a"), chunks(80..=89)), (node("b"), chunks(90..=99))]
+        );
+    }
+
+    #[test]
+    fn arrays_without_automatic_replay_keep_the_small_window() {
+        // Losing a node makes every chunk it held an unknown outcome that an
+        // operator must replay, so fast arrays don't hoard extra chunks.
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        complete_in_bucket(&mut state, 0..=7, 0);
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27)]), false),
+            vec![(node("a"), chunks(8..=9))]
         );
     }
 
@@ -816,18 +857,18 @@ mod tests {
     #[test]
     fn plan_tops_nodes_up_with_the_lowest_chunks() {
         let mut state = TaskArrayState::new(spec(10_000, 100), 1).unwrap();
-        let plan = plan_grants(&state, &slots(&[("n2", 8), ("n1", 8)]));
+        let plan = plan_grants(&state, &slots(&[("n2", 8), ("n1", 8)]), true);
         assert_eq!(
             plan,
             vec![(node("n1"), chunks(0..=1)), (node("n2"), chunks(2..=3))]
         );
         apply(&mut state, &plan);
         // Already at depth: nothing more until a chunk finishes.
-        assert!(plan_grants(&state, &slots(&[("n1", 8), ("n2", 8)])).is_empty());
+        assert!(plan_grants(&state, &slots(&[("n1", 8), ("n2", 8)]), true).is_empty());
         let finished = all_ok(&state, 2);
         state.complete(&node("n2"), &finished).unwrap();
         assert_eq!(
-            plan_grants(&state, &slots(&[("n1", 8), ("n2", 8)])),
+            plan_grants(&state, &slots(&[("n1", 8), ("n2", 8)]), true),
             vec![(node("n2"), chunks(4..=4))]
         );
     }
@@ -835,34 +876,34 @@ mod tests {
     #[test]
     fn nodes_without_slots_get_nothing() {
         let state = TaskArrayState::new(spec(1000, 100), 1).unwrap();
-        let plan = plan_grants(&state, &slots(&[("n1", 0), ("n2", 4)]));
+        let plan = plan_grants(&state, &slots(&[("n1", 0), ("n2", 4)]), true);
         assert_eq!(plan, vec![(node("n2"), chunks(0..=1))]);
     }
 
     #[test]
     fn a_node_listed_twice_is_planned_once() {
         let state = TaskArrayState::new(spec(1000, 100), 1).unwrap();
-        let plan = plan_grants(&state, &slots(&[("n1", 4), ("n1", 4)]));
+        let plan = plan_grants(&state, &slots(&[("n1", 4), ("n1", 4)]), true);
         assert_eq!(plan, vec![(node("n1"), chunks(0..=1))]);
     }
 
     #[test]
     fn an_empty_queue_or_a_stopped_array_plans_nothing() {
         let mut state = TaskArrayState::new(spec(200, 100), 1).unwrap();
-        let plan = plan_grants(&state, &slots(&[("n1", 4)]));
+        let plan = plan_grants(&state, &slots(&[("n1", 4)]), true);
         apply(&mut state, &plan);
-        assert!(plan_grants(&state, &slots(&[("n2", 4)])).is_empty());
+        assert!(plan_grants(&state, &slots(&[("n2", 4)]), true).is_empty());
 
         let mut cancelled = TaskArrayState::new(spec(1000, 100), 1).unwrap();
         cancelled.cancel();
-        assert!(plan_grants(&cancelled, &slots(&[("n1", 4)])).is_empty());
+        assert!(plan_grants(&cancelled, &slots(&[("n1", 4)]), true).is_empty());
     }
 
     #[test]
     fn the_emptiest_node_is_served_first_when_chunks_run_short() {
         let mut state = TaskArrayState::new(spec(400, 100), 1).unwrap();
         state.grant(&node("a"), &chunks(0..=0)).unwrap();
-        let plan = plan_grants(&state, &slots(&[("a", 4), ("b", 4)]));
+        let plan = plan_grants(&state, &slots(&[("a", 4), ("b", 4)]), true);
         assert_eq!(
             plan,
             vec![(node("b"), chunks(1..=2)), (node("a"), chunks(3..=3))]
@@ -873,9 +914,9 @@ mod tests {
     fn the_same_input_plans_the_same_grants() {
         let state = TaskArrayState::new(spec(100_000, 100), 1).unwrap();
         let nodes = slots(&[("n3", 300), ("n1", 50), ("n2", 1000)]);
-        let reference = plan_grants(&state, &nodes);
+        let reference = plan_grants(&state, &nodes, true);
         for _ in 0..10 {
-            assert_eq!(plan_grants(&state, &nodes), reference);
+            assert_eq!(plan_grants(&state, &nodes, true), reference);
         }
     }
 
@@ -928,7 +969,7 @@ mod tests {
             for step in steps {
                 match step {
                     Step::Plan => {
-                        let plan = plan_grants(&state, &nodes);
+                        let plan = plan_grants(&state, &nodes, true);
                         apply(&mut state, &plan);
                     }
                     Step::Complete { node: which, pick } => {
@@ -996,7 +1037,7 @@ mod tests {
                     state.complete(&holder, &result).unwrap();
                 }
             }
-            let plan = plan_grants(&state, &nodes);
+            let plan = plan_grants(&state, &nodes, true);
             apply(&mut state, &plan);
             assert!(rounds < 1_000, "the array must finish");
         }
