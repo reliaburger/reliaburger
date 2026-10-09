@@ -1254,6 +1254,11 @@ refusal for the next app ends the measurement successfully, followed by a final
 running check for every counted app. Missing evidence, expired leases, runtime
 failures and the hard safety limit fail the suite.
 
+Run a built-in timed job comparison with `relish bench --scenario jobs-shared-containers`
+(defaults: 60 seconds, concurrency 27). Fresh-container, trusted host-process
+and local Linux VM-baseline scenarios are also available; see the batch manual
+for prerequisites, resource profiles and matched comparisons.
+
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
@@ -1454,10 +1459,10 @@ Held cluster jobs conservatively reserve their CPU/memory requests on every app 
 
 [Batch jobs](manual/14_batch-jobs.md) explains compact arrays, atomic mixed-profile
 manifests, app/job resource accounting, watch summaries, indexed detail, retries
-and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
-homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
-a service. Build matching development binaries and use a fresh cluster (protocol
-50 / state 67); the published 0.1.4 recording predates this step. The
+and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
+mixed-resource work beside a service. The standalone landing-page job recording
+uses the built-in `relish bench` scenarios. Build matching development binaries
+and use a fresh cluster (protocol 50 / state 67). The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.
 
@@ -1480,11 +1485,14 @@ unsupported limits. Host applications retain their existing runtime contract.
 Verified duration summaries let fast workers queue bounded lookahead across
 control-report rounds; execution still waits for concurrency and resources.
 The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
-tracks #639 and the still-unqualified sustained target (#640). The standalone
-[four-part recording](https://reliaburger.com/#job-throughput) shows a million raw
-VM process exits, followed by 1,000 fresh-container, 10,000 shared-container and
-500,000 owned host jobs. All 511,000 public jobs completed. [Raw measurements](qualification/2026-10-09-host-job-executors/README.md)
-retain the actual hardware, retries, resource contracts and separate continuous
-hour. [Earlier comparisons and recovery evidence](qualification/2026-10-08-job-measurements/README.md)
+tracks #639 and the still-unqualified sustained target (#640). The standalone [four-part recording](https://reliaburger.com/#job-throughput)
+measures each scenario for 60 seconds: 876,671 raw exits, 196 fresh-container,
+23,000 shared-container and 246,000 native host accepted successes. Public
+windows have no failures or retries. [Raw measurements](qualification/2026-10-09-timed-job-scenarios/README.md)
+retain the actual hardware, concurrency, receipt policy, daily extrapolations
+and sequential one-hour saturation runs.
+[Earlier comparisons and recovery evidence](qualification/2026-10-08-job-measurements/README.md)
 retain failed experiments and remaining qualification work.
 Resident model workers (#641) remain separate.
+
+The [equal-window measurement plan](plans/2026-10-09-plan-timed-job-scenarios.md) compares all four scenarios for 60 seconds, then one hour each. Daily counts are labelled extrapolations.

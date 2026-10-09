@@ -68,6 +68,9 @@ mod linux {
         image: String,
         #[arg(long, default_value_t = 10000)]
         count: u32,
+        /// Count raw successful exits inside a fixed window, then drain owned children.
+        #[arg(long)]
+        seconds: Option<u64>,
         #[arg(long, default_value_t = 27)]
         concurrency: u32,
         #[arg(long)]
@@ -96,6 +99,26 @@ mod linux {
             }
         }
     }
+    fn credited_before_deadline(completed: Instant, deadline: Option<Instant>) -> bool {
+        deadline.is_none_or(|cutoff| completed <= cutoff)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn timed_window_excludes_drained_completions_after_cutoff() {
+            let cutoff = Instant::now();
+            assert!(credited_before_deadline(cutoff, Some(cutoff)));
+            assert!(!credited_before_deadline(
+                cutoff + Duration::from_nanos(1),
+                Some(cutoff)
+            ));
+            assert!(credited_before_deadline(
+                cutoff + Duration::from_secs(1),
+                None
+            ));
+        }
+    }
     struct Measurement<'a> {
         options: &'a Options,
         template: &'a JobSpec,
@@ -106,7 +129,12 @@ mod linux {
         cancel: &'a CancellationToken,
     }
     impl Measurement<'_> {
-        async fn run(&self, count: u32, batch: u64) -> anyhow::Result<(u64, u64)> {
+        async fn run(
+            &self,
+            count: u32,
+            batch: u64,
+            deadline: Option<Instant>,
+        ) -> anyhow::Result<(u64, u64, u64)> {
             if let Some(node) = self.node {
                 let mut spec = TaskArraySpec::with_count(count);
                 spec.chunk_size = 1000;
@@ -163,6 +191,7 @@ mod linux {
                                 .iter()
                                 .map(|row| u64::from(row.failed_count))
                                 .sum(),
+                            0,
                         ));
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -170,9 +199,15 @@ mod linux {
             }
             let mut pending = tokio::task::JoinSet::new();
             let mut available: Vec<u32> = (0..self.options.concurrency).collect();
-            let (mut next, mut successes, mut failures) = (0, 0, 0);
-            while next < count || !pending.is_empty() {
-                while next < count && !available.is_empty() {
+            let (mut next, mut successes, mut failures, mut drained) = (0, 0, 0, 0);
+            let mut next_progress = Instant::now() + Duration::from_secs(30);
+            while (next < count && credited_before_deadline(Instant::now(), deadline))
+                || !pending.is_empty()
+            {
+                while next < count
+                    && !available.is_empty()
+                    && credited_before_deadline(Instant::now(), deadline)
+                {
                     let Some(slot) = available.pop() else { break };
                     let index = next;
                     next += 1;
@@ -240,20 +275,28 @@ mod linux {
                                 .outcome
                                 .succeeded()
                         };
-                        Ok::<_, anyhow::Error>((slot, succeeded))
+                        Ok::<_, anyhow::Error>((slot, succeeded, Instant::now()))
                     });
                 }
                 if let Some(result) = pending.join_next().await {
-                    let (slot, succeeded) = result??;
+                    let (slot, succeeded, completed) = result??;
                     available.push(slot);
-                    if succeeded {
+                    if !credited_before_deadline(completed, deadline) {
+                        drained += 1;
+                    } else if succeeded {
                         successes += 1;
                     } else {
                         failures += 1;
                     }
                 }
+                if deadline.is_some() && Instant::now() >= next_progress {
+                    println!(
+                        "{successes} raw successful exits within the window; {failures} failures"
+                    );
+                    next_progress = Instant::now() + Duration::from_secs(30);
+                }
             }
-            Ok((successes, failures))
+            Ok((successes, failures, drained))
         }
     }
     fn limited_groups(options: &Options) -> anyhow::Result<Vec<PathBuf>> {
@@ -311,8 +354,14 @@ mod linux {
         let options = Options::parse();
         anyhow::ensure!(nix::unistd::geteuid().is_root(), "requires rootful Linux");
         anyhow::ensure!(
-            options.count > 0 && (1..=27).contains(&options.concurrency),
-            "positive count; concurrency 1–27"
+            options.count > 0
+                && (1..=if matches!(options.path, ExecutionPath::Bare) {
+                    256
+                } else {
+                    27
+                })
+                    .contains(&options.concurrency),
+            "positive count; concurrency 1–27 (1–256 for raw processes)"
         );
         anyhow::ensure!(
             options.cpu_request_millicores > 0
@@ -324,16 +373,25 @@ mod linux {
             "invalid resource profile"
         );
         anyhow::ensure!(
-            (options.cpu_request_millicores + 10) * u64::from(options.concurrency) <= 3000,
+            matches!(options.path, ExecutionPath::Bare)
+                || (options.cpu_request_millicores + 10) * u64::from(options.concurrency) <= 3000,
             "requested concurrency cannot fit the declared CPU budget, including helpers"
         );
         anyhow::ensure!(
-            (options.memory_bytes + (8 << 20)) * u64::from(options.concurrency) <= 4 << 30,
+            matches!(options.path, ExecutionPath::Bare)
+                || (options.memory_bytes + (8 << 20)) * u64::from(options.concurrency) <= 4 << 30,
             "requested concurrency cannot fit memory budget"
         );
         anyhow::ensure!(
             options.image.contains("@sha256:"),
             "image must be digest pinned"
+        );
+        anyhow::ensure!(
+            options
+                .seconds
+                .is_none_or(|seconds| seconds > 0 && seconds < options.timeout)
+                && (options.seconds.is_none() || matches!(options.path, ExecutionPath::Bare)),
+            "timed windows require bare processes and a positive duration below timeout"
         );
         std::fs::create_dir(&options.root)?;
         let images = ImageStore::new(options.root.join("images"))
@@ -434,9 +492,9 @@ mod linux {
         };
         let before_warmup = Instant::now();
         if options.warmup_count > 0 {
-            let (successes, failures) = tokio::time::timeout(
+            let (successes, failures, _) = tokio::time::timeout(
                 Duration::from_secs(options.timeout),
-                measurement.run(options.warmup_count, 1),
+                measurement.run(options.warmup_count, 1, None),
             )
             .await??;
             anyhow::ensure!(
@@ -455,6 +513,7 @@ mod linux {
             .build()?;
         let service_url = options.service_url.clone();
         let probe_cancel = cancel.clone();
+        let options_timeout = options.timeout;
         let probes = tokio::spawn(async move {
             let mut rows = Vec::new();
             loop {
@@ -464,17 +523,33 @@ mod linux {
                 response.bytes().await?;
                 rows.push(before.elapsed().as_secs_f64() * 1000.0);
                 tokio::select! { () = probe_cancel.cancelled() => break, () = tokio::time::sleep(Duration::from_secs(1)) => {} }
-                anyhow::ensure!(rows.len() <= 3600, "probe storage bound exceeded");
+                anyhow::ensure!(
+                    rows.len() as u64 <= options_timeout + 2,
+                    "probe storage bound exceeded"
+                );
             }
             Ok::<_, anyhow::Error>(rows)
         });
         let started = Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(options.timeout),
-            measurement.run(options.count, 2),
+            measurement.run(
+                if options.seconds.is_some() {
+                    u32::MAX
+                } else {
+                    options.count
+                },
+                2,
+                options
+                    .seconds
+                    .map(|seconds| started + Duration::from_secs(seconds)),
+            ),
         )
         .await;
-        let elapsed_seconds = started.elapsed().as_secs_f64();
+        let elapsed_including_drain_seconds = started.elapsed().as_secs_f64();
+        let elapsed_seconds = options
+            .seconds
+            .map_or(elapsed_including_drain_seconds, |seconds| seconds as f64);
         let timings_after = timing();
         cancel.cancel();
         let probe_result = probes.await;
@@ -512,14 +587,16 @@ mod linux {
             std::fs::remove_dir(path)?;
         }
         let probe_rows = probe_result??;
-        let (successes, failures) = outcome??;
+        let (successes, failures, drained) = outcome??;
         let report = json!({
             "path": format!("{:?}", options.path), "image": options.image, "executable_sha256": executable_sha256,
-            "command": options.command(), "count": options.count, "concurrency": options.concurrency,
+            "command": options.command(), "count": options.seconds.is_none().then_some(options.count), "concurrency": options.concurrency,
             "image_preparation_seconds_excluded": preparation_seconds, "warmth": if options.warmup_count == 0 { "warm-images-cold-executors" } else { "warm-images-after-disclosed-warmup" },
             "warmup_count": options.warmup_count, "warmup_seconds_excluded": warmup_seconds,
             "executor_timings_before": timings_before, "executor_timings_after": timings_after,
-            "elapsed_seconds": elapsed_seconds, "verified_successes": successes, "failures": failures, "retries": 0,
+            "elapsed_seconds": elapsed_seconds, "requested_seconds": options.seconds,
+            "measurement_complete": options.seconds.is_none_or(|seconds| elapsed_including_drain_seconds >= seconds as f64),
+            "elapsed_including_drain_seconds": elapsed_including_drain_seconds, "post_cutoff_drained_commands": drained, "verified_successes": successes, "failures": failures, "retries": 0,
             "verified_successes_per_second": successes as f64 / elapsed_seconds,
             "container_cpu_request_millicores": options.cpu_request_millicores, "container_cpu_limit_millicores": options.cpu_limit_millicores, "container_memory_bytes": options.memory_bytes,
             "resource_enforcement": match options.path {
@@ -539,7 +616,7 @@ mod linux {
         )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         anyhow::ensure!(
-            successes == u64::from(options.count) && failures == 0,
+            (options.seconds.is_some() || successes == u64::from(options.count)) && failures == 0,
             "not all commands succeeded"
         );
         Ok(())

@@ -1143,18 +1143,27 @@ includes failed fresh-container starts and incomplete whole-directory storage
 observations. This is a measured implementation result, not 100m/day qualification;
 scaling, sustained headroom and safe historical metadata collection remain work.
 
-The revised [four-part recording](qualification/2026-10-09-host-job-executors/README.md)
-keeps one million raw process exits separate from 1,000 fresh-container,
-10,000 shared-container and 500,000 host jobs. All 511,000 public jobs completed;
-its reports retain actual elapsed times, retries and resource contracts. Jobs
-select `runtime = "runc"` by default, or explicitly opt into `shared-runc` or
-`process`; a process definition with an image is refused. Explicit Bun
-`--runtime runc` permits containers, while `mixed` and Linux auto-detection can
-enable both backends. The one-hour measurement and the 24-hour qualification
-are separate gates. All public tiers request 100m CPU and 32 MiB with a one-core
-limit; rootful Linux native jobs enforce these limits before each fresh process
-starts. The half-million host tier completed in 90.44 seconds (5,529/s) with
-zero terminal failures or retries. Raw process exits omit these guarantees.
+The [equal-window recording](qualification/2026-10-09-timed-job-scenarios/README.md)
+gives each path 60 seconds at concurrency 27: 876,671 raw exits, 196 fresh-
+container jobs, 23,000 shared-container jobs and 246,000 host jobs. Public
+counts are unique accepted successes, with no failures or retries. The landing
+page multiplies these minute counts by 1,440 for readable daily projections;
+it labels them as extrapolations. The raw VM baseline is a measured reference
+for the same executable and hardware, without admission, limits or durable
+outcomes. It doesn't establish a universal physical ceiling.
+
+Fresh containers suit fully isolated independent work. Shared containers suit
+repeatable trusted tasks whose container startup would dominate the command.
+Host jobs trade isolation for maximum speed with an explicit allowlisted binary.
+Jobs select `runtime = "runc"` by default, or opt into `shared-runc` or `process`;
+a process definition with an image is refused. Explicit Bun `--runtime runc`
+permits containers, while `mixed` and Linux auto-detection can enable both.
+All public paths request 25m CPU / 32 MiB and enforce a one-core limit, with
+native/shared helper overhead reserved. Fresh containers use one-job receipt
+chunks; fast modes use thousand-job chunks. This choice affects reporting and
+its overhead, not bin packing or execution concurrency. The requested saturation
+check is now one hour per scenario, run sequentially beside the same application;
+it measures health and growth without requiring a 24-hour soak for this review.
 
 
 ### AI workloads: resident models and coordinated training

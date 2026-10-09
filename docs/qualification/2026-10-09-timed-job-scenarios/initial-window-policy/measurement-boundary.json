@@ -1,0 +1,16 @@
+{
+  "tooling_commit": "029fd94df2de53d89308d01a17adc7b41928026f",
+  "started_utc": "2026-10-09T14:08:37.141190+00:00",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "node_data_filesystem": "ext2/ext3",
+  "bun_pid": 3448321,
+  "service_payload_pid": 3448472,
+  "service_url": "http://10.202.142.2:8080/",
+  "apparmor_restrict_unprivileged_userns": "1",
+  "execution_binaries": "Frozen timed-window harness and native executor; no concurrent tests or builds during measurements",
+  "bun_start_ticks": 119171637,
+  "service_start_ticks": 119172860,
+  "service_generation": "6c78a0e13dc467d8f663bd2d94071ff7"
+}

@@ -1,0 +1,103 @@
+0.1s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s; 1 successful service probes
+task array 9 cancelled: running tasks are being stopped
+task array 11 cancelled: running tasks are being stopped
+{
+  "qualification_pass": false,
+  "reason": "Requires separate recovery, fault and bounded-cost evidence",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "workload_sha256": "106b396aacc6d538e2f5e39c9afad2b155794a94f46c9b0a77b1ca26a5590959",
+  "command_prefix": [
+    "/Users/miko/github/reliaburger/target/host-executor-v3-release/relish"
+  ],
+  "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
+  "last_accepted_sample_seconds": 29.585867911111563,
+  "elapsed_seconds": 30.000213065184653,
+  "requested_seconds": 30,
+  "measurement_complete": true,
+  "window_pass": true,
+  "unique_accepted_successes": 131000,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "successes_per_second": 4366.666666666667,
+  "target_with_headroom": 1388.888888888889,
+  "throughput_pass": false,
+  "application_probes": 29,
+  "application_failures": 0,
+  "completed_submissions": 0,
+  "active_submissions": [
+    9,
+    11
+  ],
+  "requires_evidence": [
+    "hardware/runtime/image-warmth",
+    "resource and storage bounds",
+    "worker loss",
+    "leader failover",
+    "delayed control",
+    "storage failure"
+  ],
+  "service_latency_ms": {
+    "samples": 29,
+    "maximum": 12.21070415340364,
+    "p95": 1.704677939414978
+  },
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.07077546115033329,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 25714688,
+          "files_observed": 611,
+          "raced_entries": 0,
+          "complete": true,
+          "filesystem_available_bytes": 2939236352,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6530496,
+          5659,
+          4945081,
+          462061888,
+          1445572,
+          0,
+          607101,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 98512896,
+          "peak_rss_bytes": 111931392
+        }
+      ]
+    }
+  ],
+  "elapsed_including_observation_seconds": 30.000213065184653,
+  "post_cutoff_drain_proofs": [
+    {
+      "batch_id": 9,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    },
+    {
+      "batch_id": 11,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "elapsed_including_cancellation_seconds": 32.04186321422458,
+  "cleanup_failed_submissions": [],
+  "measurement_window_seconds": 30,
+  "conservative_cutoff": "Only summary responses received before the deadline are counted; subsequent cancellation/results earn no credit"
+}

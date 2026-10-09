@@ -8,47 +8,65 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 class JobDemo(unittest.TestCase):
-    def test_visible_demo_precedes_install_and_matches_accepted_evidence(self):
-        page = (ROOT / 'docs/website/index.html').read_text()
-        section = page.index('<section id="job-throughput"')
-        self.assertLess(section, page.index('<section id="install"'))
-        figure = page.index('id="throughput-recording"', section)
-        self.assertNotIn('<details', page[section:figure])
-        report = json.loads((ROOT / 'docs/website/assets/job-throughput-report.json').read_text())
-        recording = [json.loads(line) for line in
-                     (ROOT / 'docs/website/assets/job-throughput.cast').read_text().splitlines()]
-        self.assertTrue(report['all_tasks_succeeded'])
+    def test_visible_demo_follows_tour_with_collapsed_details_and_matches_evidence(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('timed_tiers',ROOT/'scripts/demo/record-job-tiers.py')
+        tiers=importlib.util.module_from_spec(spec);spec.loader.exec_module(tiers)
+        page=(ROOT/'docs/website/index.html').read_text()
+        section=page.index('<section id="job-throughput"')
+        tour=page.index('<section id="tour"')
+        self.assertLess(tour,section)
+        self.assertRegex(page[page.index('</section>',tour)+10:section],r'^\s*$')
+        self.assertLess(section,page.index('<section id="start"'))
+        self.assertNotIn('id="jobs-recording"',page)
+        self.assertNotIn('Development preview',page)
+        self.assertIn('class="section-heading"',page[section:page.index('</section>',section)])
+        figure=page.index('id="throughput-recording"',section)
+        self.assertNotIn('<details',page[section:figure])
+        details=page.index('<details',figure)
+        self.assertLess(page.index('</figure>',figure),details)
+        self.assertIn('id="job-throughput-details"',page[details:page.index('>',details)])
+        self.assertNotIn(' open',page[details:page.index('>',details)])
+        self.assertLess(details,page.index('<table',section))
+        self.assertLess(details,page.index('Testing rig:',section))
+        report=json.loads((ROOT/'docs/website/assets/job-throughput-report.json').read_text())
+        recording=[json.loads(line) for line in (ROOT/'docs/website/assets/job-throughput.cast').read_text().splitlines()]
+        self.assertTrue(report['all_windows_healthy'])
         self.assertFalse(report['qualified_100m_per_day'])
-        self.assertAlmostEqual(recording[-1][0], report['recording_elapsed_seconds'], delta=1)
-        self.assertEqual(report['unique_accepted_successes'], 511000)
-        self.assertEqual(report['baseline']['path'], 'Bare')
-        self.assertEqual(report['baseline']['verified_successes'], 1000000)
-        self.assertEqual([(row['runtime'], row['total']) for row in report['tiers']],
-                         [('runc', 1000), ('shared-runc', 10000), ('process', 500000)])
+        self.assertEqual(report['measurement_window_seconds'],60)
+        self.assertAlmostEqual(recording[-1][0],report['recording_elapsed_seconds'],delta=1)
+        self.assertEqual(report['baseline']['path'],'Bare')
+        self.assertEqual([row['runtime'] for row in report['tiers']],['runc','shared-runc','process'])
+        self.assertEqual(report['unique_accepted_successes'],sum(row['unique_accepted_successes'] for row in report['tiers']))
+        text=page[section:page.index('</section>',section)]
+        for row in [report['baseline'],*report['tiers']]:
+            self.assertEqual(row['requested_seconds'],60)
+            self.assertTrue(row['measurement_complete'])
+            count=row.get('unique_accepted_successes',row.get('verified_successes'))
+            self.assertEqual(row['extrapolated_runs_per_day'],count*1440)
+            self.assertIn(f'{count:,}',text)
+            self.assertIn(tiers.human_count(round(count*1440)),text)
         for row in report['tiers']:
-            self.assertTrue(row['all_tasks_succeeded'])
-            self.assertEqual(row['unique_accepted_successes'], row['total'])
-        self.assertEqual(recording[0]['version'], 2)
-        raw = ROOT / 'docs/qualification/2026-10-09-host-job-executors/current-build/three-tiers'
-        self.assertEqual((ROOT / 'docs/website/assets/job-throughput.cast').read_bytes(),
-                         (raw / 'jobs.cast').read_bytes())
-        self.assertEqual((ROOT / 'docs/website/assets/job-throughput-report.json').read_bytes(),
-                         (raw / 'report.json').read_bytes())
-        self.assertEqual([row[0] for row in recording[1:]],
-                         sorted(row[0] for row in recording[1:]))
-        text = page[section:page.index('</section>', section)]
-        self.assertIn(f"{report['unique_accepted_successes']:,}", text)
-        for row in report['tiers']:
-            self.assertIn(f"{row['total']:,}", text)
-            self.assertIn(f"{row['accepted_elapsed_seconds']:.2f}", text)
-        self.assertIn('VM baseline', text)
-        self.assertIn('durable ownership', text)
-        self.assertIn('development binaries', text)
-        self.assertIn('24-hour', text)
-        self.assertIn('All public tiers request 100m CPU / 32 MiB', text)
-        self.assertNotIn('without hard resource limits', text)
-        self.assertRegex(text, r'data-cast="\./assets/job-throughput\.cast"')
-        self.assertIn('./assets/job-throughput-report.json', text)
+            self.assertEqual(row['terminal_failures'],0)
+            self.assertEqual(row['cleanup_failed_submissions'],[])
+            self.assertEqual(len(row['post_cutoff_drain_proofs']),len(row['active_submissions']))
+        raw=ROOT/'docs/qualification/2026-10-09-timed-job-scenarios/current-build/sixty-second-windows'
+        for asset,evidence in [('job-throughput.cast','jobs.cast'),('job-throughput-report.json','report.json')]:
+            self.assertEqual((ROOT/'docs/website/assets'/asset).read_bytes(),(raw/evidence).read_bytes())
+        self.assertEqual(recording[0]['version'],2)
+        self.assertEqual([row[0] for row in recording[1:]],sorted(row[0] for row in recording[1:]))
+        for phrase in ['60 seconds','extrapolated','independent','repeatable','no isolation','VM baseline','durable ownership','development binaries']:
+            self.assertIn(phrase,text)
+        self.assertRegex(text,r'data-cast="\./assets/job-throughput\.cast"')
+        self.assertIn('./assets/job-throughput-report.json',text)
+
+    def test_results_identify_local_vm_rig_and_workload_limits(self):
+        page=(ROOT/'docs/website/index.html').read_text()
+        start=page.index('<section id="job-throughput"')
+        section=page[start:page.index('</section>',start)]
+        for phrase in ['Apple M2 Max','Lima VM','4 vCPU','8 GiB','Ubuntu 24.04','one-core limit','BusyBox']:
+            self.assertIn(phrase,section)
+        self.assertIn('own hardware',section)
 
     def test_chapter_controls_stay_hidden_without_javascript_and_have_keyboard_focus(self):
         css = (ROOT / 'docs/website/style.css').read_text()
@@ -94,7 +112,7 @@ setImmediate(async()=>{
     def test_all_recordings_load_once_and_keep_independent_speed_controls(self):
         program = r"""
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
-const calls = [], loads = [], figures = ['tour','jobs','throughput'].map(name => {
+const calls = [], loads = [], figures = ['tour','throughput'].map(name => {
   const buttons = [1,2].map(speed => ({getAttribute: () => String(speed), setAttribute: () => {}}));
   const speeds = {hidden:true,querySelectorAll: () => buttons,addEventListener: (_, callback) => speeds.click=callback};
   const screen = {name,addEventListener:(event,callback)=>screen[event]=callback};
@@ -110,13 +128,13 @@ const window = {AsciinemaPlayer:{create: (cast,screen,options)=>{
 }}};
 vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),{document,window,Promise,Number,Object,String});
 setImmediate(async ()=>{
- assert.deepStrictEqual(calls.map(c=>c.cast),['tour.cast','jobs.cast','throughput.cast']);
+ assert.deepStrictEqual(calls.map(c=>c.cast),['tour.cast','throughput.cast']);
  assert.strictEqual(loads.filter(([name])=>name==='src').length,1);
- figures[2].screen.pointerdown();
- figures[2].speeds.click({target:{closest:()=>figures[2].buttons[1]}});
+ figures[1].screen.pointerdown();
+ figures[1].speeds.click({target:{closest:()=>figures[1].buttons[1]}});
  await Promise.resolve();
- assert.strictEqual(calls.length,4);assert.strictEqual(calls[3].cast,'throughput.cast');
- assert.strictEqual(calls[3].options.speed,2);assert.strictEqual(calls[3].options.startAt,17);
+ assert.strictEqual(calls.length,3);assert.strictEqual(calls[2].cast,'throughput.cast');
+ assert.strictEqual(calls[2].options.speed,2);assert.strictEqual(calls[2].options.startAt,17);
  assert.strictEqual(calls[0].options.speed,1);
 });
 """

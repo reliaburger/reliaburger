@@ -1,0 +1,510 @@
+0.1s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s; 1 successful service probes
+5.4s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s; 16 successful service probes
+10.6s: 4,000 unique accepted successes, 0 failures, 0 retries; 376.7/s; 31 successful service probes
+15.7s: 8,000 unique accepted successes, 0 failures, 0 retries; 510.3/s; 47 successful service probes
+20.8s: 16,000 unique accepted successes, 0 failures, 0 retries; 768.9/s; 63 successful service probes
+25.9s: 27,000 unique accepted successes, 0 failures, 0 retries; 1041.9/s; 80 successful service probes
+31.0s: 37,000 unique accepted successes, 0 failures, 0 retries; 1194.8/s; 97 successful service probes
+36.0s: 52,000 unique accepted successes, 0 failures, 0 retries; 1444.7/s; 114 successful service probes
+41.3s: 68,000 unique accepted successes, 0 failures, 0 retries; 1647.3/s; 132 successful service probes
+46.5s: 81,000 unique accepted successes, 0 failures, 0 retries; 1741.3/s; 149 successful service probes
+51.7s: 89,000 unique accepted successes, 0 failures, 0 retries; 1720.1/s; 165 successful service probes
+57.0s: 106,000 unique accepted successes, 0 failures, 0 retries; 1860.8/s; 182 successful service probes
+task array 17 cancelled: running tasks are being stopped
+task array 19 cancelled: running tasks are being stopped
+{
+  "qualification_pass": false,
+  "reason": "Requires separate recovery, fault and bounded-cost evidence",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "workload_sha256": "62f72689ad2a727df894891523d58470b5631110125898134e2a830c32a7bd79",
+  "command_prefix": [
+    "/Users/miko/github/reliaburger/target/host-executor-v3-release/relish"
+  ],
+  "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
+  "last_accepted_sample_seconds": 59.97420910000801,
+  "elapsed_seconds": 60.000079568009824,
+  "requested_seconds": 60,
+  "measurement_complete": true,
+  "window_pass": true,
+  "unique_accepted_successes": 114000,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "successes_per_second": 1900.0,
+  "target_with_headroom": 1388.888888888889,
+  "throughput_pass": false,
+  "application_probes": 192,
+  "application_failures": 0,
+  "completed_submissions": 0,
+  "active_submissions": [
+    17,
+    19
+  ],
+  "requires_evidence": [
+    "hardware/runtime/image-warmth",
+    "resource and storage bounds",
+    "worker loss",
+    "leader failover",
+    "delayed control",
+    "storage failure"
+  ],
+  "service_latency_ms": {
+    "samples": 192,
+    "maximum": 12.348026968538761,
+    "p95": 2.1199278999119997
+  },
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.06510002491995692,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 50659328,
+          "files_observed": 2370,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2891276288,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6539621,
+          5659,
+          4985301,
+          462073312,
+          1447881,
+          0,
+          607372,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 157872128,
+          "peak_rss_bytes": 157872128
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 5.367016766918823,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 70221824,
+          "files_observed": 2320,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2870235136,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6539810,
+          5659,
+          4986400,
+          462074022,
+          1447972,
+          0,
+          607389,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 174329856,
+          "peak_rss_bytes": 182091776
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 10.617746331030503,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 70021120,
+          "files_observed": 2337,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2869424128,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6539983,
+          5659,
+          4987728,
+          462074445,
+          1448082,
+          0,
+          607403,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 182460416,
+          "peak_rss_bytes": 191389696
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 15.676778835011646,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 71356416,
+          "files_observed": 2336,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2868068352,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6540152,
+          5659,
+          4988800,
+          462075055,
+          1448190,
+          0,
+          607416,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 171917312,
+          "peak_rss_bytes": 191389696
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 20.8086993501056,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 71860224,
+          "files_observed": 2335,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2867490816,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6540312,
+          5659,
+          4989751,
+          462075781,
+          1448326,
+          0,
+          607433,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 190357504,
+          "peak_rss_bytes": 204447744
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 25.915243010036647,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 72642560,
+          "files_observed": 2335,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2866528256,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6540445,
+          5659,
+          4990325,
+          462077031,
+          1448363,
+          0,
+          607443,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 194686976,
+          "peak_rss_bytes": 204447744
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.96807391801849,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 73465856,
+          "files_observed": 2335,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2865635328,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6540568,
+          5659,
+          4990823,
+          462078374,
+          1448379,
+          0,
+          607452,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 195584000,
+          "peak_rss_bytes": 204447744
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 35.99322392512113,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 74706944,
+          "files_observed": 2335,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2864320512,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6540736,
+          5659,
+          4991509,
+          462079478,
+          1448391,
+          0,
+          607456,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 195813376,
+          "peak_rss_bytes": 204447744
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 41.27925385301933,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 76181504,
+          "files_observed": 2335,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2862755840,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6540936,
+          5659,
+          4992298,
+          462080561,
+          1448403,
+          0,
+          607462,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 200413184,
+          "peak_rss_bytes": 204447744
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 46.516020176932216,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 75718656,
+          "files_observed": 2337,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2863206400,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6541086,
+          5659,
+          4993104,
+          462081575,
+          1448458,
+          0,
+          607471,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 181022720,
+          "peak_rss_bytes": 204447744
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 51.74088355409913,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 77987840,
+          "files_observed": 2336,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2860826624,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6541284,
+          5659,
+          4994259,
+          462082182,
+          1448524,
+          0,
+          607483,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 183791616,
+          "peak_rss_bytes": 226254848
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 56.96472325199284,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 79110144,
+          "files_observed": 2336,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2859597824,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6541473,
+          5659,
+          4995190,
+          462083073,
+          1448560,
+          0,
+          607493,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 198582272,
+          "peak_rss_bytes": 226254848
+        }
+      ]
+    }
+  ],
+  "elapsed_including_observation_seconds": 60.000079568009824,
+  "post_cutoff_drain_proofs": [
+    {
+      "batch_id": 17,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    },
+    {
+      "batch_id": 19,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "elapsed_including_cancellation_seconds": 62.05759184714407,
+  "cleanup_failed_submissions": [],
+  "measurement_window_seconds": 60,
+  "conservative_cutoff": "Only summary responses received before the deadline are counted; subsequent cancellation/results earn no credit"
+}

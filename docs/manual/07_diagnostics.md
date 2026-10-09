@@ -191,6 +191,14 @@ An API failure, incomplete evidence or deadline expiry is a failed measurement.
 Once a suite has started, a timeout, API error or uncertain cleanup fails the
 run (non-zero exit) instead of becoming a green skip.
 
+For job throughput, select a fixed-window scenario instead of the ordinary
+suite. For example, `relish bench --scenario jobs-shared-containers` runs for
+60 seconds with concurrency 27 by default. The `jobs-containers`,
+`jobs-host-processes` and `jobs-vm-baseline` scenarios provide the other isolation
+levels and a local Linux raw reference. See `relish manual batch` for the
+resource profile, binary allowlist, matched-node requirements and cutoff/cleanup
+semantics. Daily rates are explicitly extrapolated from the measured window.
+
 ## When the CLI can't reach anything
 
 - `relish` talks to `--endpoint`, then `RELIABURGER_ENDPOINT`, then the

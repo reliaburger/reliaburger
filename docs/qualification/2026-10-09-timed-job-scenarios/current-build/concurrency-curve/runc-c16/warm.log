@@ -1,0 +1,145 @@
+0.1s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s; 1 successful service probes
+30.2s: 117 unique accepted successes, 0 failures, 0 retries; 3.9/s; 97 successful service probes
+{
+  "qualification_pass": false,
+  "reason": "Requires separate recovery, fault and bounded-cost evidence",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "workload_sha256": "dd393449e3fd3692bc692ac053ee15540f9a927050cf3e442f55859607c1c0bb",
+  "command_prefix": [
+    "/Users/miko/github/reliaburger/target/host-executor-v6-release/relish"
+  ],
+  "timing": "Monotonic read-only window; the existing submission remains running",
+  "last_accepted_sample_seconds": 59.94829799910076,
+  "elapsed_seconds": 60.00023413193412,
+  "requested_seconds": 60,
+  "measurement_complete": true,
+  "window_pass": true,
+  "unique_accepted_successes": 232,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "successes_per_second": 3.8666666666666667,
+  "target_with_headroom": 1388.888888888889,
+  "throughput_pass": false,
+  "application_probes": 189,
+  "application_failures": 0,
+  "completed_submissions": 0,
+  "active_submissions": [
+    53
+  ],
+  "requires_evidence": [
+    "hardware/runtime/image-warmth",
+    "resource and storage bounds",
+    "worker loss",
+    "leader failover",
+    "delayed control",
+    "storage failure"
+  ],
+  "existing_batch_id": 53,
+  "initial_accepted_counts": [
+    217,
+    0,
+    0
+  ],
+  "measurement_ownership": "read-only; submission remains owned by its caller",
+  "service_latency_ms": {
+    "samples": 189,
+    "maximum": 23.256717016920447,
+    "p95": 4.360088147222996
+  },
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.08135594613850117,
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 410071040,
+          "files_observed": 2392,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2499219456,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          7023807,
+          5659,
+          6558930,
+          463286967,
+          1503690,
+          0,
+          621530,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 203030528,
+          "peak_rss_bytes": 248561664
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 2015232,
+          "peak_rss_bytes": 2015232
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.221386953955516,
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 410329088,
+          "files_observed": 2388,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2499706880,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          7025037,
+          5659,
+          6568539,
+          463287271,
+          1504298,
+          0,
+          621637,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 213897216,
+          "peak_rss_bytes": 248561664
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 2015232,
+          "peak_rss_bytes": 2015232
+        }
+      ]
+    }
+  ],
+  "elapsed_including_observation_seconds": 60.00023413193412,
+  "post_cutoff_drain_proofs": [],
+  "elapsed_including_cancellation_seconds": 60.0003007161431,
+  "cleanup_failed_submissions": [],
+  "measurement_window_seconds": 60,
+  "conservative_cutoff": "Only summary responses received before the deadline are counted; subsequent cancellation/results earn no credit"
+}

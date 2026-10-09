@@ -426,36 +426,112 @@ incomplete observation. These are selected processes, not total node or
 container memory; record cgroup working sets separately when qualifying limits.
 Storage observations also become incomplete when atomic renames race the scan.
 
-The three-tier landing-page recorder adds a separate million-process VM
-baseline, then submits 1,000 fresh containers, 10,000 shared containers and
-a selectable host tier (500,000 in the current recording). Run it only on a
-task-owned Linux measurement node with
-matching optimised `bun`, `relish` and `job-throughput` binaries:
+## Measure job throughput with Relish
+
+Run one scenario with the same tool you use to manage the cluster:
+
+```sh
+relish bench --scenario jobs-containers
+relish bench --scenario jobs-shared-containers
+relish bench --scenario jobs-host-processes
+relish bench --scenario jobs-vm-baseline
+```
+
+Each defaults to **60 seconds and concurrency 27**. You don't need Python, a
+checkout, a Bun binary path or a fixture directory. The container scenarios use
+a built-in digest-pinned BusyBox image and run `/bin/busybox true`. Public jobs
+request 25m CPU, limit each command to one core and request/limit memory to
+32 MiB. Helper reservations still count against admission. The concurrency cap
+is per node; actual running commands also depend on available resources and the
+32-slot reusable pool. Use an isolated single-node cluster when comparing with
+one local VM baseline. A larger configured cap isn't proof of higher throughput.
+
+The three public scenarios use your normal endpoint, token and CA context. Bun
+must support the selected runtime: `auto`/`mixed` allows both; explicit `runc`
+refuses host processes. Host jobs execute an explicitly allowlisted BusyBox
+binary, defaulting to `/bin/busybox`. They require the supported rootful Linux
+native backend and `mount_isolation = false`. The benchmark doesn't change the
+node's allowlist or grant itself host execution. Use `--exec /absolute/busybox`
+or set `RELIABURGER_BENCH_EXEC` for a different allowed path.
+
+The VM baseline runs **locally where Relish executes, on Linux**. By default it
+pulls and unpacks the same pinned image into your user cache, then launches its
+BusyBox binary directly. Image preparation precedes its timed window. `--exec`
+or `RELIABURGER_BENCH_EXEC` instead selects an existing local executable, which
+must be BusyBox for the built-in `true` applet. It reports the executable SHA-256.
+When Relish runs on macOS and jobs run in a VM, enter that VM for the baseline;
+local macOS process exits aren't a matched Linux comparison. To compare all four
+paths, use the same node, byte-identical BusyBox, duration and concurrency. The
+cluster report cannot verify a remote host binary's hash: verify the allowlisted
+copy against the image's executable when preparing your rig.
+
+```sh
+relish bench --scenario jobs-shared-containers --seconds 3600 --concurrency 27
+relish bench --scenario jobs-host-processes --concurrency 8
+relish --output json bench --scenario jobs-shared-containers
+relish bench --scenario jobs-containers --report containers.json
+```
+
+Use `--cpu-request` to change admission while retaining the one-core limit,
+`--namespace` to select a namespace you can deploy into, and `--image` for another
+digest-pinned image containing `/bin/busybox`. A report file must not already
+exist. Without `--scenario`, `relish bench` still runs its ordinary data-plane
+suite. Its `--quick`, `--compare`, `--capacity` and `--disruptive` options belong
+to that suite and cannot be combined with job scenarios.
+
+The public clock starts before submission. Image pulls and cold executors are
+included unless you prepare the image before running. Fresh containers use
+single-job receipt chunks; shared and host jobs use 1,000-job chunks. Receipts
+control how soon successes become visible, not how many commands fit. Only
+unique accepted successes received by the cutoff count. Raw processes count
+successful child exits by that same monotonic deadline, without scheduler
+limits or durable outcomes. Remaining work drains after the cutoff without
+extra credit. A daily figure is the window rate multiplied by 86,400, labelled
+**extrapolated**; it isn't an observed daily total or a reliability qualification.
+
+Relish cancels only its own submission and waits for positive terminal, held and
+active-command drain. Ctrl-C follows the same cleanup path and reports an
+incomplete measurement. API errors, zero accepted progress, terminal failures
+and unverified cleanup produce a non-zero exit and a diagnostic report. Retries
+are reported separately; they aren't extra successes. If a submission response
+is lost, the report retains its unique `bench-jobs-*` name for recovery rather
+than pretending it can prove cancellation of an unknown identity.
+
+The landing-page recorder measures four equal windows: raw VM processes, fresh
+containers, shared containers and host jobs. Each runs for 60 seconds. Fresh
+containers suit independent isolated jobs; shared containers suit repeatable
+trusted commands whose container startup would dominate the work; host commands
+provide maximum speed without isolation. The raw baseline is the measured
+reference for this VM and executable, with fewer guarantees than accepted jobs.
+Run on a task-owned Linux node with matching optimised binaries:
 
 ```sh
 python3 scripts/demo/record-job-tiers.py \
   --binaries /absolute/immutable-binaries --relish /absolute/immutable-binaries/relish \
   --image registry.example/busybox@sha256:DIGEST \
-  --host-binary /absolute/matching-unpacked-rootfs/bin/busybox --process-count 500000 \
+  --host-binary /absolute/matching-unpacked-rootfs/bin/busybox --seconds 60 \
   --service-url http://application/health --observe-pid BUN_PID \
   --observe-dir /absolute/node-data --output /absolute/new-recording
 ```
 
-The recorder verifies that the host binary matches the pinned-image baseline.
-Provide CLI credentials privately. Enable `mixed` on Bun, allowlist that binary,
-and set `mount_isolation = false` for these host jobs. Give the baseline its
-own node subnet identity, as with the direct driver below. The casts retain
-actual pauses, including warm-up and indexed verification. Per-tier reports
-time submission through accepted completion. All public tiers request 100m CPU
-and 32 MiB with a one-core CPU limit; native/shared helper overhead is reserved
-as well. Requested concurrency 27 remains subject to admission.
-The recorder uses the default maximum of three attempts and reports retries
-separately from unique accepted successes. Failed diagnostics stay in the raw
-evidence. Chapter jumps and labelled faster playback use the original cast;
-measured durations always refer to real elapsed time.
+The host binary must match the pinned-image baseline. Provide CLI credentials
+privately. Enable `mixed` on Bun, allowlist that binary, and set
+`mount_isolation = false` for trusted host commands. Give the baseline its own
+node subnet identity, as with the direct driver below. The recording preserves
+preparation and cancellation pauses outside the measurement windows. It counts
+only raw exits completed, or accepted summary responses received, within each
+window. Public counts therefore conservatively omit work after the last sample.
+One large submission stays queued so the total concurrency cap is comparable.
+Fresh containers use single-job receipt chunks; fast paths use 1,000-job chunks.
+A slow 1,000-job chunk can otherwise publish no accepted progress in a minute.
+Leftover work is cancelled by its own identity after the cutoff, and verified
+drain plus idle executor retirement precede the next recorded mode. All public paths request 25m CPU and
+32 MiB, enforce a one-core limit, reserve native/shared helper overhead, and
+request concurrency 27. Three attempts remain the default; retries aren't extra
+successful jobs. Daily figures extrapolate the minute count times 1,440.
 
-For a continuous one-hour run after the demo, submit one bounded batch at a
-time beside the same service:
+After recording, measure each scenario for an hour sequentially, without
+concurrent builds or tests. For each public runtime, use its manifest:
 
 ```sh
 python3 scripts/demo/qualify-jobs.py /absolute/new-recording/process.toml \
@@ -465,15 +541,16 @@ python3 scripts/demo/qualify-jobs.py /absolute/new-recording/process.toml \
   --output /absolute/new-hour-measurement
 ```
 
-The runner counts unique accepted outcomes, starts another batch when one
-finishes, and cancels its own remaining work at the cutoff. It reports service
-latency, selected process memory and bounded storage observations. Keep other
-benchmarks, builds and test traffic stopped. A complete hour can still miss the
-rate target; it never passes the separate 24-hour qualification. To observe an
-already-running submission without creating or cancelling work, use
-`--existing-batch BATCH_ID`; that read-only mode subtracts earlier accepted
-results and leaves the submission running afterwards. An idle remainder of the
-window isn't continuous throughput evidence.
+Repeat for `runc.toml` and `shared-runc.toml`; measure raw processes with
+`job-throughput --path bare --seconds 3600 --timeout 3700` and its usual required
+arguments. The public runner reports `window_pass` for a complete healthy window,
+separately from the daily-rate gate. It observes service latency, original process
+memory, aggregate CPU ticks and bounded storage scans. Verify disk capacity
+first. An hour exposes saturation failures and growth; projections don't establish
+observed daily totals. Retain failed runs and positive cleanup evidence.
+`--existing-batch BATCH_ID` observes without submitting or cancelling, subtracts
+earlier counters and leaves the caller's submission running. An idle remainder
+isn't continuous throughput evidence.
 
 For the direct baselines, build the rootful Linux example with the same profile
 as Bun and run each mode in a fresh directory on the qualification node:
@@ -532,36 +609,66 @@ until normal workload retirement. This proves a single-node crash; separate
 multi-node and sustained fault cases remain necessary.
 
 
+## Tune concurrency for the workload
+
+The matched sweep on this rig tested caps 1, 4, 8, 16, 27, 32, 48 and 64.
+Native host jobs reached the same measured second-minute maximum at 8–32;
+48/64 reduced throughput. Shared jobs started faster at 8–16 but reached their
+best repeated second-minute rate at 27. Fresh containers gained little beyond
+16. The comparison keeps a common 27 cap across modes; choose a cap from your
+own representative workload rather than copying that number as a global default.
+
+`scripts/demo/sweep-job-concurrency.py` submits once per point, measures a cold
+60-second window and then another 60 seconds on the same submission, subtracting
+initial accepted counters. It cancels and positively drains only its own work
+before changing the cap. Pass the same private CLI credentials, pinned image,
+allowlisted host executable, service URL and node observation paths as the
+recorder above. `--concurrency 1 4 8 16 27 32 48 64 --cpu-request 25` reproduces
+the wider profile. Keep the one-core limit and 32 MiB memory identical across
+runtimes. At 25m, admission can exceed 27; reusable executors still have a separate
+32-context cap. Sampled active counts may miss very short commands and retain
+`null` when unavailable. The [full curve and repeats](../qualification/2026-10-09-timed-job-scenarios/README.md#concurrency-review)
+show the cold-start variation and all settings, including the slower ones.
+
 ## Measured development results
 
-The standalone landing-page recording measures a raw VM baseline and three
-public job tiers on a four-vCPU, 8 GiB Ubuntu 24.04 aarch64 VM, with matching
-optimised development binaries and pinned BusyBox `true` commands:
+The landing-page recording gives each scenario 60 seconds on a four-vCPU,
+8 GiB Ubuntu 24.04 aarch64 Lima VM, running locally on an Apple M2 Max
+host (12 physical cores, 32 GiB host RAM). The guest runs Linux 6.8 and runc 1.4.
+These are dispatch-overhead measurements; benchmark representative work on your
+own hardware. Every mode runs the same pinned BusyBox `true`
+command with a concurrency cap of 27:
 
-| Path | Completed work | Elapsed | Rate | Accepted retries |
+| Path | Completed in 60 seconds | Rate | Extrapolated runs/day | Retries |
 |---|---:|---:|---:|---:|
-| Raw VM processes | 1,000,000 exit statuses | 62.67s | 15957.2/s | Not applicable |
-| Fresh containers | 1,000 accepted successes | 249.62s | 4.0/s | 0 |
-| Shared containers | 10,000 accepted successes | 22.73s | 439.9/s | 0 |
-| Host jobs | 500,000 accepted successes | 90.44s | 5528.7/s | 0 |
+| Raw VM processes | 876,671 exits | 14,611.2/s | 1.3B | Not applicable |
+| Fresh containers | 196 accepted successes | 3.3/s | 282.2k | 0 |
+| Shared containers | 23,000 accepted successes | 383.3/s | 33.1M | 0 |
+| Host jobs | 246,000 accepted successes | 4,100.0/s | 354.2M | 0 |
 
-All 511,000 public jobs completed without terminal failures or accepted retries.
-The million-process VM baseline counts exit statuses and omits admission, limits,
-durable ownership and task ledgers. Its rate gap is not pure scheduling overhead.
-Every public tier requests 100m CPU and 32 MiB, with a one-core CPU limit;
-native and shared helpers reserve their overhead too. Requested concurrency 27
-remains subject to admission. The pinned image is warm and executors start cold.
-Real pauses remain in the cast; chapter jumps and labelled speeds change only
-playback. The normal maximum of three attempts applies.
+The public windows accepted 269,196 unique successes with no terminal failures
+or retries. Unused queued work was cancelled and positively drained afterwards.
+All public paths request 25m CPU / 32 MiB and enforce a one-core CPU limit;
+native/shared helpers reserve another 10m / 8 MiB. Images are warm, executor
+processes start cold, and one active submission caps total concurrency at 27.
+Fresh receipt chunks contain one job; fast paths use 1,000 jobs. This reporting
+choice makes slow progress visible and amortises fast outcomes, so the rate gap
+also includes receipt granularity. Chunk size never decides how many jobs fit.
 
-The [matched comparisons and raw recording](../qualification/2026-10-09-host-job-executors/README.md)
-retain exact binary hashes, manifests, failures and cold/warm results. Run
-`scripts/demo/record-job-tiers.py --process-count 500000` with the documented
-node, image, binary and observation arguments to reproduce the host tier.
-These measurements do not establish 24-hour, fault or global metadata bounds.
+Daily projections multiply the minute count by 1,440. Raw exits omit admission,
+limits, durable ownership and task ledgers. The measured baseline is a reference
+for this VM and executable; it isn't a universal physical limit. Only completions
+observed before the cutoff count. Preparation, cancellation and verified cleanup
+remain visible outside the windows. The maximum of three attempts remains normal.
+
+Use `scripts/demo/record-job-tiers.py --seconds 60` with the documented node,
+image, binary and observation arguments. The [timed qualification record](../qualification/2026-10-09-timed-job-scenarios/README.md)
+retains raw casts, manifests, hashes and the initial inadequate receipt policy.
+[Previous fixed-volume measurements](../qualification/2026-10-09-host-job-executors/README.md)
+retain the earlier matched direct/public matrix and native-only hour.
 
 
-### Continuous one-hour native host run
+### Previous continuous one-hour native host run
 
 The new native host path completed **18,103,000 unique
 accepted successes in 3600.00 seconds (5,028.6/s)**,

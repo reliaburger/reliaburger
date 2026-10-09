@@ -1,0 +1,12 @@
+process concurrency 1 cold started
+Traceback (most recent call last):
+  File "/Users/miko/github/reliaburger/target/host-executor-v5-release/tooling/sweep-job-concurrency.py", line 123, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/Users/miko/github/reliaburger/target/host-executor-v5-release/tooling/sweep-job-concurrency.py", line 108, in main
+    row[phase] = window_summary(window,samples)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/miko/github/reliaburger/target/host-executor-v5-release/tooling/sweep-job-concurrency.py", line 42, in window_summary
+    maximum_sampled_active_commands=max((s.get('active_commands', 0) for s in summaries), default=0),
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: '>' not supported between instances of 'NoneType' and 'NoneType'

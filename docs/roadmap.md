@@ -295,7 +295,7 @@ migration and no feature gate
   [qualification](qualification/2026-10-07-common-jobs/README.md)). This tick
   records implementation; 0.2.0 isn't released. [#654](https://github.com/reliaburger/reliaburger/pull/654)
   adds bounded native/shared executors and a four-part VM/process/container demonstration
-  ([raw results](qualification/2026-10-09-host-job-executors/README.md)); it doesn't
+  ([raw results](qualification/2026-10-09-timed-job-scenarios/README.md)); it doesn't
   qualify the daily target. Reusable executors
   [#639](https://github.com/reliaburger/reliaburger/issues/639) are implemented in
   #654, pending merge. Sustained throughput qualification

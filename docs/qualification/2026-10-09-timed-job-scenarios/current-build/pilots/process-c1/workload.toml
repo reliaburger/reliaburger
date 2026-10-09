@@ -1,0 +1,14 @@
+name = "demo-process-16000000"
+namespace = "default"
+[[cohort]]
+name = "commands"
+count = 16000000
+chunk_size = 1000
+max_attempts = 3
+per_node_concurrency = 1
+[cohort.template]
+runtime = "process"
+exec = "/tmp/rb-host-executor-v4/host/busybox"
+command = ["true"]
+cpu = "100m-1000m"
+memory = "32Mi"

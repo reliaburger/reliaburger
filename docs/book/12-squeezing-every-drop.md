@@ -1531,3 +1531,118 @@ No inventory timeout appeared across the fixture lifetime. The
 [raw hour, resource observations and positive cleanup proofs](../qualification/2026-10-09-host-job-executors/README.md)
 retain these limits. This completed hour does not qualify 100m/day; 24-hour,
 fault and historical namespace/profile/cardinality work remains in #640.
+
+### Comparing equal windows
+
+A fixed million processes and a fixed thousand containers take different lengths
+of time. The next demonstration gives each path sixty seconds instead. The raw
+runner records each child's completion instant, stops creating children at the
+deadline, and drains its remaining children without counting their late exits.
+The public harness credits only accepted summary responses received before the
+cutoff. Its final sample is conservative: a completion accepted after that sample
+earns no credit. Submission time belongs inside the public window; image
+preparation and cancellation stay visible outside it.
+
+All paths use the same BusyBox executable and concurrency. Fresh containers buy
+independent isolation, shared containers amortise startup for repeatable trusted
+tasks, and host commands trade isolation for speed. Raw exits provide a measured
+VM reference without resource enforcement or durable outcomes. Multiplying a
+minute count by 1,440 produces a daily projection, not a daily observation.
+We then run each path for one hour at its admitted capacity, probing the same
+application and tracking resource growth, to look for saturation problems.
+
+The first equal-window run exposed the difference between completed commands
+and accepted receipts. Fresh containers couldn't finish a thousand-job receipt
+chunk in a minute, so the leader reported zero accepted successes despite real
+worker progress. The repaired recording uses one-job chunks for fresh containers
+and thousand-job chunks for fast paths. This is a disclosed receipt-amortisation
+choice, not a change to resource requests or execution concurrency. One active
+submission caps each public mode at 27 commands; a large queued count keeps it
+busy. Empty accepted windows now fail the harness. We retain the first recording
+and interrupted raw soak instead of presenting them as completed qualification.
+
+The repaired minute windows accepted 196 fresh-container jobs, 23,000 shared-
+container jobs and 246,000 host jobs, all without failures or retries. The raw
+reference completed 876,671 successful exits. The fresh stage now reports real
+progress, and the shared result is lower than the initial two-submission run: we
+keep one active submission to make total concurrency comparable. These are cold
+executor/public acceptance measurements, not the fully warmed direct runner.
+The landing page shows daily projections explicitly and keeps the raw guarantees
+separate. The [timed record](../qualification/2026-10-09-timed-job-scenarios/README.md)
+retains both attempts and the interrupted first soak.
+
+### Find the concurrency knee
+
+Twenty-seven slots came from admission arithmetic: the VM has a 3,000m job
+budget, and each native/shared context reserves 100m for the command plus 10m
+for its helper. That tells us what fits. It doesn't tell us what's fastest.
+More concurrent children can raise throughput until CPU, filesystem operations
+or the receipt path saturate. Beyond that point, queueing and context switching
+can make the result worse.
+
+The wider sweep uses 1, 4, 8, 16, 27, 32, 48 and 64 as configured caps. Every
+public mode uses the same 25m request, one-core burst limit and 32 MiB memory,
+so admission can exceed 27. Native and shared pools still admit at most 32
+contexts. We report that limit separately from the configured cap and sampled
+active commands. A task that lives for a millisecond can disappear between
+node-sync samples; those samples aren't a count of every concurrent child.
+
+Each point starts with cold executors and a warm image. One submission spans a
+60-second cold window and a second 60-second warm window. The second window
+subtracts its initial accepted counters, so it can't count the first window's
+jobs again. Cancellation, task drain and idle-context retirement finish before
+we change the next cap. Keep the full curve and repeat close candidates before
+choosing the recorded comparison's common cap.
+
+The rig is a local Lima VM on an Apple M2 Max machine with 12 physical cores and
+32 GiB host RAM. We allocate four vCPUs and 8 GiB to Ubuntu 24.04 aarch64, running
+Linux 6.8 and runc 1.4. Four guest cores are the relevant capacity here, not all
+twelve host cores. BusyBox `true` measures dispatch and process overhead; use
+your own hardware and representative commands when sizing a real workload.
+
+The curve didn't produce one winner for every runtime. Native public throughput
+reached 5,333 accepted jobs/s at 8, 16, 27 and 32, then fell at configured caps 48
+and 64. Eight is enough for that host-job plateau. Shared containers benefited
+from 27 in their second minute, winning both-order repeats, while 8–16 often
+started faster in their cold minute. Fresh containers gained little beyond 16.
+We keep 27 as a common comparison point across all four paths, and publish the
+whole [curve and repeated candidates](../qualification/2026-10-09-timed-job-scenarios/README.md#concurrency-review).
+A common cap makes the comparison fair; it isn't a universal tuning recommendation.
+The host plateau also points to work supply through bounded grants and accepted
+receipts, rather than raw process creation, as the next throughput constraint.
+
+### Put the experiment in the tool
+
+A benchmark isn't very useful if reproducing it means remembering a dozen paths
+from the developer's temporary directory. We moved the four timed scenarios
+into Relish: `relish bench --scenario jobs-shared-containers` needs no duration
+or concurrency arguments. Its defaults are 60 seconds, concurrency 27 and the
+same 25m–1000m / 32 MiB job profile used by the curve. Fresh containers, trusted
+host processes and the local Linux raw baseline have separate scenario names;
+the ordinary `relish bench` suite still works without `--scenario`.
+
+The public runner submits a single compact manifest, reads bounded summaries
+and cancels only the identities it owns. `AcceptedCounts` holds the submission
+identity, total and previous accepted counters. It rejects regressions or a
+changed total, so polling twice can't turn one success into two. An `Option`
+represents the active submission: `None` means we can submit new work; `Some`
+means we must keep observing that owner. A monotonic deadline decides whether a
+complete API response earns credit. Cancellation and its positive drain proof
+happen afterwards, without changing the count.
+
+`CancellationToken` lets Ctrl-C stop submission and observation without dropping
+the cleanup path. We don't abort an in-flight submission merely because Ctrl-C
+arrived: its response is how we learn which identity to cancel. If that response
+is lost, we keep the unique benchmark name and fail the cleanup claim. An error
+is evidence too. Mock API tests delay a response past the cutoff, fail reads and
+cancellation, and interrupt a running submission; each checks the final count
+and ownership cleanup rather than just checking a request's spelling.
+
+The baseline owns a bounded set of child waiters in a Tokio `JoinSet`. Each
+waiter returns its exit status and completion instant. Exits after the deadline
+are drained but don't earn credit. By default the baseline extracts the pinned
+BusyBox image into the user's cache before measuring, so no Bun path or fixture
+is needed. An explicit BusyBox path supports a preverified byte-identical host
+copy. Host execution still needs the node's allowlist; the benchmark cannot
+relax it. Run the baseline inside the same Linux VM as the public jobs, not on
+the laptop outside it, and verify the remote host executable's hash yourself.

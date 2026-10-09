@@ -15,9 +15,9 @@
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
-        <a href="#job-throughput">Jobs</a>
         <a href="#install">Install</a>
         <a href="#tour">Try it</a>
+        <a href="#job-throughput">Jobs</a>
         <a href="#start">Build it</a>
         <a href="#docs">Read the docs</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
@@ -52,59 +52,6 @@
           </video>
           <img class="burger burger-still" src="./assets/burger-still.webp" alt="" width="720" height="892">
         </figure>
-      </section>
-
-      <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
-        <div class="section-head">
-          <h2 id="job-throughput-title">Half a million host jobs. One built-in job path.
-            <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
-        </div>
-        <p>Submit indexed work directly, with resource admission, durable ownership,
-          retries and accepted outcomes. Choose a fresh container, opt into a shared
-          container for short commands, or explicitly select an allowlisted host
-          binary. Watch rates and backlog; query the indexes you need.</p>
-        <div class="throughput-comparison" role="region" aria-label="Measured job runtimes" tabindex="0">
-        <table><caption>One Linux VM, matching BusyBox commands. Real elapsed time;
-          accepted retries shown separately.</caption>
-          <thead><tr><th scope="col">Execution</th><th scope="col">Completed work</th><th scope="col">Time</th><th scope="col">Rate</th><th scope="col">Retries</th></tr></thead>
-          <tbody><tr><th scope="row">VM baseline</th><td>1,000,000 raw process exits</td><td>62.67s</td><td>15957.2/s</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>1,000 accepted jobs</td><td>249.62s</td><td>4.0/s</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>10,000 accepted jobs</td><td>22.73s</td><td>439.9/s</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>500,000 accepted jobs</td><td>90.44s</td><td>5528.7/s</td><td>0</td></tr></tbody>
-        </table></div>
-        <p>The three public tiers accepted 511,000 unique successes.
-          The million-process VM baseline measures exit statuses without admission,
-          resource enforcement, durable ownership or task ledgers. Its rate gap
-          includes those costs; it isn't a measurement of scheduling overhead alone.</p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:427.748000">
-          <div class="recording-screen"></div>
-          <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
-            <a href="./assets/job-throughput.cast">Download the recording</a> and play it
-            with <code>asciinema play job-throughput.cast</code>.</p></noscript>
-          <figcaption>
-            <span>Optimised 0.2.0 development binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
-              aarch64. Pinned BusyBox commands, warm images and cold executors.
-              All public tiers request 100m CPU / 32 MiB and enforce a one-core CPU limit.
-              Native and shared executor overhead is reserved as well.
-              Requested concurrency 27 remains subject to admission.
-              Real pauses are preserved; chapter jumps and playback speed change only
-              your view. Activity reflects the last worker report; chunk reports
-              produce bursts in recent rates. This demonstration does not establish
-              24-hour throughput or 100 million jobs/day.</span>
-            <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
-              <button type="button" data-start="0.001091">VM baseline</button>
-              <button type="button" data-start="64.664752">Fresh containers</button>
-              <button type="button" data-start="314.390493">Shared containers</button>
-              <button type="button" data-start="337.253091">Host jobs</button></span>
-            <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
-              <button type="button" data-speed="1" aria-pressed="true">1×</button>
-              <button type="button" data-speed="4" aria-pressed="false">4×</button>
-              <button type="button" data-speed="20" aria-pressed="false">20×</button></span>
-          </figcaption>
-        </figure>
-        <p><a href="./assets/job-throughput-report.json">Measured report</a> ·
-          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-host-job-executors">Raw results and reproduction</a> ·
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
-        <p>Use indexed inputs for data preparation, offline evaluation and independent
-          inference commands. Shared containers still start a process for every job;
-          keeping an AI model resident is a separate planned executor.</p>
       </section>
 
       <section id="install" class="section install" aria-labelledby="install-title">
@@ -182,25 +129,6 @@
                 <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
             </figcaption>
           </figure>
-          <figure id="jobs-recording" class="recording" data-cast="./assets/jobs.cast" data-poster="npt:114.196">
-            <div class="recording-screen"></div>
-            <noscript><p class="recording-fallback">The development preview plays with JavaScript.
-              <a href="./assets/jobs.cast">Download the jobs recording</a> and play it with
-              <code>asciinema play jobs.cast</code>, or follow the batch step below.</p></noscript>
-            <figcaption>
-              <span>Development preview: 1,000 small and 64 larger image jobs beside the
-                burger service, using the public CLI on a real Linux node.
-                Requests decide what fits; summaries show accepted progress.
-                This uses the unreleased <a href="https://github.com/reliaburger/reliaburger/pull/266">0.2.0 implementation</a>
-                on 4 vCPU / 8 GiB, with debug binaries. Idle pauses are cut to two seconds;
-                the recording states the actual elapsed time. This correctness demo
-                does not qualify 100 million jobs/day.</span>
-              <span class="recording-speed" role="group" aria-label="Jobs playback speed" hidden>speed
-                <button type="button" data-speed="1" aria-pressed="true">1×</button>
-                <button type="button" data-speed="2" aria-pressed="false">2×</button>
-                <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
-            </figcaption>
-          </figure>
           <!-- Only the commands fold away. Find-in-page opens a closed details element
                in Chromium and Safari, so Ctrl-F still reaches every command. -->
           <details class="tour-commands" id="tour-commands">
@@ -244,22 +172,6 @@
                   <code>linux/amd64</code> and <code>linux/arm64</code>: <code>images</code> lists
                   <code>burger:v1</code> once, with its platforms. Each order names the podinfo
                   backend that cooked it, found by its service name.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish --output json batch submit burger/jobs.toml</code>
-<code data-tour>relish batch watch 1</code>
-<code data-tour>relish batch results 2 --failed --limit 20</code>
-<code data-tour>relish manual batch</code></pre>
-                <p><strong>Development preview (0.2.0 / PR #266):</strong> queue
-                  1,000 small and 64 larger jobs beside the burger service.
-                  Use the returned manifest ID instead of <code>1</code> and the
-                  small profile’s child ID instead of <code>2</code>. CPU and memory
-                  requests decide what fits; chunk size decides how much is queued.
-                  Watch rates, backlog and duration distributions, then inspect a
-                  bounded failure page. The executable tour includes this step with
-                  <code>--jobs</code> and checks that the app still serves orders.
-                  This step needs development binaries; the 0.1.4 recording above
-                  predates it. A short demo does not qualify 100 million jobs/day.</p>
               </li>
               <li>
                 <pre><code data-tour>relish path frontend --to redis</code></pre>
@@ -330,9 +242,83 @@
         </div>
       </section>
 
-      <section id="start" class="section start" aria-labelledby="start-title">
+      <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">03 /</span>
+          <h2 id="job-throughput-title">Run millions of jobs. Choose your isolation.
+            <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
+        </div>
+        <div class="tour">
+        <p class="tour-note">Four ways to run the same command, measured on the same
+          VM with the same concurrency. Pick the isolation your work needs.</p>
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:259.912789">
+          <div class="recording-screen"></div>
+          <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
+            <a href="./assets/job-throughput.cast">Download the recording</a> and play it
+            with <code>asciinema play job-throughput.cast</code>.</p></noscript>
+          <figcaption>
+            <span>Four real 60-second windows: VM baseline, fresh containers,
+              shared containers and host jobs. Chapter jumps and playback speed
+              change only your view; preparation and cleanup stay visible.</span>
+            <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
+              <button type="button" data-start="0.007836">VM baseline</button>
+              <button type="button" data-start="62.124512">Fresh containers</button>
+              <button type="button" data-start="128.702376">Shared containers</button>
+              <button type="button" data-start="195.283696">Host jobs</button></span>
+            <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
+              <button type="button" data-speed="1" aria-pressed="true">1×</button>
+              <button type="button" data-speed="4" aria-pressed="false">4×</button>
+              <button type="button" data-speed="20" aria-pressed="false">20×</button></span>
+          </figcaption>
+        </figure>
+        <details class="tour-commands" id="job-throughput-details">
+          <summary>Show the results and setup <span class="tour-commands-note">use cases, rates and testing rig</span></summary>
+        <p>Run independent jobs in fresh, fully isolated containers. Use a shared
+          container for repeatable tasks when starting a container for every command
+          would dominate the work. Choose host jobs for maximum speed with no isolation,
+          using an explicit allowlisted binary. All three use built-in resource
+          admission, durable ownership, retries and accepted outcomes.</p>
+        <div class="throughput-comparison" role="region" aria-label="Measured job runtimes" tabindex="0">
+        <table><caption>Four scenarios, 60 seconds each. Same VM, BusyBox command
+          and concurrency cap of 27. Daily figures are extrapolated.</caption>
+          <thead><tr><th scope="col">Execution</th><th scope="col">Best for</th><th scope="col">Completed in 60 seconds</th><th scope="col">Rate</th><th scope="col">Extrapolated runs/day</th><th scope="col">Retries</th></tr></thead>
+          <tbody><tr><th scope="row">VM baseline</th><td>Measured raw-process ceiling on this VM</td><td>876,671 raw exits</td><td>14,611.2/s</td><td>1.3B</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>Fully isolated, independent jobs</td><td>196 accepted jobs</td><td>3.3/s</td><td>282.2k</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>Repeatable tasks; amortised container startup</td><td>23,000 accepted jobs</td><td>383.3/s</td><td>33.1M</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>Maximum speed for trusted commands; no isolation</td><td>246,000 accepted jobs</td><td>4,100.0/s</td><td>354.2M</td><td>0</td></tr></tbody>
+        </table></div>
+        <p>Testing rig: a local Lima VM on an Apple M2 Max host (12 physical cores,
+          32 GiB host RAM), with 4 vCPU and 8 GiB allocated to Ubuntu 24.04 aarch64,
+          Linux 6.8 and runc 1.4. These figures measure BusyBox <code>true</code>;
+          benchmark your real commands on your own hardware when sizing a cluster.</p>
+        <p>The VM baseline shows the measured raw-process ceiling for this VM and
+          command. It counts successful exits without resource enforcement,
+          durable ownership or task ledgers. Public rows count unique accepted successes
+          received within the window; their rate gap includes those guarantees.
+          Runs/day multiplies the minute count by 1,440; it isn't an observed daily total.</p>
+        <p>Optimised 0.2.0 development binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
+              aarch64. Pinned BusyBox commands, warm images and cold executors.
+              All public paths request 25m CPU / 32 MiB and enforce a one-core limit;
+              native/shared helpers reserve another 10m / 8 MiB. One active submission
+              caps each public mode at 27. Fresh containers use one-job receipt chunks;
+              fast modes use 1,000-job chunks to amortise reporting. The receipt size
+              controls reporting, not resource admission. Counts conservatively exclude
+              results after the last sample. Preparation, cancellation and verified
+              cleanup remain visible outside the 60-second windows. All windows have
+              zero failures or retries. Real pauses are preserved; chapter jumps and
+              playback speed change only your view.</p>
+
+        <p><a href="./assets/job-throughput-report.json">Measured report</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-timed-job-scenarios">Raw results and reproduction</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
+        <p>Use indexed work for data preparation, offline evaluation and independent
+          inference commands. Fresh containers keep dependencies and jobs separate;
+          shared containers reuse their environment. Each job still starts a process;
+          keeping an AI model resident is a separate planned executor.</p>
+        </details>
+        </div>
+      </section>
+
+      <section id="start" class="section start" aria-labelledby="start-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">04 /</span>
           <h2 id="start-title">Or build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
         </div>
         <div class="start-grid">
@@ -366,7 +352,7 @@ target/debug/relish</code></pre>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">04 /</span>
+          <span class="section-number" aria-hidden="true">05 /</span>
           <h2 id="docs-title">Read before you deploy <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
@@ -415,7 +401,7 @@ target/debug/relish</code></pre>
 
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">05 /</span>
+          <span class="section-number" aria-hidden="true">06 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
