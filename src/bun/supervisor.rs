@@ -688,7 +688,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_rootless_limits(
             job_name,
             spec.memory.is_some() || spec.cpu.is_some(),
-            spec.exec.is_some() || spec.script.is_some(),
+            spec.is_host(),
         )?;
 
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();

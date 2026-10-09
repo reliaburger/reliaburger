@@ -347,7 +347,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 != self
                     .supervisor
                     .grill()
-                    .runtime_kind_for_host(job.spec.exec.is_some() || job.spec.script.is_some())
+                    .runtime_kind_for_host(job.spec.is_host())
             {
                 return Err(BunError::AdoptionState(
                     "job attempt belongs to another runtime".into(),
