@@ -2020,3 +2020,59 @@ async fn cgroup_host_executor_drains_output_buffered_at_exit() {
     })
     .await;
 }
+
+/// Another local user can create any name in `/tmp`. A helper's control
+/// socket must live where only root can, or that user can block the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_sockets_cannot_be_blocked_by_other_users() {
+    use reliaburger::bun::task_executor::TaskRunner;
+    use reliaburger::grill::Grill;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-socket-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let first = runner
+        .run(
+            &shell_task(&template, 0, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
+        .instance_id
+        .clone();
+    wait_until("idle eviction retires the executor", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+    // What an unprivileged user could have done: claim the old, predictable name.
+    let squatted = std::path::Path::new("/tmp").join(format!(
+        "rbhx-{}",
+        hex::encode(Sha256::digest(id.0.as_bytes()))
+    ));
+    std::fs::write(&squatted, b"").unwrap();
+    std::os::unix::fs::lchown(&squatted, Some(65534), Some(65534)).unwrap();
+    let second = runner
+        .run(
+            &shell_task(&template, 1, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    std::fs::remove_file(&squatted).unwrap();
+    assert!(second.outcome.succeeded(), "{second:?}");
+    let directory = std::fs::symlink_metadata("/run/reliaburger/host-executors").unwrap();
+    assert!(directory.is_dir());
+    assert_eq!(directory.uid(), 0);
+    assert_eq!(directory.permissions().mode() & 0o7777, 0o711);
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}

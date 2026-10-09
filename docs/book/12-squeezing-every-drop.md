@@ -1450,11 +1450,19 @@ truncated]` line, never dropping bytes silently. The regression test makes the
 race deterministic by sending `SIGSTOP` to the helper while the command fills
 its pipe and exits.
 
-The native helper connects through a short socket address under `/tmp`. Its
-peer credentials and the owner's unreaped process identity authenticate the
-connection. We use this fixed directory because a private `TMPDIR` can become
-inaccessible after the helper drops its credentials; the regression test also
-runs with a root-only temporary directory.
+The native helper connects to Bun through a Unix socket. Its peer credentials
+and the owner's unreaped process identity authenticate the connection, so a
+stranger can't impersonate a helper. Our first version put the socket in
+`/tmp`, under a name derived from the instance identity. Authentication
+couldn't stop another local user from creating that name first, and Bun then
+refused the slot on every attempt: a cheap denial of service. Bun's own data
+directory is mode 0700, closed to the helper's uid, and a long data directory
+could overflow the 108-byte socket address. So sockets now live in
+`/run/reliaburger/host-executors`, mode 0711. The helper can pass through it,
+nobody else can list it, and only root can create names in it. Bun checks that
+it and its parent are directories only Bun can write. The regression test
+plants a file at the old `/tmp` name, owned by `nobody`, and checks the next
+command still starts.
 
 A durable owner holds the helper and its complete subtree for the lifetime of
 the slot. The existing group-commit task ledger records command outcomes. We

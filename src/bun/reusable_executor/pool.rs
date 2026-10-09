@@ -417,12 +417,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         drop(file);
         std::fs::File::open(&context.directory)?.sync_all()?;
         // Socket credentials and the durable owner's unreaped helper identity
-        // authenticate this short address. A private TMPDIR may be inaccessible
-        // after the helper drops its credentials.
-        let socket = Path::new("/tmp").join(format!(
-            "rbhx-{}",
-            hex::encode(Sha256::digest(context.id.0.as_bytes()))
-        ));
+        // authenticate this short address. Hash the executor directory too,
+        // so two Buns on one host never share a name.
+        let mut name = Sha256::new();
+        name.update(context.directory.as_os_str().as_encoded_bytes());
+        let socket = host_socket_directory()?.join(&hex::encode(name.finalize())[..32]);
         match std::fs::symlink_metadata(&socket) {
             Ok(metadata) => {
                 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -1012,6 +1011,36 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         Attempt { outcome, output }
     }
+}
+
+/// Where host helpers' control sockets live. The helper's reserved uid can
+/// traverse it but only root can create entries, so no other local user can
+/// claim a socket name first and block that executor slot, as anyone could
+/// in `/tmp`. Bun's 0700 data directory is closed to the helper, and a short
+/// fixed path keeps sockets within the 108-byte `sun_path` limit.
+const HOST_SOCKET_DIRECTORY: &str = "/run/reliaburger/host-executors";
+
+fn host_socket_directory() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let directory = PathBuf::from(HOST_SOCKET_DIRECTORY);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o711)
+        .create(&directory)?;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o711))?;
+    for path in directory.ancestors().take(2) {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir()
+            || metadata.uid() != nix::unistd::geteuid().as_raw()
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(std::io::Error::other(format!(
+                "{} must be a directory only Bun can write",
+                path.display()
+            )));
+        }
+    }
+    Ok(directory)
 }
 
 fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()> {
