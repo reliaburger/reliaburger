@@ -3,7 +3,8 @@
 A Reliaburger cluster is the same `bun` binary on every node, started with
 `--cluster`. Membership spreads by SWIM gossip. A Raft council, embedded in the
 agent, holds the desired state and schedules work; it starts on the first node
-and grows as nodes join, up to seven voters.
+and grows as nodes join, up to seven voters, or to the council size the
+cluster was created with (appliance clusters default to five).
 
 A container cluster needs Linux with rootful runc and eBPF (kernel 5.8+,
 cgroup v2, bpffs at `/sys/fs/bpf`). Bun refuses `--cluster` under rootless
@@ -57,6 +58,10 @@ relish join --token <TOKEN> --node-id node-02 \
   --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> https://<LEADER>:9117
 ```
 
+`relish join-token list` shows the tokens the council holds (node id, and
+whether each is used, expired or still valid, never the token itself), and
+`relish join-token revoke node-02` makes node-02's unused tokens worthless.
+
 `relish init` printed the root CA fingerprint; pinning it means a member
 offering a different CA is refused. `--token-file` reads the token from a
 private file instead of the command line. `join` only enrols the identity (into
@@ -88,8 +93,9 @@ for its own view: its role, recovery epoch, Raft term and log position. Above
 the table it prints the epoch, the leader and quorum (`3/3 voters, quorum
 ok`), and it lists any node that didn't answer. One node's answer can't show a
 split, so it compares them all and calls out fenced nodes, two epochs or two
-leaders. `--output json` gives the same report to scripts. `relish status` opens
-with a one-line summary of it.
+leaders. A cluster created with a council size shows it on a `Size:` line
+(`up to 5 voters`). `--output json` gives the same report to scripts. `relish
+status` opens with a one-line summary of it.
 
 The council heals itself: lose a voter and the reconciler promotes a caught-up
 node in its place. A voter whose disk is at least 95% full for ten minutes

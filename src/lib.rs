@@ -6,6 +6,7 @@
 //!
 //! Modules are added incrementally as each roadmap phase is implemented.
 
+pub mod appliance;
 pub mod brioche;
 pub mod bun;
 pub mod cluster;
@@ -23,6 +24,7 @@ pub mod meat;
 pub mod mustard;
 pub(crate) mod object_storage;
 pub mod onion;
+pub mod os;
 pub mod pickle;
 pub mod reconstruction;
 pub mod relish;

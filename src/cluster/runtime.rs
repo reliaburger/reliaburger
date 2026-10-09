@@ -98,6 +98,10 @@ pub struct ClusterParams {
     /// Initial `SecurityState` to seed into Raft on a fresh bootstrap. Only the
     /// bootstrap node sets this; it replicates to everyone else through Raft.
     pub bootstrap_security_state: Option<Box<crate::sesame::types::SecurityState>>,
+    /// How many voters the council grows to (`[cluster] council_size`).
+    /// Like the security state, only the bootstrap node commits it, once,
+    /// and it reaches every other node through Raft.
+    pub bootstrap_council_size: Option<crate::council::CouncilSize>,
     /// Node data directory; the durable Raft log/snapshot live under `{data_dir}/raft/`.
     pub data_dir: std::path::PathBuf,
     /// Local Mayo metrics store. When set, a `RollupWorker` pushes
@@ -480,7 +484,13 @@ pub async fn start(
         } else {
             params.bootstrap_security_state.as_deref()
         };
-        initialise_bootstrap(&council, members, bootstrap_security).await?;
+        initialise_bootstrap(
+            &council,
+            members,
+            bootstrap_security,
+            params.bootstrap_council_size,
+        )
+        .await?;
         if recovered_bootstrap {
             compact_recovered_log(&council).await?;
         }
@@ -935,6 +945,7 @@ async fn initialise_bootstrap(
     council: &CouncilNode,
     members: BTreeMap<u64, CouncilNodeInfo>,
     security: Option<&crate::sesame::types::SecurityState>,
+    council_size: Option<crate::council::CouncilSize>,
 ) -> std::io::Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         council.initialize(members).await.map_err(|error| {
@@ -947,6 +958,14 @@ async fn initialise_bootstrap(
                     std::io::Error::other(format!(
                         "failed to commit security bootstrap state: {error}"
                     ))
+                })?;
+        }
+        if let Some(voters) = council_size {
+            council
+                .write(crate::council::types::RaftRequest::CouncilSize { voters })
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!("failed to commit the council size: {error}"))
                 })?;
         }
         Ok(())
@@ -1321,11 +1340,15 @@ async fn reconcile_council_once(
         .iter()
         .filter_map(|id| directory.get(id).map(|e| e.node_id.clone()))
         .collect();
+    // The cluster's own council size, if it was created with one, caps the
+    // default. Every leader reads it from council state, so a failover
+    // can't grow the council past what the operator chose.
+    let selection = config.selection.sized(council.council_size().await);
     let selected = select_council_candidates(
         &snapshot,
         &present_voters,
-        config.selection.max_council_size,
-        &config.selection,
+        selection.max_council_size,
+        &selection,
         now,
     );
     let candidates: Vec<u64> = selected
@@ -1443,7 +1466,7 @@ async fn reconcile_council_once(
         change_in_flight,
         disk_pressured,
     };
-    let action = plan_council_action(&observation, &config.selection, now);
+    let action = plan_council_action(&observation, &selection, now);
     execute_council_action(council, action, &voters, &directory, config.op_timeout).await;
 }
 
@@ -1547,11 +1570,21 @@ mod tests {
             next_serial: 42,
             ..Default::default()
         };
-        initialise_bootstrap(&council, members.clone(), Some(&security))
-            .await
-            .unwrap();
+        initialise_bootstrap(
+            &council,
+            members.clone(),
+            Some(&security),
+            Some(crate::council::CouncilSize::APPLIANCE),
+        )
+        .await
+        .unwrap();
         assert_eq!(council.security_state().await.next_serial, 42);
-        let error = initialise_bootstrap(&council, members, None)
+        assert_eq!(
+            council.council_size().await,
+            Some(crate::council::CouncilSize::APPLIANCE),
+            "the bootstrap node commits the cluster's council size"
+        );
+        let error = initialise_bootstrap(&council, members, None, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("initialise"));
@@ -1575,7 +1608,9 @@ mod tests {
         .unwrap();
         router.register(1, council.raft().clone()).await;
         let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
-        initialise_bootstrap(&council, members, None).await.unwrap();
+        initialise_bootstrap(&council, members, None, None)
+            .await
+            .unwrap();
         council
     }
 
@@ -1822,6 +1857,104 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "council did not grow to 3 voters; got {voters:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciler_stops_growing_at_the_cluster_council_size() {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+
+        let router = InMemoryRaftRouter::new();
+        let names = ["node-1", "node-2", "node-3", "node-4", "node-5"];
+        let mut nodes = Vec::new();
+        for name in names {
+            let id = raft_id_from_name(name);
+            let network = InMemoryRaftNetworkFactory::new(id, router.clone());
+            let node = CouncilNode::new(
+                id,
+                crate::council::types::CouncilConfig {
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 200,
+                    election_timeout_max_ms: 400,
+                    snapshot_threshold: 100,
+                    max_in_snapshot_log_to_keep: 50,
+                },
+                network,
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+
+        // node-1 bootstraps with a three-voter council; gossip sees four
+        // warm peers, enough for the default cap of seven to take them all.
+        let self_id = raft_id_from_name("node-1");
+        let self_info = info("node-1", 9444);
+        initialise_bootstrap(
+            &nodes[0],
+            BTreeMap::from([(self_id, self_info.clone())]),
+            None,
+            Some(crate::council::CouncilSize::new(3).unwrap()),
+        )
+        .await
+        .unwrap();
+        let now = Instant::now();
+        let peers: Vec<MembershipSnapshot> = names[1..]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut peer = snap(name, 9445 + 2 * i as u16, now);
+                peer.first_seen = now - Duration::from_secs(600);
+                peer
+            })
+            .collect();
+        let (_membership_tx, membership_rx) = watch::channel(peers);
+
+        let config = fast_reconciler_config();
+        let mut tracker = HealthTracker::default();
+        let mut deposition_throttle = DepositionThrottle::default();
+        let no_pressure = BTreeSet::new();
+        let membership = |node: &CouncilNode| {
+            let metrics = node.metrics().borrow().clone();
+            let membership = metrics.membership_config.membership().clone();
+            let voters: BTreeSet<u64> = membership.voter_ids().collect();
+            let all: BTreeSet<u64> = membership.nodes().map(|(id, _)| *id).collect();
+            (voters, all)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut settled_ticks = 0;
+        while settled_ticks < 10 {
+            reconcile_council_once(
+                &nodes[0],
+                &membership_rx,
+                1,
+                self_id,
+                &self_info,
+                &config,
+                &mut tracker,
+                &mut deposition_throttle,
+                &no_pressure,
+            )
+            .await;
+            let (voters, all) = membership(&nodes[0]);
+            assert!(voters.len() <= 3, "council grew past 3: {voters:?}");
+            assert!(
+                all.len() <= 3,
+                "a fourth member joined as a learner: {all:?}"
+            );
+            if voters.len() == 3 {
+                settled_ticks += 1;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "council did not reach 3 voters; got {voters:?}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

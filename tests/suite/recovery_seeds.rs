@@ -37,6 +37,7 @@ async fn start_with_a_seed(
             seeds: vec!["127.0.0.1:9".parse().unwrap()],
             wrapping_ikm: None,
             bootstrap_security_state,
+            bootstrap_council_size: None,
             data_dir: data_dir.into(),
             mayo: None,
             rollup_interval: Duration::from_secs(60),

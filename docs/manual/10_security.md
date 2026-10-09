@@ -49,6 +49,23 @@ Rootless Bun and macOS don't run the perimeter, so the setting has no effect
 there. The laptop quickstart doesn't need it either: it reaches each node's API
 through a port forward that arrives on the node's loopback.
 
+### Letting new nodes in
+
+A node that hasn't joined yet isn't a member, so the perimeter drops it unless
+it's in `bootstrap_peers`. List the nodes you know about, or the network that
+nodes you add later will join from:
+
+```toml
+[security]
+bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.0/24"]
+```
+
+- It opens the API and cluster ports (9117, 9443-9445) to them, not container
+  host ports. Joining still needs a join token, and every cluster port is mTLS.
+- Entries follow the `operator_cidrs` rules: bare addresses or CIDRs, IPv4 or
+  IPv6, no `/0` and no host bits set.
+- Releases up to 0.1.2 take bare addresses only.
+
 ## API tokens
 
 ```sh

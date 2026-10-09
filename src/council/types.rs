@@ -339,6 +339,19 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
+    /// Start or advance an appliance OS rollout (W6).
+    OsRolloutUpdate {
+        rollout: Box<crate::os::rollout::OsRollout>,
+    },
+    /// Finish an OS rollout: archive it to history and clear the slot.
+    OsRolloutClear { rollout_id: String },
+    /// Set how many voters the council grows to, cluster-wide. The node
+    /// that bootstraps an appliance cluster commits it straight after the
+    /// security state, so every later leader's reconciler reads the same
+    /// size.
+    CouncilSize {
+        voters: crate::council::selection::CouncilSize,
+    },
     /// Remove the API tokens that expired more than
     /// [`crate::sesame::token::EXPIRED_TOKEN_GRACE`] before `now_unix_ms`.
     /// The leader proposes it on a timer; the state machine decides what to
@@ -528,6 +541,13 @@ pub struct DesiredState {
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
     pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
+    /// The appliance OS rollout in progress, if any. At most one, and never
+    /// at the same time as a bun upgrade.
+    #[serde(default)]
+    pub os_rollout: Option<crate::os::rollout::OsRollout>,
+    /// Finished OS rollouts, newest last (bounded to 20).
+    #[serde(default)]
+    pub os_rollout_history: Vec<crate::os::rollout::OsRollout>,
     /// Durable batch tracker: monotonic id counter plus in-flight and
     /// recently terminal batches (12b.2 JOB4).
     pub batch_state: crate::meat::batch_tracker::BatchDurableState,
@@ -564,6 +584,11 @@ pub struct DesiredState {
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
+    /// How many voters the council grows to, when the cluster was created
+    /// with a size (`relish cluster create --bare-metal --council-size`).
+    /// `None` keeps the reconciler's default cap of seven.
+    #[serde(default)]
+    pub council_size: Option<crate::council::selection::CouncilSize>,
     /// Migration intent, retained across handover when the outcome is uncertain.
     /// Missing ownership state is refused rather than decoded as an empty fence.
     #[serde(deserialize_with = "super::prerequisites::deserialize_claims")]

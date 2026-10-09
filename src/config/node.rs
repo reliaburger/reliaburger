@@ -314,9 +314,12 @@ pub struct SecuritySection {
     /// identity on disk, and a joiner starts in enrollment mode until
     /// `relish join` installs one.
     pub require_mtls: bool,
-    /// Known joining peers allowed through the perimeter to management and cluster
-    /// ports before membership exists. Does not change protocol authentication.
-    pub bootstrap_peers: Vec<std::net::IpAddr>,
+    /// Joining peers allowed through the perimeter to management and cluster
+    /// ports before membership exists: bare addresses, or IPv4/IPv6 CIDRs for
+    /// a network new nodes may join from (a fleet that grows later). Container
+    /// host ports stay closed to them. `/0` and CIDRs with host bits set are
+    /// rejected at load. Does not change protocol authentication.
+    pub bootstrap_peers: Vec<String>,
     /// Operator networks allowed through the perimeter firewall to this node's
     /// API port (`--listen`, default 9117) and to no other port. IPv4 or IPv6
     /// CIDRs, or bare addresses for a single host. `/0` and CIDRs with host
@@ -524,6 +527,10 @@ pub struct ClusterSection {
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2
     /// D21/CP12). Off by default; set `url` to enable.
     pub backup: crate::council::backup::BackupConfig,
+    /// How many voters the council grows to: an odd number from 1 to 7.
+    /// Read only by the node that bootstraps the cluster, which commits it
+    /// to the council; unset keeps the default cap of seven.
+    pub council_size: Option<crate::council::CouncilSize>,
 }
 
 impl Default for ClusterSection {
@@ -536,6 +543,7 @@ impl Default for ClusterSection {
             reporting_port: 9445,
             environment: None,
             backup: crate::council::backup::BackupConfig::default(),
+            council_size: None,
         }
     }
 }
@@ -1442,6 +1450,20 @@ mod tests {
         assert_eq!(nc.cluster.name, "default");
         // All other sections have defaults
         assert_eq!(nc.storage, StorageSection::default());
+    }
+
+    #[test]
+    fn cluster_council_size_is_unset_unless_given_and_must_be_odd() {
+        assert_eq!(NodeConfig::default().cluster.council_size, None);
+        let five = NodeConfig::parse("[cluster]\ncouncil_size = 5").unwrap();
+        assert_eq!(
+            five.cluster.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
+        let error = NodeConfig::parse("[cluster]\ncouncil_size = 4")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pick an odd size from 1 to 7"), "{error}");
     }
 
     #[test]

@@ -453,14 +453,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // the *set* changes — a node swap keeps the count constant (M18) —
         // and always on the first pass (`None`), so a standalone node with
         // no peers still gets the firewall applied.
-        let cluster_nodes = self.collect_cluster_node_ips();
-        if self.last_firewall_nodes.as_ref() == Some(&cluster_nodes) {
+        let inputs = crate::firewall::rules::PerimeterInputs {
+            nodes: self.collect_cluster_node_ips(),
+            admitted: self.join_windows.active(std::time::Instant::now()),
+        };
+        if self.last_firewall_inputs.as_ref() == Some(&inputs) {
             return;
         }
 
         let ruleset = match crate::firewall::rules::generate_ruleset(
-            &self.perimeter_config,
-            &cluster_nodes,
+            &inputs.config(&self.perimeter_config),
+            &inputs.nodes,
         ) {
             Ok(ruleset) => ruleset,
             Err(e) => {
@@ -471,7 +474,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
-        self.spawn_perimeter_apply(ruleset, cluster_nodes);
+        self.spawn_perimeter_apply(ruleset, inputs);
     }
 
     /// Withdraw local routing and poll request release without blocking the agent loop.

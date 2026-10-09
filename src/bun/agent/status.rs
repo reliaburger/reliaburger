@@ -197,6 +197,10 @@ pub struct CouncilStatus {
     /// Index of the last entry in the answering node's log.
     #[serde(default)]
     pub last_log_index: Option<u64>,
+    /// How many voters the council grows to, when the cluster was created
+    /// with a size (`DesiredState::council_size`).
+    #[serde(default)]
+    pub council_size: Option<crate::council::CouncilSize>,
 }
 
 /// Work out a node's council role from its Raft metrics and recovery fence.
@@ -258,6 +262,7 @@ pub async fn council_status(
         recovery_epoch: fence.and_then(|fence| fence.claimed_epoch()),
         fenced_by: fence.and_then(|fence| fence.fenced_by()),
         last_log_index: metrics.last_log_index,
+        council_size: desired.council_size,
     }
 }
 

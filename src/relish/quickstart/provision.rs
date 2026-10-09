@@ -60,10 +60,13 @@ pub fn vm_config(
 /// whenever they differ by more than 100 ms, and has no setting to turn
 /// that off. With systemd-timesyncd also running, the two fought: timesyncd
 /// slewed the clock forward at its +500 ppm limit and the agent stepped it
-/// back every 10 s (#608). The release image ships timesyncd disabled; this
-/// covers the stock Ubuntu image of development runs.
-const ONE_CLOCK_SOURCE: &str = "if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then\n  \
-     systemctl disable --now systemd-timesyncd.service\nfi\n";
+/// back every 10 s (#608). Ubuntu 26.04 replaced timesyncd with chrony,
+/// which would fight the agent the same way. The release image ships its
+/// time daemon disabled; this covers the stock Ubuntu image of development
+/// runs, whichever daemon it has.
+const ONE_CLOCK_SOURCE: &str = "for service in chrony.service systemd-timesyncd.service; do\n  \
+     if systemctl cat \"$service\" >/dev/null 2>&1; then\n    \
+     systemctl disable --now \"$service\"\n  fi\ndone\n";
 
 /// Shell that installs the node packages unless the image already has them.
 ///
@@ -106,7 +109,7 @@ pub fn node_config(
     config.cluster.join = seed.into_iter().map(|ip| format!("{ip}:9443")).collect();
     config.network.advertise_address = Some(address.to_string());
     config.security.require_mtls = true;
-    config.security.bootstrap_peers = peers.iter().copied().map(std::net::IpAddr::V4).collect();
+    config.security.bootstrap_peers = peers.iter().map(ToString::to_string).collect();
     config.security.allow_insecure_cluster = false;
     config.security.identity_dir = Some("/etc/reliaburger/identity".into());
     config.security.master_key_path = Some("/etc/reliaburger/master.key".into());
@@ -315,14 +318,17 @@ mod tests {
     fn provisioning_leaves_the_guest_clock_to_the_lima_guest_agent() {
         // Lima's guest agent steps the clock to the host's every 10 s and
         // can't be switched off; timesyncd slewing the other way made the
-        // two fight, stepping the clock back every 10 s (#608).
+        // two fight, stepping the clock back every 10 s (#608). Ubuntu
+        // 26.04 runs chrony instead, which would fight the agent the same way.
         let calls = run_provisioning(None).systemctl;
-        assert!(
-            calls
-                .iter()
-                .any(|call| call == "disable --now systemd-timesyncd.service"),
-            "{calls:?}"
-        );
+        for service in ["chrony.service", "systemd-timesyncd.service"] {
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call == &format!("disable --now {service}")),
+                "{service}: {calls:?}"
+            );
+        }
     }
 
     #[test]
@@ -346,7 +352,7 @@ mod tests {
         assert!(node.security.require_mtls);
         assert_eq!(
             node.security.bootstrap_peers,
-            vec!["192.168.104.3".parse::<std::net::IpAddr>().unwrap()]
+            vec!["192.168.104.3".to_string()]
         );
         assert!(!node.security.allow_insecure_cluster);
         assert!(node.security.bootstrap_path.is_some());

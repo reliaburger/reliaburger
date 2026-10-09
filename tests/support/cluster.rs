@@ -359,6 +359,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             seeds,
             wrapping_ikm: None,
             bootstrap_security_state: None,
+            bootstrap_council_size: None,
             data_dir,
             mayo: mayo.clone(),
             rollup_interval: metrics_rollup.unwrap_or(Duration::from_secs(60)),

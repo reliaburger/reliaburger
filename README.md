@@ -77,9 +77,26 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
+- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md)
+  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines
+  - `relish image download`: Download the newest OS build for every architecture and check it against the release key
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster
+- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network
+  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them)
+- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node
+  - `relish os list`: Each node's OS version, and the newest release
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots
+  - `relish os status`: The rollout in progress, or the last one
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id
 - `relish nodes`: List cluster nodes and their gossip state
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)

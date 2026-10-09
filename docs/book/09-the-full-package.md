@@ -1405,9 +1405,9 @@ architecture with the release key:
 reliaburger guest image v1
 version v0.1.0
 arch aarch64
-asset reliaburger-guest-ubuntu-24.04-20260911-aarch64.qcow2
+asset reliaburger-guest-ubuntu-26.04-20260927-aarch64.qcow2
 sha256 …
-source-sha256 7b682958…
+source-sha256 63a93bd5…
 ```
 
 The CLI downloads `guest-image-metadata.json`, rebuilds that text itself and
@@ -1555,23 +1555,24 @@ clock for a laptop anyway:
   earlier without one, so `netem` was at most the trigger there.
 
 So the guest image ships with timesyncd switched off. `build_guest_image.sh`
-runs `systemctl disable systemd-timesyncd.service` in the chroot, which only
-removes symlinks and so works without a running systemd. The VM's
-provisioning script does the same for the stock Ubuntu image of development
-runs:
+ran `systemctl disable systemd-timesyncd.service` in the chroot, which only
+removes symlinks and so works without a running systemd. (Since the guest
+moved to Ubuntu 26.04 the unit it disables is `chrony.service`; more on that
+below.) The VM's provisioning script does the same for the stock Ubuntu image
+of development runs, for whichever of the two daemons the image has:
 
 ```rust
-const ONE_CLOCK_SOURCE: &str =
-    "if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then\n  \
-     systemctl disable --now systemd-timesyncd.service\nfi\n";
+const ONE_CLOCK_SOURCE: &str = "for service in chrony.service systemd-timesyncd.service; do\n  \
+     if systemctl cat \"$service\" >/dev/null 2>&1; then\n    \
+     systemctl disable --now \"$service\"\n  fi\ndone\n";
 ```
 
 A `const` is a value the compiler bakes in. `&str` is a borrowed string, and
 for a literal the borrow lasts for the whole program (its full type is
 `&'static str`), so it needs no allocation and no owner. The trailing `\` in a
 Rust string literal swallows the line break and the next line's leading
-spaces, which is why the shell's indentation is written out as two spaces
-before it.
+spaces, which is why the shell's indentation is written out before it. `\"`
+puts a double quote inside the literal, as it would in C or Go.
 
 The trade-off is that we inherit Lima's bugs. Its agent compares its own
 clock with the host's timestamp after the message has crossed into the VM, so
@@ -1581,12 +1582,49 @@ with a fix proposed upstream). Without timesyncd pushing the other way that
 happens only under load, not every 10 seconds for the rest of the night.
 
 How do we know it stays fixed? The provisioning test runs the script against
-a stub `systemctl` that logs its arguments and expects `disable --now
-systemd-timesyncd.service` among them, and the guest image test checks the
-build script disables the unit before it seals the image. On real VMs, the
-soak's guest report now prints whether timesyncd is active, which fails the
-check outright, and counts the `SyncTime` steps the guest agent logged since
+a stub `systemctl` that logs its arguments and expects `disable --now`
+for both daemons among them, and the guest image test checks the build script
+disables chrony before it seals the image. On real VMs, the soak's guest
+report now prints whether timesyncd or chrony is active, either of which fails
+the check outright, and counts the `SyncTime` steps the guest agent logged since
 the last report. The record lists the total per node.
+
+### Following the appliance to Ubuntu 26.04
+
+Chapter 15a builds an appliance OS on Ubuntu 26.04. For 0.3.0 the quickstart guest moved to the same release, so a laptop cluster and a rack of thin clients run the same kernel (7.0), runc (1.4) and nftables (1.1.6) from the same archive. Bugs in one place should be bugs in the other.
+
+The move itself is a change to `guest-images.json`: two new dated URLs under `releases/resolute/release-20260927/`, each with the SHA-256 from Canonical's `SHA256SUMS`, and checked against the bytes we downloaded. `resolute` is 26.04's codename, as `noble` was 24.04's. The tests that knew the old release name had to learn the new one, and that was the easy part. Building and booting the result found three things the pins couldn't.
+
+**The disk was full.** The first image build died in `dpkg` with `No space left on device`. Ubuntu's 26.04 cloud image has a 2.5 GiB root filesystem with 160 MiB free, and our seven packages need about 270 MiB, mostly Buildah and what it pulls in. On a running VM that never matters, because cloud-init grows the filesystem to fill Lima's 10 GiB disk at first boot. In our chroot nothing grows it. So the build script now adds 1 GiB to the raw copy (`truncate` makes it sparse, so it costs nothing until it's used), moves the root partition's end with `growpart` and grows the filesystem with `resize2fs`. The compressed aarch64 image came out at 1009 MiB, 107 MiB more than Ubuntu's.
+
+**The clock had a new owner.** Ubuntu 25.10 replaced systemd-timesyncd with chrony, so 26.04 has no timesyncd to disable, and `systemctl disable systemd-timesyncd.service` in the chroot would have failed the build. Chrony would fight Lima's guest agent just as timesyncd did. The build disables `chrony.service` instead, and provisioning disables whichever of the two a stock image has. The soak's guest report checks both.
+
+**The first boot took two minutes.** A VM from the new image reached `READY` only after `systemd-networkd-wait-online` gave up at its 120 s timeout. The journal told the story:
+
+```text
+virtio_net virtio0 enp0s1: renamed from eth0
+...
+cloud-init: Failed to rename devices: [busy] Error renaming mac=52:55:55:5d:8a:cb from enp0s1 to eth0
+systemd-networkd-wait-online: Timeout occurred while waiting for network connectivity.
+```
+
+26.04's initrd is built by dracut, and it starts systemd-networkd, so the NIC is already up under its predictable name, `enp0s1`, when the real root takes over. Lima's network config asks cloud-init for `eth0`. cloud-init refuses to rename an interface that's up, and netplan then waits for an `eth0` that never comes. On the second boot everything works, because by then netplan has left a `.link` file behind and udev renames the interface itself, up or not. The stock image does exactly the same thing. Our first quickstart run only got through because its boot watchdog restarted the VM.
+
+The fix is the file netplan would have written, put there before first boot:
+
+```ini
+[Match]
+Driver=virtio_net
+
+[Link]
+Name=eth0
+```
+
+A quickstart VM has exactly one NIC, so matching on the driver is enough. With it, a VM from the new image went from `limactl start` to `READY` in 19 s, and the 2-minute wait was gone. Development runs still boot the stock image, which has no such file. Their first boot loses the rename and setup restarts the VM once, which costs time but not correctness.
+
+One more surprise was in our own build, not in Ubuntu. Building `bun` inside a 26.04 VM got us a binary whose eBPF objects kernel 7.0's verifier refused, and Chapter 3 tells that story. Release builds still compile on Ubuntu 22.04 with an older clang, so they weren't affected, but now the build pins the instruction set either way.
+
+What about one package list for the guest and the appliance? mkosi reads its `Packages=` from an INI-style file, not JSON, so generating one from the other would mean a build step for each. We kept the two files and made a test hold them together instead. `test_guest_images.py` parses `image/mkosi.conf` and fails if the guest's packages, less Buildah, aren't exactly the appliance's node packages. Buildah stays guest-only, because the five-minute tour builds images on the laptop cluster.
 
 ### Status from any node
 

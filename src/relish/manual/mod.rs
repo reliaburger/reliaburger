@@ -133,6 +133,34 @@ mod tests {
     }
 
     #[test]
+    fn appliance_and_netboot_find_the_bare_metal_chapter() {
+        let chapters = assets::chapters();
+        let index = find_chapter(&chapters, "appliance").unwrap();
+        assert_eq!(chapters[index].file, "15_appliance.md");
+        assert_eq!(find_chapter(&chapters, "netboot").unwrap(), index);
+        // relish serves the images, creates the cluster and seeds the fleet.
+        let markdown = &chapters[index].markdown;
+        assert!(markdown.contains("sudo relish netboot os"));
+        assert!(!markdown.contains("image/tools/netboot-server.sh"));
+        assert!(markdown.contains("relish cluster create --bare-metal"));
+        assert!(markdown.contains("relish image seed"));
+        assert!(markdown.contains("relish machines claim"));
+    }
+
+    #[test]
+    fn the_bare_metal_chapter_describes_shipped_commands_not_a_preview() {
+        let chapters = assets::chapters();
+        let chapter = &chapters[find_chapter(&chapters, "appliance").unwrap()];
+        assert_eq!(chapter.title, "Bare metal: the appliance and netboot");
+        let markdown = chapter.markdown.to_lowercase();
+        assert!(!markdown.contains("preview"));
+        // The preview scripts are retired, and a node serving netboot
+        // (`relish netboot --node`) was dropped rather than built.
+        assert!(!markdown.contains("image/tools"));
+        assert!(!markdown.contains("netboot --node"));
+    }
+
+    #[test]
     fn chapters_resolve_by_short_name_part_or_title() {
         let chapters = assets::chapters();
         let file = |query: &str| {

@@ -515,6 +515,7 @@ impl FenceNode {
                 seeds: seeds.clone(),
                 wrapping_ikm: None,
                 bootstrap_security_state: None,
+                bootstrap_council_size: None,
                 data_dir: fence_data_dir(index),
                 mayo: None,
                 rollup_interval: Duration::from_secs(60),

@@ -129,6 +129,7 @@ async fn start_node_with_mayo(
             seeds,
             wrapping_ikm: None,
             bootstrap_security_state: None,
+            bootstrap_council_size: None,
             data_dir,
             mayo,
             // Fast rollups so tests observe delivery quickly.
@@ -211,6 +212,7 @@ async fn start_mtls_node(
             seeds,
             wrapping_ikm: Some([42; 32]),
             bootstrap_security_state: None,
+            bootstrap_council_size: None,
             data_dir,
             mayo: None,
             rollup_interval: Duration::from_millis(300),

@@ -5,7 +5,7 @@ on:
     branches: [main]
   workflow_dispatch:
   pull_request:
-    branches: [main, "codex/**"]
+    branches: [main, "codex/**", "feat/appliance-*"]
 
 # PR updates supersede earlier checks. Main/candidate runs retain their own group.
 # Fixed prefixes also keep reusable source CI separate from its release caller.
@@ -159,7 +159,7 @@ jobs:
       - name: Install image tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-utils
+          sudo apt-get install -y -qq qemu-utils cloud-guest-utils
       - name: Build the guest image
         env:
           ARCH: ${{ matrix.arch }}

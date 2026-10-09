@@ -423,6 +423,15 @@ impl CouncilNode {
         self.state_machine.desired_state().await.security_state
     }
 
+    /// How many voters the council grows to, if the cluster was created
+    /// with a size. Borrows the state rather than cloning it, so the
+    /// reconciler can ask on every tick.
+    pub async fn council_size(&self) -> Option<crate::council::CouncilSize> {
+        self.state_machine
+            .read_desired(|state| state.council_size)
+            .await
+    }
+
     /// Whether an operator has permanently retired this node identity.
     /// Cheap enough to call on every request: it borrows, never clones.
     pub async fn is_node_retired(&self, node_id: &str) -> bool {

@@ -329,5 +329,112 @@ class RetargetTests(unittest.TestCase):
         self.assertIn("github.workflow", group)
 
 
+class ApplianceTests(unittest.TestCase):
+    """appliance.yml: lab builds carry a next version and a lab channel for
+    the Wyse lab, without loosening how a published build is signed."""
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "appliance.yml").read_text()
+        self.jobs = jobs(self.text)
+        self.image = steps(self.jobs["image"])
+
+    def step(self, name):
+        found = [s for s in self.image if f"- name: {name}" in s]
+        self.assertEqual(len(found), 1, name)
+        return found[0]
+
+    def test_nothing_publishes_on_a_schedule_until_v0_3_0_is_promoted(self):
+        # Maintainer, 7 October 2026: the weekly publish stays off until
+        # v0.3.0 is promoted, so the train landing on main publishes nothing
+        # by itself. A dispatch with `publish` is the only way to publish.
+        triggers = self.text.split("\njobs:", 1)[0]
+        self.assertNotRegex(triggers, r"(?m)^\s+schedule:")
+        self.assertNotRegex(triggers, r"(?m)^\s+- cron:")
+
+    def test_only_main_publishes(self):
+        plan = self.jobs["plan"]
+        self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]', plan)
+        self.assertIn("needs.plan.outputs.publish == 'true'", self.jobs["sign"])
+
+    def test_the_release_key_stays_in_the_sign_job_which_runs_only_first_party_actions(self):
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                if name == "sign":
+                    self.assertEqual(job.count("secrets.RELIABURGER_RELEASE_KEY"), 1)
+                else:
+                    self.assertNotIn("RELIABURGER_RELEASE_KEY", job)
+        actions = re.findall(r"uses: ([^@\s]+)@", self.jobs["sign"])
+        self.assertTrue(actions)
+        for action in actions:
+            self.assertTrue(action.startswith("actions/"), action)
+
+    def test_lab_builds_sign_a_lab_channel_for_the_next_version_with_the_runs_key(self):
+        sign = self.step("Sign (throwaway key)")
+        self.assertIn("if: env.PUBLISH != 'true'", sign)
+        self.assertRegex(sign, r"scripts/release/os_release\.py\"? lab-channel")
+        self.assertIn('--version "$NEXT_VERSION"', sign)
+        # The channel is checked with the run's public key, and the private
+        # key is gone before any test runs.
+        self.assertIn("os-channel.json.sig", sign)
+        self.assertLess(sign.index("lab-channel"), sign.index('rm -f "$RUNNER_TEMP/spike.key"'))
+        self.assertIn('"$RUNNER_TEMP/spike.der"', sign.split("rm -f", 1)[1])
+
+    def test_the_next_version_is_built_for_every_x86_64_lab_build(self):
+        build = self.step("Build the next version (x86-64 lab builds)")
+        self.assertIn("env.PUBLISH != 'true'", build)
+        # Not only when relish was built from source: a dispatch naming a
+        # bun release gets a next version too.
+        self.assertNotIn("source-bin", build.split("run:")[0])
+
+    def test_the_next_version_is_uploaded_as_a_release_tree(self):
+        upload = self.step("Upload the next version")
+        self.assertIn("name: appliance-x86_64-next", upload)
+        self.assertIn("lab-release", upload)
+        self.assertIn("if: env.NEXT_VERSION != ''", upload)
+        self.assertIn("lab-release.sh", self.step("Lay out the next version as a release"))
+
+    def test_dispatched_lab_builds_keep_their_artefacts_a_week(self):
+        for name in ["Upload the image", "Upload the next version"]:
+            with self.subTest(step=name):
+                self.assertIn("github.event_name == 'workflow_dispatch' && 7",
+                              self.step(name))
+        # A published build's artefacts still last three days: they go into
+        # its releases within the run.
+        self.assertIn("env.PUBLISH == 'true' && 3", self.step("Upload the image"))
+
+    def test_every_x86_64_lab_build_makes_a_broken_version_signed_with_the_runs_key(self):
+        # #406: the fallback test, and the Wyse lab's, need a broken version
+        # the run's own images trust, sorting above the next version.
+        build = self.step("Build a broken version (x86-64 lab builds)")
+        self.assertIn("if: env.NEXT_VERSION != ''", build)
+        self.assertIn("+ 2 ))", build)
+        self.assertIn('--extra-tree "$GITHUB_WORKSPACE/image/tests/broken-bun"', build)
+        self.assertIn('"$RUNNER_TEMP"/broken/*.SHA256SUMS', self.step("Sign (throwaway key)"))
+        lay_out = self.step("Lay out the next version as a release")
+        self.assertIn('"$RUNNER_TEMP/broken" "$BROKEN_VERSION"', lay_out)
+
+    def test_both_kinds_of_broken_build_break_bun_the_same_way(self):
+        self.assertIn("image/tests/broken-bun/", self.step("Break bun on purpose (spike S4)"))
+        conf = (REPO / "image/tests/broken-bun/usr/lib/systemd/system"
+                / "reliaburger.service.d/50-broken.conf").read_text()
+        self.assertIn("ExecStart=\nExecStart=/bin/false", conf)
+
+    def test_the_fallback_test_runs_on_every_x86_64_lab_build(self):
+        # Every pull request run, so the release train and its gate run it.
+        fallback = self.step("OS fallback (x86-64, KVM)")
+        condition = fallback.split("if:", 1)[1].split("\n", 1)[0]
+        self.assertIn("env.BROKEN_VERSION != ''", condition)
+        self.assertNotIn("event_name", condition)
+        self.assertIn('"$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback', fallback)
+        self.assertIn("timeout-minutes:", fallback)
+        branches = re.search(r"pull_request:\n(?:\s+#.*\n)*\s+branches: (\[.*\])", self.text)
+        self.assertIn('"release-*"', branches.group(1))
+
+    def test_the_boot_test_uses_the_wyse_sized_disk(self):
+        boot = self.step("Boot test")
+        self.assertIn(". image/tests/disk.sh", boot)
+        self.assertIn("disk_from_image", boot)
+
+
 if __name__ == "__main__":
     unittest.main()

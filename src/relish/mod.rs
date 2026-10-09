@@ -1,3 +1,4 @@
+pub mod bare_metal;
 pub mod bench_cmd;
 pub mod ca_cmd;
 /// Relish CLI library.
@@ -15,6 +16,7 @@ pub mod dev;
 pub mod diff;
 pub mod fault;
 pub mod fmt;
+pub mod image;
 pub mod inspect;
 pub mod install;
 #[cfg(feature = "kubernetes")]
@@ -32,9 +34,12 @@ pub mod k8s_export;
 )]
 pub mod k8s_import;
 pub mod local_context;
+pub mod machines;
 pub mod manifest;
 pub mod manual;
 pub mod metrics_cmd;
+pub mod netboot;
+pub mod os;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;
@@ -155,6 +160,22 @@ pub enum RelishError {
     #[error("cluster initialisation failed: {0}")]
     InitFailed(String),
 
+    /// A new bare-metal cluster's master-key backup can't be confirmed:
+    /// no `--yes` and no terminal to ask at.
+    #[error(
+        "the master key in {} needs backing up before the cluster starts: run this in a terminal to confirm, or pass --yes once you've arranged its backup",
+        .secrets.display()
+    )]
+    BackupConfirmationRequired { secrets: std::path::PathBuf },
+
+    /// The operator's input ended before they confirmed the master-key
+    /// backup.
+    #[error(
+        "the master-key backup wasn't confirmed, so the cluster wasn't started: remove {} and create it again",
+        .directory.display()
+    )]
+    BackupNotConfirmed { directory: std::path::PathBuf },
+
     /// TOML formatting failed.
     #[error("format failed: {0}")]
     FormatFailed(String),
@@ -193,6 +214,10 @@ pub enum RelishError {
     /// `relish uninstall` refused or could not remove something.
     #[error("{0}")]
     Uninstall(#[from] uninstall::UninstallError),
+
+    /// `relish netboot` refused to start or failed.
+    #[error("{0}")]
+    Netboot(#[from] netboot::NetbootError),
 
     /// `relish manual CHAPTER` named no single chapter.
     #[error("{0}")]

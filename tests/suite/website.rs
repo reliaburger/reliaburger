@@ -151,6 +151,74 @@ fn every_tour_command_parses_with_the_real_cli() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+/// The text of every `<code data-netboot>` element: the netboot section's
+/// commands, with any leading `sudo` dropped.
+fn netboot_commands() -> Vec<String> {
+    let page = read("docs/website/index.html");
+    let mut commands = Vec::new();
+    let mut rest = page.as_str();
+    while let Some(start) = rest.find("<code data-netboot>") {
+        rest = &rest[start + "<code data-netboot>".len()..];
+        let end = rest.find("</code>").expect("unterminated netboot command");
+        let command = decode(&strip_tags(&rest[..end]));
+        commands.push(
+            command
+                .strip_prefix("sudo ")
+                .unwrap_or(&command)
+                .to_string(),
+        );
+        rest = &rest[end..];
+    }
+    commands
+}
+
+#[test]
+fn every_netboot_command_parses_with_the_real_cli() {
+    let commands = netboot_commands();
+    assert!(
+        commands.len() >= 5,
+        "found only {commands:?}; did the markup change?"
+    );
+    let failures: Vec<String> = commands
+        .iter()
+        .filter_map(|command| {
+            parses(command)
+                .err()
+                .map(|error| format!("{command}\n{error}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The netboot recording is on show, like the tour's, its file is on the
+/// site, and only the commands fold.
+#[test]
+fn the_netboot_recording_is_always_visible_and_only_its_commands_fold() {
+    let page = read("docs/website/index.html");
+    let figure = page
+        .find("id=\"netboot-recording\"")
+        .expect("no netboot recording");
+    assert!(
+        !details_ranges(&page)
+            .iter()
+            .any(|range| range.contains(&figure)),
+        "the netboot recording sits inside a <details>"
+    );
+    let fold = page
+        .find("id=\"netboot-commands\"")
+        .expect("no netboot commands");
+    assert!(
+        fold > figure,
+        "the netboot commands come after the recording"
+    );
+    assert!(
+        repository()
+            .join("docs/website/assets/netboot.cast")
+            .is_file(),
+        "docs/website/assets/netboot.cast is missing"
+    );
+}
+
 #[test]
 fn homepage_and_manual_show_the_same_tour() {
     let homepage = homepage_commands();
@@ -376,6 +444,7 @@ fn every_section_can_be_linked_to() {
     for id in [
         "install",
         "tour",
+        "netboot",
         "start",
         "docs",
         "internals",

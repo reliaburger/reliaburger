@@ -432,6 +432,12 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
         .unwrap();
     let follower = (leader + 1) % 3;
     let http = reqwest::Client::new();
+    // Registering a schedule marks the minute it lands in as already
+    // observed. A request sent in the last moments of a minute can land in
+    // the target minute and skip it, so start well inside one.
+    while time::OffsetDateTime::now_utc().second() >= 45 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     // One upcoming minute, so a later legitimate occurrence cannot look like a duplicate.
     let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
     let expression = format!(
@@ -466,19 +472,31 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
     eprintln!("common cluster: UTC cron admitted run {id}; moving leadership");
     // Trigger a real election while keeping all workers and quorum alive.
     // Removing a voter is not a handover: the self-healing council may restore it.
-    nodes[follower]
-        .council
-        .raft()
-        .trigger()
-        .elect()
-        .await
-        .unwrap();
+    // One election doesn't always move leadership: voters refuse a candidate
+    // while the leader's lease holds, or while their log is ahead of the
+    // candidate's, and the old leader can win the election that follows its
+    // step-down. So ask again every two seconds until another node leads.
+    let mut last_election: Option<tokio::time::Instant> = None;
     wait_until(
         "replacement cron leader",
         Duration::from_secs(30),
         async || {
-            nodes[follower].council.is_leader().await
+            if nodes[follower].council.is_leader().await
                 || nodes[(leader + 2) % 3].council.is_leader().await
+            {
+                return true;
+            }
+            if last_election.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+                nodes[follower]
+                    .council
+                    .raft()
+                    .trigger()
+                    .elect()
+                    .await
+                    .unwrap();
+                last_election = Some(tokio::time::Instant::now());
+            }
+            false
         },
     )
     .await;

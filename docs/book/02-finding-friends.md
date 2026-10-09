@@ -2219,6 +2219,45 @@ The full loop runs in three gated acceptance tests (`RELIABURGER_CLUSTER_TESTS=1
 
 Those tests taught us one more thing, about the tests themselves. A few of them wait for "three voters" by reading the leader's Raft metrics, then kill the leader. That looks sound, and it failed now and then in CI with no successor ever elected. openraft reports a membership in the metrics as soon as the entry is *appended*, not when it commits. Mid-change, the configuration is joint, and `voter_ids()` returns the union of the old and new sets. So the leader could report `{a, b, c}` while it was still half-way from `{a, b}`. In one traced run the leader had appended the final configuration but not yet committed it, and the other old voter was still on the joint one. Kill the leader then, and the survivor sits on a configuration whose old half needs the dead node's vote. Nobody can win an election. That's Raft working exactly as designed; the test was asking the wrong node. The harness now waits until every surviving member reports the same uniform configuration (one config, not a joint pair) and has *applied* it, which means it committed. Only then does it pull the plug. We checked the product for the same shortcut. Decommissioning returns after its own Raft entry commits, and the reconciler's `change_membership` only returns once the final configuration has committed, so nothing in Reliaburger treats an appended membership as a done deal.
 
+### Five voters, not seven
+
+For a long time the cap was a constant: `max_council_size`, seven. Then the appliance lab arrived, ten Dell Wyse thin clients with 2 GB of RAM each, and seven voters on ten small machines looked like the wrong trade. Every voter keeps the whole council log on disk and has to acknowledge writes for a majority to form. Five voters ride out two failures at once; seven ride out three. On a ten-node lab that third failure isn't worth two more machines doing council work. So a cluster can now choose its size.
+
+The first question was where the setting lives. The obvious place is each node's `node.toml`, next to the ports. But the reconciler only runs on the leader, and leadership moves. If node 1 said five and node 4 said seven, the council would grow or shrink depending on who won the last election. A setting every leader must agree on is cluster state, so it goes where cluster state goes: into the Raft log. A new request, `RaftRequest::CouncilSize`, sets `DesiredState::council_size`, and each reconciler tick reads it before it plans:
+
+```rust
+let selection = config.selection.sized(council.council_size().await);
+```
+
+`sized` returns a copy of the selection config with `max_council_size` capped at the cluster's size, and `min_council_size` lowered to match when the size is smaller than three, so a one-voter council isn't held to a floor it can never reach. Everything else, the planner and its invariants and the proptest that guards them, is unchanged: the planner already stops adding learners when the open seats run out, it just runs out sooner. `council_size()` reads the field through the state machine's lock without cloning the whole desired state, because the reconciler asks every two seconds.
+
+Getting the size into the log uses the path the security state already took. `relish cluster create --bare-metal` writes it into node 1's seed, the seed becomes `[cluster] council_size = 5` in node 1's `node.toml`, and when node 1 bootstraps a fresh council it commits the security state and then the size. Joining nodes never read it; they get it from the log like everything else. `RaftRequest` is encoded with bincode, which writes a variant's position rather than its name, so the new variant goes at the end of the enum, and the change bumps both the protocol and the state generation in `src/compatibility.rs`.
+
+The size itself is a newtype that refuses to exist with a bad value:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct CouncilSize(u8);
+
+impl CouncilSize {
+    pub fn new(voters: u8) -> Result<Self, CouncilSizeError> {
+        match voters {
+            0 => Err(CouncilSizeError::Zero),
+            v if v > Self::MAX => Err(CouncilSizeError::TooLarge(v)),
+            v if v % 2 == 0 => Err(CouncilSizeError::Even(v)),
+            v => Ok(Self(v)),
+        }
+    }
+}
+```
+
+The field is private (no `pub` inside the parentheses), so code outside the module can't write `CouncilSize(4)`; it has to go through `new`. The serde attribute closes the other door. `try_from = "u8"` tells serde to decode a plain number and then call `TryFrom<u8>`, which calls `new`, so an even size can't arrive through TOML, JSON or a Raft entry either. `into = "u8"` writes it back out as a plain number. `v if v > Self::MAX` is a *match guard*: the arm matches any value, binds it to `v`, and only fires when the condition holds. Arms are tried in order, so by the time the even check runs, zero and anything over seven are already gone. In Go you'd validate in a constructor and hope nobody builds the struct literal; in Python you'd validate in `__init__` and hope nobody unpickles one. Here the type can only hold 1, 3, 5 or 7.
+
+Why refuse even sizes rather than quietly round them? A council of four needs three votes, so it survives one failure, the same as a council of three, while making every commit wait for one more machine. An operator who types `--council-size 4` almost certainly expects it to survive two, and a clear refusal teaches that better than a silent rounding would. The message says so: `a council of 4 voters survives no more failures than one of 3; pick an odd size from 1 to 7`.
+
+The tests come at it from three sides. Unit tests check the type (1, 3, 5 and 7 accepted; 0, even numbers and anything over seven refused, also when decoding) and the planner (five healthy voters and five spares: `Nothing`; four voters: add the fifth). An in-memory council of five nodes, with the size committed at three, ticks the real reconciler until it has three voters and then keeps ticking, asserting that no fourth node ever joins, even as a learner. And the claimed-pair appliance test in CI checks the size end to end: `relish machines claim --create` records five in `fleet.json`, and `relish council --output json` reports five from council state once node 1 has bootstrapped.
+
 ## When the whole council dies
 
 Self-healing has a floor. It keeps the council alive while a majority survives, because every membership change it proposes has to commit through Raft, and Raft needs a quorum to commit anything. Kill two of three voters and the planner does exactly nothing — there's no majority left to vote a replacement in. Kill all three and the cluster is, on paper, dead. Workers keep running whatever they were running, but nothing can elect a leader, schedule a new app, or answer a query about cluster state. There's no quorum to heal from.

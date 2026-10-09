@@ -137,6 +137,9 @@ it the same way
 And 0.1.6: protocol 46 and state format 63. A 0.1.5 cluster's leader refuses
 it the same way
 ([upgrading from 0.1.5](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-015)).
+Development builds of 0.3.0, the appliance release, are at protocol 49 and
+state format 66, so a 0.1.6 cluster's leader refuses them too
+([upgrading from 0.1.6](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-016)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it

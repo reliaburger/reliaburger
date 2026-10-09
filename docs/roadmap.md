@@ -307,14 +307,12 @@ migration and no feature gate
   appliance OS (our own mkosi image on Ubuntu 26.04), `relish netboot` and
   claiming machines over the LAN, weekly signed OS builds with A/B updates,
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
-  fleet control plane can extend it later. Alongside it: the acceptance gates
-  0.1.0 didn't close (V01–V04, below), WebSocket drain parity and ACME (F08,
-  [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
-  pre-checks that read the leader's gossip view
-  ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
-  ten Dell Wyse 3040s from power-on to a cluster.
-  Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
-  which waits for 0.1.6.
+  fleet control plane can extend it later. On 7 October 2026 the maintainer
+  scoped the milestone to the OS, netboot and appliance work alone; the other
+  items it held moved to Later. Exit test: three Dell Wyse 3040s from power-on
+  to a cluster ([decisions](plans/2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026)).
+  Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490);
+  the v0.3.0 tag follows the 0.2.0 release.
 - [ ] **0.4.0 and 0.4.1: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [plan](plans/2026-10-09-plan-container-migration.md),
@@ -351,10 +349,15 @@ migration and no feature gate
   [#359](https://github.com/reliaburger/reliaburger/issues/359)); rootless
   clusters (F02, [#360](https://github.com/reliaburger/reliaburger/issues/360));
   PromQL and the full metrics architecture (F06,
-  [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
+  [#364](https://github.com/reliaburger/reliaburger/issues/364)); WebSocket
+  drain parity and ACME (F08,
+  [#369](https://github.com/reliaburger/reliaburger/issues/369)); bandwidth
   faults (F09, [#366](https://github.com/reliaburger/reliaburger/issues/366));
-  and the remaining Kubernetes translations (F11,
-  [#368](https://github.com/reliaburger/reliaburger/issues/368)).
+  the remaining Kubernetes translations (F11,
+  [#368](https://github.com/reliaburger/reliaburger/issues/368)); fault
+  pre-checks that read the leader's gossip view
+  ([#334](https://github.com/reliaburger/reliaburger/issues/334)); and the
+  acceptance gates 0.1.0 didn't close (V01–V04, below).
 
 ## Known gaps
 
@@ -367,7 +370,8 @@ what's shipped and what's scheduled.
   the V02 leftovers, the snapshot uploader under power cuts and the
   `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
   V04, cold installs on Intel macOS, Linux x86_64 and Linux arm64
-  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
+  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in
+  [Later](https://github.com/reliaburger/reliaburger/milestone/9).
 - **Missing capabilities F01–F11**, one issue each, placed in
   [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
   [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F07 part 2
@@ -375,10 +379,9 @@ what's shipped and what's scheduled.
   [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11) (F05 I2, landed),
   [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
   F04 R1–R4, F05 I3–I4, landed),
-  [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
-  F06, F09, F11, and the rest of F03–F05).
+  F06, F08, F09, F11, and the rest of F03–F05).
 - **Known bugs and flakes.** The open one, the `oci_crash` flake
   ([#526](https://github.com/reliaburger/reliaburger/issues/526)), is in
   [0.2.0](https://github.com/reliaburger/reliaburger/milestone/3); the open

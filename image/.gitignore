@@ -1,0 +1,5 @@
+# Build outputs and the per-run tree of release binaries.
+mkosi.output/
+mkosi.cache/
+mkosi.tools/
+bin-tree/

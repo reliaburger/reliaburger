@@ -619,10 +619,13 @@ pub struct BunAgent<G: Grill> {
     discovery_reopen: Option<(std::path::PathBuf, bool)>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
-    /// Last applied cluster-node set for firewall reconciliation. `None`
-    /// until the first apply, so a standalone node (empty set) still gets
-    /// the firewall; comparing the set (not a count) catches node swaps (M18).
-    last_firewall_nodes: Option<crate::firewall::rules::ClusterNodes>,
+    /// Last applied cluster-node set and join windows for firewall
+    /// reconciliation. `None` until the first apply, so a standalone node
+    /// (empty set) still gets the firewall; comparing the set (not a count)
+    /// catches node swaps (M18).
+    last_firewall_inputs: Option<crate::firewall::rules::PerimeterInputs>,
+    /// Addresses let through the perimeter for a while to enrol (G2).
+    join_windows: crate::firewall::rules::JoinWindows,
     /// Deploy history (shared with API for query access).
     pub(crate) deploy_history:
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
@@ -870,7 +873,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 enabled: false,
                 ..Default::default()
             },
-            last_firewall_nodes: None,
+            last_firewall_inputs: None,
+            join_windows: Default::default(),
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
@@ -1024,7 +1028,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 host_port_range,
                 ..Default::default()
             },
-            last_firewall_nodes: None,
+            last_firewall_inputs: None,
+            join_windows: Default::default(),
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
@@ -1253,14 +1258,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         cluster_ports: Vec<u16>,
         management_port: u16,
-        bootstrap_peers: Vec<std::net::IpAddr>,
+        bootstrap_peers: Vec<String>,
         operator_cidrs: Vec<String>,
     ) {
         self.perimeter_config.cluster_ports = cluster_ports;
         self.perimeter_config.management_port = management_port;
         self.perimeter_config.bootstrap_peers = bootstrap_peers;
         self.perimeter_config.operator_cidrs = operator_cidrs;
-        self.last_firewall_nodes = None;
+        self.last_firewall_inputs = None;
     }
 
     /// Enable or disable the perimeter firewall. In-process multi-node tests

@@ -31,7 +31,8 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 - `tests/suite/` — the single portable integration binary; `tests/*.rs` — gated, heavy or process-isolated suites
 - `examples/` — `phase-1/` and `phase-8/` workload configs, `kubernetes/` YAML
 - `scripts/release/` — packaging, staging and `qualify-*.sh` release qualification
-- `.github/workflows/` — `ci.yml`, `security.yml`, `build.yml`, `stage.yml`, `promote.yml`, `soak.yml`, `v02-loops.yml`, `static.yml`
+- `image/` — the appliance OS (mkosi), its netboot installer, its script tests (`image/tests/`) and `image/lab/` (the QEMU lab, the Mac as the Wyse lab's router and `fleet-measure.sh`)
+- `.github/workflows/` — `ci.yml`, `security.yml`, `build.yml`, `stage.yml`, `promote.yml`, `soak.yml`, `v02-loops.yml`, `static.yml`, `appliance.yml`
 
 ## How We Work
 
@@ -85,6 +86,7 @@ Fixes and hardening update the existing chapter for that subsystem; they don't g
 | 13 | `13-a-room-with-a-view.md` | "A Room with a View" |
 | 14 | `14-changing-the-tyres.md` | "Changing the Tyres at Full Speed" |
 | 15 | `15-ready-for-production.md` | "Ready for Production" |
+| Appliance spike | `15a-becoming-the-os.md` | "Becoming the Operating System" |
 | — | `16-appendix-rust.md` | "Appendix: Rust for C, Python, and Go Programmers" |
 
 ## Quality Standards

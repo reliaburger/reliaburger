@@ -28,6 +28,11 @@ owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
+Test threads get an 8 MiB stack (`RUST_MIN_STACK` in
+[`.cargo/config.toml`](../.cargo/config.toml)), not std's 2 MiB. An
+unoptimised build of clap's derived `relish` parser needs more than 2 MiB, so
+without it every test that parses the CLI overflows its stack.
+
 ## The agent loop's turn budget
 
 Each node's agent runs one loop that owns all of the node's state, one turn at

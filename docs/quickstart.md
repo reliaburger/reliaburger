@@ -33,7 +33,8 @@ Until you open a new terminal, setup prints next steps with the full path.
 
 The default is three Linux VMs, running real OCI containers with runc. Relish
 installs Lima in your user directory, downloads the release's guest image (Ubuntu
-24.04 with runc and the node's other packages already installed) and signed
+26.04, the release the appliance OS is built on, with runc and the node's
+other packages already installed) and signed
 Linux binaries, creates the cluster's credentials, then enrols each
 node. It checks the authenticated APIs, the three-member council and a sample
 container through the host ingress port. Open `http://localhost:18080/` to see
@@ -58,9 +59,10 @@ Each VM takes its time from your Mac. Lima's guest agent sets the guest clock
 to the host's whenever the two drift more than 100 ms apart, checking every
 10 s, so the guests catch up within seconds after the laptop wakes from sleep
 and don't need to reach an NTP server. That makes Lima the guests' only clock
-source: the guest image ships with systemd-timesyncd disabled, and
-provisioning disables it on a stock Ubuntu image. With both running, they
-fought, and the guest clock jumped back about 0.1 s every 10 s.
+source: the guest image ships with Ubuntu's time daemon (chrony on 26.04)
+disabled, and provisioning disables chrony or systemd-timesyncd on a stock
+Ubuntu image. With both running, they fought, and the guest clock jumped back
+about 0.1 s every 10 s.
 
 For a smaller single-node cluster:
 
@@ -200,7 +202,10 @@ This bypasses release downloads for those two operator-supplied binaries. With
 no release to take the built guest image from, it boots the stock Ubuntu cloud
 image that image is built from, checked against its pinned SHA-256, and each VM
 installs the node packages from Ubuntu's mirrors at first boot: expect each
-boot to take 15–40 s longer. It still verifies the Lima archive. It prints a
+boot to take 15–40 s longer, or much longer when the mirror is slow. The
+stock Ubuntu 26.04 image also can't name its network interface on its first
+boot, so setup restarts each VM once. If setup stops at its deadline, rerun
+the same command to resume. It still verifies the Lima archive. It prints a
 notice and does not count as qualification of a signed, downloadable release.
 Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle commands.
 
