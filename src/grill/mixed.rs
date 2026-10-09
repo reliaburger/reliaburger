@@ -562,15 +562,14 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         }
     }
     async fn exec(&self, id: &InstanceId, command: &[String]) -> Result<String, GrillError> {
-        let command = command.to_vec();
-        self.operation(id, move |this, id| async move {
-            if this.selected(&id)?.runtime == RuntimeKind::Process {
-                this.host.exec(&id, &command).await
-            } else {
-                this.container.exec(&id, &command).await
-            }
-        })
-        .await
+        // Like follow_logs, exec doesn't take the lifecycle claim: it may run
+        // for minutes, and stop/kill need the claim. It also stays in the
+        // caller's future, so the agent's exec timeout drops the backend call.
+        if self.selected(id)?.runtime == RuntimeKind::Process {
+            self.host.exec(id, command).await
+        } else {
+            self.container.exec(id, command).await
+        }
     }
 }
 
@@ -925,5 +924,32 @@ mod tests {
         // Created is still owned and must be killed before switching.
         runtime.kill(&id).await.unwrap();
         runtime.create(&id, &spec(false)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_stays_in_the_callers_future_and_never_blocks_lifecycle_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let id = InstanceId("default__worker-0".into());
+        runtime.create(&id, &spec(true)).await.unwrap();
+        runtime.host.set_exec_outputs(["first".to_string()]);
+        runtime.host.block_execs();
+        let command = ["sleep".to_string(), "3600".to_string()];
+        let mut exec = std::pin::pin!(runtime.exec(&id, &command));
+        tokio::select! {
+            _ = &mut exec => panic!("blocked exec returned"),
+            () = runtime.host.wait_for_execs(1) => {}
+        }
+        // A long exec must not hold the claim that stop/kill need.
+        tokio::time::timeout(Duration::from_secs(2), runtime.kill(&id))
+            .await
+            .expect("kill waited for a running exec")
+            .unwrap();
+        // Dropping the caller's future drops the backend exec too, so the
+        // agent's exec timeout reaches the process.
+        drop(exec);
+        runtime.host.release_execs(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runtime.exec(&id, &command).await.unwrap(), "first");
     }
 }

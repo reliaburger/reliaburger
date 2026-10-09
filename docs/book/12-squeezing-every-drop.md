@@ -1099,6 +1099,13 @@ tests use two independent mocks. Its private route journal records the original
 backend before creation. A file lock serialises changes across both backends.
 The adapter moves that lock into a spawned operation, so dropping its caller's
 future does not release authority while a runtime operation can still finish.
+That's right for create and stop, but wrong for `exec`. Our first version sent
+`exec` through the same spawned operation, so `relish exec app -- sleep 3600`
+held the lock for an hour: the agent's 300-second timeout dropped only the
+caller's future, and `stop` waited behind it. `exec` changes no route, so it
+now reads the route without the lock and awaits the backend in the caller's
+own future, the way `follow_logs` already did. Dropping that future drops the
+backend call.
 Status and recovery consult the original journal rather than guessing from a
 PID. Changing backend requires positive retirement, including withdrawal of
 any retained container address. Missing or conflicting evidence refuses work.
