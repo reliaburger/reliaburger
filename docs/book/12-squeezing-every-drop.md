@@ -1089,6 +1089,13 @@ command runs in a fresh directory. The real regression checks that the next
 command succeeds through the same owned container, alongside scratch cleanup
 and resource limits. A mocked launch wouldn't have caught this.
 
+Retirement itself can't wait forever. A task in an uninterruptible kernel wait,
+say on a hung NFS mount, ignores SIGKILL until the kernel lets go, so its
+cgroup never empties. Retirement now gives up after ten seconds. The caller gets
+its timeout or cancellation back, while the slot and its resource reservation
+stay quarantined. The eviction loop retries one non-blocking step every 100 ms
+and frees both once the group finally empties.
+
 ### Selecting the runtime per workload
 
 A mixed node can run host commands alongside containers. Jobs first validate

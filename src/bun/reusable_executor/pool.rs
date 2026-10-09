@@ -39,6 +39,11 @@ impl Runtime {
     }
 }
 const IDLE: Duration = Duration::from_secs(1);
+/// How long a caller waits for an executor to retire. A task stuck in an
+/// uninterruptible kernel wait (NFS, FUSE, a hung disk) can outlive any
+/// signal; past this, the slot and its lease stay quarantined while the
+/// eviction loop keeps retrying, and the caller gets its own outcome back.
+const RETIREMENT_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) struct CommandReporting<'a> {
     pub sink: Option<&'a tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
     pub singletons: &'a std::sync::Mutex<
@@ -51,6 +56,8 @@ struct Slot {
     active_run: Option<u64>,
     key: Option<ExecutorKey>,
     context: Option<Context>,
+    /// A busy slot whose executor missed [`RETIREMENT_DEADLINE`].
+    retiring: Option<Context>,
 }
 struct Context {
     key: ExecutorKey,
@@ -142,6 +149,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                         active_run: None,
                         key: None,
                         context: None,
+                        retiring: None,
                     })
                     .collect(),
             ),
@@ -163,6 +171,22 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         self.timings.snapshot()
     }
     async fn evict_idle(&self) {
+        let stuck: Vec<(usize, Context)> = self
+            .slots
+            .lock()
+            .await
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| Some((index, slot.retiring.take()?)))
+            .collect();
+        for (index, mut context) in stuck {
+            if self.retirement_step(&mut context).await {
+                self.finish_retirement(&mut context).await;
+                self.release(index, None).await;
+            } else {
+                self.slots.lock().await[index].retiring = Some(context);
+            }
+        }
         loop {
             let victim = {
                 let mut slots = self.slots.lock().await;
@@ -179,11 +203,10 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     }
                 })
             };
-            let Some((index, Some(mut context))) = victim else {
+            let Some((index, Some(context))) = victim else {
                 break;
             };
-            self.retire(&mut context).await;
-            self.release(index, None).await;
+            self.retire_and_release(index, context).await;
         }
     }
     async fn release(&self, index: usize, context: Option<Context>) {
@@ -281,28 +304,39 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             tokio::select! { biased; () = cancel.cancelled() => return None, () = changed => {} }
         }
     }
-    async fn retire(&self, context: &mut Context) {
+    /// One non-blocking retirement attempt: true once the helper has stopped
+    /// and its task group is empty.
+    async fn retirement_step(&self, context: &mut Context) -> bool {
         context.connection.take();
-        loop {
-            match self.runtime.state(&context.id).await {
-                Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {
-                    break;
-                }
-                _ => {
-                    let _ = self.lifecycle.kill(&context.id).await;
-                }
+        match self.runtime.state(&context.id).await {
+            Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
+            _ => {
+                let _ = self.lifecycle.kill(&context.id).await;
+                return false;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // The runtime owns helper retirement; Bun owns the sibling task group.
         // Removing/reusing a group requires emptiness, independently of PID 1.
-        loop {
-            match empty_task(&context.base.join("task")) {
-                Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
+        match empty_task(&context.base.join("task")) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
         }
+    }
+    /// Retire within [`RETIREMENT_DEADLINE`]; false leaves the executor running.
+    async fn retire(&self, context: &mut Context) -> bool {
+        let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
+        while !self.retirement_step(context).await {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.finish_retirement(context).await
+    }
+    /// Remove the emptied groups and files, then return the lease. The task
+    /// group must really be gone: one that survived `cgroup.kill` must never
+    /// be reused (see `prepare_cgroups`).
+    async fn finish_retirement(&self, context: &mut Context) -> bool {
         #[cfg(feature = "ebpf")]
         if let Some(namespace) = context.namespace.take() {
             namespace.retired().await;
@@ -312,13 +346,17 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             context.base.join("helper"),
             context.base.clone(),
         ] {
-            // A task group that survived `cgroup.kill` must never be reused
-            // (see `prepare_cgroups`), so retirement waits for its removal.
-            while let Err(error) = tokio::fs::remove_dir(&directory).await {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    break;
+            match tokio::fs::remove_dir(&directory).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    eprintln!(
+                        "executor {}: cannot remove {}: {error}",
+                        context.id.0,
+                        directory.display()
+                    );
+                    return false;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
         if let Some(path) = context.socket_path.take() {
@@ -326,6 +364,24 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         let _ = tokio::fs::remove_dir_all(&context.directory).await;
         context.lease.confirm_retired();
+        true
+    }
+    /// Retire and free the slot, or quarantine it with its lease for the
+    /// eviction loop to retry.
+    async fn retire_and_release(&self, index: usize, mut context: Context) {
+        if self.retire(&mut context).await {
+            self.release(index, None).await;
+        } else {
+            self.quarantine(index, context).await;
+        }
+    }
+    async fn quarantine(&self, index: usize, context: Context) {
+        eprintln!(
+            "executor {} did not retire within {}s; its slot and reservation stay quarantined until it does",
+            context.id.0,
+            RETIREMENT_DEADLINE.as_secs()
+        );
+        self.slots.lock().await[index].retiring = Some(context);
     }
     async fn start_host(
         &self,
@@ -664,8 +720,12 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         };
         let mut context = match existing {
             Some(mut old) if old.key != key || self.budget.has_waiters() => {
-                self.retire(&mut old).await;
-                drop(old);
+                if !self.retire(&mut old).await {
+                    self.quarantine(index, old).await;
+                    return failed(ExecutorError::Configuration(
+                        "the slot's previous executor has not retired",
+                    ));
+                }
                 None
             }
             other => other,
@@ -739,8 +799,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             };
             let start = self.start(&mut new, &template, profile).await;
             if let Err(error) = start {
-                self.retire(&mut new).await;
-                self.release(index, None).await;
+                self.retire_and_release(index, new).await;
                 return failed(error);
             }
             context = Some(new);
@@ -756,8 +815,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 ExecutorKey::new(template).is_ok_and(|live| live == context.key)
             });
             let Some(refreshed) = refreshed else {
-                self.retire(&mut context).await;
-                self.release(index, None).await;
+                self.retire_and_release(index, context).await;
                 return failed(ExecutorError::Configuration(
                     "namespace credentials no longer authorise this command",
                 ));
@@ -813,8 +871,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         let (sequence, mut bytes) = match preparation {
             Ok(encoded) => encoded,
             Err(error) => {
-                self.retire(&mut context).await;
-                self.release(index, None).await;
+                self.retire_and_release(index, context).await;
                 return failed(error);
             }
         };
@@ -947,8 +1004,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             AttemptOutcome::Cancelled | AttemptOutcome::TimedOut | AttemptOutcome::Unknown { .. }
         ) || self.budget.has_waiters()
         {
-            self.retire(&mut context).await;
-            self.release(index, None).await;
+            self.retire_and_release(index, context).await;
         } else {
             context.sequence = sequence;
             context.idle_since = tokio::time::Instant::now();
@@ -1045,13 +1101,25 @@ fn empty_task(task: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// After the helper's cleanup receipt the group is normally already empty, so
+/// the first read usually succeeds. Back off from 1 ms rather than spin, and
+/// give up at [`RETIREMENT_DEADLINE`] so a job without a timeout can't wait
+/// forever; the caller then retires the executor.
 async fn wait_empty_task(task: &Path) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
+    let mut pause = Duration::from_millis(1);
     loop {
-        let events = std::fs::read_to_string(task.join("cgroup.events"))?;
+        let events = tokio::fs::read_to_string(task.join("cgroup.events")).await?;
         if events.lines().any(|line| line == "populated 0") {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other(
+                "task cgroup is still populated after cleanup",
+            ));
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
 }
 

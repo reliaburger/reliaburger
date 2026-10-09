@@ -1856,3 +1856,89 @@ async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
     })
     .await;
 }
+
+/// A task group that never empties (as with a task in uninterruptible sleep)
+/// must not hang the caller; the slot and its lease stay quarantined until
+/// the eviction loop finally retires it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskRunner};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-stuck-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let first = runner
+        .run(
+            &shell_task(&template, 0, "cat /proc/self/cgroup"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    let task = task_cgroup(&first.output.head);
+    // Keep the task group populated faster than cgroup.kill can empty it.
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let refill = std::thread::spawn({
+        let stop = stop.clone();
+        let procs = task.join("cgroup.procs");
+        move || {
+            let mut children = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(child) = std::process::Command::new("/bin/sleep").arg("60").spawn() {
+                    let _ = std::fs::write(&procs, child.id().to_string());
+                    children.push(child);
+                }
+                children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            for mut child in children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let stuck = tokio::time::timeout(
+        Duration::from_secs(30),
+        runner.run(
+            &shell_task(&template, 1, "sleep 30"),
+            Duration::from_secs(1),
+            &cancel,
+        ),
+    )
+    .await
+    .expect("retirement blocked the caller");
+    assert!(
+        matches!(stuck.outcome, AttemptOutcome::TimedOut),
+        "{stuck:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_ne!(
+        budget.available(),
+        budget.capacity(),
+        "a quarantined executor released its reservation"
+    );
+    stop.store(true, Ordering::Relaxed);
+    refill.join().unwrap();
+    wait_until("the eviction loop retires the quarantined executor", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+    let after = runner
+        .run(
+            &shell_task(&template, 2, "printf ok"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(after.outcome.succeeded(), "{after:?}");
+    assert_eq!(after.output.head, b"ok");
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
