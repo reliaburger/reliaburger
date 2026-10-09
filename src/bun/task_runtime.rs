@@ -61,6 +61,10 @@ pub struct OwnedRunner<G: Grill + Clone> {
     runtime: G,
     #[cfg(target_os = "linux")]
     reusable: std::sync::OnceLock<std::sync::Arc<super::reusable_executor::ReusablePool<G>>>,
+    #[cfg(target_os = "linux")]
+    host: std::sync::OnceLock<std::sync::Arc<super::reusable_executor::ReusablePool<G>>>,
+    #[cfg(target_os = "linux")]
+    host_runtime: Option<crate::grill::ProcessGrill>,
     budget: Mutex<std::sync::Arc<super::execution_budget::ExecutionBudget>>,
     slots: Mutex<VecDeque<u32>>,
     prefix: String,
@@ -78,10 +82,16 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         Self::with_prefix(runtime, format!("{:032x}", rand::random::<u128>()))
     }
     fn with_prefix(runtime: G, prefix: String) -> Self {
+        #[cfg(target_os = "linux")]
+        let host_runtime = runtime.host_executor_runtime();
         Self {
             runtime,
             #[cfg(target_os = "linux")]
             reusable: std::sync::OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            host: std::sync::OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            host_runtime,
             budget: Mutex::new(super::execution_budget::ExecutionBudget::new(
                 crate::meat::Resources::new(256_000, u64::MAX, 0),
             )),
@@ -116,6 +126,34 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             .await
             .map_err(|_| "namespace secret resolution stopped".to_string())?
     }
+    /// Whether host jobs can use owned executors with enforced Linux limits.
+    pub fn supports_host_limits(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.host_runtime.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+    /// Cumulative phase distributions, bounded independently of completed jobs.
+    /// Callers compare snapshots from the same pool lifetime and binary.
+    #[cfg(target_os = "linux")]
+    pub fn executor_timings(
+        &self,
+        runtime: crate::config::job::JobRuntime,
+    ) -> Option<super::reusable_executor::timings::TimingSnapshot>
+    where
+        G: 'static,
+    {
+        match runtime {
+            crate::config::job::JobRuntime::Process => self.host.get(),
+            crate::config::job::JobRuntime::SharedRunc => self.reusable.get(),
+            _ => None,
+        }
+        .map(|pool| pool.timings())
+    }
     /// Compatible idle contexts already own their complete resource request.
     #[cfg(target_os = "linux")]
     pub(crate) async fn reusable_capacity(&self, template: &crate::config::job::JobSpec) -> u32
@@ -126,7 +164,12 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         let Ok(profile) = ExecutorProfile::new(template) else {
             return 0;
         };
-        if let Some(pool) = self.reusable.get() {
+        let pool = if template.runtime == crate::config::job::JobRuntime::Process {
+            self.host.get()
+        } else {
+            self.reusable.get()
+        };
+        if let Some(pool) = pool {
             let key = self
                 .resolve_template(template)
                 .await
@@ -351,24 +394,33 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         batch_id: u64,
         template: Option<&crate::config::job::JobSpec>,
     ) -> Option<u64> {
-        if template.is_none_or(|job| job.runtime != crate::config::job::JobRuntime::SharedRunc) {
-            return None;
-        }
+        let template = template?;
         #[cfg(target_os = "linux")]
-        if self.runtime.reusable_runtime().is_some() {
-            return Some(match self.reusable.get() {
+        if (template.runtime == crate::config::job::JobRuntime::SharedRunc
+            && self.runtime.reusable_runtime().is_some())
+            || (template.runtime == crate::config::job::JobRuntime::Process
+                && self.supports_host_limits())
+        {
+            let pool = if template.runtime == crate::config::job::JobRuntime::Process {
+                self.host.get()
+            } else {
+                self.reusable.get()
+            };
+            return Some(match pool {
                 Some(pool) => pool.active_commands(batch_id).await,
                 None => 0,
             });
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = batch_id;
+        let _ = (batch_id, template);
         None
     }
     fn owns_admission(&self, task: &TaskInvocation) -> bool {
-        task.template
-            .as_ref()
-            .is_some_and(|job| job.runtime == crate::config::job::JobRuntime::SharedRunc)
+        task.template.as_ref().is_some_and(|job| {
+            job.runtime == crate::config::job::JobRuntime::SharedRunc
+                || (job.runtime == crate::config::job::JobRuntime::Process
+                    && self.supports_host_limits())
+        })
     }
     async fn run(
         &self,
@@ -417,27 +469,53 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 output: CapturedOutput::default(),
             };
         }
-        if resolved.runtime == crate::config::job::JobRuntime::SharedRunc {
+        if resolved.runtime == crate::config::job::JobRuntime::SharedRunc
+            || (resolved.runtime == crate::config::job::JobRuntime::Process
+                && self.supports_host_limits())
+        {
             #[cfg(target_os = "linux")]
-            if let Some(runtime) = self.runtime.reusable_runtime() {
-                let pool = self.reusable.get_or_init(|| {
-                    super::reusable_executor::ReusablePool::new(
-                        runtime,
-                        self.runtime.clone(),
-                        self.prefix.clone(),
-                        self.slots
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .len()
-                            .clamp(1, 32),
-                        self.budget
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clone(),
-                        #[cfg(feature = "ebpf")]
-                        self.namespace_policy.clone(),
-                    )
-                });
+            if let Some(pool) = {
+                let count = self
+                    .slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+                    .clamp(1, 32);
+                let budget = self
+                    .budget
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if resolved.runtime == crate::config::job::JobRuntime::Process {
+                    self.host_runtime.as_ref().map(|runtime| {
+                        self.host.get_or_init(|| {
+                            super::reusable_executor::ReusablePool::new_host(
+                                runtime.clone(),
+                                self.runtime.clone(),
+                                self.prefix.clone(),
+                                count,
+                                budget,
+                                #[cfg(feature = "ebpf")]
+                                self.namespace_policy.clone(),
+                            )
+                        })
+                    })
+                } else {
+                    self.runtime.reusable_runtime().map(|runtime| {
+                        self.reusable.get_or_init(|| {
+                            super::reusable_executor::ReusablePool::new(
+                                runtime,
+                                self.runtime.clone(),
+                                self.prefix.clone(),
+                                count,
+                                budget,
+                                #[cfg(feature = "ebpf")]
+                                self.namespace_policy.clone(),
+                            )
+                        })
+                    })
+                }
+            } {
                 let result = pool
                     .run(
                         task,

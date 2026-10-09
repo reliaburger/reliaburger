@@ -29,6 +29,7 @@ the detail is in the GitHub milestones and issues.
 | [Cluster migration prerequisites](2026-10-04-cluster-migration-prerequisites.md) | Execute migration gates before app desired-state writes, retaining operation ownership and refusing uncertain handovers. | [#534](https://github.com/reliaburger/reliaburger/issues/534) |
 | [Batch capacity reservations](2026-10-04-batch-capacity-reservations.md) | Shared, committed admission for app placements and batch executions, with unknown outcomes fenced across leader handover. | [#543](https://github.com/reliaburger/reliaburger/issues/543) |
 
+| [Persistent host job executors](2026-10-09-plan-host-job-executors.md) | Matched measurements, bounded native executors, event-driven cleanup and resource limits. | #640 |
 | [Reusable containers and throughput](2026-10-07-plan-reusable-executors-and-throughput.md) | Built-in command executors, matched throughput measurements, a prominent demo and sustained qualification. | [#639](https://github.com/reliaburger/reliaburger/issues/639), [#640](https://github.com/reliaburger/reliaburger/issues/640) |
 | [Common job lifecycle](2026-10-07-plan-common-job-lifecycle.md) | One durable definition/run/task/attempt path for singleton jobs, batches, cron and deployment hooks. | [#638](https://github.com/reliaburger/reliaburger/issues/638), implementation and validation |
 | [Resource-aware delegated jobs](2026-10-04-plan-delegated-jobs.md) | Resource budgets, mixed profiles, durable outcomes, summaries and the homepage demo, continuing #266. | Implementation and qualification |

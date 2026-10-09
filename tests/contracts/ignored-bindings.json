@@ -1444,5 +1444,17 @@
     "function": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
     "binary": "reliaburger::owned_task_arrays",
     "test": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller"
   }
 ]

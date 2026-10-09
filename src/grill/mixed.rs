@@ -516,6 +516,10 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         !spec.host_process && self.container.honours_cgroup_path_for(spec)
     }
     #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<super::ProcessGrill> {
+        self.host.host_executor_runtime()
+    }
+    #[cfg(target_os = "linux")]
     fn reusable_runtime(&self) -> Option<super::runc::RuncGrill> {
         self.container.reusable_runtime()
     }

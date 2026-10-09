@@ -990,13 +990,14 @@ now starts after slot/admission waiting, just as on the fresh path; cold image
 and executor preparation still counts once its profile is reserved. The
 regression requires all eight successes with one attempt each.
 
-Host `exec` and `script` jobs already provide another useful comparison. They
-avoid container setup and keep the common durable lifecycle, but their current
-owned process runtime cannot enforce hard CPU/memory limits. Requests still
-reserve scheduling capacity. The qualification harness must disclose that
-contract rather than present the fastest bare-process number as a container
-result. Reusing a container also doesn't keep a model resident: each command
-still starts a process and loads its own model. That is the separate #641 path.
+Rootful Linux host `exec` and `script` jobs borrow bounded native executors.
+Each command starts a fresh process directly inside its limited task cgroup.
+The executor keeps its durable owner across commands, charges helper overhead
+and retires descendants before accepting the next command. Other platforms
+retain the original owned process backend and refuse explicit CPU/memory limits.
+The qualification harness discloses that contract. Reusing an executor doesn't
+keep a model resident: each command still starts a process and loads its own
+model. That is the separate #641 path.
 
 The [qualification plan](../plans/2026-10-07-plan-reusable-executors-and-throughput.md)
 requires matched launch, durability and dispatch measurements, service latency,
@@ -1293,7 +1294,7 @@ while a real application serves requests. A completed hour and a qualified
 100-million-job day are separate booleans. Missing the target remains useful
 evidence; completing an hour cannot satisfy the 24-hour qualification gate.
 
-The completed repeat on the repaired runtime produced these actual results:
+The earlier recording, before native executors, produced these actual results:
 
 | Path | Completed work | Elapsed | Rate | Accepted retries |
 |---|---:|---:|---:|---:|
@@ -1373,3 +1374,63 @@ depending on scheduling. The waiter now waits through non-running states,
 but still fails immediately if a known running process has no PID; unknown
 runtime evidence still waits. We kept those three cases separate so fixing the
 fixture could not hide the earlier missing-PID reporting bug.
+
+
+### Removing the host owner's work from the command path
+
+The first landing-page experiment made the host path look ten times slower
+than commands in a shared container. It also reserved a whole CPU for each host
+job and only 100 millicores for each shared command. On the same four-CPU node,
+the two paths could admit different numbers of commands. That wasn't a matched
+comparison. A separate serial launch experiment still exposed repeated owner
+startup, durable intent publication and polling in the host path.
+
+We reuse the existing bounded pool for native host commands. Its key retains
+the namespace, credentials, environment and complete resource profile, while
+removing the command. Different allowlisted binaries can share a compatible
+slot. Linux starts each child with `CLONE_INTO_CGROUP`, so CPU, memory, swap and
+PID limits apply before user code runs. The helper has its own charged cgroup;
+it doesn't consume the command's memory allowance. Host commands retain Bun's
+user and host filesystem access. This is trusted host execution, with resource
+controls, rather than a container sandbox.
+
+The native helper connects through a short socket address under `/tmp`. Its
+peer credentials and the owner's unreaped process identity authenticate the
+connection. We use this fixed directory because a private `TMPDIR` can become
+inaccessible after the helper drops its credentials; the regression test also
+runs with a root-only temporary directory.
+
+A durable owner holds the helper and its complete subtree for the lifetime of
+the slot. The existing group-commit task ledger records command outcomes. We
+don't need to launch a new owner or publish another owner record for each
+command. Losing Bun's connection makes the helper retire its children before
+exiting; recovery still requires positive retirement of the original owner
+before creating a replacement. An unreadable owner record remains uncertainty.
+Only an absent owner directory establishes that no owner was published; a
+missing record inside an existing directory is an error.
+
+Container helpers can retire their PID namespace. Native helpers cannot signal
+all host processes. Instead, a single-threaded subreaper retains each original
+child's unreaped identity, opens its pidfd and signals through that descriptor.
+It repeats for adopted grandchildren, including children which call `setsid`.
+Only after reaping every owned descendant and observing an empty task cgroup
+does it send the exact-sequence cleanup receipt. We retain the Linux 6.8
+clone/kill workaround described above: ordinary command completion avoids
+`cgroup.kill`. Cancellation destroys the executor rather than risking reuse.
+
+Admission, cold setup, command execution and cleanup each have a fixed-size
+histogram. Rust's `AtomicU64` lets concurrent slots record samples without
+holding a pool lock. A small guard records elapsed time in its `Drop` method,
+including error returns. Its lifetime covers one phase, so waiting for a slot
+isn't silently included in command execution time. These counters have sixteen
+buckets, independent of completed job count. They complement public accepted
+outcome rates; they don't replace durability measurements.
+
+The measurement example now includes raw processes with the same CPU, memory,
+swap and PID limits as native and shared commands. It applies those limits
+before `exec`, keeps the same indexed environment and executable, and fixes
+concurrency independently of job count. Cold runs include executor setup; warm
+runs record their warmup separately. Direct exits, owned outcomes, worker-ledger
+completion and public Raft acceptance remain separate measurements. Rotating
+through new namespaces still creates historical ownership and routing records;
+a fixed live pool doesn't prove that history is bounded.

@@ -331,6 +331,17 @@ impl ProcessGrill {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn executor_directory(&self) -> Result<PathBuf, GrillError> {
+        self.log_dir
+            .as_ref()
+            .map(|path| path.join("host-executors"))
+            .ok_or_else(|| GrillError::StateUnavailable {
+                instance: InstanceId("host-executor".into()),
+                reason: "host executor requires durable ownership".into(),
+            })
+    }
+
     /// Owner-backed lifecycle operations that are still running, including
     /// ones whose caller dropped its future: cancellation never cancels a
     /// queued mutation. Zero means none can still change owner state. Always
@@ -440,6 +451,14 @@ impl Default for ProcessGrill {
 }
 
 impl super::Grill for ProcessGrill {
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<Self> {
+        (self.control.is_some()
+            && nix::unistd::geteuid().is_root()
+            && Path::new("/sys/fs/cgroup/cgroup.controllers").exists())
+        .then(|| self.clone())
+    }
+
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         if let Some(control) = &self.control {
             return control.prepare(instance, spec).await.map_err(|error| {
@@ -756,9 +775,12 @@ impl super::Grill for ProcessGrill {
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
         if let Some(control) = &self.control {
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Prepared => ContainerState::Pending,
                 OwnerPhase::Retiring { .. } => ContainerState::Stopping,
@@ -878,9 +900,12 @@ impl super::Grill for ProcessGrill {
             // An owner that didn't answer leaves the pid unknown, never
             // "no process" (#358).
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Running { pid } => Some(pid),
                 _ => None,
@@ -914,9 +939,12 @@ impl super::Grill for ProcessGrill {
             // An owner that didn't answer leaves the exit code unknown,
             // never "hasn't exited" (#389).
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Retired { exit_code } => exit_code,
                 _ => None,

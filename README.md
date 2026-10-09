@@ -284,7 +284,9 @@ in [the batch manual](docs/manual/14_batch-jobs.md). On Linux, `bun --runtime mi
 both, while explicit `--runtime runc` stays container-only. Jobs use
 `runtime="runc"` by default, `runtime="process"` for allowlisted host commands,
 or `runtime="shared-runc"` for bounded reused containers, retaining their own command process and limits;
-fresh containers remain the default. The [four-part demo](https://reliaburger.com/#job-throughput)
+rootful Linux process jobs also reuse bounded native executors and enforce
+explicit CPU/memory limits before execution. Fresh containers remain the default.
+The [four-part demo](https://reliaburger.com/#job-throughput)
 compares a million raw process exits with 1,000 fresh-container, 10,000 shared-
 container and 10,000 host jobs. It accepted all 21,000 public jobs; the raw VM
 baseline has fewer guarantees. [Raw evidence](docs/qualification/2026-10-09-job-runtime-revision/README.md)

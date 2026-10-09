@@ -145,3 +145,25 @@ class ExecutorProtocol(unittest.TestCase):
     def test_embedded_nul_is_refused_without_executing(self):
         self.connection.sendall(command(1, ['/bin/true\0ignored']))
         self.assertEqual(self.connection.recv(1), b'')
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'host child ownership requires Linux')
+class NativeHostExecutorProtocol(ExecutorProtocol):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tempfile.TemporaryDirectory(prefix='rb-host-executor-protocol-')
+        cls.binary = pathlib.Path(cls.root.name) / 'helper'
+        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-DRB_EXECUTOR_HOST', '-DRB_EXECUTOR_HOST_FIXTURE',
+                        str(ROOT / 'src/bun/reusable_executor/helper.c'),
+                        '-o', str(cls.binary)], check=True, capture_output=True)
+
+    def test_detached_descendants_are_retired_before_the_slot_is_reused(self):
+        import time
+        marker = pathlib.Path(self.fixture.name) / 'escaped-command'
+        code, _ = self.execute(1, ['/bin/sh', '-c',
+            f'setsid /bin/sh -c "sleep 0.2; echo escaped > {marker}" & exit 0'])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.execute(2, ['/bin/true'])[0], 0)
+        time.sleep(0.35)
+        self.assertFalse(marker.exists(), 'cleanup must retire children in new sessions too')

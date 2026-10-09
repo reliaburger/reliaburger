@@ -793,7 +793,9 @@ What the current binary actually enforces is a policy layer, not a sandbox:
 - **Deny-by-default binary allowlist** (`[process_workloads] allowed_binaries` in `node.toml`). An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is off on any node the operator hasn't explicitly opened up. Inline `script` workloads run through `/bin/sh`, which must itself be allowlisted.
 - **Signed-commit gating.** Inline scripts applied via Lettuce require signed commits (Section 14). When applied directly via `relish apply`, TOML files containing `script` fields require `host-exec` permission.
 
-Beyond that, the process is spawned in its own process group and its stdout/stderr are captured, but it runs directly on the host. **Status: kernel-level isolation is planned — not yet implemented.** The design target (a dedicated unprivileged `burger` user, a seccomp profile, cgroup resource limits, and network/PID/mount namespaces so process workloads sit inside the same primitives as containers) is not what the binary does today: there is no seccomp profile, no `burger` user, no `unshare`/namespace creation, and no cgroup limits on process workloads. Mount-namespace isolation is explicitly *refused* rather than silently skipped: a host workload that requests `mount_isolation` is rejected with an error until the feature lands.
+Rootful Linux process jobs use a bounded native executor pool. Each command starts as a fresh host process inside its resource-profile cgroup, with CPU, memory, swap and PID limits applied before execution. A durable owner holds the executor subtree until retirement. These jobs run as Bun's user and retain access to the host; they are trusted workloads, not a security sandbox.
+
+Process applications and jobs on platforms without the native backend still use the process owner directly. Explicit job resource limits are refused when that backend cannot enforce them. **Status: further kernel isolation is planned.** There is no dedicated `burger` user, seccomp profile or network/PID/mount namespace for host workloads. Mount-namespace isolation is explicitly refused when `mount_isolation` is requested.
 
 > For the full isolation model, security controls, and when-to-use-what guidance, see [design/agent-bun.md](design/agent-bun.md).
 
@@ -1054,7 +1056,7 @@ No. The new leader enters a learning period where it accepts StateReports from n
 
 ### Q6: Aren't exec (non-container) jobs a massive security risk?
 
-They would be, without constraints. The constraint that ships today is a policy gate, not a kernel sandbox. Process workloads require an explicit `admin` or `host-exec` Permission grant, and you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. Inline scripts additionally require signed commits when applied via GitOps. This deny-by-default posture ensures no host binary can execute without explicit operator approval. What's *not* here yet (planned, see Section 17): a dedicated unprivileged `burger` user, a seccomp profile, cgroup limits, and network/PID/mount namespaces. So treat a process workload as a binary the operator has explicitly whitelisted running on the host, not as a locked-down sandboxed process — for anything hostile, keep it in a container.
+They would be, without constraints. The constraint that ships today is a policy gate, not a kernel sandbox. Process workloads require an explicit `admin` or `host-exec` Permission grant, and you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. Inline scripts additionally require signed commits when applied via GitOps. This deny-by-default posture ensures no host binary can execute without explicit operator approval. Rootful Linux process jobs enforce CPU/memory limits through native executors. Host applications still need cgroup limits; a dedicated unprivileged `burger` user, a seccomp profile and network/PID/mount namespaces remain planned (see Section 17). So treat a process workload as a binary the operator has explicitly whitelisted running on the host, not as a locked-down sandboxed process — for anything hostile, keep it in a container.
 
 ### Q7: How does Pickle ensure image durability?
 
@@ -1119,8 +1121,12 @@ explicit trade-off, rather than a new application worker protocol.
 Warm executors retain their resource requests and helper overhead while idle.
 They expire quickly and yield to waiting profiles, preserving application
 capacity and FIFO admission. Cancellation or uncertainty retires the original
-container before replacement. The existing allowlisted host-process path also
-avoids container setup, but currently cannot enforce hard CPU/memory limits.
+container before replacement. Rootful Linux allowlisted host jobs use the same
+bounded executor design with a durable native helper and a fresh process per
+command. Explicit CPU/memory profiles are enforced before execution through
+task cgroups; helper resources stay charged while idle. Other platforms retain
+the original owned process backend and refuse unsupported explicit limits.
+Host commands retain host access and Bun's user; they require trusted workloads.
 Neither path removes process creation, durable outcomes or external-effect
 idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
 

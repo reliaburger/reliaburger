@@ -1474,7 +1474,9 @@ budget; uncertain cleanup retires the whole container before reuse. Fresh
 containers remain the default. Linux `--runtime mixed` or auto-selected mixed nodes accept explicit
 `runtime="process"` jobs alongside containers through the owned process backend;
 explicit `--runtime runc` stays container-only;
-host CPU/memory limits remain refused. The
+rootful Linux process jobs use bounded native executors and enforce explicit
+CPU/memory limits before each fresh command starts. Other platforms refuse
+unsupported limits. Host applications retain their existing runtime contract. The
 [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
 tracks #639 and the still-unqualified sustained target (#640). The standalone
 [four-part recording](https://reliaburger.com/#job-throughput) shows a million raw

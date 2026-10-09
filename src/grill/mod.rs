@@ -454,6 +454,12 @@ pub trait Grill: Send + Sync {
         !spec.host_process && self.honours_cgroup_path()
     }
 
+    /// Owned rootful host backend capable of bounded native command executors.
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<ProcessGrill> {
+        None
+    }
+
     /// Rootful owned runtime capable of the private reusable command protocol.
     #[cfg(target_os = "linux")]
     fn reusable_runtime(&self) -> Option<runc::RuncGrill> {
@@ -831,6 +837,14 @@ impl Grill for AnyGrill {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<ProcessGrill> {
+        match self {
+            Self::Process(runtime) => runtime.host_executor_runtime(),
+            Self::Mixed(runtime) => runtime.host_executor_runtime(),
+            _ => None,
+        }
+    }
     #[cfg(target_os = "linux")]
     fn reusable_runtime(&self) -> Option<runc::RuncGrill> {
         match self {

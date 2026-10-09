@@ -681,9 +681,14 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // Same admission gate as apps (jobs have no GPU field, so only the
         // host-exec/script allowlist and rootless-limit checks apply).
         self.admit_process_workload(job_name, spec.exec.as_deref(), spec.script.as_deref())?;
+        #[cfg(target_os = "linux")]
+        let native = spec.runtime == crate::config::job::JobRuntime::Process
+            && self.grill.host_executor_runtime().is_some();
+        #[cfg(not(target_os = "linux"))]
+        let native = false;
         self.admit_rootless_limits(
             job_name,
-            spec.memory.is_some() || spec.cpu.is_some(),
+            !native && (spec.memory.is_some() || spec.cpu.is_some()),
             spec.exec.is_some() || spec.script.is_some(),
         )?;
 

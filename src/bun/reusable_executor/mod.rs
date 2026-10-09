@@ -1,6 +1,8 @@
 //! Bounded image-compatible command slots beneath the common job lifecycle.
 #[cfg(target_os = "linux")]
 mod pool;
+#[cfg(any(target_os = "linux", test))]
+pub mod timings;
 #[cfg(target_os = "linux")]
 pub(crate) use pool::{CommandReporting, ReusablePool};
 #[cfg(any(target_os = "linux", test))]
@@ -30,7 +32,7 @@ pub(crate) struct ExecutorProfile {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExecutorError {
-    #[error("shared-runc refused: {0}")]
+    #[error("executor refused: {0}")]
     Configuration(&'static str),
     #[cfg(any(target_os = "linux", test))]
     #[error("cannot encode executor configuration: {0}")]
@@ -50,22 +52,27 @@ pub(crate) enum ExecutorError {
 impl ExecutorKey {
     pub(crate) fn new(template: &JobSpec) -> Result<Self, ExecutorError> {
         use sha2::{Digest, Sha256};
-        if template.exec.is_some() || template.script.is_some() {
-            return Err(ExecutorError::Configuration("shared-runc is image-only"));
-        }
-        let image = template
-            .image
-            .as_deref()
-            .ok_or(ExecutorError::Configuration("an image is required"))?;
-        let reference = crate::grill::image::ImageReference::parse(image)
-            .map_err(|_| ExecutorError::Configuration("invalid image reference"))?;
-        if !reference.tag.strip_prefix("sha256:").is_some_and(|digest| {
-            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) {
-            return Err(ExecutorError::Configuration(
-                "the admitted image must be pinned by digest",
-            ));
-        }
+        template
+            .validate_runtime()
+            .map_err(ExecutorError::Configuration)?;
+        let reference = if template.runtime == crate::config::job::JobRuntime::Process {
+            None
+        } else {
+            let image = template
+                .image
+                .as_deref()
+                .ok_or(ExecutorError::Configuration("an image is required"))?;
+            let reference = crate::grill::image::ImageReference::parse(image)
+                .map_err(|_| ExecutorError::Configuration("invalid image reference"))?;
+            if !reference.tag.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return Err(ExecutorError::Configuration(
+                    "the admitted image must be pinned by digest",
+                ));
+            }
+            Some(reference)
+        };
         if template.env.values().any(|value| value.is_encrypted()) {
             return Err(ExecutorError::Configuration(
                 "credentials must be resolved against live namespace keys",
@@ -73,7 +80,8 @@ impl ExecutorKey {
         }
         let profile = ExecutorProfile::new(template)?;
         let mut compatible = template.clone();
-        compatible.image = Some(reference.full_reference());
+        compatible.image = reference.map(|image| image.full_reference());
+        compatible.exec = None;
         compatible.namespace = Some(template.namespace.as_deref().unwrap_or("default").into());
         compatible.command = None;
         compatible.schedule = None;
@@ -196,6 +204,21 @@ mod tests {
     use super::*;
     fn template() -> JobSpec {
         toml::from_str("image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m-1000m'\nmemory='32Mi-64Mi'\n[env]\nTOKEN='first'").unwrap()
+    }
+    #[test]
+    fn host_commands_share_only_a_namespace_and_resource_profile() {
+        let mut first: JobSpec = toml::from_str("runtime='process'\nexec='/bin/true'\ncpu='100m-1000m'\nmemory='32Mi'\nnamespace='tenant-a'").unwrap();
+        let key = ExecutorKey::new(&first).unwrap();
+        first.exec = Some("/bin/echo".into());
+        first.command = Some(vec!["different".into()]);
+        assert_eq!(ExecutorKey::new(&first).unwrap(), key);
+        first.namespace = Some("tenant-b".into());
+        assert_ne!(ExecutorKey::new(&first).unwrap(), key);
+        first.namespace = Some("tenant-a".into());
+        first.cpu.as_mut().unwrap().limit += 1;
+        assert_ne!(ExecutorKey::new(&first).unwrap(), key);
+        first.image = Some("unexpected-image".into());
+        assert!(ExecutorKey::new(&first).is_err());
     }
     #[test]
     fn compatible_commands_share_a_slot_but_trust_and_profiles_do_not() {

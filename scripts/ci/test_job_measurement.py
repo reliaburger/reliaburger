@@ -107,3 +107,15 @@ class ProcessObservation(unittest.TestCase):
             self.assertFalse(measurement.process_observation(42, 100, root)['complete'])
             (process / 'status').unlink()
             self.assertFalse(measurement.process_observation(42, 101, root)['complete'])
+
+
+class MatchedTierResources(unittest.TestCase):
+    def test_all_public_tiers_use_the_same_concurrency_and_resource_profile(self):
+        spec = importlib.util.spec_from_file_location('tier_recording', ROOT / 'scripts/demo/record-job-tiers.py')
+        recording = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(recording)
+        for runtime in ['runc', 'shared-runc', 'process']:
+            source = recording.build_manifest(runtime, 1000, 'fixture@sha256:' + 'a'*64, '/bin/busybox')
+            self.assertRegex(source, r'(?m)^per_node_concurrency = 27$')
+            self.assertRegex(source, r'(?m)^cpu = "100m-1000m"$')
+            self.assertRegex(source, r'(?m)^memory = "32Mi"$')

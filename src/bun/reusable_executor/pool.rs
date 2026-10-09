@@ -1,4 +1,5 @@
 //! Bounded owned containers, with one independently limited command per slot.
+use super::timings::{Phase, TimingSnapshot, Timings};
 use super::{ExecutorError, ExecutorKey, ExecutorProfile, HELPER_MEMORY_BYTES, protocol};
 use crate::bun::execution_budget::{ExecutionBudget, ResourceLease};
 use crate::bun::task_executor::{Attempt, AttemptOutcome, CapturedOutput, TaskInvocation};
@@ -14,6 +15,29 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 const HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rb-executor-helper"));
+const HOST_HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rb-host-executor-helper"));
+#[derive(Clone)]
+enum Runtime {
+    Container(RuncGrill),
+    Host(crate::grill::ProcessGrill),
+}
+impl Runtime {
+    async fn state(&self, id: &InstanceId) -> Result<ContainerState, crate::grill::GrillError> {
+        match self {
+            Self::Container(runtime) => runtime.state(id).await,
+            Self::Host(runtime) => runtime.state(id).await,
+        }
+    }
+    fn directory(&self) -> Result<PathBuf, ExecutorError> {
+        match self {
+            Self::Container(runtime) => Ok(runtime.executor_directory()),
+            Self::Host(runtime) => Ok(runtime.executor_directory()?),
+        }
+    }
+    fn host(&self) -> bool {
+        matches!(self, Self::Host(_))
+    }
+}
 const IDLE: Duration = Duration::from_secs(1);
 pub(crate) struct CommandReporting<'a> {
     pub sink: Option<&'a tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -33,7 +57,8 @@ struct Context {
     id: InstanceId,
     directory: PathBuf,
     base: PathBuf,
-    image: crate::grill::image::PulledImage,
+    image: Option<crate::grill::image::PulledImage>,
+    socket_path: Option<PathBuf>,
     connection: Option<UnixStream>,
     lease: ResourceLease,
     sequence: u64,
@@ -44,7 +69,8 @@ struct Context {
 /// A dropped in-flight future leaves its slot and resource lease quarantined.
 pub(crate) struct ReusablePool<G> {
     lifecycle: G,
-    runtime: RuncGrill,
+    runtime: Runtime,
+    timings: Timings,
     prefix: String,
     budget: Arc<ExecutionBudget>,
     slots: Mutex<Vec<Slot>>,
@@ -63,8 +89,49 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             Arc<crate::bun::task_namespace::TaskNamespacePolicy>,
         >,
     ) -> Arc<Self> {
+        Self::with_runtime(
+            Runtime::Container(runtime),
+            lifecycle,
+            prefix,
+            count,
+            budget,
+            #[cfg(feature = "ebpf")]
+            policy,
+        )
+    }
+    pub(crate) fn new_host(
+        runtime: crate::grill::ProcessGrill,
+        lifecycle: G,
+        prefix: String,
+        count: usize,
+        budget: Arc<ExecutionBudget>,
+        #[cfg(feature = "ebpf")] policy: Option<
+            Arc<crate::bun::task_namespace::TaskNamespacePolicy>,
+        >,
+    ) -> Arc<Self> {
+        Self::with_runtime(
+            Runtime::Host(runtime),
+            lifecycle,
+            prefix,
+            count,
+            budget,
+            #[cfg(feature = "ebpf")]
+            policy,
+        )
+    }
+    fn with_runtime(
+        runtime: Runtime,
+        lifecycle: G,
+        prefix: String,
+        count: usize,
+        budget: Arc<ExecutionBudget>,
+        #[cfg(feature = "ebpf")] policy: Option<
+            Arc<crate::bun::task_namespace::TaskNamespacePolicy>,
+        >,
+    ) -> Arc<Self> {
         let pool = Arc::new(Self {
             runtime,
+            timings: Timings::default(),
             lifecycle,
             prefix,
             budget,
@@ -91,6 +158,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             }
         });
         pool
+    }
+    pub(crate) fn timings(&self) -> TimingSnapshot {
+        self.timings.snapshot()
     }
     async fn evict_idle(&self) {
         loop {
@@ -244,8 +314,136 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         ] {
             let _ = tokio::fs::remove_dir(directory).await;
         }
+        if let Some(path) = context.socket_path.take() {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         let _ = tokio::fs::remove_dir_all(&context.directory).await;
         context.lease.confirm_retired();
+    }
+    async fn start_host(
+        &self,
+        context: &mut Context,
+        template: &JobSpec,
+        profile: ExecutorProfile,
+    ) -> Result<(), ExecutorError> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        match self.runtime.state(&context.id).await {
+            Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
+            _ => {
+                return Err(ExecutorError::Configuration(
+                    "old host executor has not retired",
+                ));
+            }
+        }
+        match tokio::fs::remove_dir_all(&context.directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::create_dir_all(&context.directory)?;
+        std::fs::set_permissions(&context.directory, std::fs::Permissions::from_mode(0o700))?;
+        let helper = context.directory.join("helper");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o555)
+            .open(&helper)?;
+        std::io::Write::write_all(&mut file, HOST_HELPER)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::File::open(&context.directory)?.sync_all()?;
+        // Socket credentials and the durable owner's unreaped helper identity
+        // authenticate this short address. A private TMPDIR may be inaccessible
+        // after the helper drops its credentials.
+        let socket = Path::new("/tmp").join(format!(
+            "rbhx-{}",
+            hex::encode(Sha256::digest(context.id.0.as_bytes()))
+        ));
+        match std::fs::symlink_metadata(&socket) {
+            Ok(metadata) => {
+                use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                if !metadata.file_type().is_socket()
+                    || metadata.uid() != crate::grill::userns::EXECUTOR_HOST_UID
+                {
+                    return Err(ExecutorError::Configuration("foreign host executor socket"));
+                }
+                std::fs::remove_file(&socket)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let listener = UnixListener::bind(&socket)?;
+        context.socket_path = Some(socket.clone());
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        std::os::unix::fs::lchown(
+            &socket,
+            Some(crate::grill::userns::EXECUTOR_HOST_UID),
+            Some(crate::grill::userns::EXECUTOR_HOST_UID),
+        )?;
+        #[cfg(feature = "ebpf")]
+        if let Some(policy) = &self.policy {
+            context.namespace = Some(
+                policy
+                    .acquire(
+                        template.namespace.as_deref().unwrap_or("default"),
+                        &context.base,
+                    )
+                    .await?,
+            );
+        }
+        prepare_cgroups(&context.base, profile)?;
+        let mut spec = crate::grill::oci::generate_job_oci_spec(
+            "executor",
+            template.namespace.as_deref().unwrap_or("default"),
+            template,
+            "/unused",
+            None,
+        );
+        spec.reusable_executor = false;
+        spec.linux.resources = None;
+        spec.process.env.clear();
+        spec.process.args = vec![
+            helper.to_string_lossy().into_owned(),
+            socket.to_string_lossy().into_owned(),
+            context
+                .base
+                .join("helper/cgroup.procs")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        spec.process.overrides = None;
+        self.lifecycle.create(&context.id, &spec).await?;
+        self.lifecycle.start(&context.id).await?;
+        let (mut connection, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .map_err(|_| ExecutorError::Protocol("host helper connection timed out".into()))??;
+        let peer = connection.peer_cred()?;
+        let peer_pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
+        let Runtime::Host(runtime) = &self.runtime else {
+            return Err(ExecutorError::Configuration("host backend missing"));
+        };
+        if peer.uid() != crate::grill::userns::EXECUTOR_HOST_UID
+            || peer_pid.is_none()
+            || runtime.pid(&context.id).await? != peer_pid
+        {
+            return Err(ExecutorError::Protocol(
+                "host helper socket owner mismatch".into(),
+            ));
+        }
+        let mut magic = [0; 8];
+        connection.read_exact(&mut magic).await?;
+        if &magic != b"RBEX0001" {
+            return Err(ExecutorError::Protocol(
+                "host helper protocol mismatch".into(),
+            ));
+        }
+        std::fs::remove_file(&socket)?;
+        context.socket_path = None;
+        let native = connection.into_std()?;
+        protocol::send_directory(&native, &std::fs::File::open(context.base.join("task"))?)?;
+        context.connection = Some(UnixStream::from_std(native)?);
+        Ok(())
     }
     async fn start(
         &self,
@@ -253,6 +451,12 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         template: &JobSpec,
         profile: ExecutorProfile,
     ) -> Result<(), ExecutorError> {
+        if self.runtime.host() {
+            return self.start_host(context, template, profile).await;
+        }
+        let Runtime::Container(runtime) = &self.runtime else {
+            return Err(ExecutorError::Configuration("container backend missing"));
+        };
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         match self.runtime.state(&context.id).await {
@@ -398,7 +602,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .pid()
             .and_then(|pid| u32::try_from(pid).ok())
             .ok_or(ExecutorError::Configuration("missing helper peer pid"))?;
-        self.runtime.authenticate_executor(&context.id, pid).await?;
+        runtime.authenticate_executor(&context.id, pid).await?;
         let mut magic = [0; 8];
         connection.read_exact(&mut magic).await?;
         if &magic != b"RBEX0001" {
@@ -442,6 +646,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 "profile plus helper exceeds node capacity",
             ));
         }
+        let mut admission_timer = Some(self.timings.start(Phase::Admission));
         let Some((index, existing, reservation)) =
             self.slot(key, profile.reservation, cancel).await
         else {
@@ -475,20 +680,28 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 };
             };
             deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
-            let image = match self
-                .runtime
-                .image_store()
-                .pull_and_unpack(template.image.as_deref().unwrap_or_default())
-                .await
-            {
-                Ok(image) => image,
-                Err(error) => {
-                    self.release(index, None).await;
-                    return failed(ExecutorError::Protocol(error.to_string()));
-                }
+            drop(admission_timer.take());
+            let startup_timer = self.timings.start(Phase::Startup);
+            let image = match &self.runtime {
+                Runtime::Host(_) => None,
+                Runtime::Container(runtime) => match runtime
+                    .image_store()
+                    .pull_and_unpack(template.image.as_deref().unwrap_or_default())
+                    .await
+                {
+                    Ok(image) => Some(image),
+                    Err(error) => {
+                        self.release(index, None).await;
+                        return failed(ExecutorError::Protocol(error.to_string()));
+                    }
+                },
             };
             let namespace = template.namespace.as_deref().unwrap_or("default");
-            let app = format!("executor-{}-reuse", self.prefix);
+            let app = format!(
+                "executor-{}-{}",
+                self.prefix,
+                if self.runtime.host() { "host" } else { "reuse" }
+            );
             let id = InstanceIdentity::new(namespace, &app, index as u32).instance_id();
             let base = match crate::grill::cgroup::instance_cgroup_path(namespace, &app, &id) {
                 Ok(base) => base,
@@ -499,10 +712,17 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             };
             let mut new = Context {
                 key,
-                directory: self.runtime.executor_directory().join(&id.0),
+                directory: match self.runtime.directory() {
+                    Ok(directory) => directory.join(&id.0),
+                    Err(error) => {
+                        self.release(index, None).await;
+                        return failed(error);
+                    }
+                },
                 id,
                 base,
                 image,
+                socket_path: None,
                 connection: None,
                 lease: lease.quarantine_on_drop(),
                 sequence: 0,
@@ -517,7 +737,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 return failed(error);
             }
             context = Some(new);
+            drop(startup_timer);
         }
+        drop(admission_timer.take());
         let Some(mut context) = context else {
             self.release(index, None).await;
             return failed(ExecutorError::Configuration("missing executor context"));
@@ -537,6 +759,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         let mut output = CapturedOutput::default();
         template.command = Some(task.args.clone());
+        if let Some(script) = &mut template.script {
+            *script = script.replace("{index}", &task.index.to_string());
+        }
         for (key, value) in &task.env {
             template.env.insert(
                 key.clone(),
@@ -551,11 +776,20 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             None,
         )
         .process;
-        let preparation = crate::grill::image_config::resolve_process(
-            &mut process,
-            &context.image.config,
-            &context.image.rootfs,
-        )
+        if self.runtime.host() {
+            // Preserve the existing owned host contract: commands run as Bun's
+            // effective user, while the helper has a separate protected identity.
+            process.user.uid = nix::unistd::geteuid().as_raw();
+            process.user.gid = nix::unistd::getegid().as_raw();
+        }
+        let preparation = match &context.image {
+            Some(image) => crate::grill::image_config::resolve_process(
+                &mut process,
+                &image.config,
+                &image.rootfs,
+            ),
+            None => Ok(()),
+        }
         .map_err(|error| ExecutorError::Protocol(error.to_string()))
         .and_then(|()| {
             context
@@ -589,6 +823,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     .check(template.namespace.as_deref().unwrap_or("default"))
                     .await?;
             }
+            let mut command_timer = Some(self.timings.start(Phase::Command));
             socket.write_all(&bytes).await?;
             // The encoded buffer holds live secrets only during submission.
             bytes.fill(0);
@@ -637,6 +872,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     }
                     protocol::Event::Exited(code) if started => {
                         logs.finish().await;
+                        drop(command_timer.take());
+                        let _cleanup_timer = self.timings.start(Phase::Cleanup);
                         protocol::cleanup(socket, sequence).await?;
                         if protocol::receive(socket, sequence).await? != protocol::Event::Ready {
                             return Err(ExecutorError::Protocol("missing cleanup receipt".into()));
@@ -649,6 +886,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                         });
                     }
                     protocol::Event::SpawnFailed(error) if !started => {
+                        drop(command_timer.take());
+                        let _cleanup_timer = self.timings.start(Phase::Cleanup);
                         protocol::cleanup(socket, sequence).await?;
                         if protocol::receive(socket, sequence).await? != protocol::Event::Ready {
                             return Err(ExecutorError::Protocol(
@@ -747,6 +986,20 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
     std::fs::write(task.join("memory.high"), profile.memory.request.to_string())?;
     std::fs::write(task.join("memory.oom.group"), "1")?;
     std::fs::write(task.join("pids.max"), "256")?;
+    std::fs::write(
+        base.join("helper/cpu.max"),
+        crate::grill::cpu_max_from_millicores(100),
+    )?;
+    std::fs::write(
+        base.join("helper/cpu.weight"),
+        crate::grill::cgroup::cpu_weight_from_millicores(super::HELPER_CPU_REQUEST).to_string(),
+    )?;
+    std::fs::write(
+        base.join("helper/memory.high"),
+        HELPER_MEMORY_BYTES.to_string(),
+    )?;
+    std::fs::write(base.join("helper/memory.swap.max"), "0")?;
+    std::fs::write(base.join("helper/pids.max"), "16")?;
     std::fs::write(
         base.join("helper/memory.max"),
         HELPER_MEMORY_BYTES.to_string(),

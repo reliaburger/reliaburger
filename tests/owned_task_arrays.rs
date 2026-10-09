@@ -1441,3 +1441,277 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
     council.shutdown().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// Native jobs reuse their supervisor and enforce limits before user code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_executor::{TaskInvocation, TaskRunner},
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::config::job::{JobRuntime, JobSpec};
+    use reliaburger::grill::{AnyGrill, ProcessGrill};
+    use reliaburger::meat::Resources;
+    use std::path::Path;
+    use tokio_util::sync::CancellationToken;
+    let root_path = tempfile::Builder::new()
+        .prefix("rb-native-executor-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let root = root_path.as_path();
+    eprintln!("native fixture: {}", root.display());
+    let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
+    let runner = OwnedRunner::with_slot_count(AnyGrill::Process(runtime.clone()), 1)
+        .with_budget(budget.clone());
+    let template: JobSpec = toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native'\ncpu='100m-1000m'\nmemory='32Mi'").unwrap();
+    let cancel = CancellationToken::new();
+    for index in 0..128 {
+        if index % 32 == 0 {
+            eprintln!("native command {index}");
+        }
+        let task = TaskInvocation {
+            template: Some(Box::new(template.clone())),
+            index,
+            attempt: 1,
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"cat /proc/self/cgroup; printf '%s' "${PREVIOUS-unset}"; export PREVIOUS=old"#
+                    .into(),
+            ],
+            env: vec![],
+        };
+        let outcome = runner.run(&task, Duration::from_secs(10), &cancel).await;
+        assert!(outcome.outcome.succeeded(), "{outcome:?}");
+        let text = String::from_utf8_lossy(&outcome.output.head);
+        assert!(
+            text.contains("/task"),
+            "command escaped resource cgroup: {text}"
+        );
+        assert!(text.ends_with("unset"), "environment leaked: {text}");
+        if index == 0 {
+            let path = text.lines().next().unwrap().strip_prefix("0::").unwrap();
+            let group = Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+            for (file, expected) in [
+                ("cpu.max", "100000 100000"),
+                ("memory.max", "33554432"),
+                ("memory.swap.max", "0"),
+                ("pids.max", "256"),
+            ] {
+                assert_eq!(
+                    std::fs::read_to_string(group.join(file)).unwrap().trim(),
+                    expected,
+                    "{file}"
+                );
+            }
+            let helper = group.parent().unwrap().join("helper");
+            assert_eq!(
+                std::fs::read_to_string(helper.join("cpu.weight"))
+                    .unwrap()
+                    .trim(),
+                reliaburger::grill::cgroup::cpu_weight_from_millicores(10).to_string()
+            );
+            assert_eq!(
+                std::fs::read_to_string(helper.join("memory.swap.max"))
+                    .unwrap()
+                    .trim(),
+                "0"
+            );
+        }
+    }
+    eprintln!("native repeated commands complete");
+    let timings = runner.executor_timings(JobRuntime::Process).unwrap();
+    assert_eq!(
+        timings.startup.samples, 1,
+        "one owner per command regressed"
+    );
+    assert_eq!(timings.command.samples, 128);
+    assert_eq!(timings.cleanup.samples, 128);
+    let memory_hog = TaskInvocation {
+        template: Some(Box::new(template.clone())),
+        index: 128,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "exec /usr/bin/python3 -c 'value=bytearray(67108864)'".into(),
+        ],
+        env: vec![],
+    };
+    let outcome = runner
+        .run(&memory_hog, Duration::from_secs(10), &cancel)
+        .await;
+    assert!(
+        matches!(
+            outcome.outcome,
+            reliaburger::bun::task_executor::AttemptOutcome::Signalled { signal: 9 }
+        ),
+        "memory limit did not OOM-kill allocation: {outcome:?}"
+    );
+    let next = TaskInvocation {
+        args: vec!["-c".into(), "printf after-oom".into()],
+        ..memory_hog
+    };
+    let outcome = runner.run(&next, Duration::from_secs(10), &cancel).await;
+    assert!(
+        outcome.outcome.succeeded(),
+        "task OOM killed its helper: {outcome:?}"
+    );
+    assert_eq!(outcome.output.head, b"after-oom");
+    assert_eq!(
+        runner
+            .executor_timings(JobRuntime::Process)
+            .unwrap()
+            .startup
+            .samples,
+        1
+    );
+    let inventory = runtime.launch_inventory().await.unwrap().unwrap();
+    assert_eq!(
+        inventory.len(),
+        1,
+        "owner inventory grew with completed jobs"
+    );
+    let id = inventory[0].instance_id.clone();
+    let alive = runtime.pid(&id).await.unwrap().unwrap();
+    assert!(
+        std::fs::read_to_string(format!("/proc/{alive}/cgroup"))
+            .unwrap()
+            .contains("/helper")
+    );
+    let cancel_command = CancellationToken::new();
+    let task = TaskInvocation {
+        template: Some(Box::new(template)),
+        index: 129,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "setsid /bin/sh -c 'sleep 30' & wait".into()],
+        env: vec![("RELIABURGER_BATCH_ID".into(), "77".into())],
+    };
+    let execution = runner.run(&task, Duration::from_secs(10), &cancel_command);
+    let trigger = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runner.active_commands(77, task.template.as_deref()).await != Some(1) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel_command.cancel();
+    };
+    eprintln!("native cancellation test starts");
+    let (outcome, ()) = tokio::join!(execution, trigger);
+    assert!(matches!(
+        outcome.outcome,
+        reliaburger::bun::task_executor::AttemptOutcome::Cancelled
+    ));
+    eprintln!("native cancellation returned {outcome:?}");
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_eq!(budget.available(), budget.capacity());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Dropping a caller closes its private connection; recovery reuses only an
+/// originally retired slot identity, never a recovered numeric PID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_executor::{TaskInvocation, TaskRunner},
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::{
+        grill::{AnyGrill, ProcessGrill},
+        meat::Resources,
+    };
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-recovery-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("native recovery fixture: {}", root.display());
+    let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
+    let runner = Arc::new(
+        OwnedRunner::for_data_dir(AnyGrill::Process(runtime.clone()), &root)
+            .unwrap()
+            .with_budget(budget.clone()),
+    );
+    let template = toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native-recovery'\ncpu='100m-1000m'\nmemory='32Mi'").unwrap();
+    let task = TaskInvocation {
+        template: Some(Box::new(template)),
+        index: 0,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "setsid /bin/sh -c 'sleep 30' & wait".into()],
+        env: vec![("RELIABURGER_BATCH_ID".into(), "88".into())],
+    };
+    let execution = {
+        let runner = runner.clone();
+        let task = task.clone();
+        tokio::spawn(async move {
+            runner
+                .run(&task, Duration::from_secs(60), &CancellationToken::new())
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runner.active_commands(88, task.template.as_deref()).await != Some(1) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
+        .instance_id
+        .clone();
+    execution.abort();
+    assert!(execution.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.state(&id).await.unwrap() != ContainerState::Stopped {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropped connection did not retire the original subtree");
+    assert!(
+        budget.available() != budget.capacity(),
+        "lost caller released its quarantined reservation"
+    );
+    drop(runner);
+    let recovered_budget = ExecutionBudget::new(budget.capacity());
+    let recovered = OwnedRunner::for_data_dir(AnyGrill::Process(runtime.clone()), &root)
+        .unwrap()
+        .with_budget(recovered_budget.clone());
+    let next = TaskInvocation {
+        args: vec!["-c".into(), "printf recovered".into()],
+        ..task
+    };
+    let outcome = recovered
+        .run(&next, Duration::from_secs(10), &CancellationToken::new())
+        .await;
+    assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    assert_eq!(outcome.output.head, b"recovered");
+    let inventory = runtime.launch_inventory().await.unwrap().unwrap();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(
+        inventory[0].instance_id, id,
+        "restart grew ownership identities"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while recovered_budget.available() != recovered_budget.capacity() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    std::fs::remove_dir_all(root).unwrap();
+}

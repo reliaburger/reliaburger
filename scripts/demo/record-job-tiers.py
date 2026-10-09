@@ -38,7 +38,7 @@ def build_report(baseline, tiers, elapsed):
 
 
 def build_manifest(runtime, count, image, host_binary):
-    template = (f'exec = {json.dumps(str(host_binary))}\ncommand = ["true"]\n' if runtime == 'process' else
+    template = (f'exec = {json.dumps(str(host_binary))}\ncommand = ["true"]\ncpu = "100m-1000m"\nmemory = "32Mi"\n' if runtime == 'process' else
                 f'image = {json.dumps(image)}\ncommand = ["/bin/busybox", "true"]\ncpu = "100m-1000m"\nmemory = "32Mi"\n')
     return (f'name = "demo-{runtime}-{count}"\nnamespace = "default"\n[[cohort]]\nname = "commands"\n'
             f'count = {count}\nchunk_size = 1000\nmax_attempts = 3\nper_node_concurrency = 27\n'

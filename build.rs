@@ -148,25 +148,27 @@ fn compile_executor() {
     let compiler = std::env::var(&target_key)
         .or_else(|_| std::env::var("CC"))
         .unwrap_or_else(|_| "cc".into());
-    let output =
-        std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output directory"))
-            .join("rb-executor-helper");
-    let result = Command::new(compiler)
-        .args([
-            "-O2",
-            "-static",
-            "-std=c11",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "src/bun/reusable_executor/helper.c",
-            "-o",
-        ])
-        .arg(output)
-        .status()
-        .expect("failed to execute static Linux C compiler");
-    assert!(
-        result.success(),
-        "static reusable executor helper compilation failed"
-    );
+    for (name, host) in [
+        ("rb-executor-helper", false),
+        ("rb-host-executor-helper", true),
+    ] {
+        let output =
+            std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output directory"))
+                .join(name);
+        let mut command = Command::new(&compiler);
+        command.args(["-O2", "-static", "-std=c11", "-Wall", "-Wextra", "-Werror"]);
+        if host {
+            command.arg("-DRB_EXECUTOR_HOST");
+        }
+        let result = command
+            .arg("src/bun/reusable_executor/helper.c")
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("failed to execute static Linux C compiler");
+        assert!(
+            result.success(),
+            "static executor helper compilation failed"
+        );
+    }
 }

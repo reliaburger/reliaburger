@@ -101,7 +101,7 @@ relish run --batch render --count 10000 --image renderer:v1 --cpu 250m-500m --me
 ```
 
 CPU and memory use the same request–limit syntax as apps. Requests govern local
-packing; rootful Linux containers enforce limits. Omitted values mean 1 CPU and
+packing; rootful Linux container and native process jobs enforce limits. Omitted values mean 1 CPU and
 64 MiB, including the limits. A profile that cannot run is shown as refused in
 status. Images are bound to a digest at submission and must pass the cluster's Pickle
 and upstream trust policies, including required cosign signatures.
@@ -214,8 +214,8 @@ within the same epoch continues to reconcile existing results.
 
 Arrays containing multiple image tasks require the rootful Linux owned runtime.
 Singletons use the configured owned container or process runtime, preserving its
-supported limits. Unsupported explicit CPU/memory limits are refused on process
-and rootless runtimes. Slots reuse cached image layers and bounded instance
+supported limits. Explicit CPU/memory limits are refused when the process
+backend lacks rootful Linux native executors, and on rootless image runtimes. Slots reuse cached image layers and bounded instance
 identities; every attempt gets a fresh launch. Singleton container roots are
 writable. Larger arrays use a read-only root, temporary scratch and a 1 MiB limit
 per regular output or scratch file (`RLIMIT_FSIZE`).
@@ -230,8 +230,10 @@ On Linux, `bun --runtime mixed` enables both owned backends. `--runtime auto`
 can detect both when runc is available. Explicit `--runtime runc` is
 container-only and refuses host jobs; `--runtime process` is host-only.
 Host commands still need the executable allowlist and
-`mount_isolation = false`. Explicit host CPU/memory limits remain refused;
-container capabilities do not enforce limits or isolation on host commands.
+`mount_isolation = false`. Rootful Linux process jobs use native executors and
+enforce CPU/memory limits before execution. Other platforms retain the original
+owned process backend and refuse explicit limits. Containers and native jobs
+keep separate execution capabilities.
 
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
 
@@ -241,9 +243,13 @@ relish run --runtime process --batch hello --count 1000 \
 ```
 
 Omitting `--runtime process` refuses the host command. A process job's default
-request reserves one CPU and 64 MiB beside applications. This is admission
-accounting; host commands have no hard CPU or memory limit. The raw VM baseline
-bypasses this reservation as well as durable task ownership and outcomes.
+profile reserves one CPU and 64 MiB beside applications. A native executor adds
+10 millicores and 8 MiB for its helper and enforces that default command profile.
+Explicit smaller requests can admit more short commands while keeping their
+burst limits. Reservations remain charged while a compatible executor is idle;
+it expires after a second and yields to waiting profiles. Native host jobs keep
+host filesystem access and Bun's user. The raw VM baseline bypasses admission,
+resource limits, durable ownership and task outcomes.
 
 
 ## Reusable containers
@@ -288,8 +294,11 @@ quarantined until recovery retires the original generation. Host execution,
 rootless runtimes and GPU requests cannot select this mode. Kubernetes export
 refuses it because an ordinary Job cannot preserve this contract.
 
-Summaries include `runtime` and `idle_executor_reservation`. Host jobs report
-`process`. On rootful Linux runc, memory-limited image jobs disable swap
+Summaries include `runtime` and `idle_executor_reservation`. The reservation is
+per compatible executor profile, including its helper, rather than live node
+usage. For `process`, it applies to rootful Linux native executors; fallback
+process backends don't retain idle executors. The summary labels that scope.
+Host jobs report `process`. On rootful Linux runc, memory-limited image jobs disable swap
 in both fresh and reused execution. A job exceeding its RAM limit can be OOM-killed; it cannot silently
 spill into swap and consume unaccounted disk I/O. Choose the memory range for
 the actual working set, including model weights.
@@ -302,7 +311,13 @@ Authorised scripts and encrypted environment values use the common path. Workers
 decrypt with live keys for the job's namespace. Decrypted configuration stays
 execution-local; captured output uses normal scoped retention. Host jobs require the owned process runtime, an absolute
 allowlisted binary (or `/bin/sh` for scripts) and disabled mount isolation.
-That backend cannot enforce explicit resource ranges. GPU jobs remain refused;
+Rootful Linux process jobs use bounded native executors and accept explicit
+CPU/memory ranges. Each fresh command is born inside its limited task cgroup;
+helper overhead stays reserved while its executor is idle. Commands retain
+Bun's user and host filesystem access, so use trusted allowlisted workloads.
+Other platforms retain the original owned process backend and refuse explicit
+resource ranges. This change applies to jobs; host applications keep their
+existing runtime contract. GPU jobs remain refused;
 GPU placement is tracked separately in #359. Test-lease workloads retain their
 lease-aware admission; unowned lease namespaces and images are refused here.
 
@@ -465,10 +480,23 @@ sudo target/release/examples/job-throughput --path durable-reused \
   --count 10000 --concurrency 27 --service-url http://app.example/health
 ```
 
-Use `bare`, `fresh`, `reused`, `durable-fresh` and `durable-reused` with the same
-image, command, count and resource inputs. This driver uses `/bin/busybox true`
-from that pinned image, including the same unpacked binary in its process
-floor. Bare processes have no container limits or ownership/durability contract.
+Use `bare`, `bare-limited`, `host`, `fresh`, `reused`, `durable-host`,
+`durable-fresh` and `durable-reused` with the same image, count, concurrency and
+resource inputs. The default command is `/bin/busybox true` from that pinned
+image, including the same unpacked executable for raw and native processes.
+`--workload sleep|cpu|output` selects additional matched workloads.
+`--cpu-request-millicores`, `--cpu-limit-millicores` and `--memory-bytes`
+set the common profile. Concurrency must fit the declared node budget, including
+helper overhead. `bare-limited` applies matched CPU, memory, swap and PID limits
+before `exec`; `bare` records an unconstrained process floor. Both count exit
+statuses without durable ownership or a task ledger.
+
+Cold executor setup is included by default, while image preparation is reported
+separately. `--warmup-count` discloses excluded warmup and keeps the same executor
+pool for measurement. Reports include fixed-size admission, startup, command and
+cleanup distributions; compare the before/after snapshots. Direct host/container
+outcomes, durable worker receipts and public Raft acceptance have different
+completion boundaries. Compare each boundary separately.
 Direct runtime and durable worker modes omit Bun's live namespace supervision;
 the public cluster includes it. Disclose those differences when interpreting
 the gap. Run independent runtime allocators on separate qualification nodes or

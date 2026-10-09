@@ -16,7 +16,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#ifndef RB_EXECUTOR_HOST_FIXTURE
+#if !defined(RB_EXECUTOR_HOST_FIXTURE) || defined(RB_EXECUTOR_HOST)
 #include <grp.h>
 #include <linux/capability.h>
 #include <linux/sched.h>
@@ -30,7 +30,12 @@
 
 #define FRAME_LIMIT 65536U
 #define STRING_LIMIT 256U
+#ifdef RB_EXECUTOR_HOST
+/* Match the protected host uid used by container helpers' user mapping. */
+#define HELPER_UID 2100000000U
+#else
 #define HELPER_UID 65536U
+#endif
 static unsigned char frame[FRAME_LIMIT];
 extern char **environ;
 static int child_events[2];
@@ -127,14 +132,23 @@ static int pipes(int descriptors[2]) {
 }
 #ifndef RB_EXECUTOR_HOST_FIXTURE
 static void child_setup(uint32_t uid, uint32_t gid) {
+#ifdef RB_EXECUTOR_HOST
+    /* Host commands keep the existing Bun-user privilege contract. They are
+     * allowlisted trusted processes, not an OCI security boundary. */
+    if (setgroups(0, NULL) || setgid(gid) || setuid(uid) || prctl(PR_SET_PDEATHSIG, SIGKILL)) {
+        perror("host task credentials"); _exit(126);
+    }
+#else
     /* These capabilities exist only in this container's user namespace. A
      * command never keeps them, the helper's descriptors or delegation uid. */
+#ifndef RB_EXECUTOR_HOST
     if (unshare(CLONE_NEWNS | CLONE_NEWIPC) || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) ||
         mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777,size=16m") ||
         mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=1777,size=16m") ||
         mount(NULL, "/dev", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NOEXEC, NULL)) {
         perror("executor private scratch"); _exit(126);
     }
+#endif
     struct rlimit file_size = {.rlim_cur = 1U << 20, .rlim_max = 1U << 20};
     if (setrlimit(RLIMIT_FSIZE, &file_size) || setgroups(0, NULL) ||
         prctl(PR_SET_SECUREBITS, SECBIT_NOROOT | SECBIT_NOROOT_LOCKED |
@@ -153,6 +167,7 @@ static void child_setup(uint32_t uid, uint32_t gid) {
     if (syscall(SYS_capset, &header, capabilities) || prctl(PR_SET_PDEATHSIG, SIGKILL)) {
         perror("executor task capabilities"); _exit(126);
     }
+#endif
 }
 #endif
 static pid_t launch(int directory) {
@@ -165,6 +180,37 @@ static pid_t launch(int directory) {
     return (pid_t)syscall(SYS_clone3, &arguments, sizeof(arguments));
 #endif
 }
+#ifdef RB_EXECUTOR_HOST
+/* This single-threaded subreaper never reaps a child between reading its owned
+ * children list and opening its pidfd. Even a dead child retains its identity.
+ * Descendants are adopted when their parents exit; repeat until ECHILD. */
+static int retire_owned_children(void) {
+    for (;;) {
+        char path[96];
+        snprintf(path, sizeof(path), "/proc/self/task/%ld/children", (long)getpid());
+        FILE *children = fopen(path, "r");
+        if (!children) return -1;
+        long child;
+        while (fscanf(children, "%ld", &child) == 1) {
+            int pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+            if (pidfd < 0) { if (errno == ESRCH) continue; fclose(children); return -1; }
+            int result = (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0);
+            int saved = errno;
+            close(pidfd);
+            if (result && saved != ESRCH) { fclose(children); errno = saved; return -1; }
+        }
+        fclose(children);
+        int status;
+        pid_t waited;
+        do { waited = waitpid(-1, &status, WNOHANG); } while (waited > 0 || (waited < 0 && errno == EINTR));
+        if (waited < 0) return errno == ECHILD ? 0 : -1;
+        struct pollfd notification = {child_events[0], POLLIN, 0};
+        if (poll(&notification, 1, -1) < 0 && errno != EINTR) return -1;
+        unsigned char markers[128];
+        while (read(child_events[0], markers, sizeof(markers)) > 0) {}
+    }
+}
+#endif
 static int cleanup(int fd, uint64_t sequence) {
     unsigned char receipt[9];
     if (all(fd, receipt, sizeof(receipt), 0) || receipt[0] != 'C' ||
@@ -172,7 +218,9 @@ static int cleanup(int fd, uint64_t sequence) {
     /* Only production PID 1 calls kill-all: the kernel confines signalling to
      * this PID namespace, excluding PID 1 itself. Its namespace-local CAP_KILL
      * covers descendant users. Never use this in the host protocol fixture. */
-#ifndef RB_EXECUTOR_HOST_FIXTURE
+#ifdef RB_EXECUTOR_HOST
+    if (retire_owned_children()) return -1;
+#elif !defined(RB_EXECUTOR_HOST_FIXTURE)
     if (kill(-1, SIGKILL) && errno != ESRCH) return -1;
 #endif
     /* Reap every descendant before authorising another command. Bun checks
@@ -252,14 +300,25 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
             else if (size < 0 && errno != EAGAIN && errno != EINTR) failed = 1;
         }
         if (failed || exited) break;
+#ifdef RB_EXECUTOR_HOST
+        siginfo_t information = {0};
+        int waited = waitid(P_PID, (id_t)child, &information, WEXITED | WNOHANG | WNOWAIT);
+        if (!waited && information.si_pid) {
+            status = information.si_code == CLD_EXITED ? information.si_status << 8 : information.si_status;
+            exited = 1;
+        } else if (waited < 0 && errno != EINTR) { failed = 1; break; }
+#else
         pid_t waited = waitpid(child, &status, WNOHANG);
         if (waited == child) exited = 1;
         else if (waited < 0 && errno != EINTR) { failed = 1; break; }
+#endif
     }
     for (unsigned stream = 0; stream < 2; ++stream)
         if (outputs[stream][0] >= 0) close(outputs[stream][0]);
     if (failed) {
-#ifdef RB_EXECUTOR_HOST_FIXTURE
+#ifdef RB_EXECUTOR_HOST
+        (void)retire_owned_children();
+#elif defined(RB_EXECUTOR_HOST_FIXTURE)
         (void)kill(child, SIGKILL);
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
 #endif
@@ -270,9 +329,25 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
     return cleanup(control, sequence);
 }
 int main(int argc, char **argv) {
-    if (argc != 2 || strlen(argv[1]) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 125;
+#if defined(RB_EXECUTOR_HOST) && !defined(RB_EXECUTOR_HOST_FIXTURE)
+    if (argc != 3) return 125;
+    int placement = open(argv[2], O_WRONLY | O_CLOEXEC);
+    char identity[32];
+    int size = snprintf(identity, sizeof(identity), "%ld", (long)getpid());
+    if (placement < 0 || all(placement, identity, (size_t)size, 1)) return 125;
+    close(placement);
+#else
+    if (argc != 2) return 125;
+#endif
+#ifdef RB_EXECUTOR_HOST
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1)) return 125;
+#endif
+    if (strlen(argv[1]) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 125;
 #ifndef RB_EXECUTOR_HOST_FIXTURE
-    if (getpid() != 1 || getuid() != 0 || getgid() != 0 ||
+#ifndef RB_EXECUTOR_HOST
+    if (getpid() != 1) return 125;
+#endif
+    if (getuid() != 0 || getgid() != 0 ||
         prctl(PR_SET_KEEPCAPS, 1) || setgroups(0, NULL) ||
         setgid(HELPER_UID) || setuid(HELPER_UID)) return 125;
     struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
@@ -327,6 +402,9 @@ int main(int argc, char **argv) {
         erase(length);
     }
     erase(sizeof(frame));
+#ifdef RB_EXECUTOR_HOST
+    if (retire_owned_children()) return 125;
+#endif
     close(directory); close(control);
     return 125;
 }

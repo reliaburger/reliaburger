@@ -569,9 +569,10 @@ pub fn array_summary(
         "details_retention_seconds": crate::meat::task_array_store::TERMINAL_RETENTION_SECS,
         "execution_semantics": "at_least_once",
         "runtime": record.template.runtime,
-        "idle_executor_reservation": if record.template.runtime == crate::config::job::JobRuntime::SharedRunc {
+        "idle_executor_reservation": if matches!(record.template.runtime, crate::config::job::JobRuntime::SharedRunc | crate::config::job::JobRuntime::Process) {
             super::reusable_executor::ExecutorProfile::new(&record.template).ok().map(|profile| serde_json::json!({"cpu_millicores":profile.reservation.cpu_millicores,"memory_bytes":profile.reservation.memory_bytes}))
         } else { None },
+        "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
     })
 }
 
@@ -1441,6 +1442,22 @@ mod tests {
         assert!(array_summary(9, &record, &nodes)["active_commands"].is_null());
         nodes[1].refused = Some("unsupported".into());
         assert_eq!(array_summary(9, &record, &nodes)["active_commands"], 3);
+    }
+
+    #[test]
+    fn native_profile_summary_discloses_idle_helper_cost_without_claiming_live_usage() {
+        let record = record_with_failures(&[]);
+        let summary = array_summary(9, &record, &[]);
+        assert_eq!(summary["runtime"], "process");
+        assert_eq!(summary["idle_executor_reservation"]["cpu_millicores"], 1010);
+        assert_eq!(
+            summary["idle_executor_reservation"]["memory_bytes"],
+            72 << 20
+        );
+        assert_eq!(
+            summary["idle_executor_reservation_semantics"],
+            "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage"
+        );
     }
 
     #[test]

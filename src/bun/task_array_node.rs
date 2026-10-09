@@ -308,6 +308,18 @@ impl TaskArrayNode {
         }
     }
 
+    /// Bounded node-local executor phase distributions for measurement tooling.
+    #[cfg(target_os = "linux")]
+    pub fn executor_timings(
+        &self,
+        runtime: crate::config::job::JobRuntime,
+    ) -> Option<super::reusable_executor::timings::TimingSnapshot> {
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => runner.executor_timings(runtime),
+            _ => None,
+        }
+    }
+
     /// Use the exact admission ledger the node's supervisor uses for apps.
     pub fn with_budget(mut self, budget: Arc<super::execution_budget::ExecutionBudget>) -> Self {
         if let NodeRunner::Owned(runner) = self.runner.as_ref() {
@@ -531,11 +543,22 @@ impl TaskArrayNode {
                 .template
                 .as_ref()
                 .is_some_and(|t| t.cpu.is_some() || t.memory.is_some())
+                && !runner.supports_host_limits()
             {
                 return Err(
                     "the host process runtime cannot enforce CPU or memory limits; use image tasks"
                         .into(),
                 );
+            }
+        }
+        if let NodeRunner::Owned(runner) = self.runner.as_ref()
+            && runner.supports_host_limits()
+            && let Some(template) = assignment.template.as_ref()
+        {
+            let profile = super::reusable_executor::ExecutorProfile::new(template)
+                .map_err(|error| error.to_string())?;
+            if !self.budget.capacity().fits(&profile.reservation) {
+                return Err("host profile plus helper exceeds node capacity".into());
             }
         }
         if !self.config.policy.is_binary_allowed(&assignment.program) {
@@ -756,7 +779,9 @@ impl TaskArrayNode {
             batch_id: assignment.batch_id,
             slots: {
                 let reusable = assignment.template.as_deref().filter(|template| {
-                    template.runtime == crate::config::job::JobRuntime::SharedRunc
+                    template.runtime == crate::config::job::JobRuntime::SharedRunc ||
+                        (template.runtime == crate::config::job::JobRuntime::Process &&
+                         matches!(self.runner.as_ref(), NodeRunner::Owned(runner) if runner.supports_host_limits()))
                 });
                 let resources = reusable
                     .and_then(|template| {
