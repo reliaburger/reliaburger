@@ -105,6 +105,7 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
         program: "/unused".into(),
         args: vec!["/bin/sh".into(), "-c".into(), "sleep 60 & wait".into()],
         env: vec![],
+        run: None,
     };
     let running = {
         let runner = runner.clone();
@@ -255,6 +256,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
         program: "/unused".into(),
         args: vec!["/bin/sh".into(), "-c".into(), command],
         env: vec![],
+        run: None,
     };
     let outcome = runner.run(&invocation(format!("test \"$(wget -qO- -T 2 http://{}:{port}/)\" = ok && ! wget -qO- -T 2 http://{}:{port}/", vip(&namespace), vip(&other))), Duration::from_secs(30), &CancellationToken::new()).await;
     assert_eq!(
@@ -788,6 +790,11 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
             ("RELIABURGER_TASK_COUNT".into(), "2".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let cancel = CancellationToken::new();
     let first = runner.run(&task, Duration::from_secs(20), &cancel).await;
@@ -1371,6 +1378,11 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
             ("RELIABURGER_TASK_COUNT".into(), "2".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let active_cancel = CancellationToken::new();
     let active = tokio::spawn({
@@ -1489,6 +1501,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
                     .into(),
             ],
             env: vec![],
+            run: None,
         };
         let outcome = runner.run(&task, Duration::from_secs(10), &cancel).await;
         assert!(outcome.outcome.succeeded(), "{outcome:?}");
@@ -1546,6 +1559,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "exec /usr/bin/env".into()],
         env: vec![("JOB".into(), "1".into())],
+        run: None,
     };
     let outcome = runner
         .run(&environment, Duration::from_secs(10), &cancel)
@@ -1578,6 +1592,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
             "exec /usr/bin/python3 -c 'value=bytearray(67108864)'".into(),
         ],
         env: vec![],
+        run: None,
     };
     let outcome = runner
         .run(&memory_hog, Duration::from_secs(10), &cancel)
@@ -1638,6 +1653,11 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "setsid /bin/sh -c 'sleep 30' & wait".into()],
         env: vec![("RELIABURGER_BATCH_ID".into(), "77".into())],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 77,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let execution = runner.run(&task, Duration::from_secs(10), &cancel_command);
     let trigger = async {
@@ -1699,6 +1719,11 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "setsid /bin/sh -c 'sleep 30' & wait".into()],
         env: vec![("RELIABURGER_BATCH_ID".into(), "88".into())],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 88,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let execution = {
         let runner = runner.clone();
@@ -1802,6 +1827,7 @@ fn shell_task(
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],
         env: vec![],
+        run: None,
     }
 }
 

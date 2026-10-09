@@ -537,20 +537,8 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         },
                     )
                     .await;
-                if task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_TASK_COUNT")
-                    .is_some_and(|(_, value)| value == "1")
-                    && let Some(run) = task
-                        .env
-                        .iter()
-                        .rev()
-                        .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                        .and_then(|(_, value)| value.parse().ok())
-                {
-                    self.retire_singleton(run).await;
+                if let Some(run) = task.run.as_ref().filter(|run| run.is_singleton()) {
+                    self.retire_singleton(run.batch_id).await;
                 }
                 return result;
             }
@@ -590,21 +578,12 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         if let Some(script) = &mut spec.script {
             *script = script.replace("{index}", &task.index.to_string());
         }
-        let singleton = task
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "RELIABURGER_TASK_COUNT")
-            .is_some_and(|(_, value)| value == "1");
-        let run_id = singleton
-            .then(|| {
-                task.env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                    .and_then(|(_, value)| value.parse::<u64>().ok())
-            })
-            .flatten();
+        let run_id = task
+            .run
+            .as_ref()
+            .filter(|run| run.is_singleton())
+            .map(|run| run.batch_id);
+        let singleton = run_id.is_some();
         // Omitted requests have concrete conservative defaults, including limits.
         if template.image.is_some() && (!singleton || self.runtime.honours_cgroup_path()) {
             spec.cpu.get_or_insert(crate::config::types::ResourceRange {
@@ -747,19 +726,14 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 let runtime = self.runtime.clone();
                 let id = id.clone();
                 let app = task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
-                    .map(|(_, value)| value.clone())
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.job_name.clone())
                     .unwrap_or_else(|| "job".into());
                 let log_instance = task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                    .and_then(|(_, value)| value.parse::<u64>().ok())
-                    .map_or_else(|| id.0.clone(), |id| format!("run-{id}"));
+                    .run
+                    .as_ref()
+                    .map_or_else(|| id.0.clone(), |run| format!("run-{}", run.batch_id));
                 let namespace = namespace.to_string();
                 let offsets = self.capture_offsets.clone();
                 tokio::spawn(async move {
@@ -957,6 +931,7 @@ mod tests {
             program: "/unused".into(),
             args: vec!["worker".into()],
             env: vec![],
+            run: None,
         }
     }
     #[tokio::test]
@@ -972,6 +947,11 @@ mod tests {
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -1016,6 +996,11 @@ mod tests {
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -1077,6 +1062,11 @@ mod tests {
                 ("RELIABURGER_TASK_COUNT".into(), "1".into()),
                 ("RELIABURGER_BATCH_ID".into(), id.to_string()),
             ];
+            task.run = Some(crate::bun::task_executor::RunIdentity {
+                batch_id: id,
+                task_count: 1,
+                job_name: None,
+            });
             let attempt = runner
                 .run(&task, Duration::ZERO, &CancellationToken::new())
                 .await;
@@ -1101,6 +1091,11 @@ mod tests {
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -1146,6 +1141,11 @@ mod tests {
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
             ("RELIABURGER_JOB_NAME".into(), "migrate".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: Some("migrate".into()),
+        });
         let result = runner
             .run(&task, Duration::from_secs(5), &CancellationToken::new())
             .await;

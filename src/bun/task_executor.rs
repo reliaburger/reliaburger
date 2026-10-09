@@ -52,6 +52,28 @@ pub struct TaskInvocation {
     pub args: Vec<String>,
     /// Environment: the template's plain variables plus the task identity.
     pub env: Vec<(String, String)>,
+    /// The run this attempt belongs to, for runners that log or track per
+    /// run. The command sees the same facts as `RELIABURGER_*` variables.
+    pub run: Option<RunIdentity>,
+}
+
+/// Typed copy of the run facts a runner needs, parsed once where the
+/// invocation is built rather than searched for in `env` by every runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIdentity {
+    /// The task array (batch) id.
+    pub batch_id: u64,
+    /// Tasks in the whole array; 1 means a singleton job run.
+    pub task_count: u32,
+    /// The job's name, when the leader supplied one.
+    pub job_name: Option<String>,
+}
+
+impl RunIdentity {
+    /// A single-task run, whose output and logs are kept as the job's own.
+    pub fn is_singleton(&self) -> bool {
+        self.task_count == 1
+    }
 }
 
 /// How one attempt ended.
@@ -842,6 +864,12 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value)),
         );
+        let job_name = work
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
+            .map(|(_, value)| value.clone());
         TaskInvocation {
             template: work.template.clone(),
             index,
@@ -849,6 +877,11 @@ impl<R: TaskRunner> TaskAttempts<R> {
             program: work.program.clone(),
             args: expand_argv(&work.args, index),
             env,
+            run: Some(RunIdentity {
+                batch_id: work.batch_id,
+                task_count: work.spec.count,
+                job_name,
+            }),
         }
     }
 }
@@ -890,6 +923,7 @@ mod tests {
             program: PathBuf::from(program),
             args: args.iter().map(|a| a.to_string()).collect(),
             env: vec![("GREETING".to_string(), "hello".to_string())],
+            run: None,
         }
     }
 

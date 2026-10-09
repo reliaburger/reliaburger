@@ -877,12 +877,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 return failed(error);
             }
         };
-        let run_id = task
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-            .and_then(|(_, value)| value.parse().ok());
+        let run_id = task.run.as_ref().map(|run| run.batch_id);
         // Only the command's own run time, from the helper's start receipt to
         // its exit: not slot queueing, admission, image pulls or cleanup.
         let mut ran = None;
@@ -904,18 +899,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let mut started = false;
             let mut began = tokio::time::Instant::now();
             let mut logs = CommandLogs::new(task, &template, sink);
-            if task
-                .env
-                .iter()
-                .rev()
-                .find(|(key, _)| key == "RELIABURGER_TASK_COUNT")
-                .is_some_and(|(_, value)| value == "1")
-                && let Some(run) = task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                    .and_then(|(_, value)| value.parse().ok())
+            if let Some(run) = task
+                .run
+                .as_ref()
+                .filter(|run| run.is_singleton())
+                .map(|run| run.batch_id)
             {
                 let stream = super::CommandLogStream::new();
                 logs.live = Some(stream.clone());
@@ -1180,22 +1168,21 @@ impl<'a> CommandLogs<'a> {
         template: &JobSpec,
         sink: Option<&'a tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
     ) -> Self {
-        let field = |name| {
-            task.env
-                .iter()
-                .rev()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.clone())
-        };
+        let run = task.run.as_ref();
         Self {
             live: None,
-            sink: sink.filter(|_| field("RELIABURGER_TASK_COUNT").as_deref() == Some("1")),
-            app: field("RELIABURGER_JOB_NAME").unwrap_or_else(|| "job".into()),
+            sink: sink.filter(|_| run.is_some_and(|run| run.is_singleton())),
+            app: run
+                .and_then(|run| run.job_name.clone())
+                .unwrap_or_else(|| "job".into()),
             namespace: template
                 .namespace
                 .clone()
                 .unwrap_or_else(|| "default".into()),
-            instance: format!("run-{}", field("RELIABURGER_BATCH_ID").unwrap_or_default()),
+            instance: format!(
+                "run-{}",
+                run.map(|run| run.batch_id.to_string()).unwrap_or_default()
+            ),
             pending: Default::default(),
         }
     }

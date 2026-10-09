@@ -268,6 +268,7 @@ mod linux {
                                 program: executable,
                                 args: if host { args[1..].to_vec() } else { args },
                                 env,
+                                run: None,
                             };
                             runner
                                 .run(&task, Duration::from_secs(30), &cancel)
