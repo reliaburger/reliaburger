@@ -1425,6 +1425,20 @@ few more) and lays the job's `env` over it. The in-memory backend calls
 the parent's whole environment. The owned backend records the result, so a
 command started after a Bun upgrade sees the same variables.
 
+The helper relays output with `poll` and non-blocking reads, at most sixteen
+4 KiB reads per stream per pass, so a flooding command can't starve the exit
+check. Our first version made only one more pass after the command exited. A
+pipe normally holds 64 KiB, so that looked like enough, but a command can grow
+its pipe to a megabyte with `fcntl(F_SETPIPE_SZ)`. One that wrote 500,000
+bytes and exited lost everything past the second pass, and still reported
+success. After exit the helper now reads each stream to end-of-file. That
+happens immediately unless a background descendant still holds the pipe. In
+that case the helper stops once the descendant has been quiet for 10 ms, or
+after 16 MiB, and appends a visible `[reliaburger: output written after exit
+truncated]` line, never dropping bytes silently. The regression test makes the
+race deterministic by sending `SIGSTOP` to the helper while the command fills
+its pipe and exits.
+
 The native helper connects through a short socket address under `/tmp`. Its
 peer credentials and the owner's unreaped process identity authenticate the
 connection. We use this fixed directory because a private `TMPDIR` can become

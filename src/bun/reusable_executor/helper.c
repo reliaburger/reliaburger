@@ -30,6 +30,7 @@
 
 #define FRAME_LIMIT 65536U
 #define STRING_LIMIT 256U
+#define DRAIN_AFTER_EXIT_LIMIT (16U << 20)
 #ifdef RB_EXECUTOR_HOST
 /* Match the protected host uid used by container helpers' user mapping. */
 #define HELPER_UID 2100000000U
@@ -271,16 +272,24 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
     int status = 0;
     int failed = event(control, 1, sequence) != 0;
     int exited = 0;
+    /* After exit, drain to EOF: a command may enlarge its pipe (F_SETPIPE_SZ)
+     * and exit with far more than one pass buffered. EOF is immediate unless
+     * a descendant still holds the pipe; then stop once it stays silent for
+     * 10 ms, or at a cap, saying so in the output rather than dropping bytes
+     * silently. */
+    size_t drained_after_exit = 0;
+    int truncated = 0;
     for (;;) {
         if (failed) break;
         struct pollfd observed[4] = {{control, 0, 0},
             {outputs[0][0], POLLIN, 0}, {outputs[1][0], POLLIN, 0},
             {child_events[0], POLLIN, 0}};
-        int polled = poll(observed, 4, exited ? 0 : -1);
+        int polled = poll(observed, 4, exited ? 10 : -1);
         if (polled < 0 && errno == EINTR) continue;
         if (polled < 0 || observed[0].revents & (POLLHUP | POLLERR | POLLNVAL)) { failed = 1; break; }
         unsigned char notifications[128];
         while (read(child_events[0], notifications, sizeof(notifications)) > 0) {}
+        int progressed = 0;
         for (unsigned stream = 0; stream < 2; ++stream) {
             if (outputs[stream][0] < 0) continue;
             unsigned char bytes[4096];
@@ -290,16 +299,24 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
             for (unsigned reads = 0; reads < 16; ++reads) {
                 size = read(outputs[stream][0], bytes, sizeof(bytes));
                 if (size <= 0) break;
+                progressed = 1;
+                if (exited) drained_after_exit += (size_t)size;
                 unsigned char source = (unsigned char)stream + 1;
                 if (event(control, 2, sequence) || all(control, &source, 1, 1) ||
                     send_word(control, (uint32_t)size) || all(control, bytes, (size_t)size, 1)) {
                     failed = 1; break;
                 }
             }
-            if (!size) { close(outputs[stream][0]); outputs[stream][0] = -1; }
+            if (!size) { close(outputs[stream][0]); outputs[stream][0] = -1; progressed = 1; }
             else if (size < 0 && errno != EAGAIN && errno != EINTR) failed = 1;
         }
-        if (failed || exited) break;
+        if (failed) break;
+        if (exited) {
+            if (outputs[0][0] < 0 && outputs[1][0] < 0) break;
+            if (!progressed) break;
+            if (drained_after_exit >= DRAIN_AFTER_EXIT_LIMIT) { truncated = 1; break; }
+            continue;
+        }
 #ifdef RB_EXECUTOR_HOST
         siginfo_t information = {0};
         int waited = waitid(P_PID, (id_t)child, &information, WEXITED | WNOHANG | WNOWAIT);
@@ -315,6 +332,13 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
     }
     for (unsigned stream = 0; stream < 2; ++stream)
         if (outputs[stream][0] >= 0) close(outputs[stream][0]);
+    if (truncated && !failed) {
+        char marker[] = "\n[reliaburger: output written after exit truncated]\n";
+        unsigned char source = 2;
+        uint32_t length = sizeof(marker) - 1;
+        failed = event(control, 2, sequence) || all(control, &source, 1, 1) ||
+                 send_word(control, length) || all(control, marker, length, 1);
+    }
     if (failed) {
 #ifdef RB_EXECUTOR_HOST
         (void)retire_owned_children();

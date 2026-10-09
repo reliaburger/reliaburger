@@ -1756,20 +1756,23 @@ fn one_slot_native_runner(
     reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::AnyGrill>,
     std::sync::Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
     reliaburger::config::job::JobSpec,
+    reliaburger::grill::ProcessGrill,
 ) {
     use reliaburger::grill::{AnyGrill, ProcessGrill};
     let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
     let budget = reliaburger::bun::execution_budget::ExecutionBudget::new(
         reliaburger::meat::Resources::new(1000, 128 << 20, 0),
     );
-    let runner =
-        reliaburger::bun::task_runtime::OwnedRunner::with_slot_count(AnyGrill::Process(runtime), 1)
-            .with_budget(budget.clone());
+    let runner = reliaburger::bun::task_runtime::OwnedRunner::with_slot_count(
+        AnyGrill::Process(runtime.clone()),
+        1,
+    )
+    .with_budget(budget.clone());
     let template = toml::from_str(
         "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native'\ncpu='100m-1000m'\nmemory='32Mi'",
     )
     .unwrap();
-    (runner, budget, template)
+    (runner, budget, template, runtime)
 }
 
 fn shell_task(
@@ -1818,7 +1821,7 @@ async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
         .prefix("rb-native-fresh-")
         .tempdir()
         .unwrap();
-    let (runner, budget, template) = one_slot_native_runner(root.path());
+    let (runner, budget, template, _) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let first = runner
         .run(
@@ -1869,7 +1872,7 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
         .prefix("rb-native-stuck-")
         .tempdir()
         .unwrap();
-    let (runner, budget, template) = one_slot_native_runner(root.path());
+    let (runner, budget, template, _) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let first = runner
         .run(
@@ -1937,6 +1940,71 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
         .await;
     assert!(after.outcome.succeeded(), "{after:?}");
     assert_eq!(after.output.head, b"ok");
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
+/// Output still buffered in an enlarged pipe at exit must all arrive; output
+/// that never stops after exit is cut off with a visible marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_drains_output_buffered_at_exit() {
+    use nix::sys::signal::{Signal, kill};
+    use reliaburger::bun::task_executor::TaskRunner;
+    use reliaburger::grill::Grill;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-drain-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let warm = runner
+        .run(
+            &shell_task(&template, 0, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(warm.outcome.succeeded(), "{warm:?}");
+    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
+        .instance_id
+        .clone();
+    let helper = nix::unistd::Pid::from_raw(runtime.pid(&id).await.unwrap().unwrap() as i32);
+    // Stop the helper while the command fills a 1 MiB pipe (F_SETPIPE_SZ is
+    // 1031) and exits, so all 500,000 bytes are still buffered when the
+    // helper sees the exit. Running, it would drain them as they arrive.
+    let python = shell_task(
+        &template,
+        1,
+        "exec /usr/bin/python3 -c 'import fcntl, os, time; fcntl.fcntl(1, 1031, 1 << 20); time.sleep(0.5); os.write(1, b\"x\" * 500000)'",
+    );
+    let buffered = runner.run(&python, Duration::from_secs(10), &cancel);
+    let pause = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        kill(helper, Signal::SIGSTOP).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        kill(helper, Signal::SIGCONT).unwrap();
+    };
+    let (buffered, ()) = tokio::join!(buffered, pause);
+    assert!(buffered.outcome.succeeded(), "{buffered:?}");
+    assert_eq!(buffered.output.total_bytes, 500_000);
+    let endless = runner
+        .run(
+            &shell_task(&template, 2, "/usr/bin/yes & sleep 0.2; exit 0"),
+            Duration::from_secs(30),
+            &cancel,
+        )
+        .await;
+    assert!(endless.outcome.succeeded(), "{endless:?}");
+    let tail = &endless.output.tail;
+    assert!(
+        tail.ends_with(b"\n[reliaburger: output written after exit truncated]\n"),
+        "{} bytes, tail {:?}",
+        endless.output.total_bytes,
+        String::from_utf8_lossy(&tail[tail.len().saturating_sub(80)..])
+    );
     wait_until("the executor retires", || {
         budget.available() == budget.capacity()
     })
