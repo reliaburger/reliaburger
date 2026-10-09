@@ -569,3 +569,33 @@ fn the_tour_recording_is_always_visible_and_only_the_commands_fold() {
     );
     assert!(!player.contains("closest(\"details\")"));
 }
+
+/// Each tour step is a three-column grid: the step number, one command block,
+/// one paragraph (`.tour-steps li` in `style.css`). A second paragraph wraps
+/// onto a new row and lands in the 2.5rem number column, one word per line,
+/// as step 06 did after its batch-jobs note was added (8 October 2026).
+#[test]
+fn every_tour_step_is_one_command_block_then_one_paragraph() {
+    let page = read("docs/website/index.html");
+    let start = page.find("<ol class=\"tour-steps\">").unwrap();
+    let list = &page[start..start + page[start..].find("</ol>").unwrap()];
+    for (number, step) in list.split("<li>").skip(1).enumerate() {
+        let step = &step[..step.find("</li>").expect("unterminated tour step")];
+        let label = format!("tour step {:02}", number + 1);
+        assert_eq!(
+            step.matches("<p>").count(),
+            1,
+            "{label} needs exactly one paragraph"
+        );
+        assert!(
+            step.matches("<pre>").count() <= 1,
+            "{label} has more than one command block"
+        );
+        if let Some(pre) = step.find("<pre>") {
+            assert!(
+                pre < step.find("<p>").unwrap(),
+                "{label}'s paragraph comes before its commands"
+            );
+        }
+    }
+}

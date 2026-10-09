@@ -1,8 +1,8 @@
 # Batch jobs
 
 Development preview for 0.2.0. Build matching development binaries and start a
-fresh cluster: protocol 49 and state 66 change control messages and durable
-state. Published 0.1.5 binaries don't have this lifecycle. A council replicates
+fresh cluster: protocol 50 and state 67 change control messages and durable
+state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.
 
@@ -428,14 +428,15 @@ Storage observations also become incomplete when atomic renames race the scan.
 
 The three-tier landing-page recorder adds a separate million-process VM
 baseline, then submits 1,000 fresh containers, 10,000 shared containers and
-10,000 host jobs. Run it only on a task-owned Linux measurement node with
+a selectable host tier (500,000 in the current recording). Run it only on a
+task-owned Linux measurement node with
 matching optimised `bun`, `relish` and `job-throughput` binaries:
 
 ```sh
 python3 scripts/demo/record-job-tiers.py \
   --binaries /absolute/immutable-binaries --relish /absolute/immutable-binaries/relish \
   --image registry.example/busybox@sha256:DIGEST \
-  --host-binary /absolute/matching-unpacked-rootfs/bin/busybox \
+  --host-binary /absolute/matching-unpacked-rootfs/bin/busybox --process-count 500000 \
   --service-url http://application/health --observe-pid BUN_PID \
   --observe-dir /absolute/node-data --output /absolute/new-recording
 ```
@@ -445,8 +446,9 @@ Provide CLI credentials privately. Enable `mixed` on Bun, allowlist that binary,
 and set `mount_isolation = false` for these host jobs. Give the baseline its
 own node subnet identity, as with the direct driver below. The casts retain
 actual pauses, including warm-up and indexed verification. Per-tier reports
-time submission through accepted completion. The host tier's default request
-can reduce concurrency below the requested 27; it doesn't bypass admission.
+time submission through accepted completion. All public tiers request 100m CPU
+and 32 MiB with a one-core CPU limit; native/shared helper overhead is reserved
+as well. Requested concurrency 27 remains subject to admission.
 The recorder uses the default maximum of three attempts and reports retries
 separately from unique accepted successes. Failed diagnostics stay in the raw
 evidence. Chapter jumps and labelled faster playback use the original cast;
@@ -538,32 +540,50 @@ optimised development binaries and pinned BusyBox `true` commands:
 
 | Path | Completed work | Elapsed | Rate | Accepted retries |
 |---|---:|---:|---:|---:|
-| Raw VM processes | 1,000,000 exit statuses | 63.87s | 15656.6/s | Not applicable |
-| Fresh containers | 1,000 accepted successes | 256.01s | 3.9/s | 0 |
-| Shared containers | 10,000 accepted successes | 21.76s | 459.5/s | 0 |
-| Owned host jobs | 10,000 accepted successes | 200.56s | 49.9/s | 0 |
+| Raw VM processes | 1,000,000 exit statuses | 62.67s | 15957.2/s | Not applicable |
+| Fresh containers | 1,000 accepted successes | 249.62s | 4.0/s | 0 |
+| Shared containers | 10,000 accepted successes | 22.73s | 439.9/s | 0 |
+| Host jobs | 500,000 accepted successes | 90.44s | 5528.7/s | 0 |
 
-All 21,000 public jobs completed. The separate million-process baseline counts
-exit statuses; it omits admission, limits, durable ownership and task ledgers.
-The whole rate gap cannot be called scheduling overhead. Real pauses remain in
-the cast; chapter jumps and labelled playback speeds only change the view.
-Container profiles request 100m CPU and 32 MiB with a one-core CPU limit. Host
-jobs retain the default one-CPU/64-MiB reservation without enforced resource
-limits, so admission can reduce actual concurrency below the requested 27.
-The normal maximum of three attempts applies, and accepted retries remain
-visible. The image is warm and shared executors start cold.
+All 511,000 public jobs completed without terminal failures or accepted retries.
+The million-process VM baseline counts exit statuses and omits admission, limits,
+durable ownership and task ledgers. Its rate gap is not pure scheduling overhead.
+Every public tier requests 100m CPU and 32 MiB, with a one-core CPU limit;
+native and shared helpers reserve their overhead too. Requested concurrency 27
+remains subject to admission. The pinned image is warm and executors start cold.
+Real pauses remain in the cast; chapter jumps and labelled speeds change only
+playback. The normal maximum of three attempts applies.
 
-These results don't qualify 100m/day. Initial startup and inventory failures
-remain in the diagnostics, and bounded storage scans cannot prove a global
-bound when incomplete. Read the [raw evidence and reproduction](../qualification/2026-10-09-job-runtime-revision/README.md)
-for the one-hour run, resource observations and remaining 24-hour, headroom,
-fault and metadata-collection work. [Historical measurements and recovery proofs](../qualification/2026-10-08-job-measurements/README.md)
-retain the earlier 50,000-job recording, real Bun crash and three-worker loss
-experiments, including mixed profiles and the original application's PID.
+The [matched comparisons and raw recording](../qualification/2026-10-09-host-job-executors/README.md)
+retain exact binary hashes, manifests, failures and cold/warm results. Run
+`scripts/demo/record-job-tiers.py --process-count 500000` with the documented
+node, image, binary and observation arguments to reproduce the host tier.
+These measurements do not establish 24-hour, fault or global metadata bounds.
 
-### Continuous one-hour host run
 
-The separate host runner completed 3600.00 seconds of continuous
+### Continuous one-hour native host run
+
+The new native host path completed **18,103,000 unique
+accepted successes in 3600.00 seconds (5,028.6/s)**,
+with zero terminal failures or accepted retries, beside the original container
+application. All 3,490 service probes succeeded; p95 latency was
+1.32 ms and the maximum 12.82 ms.
+It used one active 500,000-job submission, concurrency 27 and the same
+100m CPU / one-core limit / 32-MiB profile. The original Bun and service process
+start times and application generation matched after the hour. Cancellation of
+the remaining submission and final original-owner/kernel retirement passed.
+
+Largest sampled Bun RSS was 247.7 MiB; its last lifetime
+high-water mark was 258.1 MiB. All 117 bounded
+storage scans were incomplete, so they don't establish a global storage bound.
+No inventory timeout appeared across the fixture lifetime. The
+[raw hour, resource observations and positive cleanup proofs](../qualification/2026-10-09-host-job-executors/README.md)
+retain these limits. This completed hour does not qualify 100m/day; 24-hour,
+fault and historical namespace/profile/cardinality work remains in #640.
+
+### Historical one-hour host run
+
+Before native executors, the separate host runner completed 3600.00 seconds of continuous
 public dispatch with one active 10,000-job batch at a time. It observed
 **182,000 unique accepted successes (50.6/s)**,
 0 terminal failures and 0 accepted retries.

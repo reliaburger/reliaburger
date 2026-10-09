@@ -56,8 +56,26 @@ The first matched native build completed durable worker work at 9,295/s, but
 100,000 public jobs reached only 992/s. Two queued chunks and separate receipt
 acceptance/grant-delivery ticks limited fast workers to about 1,000/s. Learn a
 bounded grant lookahead from already verified duration histograms, covering the
-two control rounds and capping extra prefetch at sixteen chunks. Unknown, slow
+two control rounds and capping learned grant depth at sixteen chunks. Unknown, slow
 or overflow-duration work keeps the original small window. This adds no wire or
 state fields and never increases execution concurrency or reserves resources for
 queued tasks. Retain the first measurements, repeat public measurements and the
 hour on a fresh frozen build, and document the larger ownership/replay window.
+
+
+## Completed implementation and review evidence
+
+The native executor, phase histograms, fresh-child protocol, per-slot durable
+ownership, helper-inclusive resource admission and bounded grant lookahead are
+implemented. The [qualification record](../qualification/2026-10-09-host-job-executors/README.md)
+contains the 62-case matched matrix, fully warmed comparisons, ten public cases,
+equal-count pilots, mixed profiles, retained failures and re-recorded demo.
+The full hour accepted 18,103,000 successes at 5,028.6/s beside the original
+application, with no failures/retries. Original-service identity and positive
+owner/network/kernel retirement passed. The current recording completes
+500,000 host jobs in 90.44s. Final portable and matching checks precede review.
+
+This completes the host throughput implementation and requested hour/demo.
+The full-day mixed-workload/fault qualification and historical
+namespace/profile/credential metadata bounds remain #640's separate release
+work; fixed live slots and incomplete capped scans don't establish those bounds.

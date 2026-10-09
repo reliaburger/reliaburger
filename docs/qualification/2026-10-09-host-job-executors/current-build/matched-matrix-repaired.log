@@ -1,0 +1,125 @@
+RUN true-bare-c1-n1000-warm0
+PASS true-bare-c1-n1000-warm0 3743.5
+RUN true-bare-limited-c1-n1000-warm0
+PASS true-bare-limited-c1-n1000-warm0 1772.85
+RUN true-host-c1-n1000-warm0
+PASS true-host-c1-n1000-warm0 1030.1
+RUN true-reused-c1-n1000-warm0
+PASS true-reused-c1-n1000-warm0 576.03
+RUN true-durable-host-c1-n1000-warm0
+PASS true-durable-host-c1-n1000-warm0 831.84
+RUN true-durable-reused-c1-n1000-warm0
+PASS true-durable-reused-c1-n1000-warm0 530.09
+RUN true-bare-c1-n1000-warm4
+PASS true-bare-c1-n1000-warm4 3755.05
+RUN true-bare-limited-c1-n1000-warm4
+PASS true-bare-limited-c1-n1000-warm4 1874.39
+RUN true-host-c1-n1000-warm4
+PASS true-host-c1-n1000-warm4 1023.47
+RUN true-reused-c1-n1000-warm4
+PASS true-reused-c1-n1000-warm4 1179.53
+RUN true-durable-host-c1-n1000-warm4
+PASS true-durable-host-c1-n1000-warm4 869.66
+RUN true-durable-reused-c1-n1000-warm4
+PASS true-durable-reused-c1-n1000-warm4 950.59
+RUN true-bare-c3-n1000-warm0
+PASS true-bare-c3-n1000-warm0 10743.0
+RUN true-bare-limited-c3-n1000-warm0
+PASS true-bare-limited-c3-n1000-warm0 3499.4
+RUN true-host-c3-n1000-warm0
+PASS true-host-c3-n1000-warm0 3171.58
+RUN true-reused-c3-n1000-warm0
+PASS true-reused-c3-n1000-warm0 852.87
+RUN true-durable-host-c3-n1000-warm0
+PASS true-durable-host-c3-n1000-warm0 2128.74
+RUN true-durable-reused-c3-n1000-warm0
+PASS true-durable-reused-c3-n1000-warm0 706.06
+RUN true-bare-c3-n1000-warm12
+PASS true-bare-c3-n1000-warm12 10708.42
+RUN true-bare-limited-c3-n1000-warm12
+PASS true-bare-limited-c3-n1000-warm12 3582.38
+RUN true-host-c3-n1000-warm12
+PASS true-host-c3-n1000-warm12 3741.37
+RUN true-reused-c3-n1000-warm12
+PASS true-reused-c3-n1000-warm12 4651.53
+RUN true-durable-host-c3-n1000-warm12
+PASS true-durable-host-c3-n1000-warm12 2342.18
+RUN true-durable-reused-c3-n1000-warm12
+PASS true-durable-reused-c3-n1000-warm12 2344.0
+RUN true-bare-c27-n1000-warm0
+PASS true-bare-c27-n1000-warm0 14849.29
+RUN true-bare-limited-c27-n1000-warm0
+PASS true-bare-limited-c27-n1000-warm0 3663.17
+RUN true-host-c27-n1000-warm0
+PASS true-host-c27-n1000-warm0 3377.57
+RUN true-reused-c27-n1000-warm0
+PASS true-reused-c27-n1000-warm0 224.17
+RUN true-durable-host-c27-n1000-warm0
+PASS true-durable-host-c27-n1000-warm0 2138.03
+RUN true-durable-reused-c27-n1000-warm0
+PASS true-durable-reused-c27-n1000-warm0 208.14
+RUN true-bare-c27-n1000-warm108
+PASS true-bare-c27-n1000-warm108 15522.81
+RUN true-bare-limited-c27-n1000-warm108
+PASS true-bare-limited-c27-n1000-warm108 4618.69
+RUN true-host-c27-n1000-warm108
+PASS true-host-c27-n1000-warm108 10542.59
+RUN true-reused-c27-n1000-warm108
+PASS true-reused-c27-n1000-warm108 833.85
+RUN true-durable-host-c27-n1000-warm108
+PASS true-durable-host-c27-n1000-warm108 2947.14
+RUN true-durable-reused-c27-n1000-warm108
+PASS true-durable-reused-c27-n1000-warm108 669.63
+RUN true-bare-c3-n200-warm0
+PASS true-bare-c3-n200-warm0 11151.39
+RUN true-bare-limited-c3-n200-warm0
+PASS true-bare-limited-c3-n200-warm0 3038.91
+RUN true-host-c3-n200-warm0
+PASS true-host-c3-n200-warm0 2588.29
+RUN true-reused-c3-n200-warm0
+PASS true-reused-c3-n200-warm0 196.58
+RUN true-fresh-c3-n200-warm0
+PASS true-fresh-c3-n200-warm0 2.82
+RUN true-durable-host-c3-n200-warm0
+PASS true-durable-host-c3-n200-warm0 705.05
+RUN true-durable-reused-c3-n200-warm0
+PASS true-durable-reused-c3-n200-warm0 168.64
+RUN true-durable-fresh-c3-n200-warm0
+PASS true-durable-fresh-c3-n200-warm0 2.82
+RUN sleep-bare-c3-n200-warm12
+PASS sleep-bare-c3-n200-warm12 260.21
+RUN sleep-bare-limited-c3-n200-warm12
+PASS sleep-bare-limited-c3-n200-warm12 198.27
+RUN sleep-host-c3-n200-warm12
+PASS sleep-host-c3-n200-warm12 261.38
+RUN sleep-reused-c3-n200-warm12
+PASS sleep-reused-c3-n200-warm12 247.45
+RUN sleep-durable-host-c3-n200-warm12
+PASS sleep-durable-host-c3-n200-warm12 206.73
+RUN sleep-durable-reused-c3-n200-warm12
+PASS sleep-durable-reused-c3-n200-warm12 206.4
+RUN cpu-bare-c3-n200-warm12
+PASS cpu-bare-c3-n200-warm12 306.32
+RUN cpu-bare-limited-c3-n200-warm12
+PASS cpu-bare-limited-c3-n200-warm12 162.16
+RUN cpu-host-c3-n200-warm12
+PASS cpu-host-c3-n200-warm12 303.11
+RUN cpu-reused-c3-n200-warm12
+PASS cpu-reused-c3-n200-warm12 290.09
+RUN cpu-durable-host-c3-n200-warm12
+PASS cpu-durable-host-c3-n200-warm12 235.26
+RUN cpu-durable-reused-c3-n200-warm12
+PASS cpu-durable-reused-c3-n200-warm12 233.94
+RUN output-bare-c3-n200-warm12
+PASS output-bare-c3-n200-warm12 9755.76
+RUN output-bare-limited-c3-n200-warm12
+PASS output-bare-limited-c3-n200-warm12 3688.64
+RUN output-host-c3-n200-warm12
+PASS output-host-c3-n200-warm12 6329.44
+RUN output-reused-c3-n200-warm12
+PASS output-reused-c3-n200-warm12 5006.67
+RUN output-durable-host-c3-n200-warm12
+PASS output-durable-host-c3-n200-warm12 859.38
+RUN output-durable-reused-c3-n200-warm12
+PASS output-durable-reused-c3-n200-warm12 886.9
+All matched direct cases complete

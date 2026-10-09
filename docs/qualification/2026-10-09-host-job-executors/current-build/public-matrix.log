@@ -1,0 +1,21 @@
+RUN process-c1-n1000
+PASS process-c1-n1000 317.66
+RUN shared-runc-c1-n1000
+PASS shared-runc-c1-n1000 239.83
+RUN process-c3-n1000
+PASS process-c3-n1000 315.44
+RUN shared-runc-c3-n1000
+PASS shared-runc-c3-n1000 314.68
+RUN process-c27-n1000
+PASS process-c27-n1000 313.96
+RUN shared-runc-c27-n1000
+PASS shared-runc-c27-n1000 104.57
+RUN runc-c3-n200
+PASS runc-c3-n200 2.29
+RUN process-c3-n200
+PASS process-c3-n200 61.94
+RUN shared-runc-c3-n200
+PASS shared-runc-c3-n200 46.69
+RUN native-mixed-profiles
+PASS native-mixed-profiles 104.25
+All public matched cases complete

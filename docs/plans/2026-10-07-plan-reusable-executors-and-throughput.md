@@ -57,7 +57,7 @@ not claim the container backend's resource or isolation capabilities.
    disk faults. If this hardware misses the target, publish the bottleneck and
    leave #640 unqualified rather than extrapolating a short burst.
 
-## Current evidence and remaining work
+## Initial reusable-container evidence and remaining work
 
 The bounded executor and mixed-runtime implementation is complete locally.
 Admission fairness, helper-inclusive advertised capacity, compatible warm slots
@@ -143,3 +143,22 @@ The separate continuous hour completed 182,000 accepted
 successes at 50.6/s, without terminal failures or retries.
 Final publication checks remain required before marking the PR ready; the
 daily throughput and bounded-cost qualification remain in #640.
+
+
+### Native host follow-through (9 October)
+
+The [native executor plan](2026-10-09-plan-host-job-executors.md) supersedes the
+old host tier and measurements above. Supported Linux host work amortises its
+durable owner over bounded native helper slots, enforces per-command resources
+and retains positive descendant cleanup. Verified duration buckets supply
+bounded grant lookahead rather than faster control polling.
+
+The [current evidence](../qualification/2026-10-09-host-job-executors/README.md)
+retains matched counts/concurrency/profiles, cold/warm matrices and failed
+harness invocations. At concurrency 27, fully warmed native execution reached
+11,553.2/s and durable worker completion 9,309.3/s. The new recording completes
+500,000 host accepted successes in 90.44s, alongside the separate raw million,
+1,000 fresh containers and 10,000 shared containers. All 511,000 public jobs
+succeeded without retries. The full continuous hour and original-service/owner
+proofs are recorded there before review; 24-hour/fault/global history bounds
+remain #640's separate qualification.

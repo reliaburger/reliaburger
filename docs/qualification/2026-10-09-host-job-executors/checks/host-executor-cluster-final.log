@@ -1,0 +1,8 @@
+RELIABURGER_CLUSTER_TESTS=1 cargo nextest run --profile default --no-tests=fail --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) '
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/host-job-executor/reliaburger)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 16s
+────────────
+ Nextest run ID 6ee6270d-5a7a-420c-9ca8-17821ca9e965 with nextest profile: default
+    Starting 46 tests across 6 binaries (1 test and 33 binaries skipped)
+────────────
+     Summary [ 383.494s] 46 tests run: 46 passed, 1 skipped

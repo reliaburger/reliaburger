@@ -56,7 +56,7 @@
 
       <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
         <div class="section-head">
-          <h2 id="job-throughput-title">Three job runtimes. One built-in job path.
+          <h2 id="job-throughput-title">Half a million host jobs. One built-in job path.
             <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
         </div>
         <p>Submit indexed work directly, with resource admission, durable ownership,
@@ -67,13 +67,13 @@
         <table><caption>One Linux VM, matching BusyBox commands. Real elapsed time;
           accepted retries shown separately.</caption>
           <thead><tr><th scope="col">Execution</th><th scope="col">Completed work</th><th scope="col">Time</th><th scope="col">Rate</th><th scope="col">Retries</th></tr></thead>
-          <tbody><tr><th scope="row">VM baseline</th><td>1,000,000 raw process exits</td><td>63.87s</td><td>15656.6/s</td><td>0</td></tr><tr><th scope="row">Fresh containers</th><td>1,000 accepted jobs</td><td>256.01s</td><td>3.9/s</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>10,000 accepted jobs</td><td>21.76s</td><td>459.5/s</td><td>0</td></tr><tr><th scope="row">Owned host jobs</th><td>10,000 accepted jobs</td><td>200.56s</td><td>49.9/s</td><td>0</td></tr></tbody>
+          <tbody><tr><th scope="row">VM baseline</th><td>1,000,000 raw process exits</td><td>62.67s</td><td>15957.2/s</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>1,000 accepted jobs</td><td>249.62s</td><td>4.0/s</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>10,000 accepted jobs</td><td>22.73s</td><td>439.9/s</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>500,000 accepted jobs</td><td>90.44s</td><td>5528.7/s</td><td>0</td></tr></tbody>
         </table></div>
-        <p>The three public tiers accepted 21,000 unique successes.
+        <p>The three public tiers accepted 511,000 unique successes.
           The million-process VM baseline measures exit statuses without admission,
           resource enforcement, durable ownership or task ledgers. Its rate gap
           includes those costs; it isn't a measurement of scheduling overhead alone.</p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:343.922666">
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:427.748000">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
@@ -81,18 +81,18 @@
           <figcaption>
             <span>Optimised 0.2.0 development binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
               aarch64. Pinned BusyBox commands, warm images and cold executors.
-              Container requests: 100m CPU / 32 MiB, one-core limit;
-              host defaults: one CPU / 64 MiB reservation, without hard resource limits.
+              All public tiers request 100m CPU / 32 MiB and enforce a one-core CPU limit.
+              Native and shared executor overhead is reserved as well.
               Requested concurrency 27 remains subject to admission.
               Real pauses are preserved; chapter jumps and playback speed change only
               your view. Activity reflects the last worker report; chunk reports
               produce bursts in recent rates. This demonstration does not establish
               24-hour throughput or 100 million jobs/day.</span>
             <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
-              <button type="button" data-start="0.000101">VM baseline</button>
-              <button type="button" data-start="65.914696">Fresh containers</button>
-              <button type="button" data-start="322.036698">Shared containers</button>
-              <button type="button" data-start="343.922764">Host jobs</button></span>
+              <button type="button" data-start="0.001091">VM baseline</button>
+              <button type="button" data-start="64.664752">Fresh containers</button>
+              <button type="button" data-start="314.390493">Shared containers</button>
+              <button type="button" data-start="337.253091">Host jobs</button></span>
             <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
               <button type="button" data-speed="1" aria-pressed="true">1×</button>
               <button type="button" data-speed="4" aria-pressed="false">4×</button>
@@ -100,7 +100,7 @@
           </figcaption>
         </figure>
         <p><a href="./assets/job-throughput-report.json">Measured report</a> ·
-          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-job-runtime-revision">Raw results and reproduction</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-host-job-executors">Raw results and reproduction</a> ·
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
         <p>Use indexed inputs for data preparation, offline evaluation and independent
           inference commands. Shared containers still start a process for every job;
@@ -246,13 +246,13 @@
                   backend that cooked it, found by its service name.</p>
               </li>
               <li>
-                <p><strong>Development preview (0.2.0 / PR #266):</strong> queue
-                  1,000 small and 64 larger jobs beside the burger service.</p>
                 <pre><code data-tour>relish --output json batch submit burger/jobs.toml</code>
 <code data-tour>relish batch watch 1</code>
 <code data-tour>relish batch results 2 --failed --limit 20</code>
 <code data-tour>relish manual batch</code></pre>
-                <p>Use the returned manifest ID instead of <code>1</code> and the
+                <p><strong>Development preview (0.2.0 / PR #266):</strong> queue
+                  1,000 small and 64 larger jobs beside the burger service.
+                  Use the returned manifest ID instead of <code>1</code> and the
                   small profile’s child ID instead of <code>2</code>. CPU and memory
                   requests decide what fits; chunk size decides how much is queued.
                   Watch rates, backlog and duration distributions, then inspect a

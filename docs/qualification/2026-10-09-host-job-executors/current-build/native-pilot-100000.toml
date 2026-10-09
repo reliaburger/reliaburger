@@ -1,0 +1,14 @@
+name = "native-pilot-100000"
+namespace = "default"
+[[cohort]]
+name = "commands"
+count = 100000
+chunk_size = 1000
+max_attempts = 1
+per_node_concurrency = 27
+[cohort.template]
+runtime = "process"
+cpu = "100m-1000m"
+memory = "32Mi"
+exec = "/tmp/rb-host-executor-v2/host/busybox"
+command = ["true"]

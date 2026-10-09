@@ -1,0 +1,13 @@
+.E.
+======================================================================
+ERROR: test_host_demo_volume_is_explicit_and_verified_against_the_recording (test_job_tiers.JobTiers)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/miko/.codex/worktrees/host-job-executor/reliaburger/scripts/ci/test_job_tiers.py", line 45, in test_host_demo_volume_is_explicit_and_verified_against_the_recording
+    report = tiers.build_report(baseline, rows, 400, process_count=500000)
+TypeError: build_report() got an unexpected keyword argument 'process_count'
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.042s
+
+FAILED (errors=1)

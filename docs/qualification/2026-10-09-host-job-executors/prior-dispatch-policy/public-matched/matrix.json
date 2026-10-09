@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "name": "process-c1-n1000",
+      "command": [
+        "python3",
+        "/Users/miko/.codex/worktrees/host-job-executor/reliaburger/scripts/demo/measure-jobs.py",
+        "/tmp/rb-host-executor-v1/public-matched/process-c1-n1000.toml",
+        "--relish",
+        "/Users/miko/github/reliaburger/target/host-executor-v1-release/relish",
+        "--service-url",
+        "http://10.202.142.2:8080/",
+        "--output",
+        "/tmp/rb-host-executor-v1/public-matched/process-c1-n1000",
+        "--timeout",
+        "1200",
+        "--warmth",
+        "warm-images-after-three-second-idle-wait",
+        "--observe-pid",
+        "2688072",
+        "--observe-dir",
+        "/tmp/rb-host-executor-v1/data"
+      ],
+      "exit_code": 2,
+      "finished_utc": "2026-10-09T09:20:29.710651+00:00"
+    }
+  ]
+}

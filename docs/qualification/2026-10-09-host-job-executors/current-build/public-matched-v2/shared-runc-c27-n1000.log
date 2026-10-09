@@ -1,0 +1,57 @@
+0/1,000 unique accepted successes in 0.03s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands unknown; queued 1000, held 0; recent unknown/s over unknowns
+application 200 in 12.94ms
+0/1,000 unique accepted successes in 1.08s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 1000; recent 0.0/s over 1.049222913s
+application 200 in 1.07ms
+0/1,000 unique accepted successes in 2.14s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 1000; recent 0.0/s over 1.055015432s
+application 200 in 0.70ms
+0/1,000 unique accepted successes in 3.22s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 1000; recent 0.0/s over 1.071966149s
+application 200 in 2.17ms
+0/1,000 unique accepted successes in 4.32s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 1000; recent 0.0/s over 1.098965354s
+application 200 in 0.97ms
+0/1,000 unique accepted successes in 5.39s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 1000; recent 0.0/s over 1.075437041s
+application 200 in 0.87ms
+0/1,000 unique accepted successes in 6.45s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 1000; recent 0.0/s over 1.059487292s
+application 200 in 0.95ms
+0/1,000 unique accepted successes in 7.51s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 1; queued 0, held 1000; recent 0.0/s over 1.062773887s
+application 200 in 0.60ms
+0/1,000 unique accepted successes in 8.54s (0.0/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 1000; recent 0.0/s over 1.034898605s
+application 200 in 0.52ms
+1,000/1,000 unique accepted successes in 9.56s (104.6/s whole run); 0 failures, 0 retries
+runtime shared-runc; commands 0; queued 0, held 0; recent 978.1890832454952/s over 1.02229724s
+application 200 in 0.52ms
+{
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "operator_declared_warmth": "warm-images-cold-executors",
+  "workload_sha256": "ba4caa87478e62b8bc1c86e44a6c9159fcfd966ed9d388c68edfaf2abdf1f436",
+  "command": [
+    "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+    "--output",
+    "json",
+    "batch",
+    "submit",
+    "/tmp/rb-host-executor-v2/public-matched-v2/shared-runc-c27-n1000.toml"
+  ],
+  "execution_path": "public full dispatch; runtime/isolation as admitted",
+  "host_process_contract": "Owned host execution has no hard CPU/memory enforcement",
+  "timing": "Monotonic clock before submit process launch through observed accepted terminal summary",
+  "qualified_100m_per_day": false,
+  "accepted_elapsed_seconds": 9.563160713063553,
+  "unique_accepted_successes": 1000,
+  "accepted_successes_per_second": 104.56793836309487,
+  "terminal_failures": 0,
+  "not_run": 0,
+  "accepted_retries": 0,
+  "all_tasks_succeeded": true,
+  "qualification_boundary": "Requires matched baselines, 24-hour headroom, concurrent apps, recovery/fault and bounded-cost evidence"
+}

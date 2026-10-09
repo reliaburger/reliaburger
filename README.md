@@ -288,8 +288,8 @@ rootful Linux process jobs also reuse bounded native executors and enforce
 explicit CPU/memory limits before execution. Fresh containers remain the default.
 The [four-part demo](https://reliaburger.com/#job-throughput)
 compares a million raw process exits with 1,000 fresh-container, 10,000 shared-
-container and 10,000 host jobs. It accepted all 21,000 public jobs; the raw VM
-baseline has fewer guarantees. [Raw evidence](docs/qualification/2026-10-09-job-runtime-revision/README.md)
+container and 500,000 host jobs. It accepted all 511,000 public jobs; the raw VM
+baseline has fewer guarantees. [Raw evidence](docs/qualification/2026-10-09-host-job-executors/README.md)
 records actual elapsed time, retries, hardware and limits. Sustained 100m/day
 throughput still needs qualification. Point the cluster at a Git repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.

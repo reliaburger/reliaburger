@@ -20,16 +20,16 @@ class JobDemo(unittest.TestCase):
         self.assertTrue(report['all_tasks_succeeded'])
         self.assertFalse(report['qualified_100m_per_day'])
         self.assertAlmostEqual(recording[-1][0], report['recording_elapsed_seconds'], delta=1)
-        self.assertEqual(report['unique_accepted_successes'], 21000)
+        self.assertEqual(report['unique_accepted_successes'], 511000)
         self.assertEqual(report['baseline']['path'], 'Bare')
         self.assertEqual(report['baseline']['verified_successes'], 1000000)
         self.assertEqual([(row['runtime'], row['total']) for row in report['tiers']],
-                         [('runc', 1000), ('shared-runc', 10000), ('process', 10000)])
+                         [('runc', 1000), ('shared-runc', 10000), ('process', 500000)])
         for row in report['tiers']:
             self.assertTrue(row['all_tasks_succeeded'])
             self.assertEqual(row['unique_accepted_successes'], row['total'])
         self.assertEqual(recording[0]['version'], 2)
-        raw = ROOT / 'docs/qualification/2026-10-09-job-runtime-revision/three-tiers'
+        raw = ROOT / 'docs/qualification/2026-10-09-host-job-executors/current-build/three-tiers'
         self.assertEqual((ROOT / 'docs/website/assets/job-throughput.cast').read_bytes(),
                          (raw / 'jobs.cast').read_bytes())
         self.assertEqual((ROOT / 'docs/website/assets/job-throughput-report.json').read_bytes(),
@@ -45,6 +45,8 @@ class JobDemo(unittest.TestCase):
         self.assertIn('durable ownership', text)
         self.assertIn('development binaries', text)
         self.assertIn('24-hour', text)
+        self.assertIn('All public tiers request 100m CPU / 32 MiB', text)
+        self.assertNotIn('without hard resource limits', text)
         self.assertRegex(text, r'data-cast="\./assets/job-throughput\.cast"')
         self.assertIn('./assets/job-throughput-report.json', text)
 

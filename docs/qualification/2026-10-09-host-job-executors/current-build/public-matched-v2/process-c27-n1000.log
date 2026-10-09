@@ -1,0 +1,39 @@
+0/1,000 unique accepted successes in 0.03s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands unknown; queued 1000, held 0; recent unknown/s over unknowns
+application 200 in 12.73ms
+0/1,000 unique accepted successes in 1.08s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 1000; recent 0.0/s over 1.049444351s
+application 200 in 0.99ms
+0/1,000 unique accepted successes in 2.14s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 1000; recent 0.0/s over 1.047976516s
+application 200 in 1.18ms
+1,000/1,000 unique accepted successes in 3.19s (314.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 0; recent 948.938081208502/s over 1.053809537s
+application 200 in 1.09ms
+{
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "operator_declared_warmth": "warm-images-cold-executors",
+  "workload_sha256": "c1288713258edfa59404a969b452522ebaeb917706752cb045613d92a29c2074",
+  "command": [
+    "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+    "--output",
+    "json",
+    "batch",
+    "submit",
+    "/tmp/rb-host-executor-v2/public-matched-v2/process-c27-n1000.toml"
+  ],
+  "execution_path": "public full dispatch; runtime/isolation as admitted",
+  "host_process_contract": "Owned host execution has no hard CPU/memory enforcement",
+  "timing": "Monotonic clock before submit process launch through observed accepted terminal summary",
+  "qualified_100m_per_day": false,
+  "accepted_elapsed_seconds": 3.1851150391157717,
+  "unique_accepted_successes": 1000,
+  "accepted_successes_per_second": 313.96040259745615,
+  "terminal_failures": 0,
+  "not_run": 0,
+  "accepted_retries": 0,
+  "all_tasks_succeeded": true,
+  "qualification_boundary": "Requires matched baselines, 24-hour headroom, concurrent apps, recovery/fault and bounded-cost evidence"
+}

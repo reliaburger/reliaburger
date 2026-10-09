@@ -1,0 +1,60 @@
+0/1,100 unique accepted successes in 0.04s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands unknown; queued 1100, held 0; recent unknown/s over unknowns
+application 200 in 12.99ms
+0/1,100 unique accepted successes in 1.12s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 1100; recent 0.0/s over 1.071060238s
+application 200 in 1.02ms
+0/1,100 unique accepted successes in 2.17s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 1100; recent 0.0/s over 1.051162388s
+application 200 in 0.56ms
+0/1,100 unique accepted successes in 3.21s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 1; queued 0, held 1100; recent 0.0/s over 1.048137006s
+application 200 in 0.57ms
+0/1,100 unique accepted successes in 4.27s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 7; queued 0, held 1100; recent 0.0/s over 1.056230701s
+application 200 in 0.54ms
+0/1,100 unique accepted successes in 5.32s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 2; queued 0, held 1100; recent 0.0/s over 1.050588727s
+application 200 in 0.52ms
+0/1,100 unique accepted successes in 6.36s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 1; queued 0, held 1100; recent 0.0/s over 1.043059624s
+application 200 in 0.52ms
+0/1,100 unique accepted successes in 7.40s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 2; queued 0, held 1100; recent 0.0/s over 1.039592906s
+application 200 in 0.67ms
+0/1,100 unique accepted successes in 8.45s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 1; queued 0, held 1100; recent 0.0/s over 1.044507008s
+application 200 in 0.51ms
+0/1,100 unique accepted successes in 9.49s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 2; queued 0, held 1100; recent 0.0/s over 1.041692627s
+application 200 in 1.00ms
+1,100/1,100 unique accepted successes in 10.55s (104.3/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 0; recent 1037.4880381873468/s over 1.060253188s
+application 200 in 1.00ms
+{
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "operator_declared_warmth": "warm-images-cold-executors",
+  "workload_sha256": "36199dff5250bdbf1330cbb40d350fac83669fe0ccbc41073f98d60108c570e9",
+  "command": [
+    "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+    "--output",
+    "json",
+    "batch",
+    "submit",
+    "/tmp/rb-host-executor-v2/public-matched-v2/native-mixed-profiles.toml"
+  ],
+  "execution_path": "public full dispatch; runtime/isolation as admitted",
+  "host_process_contract": "Owned host execution has no hard CPU/memory enforcement",
+  "timing": "Monotonic clock before submit process launch through observed accepted terminal summary",
+  "qualified_100m_per_day": false,
+  "accepted_elapsed_seconds": 10.551438970025629,
+  "unique_accepted_successes": 1100,
+  "accepted_successes_per_second": 104.25118347600396,
+  "terminal_failures": 0,
+  "not_run": 0,
+  "accepted_retries": 0,
+  "all_tasks_succeeded": true,
+  "qualification_boundary": "Requires matched baselines, 24-hour headroom, concurrent apps, recovery/fault and bounded-cost evidence"
+}

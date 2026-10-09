@@ -1,0 +1,13 @@
+RUN true-bare-c27-n10000-warm100000
+PASS true-bare-c27-n10000-warm100000 16192.91
+RUN true-bare-limited-c27-n10000-warm100000
+PASS true-bare-limited-c27-n10000-warm100000 3906.21
+RUN true-host-c27-n10000-warm100000
+PASS true-host-c27-n10000-warm100000 11553.16
+RUN true-reused-c27-n10000-warm100000
+PASS true-reused-c27-n10000-warm100000 8251.27
+RUN true-durable-host-c27-n10000-warm100000
+PASS true-durable-host-c27-n10000-warm100000 9309.29
+RUN true-durable-reused-c27-n10000-warm100000
+PASS true-durable-reused-c27-n10000-warm100000 7239.23
+All steady matched cases complete

@@ -1,0 +1,13 @@
+.................F.............
+======================================================================
+FAIL: test_native_host_cases_have_exact_linux_gate_contracts (test_contracts.Contracts)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/miko/.codex/worktrees/host-job-executor/reliaburger/scripts/ci/test_contracts.py", line 53, in test_native_host_cases_have_exact_linux_gate_contracts
+    self.assertEqual(cases.get(('reliaburger::owned_task_arrays', name)),
+AssertionError: None != ['linux-root-storage'] : cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles
+
+----------------------------------------------------------------------
+Ran 31 tests in 0.058s
+
+FAILED (failures=1)

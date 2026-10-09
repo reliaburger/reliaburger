@@ -1,0 +1,9 @@
+RELIABURGER_CLUSTER_TESTS=1 cargo nextest run --profile default --no-tests=fail --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) '
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.64s
+────────────
+ Nextest run ID d233a44d-ced2-405c-801b-ebf12d9d4a17 with nextest profile: default
+    Starting 46 tests across 6 binaries (1 test and 33 binaries skipped)
+        SLOW [> 60.000s] (─────) reliaburger::cluster_task_arrays a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change
+────────────
+     Summary [ 403.607s] 46 tests run: 46 passed (1 slow), 1 skipped
+        SLOW [  74.958s] (35/46) reliaburger::cluster_task_arrays a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change

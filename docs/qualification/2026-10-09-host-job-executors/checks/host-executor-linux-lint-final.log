@@ -1,0 +1,6 @@
+cargo clippy --all-targets --all-features -- -D warnings
+    Checking reliaburger v0.1.6 (/Users/miko/.codex/worktrees/host-job-executor/reliaburger)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 14s
+cargo clippy --all-targets --no-default-features -- -D warnings
+    Checking reliaburger v0.1.6 (/Users/miko/.codex/worktrees/host-job-executor/reliaburger)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 13s

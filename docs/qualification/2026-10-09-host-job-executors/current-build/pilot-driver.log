@@ -1,0 +1,4 @@
+START native-pilot-100000
+native-pilot-100000 {"unique_accepted_successes": 100000, "accepted_elapsed_seconds": 23.43478225194849, "accepted_successes_per_second": 4267.161474977454, "terminal_failures": 0, "accepted_retries": 0}
+START shared-pilot-100000
+shared-pilot-100000 {"unique_accepted_successes": 100000, "accepted_elapsed_seconds": 77.80228373291902, "accepted_successes_per_second": 1285.3093148689782, "terminal_failures": 0, "accepted_retries": 0}

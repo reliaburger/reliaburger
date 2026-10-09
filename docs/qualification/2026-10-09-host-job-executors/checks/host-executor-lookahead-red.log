@@ -1,0 +1,29 @@
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/host-job-executor/reliaburger)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `reliaburger` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 04s
+     Running unittests src/lib.rs (/Users/miko/github/reliaburger/target/debug/deps/reliaburger-2b15fc5e53c01c64)
+
+running 1 test
+test meat::task_array_state::tests::fast_receipts_keep_a_bounded_report_round_of_work_ready ... FAILED
+
+failures:
+
+---- meat::task_array_state::tests::fast_receipts_keep_a_bounded_report_round_of_work_ready stdout ----
+
+thread 'meat::task_array_state::tests::fast_receipts_keep_a_bounded_report_round_of_work_ready' (198023201) panicked at src/meat/task_array_state.rs:658:9:
+assertion `left == right` failed
+  left: [(NodeId("a"), IndexRangeSet { ranges: [(2, 3)] })]
+ right: [(NodeId("a"), IndexRangeSet { ranges: [(2, 17)] })]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    meat::task_array_state::tests::fast_receipts_keep_a_bounded_report_round_of_work_ready
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5449 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `--lib`

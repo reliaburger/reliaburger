@@ -1,0 +1,12 @@
+{"version": 2, "width": 140, "height": 20, "title": "Real Reliaburger accepted job throughput", "timestamp": 1791543660}
+[5.795806646347046e-05, "o", "$ /Users/miko/github/reliaburger/target/host-executor-v2-release/relish --output json batch submit /tmp/rb-host-executor-v2/public-matched-v2/process-c27-n1000.toml\r\n"]
+[0.04739196412265301, "o", "0/1,000 unique accepted successes in 0.03s (0.0/s whole run); 0 failures, 0 retries\r\nruntime process; commands unknown; queued 1000, held 0; recent unknown/s over unknowns\r\napplication 200 in 12.73ms\r\n"]
+[1.0891956679988652, "o", "0/1,000 unique accepted successes in 1.08s (0.0/s whole run); 0 failures, 0 retries\r\nruntime process; commands 0; queued 0, held 1000; recent 0.0/s over 1.049444351s\r\napplication 200 in 0.99ms\r\n"]
+[2.1510020149871707, "o", "0/1,000 unique accepted successes in 2.14s (0.0/s whole run); 0 failures, 0 retries\r\nruntime process; commands 0; queued 0, held 1000; recent 0.0/s over 1.047976516s\r\napplication 200 in 1.18ms\r\n"]
+[3.192032016115263, "o", "1,000/1,000 unique accepted successes in 3.19s (314.0/s whole run); 0 failures, 0 retries\r\nruntime process; commands 0; queued 0, held 0; recent 948.938081208502/s over 1.053809537s\r\napplication 200 in 1.09ms\r\n"]
+[3.2096973571460694, "o", "$ /Users/miko/github/reliaburger/target/host-executor-v2-release/relish batch results 10 --index 0 --limit 1\r\n"]
+[3.2097336479928344, "o", "{\"batch_id\":10,\"rows\":[{\"grant_attempt\":1,\"index\":0,\"attempts\":1,\"succeeded\":true,\"not_run\":false,\"exit_code\":0,\"run_ms\":107}],\"truncated\":false,\"next_after\":null,\"retention_seconds\":3600,\"unreachable\":[]}\r\n"]
+[3.2247972320765257, "o", "$ /Users/miko/github/reliaburger/target/host-executor-v2-release/relish batch results 10 --index 500 --limit 1\r\n"]
+[3.2248224820941687, "o", "{\"batch_id\":10,\"rows\":[{\"grant_attempt\":1,\"index\":500,\"attempts\":1,\"succeeded\":true,\"not_run\":false,\"exit_code\":0,\"run_ms\":0}],\"truncated\":false,\"next_after\":null,\"retention_seconds\":3600,\"unreachable\":[]}\r\n"]
+[3.238755644997582, "o", "$ /Users/miko/github/reliaburger/target/host-executor-v2-release/relish batch results 10 --index 999 --limit 1\r\n"]
+[3.2387877290602773, "o", "{\"batch_id\":10,\"rows\":[{\"grant_attempt\":1,\"index\":999,\"attempts\":1,\"succeeded\":true,\"not_run\":false,\"exit_code\":0,\"run_ms\":0}],\"truncated\":false,\"next_after\":null,\"retention_seconds\":3600,\"unreachable\":[]}\r\n"]

@@ -1,0 +1,13 @@
+{
+  "tooling_commit": "c4fc14746d93b347ceccdf4221dd0096936d3ecc",
+  "started_utc": "2026-10-09T09:15:50.271994+00:00",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "node_data_filesystem": "ext2/ext3",
+  "bun_pid": 2688072,
+  "service_payload_pid": 2688224,
+  "service_url": "http://10.202.142.2:8080/",
+  "apparmor_restrict_unprivileged_userns": "1",
+  "execution_binaries": "Frozen native host executor implementation; no concurrent tests or builds during measurements"
+}

@@ -522,7 +522,11 @@ mod linux {
             "elapsed_seconds": elapsed_seconds, "verified_successes": successes, "failures": failures, "retries": 0,
             "verified_successes_per_second": successes as f64 / elapsed_seconds,
             "container_cpu_request_millicores": options.cpu_request_millicores, "container_cpu_limit_millicores": options.cpu_limit_millicores, "container_memory_bytes": options.memory_bytes,
-            "resource_enforcement": if matches!(options.path, ExecutionPath::Bare) { "none; exit-status-only raw process floor" } else { "per-command CPU, memory, swap and PID limits before user code" },
+            "resource_enforcement": match options.path {
+                ExecutionPath::Bare => "none; exit-status-only raw process floor",
+                ExecutionPath::Fresh | ExecutionPath::DurableFresh => "per-command CPU and memory limits before user code; zero swap; existing OCI PID policy",
+                _ => "per-command CPU, memory, swap and PID limits before user code",
+            },
             "bare_process_resource_limits": if matches!(options.path, ExecutionPath::BareLimited) { "matched per-slot cgroups before user exec" } else { "none; profile fields are comparison inputs only" },
             "node_job_budget_cpu_millicores": 3000, "service_probe_latency_ms": probe_rows,
             "durability": if durable { "worker grant fence, per-task ledger/index, verified chunk receipts; no Raft admission" } else if matches!(options.path, ExecutionPath::Bare | ExecutionPath::BareLimited) { "exit statuses only; no durable ownership or ledger" } else { "durable executor/runtime ownership, exit and positive cleanup; no task ledger or Raft admission" },

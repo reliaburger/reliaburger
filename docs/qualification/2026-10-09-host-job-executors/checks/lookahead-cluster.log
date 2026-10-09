@@ -1,0 +1,77 @@
+RELIABURGER_CLUSTER_TESTS=1 cargo nextest run --profile default --no-tests=fail --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) '
+   Compiling reliaburger v0.1.6 (/Users/miko/.codex/worktrees/host-job-executor/reliaburger)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 15s
+────────────
+ Nextest run ID cb7d3f3e-56c5-40d8-87ee-5ad1dad64972 with nextest profile: default
+    Starting 46 tests across 6 binaries (1 test and 33 binaries skipped)
+        FAIL [   4.962s] ( 1/46) reliaburger::cluster_failover decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change
+  stdout ───
+
+    running 1 test
+    test decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change ... FAILED
+
+    failures:
+
+    failures:
+        decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 4.95s
+
+  stderr ───
+    council: no peer advertises a newer recovery epoch than 0; serving raft
+    council: joined a council at recovery epoch 0
+
+    thread 'decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change' (3591505) panicked at tests/cluster_failover.rs:733:51:
+    called `Result::unwrap()` on an `Err` value: ForwardToLeader { leader: Some("fo302") }
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    bun: identity for rbtest-decommission__cleanup-0: CSR signing failed: security operation failed: no wrapping IKM available
+
+  Cancelling due to test failure: 2 tests still running
+        SLOW [> 60.000s] (─────) reliaburger::placement a_killed_worker_has_its_replica_rescheduled_on_the_survivors
+        FAIL [  64.203s] ( 3/46) reliaburger::placement a_killed_worker_has_its_replica_rescheduled_on_the_survivors
+  stdout ───
+
+    running 1 test
+    test a_killed_worker_has_its_replica_rescheduled_on_the_survivors has been running for over 60 seconds
+    test a_killed_worker_has_its_replica_rescheduled_on_the_survivors ... FAILED
+
+    failures:
+
+    failures:
+        a_killed_worker_has_its_replica_rescheduled_on_the_survivors
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 22 filtered out; finished in 64.18s
+
+  stderr ───
+    council: no peer advertises a newer recovery epoch than 0; serving raft
+    council: joined a council at recovery epoch 0
+    bun: identity for default__web-2: CSR signing failed: no leader transport for workload signing
+    council: no peer advertises a newer recovery epoch than 0; serving raft
+    bun: identity for default__web-0: CSR signing failed: security operation failed: no wrapping IKM available
+    bun: identity for default__web-1: CSR signing failed: security operation failed: no wrapping IKM available
+      app web: committed to the cluster
+      app web: committed to the cluster
+      app web: committed to the cluster
+      app web: committed to the cluster
+    bun: identity for default__web-1: CSR signing failed: security operation failed: no wrapping IKM available
+    bun: identity for default__web-0: CSR signing failed: security operation failed: no wrapping IKM available
+    bun: identity for default__web-2: CSR signing failed: no leader transport for workload signing
+      app web: committed to the cluster
+      app web: committed to the cluster
+      app web: committed to the cluster
+    bun: identity for default__web-0: CSR signing failed: security operation failed: no wrapping IKM available
+    bun: identity for default__web-1: CSR signing failed: security operation failed: no wrapping IKM available
+    bun: identity for default__web-2: CSR signing failed: no leader transport for workload signing
+      app web: committed to the cluster
+
+    thread 'a_killed_worker_has_its_replica_rescheduled_on_the_survivors' (3591507) panicked at tests/placement.rs:1545:13:
+    web never spread one replica per node
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [  64.212s] 3/46 tests run: 1 passed, 2 failed, 1 skipped
+        FAIL [   4.962s] ( 1/46) reliaburger::cluster_failover decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change
+        FAIL [  64.203s] ( 3/46) reliaburger::placement a_killed_worker_has_its_replica_rescheduled_on_the_survivors
+warning: 43/46 tests were not run due to test failure (run with --no-fail-fast to run all tests, or run with --max-fail)
+error: test run failed
+make: *** [Makefile:52: test-cluster] Error 100

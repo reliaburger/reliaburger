@@ -1337,9 +1337,9 @@ published record still uses the strict ownership reader. The focused regression
 renames the directory between enumeration and validation; it doesn't hope to
 win a probabilistic race.
 
-### What an hour establishes
+### What the earlier hour established
 
-The separate host runner completed 3600.00 seconds of continuous
+Before native executors, the separate host runner completed 3600.00 seconds of continuous
 public dispatch with one active 10,000-job batch at a time. It observed
 **182,000 unique accepted successes (50.6/s)**,
 0 terminal failures and 0 accepted retries.
@@ -1444,7 +1444,7 @@ that two-second cycle waiting.
 We keep the one-second control interval and learn a bounded lookahead from the
 verified final-attempt duration histogram. Each bucket's upper bound gives a
 conservative duration estimate. Two control rounds of work are enough to bridge
-receipt acceptance and grant delivery; extra prefetch stops at sixteen chunks.
+receipt acceptance and grant delivery; learned grant depth stops at sixteen chunks.
 No samples, slow commands or an unbounded overflow bucket retain the original
 window. The existing two-round concurrency floor still applies to tiny chunks.
 The calculation uses `u128` intermediates so multiplying counters cannot
@@ -1457,3 +1457,77 @@ The cost is ownership: more granted work may need reconciliation or explicit
 replay after worker loss. That window is bounded, and stale attempts keep their
 existing fences. We retain the first measurement rather than relabelling it as
 evidence for the revised dispatch policy.
+
+
+### Measuring the native path
+
+The [new evidence](../qualification/2026-10-09-host-job-executors/README.md)
+pins the native implementation and dispatch policy to `ed87f20b`. Every limited
+command uses the same 100m CPU request, one-core limit and 32 MiB memory profile.
+Helper overhead is reserved too. At concurrency 27, after 100,000 warmup
+commands, an identical 10,000-command measurement produced:
+
+| Path | Verified successes/s |
+|---|---:|
+| Raw exits | 16,192.9 |
+| Raw exits with limits before exec | 3,906.2 |
+| Owned native host | 11,553.2 |
+| Owned shared container | 8,251.3 |
+| Native host with worker ledger | 9,309.3 |
+| Shared container with worker ledger | 7,239.2 |
+
+No executor started during those timed owned phases. The resource-limited raw
+path moves a child into its cgroup before exec, from a large Rust parent. The
+native path clones directly from its small helper. That's why a limited raw
+process isn't a universal floor, and why subtracting these rates doesn't give
+pure scheduler overhead.
+
+The serial comparison matters too. With concurrency one, the same 1,000 commands
+and four-command warmup produced 1,023.5/s on the host and 1,179.5/s in a shared
+container. Adding worker durability gave 869.7/s and 950.6/s. The large host
+mismatch is gone; a smaller serial difference remains. The host command phase
+averaged 789.3 µs and cleanup 130.5 µs; shared commands averaged 662.8 µs and
+cleanup 120.1 µs. We calculate these from sample and total-time deltas, not by
+subtracting lifetime maxima.
+
+Public dispatch has more work than direct worker completion. Initially cold,
+equal 100,000-command pilots at concurrency 27 accepted host work at 4,267.2/s
+and shared work at 1,285.3/s, without failures or retries. That host rate is
+about 4.3 times the first native build's 991.6/s control-window ceiling. The
+remaining gap includes cold setup, live namespace checks and the public control
+path. Conservative duration averages include long startup outliers. These
+results don't assign the whole gap to one cause.
+
+The re-recorded demo then accepted 500,000 host jobs in 90.44 seconds (5,528.7/s),
+after its raw-million, thousand-fresh-container and ten-thousand-shared-container
+stages. All 511,000 public outcomes succeeded without retries. The raw million
+counts only exits. The demo preserves its 427.80-second clock and actual pauses;
+its resource profiles and concurrency now match across public runtimes.
+
+The first attempt to repeat the direct matrix omitted its private hostname
+wrapper. Direct runc setup collided with the live node identity, producing a
+thousand startup failures and no command samples. Restoring the original mount
+namespace wrapper produced a separate successful 62-case matrix. We keep the
+failed record and the successful rerun. Neither private credentials nor a
+synthetic executor rate is published as throughput evidence.
+
+
+### A continuous hour on the native path
+
+The new native host path completed **18,103,000 unique
+accepted successes in 3600.00 seconds (5,028.6/s)**,
+with zero terminal failures or accepted retries, beside the original container
+application. All 3,490 service probes succeeded; p95 latency was
+1.32 ms and the maximum 12.82 ms.
+It used one active 500,000-job submission, concurrency 27 and the same
+100m CPU / one-core limit / 32-MiB profile. The original Bun and service process
+start times and application generation matched after the hour. Cancellation of
+the remaining submission and final original-owner/kernel retirement passed.
+
+Largest sampled Bun RSS was 247.7 MiB; its last lifetime
+high-water mark was 258.1 MiB. All 117 bounded
+storage scans were incomplete, so they don't establish a global storage bound.
+No inventory timeout appeared across the fixture lifetime. The
+[raw hour, resource observations and positive cleanup proofs](../qualification/2026-10-09-host-job-executors/README.md)
+retain these limits. This completed hour does not qualify 100m/day; 24-hour,
+fault and historical namespace/profile/cardinality work remains in #640.

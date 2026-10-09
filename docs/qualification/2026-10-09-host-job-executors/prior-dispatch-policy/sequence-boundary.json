@@ -1,0 +1,19 @@
+{
+  "started_utc": "2026-10-09T09:15:50.280441+00:00",
+  "build": {
+    "source_commit": "c4fc14746d93b347ceccdf4221dd0096936d3ecc",
+    "completed_utc": "2026-10-09T09:15:39.967797+00:00",
+    "binaries": {
+      "bun": "5d210d7c7f90830b2d71120c47fe4c7c827f70f29d250fb6a55c3ed336be4294",
+      "relish": "5dc0efca15becb194d3e75584c516ba53a44d676a1329d841144554323e975b1",
+      "job-throughput": "997f599adde21fbd0c96e9069ff7dc3a29bd553fdb44e1b62133597e96039da9"
+    }
+  },
+  "order": [
+    "direct matched matrix",
+    "public matched matrix",
+    "replacement demo",
+    "continuous hour"
+  ],
+  "no_concurrent_build_or_test_traffic": true
+}

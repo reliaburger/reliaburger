@@ -1,0 +1,14 @@
+RUN true-bare-c1-n1000-warm0
+PASS true-bare-c1-n1000-warm0 3723.02
+RUN true-bare-limited-c1-n1000-warm0
+PASS true-bare-limited-c1-n1000-warm0 1789.1
+RUN true-host-c1-n1000-warm0
+PASS true-host-c1-n1000-warm0 1118.99
+RUN true-reused-c1-n1000-warm0
+Traceback (most recent call last):
+  File "/Users/miko/github/reliaburger/target/host-executor-drivers/host-executor-matched-matrix-v2.py", line 29, in <module>
+    direct(path,'true',concurrency,1000,warmup)
+  File "/Users/miko/github/reliaburger/target/host-executor-drivers/host-executor-matched-matrix-v2.py", line 22, in direct
+    if code:raise RuntimeError('measurement failed: '+name)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: measurement failed: true-reused-c1-n1000-warm0

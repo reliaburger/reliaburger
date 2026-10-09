@@ -1132,7 +1132,7 @@ idempotency costs. See the [execution and qualification plan](plans/2026-10-07-p
 
 Fast delegated jobs use bounded grant lookahead derived from verified duration
 summaries, covering receipt acceptance and grant delivery without increasing
-control polling. Extra prefetch is capped at sixteen chunks; actual execution
+control polling. Learned grant depth is capped at sixteen chunks; actual execution
 remains gated by per-node concurrency and resource admission. The trade-off is
 more granted work to reconcile after worker loss, with unchanged attempt fences.
 
@@ -1143,16 +1143,18 @@ includes failed fresh-container starts and incomplete whole-directory storage
 observations. This is a measured implementation result, not 100m/day qualification;
 scaling, sustained headroom and safe historical metadata collection remain work.
 
-The revised [four-part recording](qualification/2026-10-09-job-runtime-revision/README.md)
+The revised [four-part recording](qualification/2026-10-09-host-job-executors/README.md)
 keeps one million raw process exits separate from 1,000 fresh-container,
-10,000 shared-container and 10,000 host jobs. All 21,000 public jobs completed;
+10,000 shared-container and 500,000 host jobs. All 511,000 public jobs completed;
 its reports retain actual elapsed times, retries and resource contracts. Jobs
 select `runtime = "runc"` by default, or explicitly opt into `shared-runc` or
 `process`; a process definition with an image is refused. Explicit Bun
 `--runtime runc` permits containers, while `mixed` and Linux auto-detection can
 enable both backends. The one-hour measurement and the 24-hour qualification
-are separate gates. Host jobs retain admission reservations without hard
-CPU/memory enforcement, which limits this comparison as well as its rate.
+are separate gates. All public tiers request 100m CPU and 32 MiB with a one-core
+limit; rootful Linux native jobs enforce these limits before each fresh process
+starts. The half-million host tier completed in 90.44 seconds (5,529/s) with
+zero terminal failures or retries. Raw process exits omit these guarantees.
 
 
 ### AI workloads: resident models and coordinated training

@@ -1,0 +1,96 @@
+0/100,000 unique accepted successes in 0.03s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands unknown; queued 100000, held 0; recent unknown/s over unknowns
+application 200 in 13.42ms
+0/100,000 unique accepted successes in 1.12s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 98000, held 2000; recent 0.0/s over 1.079896927s
+application 200 in 1.24ms
+0/100,000 unique accepted successes in 2.17s (0.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 98000, held 2000; recent 0.0/s over 1.053053095s
+application 200 in 0.53ms
+2,000/100,000 unique accepted successes in 3.22s (620.6/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 91000, held 7000; recent 1897.331783640798/s over 1.054111894s
+application 200 in 1.15ms
+2,000/100,000 unique accepted successes in 4.28s (467.3/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 91000, held 7000; recent 0.0/s over 1.057433698s
+application 200 in 0.54ms
+9,000/100,000 unique accepted successes in 5.36s (1679.6/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 77000, held 14000; recent 6490.865343538817/s over 1.078438641s
+application 200 in 1.13ms
+9,000/100,000 unique accepted successes in 6.41s (1403.0/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 77000, held 14000; recent 0.0/s over 1.057217411s
+application 200 in 0.73ms
+9,000/100,000 unique accepted successes in 7.49s (1200.8/s whole run); 0 failures, 0 retries
+runtime process; commands 22; queued 77000, held 14000; recent 0.0/s over 1.078690065s
+application 200 in 1.06ms
+23,000/100,000 unique accepted successes in 8.55s (2689.8/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 61000, held 16000; recent 13239.771750042166/s over 1.057420042s
+application 200 in 0.66ms
+23,000/100,000 unique accepted successes in 9.60s (2395.7/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 61000, held 16000; recent 0.0/s over 1.048139557s
+application 200 in 1.25ms
+39,000/100,000 unique accepted successes in 10.67s (3655.5/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 45000, held 16000; recent 14958.198803928772/s over 1.069647503s
+application 200 in 0.81ms
+39,000/100,000 unique accepted successes in 11.72s (3327.8/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 45000, held 16000; recent 0.0/s over 1.050851321s
+application 200 in 0.55ms
+39,000/100,000 unique accepted successes in 12.78s (3050.6/s whole run); 0 failures, 0 retries
+runtime process; commands 24; queued 45000, held 16000; recent 0.0/s over 1.064289491s
+application 200 in 0.95ms
+55,000/100,000 unique accepted successes in 13.85s (3969.7/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 29000, held 16000; recent 14947.936626346704/s over 1.070381846s
+application 200 in 0.95ms
+55,000/100,000 unique accepted successes in 14.91s (3687.7/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 29000, held 16000; recent 0.0/s over 1.058562936s
+application 200 in 0.85ms
+55,000/100,000 unique accepted successes in 15.98s (3442.0/s whole run); 0 failures, 0 retries
+runtime process; commands 23; queued 29000, held 16000; recent 0.0/s over 1.065088919s
+application 200 in 0.82ms
+71,000/100,000 unique accepted successes in 17.06s (4160.9/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 13000, held 16000; recent 14741.404870717715/s over 1.085378235s
+application 200 in 1.00ms
+71,000/100,000 unique accepted successes in 18.12s (3919.1/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 13000, held 16000; recent 0.0/s over 1.053254344s
+application 200 in 0.74ms
+71,000/100,000 unique accepted successes in 19.17s (3703.9/s whole run); 0 failures, 0 retries
+runtime process; commands 22; queued 13000, held 16000; recent 0.0/s over 1.053340681s
+application 200 in 0.52ms
+87,000/100,000 unique accepted successes in 20.22s (4302.1/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 13000; recent 15209.950022290655/s over 1.05194297s
+application 200 in 1.44ms
+87,000/100,000 unique accepted successes in 21.28s (4087.4/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 13000; recent 0.0/s over 1.063192967s
+application 200 in 1.26ms
+87,000/100,000 unique accepted successes in 22.37s (3889.8/s whole run); 0 failures, 0 retries
+runtime process; commands 25; queued 0, held 13000; recent 0.0/s over 1.081100027s
+application 200 in 1.15ms
+100,000/100,000 unique accepted successes in 23.43s (4267.2/s whole run); 0 failures, 0 retries
+runtime process; commands 0; queued 0, held 0; recent 12175.140957343228/s over 1.067749445s
+application 200 in 0.71ms
+{
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "operator_declared_warmth": "warm-images-cold-executors",
+  "workload_sha256": "7965569e0375ebcb4e8fa6b041ab1fc1a745230973a06d87bddc02cac8cd0918",
+  "command": [
+    "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+    "--output",
+    "json",
+    "batch",
+    "submit",
+    "/tmp/rb-host-executor-v2/native-pilot-100000.toml"
+  ],
+  "execution_path": "public full dispatch; runtime/isolation as admitted",
+  "host_process_contract": "Owned host execution has no hard CPU/memory enforcement",
+  "timing": "Monotonic clock before submit process launch through observed accepted terminal summary",
+  "qualified_100m_per_day": false,
+  "accepted_elapsed_seconds": 23.43478225194849,
+  "unique_accepted_successes": 100000,
+  "accepted_successes_per_second": 4267.161474977454,
+  "terminal_failures": 0,
+  "not_run": 0,
+  "accepted_retries": 0,
+  "all_tasks_succeeded": true,
+  "qualification_boundary": "Requires matched baselines, 24-hour headroom, concurrent apps, recovery/fault and bounded-cost evidence"
+}

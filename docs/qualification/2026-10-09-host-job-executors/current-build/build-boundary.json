@@ -1,0 +1,9 @@
+{
+  "source_commit": "ed87f20b5f73b754fce0427261a03c14705d1cfe",
+  "completed_utc": "2026-10-09T10:41:59.251038+00:00",
+  "binaries": {
+    "bun": "35bc26b5e1c866994fc26c35e949a9f748c81563482ae523f5cea6591c6a937d",
+    "relish": "b3290a43bcba94c0c9f5a6372ea9818ee6c31b8a453b2093164a4cd36a50057b",
+    "job-throughput": "ce405949ea688291af150f470ee51cf46df6fc0ca677abedb6499114821ca453"
+  }
+}
