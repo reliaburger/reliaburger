@@ -26,8 +26,8 @@ Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
 note links the `.cast` file, and the written tour works as before. Don't add other scripts. The footer names both,
 so change the two together.
 
-Every `<section>` has a stable `id` (`install`, `tour`, `start`, `docs`,
-`internals`, `contributing`) and every section heading a `#` permalink, shown on
+Every `<section>` has a stable `id` (`install`, `tour`, `netboot`, `start`,
+`docs`, `internals`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
 instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
@@ -41,6 +41,28 @@ the npm tarball
 The bundle is self-contained: no fonts, workers or other files to fetch. To
 upgrade, replace those three files from a newer tarball and check the
 recording still plays.
+
+### Recording the netboot demo
+
+The "Netboot real machines" section plays `assets/netboot.cast`: three QEMU
+VMs with blank disks and OVMF firmware network-boot from `relish netboot`,
+install the appliance, and are claimed into a cluster.
+`scripts/demo/netboot.sh` runs it for real on Linux with KVM, on a bridge
+with a router in a network namespace, as `image/tests/relish-netboot-install.sh`
+does. It needs root, so CI records it: label a pull request that changes
+`image/**` or the appliance workflow `record-netboot-demo`, and the lab
+build's "Record the netboot demo" step uploads `netboot-demo-cast`. Then:
+
+```sh
+gh run download <run> -R reliaburger/reliaburger -n netboot-demo-cast -D /tmp/netboot
+cp /tmp/netboot/netboot.cast docs/website/assets/netboot.cast
+```
+
+It serves the lab build's own image, signed with that run's throwaway key,
+because a recording made before a release can't use the published channel;
+the narration says so. Its commands sit in `<code data-netboot>` elements,
+which `tests/suite/website.rs` parses with the real CLI. Re-record it when
+`relish netboot` or `relish machines` change what they print.
 
 ### Re-recording the tour
 

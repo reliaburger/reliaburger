@@ -269,7 +269,12 @@ async fn artefact(
         }
     };
     let client = query.client();
-    (state.log)(format!("http: {client}: {arch}/{file}"));
+    // iPXE names the machine; the installer's own downloads (the image and
+    // its sums) don't, so they're logged by file alone.
+    (state.log)(match client.mac {
+        Some(_) => format!("http: {client}: {arch}/{file}"),
+        None => format!("http: {arch}/{file}"),
+    });
     let stream = ReaderStream::new(opened);
     let body = if file == "installer.efi" {
         // Remember the machine as the installer's last chunk goes out; a
@@ -519,6 +524,25 @@ mod tests {
         let lines = f.lines.lock().unwrap();
         assert!(
             lines.iter().any(|l| l.contains("has the installer")),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_that_names_no_machine_is_logged_by_file_alone() {
+        let f = fixture_with(vec![], false);
+        let image = format!("/x86_64/reliaburger-os_{}.raw.zst", fixture::VERSION);
+        let (status, ..) = get_path(&f.state, &image).await;
+        assert_eq!(status, StatusCode::OK);
+        let lines = f.lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == &format!("http: x86_64{}", &image[7..])),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("unknown MAC")),
             "{lines:?}"
         );
     }

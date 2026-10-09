@@ -498,6 +498,32 @@ jobs:
         timeout-minutes: 25
         run: image/tests/claimed-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
 
+      - name: Record the netboot demo (x86-64, KVM)
+        # The homepage's netboot recording (scripts/demo/netboot.sh): three
+        # blank VMs netboot from the commit's relish and are claimed into a
+        # cluster. Only on a pull request labelled record-netboot-demo.
+        id: netboot_demo
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != '' && contains(github.event.pull_request.labels.*.name, 'record-netboot-demo')
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          sudo install -m 755 source-bin/relish-linux-x86_64 /usr/local/bin/relish
+          curl -fsSL -o "$RUNNER_TEMP/asciinema" \
+            https://github.com/asciinema/asciinema/releases/download/v3.2.1/asciinema-x86_64-unknown-linux-musl
+          echo "bec9781bc8f297a9d3d74ff60205599507f2abba1183578b8b2f22be4c999214  $RUNNER_TEMP/asciinema" | sha256sum -c -
+          sudo install -m 755 "$RUNNER_TEMP/asciinema" /usr/local/bin/asciinema
+          scripts/demo/netboot.sh --record "$RUNNER_TEMP/netboot.cast" image/mkosi.output "$IMAGE_VERSION"
+
+      - name: Upload the netboot demo
+        if: ${{ !cancelled() && steps.netboot_demo.outcome != 'skipped' && steps.netboot_demo.outcome != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: netboot-demo-cast
+          path: ${{ runner.temp }}/netboot.cast
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: OS update (x86-64, KVM)
         # bun rolls the next version onto a one-node cluster: staging,
         # sysupdate, the reboot and the boot checks, end to end.

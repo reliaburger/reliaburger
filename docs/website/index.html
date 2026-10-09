@@ -17,6 +17,7 @@
       <nav aria-label="Main navigation">
         <a href="#install">Install</a>
         <a href="#tour">Try it</a>
+        <a href="#netboot">Bare metal</a>
         <a href="#start">Build it</a>
         <a href="#docs">Read the docs</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
@@ -276,9 +277,82 @@
         </div>
       </section>
 
-      <section id="start" class="section start" aria-labelledby="start-title">
+      <section id="netboot" class="section" aria-labelledby="netboot-title">
+        <!-- The netboot commands carry data-netboot. tests/suite/website.rs parses each one
+             with the real relish CLI, as it does the tour's. -->
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">03 /</span>
+          <h2 id="netboot-title">Netboot real machines <a class="permalink" href="#netboot" aria-label="Link to the netboot section">#</a></h2>
+        </div>
+        <div class="tour">
+          <p class="tour-note">Old mini PCs, thin clients, anything x86_64 or arm64 with UEFI
+            network boot: plug them into your switch and power them on. Your laptop serves
+            the OS, they install themselves in under a minute, and one command makes them a
+            cluster. No USB sticks, no distro, nothing to configure on each machine. Your
+            router keeps handing out the addresses; relish only answers the boot part.</p>
+          <figure id="netboot-recording" class="recording" data-cast="./assets/netboot.cast" data-poster="npt:129">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/netboot.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play netboot.cast</code>, or follow the steps below.</p></noscript>
+            <figcaption>
+              <span>Three machines with blank disks network-boot into Reliaburger and become one
+                cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh">scripts/demo/netboot.sh</a>
+                in CI, serving a lab build of the OS signed with that run’s own key.
+                Idle time is cut to two seconds; every wait says how long it really took.</span>
+              <span class="recording-speed" role="group" aria-label="Netboot playback speed" hidden>speed
+                <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                <button type="button" data-speed="2" aria-pressed="false">2×</button>
+                <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
+            </figcaption>
+          </figure>
+          <details class="tour-commands" id="netboot-commands">
+            <summary>Show the commands <span class="tour-commands-note">from blank disks to a cluster</span></summary>
+            <ol class="tour-steps">
+              <li>
+                <p>In each machine’s firmware setup, turn on UEFI network boot and turn Secure
+                  Boot off. A blank disk falls through to the network by itself.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish image download --dir os</code></pre>
+                <p>Fetches the newest OS release for every architecture into <code>os/</code>,
+                  checked against the release key <code>relish</code> carries.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>sudo relish netboot os --mac d8:9e:f3:12:34:56 --mac d8:9e:f3:12:34:57 --mac d8:9e:f3:12:34:58</code></pre>
+                <p>Serves the boot part, for the machines you list and no others: iPXE over
+                  TFTP, then the installer and the image over HTTP. Leave it running and power
+                  the machines on. Each one installs, reboots into Reliaburger and shows a claim
+                  key on its screen. A disk that isn’t blank waits for your yes here first.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish machines</code></pre>
+                <p>Lists the machines on your network that are waiting to be claimed: address,
+                  MAC and architecture.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish machines claim ~/lab --create --name lab --operator 192.168.1.10 d8:9e:f3:12:34:56 d8:9e:f3:12:34:57 d8:9e:f3:12:34:58</code></pre>
+                <p>Makes them one cluster. For each machine, it asks whether the claim key it got
+                  is the one on that machine’s screen, then asks you to back up the cluster’s
+                  master key. <code>--operator</code> is your laptop’s address.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish nodes</code></pre>
+                <p>Three nodes alive. From here it’s the same cluster as the tour’s: deploy with
+                  <code>relish apply</code>, and update the OS with <code>relish os upgrade</code>,
+                  one node at a time.</p>
+              </li>
+            </ol>
+            <p class="tour-note">Serving from a Mac, an isolated switch, firmware quirks:
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/15_appliance.md">the appliance chapter of the manual</a>.</p>
+          </details>
+        </div>
+      </section>
+
+      <section id="start" class="section start" aria-labelledby="start-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">04 /</span>
           <h2 id="start-title">Or build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
         </div>
         <div class="start-grid">
@@ -312,7 +386,7 @@ target/debug/relish</code></pre>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">04 /</span>
+          <span class="section-number" aria-hidden="true">05 /</span>
           <h2 id="docs-title">Read before you deploy <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
@@ -361,7 +435,7 @@ target/debug/relish</code></pre>
 
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">05 /</span>
+          <span class="section-number" aria-hidden="true">06 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
