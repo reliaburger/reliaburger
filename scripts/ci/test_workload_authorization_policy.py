@@ -46,7 +46,7 @@ def caller_rule(source, kind):
         end = source.index('    // Preserve the caller on the second hop', start)
         expected = '''crate::sesame::auth::authorize_workload(
             auth.as_deref(), &job.name, job.namespace(),
-            job.spec.exec.is_some() || job.spec.script.is_some(), &permissions,
+            job.spec.is_host(), &permissions,
         )'''
     body = compact(source[start:end])
     if kind == 'apply':
@@ -62,6 +62,12 @@ class WorkloadAuthorizationPolicy(unittest.TestCase):
     def test_apply_delegates_each_resolved_target_without_local_policy_duplicate(self):
         source = (ROOT / 'src/bun/api/apply.rs').read_text()
         self.assertTrue(caller_rule(source, 'apply'))
+
+    def test_job_host_test_never_narrows_below_the_host_command_fields(self):
+        source = (ROOT / 'src/config/job.rs').read_text()
+        start = source.index('    pub fn is_host(&self) -> bool {')
+        body = compact(source[start:source.index('\n    }', start)])
+        self.assertIn(compact('self.exec.is_some() || self.script.is_some()'), body)
 
     def test_batch_delegates_each_resolved_target_before_forwarding(self):
         source = (ROOT / 'src/bun/batch.rs').read_text()
@@ -89,7 +95,7 @@ class WorkloadAuthorizationPolicy(unittest.TestCase):
             self.assertFalse(caller_rule(source.replace(anchor, anchor + 'if false {').replace(
                 'return response;', 'return response; }'), kind))
         batch = (ROOT / 'src/bun/batch.rs').read_text()
-        self.assertFalse(caller_rule(batch.replace('job.spec.exec.is_some() || job.spec.script.is_some()', 'false'), 'batch'))
+        self.assertFalse(caller_rule(batch.replace('job.spec.is_host()', 'false'), 'batch'))
 
 
 if __name__ == '__main__':
