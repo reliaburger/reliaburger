@@ -1747,3 +1747,112 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
     assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A native runner with one slot, so every command reuses the same executor
+/// identity and cgroup path.
+fn one_slot_native_runner(
+    root: &std::path::Path,
+) -> (
+    reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::AnyGrill>,
+    std::sync::Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
+    reliaburger::config::job::JobSpec,
+) {
+    use reliaburger::grill::{AnyGrill, ProcessGrill};
+    let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    let budget = reliaburger::bun::execution_budget::ExecutionBudget::new(
+        reliaburger::meat::Resources::new(1000, 128 << 20, 0),
+    );
+    let runner =
+        reliaburger::bun::task_runtime::OwnedRunner::with_slot_count(AnyGrill::Process(runtime), 1)
+            .with_budget(budget.clone());
+    let template = toml::from_str(
+        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native'\ncpu='100m-1000m'\nmemory='32Mi'",
+    )
+    .unwrap();
+    (runner, budget, template)
+}
+
+fn shell_task(
+    template: &reliaburger::config::job::JobSpec,
+    index: u32,
+    script: &str,
+) -> reliaburger::bun::task_executor::TaskInvocation {
+    reliaburger::bun::task_executor::TaskInvocation {
+        template: Some(Box::new(template.clone())),
+        index,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![],
+    }
+}
+
+/// The task cgroup a native command ran in, from its `/proc/self/cgroup`.
+fn task_cgroup(output: &[u8]) -> std::path::PathBuf {
+    let text = String::from_utf8_lossy(output);
+    let path = text
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap_or_else(|| panic!("no cgroup line: {text}"));
+    std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'))
+}
+
+async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
+/// Retirement writes `cgroup.kill`; on Linux 6.8 a killed group keeps its
+/// kill sequence, so a reused one would SIGKILL the next command at birth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
+    use reliaburger::bun::task_executor::TaskRunner;
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-fresh-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let first = runner
+        .run(
+            &shell_task(&template, 0, "cat /proc/self/cgroup"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    let task = task_cgroup(&first.output.head);
+    wait_until("idle eviction retires the executor", || {
+        !task.exists() && budget.available() == budget.capacity()
+    })
+    .await;
+    // Plant a killed, empty task cgroup where the next executor will look.
+    std::fs::create_dir_all(&task).unwrap();
+    std::fs::write(task.join("cgroup.kill"), "1").unwrap();
+    let planted = std::fs::metadata(&task).unwrap().ino();
+    let second = runner
+        .run(
+            &shell_task(&template, 1, "cat /proc/self/cgroup"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(second.outcome.succeeded(), "{second:?}");
+    assert_eq!(task_cgroup(&second.output.head), task);
+    assert_ne!(
+        std::fs::metadata(&task).unwrap().ino(),
+        planted,
+        "the executor adopted a killed task cgroup"
+    );
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}

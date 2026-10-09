@@ -1076,12 +1076,18 @@ sequence, and Bun checks `cgroup.events` for `populated 0` before releasing the
 slot. We keep atomic cgroup placement at birth and the independent resource
 limits.
 
-Timeouts, cancellation and uncertain cleanup retire the entire owned container.
-That final retirement may use `cgroup.kill`, but removes the task cgroup before
-any replacement can run. We never reuse a group killed that way. The real
-regression checks that the next command succeeds through the same owned
-container, alongside scratch cleanup and resource limits. A mocked launch
-wouldn't have caught this.
+Timeouts, cancellation, uncertain cleanup and idle eviction (after one second)
+retire the entire owned executor. Retirement does write `cgroup.kill`, so the
+task cgroup it killed must never run another command. Our first version
+intended that but didn't enforce it: it ignored a failed `rmdir`, and the next
+executor's `create_dir_all` would quietly adopt the surviving directory. Now
+retirement doesn't count until the task cgroup is really gone, and
+`prepare_cgroups` removes any leftover empty task cgroup and creates the
+directory with `create_dir`, which fails rather than adopting one. A root-gated
+test plants a killed cgroup at the next executor's path and checks that the
+command runs in a fresh directory. The real regression checks that the next
+command succeeds through the same owned container, alongside scratch cleanup
+and resource limits. A mocked launch wouldn't have caught this.
 
 ### Selecting the runtime per workload
 

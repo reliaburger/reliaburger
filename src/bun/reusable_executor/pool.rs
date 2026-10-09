@@ -312,7 +312,14 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             context.base.join("helper"),
             context.base.clone(),
         ] {
-            let _ = tokio::fs::remove_dir(directory).await;
+            // A task group that survived `cgroup.kill` must never be reused
+            // (see `prepare_cgroups`), so retirement waits for its removal.
+            while let Err(error) = tokio::fs::remove_dir(&directory).await {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
         if let Some(path) = context.socket_path.take() {
             let _ = tokio::fs::remove_file(path).await;
@@ -970,10 +977,18 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
             "+cpu +memory +pids",
         )?;
     }
-    for child in ["helper", "task"] {
-        std::fs::create_dir_all(base.join(child))?;
-    }
+    std::fs::create_dir_all(base.join("helper"))?;
+    // Never reuse a task group. Retirement writes `cgroup.kill`, and on Linux
+    // 6.8 a group keeps that kill sequence, so a later `CLONE_INTO_CGROUP`
+    // child would be killed at birth. Remove a leftover (only possible when
+    // empty) and always create a fresh directory.
     let task = base.join("task");
+    match std::fs::remove_dir(&task) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::create_dir(&task)?;
     std::fs::write(
         task.join("cpu.max"),
         if profile.cpu.limit < 10 {
