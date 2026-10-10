@@ -9,7 +9,7 @@
   "memory_bytes": null,
   "receipt_chunk_size": null,
   "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
-  "executable": "/home/miko.guest/.cache/reliaburger/bench-jobs/images/rootfs/public.ecr.aws/docker/library/busybox/sha256%3A9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028/gen-408b0bda0ff853d4/bin/busybox",
+  "executable": "$HOME/.cache/reliaburger/bench-jobs/images/rootfs/public.ecr.aws/docker/library/busybox/sha256%3A9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028/gen-408b0bda0ff853d4/bin/busybox",
   "executable_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
   "measurement_boundary": "local Linux machine running Relish; raw child exits, no resource enforcement, ownership journal or accepted task ledger; compare only with jobs on this same machine and byte-identical BusyBox",
   "unique_accepted_successes": 0,
