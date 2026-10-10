@@ -168,6 +168,8 @@ impl Harness {
                         },
                         event_log: vec![],
                         has_buildah: false,
+                        job_reservations: Default::default(),
+                        capacity_refusals: Vec::new(),
                     },
                 );
             }

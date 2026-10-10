@@ -613,6 +613,60 @@ async fn reporting_binds_a_retired_launch_whose_environment_values_were_scrubbed
     assert!(rx.await.unwrap().instances[0].execution.is_none());
 }
 
+/// Job leases and app replicas share one budget. When jobs hold it, a
+/// fresh deploy fails for capacity, and the state report says so (and how
+/// much the jobs hold) so the leader can place the replica elsewhere.
+#[tokio::test]
+async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    // Requests come with limits, which only a container runtime enforces.
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
+    let held = crate::meat::Resources::new(1000, 1 << 29, 0);
+    let attempt = budget
+        .acquire(held, &CancellationToken::new())
+        .await
+        .unwrap();
+    let config =
+        Config::parse("[app.web]\nimage = 'web:v1'\ncpu = '500m'\nmemory = '64Mi'\n").unwrap();
+
+    let events = drain_deploy(&mut agent, config.clone()).await;
+    assert!(
+        matches!(events.last(), Some(ApplyEvent::Error { .. })),
+        "{events:?}"
+    );
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    let snapshot = rx.await.unwrap();
+    assert_eq!(
+        snapshot.job_reservations,
+        crate::reporting::types::JobReservations {
+            cpu_millicores: 1000,
+            memory_bytes: 1 << 29,
+        }
+    );
+    assert_eq!(
+        snapshot.capacity_refusals,
+        vec![crate::reporting::types::CapacityRefusal {
+            app_name: "web".into(),
+            namespace: "default".into(),
+        }]
+    );
+
+    drop(attempt);
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    let snapshot = rx.await.unwrap();
+    assert!(snapshot.capacity_refusals.is_empty());
+    assert_eq!(snapshot.job_reservations, Default::default());
+}
+
 #[tokio::test]
 async fn late_discovery_subscribers_receive_the_latest_service_snapshot() {
     let (mut agent, _commands, _shutdown) = test_agent();

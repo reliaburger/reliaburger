@@ -1296,6 +1296,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .deploy_app(&app_name, &namespace, &spec, now)
                     .await;
+                let key = (app_name, namespace);
+                match &result {
+                    Err(BunError::Capacity { .. }) => {
+                        self.capacity_refusals
+                            .insert(key, tokio::time::Instant::now());
+                    }
+                    Ok(_) => {
+                        self.capacity_refusals.remove(&key);
+                    }
+                    Err(_) => {}
+                }
                 let _ = reply.send(result);
             }
             DeployOp::EnforceImageReference { image, reply } => {

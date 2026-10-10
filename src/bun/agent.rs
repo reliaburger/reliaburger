@@ -157,6 +157,11 @@ const INIT_TIMEOUT_SECS: u64 = 300;
 /// in its last line or two, so a short tail says why without flooding logs.
 const INIT_FAILURE_STDERR_BYTES: u64 = 400;
 
+/// How long a capacity refusal stays in this node's state reports. A
+/// failing deploy refreshes it on every retry; a deploy that succeeds, or a
+/// leader that moved the app away, lets it lapse.
+const CAPACITY_REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Maximum time a `run_before` prerequisite job may run before the gated
 /// deploy is aborted. Migrations are the classic case; a hung one must not
 /// wedge the deploy forever.
@@ -650,6 +655,11 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Apps whose last fresh deploy here failed because the execution
+    /// budget had no room (job leases may hold it), keyed by (app_name,
+    /// namespace), with when that happened. State reports carry recent ones
+    /// so the leader places the replicas elsewhere instead of holding them.
+    capacity_refusals: std::collections::HashMap<(String, String), tokio::time::Instant>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; reservations advance beyond both this counter and all restored owners.
@@ -880,6 +890,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
             scheduled_jobs_store_uncertain: false,
@@ -1034,6 +1045,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
             scheduled_jobs_store_uncertain: false,

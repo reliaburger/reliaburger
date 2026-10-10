@@ -1553,6 +1553,8 @@ mod tests {
             cached_specs: vec![],
             resource_usage: usage,
             event_log: vec![],
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 

@@ -10575,6 +10575,8 @@ mod audit_held_job_admission {
             event_log: vec![],
             has_buildah: false,
             resource_usage: Default::default(),
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
     fn footprint(state: &DesiredState, node: &str) -> u64 {

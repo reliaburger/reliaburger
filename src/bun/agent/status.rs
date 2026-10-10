@@ -391,6 +391,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             egress_degraded: !egress_affected_workloads.is_empty(),
             egress_affected_workloads,
+            job_reservations: {
+                let held = self.execution_budget().job_reservations();
+                crate::reporting::types::JobReservations {
+                    cpu_millicores: held.cpu_millicores,
+                    memory_bytes: held.memory_bytes,
+                }
+            },
+            capacity_refusals: self
+                .capacity_refusals
+                .iter()
+                .filter(|(_, at)| at.elapsed() < CAPACITY_REFUSAL_TTL)
+                .map(
+                    |((app_name, namespace), _)| crate::reporting::types::CapacityRefusal {
+                        app_name: app_name.clone(),
+                        namespace: namespace.clone(),
+                    },
+                )
+                .collect(),
         };
         let _ = req.response.send(snapshot);
     }

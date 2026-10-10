@@ -2326,6 +2326,8 @@ mod tests {
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
             has_buildah,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 

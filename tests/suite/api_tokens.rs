@@ -82,6 +82,8 @@ fn router_for_council(
                 },
                 event_log: vec![],
                 has_buildah: false,
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         let (publisher, receiver) = tokio::sync::watch::channel(state);
@@ -922,6 +924,8 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             },
             event_log: vec![],
             has_buildah: false,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         },
     );
     let (reports, report_rx) = tokio::sync::watch::channel(report);

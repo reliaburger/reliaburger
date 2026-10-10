@@ -86,6 +86,8 @@ impl Harness {
                         resource_usage: Default::default(),
                         event_log: vec![],
                         has_buildah: true,
+                        job_reservations: Default::default(),
+                        capacity_refusals: Vec::new(),
                     },
                 );
             }

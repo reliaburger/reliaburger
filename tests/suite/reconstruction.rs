@@ -106,6 +106,8 @@ fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedStat
                 cached_specs: vec![],
                 resource_usage: ResourceUsage::default(),
                 event_log: vec![],
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
     }

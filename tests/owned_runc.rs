@@ -1359,6 +1359,8 @@ mod capacity_contract {
                         },
                         event_log: Vec::new(),
                         has_buildah: false,
+                        job_reservations: Default::default(),
+                        capacity_refusals: Vec::new(),
                     },
                 )]
                 .into_iter()

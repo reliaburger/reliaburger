@@ -733,7 +733,7 @@ fn plan_pass(
                 placements.len() == want
                     && placements
                         .iter()
-                        .all(|p| p.resources == requested && liveness.keeps(p, spec, cache))
+                        .all(|p| p.resources == requested && liveness.keeps(app_id, p, spec, cache))
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -800,7 +800,7 @@ fn plan_pass(
             Replicas::Fixed(_) => {
                 let mut holding: Vec<_> = previous
                     .iter()
-                    .filter(|p| liveness.keeps(p, spec, cache))
+                    .filter(|p| liveness.keeps(app_id, p, spec, cache))
                     .cloned()
                     .collect();
                 holding.sort_by_key(|p| p.ordinal);
@@ -1119,9 +1119,11 @@ impl Liveness<'_> {
     /// managed-volume app stays on its home whatever its node is doing
     /// (#423), even when its new request no longer fits there. Any other
     /// replica stays while its node holds it and still has room for the
-    /// request it makes now (#434).
+    /// request it makes now (#434), unless the node reported it couldn't fit
+    /// the app: job leases may have taken the room since it was placed.
     fn keeps(
         &self,
+        app_id: &crate::meat::types::AppId,
         placement: &crate::meat::types::Placement,
         spec: &AppSpec,
         cache: &ClusterStateCache,
@@ -1139,6 +1141,9 @@ impl Liveness<'_> {
         }
         if keeps_volume_home(placement, spec, self.retired) {
             return true;
+        }
+        if cache.capacity_refused(&placement.node_id, app_id) {
+            return false;
         }
         placement_holds(
             placement,
@@ -1689,9 +1694,14 @@ fn build_cluster_cache(
                 memory_bytes: u64::from(usage.memory_total_mb) * 1024 * 1024,
                 gpus: 0,
             },
+            // App requests plus what task attempts and reusable executors
+            // hold in the same node budget. Apps and jobs share one ledger
+            // on the node, so the leader has to see both.
             allocated: Resources {
-                cpu_millicores: u64::from(usage.cpu_used_millicores),
-                memory_bytes: u64::from(usage.memory_used_mb) * 1024 * 1024,
+                cpu_millicores: u64::from(usage.cpu_used_millicores)
+                    .saturating_add(report.job_reservations.cpu_millicores),
+                memory_bytes: (u64::from(usage.memory_used_mb) * 1024 * 1024)
+                    .saturating_add(report.job_reservations.memory_bytes),
                 gpus: 0,
             },
             labels: member.labels.clone(),
@@ -1719,6 +1729,12 @@ fn build_cluster_cache(
                     u64::from(instance.resource_usage.memory_mb) * 1024 * 1024,
                     0,
                 ),
+            );
+        }
+        for refusal in &report.capacity_refusals {
+            cache.record_capacity_refusal(
+                &member.node_id,
+                &crate::meat::AppId::new(&refusal.app_name, &refusal.namespace),
             );
         }
     }
@@ -4413,6 +4429,8 @@ image = "busybox:latest"
                 memory_total_mb: 8192,
             },
             event_log: vec![],
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 
@@ -5573,6 +5591,107 @@ image = "busybox:latest"
         assert!(decisions.is_empty(), "{decisions:?}");
     }
 
+    /// Reports from two ready nodes with 4000m each, `full` holding all of
+    /// its CPU in task attempts and executor leases, `idle` holding nothing.
+    fn job_filled_and_idle_reports() -> (Vec<MembershipSnapshot>, AggregatedState) {
+        let members = vec![member("full", 1), member("idle", 2)];
+        let mut reports = AggregatedState::default();
+        let mut full = report(4000, 0);
+        full.job_reservations = crate::reporting::types::JobReservations {
+            cpu_millicores: 4000,
+            memory_bytes: 1 << 30,
+        };
+        reports.reports.insert(NodeId::new("full"), full);
+        reports.reports.insert(NodeId::new("idle"), report(4000, 0));
+        for name in ["full", "idle"] {
+            reports
+                .readiness
+                .insert(NodeId::new(name), readiness(name, true));
+        }
+        reports.receive_deadlines = reports
+            .reports
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+            })
+            .collect();
+        (members, reports)
+    }
+
+    /// Job attempts and executors lease from the same node budget as app
+    /// replicas. The leader used to see only app requests, so it put a
+    /// replica on a node jobs had filled, where it could never start.
+    #[test]
+    fn app_replica_avoids_a_node_whose_budget_is_held_by_job_leases() {
+        let (members, reports) = job_filled_and_idle_reports();
+        let mut cache = build_cluster_cache(&members, &reports);
+        assert_eq!(
+            cache
+                .get_node(&NodeId::new("full"))
+                .unwrap()
+                .allocated
+                .cpu_millicores,
+            4000,
+            "job leases count as allocated"
+        );
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(AppId::new("web", "default"), app_spec(1000, 1));
+        let alive = HashSet::from([NodeId::new("full"), NodeId::new("idle")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["idle"]);
+    }
+
+    /// A placement the node refuses for lack of capacity moves: holding it
+    /// there would leave the replica down while another node sits idle.
+    #[test]
+    fn capacity_refusal_from_the_agent_moves_the_replica() {
+        let (members, mut reports) = job_filled_and_idle_reports();
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 1));
+        desired.scheduling.insert(app.clone(), placed_on(&["full"]));
+        // The node had room when the replica was placed; jobs took it since.
+        reports
+            .reports
+            .get_mut(&NodeId::new("full"))
+            .unwrap()
+            .job_reservations = Default::default();
+        let alive = HashSet::from([NodeId::new("full"), NodeId::new("idle")]);
+        let mut cache = build_cluster_cache(&members, &reports);
+        assert!(
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default())
+                .is_empty(),
+            "a placement nobody refused stays where it is"
+        );
+
+        let (_, filled) = job_filled_and_idle_reports();
+        reports = filled;
+        reports
+            .reports
+            .get_mut(&NodeId::new("full"))
+            .unwrap()
+            .capacity_refusals
+            .push(crate::reporting::types::CapacityRefusal {
+                app_name: "web".to_string(),
+                namespace: "default".to_string(),
+            });
+        let mut cache = build_cluster_cache(&members, &reports);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["idle"]);
+    }
+
     /// A node mid-upgrade is cordoned, which the cache records as not
     /// ready. That's a reason to put nothing new on it, not to start its
     /// volume app somewhere else on an empty volume.
@@ -6704,6 +6823,8 @@ mod audit_stale_endpoints {
                     uptime: Duration::ZERO,
                     resource_usage: AppResourceUsage::default(),
                 }],
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         let backends = |catalog: &crate::onion::catalog::EndpointCatalog| {
@@ -6777,6 +6898,8 @@ mod audit_stale_endpoints {
                 },
                 event_log: vec![],
                 has_buildah: false,
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         assert!(!has_stale_member(&members, &reports));
@@ -7334,6 +7457,8 @@ mod revalidation_in_place {
                         memory_mb: 0,
                     },
                 }],
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         let mut cache = build_cluster_cache(&[member], &reports);
