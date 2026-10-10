@@ -123,3 +123,12 @@ release-job soak and landing-page commands. It changes no Rust source or tests.
 Rebase these CI repairs onto that head and repeat both CI/release Python suites,
 formatting and ignored-test ownership checks. Preserve the full portable and
 runtime results above; fresh GitHub checks must produce their own receipts.
+
+
+Rebase completed onto `1cf7e4f7`; a subtree comparison confirms the tested Rust,
+Rust tests and Cargo inputs are unchanged. Integrated validation passes 373
+CI-script tests, 213 release-script tests, formatting and ignored-test ownership.
+The portable 6,216-test result and resumed runtime results remain applicable.
+Push these fixes to #654 and leave it open while fresh GitHub owners qualify
+that integrated head. #668 remains open: neither these fixes nor #672's staged
+soak harness establishes bounded global cost or a 24-hour 100m-success run.
