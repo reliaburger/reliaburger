@@ -456,7 +456,9 @@ a built-in digest-pinned BusyBox image and run `/bin/busybox true`. Public jobs
 request 25m CPU, limit each command to one core and request/limit memory to
 32 MiB. Helper reservations still count against admission. The concurrency cap
 is per node; actual running commands also depend on available resources and the
-32-slot reusable pool. Use an isolated single-node cluster when comparing with
+32-slot reusable pool. A `shared-runc` or host array without
+`per_node_concurrency` defaults to 27 per node, below the pool size: at 32 every
+executor is committed, and measured shared throughput fell to about a sixth. Use an isolated single-node cluster when comparing with
 one local VM baseline. A larger configured cap isn't proof of higher throughput.
 
 The three public scenarios use your normal endpoint, token and CA context. Bun

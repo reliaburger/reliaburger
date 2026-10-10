@@ -816,13 +816,11 @@ impl TaskArrayNode {
                     }
                     _ => fits,
                 };
-                let cap = self
-                    .concurrency(&assignment.spec)
-                    .min(if reusable.is_some() {
-                        super::reusable_executor::MAX_EXECUTOR_SLOTS as u32
-                    } else {
-                        u32::MAX
-                    });
+                let cap = slot_cap(
+                    self.concurrency(&assignment.spec),
+                    assignment.spec.per_node_concurrency.is_some(),
+                    reusable.is_some(),
+                );
                 // A pool-run caller counts as running while it still waits
                 // for a slot or admission; only a slot with resources charged
                 // is in use. Started commands alone would miss millisecond
@@ -1117,6 +1115,19 @@ async fn run_chunk(
         .insert((work.chunk.0, work.grant_attempt), outcome.result);
 }
 
+/// The most attempts this node advertises for one array at once.
+///
+/// Reusable runtimes can't exceed their executor pool, and without an
+/// explicit cap they stay below it (see `DEFAULT_REUSABLE_CONCURRENCY`).
+fn slot_cap(concurrency: u32, explicit: bool, reusable: bool) -> u32 {
+    use super::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
+    match (reusable, explicit) {
+        (false, _) => concurrency,
+        (true, true) => concurrency.min(MAX_EXECUTOR_SLOTS as u32),
+        (true, false) => concurrency.min(DEFAULT_REUSABLE_CONCURRENCY),
+    }
+}
+
 fn write_outputs(directory: &Path, outputs: &[(u32, u64, CapturedOutput)]) -> std::io::Result<()> {
     for (index, grant, output) in outputs {
         let mut bytes = output.head.clone();
@@ -1148,6 +1159,19 @@ mod tests {
     use super::*;
     use crate::bun::task_executor::AttemptOutcome;
     use crate::meat::index_set::IndexRangeSet;
+
+    #[test]
+    fn reusable_arrays_without_a_cap_stay_below_the_executor_pool() {
+        use crate::bun::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
+        assert!((DEFAULT_REUSABLE_CONCURRENCY as usize) < MAX_EXECUTOR_SLOTS);
+        assert_eq!(slot_cap(256, false, true), DEFAULT_REUSABLE_CONCURRENCY);
+        assert_eq!(slot_cap(8, false, true), 8);
+        // An explicit cap is honoured up to the pool size.
+        assert_eq!(slot_cap(32, true, true), MAX_EXECUTOR_SLOTS as u32);
+        assert_eq!(slot_cap(256, true, true), MAX_EXECUTOR_SLOTS as u32);
+        // Fresh containers are bounded only by the node budget.
+        assert_eq!(slot_cap(256, false, false), 256);
+    }
 
     const BINARY: &str = "/bin/sh";
 
@@ -1469,9 +1493,19 @@ mod tests {
 
     #[tokio::test]
     async fn reusable_advertisement_accounts_for_helper_overhead_and_pool_bound() {
-        for (capacity, expected) in [
-            (crate::meat::Resources::new(300, 96 << 20, 0), 2),
-            (crate::meat::Resources::new(256_000, 16 << 30, 0), 32),
+        use crate::bun::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
+        for (capacity, explicit, expected) in [
+            (crate::meat::Resources::new(300, 96 << 20, 0), None, 2),
+            (
+                crate::meat::Resources::new(256_000, 16 << 30, 0),
+                None,
+                DEFAULT_REUSABLE_CONCURRENCY,
+            ),
+            (
+                crate::meat::Resources::new(256_000, 16 << 30, 0),
+                Some(256),
+                MAX_EXECUTOR_SLOTS as u32,
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let mut options = config(root.path(), policy(&[BINARY], false));
@@ -1482,6 +1516,7 @@ mod tests {
                 ));
             let mut array = assignment(1, 1000, &[]);
             array.resources = crate::meat::Resources::new(100, 32 << 20, 0);
+            array.spec.per_node_concurrency = explicit;
             array.template = Some(Box::new(toml::from_str(
                 "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
             ).unwrap()));

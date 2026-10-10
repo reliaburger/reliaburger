@@ -14,6 +14,16 @@ use crate::meat::Resources;
 /// Upper bound on retained helpers per node-local owned executor pool.
 pub(crate) const MAX_EXECUTOR_SLOTS: usize = 32;
 
+/// Per-node concurrency for a reusable array that doesn't set one.
+///
+/// Kept below [`MAX_EXECUTOR_SLOTS`]: with every context committed, slow
+/// preparation and one-second idle expiry hit each new context, and the
+/// measured shared throughput fell from a median of 3,150/s at 27 to 500/s
+/// at 32 (docs/qualification/2026-10-09-timed-job-scenarios). Host commands
+/// still reach their plateau at 27. An explicit `per_node_concurrency`
+/// overrides this, up to the pool size.
+pub(crate) const DEFAULT_REUSABLE_CONCURRENCY: u32 = 27;
+
 /// Explicit reservation for the container's idle command helper.
 pub const HELPER_CPU_REQUEST: u64 = 10;
 /// The helper is independently capped, outside each command's memory limit.
