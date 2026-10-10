@@ -249,3 +249,29 @@ to fail passes. Most rows turned out to be product bugs, not test bugs.
 The harness itself is described in [`design/test-harness.md`](design/test-harness.md),
 and the book's [Chapter 15](book/15-ready-for-production.md) tells the story of
 building it.
+
+### Jobs in the release soak
+
+`make test-ci-scripts` also runs the release-controller regression tests. They
+cover lost admission replies, resumption with the same request ID, monotonic
+accounting, unknown-owner fences, independent effects, stale observations,
+exact orphan detection and failure propagation into the final V02 verdict.
+
+On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
+fixtures with:
+
+```sh
+sudo python3 scripts/release/job_soak_linux.py --bun /absolute/path/to/bun
+```
+
+This creates a separate data directory and a private mount/network identity,
+uses only its own Bun PID, and checks real executions, limits, deadlines,
+cancellation and retirement. It leaves compact diagnostics under the printed
+`/var/tmp/rb-release-job-smoke-*` path. For repeat checks, `--image-cache
+/var/tmp/rb-release-job-smoke-previous/images` copies a stopped fixture's image
+content and image catalogue into the new fixture to avoid registry rate
+limits. It preserves shifted rootfs ownership and the catalogue's format stamp,
+so incompatible candidates still refuse it. It never reuses the
+job state or owner journals. The small smoke run is not release
+qualification. The [mixed job soak plan](plans/2026-10-10-plan-release-job-soak.md)
+describes the job gates included in the unchanged staged fast/final tiers.

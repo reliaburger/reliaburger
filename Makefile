@@ -141,6 +141,7 @@ pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS 
 
 test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+	python3 -m unittest discover -s scripts/release -p 'test_*.py'
 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons

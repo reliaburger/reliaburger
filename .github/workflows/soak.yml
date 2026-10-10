@@ -159,6 +159,7 @@ jobs:
             ${{ env.EVIDENCE }}
             !${{ env.EVIDENCE }}/.token
             !${{ env.EVIDENCE }}/.auth-header
+            !${{ env.EVIDENCE }}/jobs/.token
             !${{ env.EVIDENCE }}/tls/**/*key*
           include-hidden-files: false
           retention-days: 30

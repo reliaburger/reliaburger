@@ -37,6 +37,8 @@ import socket
 import ssl
 import sys
 import time
+import job_soak
+import job_soak_inventory
 
 # Thresholds from section 4 of the plan (seconds unless stated).
 NODE_CERT_MARGIN = 300
@@ -248,9 +250,14 @@ def rotation_findings(state, node, rotation_state, now):
     return []
 
 
-def leak_findings(baseline, current, baseline_instances, current_instances, node):
+def leak_findings(baseline, current, baseline_instances, current_instances, node, job_inventory=None):
     """Resources beyond the baseline plus the node's current instances."""
     findings = []
+    if job_inventory is not None:
+        owned = job_soak_inventory.exemptions(job_inventory)
+        # Compare the reconciled kernel snapshot with exact live owner proofs.
+        current = dict(current, **{kind:[v for v in values if v not in owned[kind]]
+                                  for kind,values in job_inventory["resources"].items()})
     instances = set(current_instances)
     for kind, prefix in (("runc", ""), ("netns", "rb-"), ("lease", "")):
         for value in current.get(kind, []):
@@ -500,6 +507,16 @@ def read_json(snapshot, name):
         return None
 
 
+def job_findings(evidence, snapshot, now, fault_window):
+    metadata=read_json(evidence,"metadata.json") or {}
+    if metadata.get("job_soak") is not True: return []
+    value=read_json(snapshot,"jobs.json")
+    problems=job_soak.findings(value,now,fault_window)
+    if value and value.get("stopped") and now < metadata.get("job_stop_at",now):
+        problems.append("job controller stopped before the final drain interval")
+    return [finding("jobs", "fail", item) for item in problems]
+
+
 def evaluate(evidence, snapshot):
     state = load_state(evidence)
     meta = read_json(snapshot, "meta.json") or {}
@@ -591,6 +608,9 @@ def evaluate(evidence, snapshot):
     by_node = instances_by_node(status) if isinstance(status, list) else None
     baseline = state.get("baseline", {})
     leaks = []
+    jobs_enabled=(read_json(evidence,"metadata.json") or {}).get("job_soak") is True
+    job_problems=job_findings(evidence,snapshot,now,fault_window)
+    findings += job_problems
     for node in expected_nodes:
         diagnostics = read_json(snapshot, f"diagnostics-{node}.json")
         if diagnostics is not None:
@@ -610,9 +630,30 @@ def evaluate(evidence, snapshot):
             findings += restart_findings(state, node, inventory, restart_expectations(evidence, node), now)
             findings += resource_trend_findings(state, node, inventory, now)
             findings += clock_findings(state, node, inventory, fault_window)
+            owned=None
+            if jobs_enabled:
+                text=read(snapshot,f"jobs-{node}.txt")
+                try:
+                    owned=job_soak_inventory.validate(json.loads(text) if text else None,now,(inventory.get("boot") or [None])[0])
+                    # Refuse a forged proof even when there are no app instances.
+                    job_soak_inventory.exemptions(owned)
+                    usage=state.setdefault("job_resources",{}).setdefault(node,{})
+                    usage.update(ts=owned["ts"],complete=True,available_kb=owned["available_kb"],storage_kb=owned["storage_kb"],live_owners=len(owned["owners"]))
+                    usage["peak_owners"]=max(usage.get("peak_owners",0),len(owned["owners"]))
+                    peaks=usage.setdefault("peak_storage_kb",{})
+                    for scope,size in owned["storage_kb"].items(): peaks[scope]=max(peaks.get(scope,0),size)
+                    campaign_snapshot=read_json(snapshot,"jobs.json") or {}
+                    if campaign_snapshot.get("stopped") and now-campaign_snapshot.get("heartbeat",0)>5 and owned["owners"]:
+                        raise job_soak_inventory.InvalidInventory("job-owned resources remain after positive campaign drain")
+                except (job_soak_inventory.InvalidInventory,ValueError,KeyError,TypeError) as error:
+                    problem=finding("job-inventory","info" if fault_window else "fail",str(error),node)
+                    job_problems.append(problem); findings.append(problem)
             if by_node is not None and node in baseline:
                 leaks += leak_findings(baseline[node]["inventory"], inventory,
-                                       baseline[node]["instances"], by_node.get(node, []), node)
+                                       baseline[node]["instances"], by_node.get(node, []), node,owned)
+        elif jobs_enabled and not fault_window:
+            problem=finding("job-inventory","fail","kernel/storage inventory missing",node)
+            job_problems.append(problem); findings.append(problem)
         text = read(snapshot, f"export-{node}.txt")
         if text is not None:
             findings += export_findings(state, node, text)
@@ -637,7 +678,7 @@ def evaluate(evidence, snapshot):
     clean = None
     if meta.get("kind") in ("settle", "heavy"):
         # Without status the leak check couldn't run, so the node isn't known to be clean.
-        clean = settle_clean(report, nodes, node_problems, leaks, http_ok) and by_node is not None
+        clean = settle_clean(report, nodes, node_problems, leaks, http_ok) and by_node is not None and not job_problems
     findings = suppress_repeats(state, findings, now)
     verdict = {"ts": now, "kind": meta.get("kind"), "fault_window": fault_window,
                "settle_clean": clean, "findings": findings}
@@ -1069,6 +1110,16 @@ def render(evidence, record):
     if reload_period:
         need = max(0, int(elapsed // reload_period) - 1)
         gates.append(("operator ingress reloads (all nodes)", str(reloads), f"≥ {need}", "PASS" if reloads >= need else "FAIL"))
+    job_report=read_json(evidence,"jobs/snapshot.json")
+    job_missing=job_soak.coverage_failures(job_report,state.get("nodes",[])) if metadata.get("job_soak") is True else []
+    if metadata.get("job_soak") is True:
+        if job_report and (type(job_report.get("stop_requested_at")) is not int or job_report["stop_requested_at"] < metadata.get("job_stop_at",0)):
+            job_missing.append("job campaign requested drain before the final two-minute interval")
+        for node in state.get("nodes",[]):
+            observed=state.get("job_resources",{}).get(node,{})
+            if observed.get("complete") is not True or observed.get("ts",0)<(job_report or {}).get("heartbeat",0) or observed.get("live_owners")!=0:
+                job_missing.append(node+" lacks a complete empty owner inventory after campaign drain")
+        gates.append(("mixed job campaign and positive drain",str(len(job_missing))+" missing/failing checks","0","FAIL" if job_missing else "PASS"))
     gate_failed = any(row[3] == "FAIL" for row in gates)
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
@@ -1125,6 +1176,18 @@ def render(evidence, record):
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]
     lines.append("")
     progress = state.get("progress", {})
+    if metadata.get("job_soak") is True:
+        lines += ["## Jobs", "", "| Runtime | Accepted successes | Retries | Last accepted progress |", "|---|---|---|---|"]
+        for mode in job_soak.MODES:
+            sample=(job_report or {}).get("progress",{}).get(mode,{})
+            lines.append(f"| {mode} | {sample.get('succeeded',0)} | {sample.get('retried',0)} | {sample.get('latest_success','missing')} |")
+        lines += ["", "The bounded campaign shares the app soak's fault schedule. These counts are reliability evidence, not a saturation rate or a 100-million-per-day qualification.", ""]
+        lines += ["- "+problem for problem in job_missing]
+        lines += ["- Independent verifier execution attempts: "+str((job_report or {}).get("totals",{}).get("audit_attempts",0)),
+                  "- Explicit test-operator acknowledgements for known replay-safe fenced fixtures: "+str((job_report or {}).get("totals",{}).get("operator_replay_decisions",0)), ""]
+        for node, sample in state.get("job_resources",{}).items():
+            lines.append(f"- {node}: latest complete job storage (KiB) {sample.get('storage_kb')}; free {sample.get('available_kb')} KiB; live/peak owners {sample.get('live_owners')}/{sample.get('peak_owners')}; peak storage {sample.get('peak_storage_kb')}")
+        lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 24-hour qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
     lines += ["## Data", "",
               f"- Volume writer: highest ACK {state.get('writer-ack', 'none')} in the log view; "
               "the writer file checks (writer-lost, writer-regression) decide data loss, "

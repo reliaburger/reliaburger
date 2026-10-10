@@ -1811,6 +1811,47 @@ elapsed time in its `Drop` implementation, Rust's destructor, which runs on
 every exit path, error returns included. Its lifetime spans exactly one phase,
 so waiting for a slot can't leak into execution time.
 
+### Soak jobs while the apps keep running
+
+A fast command completing a million times tells us little about what happens
+when Bun dies halfway through owning it. The release soak already kills agents,
+powers off nodes and loses quorum while data-bearing apps run. It now drives
+all three job runtimes through the same faults, within the existing 90-minute
+fast and eight-hour final tiers.
+
+The [extension plan](../plans/2026-10-10-plan-release-job-soak.md) describes a
+bounded controller with two resource profiles per runtime. It persists each
+submission intent before sending it, then reuses that exact request ID after
+a lost reply or controller restart. Accepted counters must conserve indexes
+and never regress. A small authenticated verifier on each VM independently
+records the audited cohort's logical effects; repeated attempts are counted,
+not claimed as exactly-once execution. Cron, publication-triggered singletons
+and deploy gates use the same common job path. Fresh containers do not expose live
+command activity through the summary API, so their fault-overlap proof joins an
+independent boot/start-time receipt to the current private generation and a
+populated cgroup. Counting queued callers as active would fabricate coverage.
+
+The controller deliberately tests non-zero exits, deadlines with descendants,
+memory limits and cancellation. Long jobs opt out of automatic replay. If a
+fault leaves an unknown outcome, the test operator acknowledges only a known
+replay-safe fixture, after observing its exact grant fingerprint twice.
+That explicit decision is part of the evidence, not a production recovery
+policy.
+
+Reusable executors outlive their commands, so the app-only leak checker needed
+to change. It now recognises an exact executor only when its private journal,
+current boot, generation, pool slot and cgroup identity agree. A prefix is no
+proof. Complete disk inventories and actual cgroup limits accompany the owner
+proof; they do not substitute for the scheduler's commitment ledger. Missing
+job evidence, stale heartbeats, orphaned owners or incomplete drain fail the
+release verdict. Drain begins inside the last two minutes, with no new settle
+allowance.
+
+This machinery still needs the normal staged fast and final qualification on
+the integrated candidate. It records reliability under app load and faults;
+the hourly saturation measurements and #668's retained-storage/24-hour work
+answer different questions. No extrapolated daily rate determines a soak pass.
+
 ### Lessons from short jobs
 
 **Reuse needs proof, not hope.** Every reuse bug in this section had the same

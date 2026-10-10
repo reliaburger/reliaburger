@@ -1,0 +1,71 @@
+# Finite fixtures added after the app-only baseline. Common-path singletons,
+# UTC minute schedules (forbid overlap, skip missed occurrences), and deploy gates.
+
+[job.soak-job-cron-runc]
+runtime = "runc"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+cpu = "25m-1"
+memory = "32Mi"
+schedule = "* * * * *"
+
+[job.soak-job-hook-runc]
+runtime = "runc"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+cpu = "25m-1"
+memory = "32Mi"
+run_before = ["app.soak-identity"]
+
+[job.soak-job-after-runc]
+runtime = "runc"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+cpu = "25m-1"
+memory = "32Mi"
+
+[job.soak-job-cron-shared-runc]
+runtime = "shared-runc"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+cpu = "25m-1"
+memory = "32Mi"
+schedule = "* * * * *"
+
+[job.soak-job-hook-shared-runc]
+runtime = "shared-runc"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+cpu = "25m-1"
+memory = "32Mi"
+run_before = ["app.soak-identity"]
+
+[job.soak-job-after-shared-runc]
+runtime = "shared-runc"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+cpu = "25m-1"
+memory = "32Mi"
+
+[job.soak-job-cron-process]
+runtime = "process"
+exec = "/var/lib/reliaburger/soak-jobs/busybox"
+command = ["true"]
+cpu = "25m-1"
+memory = "32Mi"
+schedule = "* * * * *"
+
+[job.soak-job-hook-process]
+runtime = "process"
+exec = "/var/lib/reliaburger/soak-jobs/busybox"
+command = ["true"]
+cpu = "25m-1"
+memory = "32Mi"
+run_before = ["app.soak-identity"]
+
+[job.soak-job-after-process]
+runtime = "process"
+exec = "/var/lib/reliaburger/soak-jobs/busybox"
+command = ["true"]
+cpu = "25m-1"
+memory = "32Mi"
