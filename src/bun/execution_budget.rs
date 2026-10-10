@@ -69,18 +69,26 @@ impl ExecutionBudget {
             changed: Notify::new(),
         })
     }
+    /// The ledger. Every update leaves it consistent before anything that
+    /// could panic, so a lock poisoned by an unrelated panic still holds a
+    /// valid ledger, and a lease's `Drop` must never panic on it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     /// Refresh capacity without forgiving any existing commitments.
     pub fn set_capacity(&self, capacity: Resources) {
-        self.state.lock().expect("budget poisoned").capacity = capacity;
+        self.lock().capacity = capacity;
         self.changed.notify_waiters();
     }
     /// Allocatable capacity, independent of currently owned executions.
     pub fn capacity(&self) -> Resources {
-        self.state.lock().expect("budget poisoned").capacity
+        self.lock().capacity
     }
     /// Free resources, including pending and stopping application commitments.
     pub fn available(&self) -> Resources {
-        let state = self.state.lock().expect("budget poisoned");
+        let state = self.lock();
         state.capacity.saturating_sub(&state.used)
     }
     /// Capacity held by task attempts and reusable executors, quarantined
@@ -95,17 +103,12 @@ impl ExecutionBudget {
     /// Idle executors yield their reservations to queued attempts.
     #[cfg(target_os = "linux")]
     pub(crate) fn has_waiters(&self) -> bool {
-        !self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .waiters
-            .is_empty()
+        !self.lock().waiters.is_empty()
     }
     /// Commit an application replica's request in all dimensions
     /// atomically, or leave the ledger unchanged.
     pub fn try_acquire(self: &Arc<Self>, resources: Resources) -> Option<ResourceLease> {
-        let mut state = self.state.lock().expect("budget poisoned");
+        let mut state = self.lock();
         if !state.capacity.saturating_sub(&state.used).fits(&resources) {
             return None;
         }
@@ -123,10 +126,7 @@ impl ExecutionBudget {
         self: &Arc<Self>,
         resources: Resources,
     ) -> Option<ResourceLease> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         if !state.waiters.is_empty() || !state.capacity.saturating_sub(&state.used).fits(&resources)
         {
             return None;
@@ -144,7 +144,7 @@ impl ExecutionBudget {
     /// capacity shrinks. Recovery cannot forgive running work merely because
     /// it no longer fits.
     pub fn adopt(self: &Arc<Self>, resources: Resources) -> ResourceLease {
-        let mut state = self.state.lock().expect("budget poisoned");
+        let mut state = self.lock();
         state.used = state.used.saturating_add(&resources);
         ResourceLease {
             budget: self.clone(),
@@ -161,7 +161,7 @@ impl ExecutionBudget {
         cancel: &CancellationToken,
     ) -> Option<ResourceLease> {
         let ticket = {
-            let mut state = self.state.lock().expect("budget poisoned");
+            let mut state = self.lock();
             let ticket = state.next_ticket;
             state.next_ticket = state.next_ticket.wrapping_add(1);
             state.waiters.push_back(ticket);
@@ -179,7 +179,7 @@ impl ExecutionBudget {
                 return None;
             }
             {
-                let mut state = self.state.lock().expect("budget poisoned");
+                let mut state = self.lock();
                 if state.waiters.front() == Some(&ticket)
                     && state.capacity.saturating_sub(&state.used).fits(&resources)
                 {
@@ -204,9 +204,7 @@ struct Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         self.budget
-            .state
             .lock()
-            .expect("budget poisoned")
             .waiters
             .retain(|ticket| *ticket != self.ticket);
         self.budget.changed.notify_waiters();
@@ -217,7 +215,7 @@ impl Drop for ResourceLease {
         if !self.release_on_drop {
             return;
         }
-        let mut state = self.budget.state.lock().expect("budget poisoned");
+        let mut state = self.budget.lock();
         state.used = state.used.saturating_sub(&self.resources);
         if self.owner == LeaseOwner::Job {
             state.job_used = state.job_used.saturating_sub(&self.resources);
@@ -265,6 +263,21 @@ mod tests {
         );
         drop((app, adopted, executor));
         assert_eq!(budget.job_reservations(), Resources::new(100, 100, 0));
+    }
+    #[test]
+    fn poisoned_budget_lock_does_not_panic_on_drop() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1024, 0));
+        let lease = budget.try_acquire(Resources::new(500, 512, 0)).unwrap();
+        let poisoner = budget.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("poison the budget lock");
+        })
+        .join();
+        assert!(budget.state.is_poisoned());
+        drop(lease);
+        assert_eq!(budget.available(), budget.capacity());
+        assert!(budget.try_acquire(Resources::new(1000, 1024, 0)).is_some());
     }
     #[test]
     fn mixed_requests_and_apps_share_all_dimensions() {
