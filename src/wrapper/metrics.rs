@@ -112,6 +112,9 @@ impl IngressMetrics {
     ///
     /// Uses a saturating decrement so a stray underflow (never expected, since
     /// each increment is paired) can't wrap the gauge to `u64::MAX`.
+    // Rust 1.99 renamed `fetch_update` to `try_update`; the 1.97 baseline
+    // doesn't have the new name yet, so keep the old one until it does.
+    #[allow(deprecated)]
     pub fn dec_in_flight(&self) {
         // `fetch_update` lets us apply `saturating_sub` atomically: the closure
         // re-runs if another thread changes the value in between, so the gauge
