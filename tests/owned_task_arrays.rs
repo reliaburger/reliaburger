@@ -8,6 +8,14 @@ use reliaburger::grill::{ContainerState, Grill, ImageStore};
 use std::path::Path;
 use std::time::Duration;
 
+/// Retired, and then forgotten once that retirement is proven (#678).
+async fn assert_retired(runtime: &impl Grill, id: &reliaburger::grill::InstanceId) {
+    match runtime.state(id).await {
+        Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. }) => {}
+        other => panic!("{} has not retired: {other:?}", id.0),
+    }
+}
+
 /// Real isolated attempts reuse a bounded owner pool, without losing app capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
@@ -854,7 +862,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     })
     .await
     .unwrap();
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     // Explicit environment values and escaped process groups cannot survive
     // a command boundary inside the retained PID namespace.
     let mut transient = task.clone();
@@ -927,7 +935,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
             .outcome,
         AttemptOutcome::TimedOut
     );
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     assert!(!base.exists(), "timeout must remove the killed task cgroup");
     assert_eq!(budget.available(), Resources::new(500, 64 << 20, 0));
 
@@ -960,7 +968,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     let cancelled = active.await.unwrap();
     assert_eq!(runner.active_commands(42, Some(&template)).await, Some(0));
     assert_eq!(cancelled.outcome, AttemptOutcome::Cancelled);
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     assert!(
         !base.exists(),
         "cancellation must remove the killed task cgroup"
@@ -970,7 +978,25 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     // 64 MiB. Compatible waiters must reuse it instead of churning containers.
     use reliaburger::bun::task_executor::{ChunkWork, PoolConfig, TaskPool};
     use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
-    let before = runtime.launch_inventory().await.unwrap().unwrap().len();
+    // Retired executors are forgotten (#678), so the inventory cannot count
+    // churn after the fact. Sample the generations that ever existed instead.
+    let sampling = CancellationToken::new();
+    let generations = tokio::spawn({
+        let runtime = runtime.clone();
+        let sampling = sampling.clone();
+        async move {
+            let mut seen = std::collections::HashSet::new();
+            while !sampling.is_cancelled() {
+                for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+                    if launch.instance_id.0.starts_with("rbtest-reuse__") {
+                        seen.insert(launch.generation);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            seen.len()
+        }
+    });
     let concurrent =
         Arc::new(OwnedRunner::with_slot_count(runtime.clone(), 8).with_budget(budget.clone()));
     let pool = TaskPool::with_node_slots(
@@ -992,9 +1018,9 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     };
     let completed = pool.run_chunk(&work, &cancel).await;
     assert_eq!(completed.result.succeeded, 16, "{:?}", completed.records);
-    let after = runtime.launch_inventory().await.unwrap().unwrap().len();
+    sampling.cancel();
     assert_eq!(
-        after - before,
+        generations.await.unwrap(),
         1,
         "compatible resource waiters churned owned containers instead of reusing the one profile that fits"
     );
@@ -1677,7 +1703,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         reliaburger::bun::task_executor::AttemptOutcome::Cancelled
     ));
     eprintln!("native cancellation returned {outcome:?}");
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     assert_eq!(budget.available(), budget.capacity());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -1784,7 +1810,7 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
     })
     .await
     .unwrap();
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -2328,4 +2354,118 @@ async fn cgroup_host_executor_adds_no_drain_wait_to_quiet_commands() {
         budget.available() == budget.capacity()
     })
     .await;
+}
+
+/// Every namespace that ever ran a shared-runc array used to leave executor
+/// identities, journals and route files behind for good (#678). Once the
+/// executors retire, nothing of them remains, and a restart sweep finds
+/// nothing more to collect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement() {
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
+    use reliaburger::bun::{execution_budget::ExecutionBudget, task_runtime::OwnedRunner};
+    use reliaburger::grill::AnyGrill;
+    use reliaburger::meat::Resources;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-678-metadata-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("executor metadata fixture: {}", root.display());
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = AnyGrill::with_host_processes(
+        RuncGrill::new(
+            root.join("bundles"),
+            images,
+            false,
+            root.join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap(),
+        &root.join("instances"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    );
+    let budget = ExecutionBudget::new(Resources::new(2000, 512 << 20, 0));
+    let runner = Arc::new(
+        OwnedRunner::for_data_dir(runtime.clone(), &root)
+            .unwrap()
+            .with_budget(budget.clone()),
+    );
+    let cancel = CancellationToken::new();
+    let namespaces = ["rbtest-tenant-a", "rbtest-tenant-b", "rbtest-tenant-c"];
+    for namespace in namespaces {
+        let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+            "image='{image}'\nnamespace='{namespace}'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+        ))
+        .unwrap();
+        let task = TaskInvocation {
+            template: Some(Box::new(template)),
+            index: 0,
+            attempt: 1,
+            program: "/unused".into(),
+            args: vec!["/bin/sh".into(), "-c".into(), "printf ran".into()],
+            env: vec![
+                ("RELIABURGER_TASK_COUNT".into(), "1".into()),
+                ("RELIABURGER_BATCH_ID".into(), "7".into()),
+            ],
+            run: Some(reliaburger::bun::task_executor::RunIdentity {
+                batch_id: 7,
+                task_count: 1,
+                job_name: None,
+            }),
+        };
+        let outcome = runner.run(&task, Duration::from_secs(30), &cancel).await;
+        assert_eq!(
+            outcome.outcome,
+            AttemptOutcome::Exited { code: 0 },
+            "{outcome:?}"
+        );
+    }
+    let executors = |inventory: Vec<reliaburger::grill::RuntimeLaunch>| {
+        inventory
+            .into_iter()
+            .filter(|launch| launch.instance_id.0.contains("__executor-"))
+            .count()
+    };
+    // Idle executors retire about a second after their last command.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while budget.available() != budget.capacity()
+            || executors(runtime.launch_inventory().await.unwrap().unwrap()) != 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("idle executors were not retired and forgotten");
+    let leftovers = |directory: &std::path::Path| -> Vec<String> {
+        match std::fs::read_dir(directory) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.contains("__executor-"))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("{}: {error}", directory.display()),
+        }
+    };
+    for directory in [
+        root.join("instances/runtime-routes"),
+        root.join("bundles/.intents/records"),
+        root.join("bundles/.intents/locks"),
+        root.join("bundles"),
+        root.join("state"),
+    ] {
+        let kept = leftovers(&directory);
+        assert!(kept.is_empty(), "{} kept {kept:?}", directory.display());
+    }
+    assert_eq!(runner.forget_retired_executors().await, 0);
+    drop(runner);
+    std::fs::remove_dir_all(root).unwrap();
 }

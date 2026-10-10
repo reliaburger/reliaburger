@@ -400,7 +400,17 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             while !self.retirement_step(context).await {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            self.remove_files(context).await
+            if !self.remove_files(context).await {
+                return false;
+            }
+            // Retirement is proven, so the identity's journal and routing
+            // files own nothing. Without this, every namespace that ever ran
+            // a job leaves them behind (#678). A failure only leaves metadata
+            // for the startup sweep; it never holds capacity.
+            if let Err(error) = self.lifecycle.forget_retired(&context.id).await {
+                eprintln!("executor {}: metadata kept: {error}", context.id.0);
+            }
+            true
         })
         .await
         .unwrap_or(false);
@@ -1410,6 +1420,79 @@ mod tests {
         async fn state(&self, _: &InstanceId) -> Result<ContainerState, GrillError> {
             Ok(ContainerState::Running)
         }
+    }
+
+    /// A runtime whose instances have all stopped, recording what it forgets.
+    #[derive(Clone, Default)]
+    struct Forgetting {
+        forgotten: Arc<std::sync::Mutex<Vec<InstanceId>>>,
+    }
+    impl Grill for Forgetting {
+        async fn create(&self, _: &InstanceId, _: &OciSpec) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn start(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn kill(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn state(&self, _: &InstanceId) -> Result<ContainerState, GrillError> {
+            Ok(ContainerState::Stopped)
+        }
+        async fn forget_retired(&self, id: &InstanceId) -> Result<(), GrillError> {
+            self.forgotten.lock().unwrap().push(id.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_executor_identity_and_journal_are_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let lifecycle = Forgetting::default();
+        let pool = ReusablePool::with_runtime(
+            Runtime::Host(ProcessGrill::new()),
+            lifecycle.clone(),
+            "rbtest".into(),
+            2,
+            budget.clone(),
+            #[cfg(feature = "ebpf")]
+            None,
+        );
+        let id = InstanceId("tenant-a__executor-rbtest-host-0".into());
+        let mut old = context(&budget, id.clone(), root.path());
+        std::fs::create_dir(&old.directory).unwrap();
+        // The runtime has no such instance: its retirement is proven.
+        assert!(pool.retire(&mut old, Duration::from_secs(5)).await);
+        assert!(!old.directory.exists(), "executor directory kept");
+        assert_eq!(*lifecycle.forgotten.lock().unwrap(), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn an_executor_that_has_not_retired_keeps_its_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let process = ProcessGrill::new();
+        let lifecycle = Forgetting::default();
+        let pool = ReusablePool::with_runtime(
+            Runtime::Host(process.clone()),
+            lifecycle.clone(),
+            "rbtest".into(),
+            2,
+            budget.clone(),
+            #[cfg(feature = "ebpf")]
+            None,
+        );
+        let id = running(&process, "tenant-b__executor-rbtest-host-0").await;
+        let mut old = context(&budget, id, root.path());
+        // `kill` on the lifecycle is a no-op, so the helper keeps running.
+        assert!(!pool.retire(&mut old, Duration::from_millis(200)).await);
+        assert!(lifecycle.forgotten.lock().unwrap().is_empty());
+        process.kill(&old.id).await.unwrap();
     }
 
     fn reservation() -> Resources {

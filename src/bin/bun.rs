@@ -1892,6 +1892,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
     agent.adopt_recorded_instances().await?;
     let task_runner = agent.delegated_task_runner(&data_base)?;
+    let forgotten = task_runner.forget_retired_executors().await;
+    if forgotten > 0 {
+        eprintln!("bun: forgot {forgotten} retired executor identities");
+    }
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     let task_runner = if let Some(kernel) = agent.delegated_namespace_kernel() {
         task_runner.with_namespace_policy(

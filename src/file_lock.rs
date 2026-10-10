@@ -102,6 +102,40 @@ impl FileLock {
     pub fn file(&self) -> &File {
         &self.file
     }
+
+    /// Whether `path` still names the locked file.
+    ///
+    /// A lock file that may be deleted (see [`Self::remove`]) needs this
+    /// check after every lock: a holder that opened the old file before it
+    /// was unlinked would otherwise lock a file nobody else can find, beside
+    /// a newcomer locking its replacement. On `false` the caller drops this
+    /// lock and opens the path again.
+    pub fn still_names(&self, path: &std::path::Path) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self.file.metadata()?;
+        match std::fs::symlink_metadata(path) {
+            Ok(named) => Ok(named.dev() == held.dev() && named.ino() == held.ino()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Delete the lock file at `path` while still holding it, then release.
+    ///
+    /// Safe only when every locker of `path` checks [`Self::still_names`]
+    /// after locking: a waiter that opened this file then finds it unlinked
+    /// and retries against a fresh one.
+    pub fn remove(self, path: &std::path::Path) -> io::Result<()> {
+        if self.still_names(path)? {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        drop(self);
+        Ok(())
+    }
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -195,6 +229,23 @@ mod tests {
         ));
         drop(held);
         let _retaken = FileLock::try_lock(open(&path)).unwrap();
+    }
+
+    #[test]
+    fn a_waiter_on_a_removed_lock_file_sees_it_no_longer_names_the_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("held.lock");
+        let held = FileLock::try_lock(open(&path)).unwrap();
+        assert!(held.still_names(&path).unwrap());
+        // A waiter opened the old file before the holder deleted it.
+        let stale = open(&path);
+        held.remove(&path).unwrap();
+        assert!(!path.exists());
+        let stale = FileLock::try_lock(stale).unwrap();
+        assert!(!stale.still_names(&path).unwrap());
+        let fresh = FileLock::try_lock(open(&path)).unwrap();
+        assert!(fresh.still_names(&path).unwrap());
+        assert!(!stale.still_names(&path).unwrap());
     }
 
     #[test]

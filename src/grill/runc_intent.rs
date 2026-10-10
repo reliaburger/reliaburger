@@ -201,23 +201,30 @@ impl IntentJournal {
             create_directory(&journal.directory.join("records"))?;
             let locks = journal.directory.join("locks");
             create_directory(&locks)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(locks.join(&instance.0))?;
-            validate_file(&file, Access::OwnerOnly)?;
-            // Never unlink or replace a lock file: another process may
-            // already hold it.
-            let lock = FileLock::try_lock(file).map_err(|error| match error {
-                FileLockError::Busy => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "runtime lifecycle is busy")
+            let path = locks.join(&instance.0);
+            let lock = loop {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&path)?;
+                validate_file(&file, Access::OwnerOnly)?;
+                let lock = FileLock::try_lock(file).map_err(|error| match error {
+                    FileLockError::Busy => {
+                        io::Error::new(io::ErrorKind::WouldBlock, "runtime lifecycle is busy")
+                    }
+                    FileLockError::Io(error) => error,
+                })?;
+                // Only `IntentClaim::forget` unlinks a lock file, and only
+                // while holding it. A file unlinked after we opened it
+                // authorises nothing: lock the current one instead.
+                if lock.still_names(&path)? {
+                    break lock;
                 }
-                FileLockError::Io(error) => error,
-            })?;
+            };
             let record = journal.load(&instance)?;
             if record.as_ref().map(|record| &record.generation) != expected.as_ref() {
                 return Err(io::Error::other("runtime intent generation changed"));
@@ -539,6 +546,50 @@ impl IntentClaim {
                 record,
             )?;
             Ok(self)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+
+impl IntentClaim {
+    /// Delete a retired generation's journal and its lock file, so an
+    /// identity that never runs again leaves nothing behind (#678).
+    ///
+    /// Refuses, deleting nothing, unless the generation is retired and no
+    /// discovery publisher still holds its address. Afterwards the identity
+    /// has no intent at all, as before its first launch, and
+    /// [`IntentJournal::inventory`] no longer lists it.
+    pub async fn forget(self) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let locks = self.journal.directory.join("locks");
+            let lock = locks.join(&self.instance.0);
+            let Some(record) = &self.record else {
+                return self._lock.remove(&lock);
+            };
+            if !matches!(record.phase, IntentPhase::Retired { .. })
+                || matches!(
+                    record.network_reference,
+                    Some(NetworkReferenceState::Held(_))
+                )
+            {
+                return Err(io::Error::other(
+                    "runtime intent still owns resources; nothing was forgotten",
+                ));
+            }
+            let records = self.journal.directory.join("records");
+            // Unpublish first: inventory skips `.preparing-` names, so an
+            // interrupted delete never leaves a partial published record.
+            let staging = records.join(format!(
+                ".preparing-forgotten-{}",
+                record.generation.as_str()
+            ));
+            std::fs::rename(records.join(&self.instance.0), &staging)?;
+            File::open(&records)?.sync_all()?;
+            std::fs::remove_dir_all(&staging)?;
+            File::open(&records)?.sync_all()?;
+            self._lock.remove(&lock)?;
+            File::open(&locks)?.sync_all()
         })
         .await
         .map_err(io::Error::other)?
