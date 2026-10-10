@@ -1040,6 +1040,26 @@ fn check_namespace_quota(
 
 The `default` namespace has no quotas unless explicitly configured, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
 
+#### Jobs: quotas at grant time and admission caps
+
+Jobs never pass through the app placement pass: every job is a task array, and the task-array leader (`leader_tick` in `src/bun/task_array_leader.rs`) hands out chunks once a second. So that is where job quotas are enforced (decision D20). Each tick, `GrantBudget::new` builds one `QuotaLedger` per namespace from `DesiredState::namespaces`, charges every app placement's reserved resources first, then every job attempt already in flight, and only then plans new grants, oldest run first. An attempt in flight on a node is `min(tasks it holds, its slots for that run)` (`TaskArrayState::in_flight_on`), because a node never runs more of an array at once than its slots. `fit_grants` trims each run's planned grants to the room that's left; a chunk that would start more attempts than fit stops the run's grants for that tick. Deeper chunks on a node already running a full round cost nothing extra, so lookahead survives.
+
+A run whose grants were held back gets a durable `quota_blocked` reason through a `TaskArrayWrite::QuotaBlocked` entry, written only when the limit it names changes (`same_limit` ignores the usage numbers, which move with every task). It clears when grants fit again or the run finishes. Running attempts are never cancelled. Apps go first in the ledger and the app pass doesn't count jobs, so a namespace's jobs can never displace an app that fits its quota. `max_apps` and `max_replicas` stay app-only.
+
+Admission caps sit in the replicated store (`src/meat/task_array_store.rs`, decision D21):
+
+| Constant | Value | Applies to |
+|----------|-------|------------|
+| `MAX_ACTIVE_ARRAYS` | 128 | every active run |
+| `RESERVED_TRIGGERED_RUNS` | 32 | kept for cron fires and deployment hooks; bulk stops at 96 |
+| `MAX_ACTIVE_RUNS_PER_NAMESPACE` | 64 | active arrays, profiles, finite batches and manual runs in one namespace |
+| `MAX_JOB_DEFINITIONS_PER_NAMESPACE` | 64 | job definitions in one namespace |
+| `MAX_JOB_DEFINITIONS` | 1,024 | job definitions in the cluster |
+
+A run's trigger decides its class: `Cron` and `Hook` triggers are *triggered*, everything else is *bulk*. A cron `Fire` refused even with the headroom is recorded rather than failed: the cursor advances, the definition keeps `skipped: {minute, reason: capacity}` and a count, and the leader emits a `job-skipped` event. `control_state_stays_within_budget_at_the_global_cap` justifies 128: at the cap, with the largest template and saturated failure ranges, job state stays under 32 MiB (half a Raft frame) and one node's sync call under its 8 MiB body limit. 256 would not.
+
+Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop filters schedules blocked by a pending deployment before taking its sixteen per tick, and starts each tick after the last one it fired, so a long list takes turns.
+
 ---
 
 ## 6. Configuration

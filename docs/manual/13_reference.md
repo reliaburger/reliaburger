@@ -108,6 +108,20 @@ Use returned IDs; physical executor slots can be reused. Ordinary TOML jobs,
 cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
 for retry, overlap, retention, supported runtimes and API shapes.
 
+Job limits, all enforced by the council:
+
+| Limit | Value |
+|-------|-------|
+| Active runs in the cluster | 128, of which 32 only cron fires and deployment jobs may use |
+| Active arrays, batches, profiles and manual runs per namespace | 64 |
+| Job definitions per namespace / in the cluster | 64 / 1,024 (one-off definitions expire with their last run) |
+| Retained run receipts in the cluster | 2,048 |
+| Named jobs in one finite batch | 64 |
+| Leader sync call accepted by a node | 8 MiB |
+
+Namespace `cpu`, `memory` and `gpu` quotas also bound the job attempts the
+leader grants; a run waiting on its quota shows `quota_blocked_reason`.
+
 ## Files on a node
 
 `relish setup` puts `bun` in `~/.reliaburger/bin` as `bun-vX.Y.Z` plus a `bun`

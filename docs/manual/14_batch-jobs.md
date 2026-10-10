@@ -49,7 +49,11 @@ is `forbid`; JSON definitions can select `allow`. Both skip missed minutes, with
 no catch-up queue. Skipped overlapping occurrences advance the cursor too.
 Registration and observation cursors survive leader changes, result pruning and
 clock rollback. A conservative definition with unknown ownership skips new
-occurrences even when overlap is allowed.
+occurrences even when overlap is allowed. When every active-run slot is taken,
+reserved headroom included, the occurrence is skipped rather than lost:
+the cursor advances, the definition records `skipped: capacity` with the minute
+and a running count, and the leader emits one `job-skipped` event. `relish jobs`
+shows the latest skip beside the schedule.
 
 ```sh
 relish jobs
@@ -115,6 +119,14 @@ packing; rootful Linux container and native process jobs enforce limits. Omitted
 status. Images are bound to a digest at submission and must pass the cluster's Pickle
 and upstream trust policies, including required cosign signatures.
 
+Every name you submit is a job definition, and its runs are kept as receipts.
+A definition with no schedule and no `run_before` hook is a one-off: it expires
+in the same pruning step that drops its last run (see retention below). A
+daily `relish run --batch render-$DATE` therefore keeps working indefinitely.
+Schedules and deployment hooks stay until you stop or delete them. Disabling a
+schedule turns its definition into a one-off. Each namespace holds at most 64
+definitions and the cluster 1,024; the refusal names the namespace and the cap.
+
 `--count` defaults to one. Add `--schedule "0 3 * * *"` to register an array
 schedule without an immediate run. Every task receives `RELIABURGER_TASK_INDEX`, `RELIABURGER_TASK_COUNT`, `RELIABURGER_BATCH_ID` and `RELIABURGER_TASK_ATTEMPT`.
 Its identity is the array ID and index; retries keep that identity. The job image and command apply to
@@ -145,7 +157,8 @@ has a unique DNS-label `name`, `count`, optional array policies and a `[cohort.t
 job specification. There are at most 16 profiles and 16,777,216 total indexes
 per submission. Names and namespaces are DNS labels; each template is at most
 16 KiB. Use `relish batch submit burger/jobs.toml --dry-run` for local validation.
-The cluster admits at most 64 active profiles. Reduce chunk
+Each profile is one active run, so a manifest counts against the active-run
+limits under [Execution and capacity limits](#execution-and-capacity-limits). Reduce chunk
 size for expensive tasks and straggler tails; larger chunks amortise dispatch
 and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
 
@@ -199,6 +212,34 @@ a dropped future cannot free an uncertain execution's request. Retries release
 capacity during backoff.
 
 ## Execution and capacity limits
+
+Every namespace shares the cluster, so no namespace may take all of it:
+
+| Limit | Value | What happens past it |
+|-------|-------|----------------------|
+| Active runs, whole cluster | 128 | Nothing new starts until a run finishes |
+| Reserved for cron fires and deployment jobs | 32 of the 128 | Arrays, batches, profiles and manual runs stop at 96 |
+| Active arrays, batches, profiles and manual runs per namespace | 64 | Refused, naming the namespace and the cap |
+| Job definitions per namespace | 64 | Refused; one-off definitions expire with their last run |
+| Job definitions, whole cluster | 1,024 | Refused |
+| Retained run receipts, whole cluster | 2,048 | Retention keeps it below this backstop |
+| Named jobs in one finite batch | 64 | Refused |
+
+Cron fires and deployment hooks never compete with bulk work for their
+headroom, so a tenant filling its arrays can't stop another tenant's nightly
+job or block an apply. A cron fire refused even then is recorded as a skipped
+occurrence (see above), not retried for the rest of the minute.
+
+Namespace quotas cover jobs too. When the leader grants chunks, it charges
+each attempt a chunk can start (no more than the node's slots for it) at the
+template's CPU, memory and GPU requests, after the namespace's apps. If the
+quota has no room, the run gets no more grants and its status says why:
+`relish batch-status ID` shows `waiting for quota: …`, and the JSON summary has
+`quota_blocked` and `quota_blocked_reason`. Running attempts are never
+cancelled; grants resume as they finish. Jobs use what apps leave: an app that
+fits its namespace quota is never displaced by that namespace's jobs. A chunk
+costs up to one node's slots at once, so set `--concurrency` (per-node
+concurrency) low enough for one node's share to fit the quota.
 
 Explicit bulk execution is at least once. Ordinary jobs and hooks use
 acknowledged replay for unknown outcomes. A lost worker or a crash before a durable outcome
@@ -364,10 +405,10 @@ app scheduler. Set requests for services sharing a node with batch work, and
 leave capacity for rollouts. Admission protects requests; it cannot guarantee
 latency when workloads burst up to their limits.
 
-Namespace app quotas currently govern ordinary app placement, not delegated
-array resource usage. Scope checks still apply to submission and reads. Use
-admission limits and dedicated capacity for mutually untrusted batch tenants
-until tenant resource allocation is added.
+Namespace quotas govern both app placement and job grants (see
+[Execution and capacity limits](#execution-and-capacity-limits)); scope checks
+still apply to submission and reads. Quotas cap what each tenant holds. They
+don't share spare capacity fairly between tenants: there is no DRF.
 
 ## API admission shapes
 

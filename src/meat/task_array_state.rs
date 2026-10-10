@@ -737,6 +737,79 @@ pub fn plan_grants(
     plan
 }
 
+impl TaskArrayState {
+    /// Attempts of this array `node` can have running at once with what it
+    /// holds now: no more than its held tasks, and no more than its slots.
+    /// This is what a namespace quota charges (D20).
+    pub fn in_flight_on(&self, node: &NodeId, slots: u32) -> u64 {
+        self.held_by(node)
+            .map_or(0, |chunks| self.tasks_in(chunks))
+            .min(u64::from(slots))
+    }
+}
+
+/// A grant plan trimmed to a namespace's remaining quota.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FittedGrants {
+    /// The grants that fit, in the order planned.
+    pub grants: Vec<(NodeId, IndexRangeSet)>,
+    /// Attempts these grants let start, beyond what nodes already ran.
+    pub started: u64,
+    /// Attempts the first chunk held back would have let start, if the
+    /// quota held any chunk back.
+    pub held_back: Option<u64>,
+}
+
+/// Keep the planned grants whose new attempts fit in `room` more. A grant
+/// raises a node's in-flight attempts to `min(held tasks, slots)`, so once a
+/// node holds a full round of its slots, deeper chunks cost nothing more
+/// and still go out. Chunks are tried lowest first; the first one that
+/// doesn't fit stops that node's grant, and every later node's too, so an
+/// older plan order can't be overtaken.
+pub fn fit_grants(
+    state: &TaskArrayState,
+    plan: Vec<(NodeId, IndexRangeSet)>,
+    nodes: &[NodeSlots],
+    mut room: u64,
+) -> FittedGrants {
+    let mut fitted = FittedGrants {
+        grants: Vec::new(),
+        started: 0,
+        held_back: None,
+    };
+    for (node, chunks) in plan {
+        if fitted.held_back.is_some() {
+            break;
+        }
+        let slots = nodes
+            .iter()
+            .find(|candidate| candidate.node == node)
+            .map_or(0, |candidate| candidate.slots);
+        let before = state.in_flight_on(&node, slots);
+        let mut held = state.held_by(&node).map_or(0, |held| state.tasks_in(held));
+        let mut kept = IndexRangeSet::new();
+        let mut added = 0;
+        for chunk in chunks.iter() {
+            let tasks = state.tasks_in(&IndexRangeSet::from_range(chunk..=chunk));
+            let after = held.saturating_add(tasks).min(u64::from(slots));
+            let cost = after.saturating_sub(before);
+            if cost > room {
+                fitted.held_back = Some(cost - added);
+                break;
+            }
+            kept.insert(chunk);
+            held = held.saturating_add(tasks);
+            added = cost;
+        }
+        room -= added;
+        fitted.started += added;
+        if !kept.is_empty() {
+            fitted.grants.push((node, kept));
+        }
+    }
+    fitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1454,5 +1527,70 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let back: TaskArrayState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, state);
+    }
+
+    fn cpu_quota(namespace: &str, millicores: u64) -> crate::meat::quota::QuotaLedger {
+        crate::meat::quota::QuotaLedger::new(std::collections::HashMap::from([(
+            namespace.to_string(),
+            crate::meat::quota::NamespaceQuota {
+                namespace: namespace.to_string(),
+                max_cpu_millicores: Some(millicores),
+                max_memory_bytes: None,
+                max_gpus: None,
+                max_apps: None,
+                max_replicas: None,
+            },
+        )]))
+    }
+
+    #[test]
+    fn grants_stop_when_namespace_cpu_quota_is_used() {
+        // 2 CPUs of quota and 500m per task: four attempts may run. Each
+        // chunk is two tasks, and the node could run eight at once.
+        let per_task = crate::meat::Resources::new(500, 0, 0);
+        let mut quota = cpu_quota("tenant", 2000);
+        let state = TaskArrayState::new(spec(100, 2), 1).unwrap();
+        let nodes = slots(&[("a", 8)]);
+        let plan = plan_grants(&state, &nodes, true);
+        assert_eq!(plan, vec![(node("a"), chunks(0..=7))]);
+
+        let room = quota.room_for_tasks("tenant", &per_task);
+        assert_eq!(room, 4);
+        let fitted = fit_grants(&state, plan, &nodes, room);
+        assert_eq!(fitted.grants, vec![(node("a"), chunks(0..=1))]);
+        assert_eq!(fitted.started, 4);
+        assert_eq!(fitted.held_back, Some(2));
+
+        // With the four charged, nothing more fits, and the refusal names CPU.
+        quota.charge_tasks("tenant", &per_task, fitted.started);
+        assert_eq!(quota.room_for_tasks("tenant", &per_task), 0);
+        assert!(matches!(
+            quota.task_quota_error("tenant", &per_task, 2),
+            Some(crate::meat::quota::QuotaError::CpuExceeded { limit: 2000, .. })
+        ));
+    }
+
+    #[test]
+    fn chunks_beyond_a_nodes_slots_cost_no_more_quota() {
+        // The node runs at most four at once, so after its first chunk of
+        // four, the deeper chunks start nothing new and still go out.
+        let state = TaskArrayState::new(spec(100, 4), 1).unwrap();
+        let nodes = slots(&[("a", 4)]);
+        let plan = plan_grants(&state, &nodes, true);
+        let fitted = fit_grants(&state, plan.clone(), &nodes, 4);
+        assert_eq!(fitted.grants, plan);
+        assert_eq!(fitted.started, 4);
+        assert_eq!(fitted.held_back, None);
+    }
+
+    #[test]
+    fn a_quota_held_chunk_stops_later_nodes_too() {
+        let state = TaskArrayState::new(spec(100, 2), 1).unwrap();
+        let nodes = slots(&[("a", 2), ("b", 2)]);
+        let plan = plan_grants(&state, &nodes, true);
+        assert_eq!(plan.len(), 2);
+        let fitted = fit_grants(&state, plan, &nodes, 1);
+        assert!(fitted.grants.is_empty());
+        assert_eq!(fitted.held_back, Some(2));
     }
 }

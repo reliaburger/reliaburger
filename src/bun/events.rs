@@ -78,6 +78,8 @@ pub enum EventKind {
     JobCompleted,
     /// A job exhausted its retries.
     JobFailed,
+    /// A cron occurrence was claimed but not run: no active-run slot was free.
+    JobSkipped,
     /// An alert changed state.
     Alert,
     /// A fault was injected or cleared.

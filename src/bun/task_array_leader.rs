@@ -30,7 +30,7 @@ use crate::config::types::EnvValue;
 use crate::council::types::{CouncilResponse, RaftRequest};
 use crate::meat::NodeId;
 use crate::meat::task_array::ChunkId;
-use crate::meat::task_array_state::{NodeSlots, plan_grants};
+use crate::meat::task_array_state::{FittedGrants, NodeSlots, fit_grants, plan_grants};
 use crate::meat::task_array_store::{
     TaskArrayApplied, TaskArrayRecord, TaskArrayWrite, TaskArrays,
 };
@@ -315,6 +315,17 @@ async fn local_snapshot(service: &TaskArrayService) -> (TaskArrays, u64) {
     }
 }
 
+/// What one attempt of `template` reserves: its CPU and memory requests,
+/// or 1 CPU and 64 MiB when it names none. Nodes admit attempts against
+/// it, and namespace quotas charge it.
+pub fn task_reservation(template: &crate::config::job::JobSpec) -> crate::meat::Resources {
+    crate::meat::Resources::new(
+        template.cpu.map_or(1000, |r| r.request),
+        template.memory.map_or(64 << 20, |r| r.request),
+        0,
+    )
+}
+
 /// What one node should be told about one array: its held chunks with
 /// their attempts, and how to run a task.
 pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) -> ArrayAssignment {
@@ -336,11 +347,7 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
     ArrayAssignment {
         template: Some(Box::new(template)),
         batch_id,
-        resources: crate::meat::Resources::new(
-            record.template.cpu.map_or(1000, |r| r.request),
-            record.template.memory.map_or(64 << 20, |r| r.request),
-            0,
-        ),
+        resources: task_reservation(&record.template),
         spec: state.spec.clone(),
         program: record.template.exec.clone().unwrap_or_else(|| {
             if record.template.script.is_some() {
@@ -408,6 +415,19 @@ pub fn plan_sync(
     answers: &[(NodeId, &ArrayProgress)],
     replay_unknown: bool,
 ) -> Option<TaskArrayWrite> {
+    plan_sync_within(batch_id, record, answers, replay_unknown, u64::MAX).0
+}
+
+/// [`plan_sync`], with grants trimmed so they start at most `room` more
+/// attempts (see [`fit_grants`]). Also says what the grants start and
+/// what the quota held back.
+pub fn plan_sync_within(
+    batch_id: u64,
+    record: &TaskArrayRecord,
+    answers: &[(NodeId, &ArrayProgress)],
+    replay_unknown: bool,
+    room: u64,
+) -> (Option<TaskArrayWrite>, FittedGrants) {
     let mut preview = record.state.clone();
     let mut results = Vec::new();
     for (node, progress) in answers {
@@ -426,16 +446,164 @@ pub fn plan_sync(
             slots: progress.slots,
         })
         .collect();
-    let grants = plan_grants(&preview, &slots, replay_unknown);
-    if results.is_empty() && grants.is_empty() {
-        return None;
+    let planned = plan_grants(&preview, &slots, replay_unknown);
+    let mut fitted = fit_grants(&preview, planned, &slots, room);
+    if results.is_empty() && fitted.grants.is_empty() {
+        return (None, fitted);
     }
-    Some(TaskArrayWrite::Sync {
+    let write = TaskArrayWrite::Sync {
         now_epoch_secs: 0,
         batch_id,
         results,
-        grants,
+        grants: std::mem::take(&mut fitted.grants),
+    };
+    (Some(write), fitted)
+}
+
+/// Namespace quotas as one leader tick's grants see them (D20). App
+/// placements are charged first and every job attempt already in flight
+/// next, so jobs only use what apps leave; then each run's new grants take
+/// what's left, oldest run first. Built only when some namespace has a quota.
+pub struct GrantBudget {
+    ledger: crate::meat::quota::QuotaLedger,
+}
+
+impl GrantBudget {
+    /// The budget for this tick, or `None` when no namespace declares a
+    /// quota. `slots` is what a node last said about an array, if it answered.
+    pub fn new<'a>(
+        namespaces: &std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
+        placements: impl IntoIterator<
+            Item = (
+                &'a crate::meat::AppId,
+                &'a Vec<crate::meat::types::Placement>,
+            ),
+        >,
+        arrays: &TaskArrays,
+        slots: impl Fn(u64, &NodeId) -> Option<u32>,
+    ) -> Option<Self> {
+        let mut ledger = crate::meat::quota::ledger_from_namespaces(namespaces);
+        if ledger.is_empty() {
+            return None;
+        }
+        for (app, placed) in placements {
+            for placement in placed {
+                ledger.charge_tasks(&app.namespace, &placement.resources, 1);
+            }
+        }
+        for (batch_id, record) in arrays.active() {
+            // A node that didn't answer could run every task it holds.
+            let tasks = record.state.holders().fold(0u64, |sum, node| {
+                let slots = slots(batch_id, node).unwrap_or(u32::MAX);
+                sum.saturating_add(record.state.in_flight_on(node, slots))
+            });
+            ledger.charge_tasks(
+                &record.namespace,
+                &task_reservation(&record.template),
+                tasks,
+            );
+        }
+        Some(Self { ledger })
+    }
+
+    /// Plan one run's sync within its namespace's remaining quota, charge
+    /// what it starts, and say why grants were held back, if they were.
+    pub fn plan(
+        &mut self,
+        batch_id: u64,
+        record: &TaskArrayRecord,
+        answers: &[(NodeId, &ArrayProgress)],
+        replay_unknown: bool,
+    ) -> (
+        Option<TaskArrayWrite>,
+        Option<crate::meat::quota::QuotaError>,
+    ) {
+        let per_task = task_reservation(&record.template);
+        let room = self.ledger.room_for_tasks(&record.namespace, &per_task);
+        let (write, fitted) = plan_sync_within(batch_id, record, answers, replay_unknown, room);
+        self.ledger
+            .charge_tasks(&record.namespace, &per_task, fitted.started);
+        let blocked = fitted.held_back.and_then(|tasks| {
+            self.ledger
+                .task_quota_error(&record.namespace, &per_task, tasks)
+        });
+        (write, blocked)
+    }
+}
+
+/// The write that records a run's new quota-blocked reason, if it changed.
+/// Usage numbers move with every task, so only a different limit (or none)
+/// counts as a change.
+pub fn quota_blocked_write(
+    batch_id: u64,
+    record: &TaskArrayRecord,
+    blocked: Option<crate::meat::quota::QuotaError>,
+) -> Option<TaskArrayWrite> {
+    let same = match (&record.quota_blocked, &blocked) {
+        (None, None) => true,
+        (Some(old), Some(new)) => crate::meat::quota::same_limit(old, new),
+        _ => false,
+    };
+    (!same).then_some(TaskArrayWrite::QuotaBlocked {
+        batch_id,
+        reason: blocked,
     })
+}
+
+/// Most cron occurrences the leader fires in one tick.
+pub const MAX_FIRES_PER_TICK: usize = 16;
+
+/// One schedule due now: its namespace, name and definition revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueSchedule {
+    /// Namespace of the definition.
+    pub namespace: String,
+    /// Definition name.
+    pub name: String,
+    /// Revision the occurrence is fenced to.
+    pub revision: u64,
+}
+
+/// The schedules that match `at` (UTC minute `minute`) and haven't fired
+/// for it yet, at most [`MAX_FIRES_PER_TICK`]. Schedules a pending
+/// deployment `blocked` are left out *before* the limit, so they can't use
+/// up the places. The list starts after `cursor` (the last key fired) and
+/// wraps round, so a long list takes turns instead of starving its tail.
+pub fn due_schedules(
+    arrays: &TaskArrays,
+    at: time::OffsetDateTime,
+    minute: i64,
+    blocked: impl Fn(&str, &str) -> bool,
+    cursor: Option<&str>,
+) -> Vec<DueSchedule> {
+    let due: Vec<DueSchedule> = arrays
+        .jobs()
+        .definitions()
+        .filter(|(_, record)| {
+            record.last_observed_minute.is_none_or(|seen| seen < minute)
+                && record.definition.cron.as_ref().is_some_and(|cron| {
+                    crate::meat::cron::CronSchedule::parse(&cron.expression)
+                        .is_ok_and(|schedule| schedule.matches(at))
+                })
+        })
+        .filter_map(|(key, record)| {
+            let (namespace, name) = key.split_once('/')?;
+            (!blocked(name, namespace)).then(|| DueSchedule {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                revision: record.revision,
+            })
+        })
+        .collect();
+    let start = cursor.map_or(0, |cursor| {
+        due.partition_point(|due| format!("{}/{}", due.namespace, due.name).as_str() <= cursor)
+    });
+    due.iter()
+        .cycle()
+        .skip(start)
+        .take(due.len().min(MAX_FIRES_PER_TICK))
+        .cloned()
+        .collect()
 }
 
 /// Holders of `record`'s chunks that haven't answered in `silence`.
@@ -487,6 +655,8 @@ struct LeaderMemory {
     /// Nodes whose last sync failed, so a dead node is logged once, not
     /// every tick.
     failing: std::collections::HashSet<NodeId>,
+    /// The last cron definition fired, so the next tick starts after it.
+    cron_cursor: Option<String>,
 }
 
 /// Start the leader loop. It runs on every node and does nothing unless
@@ -500,6 +670,7 @@ pub(crate) fn spawn_leader_loop(state: ApiState) {
             last_heard: HashMap::new(),
             last_known: HashMap::new(),
             failing: std::collections::HashSet::new(),
+            cron_cursor: None,
         };
         loop {
             tokio::select! {
@@ -556,7 +727,7 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
     targets
 }
 
-async fn fire_due_schedules(state: &ApiState) {
+async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
     let now = crate::meat::batch_tracker::epoch_now_secs();
     let Ok(minute) = i64::try_from(now / 60) else {
         return;
@@ -586,41 +757,79 @@ async fn fire_due_schedules(state: &ApiState) {
         Some(council) => council.desired_state().await.prerequisite_claims,
         None => Default::default(),
     };
-    for (key, record) in arrays
-        .jobs()
-        .definitions()
-        .filter(|(_, record)| {
-            record.last_observed_minute.is_none_or(|seen| seen < minute)
-                && record.definition.cron.as_ref().is_some_and(|cron| {
-                    crate::meat::cron::CronSchedule::parse(&cron.expression)
-                        .is_ok_and(|schedule| schedule.matches(at))
-                })
-        })
-        .take(16)
-    {
-        let Some((namespace, name)) = key.split_once('/') else {
-            continue;
-        };
-        if claims.values().any(|claim| claim.blocks(name, namespace)) {
-            continue;
-        }
+    let due = due_schedules(
+        &arrays,
+        at,
+        minute,
+        |name, namespace| claims.values().any(|claim| claim.blocks(name, namespace)),
+        cursor.as_deref(),
+    );
+    let mut fired = Vec::new();
+    for schedule in due {
         if !is_leading(state).await {
             return;
         }
-        if let Err(error) = write_task_array(
+        let key = format!("{}/{}", schedule.namespace, schedule.name);
+        *cursor = Some(key.clone());
+        match write_task_array(
             state,
             TaskArrayWrite::Job(Box::new(crate::meat::job::JobWrite::Fire {
-                name: name.into(),
-                namespace: namespace.into(),
-                revision: record.revision,
+                name: schedule.name.clone(),
+                namespace: schedule.namespace.clone(),
+                revision: schedule.revision,
                 minute,
                 now_epoch_secs: now,
             })),
         )
         .await
         {
-            eprintln!("bun: cron {key}: {error}");
+            Ok(None) => fired.push(schedule),
+            Ok(Some(_)) => {}
+            Err(error) => eprintln!("bun: cron {key}: {error}"),
         }
+    }
+    if !fired.is_empty() {
+        report_skipped(state, &read_task_arrays(state).await, &fired, minute, now).await;
+    }
+}
+
+/// Emit one event for every fire this tick that was claimed but skipped
+/// because no active-run slot was free. The definition already records it.
+async fn report_skipped(
+    state: &ApiState,
+    arrays: &TaskArrays,
+    fired: &[DueSchedule],
+    minute: i64,
+    now: u64,
+) {
+    let Some(events) = &state.events else {
+        return;
+    };
+    for schedule in fired {
+        let skipped = arrays
+            .jobs()
+            .definition(&schedule.namespace, &schedule.name)
+            .and_then(|record| record.skipped)
+            .is_some_and(|skip| skip.minute == minute);
+        if !skipped {
+            continue;
+        }
+        eprintln!(
+            "bun: cron {}/{}: skipped the {minute} occurrence, no active-run slot was free",
+            schedule.namespace, schedule.name
+        );
+        events.write().await.record(
+            now,
+            crate::bun::events::EventKind::JobSkipped,
+            crate::bun::events::EventSeverity::Warning,
+            Some(schedule.name.clone()),
+            Some(schedule.namespace.clone()),
+            None,
+            format!(
+                "cron job {}/{} skipped an occurrence: every active-run slot was taken",
+                schedule.namespace, schedule.name
+            ),
+        );
     }
 }
 
@@ -630,14 +839,15 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         memory.last_heard.clear();
         memory.last_known.clear();
         memory.failing.clear();
+        memory.cron_cursor = None;
         state.task_arrays.rates.lock().await.clear();
         return;
     }
     super::job_apply::settle(state).await;
-    fire_due_schedules(state).await;
+    fire_due_schedules(state, &mut memory.cron_cursor).await;
     let now = Instant::now();
     let since = *memory.since.get_or_insert(now);
-    let (arrays, version) = match &state.council {
+    let (arrays, version, quotas) = match &state.council {
         Some(council) => {
             let desired = council.desired_state().await;
             let version = super::task_array_node::ControlVersion {
@@ -645,7 +855,8 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                 term: council.current_term(),
                 index: desired.last_applied_log.map_or(0, |id| id.index),
             };
-            (desired.task_arrays, version)
+            let quotas = (desired.namespaces, desired.scheduling);
+            (desired.task_arrays, version, Some(quotas))
         }
         None => {
             let (arrays, revision) = local_snapshot(&state.task_arrays).await;
@@ -655,6 +866,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                     index: revision,
                     ..Default::default()
                 },
+                None,
             )
         }
     };
@@ -698,6 +910,18 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     }
     answers.sort_by(|a, b| a.0.cmp(&b.0));
     remember_views(state, &answers, &arrays).await;
+    let mut budget = quotas.and_then(|(namespaces, scheduling)| {
+        GrantBudget::new(&namespaces, &scheduling, &arrays, |batch_id, node| {
+            answers
+                .iter()
+                .find(|(answered, _)| answered == node)?
+                .1
+                .arrays
+                .iter()
+                .find(|progress| progress.batch_id == batch_id)
+                .map(|progress| progress.slots)
+        })
+    });
 
     for (batch_id, record) in arrays.active() {
         let for_array: Vec<(NodeId, &ArrayProgress)> = answers
@@ -747,10 +971,22 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             .jobs()
             .run(batch_id)
             .is_none_or(|run| run.replay_unknown);
-        if let Some(write) = plan_sync(batch_id, record, &for_array, replay_unknown)
+        let (sync, blocked) = match budget.as_mut() {
+            Some(budget) => budget.plan(batch_id, record, &for_array, replay_unknown),
+            None => (
+                plan_sync(batch_id, record, &for_array, replay_unknown),
+                None,
+            ),
+        };
+        if let Some(write) = sync
             && let Err(error) = write_task_array(state, write).await
         {
             eprintln!("bun: task array {batch_id}: sync write failed: {error}");
+        }
+        if let Some(write) = quota_blocked_write(batch_id, record, blocked)
+            && let Err(error) = write_task_array(state, write).await
+        {
+            eprintln!("bun: task array {batch_id}: quota reason write failed: {error}");
         }
     }
 }
@@ -838,6 +1074,7 @@ mod tests {
         env.insert("PLAIN".to_string(), EnvValue::Plain("yes".to_string()));
         TaskArrayRecord {
             terminal_at_epoch_secs: None,
+            quota_blocked: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: JobSpec {
@@ -1094,5 +1331,148 @@ mod tests {
         // A leader that only just took over gives everyone the full grace.
         let fresh = silent_holders(&record, &HashMap::new(), now, now, Duration::from_secs(30));
         assert!(fresh.is_empty());
+    }
+
+    /// Twenty every-minute schedules, `job-00` to `job-19`, registered at
+    /// minute 2, so all of them are due at minute 3.
+    fn twenty_schedules() -> (TaskArrays, time::OffsetDateTime) {
+        let mut arrays = TaskArrays::default();
+        for i in 0..20 {
+            let mut definition = crate::meat::job::JobDefinition::from_spec(record(1, 1).template);
+            definition.cron = Some(crate::meat::job::CronPolicy {
+                expression: "* * * * *".into(),
+                overlap: Default::default(),
+                missed: Default::default(),
+            });
+            arrays
+                .apply(
+                    &TaskArrayWrite::Job(Box::new(crate::meat::job::JobWrite::Put {
+                        name: format!("job-{i:02}"),
+                        namespace: "default".into(),
+                        definition: Box::new(definition),
+                        trigger: None,
+                        now_epoch_secs: 120,
+                    })),
+                    || 0,
+                )
+                .unwrap();
+        }
+        let at = time::OffsetDateTime::from_unix_timestamp(180).unwrap();
+        (arrays, at)
+    }
+
+    fn names(due: &[DueSchedule]) -> Vec<&str> {
+        due.iter().map(|due| due.name.as_str()).collect()
+    }
+
+    #[test]
+    fn blocked_schedules_do_not_starve_later_ones() {
+        let (arrays, at) = twenty_schedules();
+        // A pending deployment blocks the first sixteen. Picking sixteen
+        // before checking would leave nothing to fire all minute.
+        let blocked = |name: &str, _: &str| name < "job-16";
+        let due = due_schedules(&arrays, at, 3, blocked, None);
+        assert_eq!(names(&due), ["job-16", "job-17", "job-18", "job-19"]);
+    }
+
+    #[test]
+    fn due_schedules_take_turns_after_the_last_one_fired() {
+        let (arrays, at) = twenty_schedules();
+        let first = due_schedules(&arrays, at, 3, |_, _| false, None);
+        assert_eq!(first.len(), MAX_FIRES_PER_TICK);
+        assert_eq!(first[0].name, "job-00");
+        let next = due_schedules(&arrays, at, 3, |_, _| false, Some("default/job-15"));
+        assert_eq!(
+            names(&next[..6]),
+            ["job-16", "job-17", "job-18", "job-19", "job-00", "job-01"]
+        );
+        assert!(due_schedules(&arrays, at, 2, |_, _| false, None).is_empty());
+    }
+
+    fn quota_namespaces(cpu: &str) -> BTreeMap<String, crate::config::NamespaceSpec> {
+        let spec: crate::config::NamespaceSpec = toml::from_str(&format!("cpu = '{cpu}'")).unwrap();
+        BTreeMap::from([("default".to_string(), spec)])
+    }
+
+    #[test]
+    fn a_quota_bounds_grants_and_says_why() {
+        // 2 CPUs, 1 CPU per task, a node with four slots: two attempts.
+        let record = record(100, 1);
+        let mut arrays = TaskArrays::default();
+        arrays
+            .apply(
+                &TaskArrayWrite::Register {
+                    name: record.name.clone(),
+                    namespace: record.namespace.clone(),
+                    template: Box::new(record.template.clone()),
+                    spec: record.state.spec.clone(),
+                    submitted_at_epoch_secs: 1,
+                },
+                || 1,
+            )
+            .unwrap();
+        let answer = progress(4, vec![]);
+        let answers = [(node("a"), &answer)];
+        let placements: HashMap<crate::meat::AppId, Vec<crate::meat::types::Placement>> =
+            HashMap::new();
+        let mut budget =
+            GrantBudget::new(&quota_namespaces("2"), &placements, &arrays, |_, _| Some(4)).unwrap();
+        let record = arrays.get(1).unwrap();
+        let (write, blocked) = budget.plan(1, record, &answers, true);
+        let Some(TaskArrayWrite::Sync { grants, .. }) = write else {
+            panic!("expected a sync");
+        };
+        assert_eq!(grants, vec![(node("a"), IndexRangeSet::from_range(0..=1))]);
+        assert!(matches!(
+            blocked,
+            Some(crate::meat::quota::QuotaError::CpuExceeded { limit: 2000, .. })
+        ));
+        let write = quota_blocked_write(1, record, blocked.clone()).unwrap();
+        assert_eq!(
+            write,
+            TaskArrayWrite::QuotaBlocked {
+                batch_id: 1,
+                reason: blocked
+            }
+        );
+
+        // An app placed in the namespace takes the room first.
+        let placements = HashMap::from([(
+            crate::meat::AppId::new("web", "default"),
+            vec![crate::meat::types::Placement {
+                node_id: node("a"),
+                resources: crate::meat::Resources::new(2000, 0, 0),
+                ordinal: 0,
+            }],
+        )]);
+        let mut budget =
+            GrantBudget::new(&quota_namespaces("2"), &placements, &arrays, |_, _| Some(4)).unwrap();
+        let (write, blocked) = budget.plan(1, record, &answers, true);
+        assert_eq!(write, None);
+        assert!(blocked.is_some());
+
+        // No quota anywhere: no budget, and nothing is blocked.
+        assert!(GrantBudget::new(&BTreeMap::new(), &placements, &arrays, |_, _| None).is_none());
+    }
+
+    #[test]
+    fn an_unchanged_quota_limit_writes_nothing_new() {
+        let mut record = record(10, 1);
+        let reason = |current| crate::meat::quota::QuotaError::CpuExceeded {
+            namespace: "default".into(),
+            current,
+            requested: 1000,
+            limit: 2000,
+        };
+        assert_eq!(quota_blocked_write(1, &record, None), None);
+        record.quota_blocked = Some(reason(2000));
+        assert_eq!(quota_blocked_write(1, &record, Some(reason(1500))), None);
+        assert_eq!(
+            quota_blocked_write(1, &record, None),
+            Some(TaskArrayWrite::QuotaBlocked {
+                batch_id: 1,
+                reason: None
+            })
+        );
     }
 }

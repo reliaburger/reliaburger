@@ -558,6 +558,84 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a real multi-node cluster; run with make test-cluster"]
+async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
+    use reliaburger::meat::task_array_store::{
+        MAX_ACTIVE_ARRAYS, MAX_ACTIVE_RUNS_PER_NAMESPACE, RESERVED_TRIGGERED_RUNS,
+    };
+    assert!(cluster_tests_enabled());
+    // Every task takes far longer than the test, so every array stays active.
+    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(600)).await;
+    let leader = nodes
+        .iter()
+        .position(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    let follower = (leader + 1) % 3;
+    let http = reqwest::Client::new();
+    let api = |index: usize| format!("http://127.0.0.1:{}", nodes[index].api_port);
+
+    let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+    let expression = format!(
+        "{} {} {} {} *",
+        next.minute(),
+        next.hour(),
+        next.day(),
+        u8::from(next.month())
+    );
+    let response = http
+        .post(format!("{}/v1/jobs/runs", api(follower)))
+        .bearer_auth(&token)
+        .json(&json!({"name":"nightly","namespace":"ops","definition":{"template":{"runtime":"process","exec":BINARY},"cron":{"expression":expression}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+
+    // Other tenants fill every bulk slot before the occurrence comes round.
+    let bulk = MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS;
+    let submit = async |name: String, namespace: String| {
+        http.post(format!("{}/v1/batch/array", api(leader)))
+            .bearer_auth(&token)
+            .json(&json!({"name":name,"namespace":namespace,"template":{"runtime":"process","exec":BINARY},"spec":{"count":1}}))
+            .send()
+            .await
+            .unwrap()
+    };
+    for i in 0..bulk {
+        let namespace = format!("tenant-{}", i / MAX_ACTIVE_RUNS_PER_NAMESPACE);
+        let response = submit(format!("bulk-{i}"), namespace).await;
+        assert_eq!(response.status(), 202, "bulk array {i}");
+    }
+    let refused = submit("one-more".into(), "tenant-late".into()).await;
+    assert!(refused.status().is_client_error(), "{}", refused.status());
+    let reason = refused.json::<Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(reason.contains("cron fires and deployments"), "{reason}");
+
+    wait_until(
+        "the cron occurrence admitted into the reserved headroom",
+        Duration::from_secs(75),
+        async || {
+            nodes[leader]
+                .council
+                .desired_state()
+                .await
+                .task_arrays
+                .jobs()
+                .runs()
+                .any(|(_, run)| run.name == "nightly" && run.namespace == "ops")
+        },
+    )
+    .await;
+    let arrays = nodes[leader].council.desired_state().await.task_arrays;
+    let record = arrays.jobs().definition("ops", "nightly").unwrap();
+    assert_eq!(record.skipped, None, "the fire must run, not be skipped");
+    root.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a real multi-node cluster; run with make test-cluster"]
 async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt() {
     assert!(cluster_tests_enabled());
     let (root, _data, nodes, token) = common_cluster(Duration::from_secs(10)).await;

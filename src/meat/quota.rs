@@ -262,6 +262,117 @@ impl QuotaLedger {
         let entry = self.usage.entry(namespace.to_string()).or_default();
         accumulate(entry, per_replica, replicas, true);
     }
+
+    /// Record `tasks` job attempts already in flight, each reserving
+    /// `per_task`. Jobs count towards CPU, memory and GPUs, never towards
+    /// the app or replica counts.
+    pub fn charge_tasks(&mut self, namespace: &str, per_task: &Resources, tasks: u64) {
+        let entry = self.usage.entry(namespace.to_string()).or_default();
+        let tasks32 = u32::try_from(tasks).unwrap_or(u32::MAX);
+        entry.cpu_millicores = entry
+            .cpu_millicores
+            .saturating_add(per_task.cpu_millicores.saturating_mul(tasks));
+        entry.memory_bytes = entry
+            .memory_bytes
+            .saturating_add(per_task.memory_bytes.saturating_mul(tasks));
+        entry.gpus = entry
+            .gpus
+            .saturating_add(per_task.gpus.saturating_mul(tasks32));
+    }
+
+    /// How many more job attempts reserving `per_task` fit in `namespace`
+    /// now. `u64::MAX` when nothing limits them: no quota, or the quota
+    /// doesn't cover any resource the task asks for.
+    pub fn room_for_tasks(&self, namespace: &str, per_task: &Resources) -> u64 {
+        let Some(quota) = self.quotas.get(namespace) else {
+            return u64::MAX;
+        };
+        let usage = self.usage.get(namespace).cloned().unwrap_or_default();
+        let fit = |limit: Option<u64>, used: u64, each: u64| match limit {
+            Some(limit) if each > 0 => limit.saturating_sub(used) / each,
+            _ => u64::MAX,
+        };
+        fit(
+            quota.max_cpu_millicores,
+            usage.cpu_millicores,
+            per_task.cpu_millicores,
+        )
+        .min(fit(
+            quota.max_memory_bytes,
+            usage.memory_bytes,
+            per_task.memory_bytes,
+        ))
+        .min(fit(
+            quota.max_gpus.map(u64::from),
+            u64::from(usage.gpus),
+            u64::from(per_task.gpus),
+        ))
+    }
+
+    /// The quota error for starting `tasks` more attempts reserving
+    /// `per_task`, or `None` if they fit.
+    pub fn task_quota_error(
+        &self,
+        namespace: &str,
+        per_task: &Resources,
+        tasks: u64,
+    ) -> Option<QuotaError> {
+        let quota = self.quotas.get(namespace)?;
+        let usage = self.usage.get(namespace).cloned().unwrap_or_default();
+        // App and replica limits don't apply to jobs: check the resources only.
+        let resources_only = NamespaceQuota {
+            max_apps: None,
+            max_replicas: None,
+            ..quota.clone()
+        };
+        let replicas = u32::try_from(tasks).unwrap_or(u32::MAX);
+        check_quota(&resources_only, &usage, per_task, replicas, false).err()
+    }
+}
+
+/// Whether two quota refusals name the same limit, ignoring the usage
+/// numbers, which move with every finished task.
+pub fn same_limit(a: &QuotaError, b: &QuotaError) -> bool {
+    use QuotaError::*;
+    match (a, b) {
+        (
+            CpuExceeded {
+                namespace: a,
+                limit: x,
+                ..
+            },
+            CpuExceeded {
+                namespace: b,
+                limit: y,
+                ..
+            },
+        )
+        | (
+            MemoryExceeded {
+                namespace: a,
+                limit: x,
+                ..
+            },
+            MemoryExceeded {
+                namespace: b,
+                limit: y,
+                ..
+            },
+        ) => a == b && x == y,
+        (
+            GpuExceeded {
+                namespace: a,
+                limit: x,
+                ..
+            },
+            GpuExceeded {
+                namespace: b,
+                limit: y,
+                ..
+            },
+        ) => a == b && x == y,
+        _ => a == b,
+    }
 }
 
 /// Add `replicas` of `per_replica` (and, when `count_app`, one app) to `entry`.
@@ -477,5 +588,60 @@ mod tests {
         };
         let res = Resources::new(999_999, 999_999_999, 100);
         assert!(check_quota(&unlimited, &empty_usage(), &res, 100, true).is_ok());
+    }
+
+    #[test]
+    fn jobs_and_apps_share_one_namespace_quota() {
+        // 2 CPUs: a 1.5-CPU app leaves room for two 250m attempts, not eight.
+        let mut ledger = QuotaLedger::new(HashMap::from([("prod".to_string(), quota("prod"))]));
+        let per_task = Resources::new(250, 0, 0);
+        assert_eq!(ledger.room_for_tasks("prod", &per_task), 8);
+        ledger.charge_tasks("prod", &Resources::new(1500, 0, 0), 1);
+        assert_eq!(ledger.room_for_tasks("prod", &per_task), 2);
+        ledger.charge_tasks("prod", &per_task, 2);
+        assert_eq!(ledger.room_for_tasks("prod", &per_task), 0);
+        // Job attempts never count as apps or replicas.
+        assert!(
+            ledger
+                .try_admit("prod", &Resources::new(0, 0, 0), 10, true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn namespace_without_quota_is_unlimited_for_jobs() {
+        let mut ledger = QuotaLedger::new(HashMap::from([("prod".to_string(), quota("prod"))]));
+        let per_task = Resources::new(1000, 64 << 20, 0);
+        ledger.charge_tasks("batch", &per_task, 1_000_000);
+        assert_eq!(ledger.room_for_tasks("batch", &per_task), u64::MAX);
+        assert_eq!(ledger.task_quota_error("batch", &per_task, 1_000), None);
+        // A quota that limits only GPUs leaves CPU-only tasks unlimited.
+        let gpus_only = NamespaceQuota {
+            max_cpu_millicores: None,
+            max_memory_bytes: None,
+            ..quota("gpu")
+        };
+        let ledger = QuotaLedger::new(HashMap::from([("gpu".to_string(), gpus_only)]));
+        assert_eq!(ledger.room_for_tasks("gpu", &per_task), u64::MAX);
+    }
+
+    #[test]
+    fn a_refusal_names_the_same_limit_however_usage_moves() {
+        let refusal = |current| QuotaError::CpuExceeded {
+            namespace: "prod".into(),
+            current,
+            requested: 500,
+            limit: 2000,
+        };
+        assert!(same_limit(&refusal(1600), &refusal(1900)));
+        assert!(!same_limit(
+            &refusal(1600),
+            &QuotaError::MemoryExceeded {
+                namespace: "prod".into(),
+                current: 0,
+                requested: 1,
+                limit: 2000,
+            }
+        ));
     }
 }
