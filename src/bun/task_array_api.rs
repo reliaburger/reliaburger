@@ -1558,6 +1558,7 @@ mod tests {
             template: template(),
             state,
             terminal_at_epoch_secs: Some(1),
+            quota_blocked: None,
         };
         let summary = array_summary(9, &record, &[]);
         assert_eq!(summary["retried"], 3);

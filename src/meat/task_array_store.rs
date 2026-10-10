@@ -1949,6 +1949,7 @@ mod tests {
                 failed_indices: failures,
                 not_run: 0,
                 retried: 0,
+                retry_causes: Default::default(),
             };
             state.complete(&node("n1"), &result).unwrap();
             chunk += 1;
