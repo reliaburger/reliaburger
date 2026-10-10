@@ -39,6 +39,32 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// Refuse log or metric storage caps larger than the filesystem they
+    /// live on (`filesystem_bytes`): such a cap would never prune before the
+    /// disk filled. `0` (unlimited) is an explicit opt-out and passes.
+    pub fn validate_storage_caps(
+        &self,
+        filesystem_bytes: u64,
+    ) -> Result<(), super::error::ConfigError> {
+        for (context, cap_mb) in [
+            ("logs", self.logs.max_storage_mb),
+            ("metrics", self.metrics.max_storage_mb),
+        ] {
+            if cap_mb.saturating_mul(1024 * 1024) > filesystem_bytes {
+                return Err(super::error::ConfigError::Validation {
+                    field: "max_storage_mb".to_string(),
+                    context: context.to_string(),
+                    reason: format!(
+                        "{cap_mb} MB is larger than the {} MB filesystem holding the data directory; \
+                         lower it, or set 0 to opt out of the cap",
+                        filesystem_bytes / (1024 * 1024)
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Parse node configuration from a TOML string.
     pub fn parse(toml: &str) -> Result<Self, super::error::ConfigError> {
         Ok(toml::from_str(toml)?)
@@ -1017,8 +1043,10 @@ pub struct MetricsSection {
     pub rollup_interval_secs: u64,
     /// How long to retain rollup data on council members (hours).
     pub rollup_retention_hours: u32,
-    /// Maximum local Parquet storage for metrics (MB). 0 means unlimited.
-    /// When exceeded, exported files are pruned oldest-first.
+    /// Maximum local Parquet storage for metrics (MB). Defaults to
+    /// [`DEFAULT_METRICS_STORAGE_MB`]; `0` explicitly means unlimited, so
+    /// only `retention_days` prunes. When exceeded, files are pruned
+    /// oldest-first (only once exported, when `export_path` is set).
     pub max_storage_mb: u64,
     /// Optional export destination for metrics Parquet files.
     pub export_path: Option<String>,
@@ -1036,7 +1064,7 @@ impl Default for MetricsSection {
             object_store_url: String::new(),
             rollup_interval_secs: 60,
             rollup_retention_hours: 24,
-            max_storage_mb: 0,
+            max_storage_mb: DEFAULT_METRICS_STORAGE_MB,
             export_path: None,
         }
     }
@@ -1053,6 +1081,13 @@ pub struct ScrapeTarget {
     pub url: String,
 }
 
+/// Default cap on local log storage, in MB. A node streaming job output at a
+/// million-jobs rate would otherwise fill its disk inside the retention window.
+pub const DEFAULT_LOG_STORAGE_MB: u64 = 2048;
+
+/// Default cap on local metric storage, in MB.
+pub const DEFAULT_METRICS_STORAGE_MB: u64 = 1024;
+
 /// Log collection configuration (Ketchup).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1066,8 +1101,10 @@ pub struct LogsSection {
     pub export_path: Option<String>,
     /// How often to export logs (seconds). Default: 3600 (1 hour).
     pub export_interval_secs: u64,
-    /// Maximum local Parquet storage for logs (MB). 0 means unlimited.
-    /// When exceeded, exported files are pruned oldest-first.
+    /// Maximum local Parquet storage for logs (MB). Defaults to
+    /// [`DEFAULT_LOG_STORAGE_MB`]; `0` explicitly means unlimited, so only
+    /// `retention_days` prunes. When exceeded, files are pruned oldest-first
+    /// (only once exported, when `export_path` is set).
     pub max_storage_mb: u64,
 }
 
@@ -1077,7 +1114,7 @@ impl Default for LogsSection {
             retention_days: 7,
             export_path: None,
             export_interval_secs: 3600,
-            max_storage_mb: 0,
+            max_storage_mb: DEFAULT_LOG_STORAGE_MB,
         }
     }
 }
@@ -1146,6 +1183,33 @@ pub struct AlertDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_and_metrics_have_a_default_storage_cap() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(config.logs.max_storage_mb, DEFAULT_LOG_STORAGE_MB);
+        assert_eq!(config.metrics.max_storage_mb, DEFAULT_METRICS_STORAGE_MB);
+        const { assert!(DEFAULT_LOG_STORAGE_MB > 0 && DEFAULT_METRICS_STORAGE_MB > 0) };
+        config.validate_storage_caps(64 << 30).unwrap();
+
+        // A cap the filesystem can't hold would never prune in time.
+        let error = config
+            .validate_storage_caps(1 << 30)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("logs"), "{error}");
+        assert!(error.contains("set 0"), "{error}");
+    }
+
+    #[test]
+    fn zero_storage_cap_means_explicitly_unlimited() {
+        let config =
+            NodeConfig::parse("[logs]\nmax_storage_mb = 0\n[metrics]\nmax_storage_mb = 0\n")
+                .unwrap();
+        assert_eq!(config.logs.max_storage_mb, 0);
+        assert_eq!(config.metrics.max_storage_mb, 0);
+        config.validate_storage_caps(1 << 20).unwrap();
+    }
 
     #[test]
     fn image_mirrors_parse_and_refuse_urls() {

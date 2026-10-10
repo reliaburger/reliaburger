@@ -84,6 +84,8 @@ pub struct TaskArrayService {
     pub sync_interval: Duration,
     /// Silence before a node's chunks are taken back.
     pub silence_timeout: Duration,
+    /// How long a finished run stays readable before the leader prunes it.
+    pub retention: Duration,
     /// Standalone copy of the arrays (unused with a council).
     local: Mutex<TaskArrays>,
     /// What each node last said about each array, by batch id.
@@ -136,10 +138,18 @@ impl TaskArrayService {
             node,
             sync_interval,
             silence_timeout,
+            retention: Duration::from_secs(crate::meat::task_array_store::TERMINAL_RETENTION_SECS),
             local: Mutex::new(TaskArrays::default()),
             views: Mutex::new(HashMap::new()),
             rates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Keep finished runs readable for `retention` instead of the default
+    /// hour. Tests use a short window to watch collection happen.
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = retention;
+        self
     }
 
     /// Open private durable standalone state before admitting or dispatching work.
@@ -624,6 +634,27 @@ async fn fire_due_schedules(state: &ApiState) {
     }
 }
 
+/// Drop finished runs past retention with one replicated write, so an
+/// idle cluster forgets them too. Workers delete a run's files once the
+/// leader stops listing it. Nothing is written while nothing is due.
+async fn prune_retired_runs(state: &ApiState) {
+    let now = crate::meat::batch_tracker::epoch_now_secs();
+    let retention_secs = state.task_arrays.retention.as_secs();
+    if !read_task_arrays(state)
+        .await
+        .has_expired(now, retention_secs)
+    {
+        return;
+    }
+    let write = TaskArrayWrite::Prune {
+        now_epoch_secs: now,
+        retention_secs,
+    };
+    if let Err(error) = write_task_array(state, write).await {
+        eprintln!("bun: task arrays: retention write failed: {error}");
+    }
+}
+
 async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     if !is_leading(state).await {
         memory.since = None;
@@ -635,6 +666,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     }
     super::job_apply::settle(state).await;
     fire_due_schedules(state).await;
+    prune_retired_runs(state).await;
     let now = Instant::now();
     let since = *memory.since.get_or_insert(now);
     let (arrays, version) = match &state.council {

@@ -23,7 +23,7 @@ use super::types::NodeId;
 use crate::config::job::JobSpec;
 
 /// How long a finished array stays readable (status, results, logs)
-/// before a later registration prunes it.
+/// before the leader's retention write (or a later registration) prunes it.
 pub const TERMINAL_RETENTION_SECS: u64 = 3600;
 
 /// Most finished arrays kept, newest first. Each can hold up to about
@@ -108,6 +108,13 @@ pub enum TaskArrayWrite {
     Job(Box<super::job::JobWrite>),
     /// Persist the latest observed UTC minute independently of matching schedules.
     CronObserve { minute: i64 },
+    /// Drop finished runs past retention. The leader writes this on a timer
+    /// so an idle cluster still forgets them and workers delete their files.
+    /// Both values come from the write, so every replica drops the same runs.
+    Prune {
+        now_epoch_secs: u64,
+        retention_secs: u64,
+    },
     /// Retain a conservative run's ownership when its outcome cannot be established.
     Unknown { batch_id: u64, node: NodeId },
     /// An operator acknowledged repeating an unknown owner's side effects.
@@ -471,6 +478,13 @@ impl TaskArrays {
                     ));
                 }
                 self.cron_observed_minute = self.cron_observed_minute.max(Some(*minute));
+                Ok(TaskArrayApplied::JobRecorded)
+            }
+            TaskArrayWrite::Prune {
+                now_epoch_secs,
+                retention_secs,
+            } => {
+                self.prune_within(*now_epoch_secs, *retention_secs);
                 Ok(TaskArrayApplied::JobRecorded)
             }
             TaskArrayWrite::Job(write) => self.apply_job(write, allocate_id),
@@ -930,6 +944,33 @@ impl TaskArrays {
     /// [`MAX_TERMINAL_ARRAYS`] of the rest (newest ids win). `now` comes
     /// from the write, so every replica prunes the same arrays.
     pub(crate) fn prune(&mut self, now_epoch_secs: u64) {
+        self.prune_within(now_epoch_secs, TERMINAL_RETENTION_SECS);
+    }
+
+    /// Whether a retention write at `now_epoch_secs` would drop anything.
+    /// The leader asks first, so an idle cluster writes nothing.
+    pub fn has_expired(&self, now_epoch_secs: u64, retention_secs: u64) -> bool {
+        !self.expired(now_epoch_secs, retention_secs).is_empty()
+    }
+
+    fn prune_within(&mut self, now_epoch_secs: u64, retention_secs: u64) {
+        for (id, parent) in self.expired(now_epoch_secs, retention_secs) {
+            if parent {
+                if let Some(manifest) = self.manifests.remove(&id) {
+                    for (_, child) in manifest.cohorts {
+                        self.arrays.remove(&child);
+                    }
+                }
+            } else {
+                self.arrays.remove(&id);
+            }
+        }
+        self.jobs
+            .retain_runs(&self.arrays.keys().copied().collect());
+    }
+
+    /// Finished retention units to drop, as `(id, is_manifest_parent)`.
+    fn expired(&self, now_epoch_secs: u64, retention_secs: u64) -> Vec<(u64, bool)> {
         let pinned: std::collections::BTreeSet<_> = self
             .deployments
             .values()
@@ -964,29 +1005,21 @@ impl TaskArrays {
         terminal.sort_unstable();
         let retained = terminal
             .iter()
-            .filter(|(time, _, _)| now_epoch_secs.saturating_sub(*time) <= TERMINAL_RETENTION_SECS)
+            .filter(|(time, _, _)| now_epoch_secs.saturating_sub(*time) <= retention_secs)
             .count();
         let mut excess = retained.saturating_sub(MAX_TERMINAL_ARRAYS);
+        let mut dropped = Vec::new();
         for (time, id, parent) in terminal {
-            let expired = now_epoch_secs.saturating_sub(time) > TERMINAL_RETENTION_SECS;
+            let expired = now_epoch_secs.saturating_sub(time) > retention_secs;
             if !expired && excess == 0 {
                 continue;
             }
             if !expired {
                 excess -= 1;
             }
-            if parent {
-                if let Some(manifest) = self.manifests.remove(&id) {
-                    for (_, child) in manifest.cohorts {
-                        self.arrays.remove(&child);
-                    }
-                }
-            } else {
-                self.arrays.remove(&id);
-            }
+            dropped.push((id, parent));
         }
-        self.jobs
-            .retain_runs(&self.arrays.keys().copied().collect());
+        dropped
     }
 
     /// Active deployment intent, excluding bounded terminal receipts.
@@ -1601,6 +1634,47 @@ mod tests {
             3,
         );
         assert!(arrays.get(old).is_none());
+    }
+
+    #[test]
+    fn finished_arrays_expire_on_the_timer_without_new_submissions() {
+        let mut leader = TaskArrays::default();
+        let old = registered(&mut leader, &register(4, 4, 100), 1);
+        let running = registered(&mut leader, &register(4, 4, 100), 2);
+        leader
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    now_epoch_secs: 200,
+                    batch_id: old,
+                },
+                || 0,
+            )
+            .unwrap();
+        let mut follower = leader.clone();
+
+        // Nothing is due inside the window, so the leader writes nothing.
+        assert!(!leader.has_expired(200 + TERMINAL_RETENTION_SECS, TERMINAL_RETENTION_SECS));
+        assert!(leader.has_expired(201 + TERMINAL_RETENTION_SECS, TERMINAL_RETENTION_SECS));
+
+        // The timer write carries its own clock and window: every replica
+        // that applies it drops the same runs, with no registration at all.
+        let write = TaskArrayWrite::Prune {
+            now_epoch_secs: 201 + TERMINAL_RETENTION_SECS,
+            retention_secs: TERMINAL_RETENTION_SECS,
+        };
+        for replica in [&mut leader, &mut follower] {
+            replica.apply(&write, || panic!("no id allocated")).unwrap();
+            assert!(
+                replica.get(old).is_none(),
+                "finished run outlived retention"
+            );
+            assert!(
+                replica.get(running).is_some(),
+                "a running array is never pruned"
+            );
+        }
+        assert_eq!(leader, follower);
+        assert!(!leader.has_expired(201 + TERMINAL_RETENTION_SECS, TERMINAL_RETENTION_SECS));
     }
 
     #[test]

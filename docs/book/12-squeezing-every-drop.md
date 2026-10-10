@@ -767,7 +767,7 @@ A shared `ExecutionBudget` accounts for app commitments and actual running attem
 
 A manifest groups up to sixteen homogeneous resource profiles. Stable parent/profile/index identities avoid serialising a million specs. Workers reserve each attempt, not its queued chunk, release requests during retry backoff, and reuse a bounded pool of owned runtime identities per namespace. Each image attempt has a fresh runtime generation, a read-only root and temporary scratch space. Cached images reduce transfer and unpacking cost; runc still launches a container per attempt, so startup cost remains part of the throughput budget.
 
-Terminal outcomes stream into the ledger while a chunk runs. The acknowledgement waits for the checksummed block, fsync and derived redb index transaction. A failed write stops local work and reports a refusal. The leader's accepted owner/generation ranges select results, including failures beyond the capped summary list. The index keeps the newest grant for each task even when an older execution finishes later. Output is keyed by grant too. New worker and array directories are synced in
+Terminal outcomes stream into the ledger while a chunk runs. The acknowledgement waits for the checksummed block, fsync and the derived result index write (originally a redb transaction; see "Where the bytes went" below). A failed write stops local work and reports a refusal. The leader's accepted owner/generation ranges select results, including failures beyond the capped summary list. The index keeps the newest grant for each task even when an older execution finishes later. Output is keyed by grant too. New worker and array directories are synced in
 their parent before a grant can execute, because syncing a file alone does not
 make its directory entry durable. Streaming recovery retains one checksummed
 block and only records from held chunks; it does not build a sparse set of every
@@ -776,7 +776,7 @@ small callers.
 
 A disaster-recovery epoch can rewind the council snapshot while worker grant fences remain newer. Comparing just term and index would either hang that work or mix histories. The node instead persists a recovery refusal before cancelling old attempts, preserves their directories and requires fresh worker data after re-enrolment. Ordinary leader elections keep the same epoch and still resume durable outcomes. An empty leader snapshot still syncs once with each worker; it cannot assume no work exists locally. The recovery test finishes generation five, rolls control back to generation one in a new epoch, restarts the worker and verifies that neither execution nor deletion can cross that refusal. External effects still need a business key that survives a cluster rebuild.
 
-The derived index uses a 1 MiB cache per profile, rather than redb's 1 GiB default. A node can retain many profiles, so leaving the database default would make job-history queries compete with application memory. The million-record ledger case also exercises index rebuild and lookup with that small cache.
+The first derived index was a redb database with a 1 MiB cache per profile, rather than redb's 1 GiB default, so that job-history queries wouldn't compete with application memory. Its replacement, a dense slot file, has no cache to size at all: a page is one bounded read.
 
 The default view is a summary, not a task list. Watch, JSON status and the dashboard show counts and rates. Histograms merge before p50/p95/p99 are read; those are bucket upper bounds for final attempts, not end-to-end latency. Detail pages inspect at most 4,096 indexes, return at most 1,000 rows and contact at most eight workers, with a cursor even for an empty failure page. Retention starts at terminal acceptance and groups a parent with its profiles. Worker loss can lose detail without changing replicated accepted counts.
 
@@ -909,6 +909,36 @@ restart, output identity and public endpoints. Protocol/state are 48/65 and
 require matching binaries and a fresh cluster. Executor reuse, throughput
 qualification and resident model workers remain separate issues; these semantics
 don't establish 100m accepted successes/day.
+
+### Where the bytes went
+
+The October qualification rig lost about 82 bytes of free disk for every task it accepted, five times the plan's budget, and got none of it back between runs. At the target rate that's several gigabytes a day, and when a worker's storage fails it stops taking work until someone repairs it. So "a million jobs" quietly meant "a million jobs, then a full disk". Nobody had broken the number down, so that's where we started: a unit test that pushes a million outcomes through the real ledger and its index and prints each file's allocated size.
+
+The answer was embarrassing. The ledger, the thing we'd agonised over, was 22 bytes a task, exactly as designed. The redb index beside it, there only so `relish batch results` can page by task index, was 87. A B-tree keyed by a 32-bit integer pays for page headers, per-entry offsets, half-empty leaves after splits, a second table for failures and copy-on-write pages between commits. That's a fine price for a general-purpose database. It's a silly price for keys that are the numbers 0 to 999,999.
+
+Task indexes are dense, so we threw the B-tree out and gave each task a fixed slot: byte `index * 24` of one file holds its 22-byte record plus a 16-bit check. A page of 4,096 indexes, the most a detail request ever examines, is one contiguous read, and filtering failures inside it needs no second table. A worker that ran a third of an array writes a third of the slots; the rest stay *holes* in a sparse file and cost nothing on ext4, XFS or APFS. The index reads and writes at explicit offsets:
+
+```rust
+use std::os::unix::fs::FileExt;
+
+self.file.write_all_at(&slot(raw), offset)?;
+```
+
+`write_all_at` isn't a method of `File` itself. It belongs to the `FileExt` *trait*, which the standard library implements for `File` only on Unix, and a trait's methods are in scope only once you `use` the trait. That's how Rust adds platform-specific methods without a `#[cfg]` on every call: Windows code simply has no `write_all_at` to call. Positional reads and writes (`pread` and `pwrite` underneath) also take `&self`, not `&mut self`, because they don't move a shared file cursor. The API readers and the ledger writer share one `Arc<TaskResultIndex>`, and the borrow checker is happy for them to.
+
+A million tasks now cost 22.4 bytes of ledger and 25.0 of index on APFS, about 45 MiB. That still isn't the plan's 16 MiB per million (the ledger alone is over it), so we recorded the measured bound instead, 50 bytes a task (some headroom for filesystem block rounding), and `make bench-task-arrays` fails above it.
+
+Bytes per task only matter if they eventually go away. Workers already deleted a run's directory once the leader stopped listing it, but the leader only forgot a finished run when someone *submitted* something: pruning lived in the registration path. An idle cluster, or one running the same long array all day, kept everything. The fix is a new replicated write:
+
+```rust
+Prune { now_epoch_secs: u64, retention_secs: u64 },
+```
+
+The leader's one-second tick asks the store whether anything has expired (a read, so an idle cluster writes nothing) and, if it has, writes `Prune`. The clock and the window travel *inside* the write, like every other timestamp in this state machine, so every replica that applies it drops exactly the same runs. A follower reading its own clock could disagree with the leader by a few seconds and end up with different state, which in a replicated log is a bug, not a rounding error.
+
+Failed tasks were the other leak. Each kept its output in its own fsynced file, so an array with a typo in its command wrote a million files and a million fsyncs. Now each chunk grant gets one append-only segment, a whole batch of outputs costs one fsync, and only the first 16 failures per chunk keep their output. The ledger still records every failure's exit code. Past the sixteenth, `relish batch logs` answers `410 Gone` with "its output wasn't kept", because silently returning nothing would look like a task that printed nothing.
+
+Last, task data now counts toward disk pressure. Past a quarter of the filesystem, or with less than a gibibyte free, a worker finishes and reports what it holds but advertises no free slots, so it stops attracting grants before it fails rather than after. Our first version said "95% full", the council's resignation threshold, and promptly stopped every job test on a laptop with 28 GiB free on a 926 GiB disk. On a big disk 5% is millions of tasks of headroom, so the floor is absolute. And `[logs]` and `[metrics]` finally ship size caps (2 GiB and 1 GiB) instead of "unlimited", with `0` kept as a deliberate opt-out. Bun refuses a cap bigger than the filesystem, since that's just "unlimited" in a costume.
 
 ## Lessons from the phase
 

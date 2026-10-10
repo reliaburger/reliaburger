@@ -165,6 +165,26 @@ cluster. Don't write a new `state-format.json` by hand; the stamp is the only
 thing standing between the new binary and data it can't read. The policy is
 in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100).
 
+## Sizing a node's disk
+
+A node's disk holds four growing things besides images and volumes: logs,
+metrics, job data and the council log. Logs and metrics are capped by default
+(`[logs] max_storage_mb = 2048`, `[metrics] max_storage_mb = 1024`; see
+[Observability](04_observability.md)), and Bun refuses a cap larger than the
+filesystem. Job data is the outcome ledger, its result index and the kept
+output of failed tasks, under `<data>/task-arrays/`. It stays while the cluster
+lists the run and goes about an hour after the run finishes, whether or not
+anyone submits more work. Each chunk keeps the output of its first 16 failed
+tasks only, so a run that fails everywhere costs a few hundred kilobytes of
+output per thousand tasks, not a file per task.
+
+Plan for job data at the measured bytes per task in
+[Batch jobs](14_batch-jobs.md#execution-and-capacity-limits), multiplied by
+the tasks a node finishes in an hour plus whatever the retained runs hold.
+When job data passes a quarter of the filesystem, or less than 1 GiB of it is
+free, the node keeps running the chunks it already holds but advertises no free
+slots, so it takes no new grants until retention frees space.
+
 ## GitOps
 
 Point the config at a repository and the council leader keeps the cluster in

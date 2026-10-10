@@ -119,8 +119,7 @@ impl Ledger {
                 file.sync_all()?;
             }
         }
-        let index =
-            super::task_result_index::TaskResultIndex::open(&path.with_extension("index.redb"))?;
+        let index = super::task_result_index::TaskResultIndex::open(&path.with_extension("index"))?;
         index.rebuild(path)?;
         Ok(Self {
             index,
@@ -686,15 +685,25 @@ mod tests {
             ledger.append(&shifted);
             ledger.flush().unwrap();
         }
-        let bytes = std::fs::metadata(path_in(&dir)).unwrap().len();
-        assert!(bytes <= 24 * 1024 * 1024, "{bytes} ledger bytes");
-        let indexed = std::fs::metadata(path_in(&dir).with_extension("index.redb"))
-            .unwrap()
-            .len();
-        eprintln!("million task outcomes: ledger={bytes} bytes, index={indexed} bytes");
+        // Allocated bytes, per component: what the disk actually pays.
+        let allocated = |path: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().blocks() * 512
+        };
+        let tasks = 245 * 4096u64;
+        let bytes = allocated(&path_in(&dir));
+        let indexed = allocated(&path_in(&dir).with_extension("index"));
+        eprintln!(
+            "{tasks} task outcomes: ledger {bytes} bytes ({:.1}/task), index {indexed} bytes ({:.1}/task)",
+            bytes as f64 / tasks as f64,
+            indexed as f64 / tasks as f64,
+        );
+        assert!(bytes <= tasks * 23, "{bytes} ledger bytes");
+        assert!(indexed <= tasks * 26, "{indexed} index bytes");
+        let bound = super::super::task_array_node::STORAGE_BYTES_PER_TASK;
         assert!(
-            bytes + indexed <= 128 * 1024 * 1024,
-            "{} total bytes",
+            bytes + indexed <= tasks * bound,
+            "{} bytes is over {bound} per task",
             bytes + indexed
         );
         let replayed = replay(&path_in(&dir)).unwrap();

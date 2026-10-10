@@ -178,17 +178,19 @@ Only the worker and grant whose completion was accepted can supply an outcome
 or retained task output. Unreachable workers are explicit. Singletons keep bounded successful output as
 well as failure output; larger arrays discard successful output. Control reports keep exact failure counts and at most 256 index
 ranges per chunk; indexed detail remains available beyond that preview.
-Retained output keeps a bounded head and tail. Singleton live stdout/stderr also
+Retained output keeps a bounded head and tail. Each chunk keeps the output
+of its first 16 failed tasks; later failures keep their exit code and attempts
+in the results, and `relish batch logs` says the output wasn't kept. Singleton live stdout/stderr also
 uses ordinary log capture under its logical name, namespace and `run-ID` selector. Never interpret
 missing detail as success. A missing or corrupt result index is an explicit
 error; rebuilding it is worker recovery, rather than an unbounded page read.
-Use the child array ID for results and logs. Each profile index has a 1 MiB
-cache budget; more detail traffic may require additional disk reads.
+Use the child array ID for results and logs.
 
-Detail remains on the worker disk. Later submissions prune detail older than
-one hour **after completion** and keep the newest 20 terminal submissions.
-This is pruning on registration, rather than a background expiry timer; detail
-can remain readable longer while no new work is submitted. For a mixed manifest,
+Detail remains on the worker disk for one hour **after completion**, and the
+cluster keeps at most the newest 20 terminal submissions. The leader checks
+every second and prunes expired runs with one replicated write, whether or not
+anyone submits new work; workers then delete the run's ledger, index and kept
+output on their next sync. For a mixed manifest,
 the clock starts when its last profile finishes; profiles are pruned together.
 Permanent worker or disk loss can lose
 individual results even when accepted aggregate counts remain replicated.
@@ -213,6 +215,15 @@ commit incremental outcomes in groups and acknowledge chunks only after
 outcomes and their result index are durable. Standalone admission reserves sparse progress within its 64 MiB store before
 accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
+
+A worker holds at most 50 bytes of disk per accepted task while the cluster
+lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
+million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
+about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
+tasks' head and tail per chunk. All of it goes when the run retires. Task data
+counts toward disk pressure: past a quarter of the filesystem, or with less
+than 1 GiB free, a worker finishes the chunks it holds but advertises no
+free slots, so it takes no new grants until retention frees space.
 
 After council disaster recovery advances the recovery epoch, workers with old
 array directories stop their attempts and persist a refusal. Old results and
@@ -281,6 +292,10 @@ keeps at most 32 compatible containers. The compatibility key includes the
 pinned image, namespace, live credentials and resource profile. Each container
 runs one command at a time, as a separate process. Jobs, arrays, schedules and
 hooks keep their common run identities, retries and durable results.
+Once a container's retirement is proven, the worker deletes its runtime
+journal, bundle and route files, and at startup it sweeps any an interrupted
+retirement left behind, so executor metadata doesn't grow with every namespace
+that ever ran a job.
 
 The command is born in its task cgroup, with independent CPU and memory limits.
 It receives its own mount and IPC namespaces, empty environment before explicit
