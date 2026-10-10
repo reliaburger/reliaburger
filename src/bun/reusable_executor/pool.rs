@@ -249,6 +249,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .filter(|slot| slot.holder == Some(run))
             .count() as u64
     }
+    /// The executor cgroups this run's callers hold right now, for CPU and
+    /// memory sampling. An executor's group holds its helper and its task
+    /// groups, so the sample includes the helper's small overhead.
+    pub(crate) async fn run_cgroups(&self, run: u64) -> Vec<PathBuf> {
+        self.slots
+            .lock()
+            .await
+            .iter()
+            .filter(|slot| slot.holder == Some(run))
+            .filter_map(|slot| slot.context.as_ref().map(|context| context.base.clone()))
+            .collect()
+    }
     pub(crate) async fn active_commands(&self, run: u64) -> u64 {
         self.slots
             .lock()

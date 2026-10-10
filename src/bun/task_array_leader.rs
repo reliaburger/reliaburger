@@ -89,6 +89,8 @@ pub struct TaskArrayService {
     /// What each node last said about each array, by batch id.
     views: Mutex<HashMap<u64, BTreeMap<NodeId, NodeView>>>,
     rates: Mutex<HashMap<u64, super::task_rates::RateSample>>,
+    /// Where the leader sends failed and unknown-outcome run notifications.
+    pub(crate) job_notifier: Option<crate::mayo::webhook::WebhookDispatcher>,
 }
 
 impl TaskArrayService {
@@ -107,6 +109,13 @@ impl TaskArrayService {
     /// Apply the configured image policy to batch admission too.
     pub fn with_trust_policy(mut self, policy: crate::config::node::TrustPolicySection) -> Self {
         self.trust_policy = policy;
+        self
+    }
+
+    /// Send failed and unknown-outcome run notifications to these alert
+    /// destinations while this node leads. Nothing is sent when it has none.
+    pub fn with_job_notifier(mut self, notifier: crate::mayo::webhook::WebhookDispatcher) -> Self {
+        self.job_notifier = notifier.has_destinations().then_some(notifier);
         self
     }
 
@@ -139,6 +148,7 @@ impl TaskArrayService {
             local: Mutex::new(TaskArrays::default()),
             views: Mutex::new(HashMap::new()),
             rates: Mutex::new(HashMap::new()),
+            job_notifier: None,
         }
     }
 
@@ -379,12 +389,29 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
         held,
         stopping: state.stop_reason().is_some(),
         replay_unknown: true,
+        labels: crate::mayo::job_metrics::JobLabels {
+            namespace: record.namespace.clone(),
+            definition: record.name.clone(),
+            profile: DEFAULT_PROFILE.into(),
+        },
     }
 }
+
+/// The `profile` label of a run that isn't one profile of a manifest.
+pub const DEFAULT_PROFILE: &str = "default";
 
 /// The whole sync call for one node: every running array, plus the ids of
 /// every array the cluster still keeps.
 pub fn sync_request_for(arrays: &TaskArrays, node: &NodeId) -> NodeSyncRequest {
+    let profiles: HashMap<u64, &str> = arrays
+        .manifests()
+        .flat_map(|(_, manifest)| {
+            manifest
+                .cohorts
+                .iter()
+                .map(|(profile, id)| (*id, profile.as_str()))
+        })
+        .collect();
     NodeSyncRequest {
         version: Default::default(),
         known: arrays.ids(),
@@ -396,6 +423,9 @@ pub fn sync_request_for(arrays: &TaskArrays, node: &NodeId) -> NodeSyncRequest {
                     .jobs()
                     .run(batch_id)
                     .is_none_or(|run| run.replay_unknown);
+                if let Some(profile) = profiles.get(&batch_id) {
+                    assignment.labels.profile = (*profile).to_string();
+                }
                 assignment
             })
             .collect(),
@@ -657,6 +687,46 @@ struct LeaderMemory {
     failing: std::collections::HashSet<NodeId>,
     /// The last cron definition fired, so the next tick starts after it.
     cron_cursor: Option<String>,
+    /// Which run outcomes this leader has already announced.
+    job_events: super::job_events::JobEventTracker,
+}
+
+/// Record one event for every run that finished or lost track of its
+/// outcome since the last tick, and send the failed and unknown ones to the
+/// alert webhook. Delivery runs in the background: a slow receiver must not
+/// hold up dispatch.
+async fn report_run_changes(
+    state: &ApiState,
+    arrays: &TaskArrays,
+    tracker: &mut super::job_events::JobEventTracker,
+) {
+    let changes = tracker.observe(arrays);
+    if changes.is_empty() {
+        return;
+    }
+    let now = crate::meat::batch_tracker::epoch_now_secs();
+    for change in changes {
+        let message = change.message();
+        let (kind, severity) = change.event_kind();
+        if change.notifies() {
+            eprintln!("bun: {message}");
+        }
+        if let Some(events) = &state.events {
+            events.write().await.record(
+                now,
+                kind,
+                severity,
+                Some(change.name.clone()),
+                Some(change.namespace.clone()),
+                None,
+                message,
+            );
+        }
+        if let (Some(notifier), Some(alert)) = (&state.task_arrays.job_notifier, change.alert()) {
+            let notifier = notifier.clone();
+            tokio::spawn(async move { notifier.dispatch_job_run(&alert).await });
+        }
+    }
 }
 
 /// Start the leader loop. It runs on every node and does nothing unless
@@ -671,6 +741,7 @@ pub(crate) fn spawn_leader_loop(state: ApiState) {
             last_known: HashMap::new(),
             failing: std::collections::HashSet::new(),
             cron_cursor: None,
+            job_events: Default::default(),
         };
         loop {
             tokio::select! {
@@ -840,6 +911,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         memory.last_known.clear();
         memory.failing.clear();
         memory.cron_cursor = None;
+        memory.job_events.reset();
         state.task_arrays.rates.lock().await.clear();
         return;
     }
@@ -873,6 +945,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     if !is_leading(state).await {
         return;
     }
+    report_run_changes(state, &arrays, &mut memory.job_events).await;
     let known = arrays.ids();
     // Even an empty restored snapshot must reach workers: they can hold
     // pre-recovery attempts or directories unknown to this council history.

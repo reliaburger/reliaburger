@@ -1528,5 +1528,11 @@
     "function": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_shared_profile_reports_cgroup_cpu_and_memory",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_shared_profile_reports_cgroup_cpu_and_memory"
   }
 ]

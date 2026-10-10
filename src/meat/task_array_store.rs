@@ -26,9 +26,15 @@ use crate::config::job::JobSpec;
 /// before a later registration prunes it.
 pub const TERMINAL_RETENTION_SECS: u64 = 3600;
 
-/// Most finished arrays kept, newest first. Each can hold up to about
-/// 160 KiB of failed-index ranges, so this bounds the snapshot too.
-pub const MAX_TERMINAL_ARRAYS: usize = 20;
+/// Most finished arrays kept across the cluster. Each can hold up to about
+/// 160 KiB of failed-index ranges, so this bounds the snapshot too. When
+/// more finish, the namespace keeping the most loses its oldest first, so a
+/// busy namespace can't push out a quiet one's runs.
+pub const MAX_TERMINAL_ARRAYS: usize = 24;
+
+/// Most finished arrays one namespace keeps. A definition's outcome history
+/// outlives this; the run's details (results, logs) don't.
+pub const MAX_TERMINAL_PER_NAMESPACE: usize = 20;
 
 /// Most runs active at once across the cluster. The leader syncs every node
 /// for every running array once a second, and every active run sits in the
@@ -462,6 +468,50 @@ impl TryFrom<ArraysWire> for TaskArrays {
         }
         Ok(store)
     }
+}
+
+/// One finished run, or one manifest with all its profiles, as pruning
+/// sees it.
+struct RetentionUnit<'a> {
+    finished_at: u64,
+    id: u64,
+    parent: bool,
+    namespace: &'a str,
+}
+
+/// Which finished units `prune` drops, given units sorted oldest first:
+/// everything past [`TERMINAL_RETENTION_SECS`], then each namespace's
+/// oldest beyond [`MAX_TERMINAL_PER_NAMESPACE`], then, while more than
+/// [`MAX_TERMINAL_ARRAYS`] remain, the oldest of whichever namespace keeps
+/// the most. Deterministic, so every replica drops the same units.
+fn retention_evictions(terminal: &[RetentionUnit<'_>], now_epoch_secs: u64) -> Vec<(u64, bool)> {
+    let mut evicted = Vec::new();
+    let mut kept: BTreeMap<&str, std::collections::VecDeque<(u64, bool)>> = BTreeMap::new();
+    for unit in terminal {
+        if now_epoch_secs.saturating_sub(unit.finished_at) > TERMINAL_RETENTION_SECS {
+            evicted.push((unit.id, unit.parent));
+        } else {
+            kept.entry(unit.namespace)
+                .or_default()
+                .push_back((unit.id, unit.parent));
+        }
+    }
+    for units in kept.values_mut() {
+        while units.len() > MAX_TERMINAL_PER_NAMESPACE {
+            evicted.extend(units.pop_front());
+        }
+    }
+    let mut total: usize = kept.values().map(|units| units.len()).sum();
+    while total > MAX_TERMINAL_ARRAYS {
+        // `max_by_key` keeps the last maximum it sees; walking backwards
+        // makes a tie go to the first namespace by name on every replica.
+        let Some(units) = kept.values_mut().rev().max_by_key(|units| units.len()) else {
+            break;
+        };
+        evicted.extend(units.pop_front());
+        total -= 1;
+    }
+    evicted
 }
 
 impl TaskArrays {
@@ -977,11 +1027,40 @@ impl TaskArrays {
 
     fn mark_terminal(&mut self, id: u64, now: u64) -> Result<(), TaskArrayStoreError> {
         let record = self.record_mut(id)?;
+        let mut outcome = None;
         if record.state.status().is_terminal() && record.terminal_at_epoch_secs.is_none() {
-            record.terminal_at_epoch_secs = Some(now.max(record.state.submitted_at_epoch_secs));
+            let finished = now.max(record.state.submitted_at_epoch_secs);
+            record.terminal_at_epoch_secs = Some(finished);
             record.quota_blocked = None;
+            let summary = record.state.summary();
+            outcome = Some((
+                record.namespace.clone(),
+                record.name.clone(),
+                super::job::RunOutcome {
+                    run: id,
+                    started_at_epoch_secs: record.state.submitted_at_epoch_secs,
+                    finished_at_epoch_secs: finished,
+                    status: summary.status,
+                    succeeded: summary.succeeded,
+                    failed: summary.failed,
+                    not_run: summary.not_run,
+                    first_failed_index: record
+                        .state
+                        .failed_indices()
+                        .ranges()
+                        .next()
+                        .map(|range| *range.start()),
+                },
+            ));
         }
         let state = record.state.clone();
+        // Only runs a definition admitted carry history; a raw array or a
+        // manifest profile has no definition to keep it on.
+        if let Some((namespace, name, outcome)) = outcome
+            && self.jobs.run(id).is_some()
+        {
+            self.jobs.record_outcome(&namespace, &name, outcome);
+        }
         if let Some(run) = self.jobs.run_mut(id) {
             run.unknown_owners
                 .retain(|node| state.held_by(node).is_some());
@@ -1012,7 +1091,7 @@ impl TaskArrays {
             .collect();
         // A parent and all its profiles are one retention unit. Its clock
         // starts when the last profile finishes, not at submission.
-        let mut terminal: Vec<(u64, u64, bool)> = self
+        let mut terminal: Vec<RetentionUnit<'_>> = self
             .manifests
             .iter()
             .filter_map(|(id, m)| {
@@ -1021,29 +1100,27 @@ impl TaskArrays {
                     .iter()
                     .map(|(_, child)| self.arrays.get(child)?.terminal_at_epoch_secs)
                     .collect();
-                completed.map(|times| (times.into_iter().max().unwrap_or(0), *id, true))
+                completed.map(|times| RetentionUnit {
+                    finished_at: times.into_iter().max().unwrap_or(0),
+                    id: *id,
+                    parent: true,
+                    namespace: &m.namespace,
+                })
             })
             .chain(self.arrays.iter().filter_map(|(id, r)| {
                 if children.contains(id) || pinned.contains(id) {
                     return None;
                 }
-                r.terminal_at_epoch_secs.map(|time| (time, *id, false))
+                r.terminal_at_epoch_secs.map(|time| RetentionUnit {
+                    finished_at: time,
+                    id: *id,
+                    parent: false,
+                    namespace: &r.namespace,
+                })
             }))
             .collect();
-        terminal.sort_unstable();
-        let retained = terminal
-            .iter()
-            .filter(|(time, _, _)| now_epoch_secs.saturating_sub(*time) <= TERMINAL_RETENTION_SECS)
-            .count();
-        let mut excess = retained.saturating_sub(MAX_TERMINAL_ARRAYS);
-        for (time, id, parent) in terminal {
-            let expired = now_epoch_secs.saturating_sub(time) > TERMINAL_RETENTION_SECS;
-            if !expired && excess == 0 {
-                continue;
-            }
-            if !expired {
-                excess -= 1;
-            }
+        terminal.sort_unstable_by_key(|unit| (unit.finished_at, unit.id));
+        for (id, parent) in retention_evictions(&terminal, now_epoch_secs) {
             if parent {
                 if let Some(manifest) = self.manifests.remove(&id) {
                     for (_, child) in manifest.cohorts {
@@ -2037,9 +2114,9 @@ mod tests {
     }
 
     #[test]
-    fn registration_keeps_only_the_newest_finished_arrays() {
+    fn registration_keeps_only_a_namespaces_newest_finished_arrays() {
         let mut arrays = TaskArrays::default();
-        for id in 1..=(MAX_TERMINAL_ARRAYS as u64 + 5) {
+        for id in 1..=(MAX_TERMINAL_PER_NAMESPACE as u64 + 5) {
             registered(&mut arrays, &register(4, 4, 1), id);
             arrays
                 .apply(
@@ -2057,8 +2134,158 @@ mod tests {
             .filter(|(_, r)| r.state.status().is_terminal())
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(terminal.len(), MAX_TERMINAL_ARRAYS);
+        assert_eq!(terminal.len(), MAX_TERMINAL_PER_NAMESPACE);
         assert_eq!(terminal.first(), Some(&6), "the oldest go first");
+    }
+
+    /// Run a singleton to a failed end on node `a`, at `now`.
+    fn fail_singleton(arrays: &mut TaskArrays, id: u64, now: u64) {
+        arrays
+            .apply(
+                &sync(
+                    id,
+                    Vec::new(),
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                || 0,
+            )
+            .unwrap();
+        let mut result = finished(0, 1, 0);
+        result.failed_count = 1;
+        result.failed_indices = IndexRangeSet::from_range(0..=0);
+        arrays
+            .apply(
+                &TaskArrayWrite::Sync {
+                    now_epoch_secs: now,
+                    batch_id: id,
+                    results: vec![(node("a"), result)],
+                    grants: Vec::new(),
+                },
+                || 0,
+            )
+            .unwrap();
+        assert!(arrays.get(id).unwrap().state.status().is_terminal());
+    }
+
+    fn cancelled_in(arrays: &mut TaskArrays, namespace: &str, id: u64, now: u64) {
+        let mut write = register_in(namespace);
+        if let TaskArrayWrite::Register {
+            submitted_at_epoch_secs,
+            ..
+        } = &mut write
+        {
+            *submitted_at_epoch_secs = now;
+        }
+        registered(arrays, &write, id);
+        arrays
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    now_epoch_secs: now,
+                    batch_id: id,
+                },
+                || 0,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_failed_cron_run_stays_in_definition_history_after_twenty_newer_runs() {
+        let mut arrays = TaskArrays::default();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                || 0,
+            )
+            .unwrap();
+        let failed = registered(&mut arrays, &cron_fire("ops", "nightly", 3), 1);
+        fail_singleton(&mut arrays, failed, 200);
+
+        for id in 2..=(MAX_TERMINAL_PER_NAMESPACE as u64 + 2) {
+            cancelled_in(&mut arrays, "ops", id, 300);
+        }
+        assert!(
+            arrays.get(failed).is_none(),
+            "the run's details were pruned"
+        );
+
+        let history = &arrays.jobs().definition("ops", "nightly").unwrap().history;
+        assert_eq!(history.len(), 1);
+        let outcome = &history[0];
+        assert_eq!(outcome.run, failed);
+        assert_eq!(outcome.status, TaskArrayStatus::CompletedWithFailures);
+        assert_eq!((outcome.succeeded, outcome.failed), (0, 1));
+        assert_eq!(outcome.started_at_epoch_secs, 180);
+        assert_eq!(outcome.finished_at_epoch_secs, 200);
+        assert_eq!(outcome.first_failed_index, Some(0));
+        assert!(outcome.failed());
+    }
+
+    #[test]
+    fn one_namespace_cannot_evict_another_namespaces_terminal_runs() {
+        let mut arrays = TaskArrays::default();
+        cancelled_in(&mut arrays, "quiet", 1, 10);
+        for id in 2..=(MAX_TERMINAL_ARRAYS as u64 * 2) {
+            cancelled_in(&mut arrays, "busy", id, 20);
+        }
+        // The next registration prunes.
+        registered(&mut arrays, &register_in("busy"), 1000);
+        assert!(arrays.get(1).is_some(), "quiet's only run was evicted");
+        let terminal: Vec<_> = arrays
+            .iter()
+            .filter(|(_, record)| record.state.status().is_terminal())
+            .collect();
+        assert!(
+            terminal.len() <= MAX_TERMINAL_ARRAYS,
+            "{} kept",
+            terminal.len()
+        );
+        let busy = terminal
+            .iter()
+            .filter(|(_, record)| record.namespace == "busy")
+            .count();
+        assert!(busy <= MAX_TERMINAL_PER_NAMESPACE, "{busy} kept for busy");
+    }
+
+    #[test]
+    fn definition_history_is_bounded_to_n_entries() {
+        use super::super::job::MAX_DEFINITION_HISTORY;
+        let mut arrays = TaskArrays::default();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                || 0,
+            )
+            .unwrap();
+        let runs = MAX_DEFINITION_HISTORY as u64 + 3;
+        for minute in 3..3 + runs {
+            let id = registered(
+                &mut arrays,
+                &cron_fire("ops", "nightly", minute as i64),
+                minute,
+            );
+            arrays
+                .apply(
+                    &TaskArrayWrite::Cancel {
+                        now_epoch_secs: minute * 60,
+                        batch_id: id,
+                    },
+                    || 0,
+                )
+                .unwrap();
+        }
+        let history = &arrays.jobs().definition("ops", "nightly").unwrap().history;
+        assert_eq!(history.len(), MAX_DEFINITION_HISTORY);
+        assert_eq!(history.first().map(|outcome| outcome.run), Some(6));
+        assert_eq!(history.last().map(|outcome| outcome.run), Some(2 + runs));
+        assert!(
+            history
+                .iter()
+                .all(|outcome| outcome.status == TaskArrayStatus::Cancelled)
+        );
+        // The bound is part of the durable format too.
+        let reopened: TaskArrays =
+            serde_json::from_slice(&serde_json::to_vec(&arrays).unwrap()).unwrap();
+        assert_eq!(reopened, arrays);
     }
 
     #[test]

@@ -1635,7 +1635,10 @@ fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
         "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
     );
     for row in rows {
-        let pid = pid_cell(&row.instance);
+        // A job row stands for many tasks, so it shows their count, not a PID.
+        let pid = row
+            .tasks
+            .map_or_else(|| pid_cell(&row.instance), |tasks| format!("tasks:{tasks}"));
         let cpu = row
             .cpu_percent
             .map(|cpu| format!("{cpu:.1}%"))
@@ -2505,14 +2508,7 @@ pub async fn jobs(definitions: bool, output: OutputFormat) -> Result<(), RelishE
     }
     if definitions {
         for row in rows["definitions"].as_array().into_iter().flatten() {
-            println!(
-                "{}/{} revision {}: {} tasks, UTC schedule {}",
-                row["namespace"].as_str().unwrap_or("?"),
-                row["name"].as_str().unwrap_or("?"),
-                row["revision"],
-                row["count"],
-                row["cron"]["expression"].as_str().unwrap_or("disabled")
-            );
+            print!("{}", format_definition(row));
         }
     } else {
         for row in rows["batches"].as_array().into_iter().flatten() {
@@ -2942,6 +2938,42 @@ fn render_token_scope(scope: &super::client::TokenScopeSummary) -> String {
     }
 }
 
+/// One job definition for `relish jobs --definitions`: its schedule, then
+/// its last outcomes, newest first. The outcomes outlive the runs' details.
+fn format_definition(row: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "{}/{} revision {}: {} tasks, UTC schedule {}\n",
+        row["namespace"].as_str().unwrap_or("?"),
+        row["name"].as_str().unwrap_or("?"),
+        row["revision"],
+        row["count"],
+        row["cron"]["expression"].as_str().unwrap_or("disabled")
+    );
+    let history = row["history"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for outcome in history.iter().rev() {
+        let _ = write!(
+            text,
+            "  run {} finished {}: {}, {} succeeded, {} failed",
+            outcome["run"],
+            outcome["finished_at_epoch_secs"]
+                .as_u64()
+                .map_or_else(|| "?".to_string(), format_utc),
+            outcome["status"].as_str().unwrap_or("?"),
+            outcome["succeeded"],
+            outcome["failed"],
+        );
+        if outcome["not_run"].as_u64().is_some_and(|count| count > 0) {
+            let _ = write!(text, ", {} not run", outcome["not_run"]);
+        }
+        if let Some(index) = outcome["first_failed_index"].as_u64() {
+            let _ = write!(text, "; first failure: task {index}");
+        }
+        text.push('\n');
+    }
+    text
+}
+
 /// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
 fn format_utc(unix_seconds: u64) -> String {
     let Ok(at) = i64::try_from(unix_seconds)
@@ -3184,7 +3216,36 @@ mod tests {
             },
             cpu_percent: cpu,
             memory_bytes: memory,
+            tasks: None,
         }
+    }
+
+    #[test]
+    fn job_definitions_list_their_last_outcomes_newest_first() {
+        let text = format_definition(&serde_json::json!({
+            "namespace": "ops", "name": "nightly", "revision": 2, "count": 1,
+            "cron": {"expression": "0 3 * * *"},
+            "history": [
+                {"run": 40, "finished_at_epoch_secs": 1_791_601_200u64, "status": "Succeeded",
+                 "succeeded": 1, "failed": 0, "not_run": 0},
+                {"run": 41, "finished_at_epoch_secs": 1_791_687_600u64, "status": "CompletedWithFailures",
+                 "succeeded": 0, "failed": 1, "not_run": 0, "first_failed_index": 0},
+            ],
+        }));
+        insta::assert_snapshot!(text);
+    }
+
+    #[test]
+    fn top_shows_a_job_row_with_its_running_task_count() {
+        let mut job = top_row("rb-2", "tasks", None, Some(250.0), Some(8 << 20));
+        job.instance.app_name = "render".into();
+        job.tasks = Some(27);
+        let table = render_top(&[job]);
+        let line = table.lines().nth(1).unwrap();
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(columns[1], "render", "{table}");
+        assert_eq!(columns[4], "tasks:27", "{table}");
+        assert_eq!(columns[6], "250.0%", "{table}");
     }
 
     #[test]
