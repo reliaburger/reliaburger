@@ -62,6 +62,65 @@ impl ProcessControl {
     }
 }
 
+impl ProcessControl {
+    /// Remove the retired generation of a reusable instance identity, so
+    /// identities that never run again leave nothing behind (#678).
+    ///
+    /// The caller must already exclude other lifecycle operations on `id`, as
+    /// an executor pool does for a slot it is retiring. A later `prepare`
+    /// publishes a fresh generation, exactly as on a new node. A generation
+    /// that may still own a process is refused and kept.
+    pub(crate) async fn forget_retired(&self, id: &InstanceId) -> io::Result<()> {
+        self.run(id, |this, id| {
+            let directory = this.directory(&id)?;
+            let garbage = this
+                .root
+                .parent()
+                .ok_or_else(|| io::Error::other("process owners have no parent"))?
+                .join("forgotten-process-owners");
+            match std::fs::symlink_metadata(&garbage) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => reap_forgotten(&garbage)?,
+            }
+            match std::fs::symlink_metadata(&directory) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) => validate_directory(&directory)?,
+            }
+            let _operation = operation_lock(&directory)?;
+            let _owner = wait_for_owner_lock(&directory)?;
+            let record = this.load(&id)?;
+            if !terminal(&record.phase) {
+                return Err(io::Error::other("process generation has not retired"));
+            }
+            create_directory(&garbage)?;
+            let destination = garbage.join(format!("{}-{}", id.0, record.nonce));
+            // Atomic removal from the inventory first: an interrupted delete
+            // leaves a private garbage directory, never a partial record.
+            std::fs::rename(&directory, &destination)?;
+            File::open(&this.root)?.sync_all()?;
+            File::open(&garbage)?.sync_all()?;
+            std::fs::remove_dir_all(destination)?;
+            File::open(&garbage)?.sync_all()
+        })
+        .await
+    }
+}
+
+/// Finish deletions an earlier [`ProcessControl::forget_retired`] began.
+fn reap_forgotten(directory: &Path) -> io::Result<()> {
+    validate_directory(directory)?;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        validate_directory(&entry.path())?;
+        // Publication into this private directory already removed the
+        // generation from the inventory; only its bytes remain.
+        std::fs::remove_dir_all(entry.path())?;
+    }
+    File::open(directory)?.sync_all()
+}
+
 fn terminal(phase: &OwnerPhase) -> bool {
     matches!(phase, OwnerPhase::Cancelled | OwnerPhase::Retired { .. })
 }

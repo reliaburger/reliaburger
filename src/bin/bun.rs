@@ -934,6 +934,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    // Log and metric caps must fit the disk they bound (#678).
+    let data_filesystem =
+        reliaburger::bun::disk_pressure::FilesystemUsage::of(&config.storage.data)
+            .with_context(|| format!("cannot measure {}", config.storage.data.display()))?;
+    config
+        .validate_storage_caps(data_filesystem.total_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // Create port allocator from config
     let port_allocator = PortAllocator::new(
@@ -1892,6 +1899,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
     agent.adopt_recorded_instances().await?;
     let task_runner = agent.delegated_task_runner(&data_base)?;
+    let forgotten = task_runner.forget_retired_executors().await;
+    if forgotten > 0 {
+        eprintln!("bun: forgot {forgotten} retired executor identities");
+    }
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     let task_runner = if let Some(kernel) = agent.delegated_namespace_kernel() {
         task_runner.with_namespace_policy(
