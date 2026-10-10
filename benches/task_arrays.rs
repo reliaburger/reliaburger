@@ -8,7 +8,10 @@
 /// - the node pool's overhead per task with a zero-cost fake runner (the
 ///   ceiling a real process can't beat);
 /// - the fork/exec floor of this machine: `/usr/bin/true` through the
-///   real process runner at concurrency 1, 4 and 16.
+///   real process runner at concurrency 1, 4 and 16;
+/// - a worker's disk cost per task: 1M outcomes through the real ledger and
+///   result index, broken down per file, failing above
+///   `STORAGE_BYTES_PER_TASK`.
 ///
 /// Every benchmark reports tasks (or elements) per second.
 use std::path::PathBuf;
@@ -16,9 +19,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use reliaburger::bun::task_array_node::STORAGE_BYTES_PER_TASK;
 use reliaburger::bun::task_executor::{
-    AttemptOutcome, ChunkWork, FakeRunner, PoolConfig, ProcessRunner, TaskPool, TaskRunner,
+    AttemptOutcome, ChunkWork, FakeRunner, PoolConfig, ProcessRunner, TaskFinal, TaskPool,
+    TaskRecord, TaskRunner,
 };
+use reliaburger::bun::task_ledger::Ledger;
 use reliaburger::meat::NodeId;
 use reliaburger::meat::index_set::IndexRangeSet;
 use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
@@ -185,5 +191,69 @@ fn bench_executor(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_index_set, bench_leader, bench_executor);
+/// Write `tasks` outcomes (1% failed) the way a worker does: blocks of 4,096
+/// records, each fsynced to the ledger and then its result index. Returns
+/// the allocated bytes of the ledger and the index.
+fn write_outcomes(directory: &std::path::Path, tasks: u32) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let path = directory.join("ledger");
+    let mut ledger = Ledger::open(&path).unwrap();
+    for start in (0..tasks).step_by(4096) {
+        let records: Vec<TaskRecord> = (start..(start + 4096).min(tasks))
+            .map(|index| TaskRecord {
+                grant_attempt: 1,
+                index,
+                attempts: 1,
+                outcome: if index % 100 == 0 {
+                    TaskFinal::Failed
+                } else {
+                    TaskFinal::Succeeded
+                },
+                exit_code: Some(i32::from(index % 100 == 0)),
+                run_ms: 5,
+                output: None,
+            })
+            .collect();
+        ledger.append(&records);
+        ledger.flush().unwrap();
+    }
+    let allocated = |path: &std::path::Path| std::fs::metadata(path).unwrap().blocks() * 512;
+    (allocated(&path), allocated(&path.with_extension("index")))
+}
+
+fn bench_storage(c: &mut Criterion) {
+    let directory = tempfile::tempdir().unwrap();
+    let (ledger, index) = write_outcomes(directory.path(), MILLION);
+    let per_task = (ledger + index) as f64 / f64::from(MILLION);
+    eprintln!(
+        "storage per 1M tasks: ledger {:.1} MiB ({:.1} B/task), result index {:.1} MiB ({:.1} B/task), total {per_task:.1} B/task",
+        ledger as f64 / 1048576.0,
+        ledger as f64 / f64::from(MILLION),
+        index as f64 / 1048576.0,
+        index as f64 / f64::from(MILLION),
+    );
+    assert!(
+        ledger + index <= u64::from(MILLION) * STORAGE_BYTES_PER_TASK,
+        "{per_task:.1} bytes per task is over the {STORAGE_BYTES_PER_TASK}-byte bound"
+    );
+
+    let mut group = c.benchmark_group("storage");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(65_536));
+    group.bench_function("ledger_and_index_64k", |b| {
+        b.iter(|| {
+            let directory = tempfile::tempdir().unwrap();
+            write_outcomes(directory.path(), 65_536)
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_index_set,
+    bench_leader,
+    bench_executor,
+    bench_storage
+);
 criterion_main!(benches);
