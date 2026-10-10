@@ -546,24 +546,56 @@ the real `curl … | sh` install against it on every host we advertise.
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
-5. **Record it.** Copy each host's record into
+5. **Pull the plug.** Killing a process isn't a power cut: page-cache writes
+   survive one and not the other. Run the power-cut and reboot qualifications
+   ([what they prove](testing.md#pulling-the-plug)) on the candidate's commit,
+   against a disposable Lima VM. Never use the development VM; the drivers
+   refuse `reliaburger-test` by name. Create it from that VM's template with
+   4 vCPUs, 6 GiB of memory, 6 GiB of swap (so the linker isn't killed) and
+   only the checkout mounted, read-only. Then, from that checkout:
+
+   ```sh
+   for fixture in exporter leases backups; do
+     scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_VM \
+       --fixture "$fixture" --iterations 10 --record "power-cut-$fixture.md"
+   done
+   for i in $(seq 10); do scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_VM; done
+   for i in $(seq 10); do scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_VM; done
+   ```
+
+   Every iteration must pass. A row marked `PASS (VM start retried)` is the
+   known Lima start failure straight after a forced stop, not a product
+   failure; any other failure is a release blocker. Record the commit, the
+   VM, each lane's runs and its rule-of-three bound in
+   `docs/qualification/DATE-power-cut-reboot.md`, as the
+   [11 October record](qualification/2026-10-11-power-cut-reboot.md) does.
+   Ten clean runs only rule out failure rates above 30%, so this catches a
+   regression, not a rare race; a release that changes storage, locking or
+   ownership (as #613 did) runs 25.
+
+   Also link the candidate commit's `task-array benchmarks` run from the gate
+   issue. It runs nightly on `main` and fails only on a regression of more
+   than 2x against main's last baseline; its `criterion-task-arrays` artefact
+   is the cost evidence for bounded-cost claims such as 0.2.0's (#668).
+
+6. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest, and link them from the release's milestone or
    gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
 
-6. **Clean up the staging pre-releases.** Delete them before promotion so the
+7. **Clean up the staging pre-releases.** Delete them before promotion so the
    release page and the release notes' "previous tag" don't pick them up:
 
    ```sh
    gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
    ```
 
-7. **Promote** as described above, with the same run ID and digest. The
+8. **Promote** as described above, with the same run ID and digest. The
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
 
-8. **Update the docs** once the release is public: the release date in the
+9. **Update the docs** once the release is public: the release date in the
    [roadmap](roadmap.md) (tick the release) and the homepage
    (`docs/website/index.html`), and the bootstrap's default version if it
    changed. Grep for the previous version to find the other "current
