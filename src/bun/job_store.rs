@@ -84,7 +84,7 @@ impl JobStore {
         &self.checkpoint.arrays
     }
 
-    pub(super) fn apply(&mut self, write: &TaskArrayWrite) -> Result<Option<u64>, String> {
+    pub(super) fn apply(&mut self, write: &TaskArrayWrite) -> Result<TaskArrayApplied, String> {
         if self.fenced {
             return Err(
                 "standalone job storage is fenced after publication failure; restart and reconcile"
@@ -121,10 +121,7 @@ impl JobStore {
             return Err(format!("job storage publication failed: {error}"));
         }
         self.checkpoint = next;
-        Ok(match result {
-            TaskArrayApplied::Registered { batch_id } => Some(batch_id),
-            _ => None,
-        })
+        Ok(result)
     }
 }
 
@@ -150,7 +147,7 @@ fn reserve_progress(checkpoint: &Checkpoint) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::meat::task_array::TaskArraySpec;
-    use crate::meat::task_array_store::TaskArrayWrite;
+    use crate::meat::task_array_store::{TaskArrayApplied, TaskArrayWrite};
 
     fn registration() -> TaskArrayWrite {
         TaskArrayWrite::Register {
@@ -171,7 +168,10 @@ mod tests {
             spec.count = 65_536;
             spec.chunk_size = 1;
         }
-        assert_eq!(store.apply(&write).unwrap(), Some(1));
+        assert_eq!(
+            store.apply(&write).unwrap(),
+            TaskArrayApplied::Registered { batch_id: 1 }
+        );
         assert!(
             store.apply(&write).is_err(),
             "future progress must fit before another run is accepted"
@@ -225,11 +225,17 @@ mod tests {
     fn a_restart_preserves_execution_and_the_next_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = JobStore::open(dir.path()).unwrap();
-        assert_eq!(store.apply(&registration()).unwrap(), Some(1));
+        assert_eq!(
+            store.apply(&registration()).unwrap(),
+            TaskArrayApplied::Registered { batch_id: 1 }
+        );
         drop(store);
         let mut store = JobStore::open(dir.path()).unwrap();
         assert!(store.arrays().get(1).is_some());
-        assert_eq!(store.apply(&registration()).unwrap(), Some(2));
+        assert_eq!(
+            store.apply(&registration()).unwrap(),
+            TaskArrayApplied::Registered { batch_id: 2 }
+        );
     }
 
     #[test]
