@@ -333,7 +333,7 @@ Valid actions: `deploy`, `scale`, `logs`, `metrics`, `exec`, `host-exec`, `admin
 
 ### 5.7 Namespace
 
-Optional workload isolation with resource quotas (CPU, memory, GPU, app count, replica count). Reliaburger uses a single default namespace unless you explicitly create others.
+Optional workload isolation with resource quotas (CPU, memory, GPU, app count, replica count). Reliaburger uses a single default namespace unless you explicitly create others. CPU, memory and GPU budgets cover jobs as well as apps: the leader charges every job attempt it grants against them, after the namespace's apps. Every namespace also gets its own share of the cluster's job capacity (64 active bulk runs and 64 job definitions), and cron fires and deployment hooks keep reserved headroom that bulk work can't use.
 
 ```toml
 [namespace.team-backend]
@@ -1095,9 +1095,10 @@ Individual tasks remain addressable for diagnosis, with bounded detail queries
 and exports. Histograms merge before percentiles are calculated, and metric
 labels never use individual task IDs. Local FIFO admission prevents small tasks
 continually overtaking a large waiting request, at the cost of idle capacity
-behind that request. Namespace app quotas currently govern ordinary placement,
-not delegated array resource usage. Tenant allocation, DRF and service pre-emption
-remain future work;
+behind that request. Namespace quotas govern app placement and job grants
+alike, and each namespace has its own caps on active runs and definitions, with
+headroom reserved for cron fires and deployment hooks. Fair sharing of spare
+capacity between tenants (DRF) and service pre-emption remain future work;
 new app deployments still require free capacity and rollout headroom.
 
 **Implementation status:** this is the architecture implemented in
@@ -1216,7 +1217,7 @@ Not in v1. Reliaburger v1 supports whole-device GPU allocation only (`gpu = 1`, 
 
 ### Q13: How does multi-tenancy work? Can one team starve the cluster?
 
-Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Meat scheduler enforces when it places workloads. The check happens in the leader's scheduling pass, not at apply time: `relish apply` accepts an over-quota app and commits it to the desired state, and Meat then leaves it unplaced. Running apps are never evicted to make room. The leader records why in the council, so `relish status`, `relish inspect`, the dashboard and `relish wtf` all show the app as blocked with the quota it would break, and the reason clears on the first pass where the app fits. An apply-time rejection isn't on the roadmap yet. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
+Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Meat scheduler enforces when it places workloads. The check happens in the leader's scheduling pass, not at apply time: `relish apply` accepts an over-quota app and commits it to the desired state, and Meat then leaves it unplaced. Running apps are never evicted to make room. The leader records why in the council, so `relish status`, `relish inspect`, the dashboard and `relish wtf` all show the app as blocked with the quota it would break, and the reason clears on the first pass where the app fits. An apply-time rejection isn't on the roadmap yet. Jobs are held to the same budget at the moment the leader grants them work: each attempt's CPU, memory and GPU requests count against the namespace after its apps, and a run with no room waits with a visible quota-blocked reason instead of starting. Job capacity is divided too. One namespace can hold at most 64 active arrays, batches and manual runs and 64 job definitions, and 32 of the cluster's 128 active-run slots are kept for cron fires and deployment hooks, so a tenant flooding the queue can't lock out anyone else's schedules or deploys. A cron fire that still finds no room is recorded as a skipped occurrence with an event, never dropped silently. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
 
 ### Q14: What's the minimum cluster size?
 

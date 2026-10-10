@@ -301,6 +301,9 @@ Batch jobs retain distinct execution identities and their original scoped
 labels across retries and recovery. Finite durable history keeps replay fences;
 see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and job attempts share node CPU/memory admission. Committed grants and
 accepted outcomes survive leader changes; retired nodes receive no new work.
+Namespace quotas bound job attempts as well as apps, each namespace has its own
+caps on active runs and job definitions, and cron fires and deployment hooks
+keep reserved headroom, so one tenant can't starve another.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary

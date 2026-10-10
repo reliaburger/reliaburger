@@ -111,6 +111,14 @@ council, so any node gives the same answer. Raise the budget, or shrink or
 delete other apps in the namespace, and the next scheduling pass (a few seconds
 later) places the app and clears the reason.
 
+The same budget covers jobs. The leader charges each job attempt it lets start
+against the namespace's `cpu`, `memory` and GPU budget, after the namespace's
+apps, so a job never displaces an app that fits. A job with no room waits
+instead of failing, and `relish batch-status ID` says why (`waiting for quota:
+namespace "shop" would exceed CPU quota: …`). Running attempts are never
+stopped; new ones start as old ones finish. `max_apps` and `max_replicas`
+count apps only. See "Execution and capacity limits" in the batch jobs chapter.
+
 A `[namespace]` block can also give the namespace its own secret key with
 `secret_key = true`, so its encrypted values don't decrypt anywhere else. See
 "A key per namespace" in the security chapter.
