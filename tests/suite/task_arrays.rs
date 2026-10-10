@@ -32,6 +32,8 @@ use crate::task_harness::TestTasks;
 
 const SHELL: &str = "/bin/sh";
 const NODE: &str = "node-1";
+/// Finished runs stay readable this long unless a test shortens it.
+const RETENTION: Duration = Duration::from_secs(3600);
 
 struct Harness {
     base_url: String,
@@ -46,6 +48,7 @@ struct Options {
     runner: NodeRunner,
     allowed: Vec<&'static str>,
     slots: u32,
+    retention: Duration,
 }
 
 impl Options {
@@ -55,6 +58,7 @@ impl Options {
             runner: NodeRunner::Process(ProcessRunner::default()),
             allowed: vec![SHELL],
             slots: 8,
+            retention: RETENTION,
         }
     }
 }
@@ -165,6 +169,7 @@ impl Harness {
                 Duration::from_millis(50),
                 Duration::from_secs(30),
             )
+            .with_retention(options.retention)
             .with_storage(data.path())
             .await
             .unwrap(),
@@ -380,6 +385,7 @@ async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
         })),
         allowed: vec![SHELL],
         slots: 64,
+        retention: RETENTION,
     })
     .await;
     let council = harness.council.clone().unwrap();
@@ -425,6 +431,7 @@ async fn cancelling_an_array_stops_it() {
         })),
         allowed: vec![SHELL],
         slots: 4,
+        retention: RETENTION,
     })
     .await;
     let batch_id = harness.submit_ok(shell_array(1000, 100, "exit 0")).await;
@@ -513,6 +520,7 @@ async fn mixed_manifest_has_atomic_identity_histograms_and_indexed_pages() {
         })),
         allowed: vec![SHELL],
         slots: 16,
+        retention: RETENTION,
     })
     .await;
     let cohort = |name: &str, count: u32, cpu: &str, memory: &str| json!({"name":name,"count":count,"chunk_size":256,"max_attempts":1,"template":{"image":"fixture:v1","command":["worker","{index}"],"cpu":cpu,"memory":memory}});
@@ -570,6 +578,7 @@ async fn invalid_profile_refuses_the_whole_manifest_and_parent_cancel_drains_all
         })),
         allowed: vec![SHELL],
         slots: 2,
+        retention: RETENTION,
     })
     .await;
     let profile = |name: &str, count: u32| json!({"name":name,"count":count,"chunk_size":10,"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]}});
@@ -656,6 +665,7 @@ async fn manifest_admission_and_summary_views_honour_the_callers_scope() {
             })),
             allowed: vec![SHELL],
             slots: 2,
+            retention: RETENTION,
         },
         Some(tokens),
     )
@@ -1064,5 +1074,123 @@ async fn standalone_restart_retains_runs_requests_and_the_next_identity() {
             .as_u64()
             .unwrap()
             > id
+    );
+}
+
+/// Bytes in every file under `path`.
+fn bytes_under(path: &std::path::Path) -> u64 {
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| {
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    bytes_under(&entry.path())
+                } else {
+                    entry.metadata().map_or(0, |m| m.len())
+                }
+            })
+            .sum()
+    })
+}
+
+fn files_under(path: &std::path::Path) -> usize {
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| {
+                if entry.file_type().unwrap().is_dir() {
+                    files_under(&entry.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mass_failing_array_keeps_bounded_output_on_disk() {
+    let harness = Harness::start(Options {
+        runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |_| {
+            AttemptOutcome::Exited { code: 1 }
+        })),
+        slots: 64,
+        ..Options::processes(true)
+    })
+    .await;
+    let mut array = shell_array(20_000, 1000, "exit 1");
+    array["spec"]["max_attempts"] = json!(1);
+    let batch_id = harness.submit_ok(array).await;
+    let summary = harness.wait_done(batch_id, 120).await;
+    assert_eq!(summary["failed"], 20_000, "{summary}");
+
+    // Twenty chunks: one output segment each, holding at most sixteen
+    // tasks' output, instead of twenty thousand files.
+    let output = harness
+        ._data
+        .path()
+        .join(format!("task-arrays/{batch_id}/output"));
+    assert_eq!(files_under(&output), 20);
+    let kept = reliaburger::bun::task_output::KEPT_FAILURES_PER_CHUNK as u64;
+    assert!(bytes_under(&output) <= 20 * kept * (8 + 4096 + 64));
+
+    // A failure past its chunk's share says so rather than looking absent.
+    let mut gone = 0;
+    for index in 0..40 {
+        let (status, body) = harness
+            .get(&format!("/v1/batch/{batch_id}/tasks/{index}/logs"))
+            .await;
+        match status {
+            200 => {}
+            410 => {
+                gone += 1;
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.contains("wasn't kept"), "{body}");
+            }
+            other => panic!("task {index}: {other} {}", String::from_utf8_lossy(&body)),
+        }
+    }
+    assert!(gone >= 40 - 2 * kept as usize, "{gone} of 40 not kept");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_disk_returns_to_baseline_after_runs_retire() {
+    let harness = Harness::start(Options {
+        runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |task| {
+            AttemptOutcome::Exited {
+                code: i32::from(task.index % 7 == 0),
+            }
+        })),
+        slots: 64,
+        retention: Duration::ZERO,
+        ..Options::processes(true)
+    })
+    .await;
+    let arrays = harness._data.path().join("task-arrays");
+    let baseline = bytes_under(&arrays);
+    let mut array = shell_array(5_000, 500, "exit 0");
+    array["spec"]["max_attempts"] = json!(1);
+    let batch_id = harness.submit_ok(array).await;
+    harness.wait_done(batch_id, 60).await;
+
+    // No new submission: the leader's retention write alone retires the run
+    // and the worker deletes its ledger, index and output.
+    let directory = arrays.join(batch_id.to_string());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while directory.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retired run's files stayed: {} bytes",
+            bytes_under(&directory)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let (status, _) = harness.get(&format!("/v1/batch/{batch_id}")).await;
+    assert_eq!(status, 404, "the cluster forgot the run too");
+    assert!(
+        bytes_under(&arrays) <= baseline + 4096,
+        "{} bytes left after retirement, {baseline} before",
+        bytes_under(&arrays)
     );
 }

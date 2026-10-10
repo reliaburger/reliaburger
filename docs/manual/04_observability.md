@@ -60,7 +60,20 @@ Retention and export are node config:
 retention_days = 7                # default
 export_path = "s3://bucket/logs/" # optional: a local path, file://, s3:// or gs://
 export_interval_secs = 3600       # default
+max_storage_mb = 2048             # default; 0 = no size cap
+
+[metrics]
+max_storage_mb = 1024             # default; 0 = no size cap
 ```
+
+Both stores are capped by size as well as age. Past the cap, Bun prunes the
+oldest Parquet files on its five-minute disk check; with an `export_path` it
+prunes only files that have already shipped. A cap of `0` turns the size limit
+off, leaving only `retention_days`, so set it only when something else watches
+the disk. Bun refuses to start with a cap larger than the filesystem holding
+its data directory, because such a cap would never prune before the disk
+filled. Singleton jobs stream their output into the log store, so a busy job
+node reaches the log cap well within the seven days.
 
 Exported Parquet archives answer SQL:
 

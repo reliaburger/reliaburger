@@ -934,6 +934,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    // Log and metric caps must fit the disk they bound (#678).
+    let data_filesystem =
+        reliaburger::bun::disk_pressure::FilesystemUsage::of(&config.storage.data)
+            .with_context(|| format!("cannot measure {}", config.storage.data.display()))?;
+    config
+        .validate_storage_caps(data_filesystem.total_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // Create port allocator from config
     let port_allocator = PortAllocator::new(

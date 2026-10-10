@@ -37,6 +37,7 @@ pub mod task_executor;
 pub mod task_ledger;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod task_namespace;
+pub mod task_output;
 pub mod task_rates;
 pub mod task_result_index;
 pub mod task_runtime;

@@ -406,9 +406,10 @@ rollup_interval_secs = 60
 # Prunes rollups past this age on the disk-pressure tick (see §3.3).
 rollup_retention_hours = 24
 
-# Maximum local metrics Parquet storage (MB). 0 = unlimited (the default).
-# When exceeded, exported files are pruned oldest-first (see §7.1).
-max_storage_mb = 0
+# Maximum local metrics Parquet storage (MB). Default: 1024. 0 = unlimited.
+# When exceeded, files are pruned oldest-first (see §7.1). Bun refuses to
+# start with a cap larger than the filesystem holding its data directory.
+max_storage_mb = 1024
 
 # Optional export destination for metrics Parquet files
 # (local path, file://, s3://, gs://). Default: unset.
@@ -458,7 +459,7 @@ The push interval is `metrics.rollup_interval_secs` (§6.1). The consistent-hash
 **Behaviour (`src/bun/disk_pressure.rs`):**
 
 1. If `export_path` is set, un-exported Parquet files are shipped to the destination first (via `object_store`), and only files whose exact bytes are recorded in the export checkpoint become eligible for deletion.
-2. Files are then pruned **oldest-first by mtime** when either they are past `retention_days` or total size exceeds `max_storage_mb`. With `max_storage_mb = 0` (the default) only the retention cutoff prunes.
+2. Files are then pruned **oldest-first by mtime** when either they are past `retention_days` or total size exceeds `max_storage_mb`. The cap defaults to 1024 MB (#678); `max_storage_mb = 0` is an explicit opt-out, and then only the retention cutoff prunes.
 3. Ingestion is never blocked; there is no in-memory ring-buffer degraded mode and no dedicated `mayo_storage_exhausted` alert.
 
 **Recovery:** pruning is idempotent and runs each pressure check; once usage is back under the threshold nothing is deleted.

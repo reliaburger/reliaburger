@@ -62,6 +62,42 @@ pub fn dir_parquet_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Default share of the filesystem, in percent, that task-array data (ledgers,
+/// result indexes, kept failure output) may use before a worker stops taking
+/// new grants.
+pub const TASK_DATA_MAX_PERCENT: u64 = 25;
+
+/// Disk space allocated to every regular file under `dir`, at any depth.
+/// Allocated, not apparent, size: a sparse result index pays only for the
+/// slots it wrote. A missing or unreadable entry counts as empty; this is
+/// an estimate for pressure, not an audit.
+pub fn dir_total_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dir_total_size(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |m| {
+                use std::os::unix::fs::MetadataExt;
+                // st_blocks counts 512-byte units whatever the block size.
+                m.blocks().saturating_mul(512)
+            }),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Whether a worker holding `task_bytes` of task data on `filesystem` must
+/// stop taking new task grants: the data is over `max_percent` of the
+/// filesystem, or the filesystem itself is under pressure.
+pub fn task_data_pressured(task_bytes: u64, filesystem: FilesystemUsage, max_percent: u64) -> bool {
+    filesystem.is_pressured()
+        || u128::from(task_bytes) * 100
+            > u128::from(filesystem.total_bytes) * u128::from(max_percent)
+}
+
 /// Check disk pressure and export-then-prune if needed.
 ///
 /// When the total Parquet size in `source_dir` exceeds `max_bytes`,
@@ -321,6 +357,34 @@ impl DiskPressureResignation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_output_counts_toward_disk_pressure() {
+        let root = tempfile::tempdir().unwrap();
+        let array = root.path().join("7");
+        std::fs::create_dir_all(array.join("output")).unwrap();
+        std::fs::write(array.join("ledger"), vec![0xab; 100_000]).unwrap();
+        std::fs::write(array.join("ledger.index"), vec![0xab; 100_000]).unwrap();
+        let filesystem = FilesystemUsage {
+            total_bytes: 1_000_000,
+            available_bytes: 900_000,
+        };
+        let before = dir_total_size(root.path());
+        assert!((200_000..220_000).contains(&before), "{before}");
+        assert!(!task_data_pressured(before, filesystem, 25));
+
+        std::fs::write(array.join("output/0-99-1.seg"), vec![0xab; 100_000]).unwrap();
+        let bytes = dir_total_size(root.path());
+        assert!(bytes >= before + 100_000, "kept output is task data too");
+        assert!(task_data_pressured(bytes, filesystem, 25));
+
+        // A nearly full filesystem refuses grants whatever task data holds.
+        let full = FilesystemUsage {
+            total_bytes: 1_000_000,
+            available_bytes: 100,
+        };
+        assert!(task_data_pressured(0, full, 25));
+    }
 
     #[tokio::test]
     async fn failed_export_is_reported_and_unexported_data_is_preserved() {
