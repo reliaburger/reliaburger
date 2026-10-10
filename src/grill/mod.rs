@@ -13,6 +13,8 @@ pub mod command;
 pub mod image;
 pub mod image_config;
 mod inventory;
+#[cfg(target_os = "linux")]
+pub mod kernel;
 pub mod mixed;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
