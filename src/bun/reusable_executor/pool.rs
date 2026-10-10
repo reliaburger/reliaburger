@@ -41,9 +41,13 @@ impl Runtime {
 const IDLE: Duration = Duration::from_secs(1);
 /// How long a caller waits for an executor to retire. A task stuck in an
 /// uninterruptible kernel wait (NFS, FUSE, a hung disk) can outlive any
-/// signal; past this, the slot and its lease stay quarantined while the
-/// eviction loop keeps retrying, and the caller gets its own outcome back.
+/// signal, and a runtime call can hang with it; past this, the slot and its
+/// lease stay quarantined while the eviction loop keeps retrying, and the
+/// caller gets its own outcome back.
 const RETIREMENT_DEADLINE: Duration = Duration::from_secs(10);
+/// How long one eviction tick spends on each executor, so one that won't
+/// retire can't hold up the others behind it.
+const EVICTION_BUDGET: Duration = Duration::from_secs(1);
 pub(crate) struct CommandReporting<'a> {
     pub sink: Option<&'a tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
     pub singletons: &'a std::sync::Mutex<
@@ -73,6 +77,10 @@ struct Context {
     lease: ResourceLease,
     sequence: u64,
     idle_since: tokio::time::Instant,
+    /// The retirement probe still in flight from an abandoned attempt. It is
+    /// awaited again rather than started again, so a runtime call that never
+    /// returns leaves one stuck task behind, not one per retry.
+    probe: Option<tokio::task::JoinHandle<bool>>,
     #[cfg(feature = "ebpf")]
     namespace: Option<crate::bun::task_namespace::NamespaceLease>,
 }
@@ -184,9 +192,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .filter_map(|(index, slot)| Some((index, slot.retiring.take()?)))
             .collect();
         for (index, mut context) in stuck {
-            if self.retirement_step(&mut context).await
-                && self.finish_retirement(&mut context).await
-            {
+            if self.retire(&mut context, EVICTION_BUDGET).await {
                 self.release(index, None).await;
             } else {
                 self.slots.lock().await[index].retiring = Some(context);
@@ -211,7 +217,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let Some((index, Some(context))) = victim else {
                 break;
             };
-            self.retire_and_release(index, context).await;
+            self.retire_and_release(index, context, EVICTION_BUDGET)
+                .await;
         }
     }
     async fn release(&self, index: usize, context: Option<Context>) {
@@ -324,16 +331,29 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             tokio::select! { biased; () = cancel.cancelled() => return None, () = changed => {} }
         }
     }
-    /// One non-blocking retirement attempt: true once the helper has stopped
-    /// and its task group is empty.
+    /// One retirement attempt: true once the helper has stopped and its task
+    /// group is empty. Cancel-safe: an unfinished probe stays in the context.
     async fn retirement_step(&self, context: &mut Context) -> bool {
         context.connection.take();
-        match self.runtime.state(&context.id).await {
-            Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
-            _ => {
-                let _ = self.lifecycle.kill(&context.id).await;
-                return false;
-            }
+        let probe = context.probe.get_or_insert_with(|| {
+            let runtime = self.runtime.clone();
+            let lifecycle = self.lifecycle.clone();
+            let id = context.id.clone();
+            tokio::spawn(async move {
+                match runtime.state(&id).await {
+                    Ok(ContainerState::Stopped)
+                    | Err(crate::grill::GrillError::NotFound { .. }) => true,
+                    _ => {
+                        let _ = lifecycle.kill(&id).await;
+                        false
+                    }
+                }
+            })
+        });
+        let stopped = probe.await.unwrap_or(false);
+        context.probe = None;
+        if !stopped {
+            return false;
         }
         // The runtime owns helper retirement; Bun owns the sibling task group.
         // Removing/reusing a group requires emptiness, independently of PID 1.
@@ -342,25 +362,33 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             Err(error) => error.kind() == std::io::ErrorKind::NotFound,
         }
     }
-    /// Retire within [`RETIREMENT_DEADLINE`]; false leaves the executor running.
-    async fn retire(&self, context: &mut Context) -> bool {
-        let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
-        while !self.retirement_step(context).await {
-            if tokio::time::Instant::now() >= deadline {
-                return false;
+    /// Retire within `budget`, every runtime call and file removal included;
+    /// false leaves the executor, its lease and its namespace binding held.
+    async fn retire(&self, context: &mut Context, budget: Duration) -> bool {
+        let retired = tokio::time::timeout(budget, async {
+            while !self.retirement_step(context).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.remove_files(context).await
+        })
+        .await
+        .unwrap_or(false);
+        if !retired {
+            return false;
         }
-        self.finish_retirement(context).await
-    }
-    /// Remove the emptied groups and files, then return the lease. The task
-    /// group must really be gone: one that survived `cgroup.kill` must never
-    /// be reused (see `prepare_cgroups`).
-    async fn finish_retirement(&self, context: &mut Context) -> bool {
+        // Releasing the binding takes a lock and must not be cut off halfway,
+        // so it runs on its own once retirement is proven.
         #[cfg(feature = "ebpf")]
         if let Some(namespace) = context.namespace.take() {
-            namespace.retired().await;
+            tokio::spawn(namespace.retired());
         }
+        context.lease.confirm_retired();
+        true
+    }
+    /// Remove the emptied groups and files. The task group must really be
+    /// gone: one that survived `cgroup.kill` must never be reused (see
+    /// `prepare_cgroups`). Each removal tolerates a previous attempt's.
+    async fn remove_files(&self, context: &Context) -> bool {
         for directory in [
             context.base.join("task"),
             context.base.join("helper"),
@@ -379,27 +407,25 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 }
             }
         }
-        if let Some(path) = context.socket_path.take() {
+        if let Some(path) = &context.socket_path {
             let _ = tokio::fs::remove_file(path).await;
         }
         let _ = tokio::fs::remove_dir_all(&context.directory).await;
-        context.lease.confirm_retired();
         true
     }
-    /// Retire and free the slot, or quarantine it with its lease for the
-    /// eviction loop to retry.
-    async fn retire_and_release(&self, index: usize, mut context: Context) {
-        if self.retire(&mut context).await {
+    /// Retire within `budget` and free the slot, or quarantine it with its
+    /// lease for the eviction loop to retry.
+    async fn retire_and_release(&self, index: usize, mut context: Context, budget: Duration) {
+        if self.retire(&mut context, budget).await {
             self.release(index, None).await;
         } else {
-            self.quarantine(index, context).await;
+            self.quarantine(index, context, budget).await;
         }
     }
-    async fn quarantine(&self, index: usize, context: Context) {
+    async fn quarantine(&self, index: usize, context: Context, budget: Duration) {
         eprintln!(
-            "executor {} did not retire within {}s; its slot and reservation stay quarantined until it does",
-            context.id.0,
-            RETIREMENT_DEADLINE.as_secs()
+            "executor {} did not retire within {budget:?}; its slot and reservation stay quarantined until it does",
+            context.id.0
         );
         let mut slots = self.slots.lock().await;
         slots[index].holder = None;
@@ -734,8 +760,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         };
         let mut context = match existing {
             Some(mut old) if old.key != key || self.budget.has_waiters() => {
-                if !self.retire(&mut old).await {
-                    self.quarantine(index, old).await;
+                if !self.retire(&mut old, RETIREMENT_DEADLINE).await {
+                    self.quarantine(index, old, RETIREMENT_DEADLINE).await;
                     return failed(ExecutorError::Configuration(
                         "the slot's previous executor has not retired",
                     ));
@@ -809,12 +835,14 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 lease: lease.quarantine_on_drop(),
                 sequence: 0,
                 idle_since: tokio::time::Instant::now(),
+                probe: None,
                 #[cfg(feature = "ebpf")]
                 namespace: None,
             };
             let start = self.start(&mut new, &template, profile).await;
             if let Err(error) = start {
-                self.retire_and_release(index, new).await;
+                self.retire_and_release(index, new, RETIREMENT_DEADLINE)
+                    .await;
                 return failed(error);
             }
             context = Some(new);
@@ -830,7 +858,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 ExecutorKey::new(template).is_ok_and(|live| live == context.key)
             });
             let Some(refreshed) = refreshed else {
-                self.retire_and_release(index, context).await;
+                self.retire_and_release(index, context, RETIREMENT_DEADLINE)
+                    .await;
                 return failed(ExecutorError::Configuration(
                     "namespace credentials no longer authorise this command",
                 ));
@@ -886,7 +915,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         let (sequence, mut bytes) = match preparation {
             Ok(encoded) => encoded,
             Err(error) => {
-                self.retire_and_release(index, context).await;
+                self.retire_and_release(index, context, RETIREMENT_DEADLINE)
+                    .await;
                 return failed(error);
             }
         };
@@ -1013,7 +1043,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             AttemptOutcome::Cancelled | AttemptOutcome::TimedOut | AttemptOutcome::Unknown { .. }
         ) || self.budget.has_waiters()
         {
-            self.retire_and_release(index, context).await;
+            self.retire_and_release(index, context, RETIREMENT_DEADLINE)
+                .await;
         } else {
             context.sequence = sequence;
             context.idle_since = tokio::time::Instant::now();
@@ -1276,5 +1307,178 @@ impl<'a> CommandLogs<'a> {
                 self.emit(index, &line).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grill::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
+    use crate::grill::{GrillError, ProcessGrill};
+    use crate::meat::Resources;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A runtime whose `kill` never returns, as when it waits on a task in
+    /// uninterruptible sleep.
+    #[derive(Clone, Default)]
+    struct HangingKill {
+        kills: Arc<AtomicUsize>,
+    }
+    impl Grill for HangingKill {
+        async fn create(&self, _: &InstanceId, _: &OciSpec) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn start(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn kill(&self, _: &InstanceId) -> Result<(), GrillError> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        async fn state(&self, _: &InstanceId) -> Result<ContainerState, GrillError> {
+            Ok(ContainerState::Running)
+        }
+    }
+
+    fn reservation() -> Resources {
+        Resources::new(100, 16 << 20, 0)
+    }
+
+    fn pool(
+        process: &ProcessGrill,
+        lifecycle: HangingKill,
+        budget: &Arc<ExecutionBudget>,
+    ) -> Arc<ReusablePool<HangingKill>> {
+        ReusablePool::with_runtime(
+            Runtime::Host(process.clone()),
+            lifecycle,
+            "rbtest".into(),
+            2,
+            budget.clone(),
+            #[cfg(feature = "ebpf")]
+            None,
+        )
+    }
+
+    /// An executor whose helper is a real `sleep` the in-memory backend
+    /// reports as running.
+    async fn running(process: &ProcessGrill, name: &str) -> InstanceId {
+        let id = InstanceId(name.into());
+        let spec = OciSpec {
+            reusable_executor: false,
+            host_process: false,
+            port_mapping: None,
+            root: OciRoot {
+                path: "/".into(),
+                readonly: false,
+            },
+            process: OciProcess {
+                rlimits: Vec::new(),
+                args: vec!["sleep".into(), "60".into()],
+                env: vec![],
+                cwd: "/".into(),
+                user: OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
+            },
+            mounts: vec![],
+            linux: OciLinux {
+                namespaces: vec![],
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+        process.create(&id, &spec).await.unwrap();
+        process.start(&id).await.unwrap();
+        id
+    }
+
+    fn context(budget: &Arc<ExecutionBudget>, id: InstanceId, root: &Path) -> Context {
+        Context {
+            key: ExecutorKey([0; 32]),
+            directory: root.join(&id.0),
+            base: root.join(format!("{}-cgroup", id.0)),
+            id,
+            image: None,
+            socket_path: None,
+            connection: None,
+            lease: budget
+                .try_acquire_executor(reservation())
+                .unwrap()
+                .quarantine_on_drop(),
+            sequence: 0,
+            idle_since: tokio::time::Instant::now(),
+            probe: None,
+            #[cfg(feature = "ebpf")]
+            namespace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_gives_up_at_its_budget_when_a_runtime_call_never_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let process = ProcessGrill::new();
+        let lifecycle = HangingKill::default();
+        let pool = pool(&process, lifecycle.clone(), &budget);
+        let id = running(&process, "rbtest-hanging").await;
+        let mut stuck = context(&budget, id.clone(), root.path());
+        for _ in 0..2 {
+            let retired = tokio::time::timeout(
+                Duration::from_secs(5),
+                pool.retire(&mut stuck, Duration::from_millis(200)),
+            )
+            .await
+            .expect("retirement outlived its budget");
+            assert!(!retired);
+        }
+        assert_eq!(
+            lifecycle.kills.load(Ordering::SeqCst),
+            1,
+            "a retry started a second kill instead of waiting for the first"
+        );
+        drop(stuck);
+        assert_ne!(
+            budget.available(),
+            budget.capacity(),
+            "an unretired executor returned its reservation"
+        );
+        process.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eviction_retires_other_executors_past_one_whose_runtime_hangs() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let process = ProcessGrill::new();
+        let pool = pool(&process, HangingKill::default(), &budget);
+        let id = running(&process, "rbtest-hanging").await;
+        // The second executor has already exited and left nothing behind.
+        let gone = InstanceId("rbtest-gone".into());
+        {
+            let mut slots = pool.slots.lock().await;
+            for (slot, id) in slots.iter_mut().zip([id.clone(), gone]) {
+                slot.busy = true;
+                slot.retiring = Some(context(&budget, id, root.path()));
+            }
+        }
+        let one_held = budget.capacity().saturating_sub(&reservation());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while budget.available() != one_held {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the hanging executor held up eviction of the other");
+        let slots = pool.slots.lock().await;
+        assert!(slots[0].busy, "the hanging executor's slot was freed");
+        assert!(!slots[1].busy, "the retired executor's slot stayed busy");
+        drop(slots);
+        process.kill(&id).await.unwrap();
     }
 }

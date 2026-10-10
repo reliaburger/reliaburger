@@ -1253,6 +1253,48 @@ go. `RETIREMENT_DEADLINE` gives up after ten seconds: the caller gets its
 timeout back, while the slot and its resource reservation stay quarantined. The
 eviction loop keeps retrying and frees both once the cgroup finally empties.
 
+Our first version of that deadline was a loop that checked the clock between
+attempts. #654's author pointed out in review that this bounds nothing if one
+attempt never comes back. Each attempt awaits the runtime's `state` and `kill`,
+and runc's lifecycle lock can make either wait indefinitely. So the deadline
+now wraps the whole operation, every attempt and the final file removal
+included:
+
+```rust
+let retired = tokio::time::timeout(budget, async {
+    while !self.retirement_step(context).await {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    self.remove_files(context).await
+})
+.await
+.unwrap_or(false);
+```
+
+In Rust, a timeout cancels a future by dropping it, at whichever `.await` it
+happens to be paused. Nothing inside gets a chance to clean up. Go has no
+equivalent: a goroutine only stops if it checks its `context`. Python's
+`asyncio.wait_for` is closer, but it at least raises `CancelledError` inside
+the task. So everything under the timeout has to be *cancel-safe*: dropping it
+halfway must leave nothing inconsistent. Two pieces weren't.
+
+The first was the runtime calls themselves. If an abandoned `kill` were simply
+started again on the next attempt, a runtime that hangs would collect one stuck
+call per retry. The `state`-then-`kill` probe now runs as its own spawned task,
+and the context keeps its `JoinHandle`. Awaiting a `&mut JoinHandle` doesn't
+consume it, so a cancelled attempt leaves the handle in place. The next attempt
+waits on that same probe instead of starting another. The second was releasing
+the executor's namespace binding. That takes a lock and then decrements a
+counter, and cutting it off in between would leak the binding. It now runs in
+its own task, once retirement is proven.
+
+The eviction loop had the same flaw one level up: it retired executors one
+after another, so a single stuck one held up all the rest. Each executor now
+gets one second per eviction tick, and if it hasn't retired by then, it goes
+back into quarantine and the loop moves on. The tests use a fake runtime whose
+`kill` never returns. With the old loop, both tests hang until their guard
+fires.
+
 **What the real Linux tests found.** Most of the bugs in this path were
 invisible to mocks:
 
