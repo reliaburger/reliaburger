@@ -73,6 +73,36 @@ pub struct JobSpec {
     /// Inline script content (Phase 8: process workloads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
+
+    // Run policy. The names match the manifest and JSON API fields, and
+    // `JobDefinition::from_spec` moves them out of the template.
+    /// Attempts per run before it counts as failed (1–10). Omitted: 4, or 1
+    /// for a `run_before` hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u8>,
+    /// Per-attempt wall-clock limit in seconds; 0 means no deadline. Omitted:
+    /// no deadline, or 600 for a `run_before` hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_timeout_secs: Option<u32>,
+    /// Whether a cron occurrence may start while an earlier run is still
+    /// active. Only valid with `schedule`; omitted means `forbid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<OverlapPolicy>,
+    /// Replay automatically after a worker is lost with an unknown outcome,
+    /// instead of waiting for `relish batch replay`. Hooks refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replay_unknown: bool,
+}
+
+/// Whether a matching cron occurrence may overlap an earlier run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapPolicy {
+    /// Advance the occurrence cursor without launching while a run remains active.
+    #[default]
+    Forbid,
+    /// Admit another run, still subject to the cluster's bounded capacity.
+    Allow,
 }
 
 impl JobSpec {
@@ -84,6 +114,15 @@ impl JobSpec {
     /// command as a container, whether or not validation ran first.
     pub fn is_host(&self) -> bool {
         self.runtime == JobRuntime::Process || self.exec.is_some() || self.script.is_some()
+    }
+
+    /// Whether any run-policy field is set. Array templates refuse them,
+    /// because an array carries its policy beside the template.
+    pub fn has_run_policy(&self) -> bool {
+        self.max_attempts.is_some()
+            || self.task_timeout_secs.is_some()
+            || self.overlap.is_some()
+            || self.replay_unknown
     }
 
     /// Refuse fields that contradict the explicitly selected execution backend.

@@ -50,12 +50,96 @@ pub struct TaskArrayRecord {
 }
 
 /// One homogeneous resource profile in a mixed submission.
+///
+/// People write the count and policy flat beside the profile's name, so the
+/// serialised form is [`CohortWire`]. Serde can't combine `flatten` with
+/// `deny_unknown_fields`, and a flattened policy silently ignored typos such as
+/// `max_attempt = 1`; spelling every field out lets the wire form refuse them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "CohortWire", into = "CohortWire")]
 pub struct ManifestCohort {
+    /// Profile name, unique within the manifest.
     pub name: String,
-    #[serde(flatten)]
+    /// Count and policy for this profile's array.
     pub spec: TaskArraySpec,
+    /// What every task of this profile runs.
     pub template: JobSpec,
+}
+
+/// The flat, strict wire form of a [`ManifestCohort`]. Each field mirrors one
+/// of [`TaskArraySpec`]'s, with the same defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortWire {
+    name: String,
+    #[serde(default = "default_cohort_count")]
+    count: u32,
+    #[serde(default = "default_cohort_chunk_size")]
+    chunk_size: u32,
+    #[serde(default = "default_cohort_max_attempts")]
+    max_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_failed_indexes: Option<u32>,
+    #[serde(default = "default_cohort_task_timeout_secs")]
+    task_timeout_secs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    per_node_concurrency: Option<u32>,
+    template: JobSpec,
+}
+
+fn default_cohort_count() -> u32 {
+    TaskArraySpec::with_count(1).count
+}
+fn default_cohort_chunk_size() -> u32 {
+    TaskArraySpec::with_count(1).chunk_size
+}
+fn default_cohort_max_attempts() -> u8 {
+    TaskArraySpec::with_count(1).max_attempts
+}
+fn default_cohort_task_timeout_secs() -> u32 {
+    TaskArraySpec::with_count(1).task_timeout_secs
+}
+
+impl From<CohortWire> for ManifestCohort {
+    fn from(wire: CohortWire) -> Self {
+        Self {
+            name: wire.name,
+            spec: TaskArraySpec {
+                count: wire.count,
+                chunk_size: wire.chunk_size,
+                max_attempts: wire.max_attempts,
+                max_failed_indexes: wire.max_failed_indexes,
+                task_timeout_secs: wire.task_timeout_secs,
+                per_node_concurrency: wire.per_node_concurrency,
+            },
+            template: wire.template,
+        }
+    }
+}
+
+impl From<ManifestCohort> for CohortWire {
+    fn from(cohort: ManifestCohort) -> Self {
+        // Destructure without `..` so a new policy field fails to compile
+        // here until the wire form carries it too.
+        let TaskArraySpec {
+            count,
+            chunk_size,
+            max_attempts,
+            max_failed_indexes,
+            task_timeout_secs,
+            per_node_concurrency,
+        } = cohort.spec;
+        Self {
+            name: cohort.name,
+            count,
+            chunk_size,
+            max_attempts,
+            max_failed_indexes,
+            task_timeout_secs,
+            per_node_concurrency,
+            template: cohort.template,
+        }
+    }
 }
 /// Durable mapping from a manifest's profile names to stable array identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +205,9 @@ pub enum TaskArrayWrite {
     RegisterManifest {
         name: String,
         namespace: String,
+        /// The submission's `Idempotency-Key`: a retry with the same key and
+        /// content returns the existing runs instead of admitting new ones.
+        request_id: String,
         cohorts: Vec<ManifestCohort>,
         submitted_at_epoch_secs: u64,
     },
@@ -409,6 +496,24 @@ impl TryFrom<ArraysWire> for TaskArrays {
     }
 }
 
+/// Digest of everything a manifest admits, so a retry can prove it names the
+/// same work as the receipt it matches.
+fn manifest_digest(write: &TaskArrayWrite) -> Result<String, TaskArrayStoreError> {
+    use sha2::{Digest, Sha256};
+    let TaskArrayWrite::RegisterManifest {
+        name,
+        namespace,
+        cohorts,
+        ..
+    } = write
+    else {
+        return Err(TaskArrayStoreError::Manifest("not a manifest".into()));
+    };
+    let bytes = serde_json::to_vec(&(name, namespace, cohorts))
+        .map_err(|error| TaskArrayStoreError::Manifest(error.to_string()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 impl TaskArrays {
     /// Apply one write. `allocate_id` is called only for a registration
     /// that will succeed, so a refused one doesn't burn an id.
@@ -477,9 +582,13 @@ impl TaskArrays {
             TaskArrayWrite::RegisterManifest {
                 name,
                 namespace,
+                request_id,
                 cohorts,
                 submitted_at_epoch_secs,
             } => {
+                if let Some(batch_id) = self.manifest_replay(write)? {
+                    return Ok(TaskArrayApplied::Registered { batch_id });
+                }
                 if !crate::config::valid_workload_label(name)
                     || !crate::config::valid_workload_label(namespace)
                     || cohorts.is_empty()
@@ -538,7 +647,7 @@ impl TaskArrays {
                         namespace: namespace.clone(),
                         cohorts: identities,
                         common_jobs: false,
-                        request: None,
+                        request: Some((request_id.clone(), manifest_digest(write)?)),
                         submitted_at_epoch_secs: *submitted_at_epoch_secs,
                     },
                 );
@@ -704,9 +813,49 @@ impl TaskArrays {
         }
     }
 
+    /// The parent id a manifest retry already created, if its `request_id`
+    /// names a retained receipt with the same content. The same key with
+    /// different content is refused rather than merged or duplicated.
+    fn manifest_replay(&self, write: &TaskArrayWrite) -> Result<Option<u64>, TaskArrayStoreError> {
+        let TaskArrayWrite::RegisterManifest { request_id, .. } = write else {
+            return Ok(None);
+        };
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || request_id.chars().any(char::is_control)
+        {
+            return Err(TaskArrayStoreError::Manifest(
+                "request identity must contain 1–128 bytes without control characters".into(),
+            ));
+        }
+        let Some((batch_id, prior)) = self.manifests.iter().find(|(_, record)| {
+            record
+                .request
+                .as_ref()
+                .is_some_and(|(id, _)| id == request_id)
+        }) else {
+            return Ok(None);
+        };
+        let digest = manifest_digest(write)?;
+        if prior
+            .request
+            .as_ref()
+            .is_some_and(|(_, prior)| *prior == digest)
+        {
+            Ok(Some(*batch_id))
+        } else {
+            Err(TaskArrayStoreError::Manifest(
+                "this Idempotency-Key already names different work".into(),
+            ))
+        }
+    }
+
     /// IDs needed by this exact transaction; idempotent replays and skipped
     /// occurrences remain admissible even when the shared counter is exhausted.
     pub fn registration_ids(&self, write: &TaskArrayWrite) -> Result<usize, TaskArrayStoreError> {
+        if self.manifest_replay(write)?.is_some() {
+            return Ok(0);
+        }
         if matches!(
             write,
             TaskArrayWrite::RegisterJobs { .. }
@@ -1433,6 +1582,10 @@ mod tests {
             namespace: None,
             exec: Some("/usr/bin/true".into()),
             script: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         })
     }
 
@@ -1762,6 +1915,7 @@ mod tests {
                 write = TaskArrayWrite::RegisterManifest {
                     name,
                     namespace,
+                    request_id: "manifest-1".into(),
                     cohorts: vec![ManifestCohort {
                         name: "small".into(),
                         template: *template,
@@ -1884,6 +2038,7 @@ mod tests {
                 &TaskArrayWrite::RegisterManifest {
                     name: "mixed".into(),
                     namespace: "default".into(),
+                    request_id: "mixed-1".into(),
                     cohorts: vec![cohort("small"), cohort("large")],
                     submitted_at_epoch_secs: 0,
                 },
@@ -1949,5 +2104,99 @@ mod tests {
         assert!(arrays.manifest(1).is_none());
         assert!(arrays.get(2).is_none());
         assert!(arrays.get(3).is_none());
+    }
+
+    #[test]
+    fn manifest_cohort_with_misspelt_policy_key_is_refused() {
+        let good = "name='mixed'\n[[cohort]]\nname='small'\ncount=4\ntask_timeout_secs=30\n[cohort.template]\nruntime='process'\nexec='/bin/true'";
+        let parsed: crate::bun::task_array_api::TaskManifestRequest = toml::from_str(good).unwrap();
+        assert_eq!(parsed.cohort[0].spec.task_timeout_secs, 30);
+        for typo in ["task_timeout = 30", "max_attempt = 1", "concurrency = 4"] {
+            let source = good.replace("task_timeout_secs=30", typo);
+            let error = toml::from_str::<crate::bun::task_array_api::TaskManifestRequest>(&source)
+                .unwrap_err()
+                .to_string();
+            let key = typo.split(' ').next().unwrap();
+            assert!(error.contains(key), "{typo}: {error}");
+        }
+        // The JSON API refuses the same typo.
+        let json = serde_json::json!({"name":"mixed","cohort":[{"name":"small","count":4,
+            "max_attempt":1,"template":{"runtime":"process","exec":"/bin/true"}}]});
+        assert!(
+            serde_json::from_value::<crate::bun::task_array_api::TaskManifestRequest>(json)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_cohort_round_trips_every_policy_field() {
+        let cohort = ManifestCohort {
+            name: "small".into(),
+            spec: TaskArraySpec {
+                count: 9,
+                chunk_size: 3,
+                max_attempts: 2,
+                max_failed_indexes: Some(1),
+                task_timeout_secs: 0,
+                per_node_concurrency: Some(4),
+            },
+            template: *template(),
+        };
+        let encoded = serde_json::to_value(&cohort).unwrap();
+        // Flat on the wire, like the TOML a person writes.
+        assert_eq!(encoded["per_node_concurrency"], 4);
+        assert_eq!(
+            serde_json::from_value::<ManifestCohort>(encoded).unwrap(),
+            cohort
+        );
+    }
+
+    fn manifest_write(request_id: &str, count: u32) -> TaskArrayWrite {
+        TaskArrayWrite::RegisterManifest {
+            name: "mixed".into(),
+            namespace: "default".into(),
+            request_id: request_id.into(),
+            cohorts: vec![ManifestCohort {
+                name: "small".into(),
+                spec: TaskArraySpec::with_count(count),
+                template: *template(),
+            }],
+            submitted_at_epoch_secs: 0,
+        }
+    }
+
+    #[test]
+    fn manifest_retry_with_same_key_returns_the_existing_runs() {
+        let mut arrays = TaskArrays::default();
+        let mut next = 0;
+        let mut allocate = || {
+            next += 1;
+            next
+        };
+        let first = arrays
+            .apply(&manifest_write("retry-1", 4), &mut allocate)
+            .unwrap();
+        let before = arrays.clone();
+        assert_eq!(
+            arrays
+                .registration_ids(&manifest_write("retry-1", 4))
+                .unwrap(),
+            0
+        );
+        let retry = arrays
+            .apply(&manifest_write("retry-1", 4), &mut allocate)
+            .unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(arrays, before, "a retry admits nothing new");
+        // Changed content under the same key is refused, not silently merged.
+        let error = arrays
+            .apply(&manifest_write("retry-1", 5), &mut allocate)
+            .unwrap_err();
+        assert!(error.to_string().contains("different work"), "{error}");
+        // A new key is a new submission.
+        let other = arrays
+            .apply(&manifest_write("retry-2", 4), &mut allocate)
+            .unwrap();
+        assert_ne!(other, first);
     }
 }

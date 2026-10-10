@@ -106,7 +106,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish batch watch <ID>`: Watch rates, bounded profile summaries and duration distributions
   - `relish batch cancel <ID>`: Cancel an array or mixed manifest and retire its active attempts
   - `relish batch results <ID>`: Read a bounded indexed page of accepted task outcomes
-  - `relish batch logs --index <INDEX> <ID>`: Print a failed task's output (the first and last 2 KiB)
+  - `relish batch logs --index <INDEX> <ID>`: Print a task's retained output (the first and last 2 KiB): any singleton's, or a failed task's in a larger array
 - `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
 - `relish batch-status <ID>`: Show the progress of a submitted batch
 - `relish jobs`: List bounded job run summaries and rates, or durable schedule definitions
@@ -359,8 +359,11 @@ describes the common definition/run/task/attempt path for singleton jobs,
 arrays, durable UTC cron and deployment hooks (#638). The development API,
 CLI and dashboard show bounded summaries and accepted rates. Ordinary jobs and
 hooks require acknowledged replay after an unknown outcome; standalone admission
-is durable. See the [job manual](docs/manual/14_batch-jobs.md) for policies and
-runtime limits.
+is durable. TOML jobs set attempts, timeouts, cron overlap and replay with the
+manifest's field names, cron reads Kubernetes CronJob schedules, and every
+submitting command prints an idempotency key so a timed-out submission can be
+retried safely. See the [job manual](docs/manual/14_batch-jobs.md) for policies
+and runtime limits.
 
 ## Limits in 0.1.6
 

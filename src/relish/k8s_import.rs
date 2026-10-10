@@ -1452,6 +1452,10 @@ fn pod_to_jobspec(
         namespace: metadata_namespace.cloned(),
         exec: None,
         script: None,
+        max_attempts: None,
+        task_timeout_secs: None,
+        overlap: None,
+        replay_unknown: false,
     }
 }
 

@@ -1,10 +1,16 @@
 # Example: batch job submission.
 #
-# Batch jobs are short-lived tasks submitted in bulk. The batch
-# scheduler uses greedy bin-packing for high throughput rather than
-# the per-job Filter→Score→Select→Commit pipeline.
+# A finite batch admits up to 64 named jobs in one Raft entry. Each job
+# becomes a one-task run on the same lifecycle as task arrays: the leader
+# hands tasks to nodes with room for their CPU and memory requests, and
+# each node runs them under its own concurrency cap.
+#
+# Each job can set its own run policy, using the manifest's field names:
+# max_attempts, task_timeout_secs and replay_unknown.
 #
 # Submit: relish batch examples/phase-8/batch-jobs.toml
+# relish prints an idempotency key first. If the submission times out,
+# retry with --idempotency-key KEY to get the same runs back.
 
 [job.etl-chunk-0]
 image = "etl-worker:v3"
@@ -12,6 +18,7 @@ command = ["process", "--chunk", "0", "--total", "100"]
 cpu = "100m-200m"
 memory = "128Mi-256Mi"
 namespace = "batch"
+task_timeout_secs = 900
 
 [job.etl-chunk-1]
 image = "etl-worker:v3"

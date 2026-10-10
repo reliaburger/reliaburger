@@ -50,9 +50,9 @@ struct HarnessOptions {
     records_dir: Option<std::path::PathBuf>,
 }
 
-struct Harness {
+pub(crate) struct Harness {
     client: BunClient,
-    base_url: String,
+    pub(crate) base_url: String,
     port: u16,
     cmd_tx: mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
     _tasks: TestTasks,
@@ -61,7 +61,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         Self::start_with(HarnessOptions::default()).await
     }
 
@@ -263,7 +263,7 @@ impl Harness {
     }
 
     /// Poll the batch summary until `done` or the deadline.
-    async fn wait_done(&self, batch_id: u64, secs: u64) -> serde_json::Value {
+    pub(crate) async fn wait_done(&self, batch_id: u64, secs: u64) -> serde_json::Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         loop {
             let summary = self.client.batch_status(batch_id).await.unwrap();
@@ -2526,8 +2526,8 @@ exec = "/bin/sleep"
 command = ["1"]
 "#,
     );
-    let first = harness.client.submit_batch(&jobs).await.unwrap();
-    let second = harness.client.submit_batch(&jobs).await.unwrap();
+    let first = harness.client.submit_batch(&jobs, None).await.unwrap();
+    let second = harness.client.submit_batch(&jobs, None).await.unwrap();
     assert_ne!(
         first["executions"]["shared"],
         second["executions"]["shared"]
@@ -2548,7 +2548,7 @@ async fn a_maximum_length_batch_label_gets_a_valid_independent_execution_name() 
     let jobs = jobs_from(&format!(
         "[job.{label}]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\n"
     ));
-    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
     let execution = response["executions"][&label]
         .as_str()
         .expect("submission must expose its independent execution identity");
@@ -2591,7 +2591,7 @@ async fn batch_of_proc_jobs_completes_locally() {
         command = ["three"]
     "#,
     );
-    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
     assert_eq!(response["assigned"].as_u64(), Some(3));
     assert!(
         response["unschedulable"].as_array().unwrap().is_empty(),
@@ -2619,7 +2619,7 @@ async fn batch_failing_job_reports_failed() {
         command = ["-c", "exit 1"]
     "#,
     );
-    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
     let batch_id = response["batch_id"].as_u64().unwrap();
 
     // 3 retries with 1s/2s/4s backoff — well inside 60s.
@@ -2634,7 +2634,7 @@ async fn empty_batch_is_rejected() {
     let harness = Harness::start().await;
     let result = harness
         .client
-        .submit_batch(&std::collections::BTreeMap::new())
+        .submit_batch(&std::collections::BTreeMap::new(), None)
         .await;
     assert!(result.is_err());
 }
@@ -2655,7 +2655,7 @@ async fn batch_in_a_non_default_namespace_completes() {
         command = ["hi"]
     "#,
     );
-    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
     let batch_id = response["batch_id"].as_u64().unwrap();
     let summary = harness.wait_done(batch_id, 30).await;
     assert_eq!(summary["succeeded"].as_u64(), Some(1), "{summary}");
@@ -2815,7 +2815,7 @@ async fn legacy_callbacks_cannot_forge_or_change_common_run_outcomes() {
         command = ["hi"]
     "#,
     );
-    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
     let batch_id = response["batch_id"].as_u64().unwrap();
     let execution = response["executions"]["steady"].as_str().unwrap();
     harness.wait_done(batch_id, 30).await;
@@ -2926,7 +2926,7 @@ async fn cli_batch_wait_times_out_with_the_last_known_state() {
         command = ["300"]
     "#,
     );
-    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
     let batch_id = response["batch_id"].as_u64().unwrap();
 
     let err = reliaburger::relish::commands::wait_for_batch(
@@ -2961,7 +2961,7 @@ async fn batch_ids_stay_monotonic_across_an_api_restart() {
         command = ["one"]
     "#,
     );
-    let response = first.client.submit_batch(&jobs).await.unwrap();
+    let response = first.client.submit_batch(&jobs, None).await.unwrap();
     let first_id = response["batch_id"].as_u64().unwrap();
     first.wait_done(first_id, 30).await;
     drop(first);
@@ -2976,7 +2976,7 @@ async fn batch_ids_stay_monotonic_across_an_api_restart() {
     let summary = second.client.batch_status(first_id).await.unwrap();
     assert_eq!(summary["succeeded"].as_u64(), Some(1), "{summary}");
     // …and a new submission gets a strictly newer id.
-    let response = second.client.submit_batch(&jobs).await.unwrap();
+    let response = second.client.submit_batch(&jobs, None).await.unwrap();
     let second_id = response["batch_id"].as_u64().unwrap();
     assert!(second_id > first_id, "{second_id} vs {first_id}");
 }
@@ -3043,7 +3043,7 @@ async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
         command = ["far"]
     "#,
     );
-    let response = leader.client.submit_batch(&jobs).await.unwrap();
+    let response = leader.client.submit_batch(&jobs, None).await.unwrap();
     let batch_id = response["batch_id"].as_u64().unwrap();
     assert_eq!(response["assigned"].as_u64(), Some(1), "{response}");
 
@@ -4410,7 +4410,7 @@ async fn common_run_logs_keep_the_logical_scope_and_select_the_stable_run() {
     let jobs = jobs_from(
         "[job.migration]\nruntime = \"process\"\nexec = \"/bin/sh\"\ncommand=['-c','echo selected-output']\nnamespace='team'",
     );
-    let response = harness.client.submit_batch(&jobs).await.unwrap();
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
     let run = response["executions"]["migration"].as_str().unwrap();
     let record = tokio::time::timeout(Duration::from_secs(10), records.recv())
         .await
@@ -4474,9 +4474,12 @@ async fn common_jobs_execute_with_worker_evidence_independent_of_global_capacity
         let harness = Harness::start_with(options).await;
         let response = harness
             .client
-            .submit_batch(&jobs_from(
-                "[job.worker-proof]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]",
-            ))
+            .submit_batch(
+                &jobs_from(
+                    "[job.worker-proof]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]",
+                ),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(response["assigned"], 1, "{mode}: {response}");

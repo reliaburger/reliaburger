@@ -1066,3 +1066,109 @@ async fn standalone_restart_retains_runs_requests_and_the_next_identity() {
             > id
     );
 }
+
+/// A submission that timed out is retried with the key relish printed: the
+/// cluster returns the run it already admitted instead of a second array,
+/// for a single array and for a mixed manifest alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrying_a_submission_with_the_same_key_creates_one_array() {
+    let harness = Harness::start(Options {
+        council: true,
+        runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |_| {
+            AttemptOutcome::Exited { code: 0 }
+        })),
+        allowed: vec![SHELL],
+        slots: 8,
+    })
+    .await;
+    let post = |path: &str, key: &str, body: &Value| {
+        harness
+            .http
+            .post(format!("{}{path}", harness.base_url))
+            .header("Idempotency-Key", key)
+            .json(body)
+            .send()
+    };
+    let array = shell_array(16, 4, "exit 0");
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let response = post("/v1/batch/array", "array-retry-1", &array)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        ids.push(response.json::<Value>().await.unwrap()["batch_id"].clone());
+    }
+    assert_eq!(ids[0], ids[1], "the retry admitted a second array");
+
+    let manifest = json!({"name":"mixed","cohort":[{"name":"small","count":8,"chunk_size":4,
+        "template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]}}]});
+    let mut parents = Vec::new();
+    for _ in 0..2 {
+        let response = post("/v1/batch/manifest", "manifest-retry-1", &manifest)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        parents.push(response.json::<Value>().await.unwrap()["batch_id"].clone());
+    }
+    assert_eq!(
+        parents[0], parents[1],
+        "the retry admitted a second manifest"
+    );
+    // Reusing the key for different work is refused rather than merged.
+    let mut changed = manifest.clone();
+    changed["cohort"][0]["count"] = json!(9);
+    let response = post("/v1/batch/manifest", "manifest-retry-1", &changed)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let arrays = harness
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await
+        .task_arrays;
+    let manifests = arrays
+        .manifests()
+        .filter(|(_, m)| m.name == "mixed")
+        .count();
+    assert_eq!(manifests, 1, "one manifest receipt");
+    assert_eq!(arrays.iter().count(), 2, "one array plus one profile");
+}
+
+/// `relish batch submit --dry-run` refuses a misspelt policy key instead of
+/// calling the manifest valid and quietly applying the defaults.
+#[test]
+fn dry_run_rejects_a_misspelt_cohort_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("jobs.toml");
+    let write = |policy: &str| {
+        std::fs::write(
+            &manifest,
+            format!(
+                "name = \"mixed\"\n[[cohort]]\nname = \"small\"\ncount = 8\n{policy}\n[cohort.template]\nruntime = \"process\"\nexec = \"/bin/true\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    let dry_run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(["batch", "submit"])
+            .arg(&manifest)
+            .arg("--dry-run")
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .output()
+            .unwrap()
+    };
+    write("task_timeout_secs = 30");
+    let output = dry_run();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("valid manifest"));
+    write("task_timeout = 30");
+    let output = dry_run();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("task_timeout"), "{stderr}");
+}

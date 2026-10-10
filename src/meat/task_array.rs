@@ -54,6 +54,7 @@ pub struct ChunkId(pub u32);
 /// rather than inside it, keeping ordinary job configuration separate from
 /// delegated execution policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskArraySpec {
     /// Number of tasks; indices run from 0 to `count - 1`.
     #[serde(default = "default_count")]
@@ -110,7 +111,9 @@ pub enum TaskArraySpecError {
     },
     #[error("max attempts must be between 1 and {MAX_ATTEMPTS}, got {max_attempts}")]
     AttemptsOutOfRange { max_attempts: u8 },
-    #[error("task timeout must be between 1 and {MAX_TASK_TIMEOUT_SECS} seconds, got {seconds}")]
+    #[error(
+        "task timeout must be between 0 (no deadline) and {MAX_TASK_TIMEOUT_SECS} seconds, got {seconds}"
+    )]
     TimeoutOutOfRange { seconds: u32 },
     #[error("per-node concurrency must be at least 1")]
     ZeroConcurrency,
@@ -236,6 +239,11 @@ pub fn validate_template(template: &JobSpec) -> Result<(), TaskArraySpecError> {
             field: "run_before dependencies",
         });
     }
+    if template.has_run_policy() {
+        return Err(TaskArraySpecError::TemplateField {
+            field: "run policy fields (max_attempts, task_timeout_secs, overlap, replay_unknown); set them beside the template",
+        });
+    }
     Ok(())
 }
 
@@ -281,6 +289,10 @@ mod tests {
             namespace: None,
             exec: Some(PathBuf::from("/usr/local/bin/rb-task")),
             script: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         }
     }
 
@@ -534,5 +546,41 @@ mod tests {
             }
             prop_assert_eq!(next, count);
         }
+    }
+
+    #[test]
+    fn json_tasks_with_unknown_key_is_refused() {
+        let good = serde_json::json!({"count": 4, "task_timeout_secs": 30});
+        assert_eq!(
+            serde_json::from_value::<TaskArraySpec>(good)
+                .unwrap()
+                .task_timeout_secs,
+            30
+        );
+        for typo in ["task_timeout", "max_attempt", "concurrency"] {
+            let error = serde_json::from_value::<TaskArraySpec>(serde_json::json!({
+                "count": 4, typo: 1
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(typo), "{error}");
+        }
+        // The same strictness reaches a JSON job definition's `tasks`.
+        let definition = serde_json::json!({
+            "template": {"runtime": "process", "exec": "/bin/true"},
+            "tasks": {"count": 4, "max_attempt": 1}
+        });
+        assert!(serde_json::from_value::<crate::meat::job::JobDefinition>(definition).is_err());
+    }
+
+    #[test]
+    fn timeout_error_names_zero_as_no_deadline() {
+        let mut spec = TaskArraySpec::with_count(1);
+        spec.task_timeout_secs = MAX_TASK_TIMEOUT_SECS + 1;
+        let message = spec.validate().unwrap_err().to_string();
+        assert!(
+            message.contains("between 0 (no deadline) and 86400"),
+            "{message}"
+        );
     }
 }

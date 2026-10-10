@@ -36,22 +36,35 @@ pub struct JobDefinition {
 
 impl JobDefinition {
     /// Normalise a TOML job into one indexed task, retaining its execution contract.
+    ///
+    /// The job's own policy fields move out of the template into the
+    /// definition. Omitted ones keep the defaults: four attempts and no
+    /// deadline, or one attempt and 600 seconds for a `run_before` hook.
     pub fn from_spec(mut template: JobSpec) -> Self {
+        let overlap = template.overlap.take().unwrap_or_default();
         let cron = template.schedule.take().map(|expression| CronPolicy {
             expression,
-            overlap: OverlapPolicy::Forbid,
+            overlap,
             missed: MissedRunPolicy::Skip,
         });
         let hook = !template.run_before.is_empty();
         template.run_before.clear();
         let mut tasks = TaskArraySpec::with_count(1);
-        tasks.max_attempts = if hook { 1 } else { 4 };
-        tasks.task_timeout_secs = if hook { 600 } else { 0 };
+        tasks.max_attempts = template
+            .max_attempts
+            .take()
+            .unwrap_or(if hook { 1 } else { 4 });
+        tasks.task_timeout_secs =
+            template
+                .task_timeout_secs
+                .take()
+                .unwrap_or(if hook { 600 } else { 0 });
+        let replay_unknown = std::mem::take(&mut template.replay_unknown);
         Self {
             template,
             tasks,
             cron,
-            replay_unknown: false,
+            replay_unknown,
         }
     }
 
@@ -74,16 +87,8 @@ impl JobDefinition {
     }
 }
 
-/// Whether a matching occurrence may overlap an earlier run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlapPolicy {
-    /// Advance the occurrence cursor without launching while a run remains active.
-    #[default]
-    Forbid,
-    /// Admit another run, still subject to the cluster's bounded capacity.
-    Allow,
-}
+/// TOML jobs name the overlap policy too, so it lives with the job config.
+pub use crate::config::job::OverlapPolicy;
 
 /// What a leader does with schedule minutes missed while it was unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1122,5 +1127,76 @@ mod tests {
         );
         assert_eq!(store.jobs().run(1).unwrap().trigger, trigger);
         assert_eq!(store.get(1).unwrap().state.spec.count, 1);
+    }
+
+    #[test]
+    fn toml_job_timeout_reaches_the_definition() {
+        let config = crate::config::Config::parse(
+            "[job.cleanup]\nimage = 'cleanup:v1'\nschedule = '0 3 * * *'\nmax_attempts = 2\ntask_timeout_secs = 30\noverlap = 'allow'\nreplay_unknown = true\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let definition = JobDefinition::from_spec(config.job["cleanup"].clone());
+        assert_eq!(definition.tasks.task_timeout_secs, 30);
+        assert_eq!(definition.tasks.max_attempts, 2);
+        assert!(definition.replay_unknown);
+        let cron = definition.cron.as_ref().unwrap();
+        assert_eq!(cron.overlap, OverlapPolicy::Allow);
+        // The policy moved out of the template, so the template is a valid
+        // execution template and the definition as a whole validates.
+        assert!(!definition.template.has_run_policy());
+        definition.validate().unwrap();
+    }
+
+    #[test]
+    fn toml_job_without_policy_keeps_todays_defaults() {
+        let config = crate::config::Config::parse(
+            "[job.once]\nimage = 'once:v1'\n\n[job.nightly]\nimage = 'once:v1'\nschedule = '0 3 * * *'\n\n[job.migrate]\nimage = 'once:v1'\nrun_before = ['app.web']\n\n[app.web]\nimage = 'web:v1'\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let once = JobDefinition::from_spec(config.job["once"].clone());
+        assert_eq!(
+            (once.tasks.max_attempts, once.tasks.task_timeout_secs),
+            (4, 0)
+        );
+        assert!(!once.replay_unknown);
+        let nightly = JobDefinition::from_spec(config.job["nightly"].clone());
+        assert_eq!(nightly.cron.unwrap().overlap, OverlapPolicy::Forbid);
+        let hook = JobDefinition::from_spec(config.job["migrate"].clone());
+        assert_eq!(
+            (hook.tasks.max_attempts, hook.tasks.task_timeout_secs),
+            (1, 600)
+        );
+        assert!(!hook.replay_unknown);
+    }
+
+    #[test]
+    fn hook_refuses_replay_unknown() {
+        let config = crate::config::Config::parse(
+            "[job.migrate]\nimage = 'once:v1'\nrun_before = ['app.web']\nreplay_unknown = true\n\n[app.web]\nimage = 'web:v1'\n",
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("replay_unknown"), "{error}");
+        // A hook may still choose its attempts and deadline.
+        let config = crate::config::Config::parse(
+            "[job.migrate]\nimage = 'once:v1'\nrun_before = ['app.web']\nmax_attempts = 3\ntask_timeout_secs = 0\n\n[app.web]\nimage = 'web:v1'\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let hook = JobDefinition::from_spec(config.job["migrate"].clone());
+        assert_eq!(
+            (hook.tasks.max_attempts, hook.tasks.task_timeout_secs),
+            (3, 0)
+        );
+    }
+
+    #[test]
+    fn array_templates_refuse_run_policy_fields() {
+        let mut definition = definition(4, None);
+        definition.template.task_timeout_secs = Some(30);
+        let error = definition.validate().unwrap_err();
+        assert!(error.contains("task_timeout_secs"), "{error}");
     }
 }

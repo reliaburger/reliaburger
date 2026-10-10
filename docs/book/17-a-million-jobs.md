@@ -301,6 +301,173 @@ and state formats, so it needs matching binaries and a fresh cluster
 qualification and resident model workers remain separate issues; these semantics
 don't establish 100m accepted successes/day.
 
+### A contract you can retry, and can't misspell
+
+The run identities above were only half the story. The server read an
+`Idempotency-Key` header on array admission and minted a random one when it was
+missing. No `relish` command ever sent one. So the manual's advice, "reuse the
+same key after a timeout", was advice nobody could follow: a person whose
+`relish run --batch --count 16000000` timed out had no key to reuse, and a retry
+admitted a second sixteen-million-task array. The mixed-profile manifest route
+had no request identity at all.
+
+The fix starts in the client. Every submitting command now chooses its key
+before it sends anything and prints it on stderr, so a timeout leaves you
+holding the one thing that makes the retry safe:
+
+```rust
+pub fn submission_key(
+    explicit: Option<String>,
+    err: &mut dyn std::io::Write,
+) -> Result<String, RelishError> {
+    let key = match explicit {
+        Some(key) => { /* 1–128 printable ASCII bytes, or refuse */ key }
+        None => format!("{:032x}", rand::random::<u128>()),
+    };
+    let _ = writeln!(
+        err,
+        "idempotency key {key}; if this submission times out, retry with --idempotency-key {key}"
+    );
+    Ok(key)
+}
+```
+
+`&mut dyn std::io::Write` is a *trait object*: a mutable borrow of some value
+that implements `Write`, with the concrete type chosen at run time through a
+vtable, much like a Go interface value. Production passes `std::io::stderr()`;
+the unit tests pass a `Vec<u8>`, which implements `Write` too, and then read
+back what was "printed". `let _ =` discards the `Result` of the write on
+purpose. Rust warns when you silently drop a `Result`, and a closed stderr is
+no reason to refuse a submission, so we say so out loud.
+
+Why stderr? Scripts parse `relish --output json batch submit` from stdout, and
+the key line would break every one of them. Diagnostics already go to stderr,
+and the key is exactly the kind of thing you want to see even when stdout is
+piped into `jq`.
+
+On the server, `TaskArrayWrite::RegisterManifest` gained a `request_id`. The
+manifest's receipt already had a slot for `(request_id, digest)`, used by finite
+job groups, so the store hashes the name, namespace and cohorts and looks for a
+retained receipt with the same key. Same key and same digest returns the
+original parent id; same key and a different digest is refused rather than
+merged. The same check runs in `registration_ids`, which tells the leader how
+many batch ids a write will consume: a replay consumes none, so a retry still
+succeeds when the shared id counter has run dry.
+
+The second gap was quieter. `ManifestCohort` looked like this:
+
+```rust
+pub struct ManifestCohort {
+    pub name: String,
+    #[serde(flatten)]
+    pub spec: TaskArraySpec,
+    pub template: JobSpec,
+}
+```
+
+`#[serde(flatten)]` lets a person write `count` and `max_attempts` beside
+`name` instead of in a nested table. It also switches off unknown-field
+checking: serde can't combine `flatten` with `deny_unknown_fields`, because the
+outer struct has to pass every key it doesn't recognise down to the inner one.
+`TaskArraySpec` didn't deny unknown fields either. So `task_timeout = 30` (the
+real name is `task_timeout_secs`) was silently ignored, the task got the
+600-second default, and `relish batch submit --dry-run` cheerfully printed
+"valid manifest".
+
+We kept the flat format people already write and moved the strictness to a
+private wire type:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "CohortWire", into = "CohortWire")]
+pub struct ManifestCohort { /* name, spec, template */ }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortWire {
+    name: String,
+    count: u32,
+    chunk_size: u32,
+    // ... one field per TaskArraySpec field, with the same defaults
+    template: JobSpec,
+}
+```
+
+`from` and `into` tell serde to deserialise a `CohortWire` and convert it with
+the `From` impl, and to convert back before serialising. The rest of the code
+keeps using `cohort.spec`. Spelling the fields out twice is the price, and the
+`From<ManifestCohort> for CohortWire` impl destructures `TaskArraySpec` without
+a `..` rest pattern. Add a field to the spec and that line stops compiling until
+the wire type carries it too, which is the cheapest drift check there is.
+`TaskArraySpec` itself now has `deny_unknown_fields`, which covers the JSON
+`tasks` object of a job definition as well.
+
+### Policies for TOML jobs
+
+A TOML job couldn't set any of this. `JobDefinition::from_spec` hard-coded four
+attempts and no deadline (one attempt and 600 seconds for a hook), and cron
+overlap was always `forbid`. A hung nightly job therefore ran for ever, and with
+overlap forbidden it blocked every later night too.
+
+`JobSpec` now has the manifest's field names: `max_attempts`,
+`task_timeout_secs`, `overlap` and `replay_unknown`. The first three are
+`Option`s, because "not set" has to mean "use today's default", which differs
+between hooks and ordinary jobs. `from_spec` moves them out of the template:
+
+```rust
+tasks.task_timeout_secs = template
+    .task_timeout_secs
+    .take()
+    .unwrap_or(if hook { 600 } else { 0 });
+let replay_unknown = std::mem::take(&mut template.replay_unknown);
+```
+
+`Option::take` returns the value and leaves `None` behind; `std::mem::take`
+does the same for any type with a `Default`, here leaving `false`. Both mutate
+in place through a `&mut`, so the template that reaches the definition carries
+no policy, and `validate_template` can refuse policy fields on array templates,
+where they'd otherwise be silently shadowed by the array's own spec.
+Validation reuses the array limits by building the definition and calling
+`tasks.validate()`, so `relish lint` and the API refuse the same values. Hooks
+still refuse `replay_unknown = true`, and `overlap` needs a `schedule`.
+
+The hung-job test found the subtle part. A timed-out attempt in a run without
+`replay_unknown` doesn't count as failed: Bun stops the command, but whatever it
+was doing may have half happened, so the run waits for `relish batch replay`
+like any other unknown outcome. That's the right default for a migration and
+the wrong one for an idempotent cleanup, which is exactly what
+`replay_unknown = true` is for. The test in `tests/suite/relish_cli.rs` drives
+the compiled `relish` binary against an in-process node with the real executor and checks both: a repeatable
+job fails after one second, and a conservative one stops its command and
+reports an unknown owner.
+
+### The cron dialect
+
+People copy schedules from Kubernetes CronJobs, so the parser now reads them
+the same way. Three differences went away. `5/15` meant "minute 5 only"; it now
+means 5, 20, 35 and 50, as in the `robfig/cron` parser Kubernetes uses. A day
+field written `*/2` restricted the values but also switched on the old
+"day-of-month OR day-of-week" rule; now any field starting with `*` counts as
+unrestricted for that rule. And month and weekday names plus the `@hourly` to
+`@yearly` macros work, while `@reboot` and `@every` are refused with an error
+that lists what is supported. Each parsed field records whether it started with
+a star, instead of a separate "any" case, so matching is one set lookup.
+
+### A recovery probe a user can run
+
+`scripts/demo/verify-job-recovery.py` crashes a qualification Bun mid-run and
+checks the replacement finishes. Its last step posted a stale control message to
+`/v1/batch/array/sync`, a node-to-node route only the system principal may call,
+using the ordinary token the manual told people to set. It could only ever get a
+403. Nobody had recorded a real run, which is how it survived.
+
+There's no user-visible way to send a stale control version, by design. So the
+probe now checks what a user can see after recovery (no worker reports a
+refusal, no owner is left unknown) and leaves the fence itself to
+`task_array_recovery::stale_control_cannot_delete_ledgers_after_a_restart`,
+which runs in the portable suite. A CI test reads the system-only routes out of
+`src/bun/authz.rs` and fails if the probe ever names one again.
+
 ## Short jobs without fresh containers
 
 What does a job that runs for five milliseconds cost? Until now, a whole
@@ -1313,6 +1480,12 @@ fixing the test couldn't hide the real missing-PID bug it was written to catch.
 wrong. They measured something else: unequal reservations, unequal counts,
 receipt chunks bigger than the window, a no-op instead of real work. Writing
 down what a number *doesn't* show turned out to be most of the work.
+
+**A server feature no client uses isn't a feature.** The cluster had
+idempotent admission for months, and the manual described it. Because `relish`
+never sent the header, the protection existed only for people who wrote their
+own HTTP clients. Test the contract from the command a person types, not from
+the route it eventually reaches.
 
 **Durable identity before durable work.** Replaying a lost admission must
 return the original run, and a new leader mustn't revive a cron occurrence the

@@ -482,7 +482,43 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
             field: "runtime".into(),
             context: format!("job {name:?}"),
             reason: reason.into(),
-        })
+        })?;
+    validate_job_policy(name, job)
+}
+
+/// Check a TOML job's run policy against the same limits a manifest has.
+fn validate_job_policy(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
+    let refuse = |field: &str, reason: String| ConfigError::Validation {
+        field: field.into(),
+        context: format!("job {name:?}"),
+        reason,
+    };
+    if job.overlap.is_some() && job.schedule.is_none() {
+        return Err(refuse(
+            "overlap",
+            "only applies to a job with a schedule".into(),
+        ));
+    }
+    if job.replay_unknown && !job.run_before.is_empty() {
+        return Err(refuse(
+            "replay_unknown",
+            "a run_before hook can't replay an unknown outcome automatically; acknowledge it with relish batch replay".into(),
+        ));
+    }
+    // The definition is where the policy lands, so its limits are the ones to check.
+    let tasks = crate::meat::job::JobDefinition::from_spec(job.clone()).tasks;
+    tasks.validate().map_err(|error| {
+        let field = match error {
+            crate::meat::task_array::TaskArraySpecError::AttemptsOutOfRange { .. } => {
+                "max_attempts"
+            }
+            crate::meat::task_array::TaskArraySpecError::TimeoutOutOfRange { .. } => {
+                "task_timeout_secs"
+            }
+            _ => "job",
+        };
+        refuse(field, error.to_string())
+    })
 }
 
 impl NodeConfig {

@@ -35,21 +35,61 @@ arbitrary task dependency graphs aren't supported. Ordinary jobs are admitted
 when application publication succeeds. A disconnected client or a new leader
 can resume the operation from the same accepted run identities.
 
-Ordinary TOML jobs get four attempts for known failures; deployment hooks get one
-attempt, so a failed migration is not repeated automatically. Ordinary jobs have no implicit
-runtime deadline; hooks have a 600-second deadline. An uncertain attempt outcome
-becomes `Unknown`, retains ownership and prevents automatic replay, even after
-worker restart or disappearance. A successful launch isn't evidence of successful
-work. Explicit bulk submissions retain at-least-once replay, including a
-one-element array. This is a retry policy on the common engine.
+Each `[job.<name>]` can set its run policy with the same field names that
+manifests and the JSON API use:
 
-Cron uses five fields in UTC. Registration starts with the next matching minute.
+```toml
+[job.cleanup]
+image = "database-tools:v1"
+command = ["/cleanup"]
+schedule = "0 3 * * *"
+max_attempts = 2          # 1–10
+task_timeout_secs = 1800  # 0–86400; 0 means no deadline
+overlap = "allow"         # cron only: "forbid" (default) or "allow"
+replay_unknown = true     # safe to repeat after a lost worker
+```
+
+Omitted fields keep the defaults. Ordinary TOML jobs get four attempts for
+known failures and no deadline. Deployment hooks get one attempt, so a failed
+migration isn't repeated automatically, and a 600-second deadline. `overlap`
+needs a `schedule`, and a `run_before` hook refuses `replay_unknown = true`.
+`relish lint` and `relish apply --dry-run` reject out-of-range values. Give
+every job that might hang a `task_timeout_secs`: without one, a stuck cron job
+runs for ever, and with `overlap = "forbid"` it also blocks every later
+occurrence.
+
+An uncertain attempt outcome becomes `Unknown`. Unless the job sets
+`replay_unknown = true`, it retains ownership and prevents automatic replay,
+even after worker restart or disappearance. A timed-out attempt counts as
+uncertain too: Bun stops the command, but the work may have half happened, so
+a job without `replay_unknown` waits for `relish batch replay` rather than
+retrying. With `replay_unknown = true`, a timeout is an ordinary failed attempt.
+A successful launch isn't evidence of successful work. Explicit bulk
+submissions retain at-least-once replay, including a one-element array. This is
+a retry policy on the common engine.
+
+Cron schedules are in UTC. Registration starts with the next matching minute.
 The leader atomically claims the occurrence and admits its run. Default overlap
-is `forbid`; JSON definitions can select `allow`. Both skip missed minutes, with
-no catch-up queue. Skipped overlapping occurrences advance the cursor too.
-Registration and observation cursors survive leader changes, result pruning and
-clock rollback. A conservative definition with unknown ownership skips new
-occurrences even when overlap is allowed.
+is `forbid`; TOML jobs and JSON definitions can select `allow`. Both skip missed
+minutes, with no catch-up queue. Skipped overlapping occurrences advance the
+cursor too. Registration and observation cursors survive leader changes, result
+pruning and clock rollback. A conservative definition with unknown ownership
+skips new occurrences even when overlap is allowed.
+
+The schedule dialect is the one Kubernetes CronJob uses:
+
+- Five fields: minute, hour, day of month, month, day of week. Each takes `*`,
+  a number, a list (`1,15`), a range (`1-5`) and a step (`*/15`, `0-30/10`).
+- `N/step` repeats from N to the field's maximum: `5/15` in the minute field is
+  minutes 5, 20, 35 and 50.
+- Month names `JAN`–`DEC` and weekday names `SUN`–`SAT`, in any case. Sunday is
+  0 or 7.
+- When day of month and day of week are both restricted, either one matching
+  fires the job: `0 0 1 * MON` runs on the 1st and on every Monday. A field that
+  starts with `*`, such as `*/2`, counts as unrestricted for this rule, so
+  `0 0 */2 * MON` runs on odd-numbered days that are also Mondays.
+- The macros `@hourly`, `@daily` (or `@midnight`), `@weekly`, `@monthly` and
+  `@yearly` (or `@annually`). `@reboot`, `@every` and time zones are refused.
 
 ```sh
 relish jobs
@@ -205,10 +245,26 @@ acknowledged replay for unknown outcomes. A lost worker or a crash before a dura
 can rerun a task, so external effects need a stable business idempotency key.
 Array ID and index identify a task within this cluster history; backup rollback
 or a new cluster can reuse those IDs. Grant fencing prevents accepting an obsolete result; it cannot undo
-an external effect. Submission timeouts have an uncertain outcome. Reuse the same `Idempotency-Key`
-for array, finite group or apply admission; the JSON definition endpoint uses
-`request_id`. Changed content under a retained identity is refused. Dedupe lasts
-while that receipt is retained; a new request creates new identities. Workers repair an incomplete ledger tail before appending,
+an external effect. Submission timeouts have an uncertain outcome. `relish run
+--batch`, `relish batch FILE` and `relish batch submit` print an idempotency key
+on stderr before they send anything:
+
+```text
+idempotency key 3f9c…; if this submission times out, retry with --idempotency-key 3f9c…
+```
+
+Retry with that `--idempotency-key` and the cluster returns the runs it already
+admitted rather than starting a second array. API clients send the same
+`Idempotency-Key` header for array, manifest, finite group or apply admission;
+the JSON definition endpoint uses `request_id`. A request without one is always
+new work. Changed content under a retained identity is refused. Dedupe lasts
+while that receipt is retained; a new request creates new identities.
+
+Manifests, cohorts and JSON `tasks` objects refuse fields they don't know. A
+typo such as `task_timeout = 30` or `max_attempt = 1` fails, including at
+`relish batch submit --dry-run`, instead of silently falling back to the
+defaults (three attempts and 600 seconds). Array templates refuse the TOML job
+policy fields; set them beside the template. Workers repair an incomplete ledger tail before appending,
 commit incremental outcomes in groups and acknowledge chunks only after
 outcomes and their result index are durable. Standalone admission reserves sparse progress within its 64 MiB store before
 accepting work. Storage failure cancels local work
@@ -610,17 +666,21 @@ uses a mixed-profile reusable manifest and a running application:
 python3 scripts/demo/verify-job-recovery.py mixed-jobs.toml \
   --bun /opt/qualification/bun --relish /opt/qualification/relish \
   --config /opt/qualification/node.toml --pid-file /opt/qualification/bun.pid \
-  --node-name worker-1 --service-name web --service-url http://app.example/health \
+  --service-name web --service-url http://app.example/health \
   --output recovery-proof
 ```
 
 Set the ordinary `RELIABURGER_ENDPOINT`, `RELIABURGER_CA_CERT` and
-`RELIABURGER_TOKEN` environment variables. The probe checks the original binary
+`RELIABURGER_TOKEN` environment variables; the probe reaches the cluster only
+through `relish`, so a deployer token is enough. It checks the original binary
 and configuration before using a Linux PID handle to kill Bun during partially
 accepted completion. It starts the same binary/configuration, updates the PID
 file, verifies the application's original PID, resumed accepted outcomes and
-selected indexes, and rejects a stale control version over verified node TLS.
-The replacement remains running. Preserve its binary and ownership journals
+selected indexes, and checks that no worker reports a refusal and no owner is
+left unknown. An ordinary token can't send control messages, so the probe
+doesn't replay a stale control version itself; the portable test
+`task_array_recovery::stale_control_cannot_delete_ledgers_after_a_restart`
+covers that fence. The replacement remains running. Preserve its binary and ownership journals
 until normal workload retirement. This proves a single-node crash; separate
 multi-node and sustained fault cases remain necessary.
 

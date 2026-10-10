@@ -208,12 +208,9 @@ pub async fn submit_handler(
     let trigger = if definition.cron.is_some() {
         None
     } else {
-        let request_id = match headers.get("idempotency-key") {
-            Some(value) => match value.to_str() {
-                Ok(value) => value.to_string(),
-                Err(_) => return error(StatusCode::BAD_REQUEST, "invalid idempotency-key"),
-            },
-            None => hex::encode(rand::random::<[u8; 16]>()),
+        let request_id = match request_identity(&headers) {
+            Ok(request_id) => request_id,
+            Err(response) => return response,
         };
         Some(crate::meat::job::RunTrigger::Manual { request_id })
     };
@@ -236,6 +233,20 @@ pub async fn submit_handler(
             .into_response(),
         Ok(None) => (StatusCode::ACCEPTED, Json(serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true}))).into_response(),
         Err(e) => write_error(e),
+    }
+}
+
+/// The submission's `Idempotency-Key` header, or a fresh random identity when
+/// the client sent none. A retry that reuses the key returns the runs the
+/// first attempt created; without one, every request is new work.
+#[allow(clippy::result_large_err)] // An HTTP refusal is the error.
+fn request_identity(headers: &HeaderMap) -> Result<String, Response> {
+    match headers.get("idempotency-key") {
+        Some(value) => match value.to_str() {
+            Ok(value) => Ok(value.to_string()),
+            Err(_) => Err(error(StatusCode::BAD_REQUEST, "invalid idempotency-key")),
+        },
+        None => Ok(hex::encode(rand::random::<[u8; 16]>())),
     }
 }
 
@@ -311,9 +322,14 @@ pub async fn manifest_handler(
         }
         cohort.template = definition.template;
     }
+    let request_id = match request_identity(&headers) {
+        Ok(request_id) => request_id,
+        Err(response) => return response,
+    };
     let write = TaskArrayWrite::RegisterManifest {
         name: request.name,
         namespace: request.namespace,
+        request_id,
         cohorts: request.cohort,
         submitted_at_epoch_secs: epoch_now_secs(),
     };
@@ -1202,6 +1218,10 @@ mod tests {
             namespace: None,
             exec: Some("/usr/bin/true".into()),
             script: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         }
     }
 

@@ -7656,6 +7656,10 @@ mod tests {
                     namespace: None,
                     exec: Some("/usr/bin/true".into()),
                     script: None,
+                    max_attempts: None,
+                    task_timeout_secs: None,
+                    overlap: None,
+                    replay_unknown: false,
                 }),
                 spec: crate::meat::task_array::TaskArraySpec {
                     chunk_size: 4,
@@ -7783,6 +7787,7 @@ mod tests {
                 TaskArrayWrite::RegisterManifest {
                     name: "render".into(),
                     namespace: "default".into(),
+                    request_id: "render-1".into(),
                     cohorts: vec![ManifestCohort {
                         name: "small".into(),
                         template: *template,

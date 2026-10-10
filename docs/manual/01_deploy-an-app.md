@@ -263,21 +263,33 @@ known failure is settled.
 
 Cluster migration cancellation is checked after job settlement and immediately before desired-state publication is proposed. A transaction already submitted to Raft may still commit. Ownership-write timeouts return uncertainty and retain the fence; they do not authorize automatic reruns or imply that the proposal was rejected.
 
-The cron example is for a standalone node. Cluster apply refuses any manifest
-containing recurring schedules before changing desired state or launching work.
-It also refuses an overlapping app or job while an earlier cluster job claim
-has an uncertain outcome. Leadership changes or recovery preserve that fence;
-there is no automatic expiry or replay of an uncertain migration.
+The cron example works on a cluster as well as a standalone node. Once the
+apply publishes its apps, the leader registers each schedule as a durable
+definition and claims every matching UTC minute itself, so a leader change
+neither loses nor repeats an occurrence. Apply refuses an overlapping app or job
+while an earlier run of it still has an uncertain outcome. Leadership changes or
+recovery preserve that fence; there is no automatic expiry or replay of an
+uncertain migration.
 
-A failed ordinary job retries up to three times. A job whose exit Bun couldn't observe
-(say, the node crashed) is `unknown`, and an ordinary apply won't rerun it,
-because it may already have done its work. Check, then ask explicitly:
+A failed ordinary job gets four attempts in all, unless it sets `max_attempts`.
+A job whose exit Bun couldn't observe (say, the node crashed) is `unknown`, and
+nothing reruns it automatically, because it may already have done its work.
+Cron skips that job's occurrences until the outcome is settled. Check what the
+job did, then acknowledge the exact grant the status shows:
 
 ```sh
-relish apply jobs.toml --rerun-jobs
+relish --output json batch-status 42
+relish batch replay 42 --node worker-2 --grant-digest DIGEST --acknowledge-side-effects
 ```
 
-Cron doesn't catch up: firings missed while a node was down are skipped.
+`relish apply jobs.toml --rerun-jobs` is a different thing: it starts a fresh
+apply operation, so jobs that already succeeded run again. It doesn't clear an
+unknown outcome; while one remains, the cluster refuses the new run with
+"acknowledge replay before another admission".
+
+Cron doesn't catch up: firings missed while the cluster had no leader are
+skipped. The policy fields (`max_attempts`, `task_timeout_secs`, `overlap` and
+`replay_unknown`) and the cron dialect are in [Batch jobs](14_batch-jobs.md).
 
 ## Task arrays
 

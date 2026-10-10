@@ -5,6 +5,12 @@
 //! month, day-of-week) and answer one question per event-loop minute: does this
 //! schedule fire *now*? There is no external cron daemon and no new dependency;
 //! the calendar arithmetic comes from the `time` crate we already pull in.
+//!
+//! The dialect follows Kubernetes CronJob (the `robfig/cron` parser): `N/step`
+//! repeats from N to the field's maximum, a term starting with `*` leaves its
+//! day field unrestricted for the day-of-month/day-of-week OR rule, month and
+//! weekday names (`JAN`, `MON`) work, and so do the `@hourly`, `@daily`,
+//! `@weekly`, `@monthly` and `@yearly` macros. Every time is UTC.
 
 use std::collections::BTreeSet;
 
@@ -27,23 +33,31 @@ pub enum CronError {
         max: u8,
     },
 
-    /// A field was syntactically malformed (bad range, bad step, non-numeric).
+    /// A field was syntactically malformed (bad range, bad step, unknown name).
     #[error("field {field:?} is malformed: {token:?}")]
     Malformed { field: &'static str, token: String },
+
+    /// An `@` shorthand we don't run, such as `@reboot` or `@every 5m`.
+    #[error(
+        "unsupported cron macro {name:?}; use @hourly, @daily, @midnight, @weekly, @monthly, @yearly, @annually or five fields"
+    )]
+    UnsupportedMacro { name: String },
 }
 
-/// One parsed cron field: either "any value" (`*`) or an explicit set of
-/// matching values. Keeping the `*` case distinct is what lets us implement the
-/// day-of-month / day-of-week OR rule below.
+/// One parsed cron field: the set of matching values, plus whether the field
+/// was written starting with `*`. Remembering the star is what lets us
+/// implement the day-of-month / day-of-week OR rule below: `*/2` still
+/// restricts the values, but it counts as "unrestricted" for that rule, just
+/// as it does in Kubernetes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CronField {
-    any: bool,
+    star: bool,
     values: BTreeSet<u8>,
 }
 
 impl CronField {
     fn matches(&self, value: u8) -> bool {
-        self.any || self.values.contains(&value)
+        self.values.contains(&value)
     }
 }
 
@@ -67,13 +81,42 @@ const BOUNDS: [(&str, u8, u8); 5] = [
     ("day-of-week", 0, 7),
 ];
 
+/// Month names, numbered from 1.
+const MONTHS: [&str; 12] = [
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+];
+
+/// Weekday names, numbered from 0 (Sunday).
+const WEEKDAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// The five-field expansion of each supported `@` macro.
+fn expand_macro(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "@yearly" | "@annually" => Some("0 0 1 1 *"),
+        "@monthly" => Some("0 0 1 * *"),
+        "@weekly" => Some("0 0 * * 0"),
+        "@daily" | "@midnight" => Some("0 0 * * *"),
+        "@hourly" => Some("0 * * * *"),
+        _ => None,
+    }
+}
+
 impl CronSchedule {
-    /// Parse a five-field cron expression (`"minute hour dom month dow"`).
+    /// Parse a five-field cron expression (`"minute hour dom month dow"`) or
+    /// one of the `@` macros.
     ///
     /// Supports `*`, single values, comma lists (`1,15,30`), ranges (`1-5`),
-    /// and steps (`*/15`, `0-30/10`) — the common crontab vocabulary. Day and
-    /// month names (`MON`, `JAN`) are not supported; use numbers.
+    /// steps (`*/15`, `0-30/10`, `5/15`), month names (`JAN`-`DEC`) and
+    /// weekday names (`SUN`-`SAT`), case-insensitively.
     pub fn parse(expression: &str) -> Result<Self, CronError> {
+        let trimmed = expression.trim();
+        let expression = if trimmed.starts_with('@') {
+            expand_macro(trimmed).ok_or_else(|| CronError::UnsupportedMacro {
+                name: trimmed.to_string(),
+            })?
+        } else {
+            expression
+        };
         let fields: Vec<&str> = expression.split_whitespace().collect();
         if fields.len() != 5 {
             return Err(CronError::FieldCount { got: fields.len() });
@@ -96,10 +139,10 @@ impl CronSchedule {
 
     /// Does this schedule fire at the given instant, to minute resolution?
     ///
-    /// When both day-of-month and day-of-week are restricted (neither is `*`),
-    /// a match on *either* fires — the historical Vixie-cron behaviour that
-    /// makes `0 0 1 * MON` mean "the 1st or any Monday", not "Mondays that fall
-    /// on the 1st".
+    /// When both day-of-month and day-of-week are restricted (neither starts
+    /// with `*`), a match on *either* fires: the historical Vixie-cron
+    /// behaviour that makes `0 0 1 * MON` mean "the 1st or any Monday", not
+    /// "Mondays that fall on the 1st".
     pub fn matches(&self, at: OffsetDateTime) -> bool {
         let minute_ok = self.minute.matches(at.minute());
         let hour_ok = self.hour.matches(at.hour());
@@ -107,7 +150,7 @@ impl CronSchedule {
 
         let dom = at.day();
         let dow = weekday_number(at.weekday());
-        let day_ok = if self.day_of_month.any || self.day_of_week.any {
+        let day_ok = if self.day_of_month.star || self.day_of_week.star {
             self.day_of_month.matches(dom) && self.day_of_week.matches(dow)
         } else {
             self.day_of_month.matches(dom) || self.day_of_week.matches(dow)
@@ -137,14 +180,9 @@ fn parse_field(token: &str, field: &'static str, min: u8, max: u8) -> Result<Cro
         token: token.to_string(),
     };
 
-    if token == "*" {
-        return Ok(CronField {
-            any: true,
-            values: BTreeSet::new(),
-        });
-    }
-
     let mut values = BTreeSet::new();
+    // Like robfig/cron, a field counts as a star when it starts with `*`.
+    let star = token.starts_with('*');
     // A field is a comma list of terms; each term is a value, a range, or either
     // of those with a trailing `/step`.
     for term in token.split(',') {
@@ -154,9 +192,9 @@ fn parse_field(token: &str, field: &'static str, min: u8, max: u8) -> Result<Cro
                 if step == 0 {
                     return Err(malformed());
                 }
-                (base, step)
+                (base, Some(step))
             }
-            None => (term, 1),
+            None => (term, None),
         };
 
         let (start, end) = if base == "*" {
@@ -168,21 +206,35 @@ fn parse_field(token: &str, field: &'static str, min: u8, max: u8) -> Result<Cro
             )
         } else {
             let v = parse_value(base, field, min, max)?;
-            (v, v)
+            // `N/step` repeats from N up to the field's maximum.
+            (v, if step.is_some() { max } else { v })
         };
 
         if start > end {
             return Err(malformed());
         }
-        for value in (start..=end).step_by(usize::from(step)) {
+        for value in (start..=end).step_by(usize::from(step.unwrap_or(1))) {
             values.insert(normalise(field, value));
         }
     }
 
-    Ok(CronField { any: false, values })
+    Ok(CronField { star, values })
 }
 
 fn parse_value(token: &str, field: &'static str, min: u8, max: u8) -> Result<u8, CronError> {
+    let names: &[&str] = match field {
+        "month" => &MONTHS,
+        "day-of-week" => &WEEKDAYS,
+        _ => &[],
+    };
+    if let Some(position) = names
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(token))
+    {
+        // Months count from 1, weekdays from 0 (Sunday), which is `min`.
+        // The tables are at most 12 long, so the cast can't truncate.
+        return Ok(min + position as u8);
+    }
     let value: u32 = token.parse().map_err(|_| CronError::Malformed {
         field,
         token: token.to_string(),
@@ -346,6 +398,85 @@ mod tests {
         ));
         assert!(matches!(
             CronSchedule::parse("5-1 * * * *"),
+            Err(CronError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn start_slash_step_repeats_to_the_field_maximum() {
+        // Kubernetes (robfig/cron) reads `5/15` as 5, 20, 35 and 50.
+        let s = schedule("5/15 * * * *");
+        for minute in 0..60 {
+            assert_eq!(
+                s.matches(utc(2026, 8, 13, 9, minute)),
+                [5, 20, 35, 50].contains(&minute),
+                "minute {minute}"
+            );
+        }
+        let hours = schedule("0 1/6 * * *");
+        for hour in 0..24 {
+            assert_eq!(
+                hours.matches(utc(2026, 8, 13, hour, 0)),
+                [1, 7, 13, 19].contains(&hour),
+                "hour {hour}"
+            );
+        }
+    }
+
+    #[test]
+    fn star_slash_step_day_fields_are_unrestricted_for_the_or_rule() {
+        // `*/2` in day-of-month still starts with `*`, so the OR rule doesn't
+        // apply: the job fires on odd days that are also Mondays.
+        // 2026-08-03 is a Monday (odd day), 2026-08-10 a Monday (even day),
+        // 2026-08-05 a Wednesday (odd day).
+        let s = schedule("0 0 */2 * 1");
+        assert!(s.matches(utc(2026, 8, 3, 0, 0)));
+        assert!(!s.matches(utc(2026, 8, 10, 0, 0)));
+        assert!(!s.matches(utc(2026, 8, 5, 0, 0)));
+        // Day-of-week `*/2` (Sunday, Tuesday, Thursday, Saturday) with a
+        // restricted day-of-month: both must match.
+        let s = schedule("0 0 1 * */2");
+        assert!(s.matches(utc(2026, 8, 1, 0, 0))); // Saturday the 1st
+        assert!(!s.matches(utc(2026, 6, 1, 0, 0))); // Monday the 1st
+        assert!(!s.matches(utc(2026, 8, 4, 0, 0))); // Tuesday the 4th
+    }
+
+    #[test]
+    fn daily_macro_is_supported_or_refused_clearly() {
+        for (named, expanded) in [
+            ("@yearly", "0 0 1 1 *"),
+            ("@annually", "0 0 1 1 *"),
+            ("@monthly", "0 0 1 * *"),
+            ("@weekly", "0 0 * * 0"),
+            ("@daily", "0 0 * * *"),
+            ("@midnight", "0 0 * * *"),
+            ("@hourly", "0 * * * *"),
+        ] {
+            assert_eq!(schedule(named), schedule(expanded), "{named}");
+        }
+        assert_eq!(schedule("@DAILY"), schedule("0 0 * * *"));
+        for unsupported in ["@reboot", "@every 5m", "@fortnightly"] {
+            let error = CronSchedule::parse(unsupported).unwrap_err();
+            assert!(
+                matches!(error, CronError::UnsupportedMacro { .. }),
+                "{unsupported}: {error}"
+            );
+            assert!(error.to_string().contains("@hourly"), "{error}");
+        }
+    }
+
+    #[test]
+    fn month_and_weekday_names_match_their_numbers() {
+        assert_eq!(schedule("0 0 1 JAN MON"), schedule("0 0 1 1 1"));
+        assert_eq!(schedule("0 0 * jun-aug sat,sun"), schedule("0 0 * 6-8 6,0"));
+        assert_eq!(schedule("0 9 * * Mon-Fri"), schedule("0 9 * * 1-5"));
+        assert!(matches!(
+            CronSchedule::parse("0 0 * * FOO"),
+            Err(CronError::Malformed { .. })
+        ));
+        // Names belong only to their own field.
+        assert!(matches!(
+            CronSchedule::parse("0 0 * MON *"),
             Err(CronError::Malformed { .. })
         ));
     }

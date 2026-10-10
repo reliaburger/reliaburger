@@ -3,19 +3,16 @@
 
 Use only a task-owned persistent cluster, a mixed reusable-container manifest
 and a separately deployed application. Credentials come from the ordinary
-Relish environment. The replacement keeps running and its PID replaces the
+Relish environment; the probe calls only routes an ordinary token may use. The replacement keeps running and its PID replaces the
 provided PID file; retain its original binary and journals until retirement.
 This is a single-node crash proof, not a throughput or multi-node qualification.
 """
 import argparse
-import http.client
 import importlib.util
 import json
 import os
 import pathlib
 import signal
-import socket
-import ssl
 import subprocess
 import time
 import urllib.parse
@@ -46,10 +43,9 @@ def main():
     parser.add_argument('--pid-file', required=True, type=pathlib.Path)
     parser.add_argument('--service-url', required=True)
     parser.add_argument('--service-name', required=True)
-    parser.add_argument('--node-name', required=True)
     parser.add_argument('--output', required=True, type=pathlib.Path)
     options = parser.parse_args()
-    endpoint = urllib.parse.urlsplit(os.environ['RELIABURGER_ENDPOINT'])
+    endpoint = urllib.parse.urlsplit(os.environ.get('RELIABURGER_ENDPOINT', ''))
     if endpoint.scheme != 'https' or not endpoint.hostname:
         parser.error('requires a real TLS endpoint and normal Relish credentials')
     options.output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -110,37 +106,25 @@ def main():
             or service()['pid'] != original_service['pid']):
         raise RuntimeError('recovery failed accepted completion or original application adoption')
     measurement.probe(options.service_url)
-    cohort = summary['cohorts'][0]
-    stale_request = dict(version=dict(epoch=0, term=0, index=0), known=[], arrays=[dict(
-        template=None, resources=dict(cpu_millicores=100, memory_bytes=33554432, gpus=0),
-        batch_id=cohort['batch_id'], spec=dict(count=cohort['total'], chunk_size=8,
-        max_attempts=3, per_node_concurrency=2), program='/unused', args=[], env=[],
-        held=[], stopping=False, replay_unknown=True)])
-    context = ssl.create_default_context(cafile=os.environ['RELIABURGER_CA_CERT'])
-    connection = http.client.HTTPSConnection(options.node_name, endpoint.port or 443,
-                                              context=context, timeout=30)
-    connection._create_connection = lambda address, timeout, source_address=None: socket.create_connection(
-        (endpoint.hostname, endpoint.port or 443), timeout, source_address)
-    connection.connect()
-    if ('URI', 'spiffe://reliaburger/node/' + options.node_name) not in connection.sock.getpeercert()['subjectAltName']:
-        raise ValueError('wrong node certificate identity')
-    connection.request('POST', '/v1/batch/array/sync', body=json.dumps(stale_request), headers={
-        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + os.environ['RELIABURGER_TOKEN']})
-    response = connection.getresponse()
-    if response.status != 200:
-        raise RuntimeError('stale control probe failed')
-    stale = json.loads(response.read(1 << 20))
-    connection.close()
-    (options.output / 'stale-response.json').write_text(json.dumps(stale, indent=2))
-    if stale['arrays'][0]['slots'] != 0 or 'stale' not in stale['arrays'][0]['refused']:
-        raise RuntimeError('stale control was not fenced')
+    # Ordinary credentials can't send control messages (that route is
+    # node-to-node only), so the probe checks what a user can see: after
+    # recovery no worker reports a refusal and no owner is left unknown. The
+    # control-version fence itself is covered by
+    # tests/suite/task_array_recovery.rs::stale_control_cannot_delete_ledgers_after_a_restart.
+    profiles = [summary, *summary.get('cohorts', [])]
+    refusals = [dict(batch_id=profile.get('batch_id'), node=node.get('node'), refused=node['refused'])
+                for profile in profiles for node in profile.get('nodes', []) if node.get('refused')]
+    unknown = [owner for profile in profiles for owner in profile.get('unknown_owners', [])]
+    (options.output / 'recovered-summary.json').write_text(json.dumps(summary, indent=2))
+    if refusals or unknown:
+        raise RuntimeError(f'recovered run still reports refusals {refusals} or unknown owners {unknown}')
     for result_id, index in measurement.indexed_queries(summary):
         result = cli('batch', 'results', str(result_id), '--index', str(index), '--limit', '1')
         measurement.check_indexed_result(result, result_id, index)
         (options.output / f'results-{result_id}-{index}.json').write_text(json.dumps(result, indent=2))
     report = dict(batch_id=batch_id, total=summary['total'], accepted_successes=summary['succeeded'],
                   failures=summary['failed'], retries=summary['retried'], service_pid_retained=True,
-                  stale_control_refused=True, qualified_100m_per_day=False)
+                  node_refusals=refusals, unknown_owners=unknown, qualified_100m_per_day=False)
     (options.output / 'report.json').write_text(json.dumps(report, indent=2))
     observations.close()
     print(json.dumps(report, indent=2))

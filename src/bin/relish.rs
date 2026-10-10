@@ -419,19 +419,28 @@ enum Command {
         action: Option<BatchAction>,
         /// Path to a TOML config file with [job.*] sections.
         path: Option<PathBuf>,
+        /// Reuse the key printed by an earlier submission that timed out, so
+        /// the retry returns its runs instead of admitting the jobs again.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
     },
     /// Run a resource-aware task array from an image or allowlisted host binary.
     ///
-    /// Every task runs the same binary with `{index}` in its arguments
+    /// Every task runs the same command with `{index}` in its arguments
     /// replaced by its own index, from 0 to COUNT-1, and gets
     /// RELIABURGER_TASK_INDEX, RELIABURGER_TASK_COUNT,
     /// RELIABURGER_TASK_ATTEMPT and RELIABURGER_BATCH_ID in its
-    /// environment. The binary must be in the nodes' [process_workloads]
-    /// allowed_binaries.
+    /// environment. With --image, the tasks run in containers; with
+    /// --runtime process --exec, the binary must be in the nodes'
+    /// [process_workloads] allowed_binaries.
     ///
     /// Tasks run at least once, not exactly once: a task that finished
     /// just before its node crashed can run again. Make tasks safe to
     /// repeat.
+    ///
+    /// Each submission prints an idempotency key before it is sent. If the
+    /// submission times out, retry with --idempotency-key KEY: the cluster
+    /// returns the run it already admitted rather than starting a second.
     Run {
         /// Name for the array (required: task arrays are the only kind of
         /// run so far).
@@ -440,7 +449,8 @@ enum Command {
         /// Number of tasks; one uses the same indexed executor.
         #[arg(long, default_value_t = 1)]
         count: u32,
-        /// Register a durable five-field UTC cron schedule instead of running now.
+        /// Register a durable UTC cron schedule (five fields, or a macro such
+        /// as @daily) instead of running now.
         #[arg(long)]
         schedule: Option<String>,
         /// Host binary every task runs.
@@ -467,7 +477,7 @@ enum Command {
         /// Stop the whole array once more than this many tasks have failed.
         #[arg(long)]
         max_failed: Option<u32>,
-        /// Per-attempt timeout, in seconds.
+        /// Per-attempt timeout, in seconds; 0 means no deadline.
         #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_TASK_TIMEOUT_SECS)]
         timeout: u32,
         /// Most tasks one node runs at once (default: 256, bounded by requests).
@@ -479,6 +489,9 @@ enum Command {
         /// An environment variable for every task (repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Reuse the key printed by an earlier submission that timed out.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
         /// Arguments after `--`; `{index}` becomes the task's index.
         #[arg(last = true)]
         args: Vec<String>,
@@ -491,8 +504,8 @@ enum Command {
         /// Poll until the batch reaches a terminal state.
         #[arg(long)]
         wait: bool,
-        /// Give up waiting after this many seconds (jobs time out
-        /// server-side after 3600s; the margin covers reporting).
+        /// Give up waiting after this many seconds. This only bounds the
+        /// wait: the run keeps going, under its own per-attempt timeout.
         #[arg(long, default_value_t = 3660)]
         timeout: u64,
     },
@@ -926,6 +939,10 @@ enum BatchAction {
         /// Validate the manifest locally without submitting work.
         #[arg(long)]
         dry_run: bool,
+        /// Reuse the key printed by an earlier submission that timed out, so
+        /// the retry returns its runs instead of admitting the manifest again.
+        #[arg(long, value_name = "KEY", conflicts_with = "dry_run")]
+        idempotency_key: Option<String>,
     },
     /// Acknowledge repeating side effects for the exact unknown owner grants.
     Replay {
@@ -965,7 +982,8 @@ enum BatchAction {
         #[arg(long, conflicts_with = "after")]
         index: Option<u32>,
     },
-    /// Print a failed task's output (the first and last 2 KiB).
+    /// Print a task's retained output (the first and last 2 KiB): any
+    /// singleton's, or a failed task's in a larger array.
     Logs {
         /// Batch id from `relish run --batch`.
         id: u64,
@@ -1920,10 +1938,19 @@ async fn main() -> ExitCode {
             registry_port,
             timeout,
         } => commands::build(path, registry_port, timeout).await,
-        Command::Batch { action, path } => match (action, path) {
-            (Some(BatchAction::Submit { path, dry_run }), _) => {
-                commands::submit_task_manifest(&path, cli.output, dry_run).await
-            }
+        Command::Batch {
+            action,
+            path,
+            idempotency_key,
+        } => match (action, path) {
+            (
+                Some(BatchAction::Submit {
+                    path,
+                    dry_run,
+                    idempotency_key,
+                }),
+                _,
+            ) => commands::submit_task_manifest(&path, cli.output, dry_run, idempotency_key).await,
             (Some(BatchAction::Watch { id, timeout }), _) => {
                 commands::watch_task_batch(id, timeout).await
             }
@@ -1950,7 +1977,7 @@ async fn main() -> ExitCode {
             (Some(BatchAction::Logs { id, index }), _) => {
                 commands::batch_task_logs(id, index).await
             }
-            (None, Some(path)) => commands::batch(&path).await,
+            (None, Some(path)) => commands::batch(&path, idempotency_key).await,
             (None, None) => Err(reliaburger::relish::RelishError::InvalidFlag {
                 flag: "file".to_string(),
                 reason: "give a [job.*] TOML file, or one of: cancel, results, logs".to_string(),
@@ -1973,6 +2000,7 @@ async fn main() -> ExitCode {
             concurrency,
             namespace,
             env,
+            idempotency_key,
             args,
         } => {
             commands::run_task_array(commands::TaskArrayRun {
@@ -1994,6 +2022,7 @@ async fn main() -> ExitCode {
                     task_timeout_secs: timeout,
                     per_node_concurrency: concurrency,
                 },
+                idempotency_key,
             })
             .await
         }
@@ -4133,9 +4162,14 @@ mod tests {
     fn parse_batch_command() {
         let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
         match cli.command {
-            Command::Batch { action, path } => {
+            Command::Batch {
+                action,
+                path,
+                idempotency_key,
+            } => {
                 assert!(action.is_none());
                 assert_eq!(path, Some(PathBuf::from("jobs.toml")));
+                assert!(idempotency_key.is_none());
             }
             _ => panic!("expected Batch"),
         }
@@ -4148,7 +4182,8 @@ mod tests {
             cli.command,
             Command::Batch {
                 action: Some(BatchAction::Cancel { id: 7 }),
-                path: None
+                path: None,
+                ..
             }
         ));
         let cli = parse(&["relish", "batch", "results", "7", "--failed"]).unwrap();
@@ -4545,5 +4580,87 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn job_submissions_accept_an_idempotency_key_for_a_retry() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "render",
+            "--image",
+            "fixture:v1",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run { idempotency_key: Some(ref key), .. } if key == "retry-7"
+        ));
+        let cli = parse(&[
+            "relish",
+            "batch",
+            "jobs.toml",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch { idempotency_key: Some(ref key), .. } if key == "retry-7"
+        ));
+        let cli = parse(&[
+            "relish",
+            "batch",
+            "submit",
+            "jobs.toml",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch {
+                action: Some(BatchAction::Submit { idempotency_key: Some(ref key), .. }),
+                ..
+            } if key == "retry-7"
+        ));
+        // A dry run sends nothing, so a key would be meaningless.
+        assert!(
+            parse(&[
+                "relish",
+                "batch",
+                "submit",
+                "jobs.toml",
+                "--dry-run",
+                "--idempotency-key",
+                "k",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn job_help_text_matches_what_the_commands_do() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let mut help = String::new();
+        for path in [
+            &["run"][..],
+            &["batch-status"],
+            &["batch", "logs"],
+            &["batch", "submit"],
+        ] {
+            let mut command = &mut cli;
+            for name in path {
+                command = command.find_subcommand_mut(name).unwrap();
+            }
+            help.push_str(&format!("=== relish {} ===\n", path.join(" ")));
+            help.push_str(&command.render_long_help().to_string());
+            help.push('\n');
+        }
+        insta::assert_snapshot!(help);
     }
 }

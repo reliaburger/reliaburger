@@ -721,7 +721,16 @@ relish sign keygen --out <path>     # Generate a signing key, print its public k
 
 # Jobs / batch
 relish batch <path>                 # Submit [job.*] sections as a batch
-relish batch-status <id> [--wait] [--timeout <secs>]
+relish batch <path> --idempotency-key <key> # Retry an uncertain submission
+relish batch submit <manifest> [--dry-run] # Mixed-profile manifest; unknown keys refused
+relish batch submit <manifest> --idempotency-key <key>
+relish run --batch <name> --image <image> [--count N] -- <command>
+relish run --batch <name> ... --idempotency-key <key>
+relish batch-status <id> [--wait] [--timeout <secs>] # --timeout bounds only the wait
+relish batch replay <id> --node <node> --grant-digest <digest> --acknowledge-side-effects
+relish jobs [--definitions]
+# Submitting commands print the key they send on stderr before sending, so a
+# timed-out submission can be retried without admitting the work twice.
 
 # Upgrades
 relish upgrade check                # Check for available updates

@@ -103,8 +103,29 @@ and leaves anything else under `~/.reliaburger`.
 | `relish logs NAME --namespace NS --instance run-ID` | Singleton log stream selected by run |
 | `relish batch cancel ID` | Cancel one run or all profiles in its parent |
 | `relish batch replay ID --node NODE --grant-digest DIGEST --acknowledge-side-effects` | Acknowledge repeated effects for exact unknown grants |
+| `relish run --batch …`, `relish batch FILE`, `relish batch submit FILE` with `--idempotency-key KEY` | Retry an uncertain submission without admitting it twice |
 
-Use returned IDs; physical executor slots can be reused. Ordinary TOML jobs,
+Use returned IDs; physical executor slots can be reused.
+
+## Job fields
+
+A `[job.NAME]` table takes these fields. Unknown fields are refused.
+
+| Field | Meaning |
+|-------|---------|
+| `runtime` | `runc` (default), `shared-runc` or `process` |
+| `image` | OCI image, for `runc` and `shared-runc` |
+| `exec`, `script` | Host binary or inline script, for `process` only |
+| `command` | Command and arguments |
+| `cpu`, `memory` | Request–limit ranges, as for apps |
+| `env` | Environment variables, plain or encrypted |
+| `namespace` | Namespace; `default` when omitted |
+| `schedule` | Cron schedule in UTC: five fields or a macro such as `@daily` |
+| `run_before` | `["app.NAME"]`: run as a hook before that app publishes |
+| `max_attempts` | 1–10. Default 4, or 1 for a hook |
+| `task_timeout_secs` | 0–86400 per attempt; 0 means no deadline. Default none, or 600 for a hook |
+| `overlap` | Cron only: `forbid` (default) skips an occurrence while a run is active; `allow` starts another |
+| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` | Ordinary TOML jobs,
 cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
 for retry, overlap, retention, supported runtimes and API shapes.
 

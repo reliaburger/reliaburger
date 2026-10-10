@@ -2099,8 +2099,62 @@ pub async fn build(
     Ok(())
 }
 
+/// Longest `Idempotency-Key` the cluster keeps as a request identity.
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+/// The key this submission sends: the caller's `--idempotency-key`, or a
+/// fresh random one. Either way it is written to `err` (stderr in
+/// production) *before* anything is sent, so a person whose submission times
+/// out already holds the key that makes the retry safe.
+pub fn submission_key(
+    explicit: Option<String>,
+    err: &mut dyn std::io::Write,
+) -> Result<String, RelishError> {
+    let key = match explicit {
+        Some(key) => {
+            if key.is_empty()
+                || key.len() > MAX_IDEMPOTENCY_KEY_BYTES
+                || !key.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(RelishError::InvalidFlag {
+                    flag: "idempotency-key".into(),
+                    reason: format!(
+                        "use 1–{MAX_IDEMPOTENCY_KEY_BYTES} printable ASCII characters without spaces"
+                    ),
+                });
+            }
+            key
+        }
+        None => format!("{:032x}", rand::random::<u128>()),
+    };
+    // A failed write to stderr mustn't stop the submission.
+    let _ = writeln!(
+        err,
+        "idempotency key {key}; if this submission times out, retry with --idempotency-key {key}"
+    );
+    Ok(key)
+}
+
 /// Submit a batch of jobs for high-throughput scheduling.
-pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
+pub async fn batch(
+    path: &std::path::Path,
+    idempotency_key: Option<String>,
+) -> Result<(), RelishError> {
+    batch_with_client(
+        path,
+        idempotency_key,
+        &BunClient::default_local(),
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+async fn batch_with_client(
+    path: &std::path::Path,
+    idempotency_key: Option<String>,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
+) -> Result<(), RelishError> {
     use crate::config::Config;
 
     let config = Config::from_file(path)?;
@@ -2109,8 +2163,8 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
         return Ok(());
     }
 
-    let client = BunClient::default_local();
-    let result = client.submit_batch(&config.job).await?;
+    let key = submission_key(idempotency_key, err)?;
+    let result = client.submit_batch(&config.job, Some(&key)).await?;
     println!(
         "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
@@ -2210,6 +2264,8 @@ pub struct TaskArrayRun {
     pub env: Vec<String>,
     /// Count and policy.
     pub spec: crate::meat::task_array::TaskArraySpec,
+    /// `--idempotency-key` from an earlier, uncertain submission.
+    pub idempotency_key: Option<String>,
 }
 
 /// Turn `relish run --batch` flags into the API request, refusing bad
@@ -2269,6 +2325,10 @@ pub fn task_array_request(
             namespace: None,
             exec: run.exec,
             script: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         },
         spec: run.spec,
     })
@@ -2279,6 +2339,26 @@ pub async fn submit_task_manifest(
     path: &std::path::Path,
     output: OutputFormat,
     dry_run: bool,
+    idempotency_key: Option<String>,
+) -> Result<(), RelishError> {
+    submit_task_manifest_with_client(
+        path,
+        output,
+        dry_run,
+        idempotency_key,
+        &BunClient::default_local(),
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+async fn submit_task_manifest_with_client(
+    path: &std::path::Path,
+    output: OutputFormat,
+    dry_run: bool,
+    idempotency_key: Option<String>,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
 ) -> Result<(), RelishError> {
     let source = std::fs::read_to_string(path)?;
     let request: crate::bun::task_array_api::TaskManifestRequest = toml::from_str(&source)
@@ -2293,6 +2373,7 @@ pub async fn submit_task_manifest(
             &crate::meat::task_array_store::TaskArrayWrite::RegisterManifest {
                 name: request.name.clone(),
                 namespace: request.namespace.clone(),
+                request_id: "dry-run".into(),
                 cohorts: request.cohort.clone(),
                 submitted_at_epoch_secs: 0,
             },
@@ -2314,9 +2395,8 @@ pub async fn submit_task_manifest(
         );
         return Ok(());
     }
-    let response = BunClient::default_local()
-        .submit_task_manifest(&request)
-        .await?;
+    let key = submission_key(idempotency_key, err)?;
+    let response = client.submit_task_manifest(&request, Some(&key)).await?;
     if matches!(output, OutputFormat::Human) {
         println!(
             "manifest {} submitted; watch with: relish batch watch {}",
@@ -2465,9 +2545,25 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
 
 /// Submit a task array (`relish run --batch`).
 pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
+    run_task_array_with_client(run, &BunClient::default_local(), &mut std::io::stderr()).await
+}
+
+async fn run_task_array_with_client(
+    mut run: TaskArrayRun,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
+) -> Result<(), RelishError> {
+    let explicit = run.idempotency_key.take();
+    let scheduled = run.schedule.is_some();
     let request = task_array_request(run)?;
-    let client = BunClient::default_local();
-    let answer = client.submit_task_array(&request).await?;
+    // A schedule registers a definition, not a run, so it needs no key;
+    // re-registering the same schedule is already idempotent.
+    let key = if scheduled {
+        explicit.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()))
+    } else {
+        submission_key(explicit, err)?
+    };
+    let answer = client.submit_task_array(&request, Some(&key)).await?;
     if let Some(id) = answer["batch_id"].as_u64() {
         println!(
             "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
@@ -4240,6 +4336,112 @@ mod task_array_tests {
     use crate::bun::task_array_node::TaskResultRow;
     use crate::meat::task_array::TaskArraySpec;
 
+    /// A stand-in leader that records each `/v1/batch/array` submission's
+    /// `Idempotency-Key` header and admits it as run 7.
+    async fn key_recording_server() -> (
+        BunClient,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/batch/array",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let recorder = recorder.clone();
+                async move {
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    recorder.lock().unwrap().push(key);
+                    axum::Json(serde_json::json!({"batch_id": 7, "count": 10, "chunks": 1}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (client, seen, server)
+    }
+
+    #[tokio::test]
+    async fn run_batch_sends_and_prints_an_idempotency_key() {
+        let (client, seen, server) = key_recording_server().await;
+        let mut err = Vec::new();
+        run_task_array_with_client(run(), &client, &mut err)
+            .await
+            .unwrap();
+        server.abort();
+        let sent = seen.lock().unwrap().clone();
+        let [Some(key)] = sent.as_slice() else {
+            panic!("expected one keyed submission, got {sent:?}");
+        };
+        assert_eq!(key.len(), 32, "{key}");
+        let printed = String::from_utf8(err).unwrap();
+        assert!(
+            printed.contains(&format!("--idempotency-key {key}")),
+            "{printed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_idempotency_key_is_sent_unchanged() {
+        let (client, seen, server) = key_recording_server().await;
+        let mut retry = run();
+        retry.idempotency_key = Some("retry-after-timeout-1".into());
+        let mut err = Vec::new();
+        run_task_array_with_client(retry, &client, &mut err)
+            .await
+            .unwrap();
+        let mut bad = run();
+        bad.idempotency_key = Some("has a space".into());
+        assert!(
+            run_task_array_with_client(bad, &client, &mut Vec::new())
+                .await
+                .is_err()
+        );
+        server.abort();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("retry-after-timeout-1".to_string())],
+            "a refused key never reaches the cluster"
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("retry-after-timeout-1")
+        );
+    }
+
+    #[test]
+    fn lint_rejects_an_out_of_range_job_policy() {
+        for policy in [
+            "max_attempts = 0",
+            "max_attempts = 11",
+            "task_timeout_secs = 86401",
+            "overlap = 'allow'",
+        ] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                file.path(),
+                format!("[job.cleanup]\nimage = 'cleanup:v1'\n{policy}\n"),
+            )
+            .unwrap();
+            assert!(lint(file.path()).is_err(), "{policy}");
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "[job.cleanup]\nimage = 'cleanup:v1'\nschedule = '@daily'\nmax_attempts = 2\ntask_timeout_secs = 300\noverlap = 'allow'\nreplay_unknown = true\n",
+        )
+        .unwrap();
+        lint(file.path()).unwrap();
+    }
+
     fn run() -> TaskArrayRun {
         TaskArrayRun {
             runtime: crate::config::job::JobRuntime::Process,
@@ -4253,6 +4455,7 @@ mod task_array_tests {
             args: vec!["--frame".to_string(), "{index}".to_string()],
             env: vec!["MODE=fast".to_string(), "EMPTY=".to_string()],
             spec: TaskArraySpec::with_count(10),
+            idempotency_key: None,
         }
     }
 

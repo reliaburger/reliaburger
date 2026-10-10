@@ -317,6 +317,17 @@ const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_m
 
 /// Classify a reqwest send error as either a timeout or a connection failure.
 /// A successful response's JSON body, or the API error it carried.
+/// Attach an `Idempotency-Key` header when the caller has one.
+fn with_idempotency_key(
+    request: reqwest::RequestBuilder,
+    key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match key {
+        Some(key) => request.header("Idempotency-Key", key),
+        None => request,
+    }
+}
+
 async fn json_or_api_error<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, RelishError> {
@@ -2474,9 +2485,13 @@ impl BunClient {
     /// Submit a batch: full job specs travel with the request, so the
     /// cluster needs no prior deploy of them. Returns the response
     /// JSON (`batch_id`, `assigned`, `unschedulable`).
+    ///
+    /// `idempotency_key`, when given, travels as the `Idempotency-Key` header: a retry
+    /// with the same key and jobs returns the first attempt's runs.
     pub async fn submit_batch(
         &self,
         jobs: &std::collections::BTreeMap<String, crate::config::job::JobSpec>,
+        idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch", self.base_url);
         let payload = serde_json::json!({
@@ -2487,10 +2502,8 @@ impl BunClient {
                 })
                 .collect::<Vec<_>>(),
         });
-        let response = self
-            .http()?
-            .post(&url)
-            .json(&payload)
+        let request = self.http()?.post(&url).json(&payload);
+        let response = with_idempotency_key(request, idempotency_key)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2533,16 +2546,36 @@ impl BunClient {
         json_or_api_error(response).await
     }
 
-    /// Submit a task array (`POST /v1/batch/array`).
+    /// Submit a task array (`POST /v1/batch/array`). `idempotency_key`,
+    /// when given, travels as the `Idempotency-Key` header, so a retry after an
+    /// uncertain timeout returns the same run rather than a second array.
     pub async fn submit_task_array(
         &self,
         request: &crate::bun::task_array_api::TaskArraySubmitRequest,
+        idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch/array", self.base_url);
-        let response = self
+        let builder = self.http()?.post(&url).json(request);
+        let response = with_idempotency_key(builder, idempotency_key)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
+    /// Admit all manifest profiles through one durable request. A retry with
+    /// the same `idempotency_key` and manifest returns the existing runs;
+    /// without one, the cluster treats every request as new work.
+    pub async fn submit_task_manifest(
+        &self,
+        request: &crate::bun::task_array_api::TaskManifestRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<serde_json::Value, RelishError> {
+        let builder = self
             .http()?
-            .post(&url)
-            .json(request)
+            .post(format!("{}/v1/batch/manifest", self.base_url))
+            .json(request);
+        let response = with_idempotency_key(builder, idempotency_key)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2550,21 +2583,6 @@ impl BunClient {
     }
 
     /// Cancel a task array (`POST /v1/batch/{id}/cancel`).
-    /// Admit all manifest profiles through one durable request.
-    pub async fn submit_task_manifest(
-        &self,
-        request: &crate::bun::task_array_api::TaskManifestRequest,
-    ) -> Result<serde_json::Value, RelishError> {
-        let response = self
-            .http()?
-            .post(format!("{}/v1/batch/manifest", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .map_err(classify_error)?;
-        json_or_api_error(response).await
-    }
-
     pub async fn cancel_batch(&self, batch_id: u64) -> Result<(), RelishError> {
         let url = format!("{}/v1/batch/{batch_id}/cancel", self.base_url);
         let response = self
