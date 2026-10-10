@@ -1599,9 +1599,9 @@ millisecond, so a node running 27 executors flat out would sample only the few
 commands caught mid-flight, and advertise far less than it was doing. (We first
 blamed this for a benchmark plateau; the drain bug above was the real cause, but
 the under-count is real too.) The right count sits between the two. Each
-pool slot records which run's caller has checked it out, from checkout to
-release, setup and cleanup included, so a waiting caller doesn't count and a
-millisecond command does. One regression fills a two-executor budget with 64
+pool slot records which run's caller holds it, from the moment resources are
+charged to it until release, setup and cleanup included. A caller waiting for
+a slot or for admission doesn't count, and a millisecond command does. One regression fills a two-executor budget with 64
 two-second commands and checks the node advertises two. Another stops the
 helper with `SIGSTOP` so a submitted command holds its slot without starting,
 and checks the slot counts as busy while no command counts as started.
@@ -1688,6 +1688,53 @@ final outcome and the attempt count, not the earlier failure's reason. At this
 volume you want bounded summaries of failure causes, not millions of log lines
 for successful jobs. A real daily run, faults and collection of that history
 remain in #668.
+
+**Benchmark your own fixes.** The review that hardened this code was checked
+by rerunning the benchmarks on the fixed build, and the reruns found three
+regressions in the fixes themselves. One was the 10 ms drain wait above. The
+second was a single line. Bounding retirement had made the "is the task group
+empty?" check async, and the read moved to `tokio::fs::read_to_string`. Tokio's
+file functions hand each call to a pool of blocking threads, because ordinary
+file I/O can stall a thread. That's the right default for a disk. But
+`cgroup.events` lives in cgroupfs, which, like `/proc`, is answered from kernel
+memory and never waits. The read happens once per command, and the thread hop
+cost about 3% of host-job throughput. It's a plain synchronous read again,
+with a comment saying why.
+
+The third was memory. Bun's resident memory after five minutes of host jobs
+moved by up to 170 MiB between builds, with changes that had nothing to do
+with memory. Reverting them one at a time never brought it back to #654's
+figure. The cause was glibc's allocator. To avoid lock contention, glibc gives
+busy threads their own *arenas*, up to eight per core, and keeps freed memory
+in each arena for reuse rather than returning it to the kernel. Tokio's worker
+and blocking threads all count. So resident memory tracked how many threads
+had ever been busy, not how much data Bun held. Go and Python manage their own
+heaps, so you meet this mostly in C, and in Rust, which uses the system
+allocator by default. Setting `MALLOC_ARENA_MAX=2` brought the same run down to
+about 190 MiB. Bun now does it for itself, before the runtime starts any
+threads:
+
+```rust
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // SAFETY: mallopt only tunes the allocator, and runs here before Bun
+    // starts any other thread. A value glibc rejects is reported by the return
+    // value, which we can ignore: the default arenas simply stay in place.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+```
+
+`#[cfg(...)]` compiles the function only on Linux with glibc. musl and macOS
+have different allocators and no such knob. Calling a C function is `unsafe`
+in Rust because the compiler can't check what C does. The `// SAFETY:` comment
+records why this call is fine, and an operator's own `MALLOC_ARENA_MAX` still
+wins. Bun then ended the run at 169 MiB, against 587 MiB for #654, and accepted
+about as many jobs: its hot paths wait on I/O, not on the allocator.
 
 **Keep the failures.** One rerun of the direct matrix forgot its private
 hostname wrapper, collided with the live node and produced a thousand startup
