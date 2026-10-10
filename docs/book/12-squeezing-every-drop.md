@@ -1535,10 +1535,21 @@ That's the idea. The edges took four more fixes:
   the counts only grew, it was never forgotten. The planner now uses a second,
   *decaying* histogram, and falls back only when more than one in sixteen
   recent samples overflowed.
-- **The tail must be shared.** `plan_grants` tops up the emptiest node first.
-  Near the end of an array, the first fast node could take sixteen of the last
-  twenty chunks while another sat idle. The learned depth is now capped at the
-  node's fair share of what's left.
+- **The tail must be shared, by capacity.** `plan_grants` tops up the
+  emptiest node first. Near the end of an array, the first fast node could
+  take sixteen of the last twenty chunks while another sat idle. Our first
+  cap split what was left evenly, and #654's author showed in review that this
+  is wrong too. With 27 slots on one node and 8 on the other, the last twenty
+  chunks went 10/10, so the bigger node finished early and the smaller one
+  owned half the tail. The cap is now each node's share of every outstanding
+  chunk, queued or already held, in proportion to its slots: 15/5 in that
+  example. Counting held chunks means a node still working through a big
+  grant doesn't get more on top. Rounding each share up would hand out more
+  chunks than exist, and rounding down would strand some. So the whole parts
+  go out first, and the leftover chunks go to the largest fractions (the
+  *largest remainder* method that some countries use to share out
+  parliamentary seats). The baseline window still applies, so even a node
+  with a thousandth of the capacity gets two chunks.
 - **Lookahead needs automatic replay.** If a node dies, every chunk it held
   has an unknown outcome. Arrays that replay automatically don't mind. Arrays
   that need an operator to acknowledge and replay would turn sixteen chunks

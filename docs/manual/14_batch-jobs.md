@@ -98,7 +98,8 @@ replay after worker loss. Lookahead learns from roughly the last 4,096
 completions; arrays without samples, with slow recent work, or with more than
 one in sixteen recent tasks over 16 seconds keep the small window, and so do
 runs without automatic replay of unknown outcomes. Near the end of an array no
-node takes more than its share of the remaining chunks. Applications and
+node takes more than its share of the remaining chunks, weighted by how many
+tasks it can run at once and counting the chunks it already holds. Applications and
 batch attempts share the same node resource accounting. Existing app commitments
 remain reserved while an app starts, runs or retires.
 

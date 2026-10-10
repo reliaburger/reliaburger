@@ -617,9 +617,9 @@ pub fn grant_depth(slots: u32, chunk_size: u32) -> u64 {
 }
 
 impl TaskArrayState {
-    /// `fair_share` caps the learned part: near the tail, one node mustn't
-    /// take all the remaining chunks while another idles.
-    fn observed_grant_depth(&self, slots: u32, fair_share: u64) -> u64 {
+    /// `share` caps the learned part: near the tail, one node mustn't take
+    /// all the remaining chunks while another idles.
+    fn observed_grant_depth(&self, slots: u32, share: u64) -> u64 {
         let baseline = grant_depth(slots, self.spec.chunk_size);
         // The overflow bucket has no finite upper bound. Mostly slow recent
         // work retains the small window rather than inventing a throughput
@@ -644,16 +644,47 @@ impl TaskArrayState {
         // cover receipt acceptance and delivery of the committed next grant.
         let tasks = u128::from(slots) * LOOKAHEAD_MILLISECONDS * samples / milliseconds;
         let chunks = tasks.div_ceil(u128::from(self.spec.chunk_size.max(1)));
-        let learned = chunks.min(u128::from(MAX_LEARNED_GRANT_DEPTH.min(fair_share))) as u64;
+        let learned = chunks.min(u128::from(MAX_LEARNED_GRANT_DEPTH.min(share))) as u64;
         baseline.max(learned)
     }
 }
 
+/// Split `outstanding` chunks across nodes in proportion to their slots. The
+/// shares add up exactly: each node gets the whole part of its share, and
+/// the chunks left over go to the largest fractions, ties in `slots` order.
+fn capacity_shares(outstanding: u64, slots: &[u32]) -> Vec<u64> {
+    let total: u128 = slots.iter().map(|slots| u128::from(*slots)).sum();
+    if total == 0 {
+        return vec![0; slots.len()];
+    }
+    let exact: Vec<u128> = slots
+        .iter()
+        .map(|slots| u128::from(outstanding) * u128::from(*slots))
+        .collect();
+    // Each whole part is at most `outstanding`, so it fits in a u64.
+    let mut shares: Vec<u64> = exact
+        .iter()
+        .map(|exact| u64::try_from(exact / total).unwrap_or(u64::MAX))
+        .collect();
+    let mut left = outstanding.saturating_sub(shares.iter().sum());
+    let mut by_fraction: Vec<usize> = (0..slots.len()).collect();
+    // A stable sort keeps ties in their original order.
+    by_fraction.sort_by_key(|index| std::cmp::Reverse(exact[*index] % total));
+    for index in by_fraction {
+        if left == 0 {
+            break;
+        }
+        shares[index] += 1;
+        left -= 1;
+    }
+    shares
+}
+
 /// Decide which queued chunks to hand to which node. Each node is topped
 /// up to its baseline [`grant_depth`] or, with `lookahead`, a learned
-/// bounded lookahead no bigger than its fair share of the queue, the
-/// emptiest nodes first (ties by name), and
-/// always with the lowest queued chunk ids. It's pull-shaped load
+/// bounded lookahead no bigger than its share of the outstanding chunks
+/// (queued and held), weighted by its slots. The emptiest nodes go first
+/// (ties by name), always with the lowest queued chunk ids. It's pull-shaped load
 /// balancing: a fast node empties its chunks sooner and gets more, so
 /// there's no up-front split to go wrong. The state isn't changed; the
 /// caller applies the plan with [`TaskArrayState::grant`] (through Raft,
@@ -680,14 +711,20 @@ pub fn plan_grants(
     order.sort_by(|a, b| held(&a.node).cmp(&held(&b.node)).then(a.node.cmp(&b.node)));
 
     let mut queue = state.queued().clone();
-    let fair_share = queue.len().div_ceil(order.len().max(1) as u64);
+    // Chunks a node already holds count towards its share, so one that is
+    // still working through a big grant doesn't get more of the tail.
+    let outstanding = order.iter().fold(queue.len(), |sum, node| {
+        sum.saturating_add(held(&node.node))
+    });
+    let slots: Vec<u32> = order.iter().map(|node| node.slots).collect();
+    let shares = capacity_shares(outstanding, &slots);
     let mut plan = Vec::new();
-    for candidate in order {
+    for (candidate, share) in order.into_iter().zip(shares) {
         if queue.is_empty() {
             break;
         }
         let depth = if lookahead {
-            state.observed_grant_depth(candidate.slots, fair_share)
+            state.observed_grant_depth(candidate.slots, share)
         } else {
             grant_depth(candidate.slots, state.spec.chunk_size)
         };
@@ -830,6 +867,63 @@ mod tests {
         assert_eq!(
             plan_grants(&state, &slots(&[("a", 27), ("b", 27)]), true),
             vec![(node("a"), chunks(80..=89)), (node("b"), chunks(90..=99))]
+        );
+    }
+
+    /// 100 chunks, 80 of them done with millisecond tasks.
+    fn fast_array_near_its_tail() -> TaskArrayState {
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        complete_in_bucket(&mut state, 0..=79, 0);
+        state
+    }
+
+    #[test]
+    fn near_the_tail_chunks_split_by_node_capacity() {
+        // An even split would leave the 8-slot node half the tail while the
+        // 27-slot node ran out of work.
+        let state = fast_array_near_its_tail();
+        let expected = vec![(node("a"), chunks(80..=94)), (node("b"), chunks(95..=99))];
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27), ("b", 8)]), true),
+            expected
+        );
+        // The order nodes report in doesn't matter.
+        assert_eq!(
+            plan_grants(&state, &slots(&[("b", 8), ("a", 27)]), true),
+            expected
+        );
+    }
+
+    #[test]
+    fn chunks_a_node_already_holds_count_towards_its_share() {
+        // The fast node still holds ten: the slow one gets its five, and the
+        // fast one only tops up to fifteen.
+        let mut state = fast_array_near_its_tail();
+        state.grant(&node("a"), &chunks(80..=89)).unwrap();
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27), ("b", 8)]), true),
+            vec![(node("b"), chunks(90..=94)), (node("a"), chunks(95..=99))]
+        );
+        // The slow node holding ten already has more than its share.
+        let mut state = fast_array_near_its_tail();
+        state.grant(&node("b"), &chunks(80..=89)).unwrap();
+        assert_eq!(
+            plan_grants(&state, &slots(&[("a", 27), ("b", 8)]), true),
+            vec![(node("a"), chunks(90..=99))]
+        );
+    }
+
+    #[test]
+    fn capacity_shares_stay_within_the_grant_depth_bounds() {
+        // Almost the whole share goes to "big", but its lookahead still stops
+        // at the learned maximum; "tiny" still gets the baseline window.
+        let state = fast_array_near_its_tail();
+        assert_eq!(
+            plan_grants(&state, &slots(&[("big", 1000), ("tiny", 1)]), true),
+            vec![
+                (node("big"), chunks(80..=95)),
+                (node("tiny"), chunks(96..=97))
+            ]
         );
     }
 
@@ -995,7 +1089,10 @@ mod tests {
                             .map(|set| set.iter().collect())
                             .unwrap_or_default();
                         if let Some(&chunk) = held.get(pick % held.len().max(1)) {
-                            let result = all_ok(&state, chunk);
+                            // Fast tasks, so plans use the learned lookahead
+                            // and the capacity shares.
+                            let mut result = all_ok(&state, chunk);
+                            result.duration_counts[0] = u64::from(result.succeeded);
                             proptest::prop_assert_eq!(
                                 state.complete(&holder, &result),
                                 Ok(CompletionOutcome::Applied)
