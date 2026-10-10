@@ -1459,8 +1459,8 @@ Held cluster jobs conservatively reserve their CPU/memory requests on every app 
 ### Delegated jobs (0.2.0 development preview)
 
 [Batch jobs](manual/14_batch-jobs.md) explains compact arrays, atomic mixed-profile
-manifests, app/job resource accounting, watch summaries, indexed detail, retries
-and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
+manifests, app/job resource accounting, namespace quotas and per-namespace job
+caps, watch summaries, indexed detail, retries and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
 mixed-resource work beside a service. The standalone landing-page job recording
 uses the built-in `relish bench` scenarios. Build matching development binaries
 and use a fresh cluster (protocol 51 / state 68). The
