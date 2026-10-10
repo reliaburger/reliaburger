@@ -1258,7 +1258,10 @@ failures and the hard safety limit fail the suite.
 (60 seconds at concurrency 27 by default), with fresh-container, host-process
 and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
 it measures per-job overhead rather than real work; see the batch manual for
-prerequisites and resource profiles.
+prerequisites and resource profiles. `--compare OLD.json` checks a scenario
+against an earlier report of the same scenario and fails on a drop beyond
+`--tolerance` (10% by default). The 100-million-a-day claim itself needs the
+24-hour job qualification (`scripts/release/qualify-jobs-sustained.sh`).
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,

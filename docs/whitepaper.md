@@ -821,6 +821,13 @@ blast-radius protection (quorum, replica and leader guards). Admin doesn't
 override a disabled operation, and Bun attributes audit events to the
 authenticated credential rather than a client-supplied name.
 
+In 0.2.0 workload faults target apps only: the replica guard refuses a kill or
+pause aimed at a job, and array or shared-executor attempts aren't Smoker
+targets. Jobs are tested under node-level faults instead (Bun killed on a
+worker or the leader, delayed traffic between nodes, a full disk, slow
+fsync), which is how the release's job qualification breaks them. Job-aware
+chaos is planned for 0.2.2.
+
 | | Chaos Mesh (K8s) | Litmus (K8s) | Gremlin (SaaS) | **Smoker** |
 |---|---|---|---|---|
 | **Installation** | CRDs + operator + RBAC | CRDs + operator + agent | SaaS agent | **Built-in** |
@@ -852,6 +859,14 @@ reverses them after failure, timeout or panic; unconfirmed reversal is
 `Unknown`.
 
 `relish bench` measures performance against the design goals (Section 2) and produces a report with regression detection when compared against a baseline.
+Four job scenarios (`--scenario jobs-containers`, `jobs-shared-containers`,
+`jobs-host-processes` and the raw `jobs-vm-baseline`) count unique accepted
+successes in a fixed window through the public job API. Each writes a strict
+JSON report, and `--compare` with an earlier report of the same scenario fails
+on a drop in the window rate beyond `--tolerance` (10% by default); different
+settings make the comparison informational. A window rate is a regression
+guard, never a daily qualification: the 100-million-a-day claim needs the
+24-hour job qualification on at least three nodes.
 
 > For test output examples, benchmark methodology, and CI integration, see the design docs for each component.
 
