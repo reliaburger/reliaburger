@@ -1504,7 +1504,6 @@ mod tests {
             namespace: "payments".to_string(),
             app_name: "rootfs-adoption".to_string(),
             replica_index: 0,
-            is_job: false,
             image: ALPINE_IMAGE.to_string(),
             runtime: crate::grill::records::RuntimeKind::Runc,
             pid,

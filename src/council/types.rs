@@ -166,22 +166,6 @@ pub enum RaftRequest {
     /// Finish a cluster upgrade: archive it to history and clear the
     /// active slot.
     UpgradeClear { upgrade_id: String },
-    /// Register a batch, allocating its id from the durable counter
-    /// (12b.2 JOB4). The response carries the assigned id.
-    BatchRegister {
-        /// Revision used to plan this complete allocation.
-        expected_log_id: Option<openraft::LogId<u64>>,
-        batch: crate::meat::batch_tracker::BatchRecord,
-    },
-    /// Record a job's state transition within a tracked batch. An
-    /// unknown batch/job or an illegal transition is `Refused`.
-    BatchJobUpdate {
-        batch_id: u64,
-        job_name: String,
-        namespace: String,
-        status: crate::meat::batch_tracker::JobStatus,
-        exit_code: Option<i32>,
-    },
     /// Register a build, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.
     BuildRegister {
@@ -345,18 +329,6 @@ pub enum RaftRequest {
     /// remove from `now_unix_ms` alone, so every replica removes the same
     /// tokens. It never removes the last Admin and never empties the store.
     SweepExpiredApiTokens { now_unix_ms: u64 },
-    /// Hold migration intent before authorising any execution or app revision.
-    PrerequisiteBegin {
-        operation_id: String,
-        term: u64,
-        config: Box<crate::config::Config>,
-    },
-    /// Publish the held manifest atomically after durable prerequisite success.
-    PrerequisiteCommit { operation_id: String },
-    /// Release a positively failed, durably settled prerequisite operation.
-    PrerequisiteFailed { operation_id: String },
-    /// Release ordinary-job intent after trusted positive terminal proof.
-    JobApplyComplete { operation_id: String },
     /// Publish dependent apps and admit ordinary indexed runs in one transaction.
     JobApplyCommit {
         operation_id: String,
@@ -407,6 +379,14 @@ pub enum RaftRequest {
     /// jobs). One variant wrapping the array's own write type, so the
     /// rules live beside the data in `meat::task_array_store`.
     TaskArray(Box<crate::meat::task_array_store::TaskArrayWrite>),
+    /// Attach jobs to an active job test lease before their deployment is
+    /// admitted, so the lease's cleanup knows to stop and forget them. A job
+    /// in a test namespace is only admitted once its lease owns it.
+    TestLeaseJobs {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        jobs: Vec<AppId>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -438,9 +418,6 @@ pub enum CouncilResponse {
     /// sealed under an old generation (PKI8). The state is unchanged;
     /// `reason` tells the proposer why.
     Refused { reason: String },
-    /// A `BatchRegister` entry was applied; carries the batch id the
-    /// durable counter assigned to *this* entry (12b.2 JOB4).
-    BatchRegistered { batch_id: u64 },
     /// A `BuildRegister` entry was applied; carries the assigned build id.
     BuildRegistered { build_id: u64 },
     /// A `ConsumeJoinTokenForIssue` entry was applied and this proposer won
@@ -528,13 +505,13 @@ pub struct DesiredState {
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
     pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
-    /// Durable batch tracker: monotonic id counter plus in-flight and
-    /// recently terminal batches (12b.2 JOB4).
-    pub batch_state: crate::meat::batch_tracker::BatchDurableState,
+    /// The id counter task arrays, job runs and manifests share, so a new
+    /// leader never hands out an id twice.
+    pub batch_ids: crate::meat::batch_ids::BatchIds,
     /// Task arrays (0.2.0): chunk tables and counts, never a record per
-    /// task. Ids come from `batch_state`'s counter.
+    /// task. Ids come from `batch_ids`.
     pub task_arrays: crate::meat::task_array_store::TaskArrays,
-    /// Durable build tracker, same shape and rationale as `batch_state`.
+    /// Durable build tracker: a monotonic id counter plus recent builds.
     pub build_state: crate::bun::build_runner::BuildDurableState,
     /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster
     /// that has never been recovered; the recovery path stamps a strictly
@@ -564,11 +541,6 @@ pub struct DesiredState {
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
-    /// Migration intent, retained across handover when the outcome is uncertain.
-    /// Missing ownership state is refused rather than decoded as an empty fence.
-    #[serde(deserialize_with = "super::prerequisites::deserialize_claims")]
-    pub prerequisite_claims:
-        std::collections::BTreeMap<String, super::prerequisites::PrerequisiteClaim>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

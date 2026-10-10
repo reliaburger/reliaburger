@@ -273,17 +273,11 @@ async fn write_admission_fixture(
     mut request: reliaburger::council::RaftRequest,
 ) -> Result<reliaburger::council::CouncilResponse, reliaburger::council::CouncilError> {
     let previous = council.desired_state().await.last_applied_log;
-    match &mut request {
-        reliaburger::council::RaftRequest::BatchRegister {
-            expected_log_id, ..
-        } => *expected_log_id = previous,
-        reliaburger::council::RaftRequest::SchedulingDecision(decision) => {
-            request = reliaburger::council::RaftRequest::SchedulingDecisions {
-                expected_log_id: previous,
-                decisions: vec![decision.clone()],
-            }
+    if let reliaburger::council::RaftRequest::SchedulingDecision(decision) = &request {
+        request = reliaburger::council::RaftRequest::SchedulingDecisions {
+            expected_log_id: previous,
+            decisions: vec![decision.clone()],
         }
-        _ => {}
     }
     council.write(request).await
 }

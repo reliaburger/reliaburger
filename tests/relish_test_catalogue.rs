@@ -150,14 +150,17 @@ fn qualify_process_catalogue(group: &str) {
             )
         });
     if group == "jobs" {
-        assert_success(&output, "qualify node-local jobs catalogue");
+        assert_success(&output, "qualify jobs catalogue");
         let results = report["results"].as_array().unwrap();
         assert_eq!(results.len(), 3, "{report}");
         for case in results {
             assert_eq!(case["outcome"]["status"], "pass", "{case}");
             assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
         }
-        let leases = std::fs::read_to_string(node_data.join("node-test-leases.json")).unwrap();
+        // With a council, job leases live in Raft; the node's own store
+        // must hold none of them.
+        let leases =
+            std::fs::read_to_string(node_data.join("node-test-leases.json")).unwrap_or_default();
         assert!(!leases.contains("node-jobs-"), "{leases}");
         return;
     }

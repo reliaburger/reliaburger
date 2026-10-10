@@ -94,7 +94,6 @@ pub(super) async fn test_lease_create_handler(
         }
     }
     if let Some(council) = &state.council
-        && request.scope == LeaseScope::Applications
         && !council.is_leader().await
     {
         let created = forward_test_lease_request(
@@ -161,9 +160,7 @@ pub(super) async fn test_lease_create_handler(
         Err(error) => return lease_error_response(error),
     };
 
-    if let Some(council) = &state.council
-        && request.scope == LeaseScope::Applications
-    {
+    if let Some(council) = &state.council {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseCreate(lease.clone()),
@@ -239,7 +236,6 @@ pub(super) async fn test_lease_get_handler(
             Err(response) => return response,
         };
     if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
         && !confirmed_lease_leader(council).await
     {
         return forward_test_lease_request::<()>(
@@ -292,7 +288,6 @@ pub(super) async fn test_lease_renew_handler(
         Err(response) => return response,
     };
     if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request(
@@ -314,9 +309,7 @@ pub(super) async fn test_lease_renew_handler(
         return lease_error_response(error);
     }
 
-    if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
-    {
+    if let Some(council) = &state.council {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseRenew {
@@ -358,7 +351,6 @@ pub(super) async fn test_lease_release_handler(
             Err(response) => return response,
         };
     if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request::<()>(
@@ -390,14 +382,13 @@ pub(super) async fn test_lease_release_handler(
     } else {
         return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
     };
-    let result = if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
-    {
+    let result = if let Some(council) = &state.council {
         crate::testkit::lease::cleanup_cluster_lease(council, &lease_id, owner_id).await
     } else {
         crate::testkit::lease::cleanup_local_lease(
             &state.local_test_leases,
             &state.cmd_tx,
+            Some(&state.task_arrays),
             &lease_id,
             owner_id,
         )
@@ -556,9 +547,6 @@ pub(super) async fn find_test_lease(
     state: &ApiState,
     lease_id: &str,
 ) -> Option<crate::testkit::lease::TestLease> {
-    if is_node_job_lease(lease_id) {
-        return state.local_test_leases.get(lease_id).await;
-    }
     match &state.council {
         Some(council) => council
             .desired_state()

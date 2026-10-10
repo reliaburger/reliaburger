@@ -39,46 +39,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.deployed_specs
             .remove(&(app_name.to_string(), namespace.to_string()));
-        let mut inventory = crate::bun::jobs::JobInventory {
-            jobs: self.recorded_jobs.clone(),
-            retired: self.retired_batch_executions.clone(),
-        };
-        let retiring: Vec<_> = inventory
-            .jobs
-            .iter()
-            .filter(|(_, job)| job.name == app_name && job.namespace == namespace)
-            .map(|(id, job)| (id.clone(), job.clone()))
-            .collect();
-        for (id, job) in retiring {
-            if let Some(owner) = &job.batch_execution {
-                if !job.runtime_absent {
-                    return Err(BunError::JobState(
-                        "batch execution retirement lacks positive runtime absence".into(),
-                    ));
-                }
-                // Only current-attempt terminal evidence becomes a terminal proof.
-                // An interrupted retry or explicit unknown stop remains unknown.
-                let phase = job
-                    .batch_terminal_exit()
-                    .map_or(crate::bun::jobs::JobPhase::Unknown, |code| {
-                        crate::bun::jobs::JobPhase::Exited { code }
-                    });
-                inventory.retired.insert(
-                    id.clone(),
-                    crate::bun::jobs::RetiredBatchExecution {
-                        name: job.name.clone(),
-                        namespace: job.namespace.clone(),
-                        generation: job.generation,
-                        restart_count: job.restart_count,
-                        batch_execution: owner.clone(),
-                        runtime_absent: true,
-                        phase,
-                    },
-                );
-            }
-            inventory.jobs.remove(&id);
-        }
-        self.commit_job_inventory(inventory).await?;
         Ok(())
     }
 
@@ -278,6 +238,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Ownership stays put until the kill is confirmed: the outer `Err` is
     /// `StillRunning` while it isn't yet, and the inner one says why the
     /// runtime didn't confirm it.
+    #[cfg_attr(
+        not(any(test, all(feature = "ebpf", target_os = "linux"))),
+        allow(dead_code)
+    )]
     pub(super) async fn kill_off_the_loop(
         &mut self,
         key: off_loop_work::WorkKey,
@@ -289,10 +253,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             self.take_back_from_restart(id)
         };
-        let runtime_absent = self
-            .recorded_jobs
-            .get(&id.0)
-            .is_some_and(|job| job.runtime_absent);
         let grill = self.supervisor.grill().clone();
         let confirmation = self.stop_confirmation_timeout;
         let target = id.clone();
@@ -302,9 +262,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .settle(confirmation)
                     .await
                     .map_err(|error| error.to_string())?;
-            }
-            if runtime_absent {
-                return Ok(());
             }
             kill_runtime_instance(&grill, &target, confirmation)
                 .await
@@ -320,7 +277,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn kill_and_wait_for_exit(&mut self, id: &InstanceId) -> Result<(), BunError> {
         loop {
             match self
-                .kill_off_the_loop(off_loop_work::WorkKey::ClearJobRun(id.clone()), id)
+                .kill_off_the_loop(off_loop_work::WorkKey::FenceExecution(id.clone()), id)
                 .await
             {
                 Err(BunError::StillRunning { .. }) => tokio::task::yield_now().await,

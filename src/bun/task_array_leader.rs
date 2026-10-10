@@ -86,6 +86,8 @@ pub struct TaskArrayService {
     pub silence_timeout: Duration,
     /// Standalone copy of the arrays (unused with a council).
     local: Mutex<TaskArrays>,
+    /// The id counter for `local`. With a council the counter lives in Raft.
+    local_ids: Mutex<crate::meat::batch_ids::BatchIds>,
     /// What each node last said about each array, by batch id.
     views: Mutex<HashMap<u64, BTreeMap<NodeId, NodeView>>>,
     rates: Mutex<HashMap<u64, super::task_rates::RateSample>>,
@@ -137,6 +139,7 @@ impl TaskArrayService {
             sync_interval,
             silence_timeout,
             local: Mutex::new(TaskArrays::default()),
+            local_ids: Mutex::new(crate::meat::batch_ids::BatchIds::default()),
             views: Mutex::new(HashMap::new()),
             rates: Mutex::new(HashMap::new()),
         }
@@ -208,73 +211,12 @@ pub(crate) async fn write_task_array(
         | TaskArrayWrite::CancelManifest { now_epoch_secs, .. }
             if *now_epoch_secs == 0 =>
         {
-            *now_epoch_secs = crate::meat::batch_tracker::epoch_now_secs();
+            *now_epoch_secs = crate::meat::batch_ids::epoch_now_secs();
         }
         _ => {}
     }
     let Some(council) = &state.council else {
-        if state.task_arrays.require_council {
-            return Err(TaskArrayWriteError::Unavailable(
-                "delegated arrays require a council for durable definitions and identities".into(),
-            ));
-        }
-        if let Some(store) = &state.task_arrays.standalone {
-            if state
-                .task_arrays
-                .storage_fenced
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(TaskArrayWriteError::Unavailable(
-                    "standalone publication timed out; restart and reconcile".into(),
-                ));
-            }
-            let store = Arc::clone(store);
-            let publication = tokio::task::spawn_blocking(move || {
-                let mut store = store.lock().map_err(|_| {
-                    TaskArrayWriteError::Unavailable("job store lock poisoned".into())
-                })?;
-                store.apply(&write).map_err(|error| {
-                    if store.ready() {
-                        TaskArrayWriteError::Refused(error)
-                    } else {
-                        TaskArrayWriteError::Unavailable(error)
-                    }
-                })
-            });
-            return match tokio::time::timeout(WRITE_TIMEOUT, publication).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    state
-                        .task_arrays
-                        .storage_fenced
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Err(TaskArrayWriteError::Unavailable(error.to_string()))
-                }
-                Err(_) => {
-                    state
-                        .task_arrays
-                        .storage_fenced
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Err(TaskArrayWriteError::Unavailable(
-                        "standalone publication timed out; admission and dispatch are fenced"
-                            .into(),
-                    ))
-                }
-            };
-        }
-        let mut tracker = state.batch_tracker.lock().await;
-        let mut arrays = state.task_arrays.local.lock().await;
-        let ids = arrays
-            .planned_ids(&write)
-            .map_err(|error| TaskArrayWriteError::Refused(error.to_string()))?;
-        tracker
-            .preflight_ids(ids)
-            .map_err(TaskArrayWriteError::Refused)?;
-        return match arrays.apply(&write, || tracker.allocate_id()) {
-            Ok(TaskArrayApplied::Registered { batch_id }) => Ok(Some(batch_id)),
-            Ok(_) => Ok(None),
-            Err(error) => Err(TaskArrayWriteError::Refused(error.to_string())),
-        };
+        return write_standalone(&state.task_arrays, write).await;
     };
     let written = tokio::time::timeout(
         WRITE_TIMEOUT,
@@ -288,6 +230,77 @@ pub(crate) async fn write_task_array(
         Ok(_) => Ok(None),
         Err(error) => Err(TaskArrayWriteError::Unavailable(error.to_string())),
     }
+}
+
+/// Commit a write to a standalone node's own arrays. Returns the new id for
+/// a registration.
+pub(crate) async fn write_standalone(
+    service: &TaskArrayService,
+    write: TaskArrayWrite,
+) -> Result<Option<u64>, TaskArrayWriteError> {
+    if service.require_council {
+        return Err(TaskArrayWriteError::Unavailable(
+            "delegated arrays require a council for durable definitions and identities".into(),
+        ));
+    }
+    if let Some(store) = &service.standalone {
+        if service
+            .storage_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(TaskArrayWriteError::Unavailable(
+                "standalone publication timed out; restart and reconcile".into(),
+            ));
+        }
+        let store = Arc::clone(store);
+        let publication = tokio::task::spawn_blocking(move || {
+            let mut store = store
+                .lock()
+                .map_err(|_| TaskArrayWriteError::Unavailable("job store lock poisoned".into()))?;
+            store.apply(&write).map_err(|error| {
+                if store.ready() {
+                    TaskArrayWriteError::Refused(error)
+                } else {
+                    TaskArrayWriteError::Unavailable(error)
+                }
+            })
+        });
+        return match tokio::time::timeout(WRITE_TIMEOUT, publication).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                service
+                    .storage_fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Err(TaskArrayWriteError::Unavailable(error.to_string()))
+            }
+            Err(_) => {
+                service
+                    .storage_fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Err(TaskArrayWriteError::Unavailable(
+                    "standalone publication timed out; admission and dispatch are fenced".into(),
+                ))
+            }
+        };
+    }
+    let mut batch_ids = service.local_ids.lock().await;
+    let mut arrays = service.local.lock().await;
+    let ids = arrays
+        .planned_ids(&write)
+        .map_err(|error| TaskArrayWriteError::Refused(error.to_string()))?;
+    batch_ids
+        .preflight(ids)
+        .map_err(TaskArrayWriteError::Refused)?;
+    match arrays.apply(&write, || batch_ids.allocate()) {
+        Ok(TaskArrayApplied::Registered { batch_id }) => Ok(Some(batch_id)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(TaskArrayWriteError::Refused(error.to_string())),
+    }
+}
+
+/// A standalone node's arrays.
+pub(crate) async fn read_standalone(service: &TaskArrayService) -> TaskArrays {
+    local_snapshot(service).await.0
 }
 
 /// The current arrays: the replicated copy with a council, the local one
@@ -557,7 +570,7 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
 }
 
 async fn fire_due_schedules(state: &ApiState) {
-    let now = crate::meat::batch_tracker::epoch_now_secs();
+    let now = crate::meat::batch_ids::epoch_now_secs();
     let Ok(minute) = i64::try_from(now / 60) else {
         return;
     };
@@ -582,10 +595,6 @@ async fn fire_due_schedules(state: &ApiState) {
     else {
         return;
     };
-    let claims = match &state.council {
-        Some(council) => council.desired_state().await.prerequisite_claims,
-        None => Default::default(),
-    };
     for (key, record) in arrays
         .jobs()
         .definitions()
@@ -601,9 +610,6 @@ async fn fire_due_schedules(state: &ApiState) {
         let Some((namespace, name)) = key.split_once('/') else {
             continue;
         };
-        if claims.values().any(|claim| claim.blocks(name, namespace)) {
-            continue;
-        }
         if !is_leading(state).await {
             return;
         }
@@ -734,7 +740,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                 TaskArrayWrite::Unknown { batch_id, node }
             } else {
                 TaskArrayWrite::Requeue {
-                    now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                    now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
                     batch_id,
                     node,
                 }

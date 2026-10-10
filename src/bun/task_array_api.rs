@@ -26,7 +26,7 @@ use super::task_array_leader::{NodeView, TaskArrayWriteError, read_task_arrays, 
 use super::task_array_node::{MAX_RESULT_ROWS, NodeSyncRequest, TaskArrayNodeError, TaskResultRow};
 use crate::config::job::JobSpec;
 use crate::meat::NodeId;
-use crate::meat::batch_tracker::epoch_now_secs;
+use crate::meat::batch_ids::epoch_now_secs;
 use crate::meat::task_array::{TaskArraySpec, validate_template};
 use crate::meat::task_array_store::{TaskArrayRecord, TaskArrayWrite};
 
@@ -200,6 +200,7 @@ pub async fn submit_handler(
         &request.name,
         &namespace,
         &mut definition,
+        None,
     )
     .await
     {
@@ -304,6 +305,7 @@ pub async fn manifest_handler(
             &request.name,
             &request.namespace,
             &mut definition,
+            None,
         )
         .await
         {
@@ -433,7 +435,7 @@ pub async fn cancel_handler(
             &record.name,
             &record.namespace,
             TaskArrayWrite::Cancel {
-                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
                 batch_id,
             },
         )

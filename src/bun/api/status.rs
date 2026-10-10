@@ -427,7 +427,7 @@ pub(super) async fn jobs_handler(
     let mut common = Vec::new();
     if !query.local {
         let arrays = crate::bun::task_array_leader::read_task_arrays(&state).await;
-        let now = crate::meat::batch_tracker::epoch_now_secs();
+        let now = crate::meat::batch_ids::epoch_now_secs();
         for (id, run) in arrays.jobs().runs() {
             let Some(record) = arrays.get(id) else {
                 continue;
@@ -481,31 +481,14 @@ pub(super) async fn jobs_handler(
         }
         common.retain(visible);
     }
-    let local = match ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
-        response,
-    })
-    .await
-    {
-        Ok(local) => local,
-        Err(_) if !common.is_empty() => Vec::new(),
-        Err(_) => return agent_unavailable(),
-    };
+    // Every job runs through the common lifecycle, so the cluster's run and
+    // definition records are the whole answer: no node keeps jobs of its own.
     if !query.cluster {
-        common.extend(local.into_iter().filter(visible));
         return Json(common).into_response();
     }
-    let (peers, warnings) = fan_out_to_peers::<Vec<crate::bun::agent::JobStatus>>(
-        &state,
-        "/v1/jobs?local=true",
-        CLUSTER_STATUS_TIMEOUT,
-    )
-    .await;
-    let mut answers: Vec<_> = std::iter::once((local_node_name(&state), local))
-        .chain(peers)
-        .collect();
-    answers.push(("cluster".into(), common));
-    let mut jobs = crate::bun::cluster_view::merge_jobs(answers);
+    let mut jobs = crate::bun::cluster_view::merge_jobs(vec![("cluster".into(), common)]);
     jobs.retain(|job| visible(&job.row));
+    let warnings = Vec::new();
     Json(crate::bun::cluster_view::ClusterJobs { jobs, warnings }).into_response()
 }
 

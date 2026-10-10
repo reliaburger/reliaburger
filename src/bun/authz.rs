@@ -290,10 +290,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/test/leases/retired", System),
     gated(Post, "/v1/nodes/decommission", Admin, Cluster(ADMIN)),
     route(Get, "/v1/images", AnyToken),
-    // Batch + build. `run`/`report`/`track`/`sign` are node-to-node (System).
+    // Batch + build. `track`/`sign` are node-to-node (System).
     route(Post, "/v1/batch", Deployer),
-    route(Post, "/v1/batch/run", System),
-    route(Post, "/v1/batch/{id}/report", System),
     route(Get, "/v1/batch/{id}", AnyToken),
     // Task arrays. `sync` and the `local` reads are the leader's calls to
     // nodes; results and logs are also held to the array's scope.
@@ -383,8 +381,6 @@ mod tests {
         for path in [
             "/v1/cluster/renew",
             "/v1/cluster/trust-ack",
-            "/v1/batch/run",
-            "/v1/batch/{id}/report",
             "/v1/batch/array/sync",
             "/v1/build/run",
             "/v1/build/track",

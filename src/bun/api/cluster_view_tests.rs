@@ -17,8 +17,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use super::*;
-use crate::bun::agent::JobStatus;
-use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
+use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents};
 use crate::bun::events::{EventKind, EventSeverity, EventStore};
 use crate::meat::deploy_types::{DeployId, DeployResult};
 use crate::meat::types::AppId;
@@ -77,22 +76,9 @@ fn history_entry(app: &str, namespace: &str, id: u64, created_secs: u64) -> Depl
     }
 }
 
-fn job(name: &str, namespace: &str) -> JobStatus {
-    JobStatus {
-        name: name.into(),
-        namespace: namespace.into(),
-        instance_id: format!("{name}-0"),
-        image: "proc-grill:image-ignored".into(),
-        state: "stopped".into(),
-        restart_count: 0,
-        age_seconds: 5,
-    }
-}
-
-/// A stand-in agent loop: answers status, jobs and follow requests.
+/// A stand-in agent loop: answers status and follow requests.
 fn spawn_agent(
     statuses: Vec<InstanceStatus>,
-    jobs: Vec<JobStatus>,
     follow_lines: Vec<String>,
 ) -> mpsc::Sender<AgentCommand> {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
@@ -119,9 +105,6 @@ fn spawn_agent(
                             .collect(),
                         selected_instance: instance,
                     }));
-                }
-                AgentCommand::JobStatus { response } => {
-                    let _ = response.send(jobs.clone());
                 }
                 AgentCommand::FollowLogs { lines, .. } => {
                     let follow_lines = follow_lines.clone();
@@ -206,19 +189,6 @@ async fn get(app: Router, uri: &str, bearer: Option<&str>) -> (StatusCode, Vec<u
     (status, body.to_vec())
 }
 
-fn scoped_token(namespace: &str) -> crate::sesame::token::CreatedToken {
-    crate::sesame::token::create_token(
-        "tenant-reader",
-        crate::sesame::types::ApiRole::ReadOnly,
-        crate::sesame::types::TokenScope {
-            apps: None,
-            namespaces: Some(vec![namespace.to_string()]),
-        },
-        None,
-    )
-    .unwrap()
-}
-
 // ---------------------------------------------------------------------------
 // Deploy history
 // ---------------------------------------------------------------------------
@@ -248,7 +218,7 @@ fn history_peer(entries: Vec<DeployHistoryEntry>) -> Router {
 #[tokio::test]
 async fn deploy_history_merges_every_members_record_with_its_node() {
     let peer = serve_peer(history_peer(vec![history_entry("web", "default", 2, 200)])).await;
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.history = vec![
         history_entry("web", "default", 1, 100),
         history_entry("web", "other", 9, 150),
@@ -271,7 +241,7 @@ async fn deploy_history_merges_every_members_record_with_its_node() {
 #[tokio::test]
 async fn deploy_history_names_a_member_that_did_not_answer() {
     let dead = dead_address().await;
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.history = vec![history_entry("web", "default", 1, 100)];
     setup.members = Some(members(&[("gone", dead)]));
     let app = setup.router().await;
@@ -287,7 +257,7 @@ async fn deploy_history_names_a_member_that_did_not_answer() {
 #[tokio::test]
 async fn a_peer_asked_for_its_own_history_does_not_fan_out_again() {
     let dead = dead_address().await;
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.history = vec![history_entry("web", "default", 1, 100)];
     setup.members = Some(members(&[("gone", dead)]));
     let app = setup.router().await;
@@ -344,7 +314,7 @@ async fn events_merge_every_members_newest_with_their_node() {
     record(&mut local_store, 10, "local deployed");
     record(&mut local_store, 30, "local stopped");
 
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.events = Some(Arc::new(RwLock::new(local_store)));
     setup.members = Some(members(&[("peer", peer)]));
     let app = setup.router().await;
@@ -373,7 +343,7 @@ async fn events_name_a_member_that_did_not_answer() {
     let dead = dead_address().await;
     let mut local_store = EventStore::new();
     record(&mut local_store, 10, "local deployed");
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.events = Some(Arc::new(RwLock::new(local_store)));
     setup.members = Some(members(&[("gone", dead)]));
     let app = setup.router().await;
@@ -387,88 +357,6 @@ async fn events_name_a_member_that_did_not_answer() {
         "{:?}",
         view.warnings
     );
-}
-
-// ---------------------------------------------------------------------------
-// Jobs
-// ---------------------------------------------------------------------------
-
-fn jobs_peer(jobs: Vec<JobStatus>) -> Router {
-    Router::new().route(
-        "/v1/jobs",
-        axum::routing::get(move |Query(params): Params| {
-            let jobs = jobs.clone();
-            async move {
-                // A peer answers the single-node shape for itself.
-                if params.contains_key("cluster") {
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-                Ok(Json(jobs))
-            }
-        }),
-    )
-}
-
-#[tokio::test]
-async fn cluster_jobs_list_every_members_jobs_with_their_node() {
-    let peer = serve_peer(jobs_peer(vec![job("seed", "default")])).await;
-    let dead = dead_address().await;
-    let mut setup = Setup::new(spawn_agent(
-        Vec::new(),
-        vec![job("migrate", "default")],
-        Vec::new(),
-    ));
-    setup.members = Some(members(&[("peer", peer), ("gone", dead)]));
-    let app = setup.router().await;
-
-    let (status, body) = get(app, "/v1/jobs?cluster=true", None).await;
-    assert_eq!(status, StatusCode::OK);
-    let view: ClusterJobs = serde_json::from_slice(&body).unwrap();
-    let rows: Vec<(&str, &str)> = view
-        .jobs
-        .iter()
-        .map(|job| (job.node.as_str(), job.row.name.as_str()))
-        .collect();
-    assert_eq!(rows, [("local", "migrate"), ("peer", "seed")]);
-    assert_eq!(view.warnings.len(), 1, "{:?}", view.warnings);
-    assert!(view.warnings[0].contains("gone"));
-}
-
-/// Peers answer with the service token, which sees every namespace, so the
-/// entry node trims the merged jobs to the caller's scope, locally and
-/// cluster-wide.
-#[tokio::test]
-async fn namespace_scoped_token_sees_only_its_namespaces_jobs() {
-    let peer = serve_peer(jobs_peer(vec![
-        job("seed", "team-a"),
-        job("seed", "team-b"),
-    ]))
-    .await;
-    let created = scoped_token("team-a");
-    let mut setup = Setup::new(spawn_agent(
-        Vec::new(),
-        vec![job("migrate", "team-a"), job("migrate", "team-b")],
-        Vec::new(),
-    ));
-    setup.members = Some(members(&[("peer", peer)]));
-    setup.tokens = vec![created.token];
-    let app = setup.router().await;
-
-    let (status, body) = get(app.clone(), "/v1/jobs", Some(&created.plaintext)).await;
-    assert_eq!(status, StatusCode::OK);
-    let local: Vec<JobStatus> = serde_json::from_slice(&body).unwrap();
-    let namespaces: Vec<&str> = local.iter().map(|job| job.namespace.as_str()).collect();
-    assert_eq!(namespaces, ["team-a"]);
-
-    let (status, body) = get(app, "/v1/jobs?cluster=true", Some(&created.plaintext)).await;
-    assert_eq!(status, StatusCode::OK);
-    let view: ClusterJobs = serde_json::from_slice(&body).unwrap();
-    assert!(
-        view.jobs.iter().all(|job| job.row.namespace == "team-a"),
-        "{:?}",
-        view.jobs
-    );
-    assert_eq!(view.jobs.len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,11 +382,7 @@ async fn node_page_lists_another_nodes_workloads_without_this_nodes_charts() {
         }),
     ))
     .await;
-    let mut setup = Setup::new(spawn_agent(
-        vec![instance("local-web-0")],
-        Vec::new(),
-        Vec::new(),
-    ));
+    let mut setup = Setup::new(spawn_agent(vec![instance("local-web-0")], Vec::new()));
     setup.members = Some(members(&[("peer", peer)]));
     let app = setup.router().await;
 
@@ -522,7 +406,7 @@ async fn node_page_lists_another_nodes_workloads_without_this_nodes_charts() {
 #[tokio::test]
 async fn node_page_says_when_that_node_did_not_answer() {
     let dead = dead_address().await;
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.members = Some(members(&[("gone", dead)]));
     let app = setup.router().await;
 
@@ -547,7 +431,6 @@ async fn websocket_log_frames_are_tagged_lines() {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     let setup = Setup::new(spawn_agent(
-        Vec::new(),
         Vec::new(),
         vec!["hello".into(), "world".into()],
     ));
@@ -640,7 +523,7 @@ async fn the_live_event_stream_merges_every_members_events() {
     let mut local_store = EventStore::new();
     record(&mut local_store, 10, "local earlier");
     let local_store = Arc::new(RwLock::new(local_store));
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.events = Some(Arc::clone(&local_store));
     setup.members = Some(members(&[("peer", peer)]));
     let address = serve_peer(setup.router().await).await;
@@ -692,7 +575,7 @@ async fn a_node_streams_its_own_new_events_on_request() {
     use futures_util::StreamExt as _;
 
     let local_store = Arc::new(RwLock::new(EventStore::new()));
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.events = Some(Arc::clone(&local_store));
     let address = serve_peer(setup.router().await).await;
 
@@ -773,7 +656,7 @@ async fn token_list_shows_scope_expiry_and_last_use_after_a_request() {
     )
     .unwrap();
     let tokens = vec![admin.token.clone(), reader.token.clone()];
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.council = Some(council_with_tokens("token-last-used", &tokens).await);
     setup.tokens = tokens;
     let app = setup.router().await;
@@ -863,7 +746,7 @@ async fn token_list_merges_every_members_last_use_and_names_a_silent_one() {
     let dead = dead_address().await;
 
     let tokens = vec![admin.token.clone(), ci.token.clone()];
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.council = Some(council_with_tokens("token-merge", &tokens).await);
     setup.tokens = tokens;
     setup.members = Some(members(&[("peer", peer), ("gone", dead)]));
@@ -894,7 +777,7 @@ async fn the_service_principal_reads_only_a_nodes_own_token_list() {
             .unwrap();
     let service = crate::sesame::token::derive_service_token(&[3u8; 32]).unwrap();
     let tokens = vec![admin.token.clone()];
-    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new(), Vec::new()));
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.council = Some(council_with_tokens("token-service", &tokens).await);
     setup.tokens = tokens;
     setup.service_token = Some(service.clone());

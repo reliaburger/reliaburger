@@ -13,8 +13,6 @@ use super::*;
 /// loop as a `DeployOp` through `ops`, so the loop stays the single owner of
 /// supervisor / service-map / networking state.
 pub(super) struct DeployWorker<G: Grill> {
-    pub(super) rerun_unknown_jobs: bool,
-    pub(super) prepared_batch_jobs: Option<BTreeMap<String, u64>>,
     pub(super) grill: G,
     pub(super) ops: DeployOps,
     /// Shared drain tracker, so the worker can drain-and-stop a retiring
@@ -118,21 +116,24 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
     }
 
-    /// Deploy all apps and jobs from a config, streaming progress events. The
+    /// Deploy all apps from a config, streaming progress events. The
     /// mirror of the former `BunAgent::deploy`, but off the command loop.
-    pub(super) async fn run_deploy(self, mut config: Config, events: mpsc::Sender<ApplyEvent>) {
+    pub(super) async fn run_deploy(self, config: Config, events: mpsc::Sender<ApplyEvent>) {
         if self.report_cancellation(&events).await {
             return;
         }
-        if let Err(message) = self.preflight_prerequisites(&mut config).await {
-            let _ = events.send(ApplyEvent::Error { message }).await;
+        // Jobs take the common job lifecycle; a node's deploy runs apps only.
+        if !config.job.is_empty() {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: "jobs run through the common job lifecycle, not a node's app deploy"
+                        .into(),
+                })
+                .await;
             return;
         }
         let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
-        // Jobs already run as `run_before` prerequisites, so the regular jobs
-        // loop below doesn't run them a second time.
-        let mut ran_prereqs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deployed_apps: Vec<(String, String)> = config
             .app
             .iter()
@@ -164,37 +165,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
             let namespace = spec.namespace.as_deref().unwrap_or("default");
 
-            // run_before (E): jobs declaring `run_before = ["app.<name>"]` must
-            // run to completion before this app's deploy begins — migrations are
-            // the classic case. A prerequisite failure aborts the whole deploy.
-            let target = format!("app.{app_name}");
-            for (job_name, job_spec) in &config.job {
-                // Cron-scheduled jobs fire on their schedule, never as a
-                // deploy-time prerequisite.
-                if ran_prereqs.contains(job_name)
-                    || job_spec.schedule.is_some()
-                    || !job_spec.run_before.contains(&target)
-                {
-                    continue;
-                }
-                let job_ns = job_spec.namespace.as_deref().unwrap_or("default");
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!(
-                            "running prerequisite job {job_name} before app {app_name}"
-                        ),
-                    })
-                    .await;
-                if let Err(e) = self.run_prerequisite_job(job_name, job_ns, job_spec).await {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-                ran_prereqs.insert(job_name.clone());
-            }
             if self.report_cancellation(&events).await {
                 return;
             }
@@ -389,9 +359,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     return;
                 }
 
-                self.ops
-                    .provision_identity(app_name, namespace, id, false)
-                    .await;
+                self.ops.provision_identity(app_name, namespace, id).await;
 
                 let _ = events
                     .send(ApplyEvent::InstanceCreated {
@@ -419,103 +387,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     spec: Some(Box::new(spec.clone())),
                 })
                 .await;
-
-            all_ids.extend(ids.iter().map(|id| id.0.clone()));
-        }
-
-        if !config.job.is_empty()
-            && let Some(operation) = &self.operation
-        {
-            operation
-                .advance(
-                    crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
-                    None,
-                    format!("deploying {} job(s)", config.job.len()),
-                )
-                .await;
-        }
-
-        for (job_name, spec) in &config.job {
-            if self.report_cancellation(&events).await {
-                return;
-            }
-            // Already run to completion as a run_before prerequisite above, or a
-            // cron-scheduled job that fires on its schedule rather than now.
-            if ran_prereqs.contains(job_name) || spec.schedule.is_some() {
-                continue;
-            }
-            let namespace = spec.namespace.as_deref().unwrap_or("default");
-            if let Some(operation) = &self.operation {
-                operation
-                    .advance(
-                        crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
-                        Some(crate::bun::deploy_operations::DeployTarget {
-                            kind: crate::bun::deploy_operations::DeployTargetKind::Job,
-                            name: job_name.clone(),
-                            namespace: namespace.to_string(),
-                        }),
-                        format!("deploying job {namespace}/{job_name}"),
-                    )
-                    .await;
-            }
-            let _ = events
-                .send(ApplyEvent::Progress {
-                    message: format!("deploying job {job_name}"),
-                })
-                .await;
-
-            let admission = match &self.prepared_batch_jobs {
-                Some(prepared) => match prepared.get(job_name) {
-                    Some(generation) => {
-                        self.ops
-                            .prepared_batch_job(job_name, namespace, *generation, spec)
-                            .await
-                    }
-                    None => Err(BunError::BatchConflict(
-                        "worker lacks the exact prepared generation".into(),
-                    )),
-                },
-                None => {
-                    self.ops
-                        .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
-                        .await
-                }
-            };
-            let ids = match admission {
-                Ok(ids) => ids,
-                Err(e) => {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            for id in &ids {
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!("creating instance {}", id.0),
-                    })
-                    .await;
-
-                if let Err(e) = self.drive_job(id, job_name, namespace, spec).await {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-
-                let _ = events
-                    .send(ApplyEvent::InstanceCreated {
-                        id: id.0.clone(),
-                        app: job_name.to_string(),
-                    })
-                    .await;
-            }
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
@@ -670,130 +541,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
     }
 
-    /// Drive a job through create → source policy → start → Running.
-    /// Jobs have no external allowlist or health checks.
-    pub(super) async fn drive_job(
-        &self,
-        instance_id: &InstanceId,
-        job_name: &str,
-        namespace: &str,
-        spec: &JobSpec,
-    ) -> Result<(), BunError> {
-        self.ops
-            .transition_state(instance_id, ContainerState::Preparing)
-            .await?;
-
-        let cgroup_path =
-            crate::grill::cgroup::instance_cgroup_path(namespace, job_name, instance_id)?;
-        let cgroup_str = cgroup_path.to_string_lossy();
-        let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str, None);
-
-        self.grill.create(instance_id, &oci_spec).await?;
-        self.ops.store_oci_spec(instance_id, oci_spec.clone()).await;
-        self.prepare_network(instance_id, job_name, None, &cgroup_path)
-            .await?;
-        self.ops
-            .transition_state(instance_id, ContainerState::Starting)
-            .await?;
-        self.grill.start(instance_id).await?;
-        let evidence = launch_evidence::LaunchEvidence::read(&self.grill, instance_id).await;
-        self.ops
-            .finish_job_instance(instance_id, job_name, namespace, oci_spec, evidence)
-            .await
-    }
-
-    /// Verify and pin every referenced image before a migration can execute.
-    /// Ordinary applies with no prerequisites retain their existing admission.
-    pub(super) async fn preflight_prerequisites(&self, config: &mut Config) -> Result<(), String> {
-        if !config.job.values().any(|job| !job.run_before.is_empty()) {
-            return Ok(());
-        }
-        for spec in config.app.values_mut() {
-            if let Some(image) = self
-                .ops
-                .enforce_image_reference(spec.image.as_deref())
-                .await?
-            {
-                spec.image = Some(image);
-            }
-            for init in &mut spec.init {
-                let reference = init.image.as_deref().or(spec.image.as_deref());
-                if let Some(image) = self.ops.enforce_image_reference(reference).await? {
-                    init.image = Some(image);
-                }
-            }
-        }
-        for job in config.job.values_mut() {
-            if let Some(image) = self
-                .ops
-                .enforce_image_reference(job.image.as_deref())
-                .await?
-            {
-                job.image = Some(image);
-            }
-        }
-        Ok(())
-    }
-
-    /// Run a `run_before` prerequisite job to completion for dependency
-    /// ordering. Deploys the job, then polls the runtime until every instance
-    /// exits. Returns `Ok(())` only when all instances exit cleanly (code 0);
-    /// a non-zero exit or a timeout is an error that aborts the gated deploy.
-    pub(super) async fn run_prerequisite_job(
-        &self,
-        job_name: &str,
-        namespace: &str,
-        spec: &JobSpec,
-    ) -> Result<(), BunError> {
-        let ids = self
-            .ops
-            .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
-            .await?;
-        for id in &ids {
-            self.drive_job(id, job_name, namespace, spec).await?;
-
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(RUN_BEFORE_TIMEOUT_SECS);
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let state = self.grill.state(id).await?;
-                if state == ContainerState::Stopped {
-                    let exit_code = self.grill.exit_code(id).await?;
-                    if exit_code == Some(0) {
-                        self.ops.confirm_job_success(id).await?;
-                        break;
-                    }
-                    if let Some(code) = exit_code {
-                        self.ops.confirm_job_exit(id, code).await?;
-                        return Err(BunError::PrerequisiteFailed {
-                            app_name: job_name.to_string(),
-                            code,
-                        });
-                    }
-                    return Err(BunError::DeployFailed {
-                        app_name: job_name.to_string(),
-                        reason: format!(
-                            "run_before job exited with {}",
-                            exit_code
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "unknown status".to_string())
-                        ),
-                    });
-                }
-                if std::time::Instant::now() >= deadline {
-                    let _ = self.grill.kill(id).await;
-                    return Err(BunError::DeployFailed {
-                        app_name: job_name.to_string(),
-                        reason: format!(
-                            "run_before job timed out after {RUN_BEFORE_TIMEOUT_SECS}s"
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Start `count` more replicas beside the ones an app already runs, the
     /// way a fresh deploy starts its replicas. The running ones aren't
     /// touched. Returns `Break` when the caller must stop the whole deploy.
@@ -847,9 +594,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
                 return std::ops::ControlFlow::Break(());
             }
-            self.ops
-                .provision_identity(app_name, namespace, id, false)
-                .await;
+            self.ops.provision_identity(app_name, namespace, id).await;
             let _ = events
                 .send(ApplyEvent::InstanceCreated {
                     id: id.0.clone(),
@@ -1198,7 +943,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         })
                         .await;
                     self.ops
-                        .provision_identity(app_name, namespace, &new_id, false)
+                        .provision_identity(app_name, namespace, &new_id)
                         .await;
                 }
                 Err(message) => {
@@ -1669,7 +1414,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         })
                         .await;
                     self.ops
-                        .provision_identity(app_name, namespace, &new_id, false)
+                        .provision_identity(app_name, namespace, &new_id)
                         .await;
                 }
                 Err(message) => {

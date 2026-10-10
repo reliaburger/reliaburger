@@ -604,7 +604,7 @@ mod tests {
         let record = serde_json::from_value(serde_json::json!({
             "schema": crate::grill::records::RECORD_SCHEMA, "instance_id": id.0, "namespace": "default",
             "app_name": "apple-evidence", "replica_index": 0,
-            "is_job": false, "image": "unused", "runtime": "Apple",
+            "image": "unused", "runtime": "Apple",
             "pid": 0, "pid_started_at": 0,
             "oci_spec": {
                 "root": {"path": "unused", "readonly": true},
@@ -1060,7 +1060,6 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "apple-adopt".to_string(),
             replica_index: 0,
-            is_job: false,
             image: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
             runtime: crate::grill::records::RuntimeKind::Apple,
             pid: 0,

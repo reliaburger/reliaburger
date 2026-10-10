@@ -1258,7 +1258,6 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "test".to_string(),
             replica_index: 0,
-            is_job: false,
             image: String::new(),
             runtime: RuntimeKind::Process,
             pid,

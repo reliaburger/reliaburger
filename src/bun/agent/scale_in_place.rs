@@ -35,8 +35,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .list_instances()
             .into_iter()
             .filter(|instance| {
-                !instance.is_job
-                    && instance.app_name == app_name
+                instance.app_name == app_name
                     && instance.namespace == namespace
                     && !self.deferred_retirements.contains(&instance.id)
             })

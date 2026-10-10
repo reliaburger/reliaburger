@@ -861,9 +861,9 @@ impl BunClient {
             .await
     }
 
-    /// Explicitly rerun unknown jobs on this node after retiring their old runtime.
+    /// Explicitly admit fresh runs of a manifest's jobs.
     pub async fn apply_rerunning_jobs(&self, config: &Config) -> Result<ApplyResult, RelishError> {
-        crate::bun::jobs::validate_rerun(config).map_err(|error| RelishError::ApiError {
+        crate::bun::job_apply::validate_rerun(config).map_err(|error| RelishError::ApiError {
             status: 400,
             body: error.into(),
         })?;

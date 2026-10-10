@@ -37,7 +37,7 @@ use crate::mayo::rollup_store::RollupStore;
 use crate::mayo::store::MayoStore;
 use crate::meat::deploy_types::DeployHistoryEntry;
 use crate::pickle::types::ManifestCatalog;
-use crate::testkit::lease::{LeaseScope, is_node_job_lease};
+use crate::testkit::lease::LeaseScope;
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
@@ -363,15 +363,11 @@ pub struct ApiState {
     /// Self-upgrade manager, for the fast dependency-free `/v1/version`
     /// endpoint. Upgrade *operations* go through the agent command channel.
     pub upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
-    /// Batch job tracker (Phase 12 F1). Lives leader-side: submissions
-    /// and status reads leader-forward, so one tracker sees them all.
-    pub batch_tracker: Arc<tokio::sync::Mutex<crate::meat::batch_tracker::BatchTracker>>,
-    /// The leader's aggregated worker reports — batch capacity comes
-    /// from here (the same source the deploy scheduler uses). `None`
-    /// standalone; batch then schedules onto this node only.
+    /// The leader's aggregated worker reports, the same source the deploy
+    /// scheduler uses. `None` standalone.
     pub aggregated_rx:
         Option<tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>>,
-    /// This node's gossip name, for batch self-dispatch short-circuits.
+    /// This node's gossip name.
     pub node_name: Option<String>,
     /// Immutable SPIFFE trust domain for build-signing identities.
     pub trust_domain: String,
@@ -406,10 +402,6 @@ pub struct ApiState {
     /// is only `Completed` once its pushed digest carries a signature
     /// the cluster trusts (JOB7).
     pub require_signatures: bool,
-    /// Batch ids with a live leader-side completion watcher in this
-    /// process. Lets a restarted leader spot durable batches nobody is
-    /// watching and resume them (JOB4).
-    pub batch_watchers: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
     /// Build ids with a live runner task in this process. A durable
     /// `Running` record without one means the node restarted mid-build
     /// and the record is terminated honestly (JOB4).
@@ -540,9 +532,6 @@ pub fn router_with_upgrade(
         cluster_http,
         api_port,
         upgrade,
-        batch_tracker: Arc::new(tokio::sync::Mutex::new(
-            crate::meat::batch_tracker::BatchTracker::new(),
-        )),
         aggregated_rx,
         trust_domain,
         node_name,
@@ -556,7 +545,6 @@ pub fn router_with_upgrade(
         static_capabilities: Arc::new(static_capabilities),
         max_context_bytes,
         require_signatures,
-        batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         active_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         task_arrays: task_arrays
@@ -780,11 +768,6 @@ pub fn router_with_upgrade(
         .route(
             "/v1/batch/summaries",
             get(super::task_array_api::summaries_handler),
-        )
-        .route("/v1/batch/run", post(super::batch::batch_run_handler))
-        .route(
-            "/v1/batch/{id}/report",
-            post(super::batch::batch_report_handler),
         )
         .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
         .route(
