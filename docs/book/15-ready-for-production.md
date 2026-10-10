@@ -5389,6 +5389,13 @@ had nothing to restore from. With the shared helper, the fixture passes. The
 [qualification record](../qualification/2026-09-25-v02-power-cut.md) has both
 sets of runs.
 
+Then we stopped running them. They need a VM you're willing to switch off, so no
+workflow could, and nothing on the release checklist said to. By 0.2.0 the last
+record was a fortnight older than the change that rerouted every file lock in the
+programme. Nothing had broken, as it turned out: the [rerun](../qualification/2026-10-11-power-cut-reboot.md)
+passed 25 power cuts per lane. But a check that only runs when someone remembers
+it isn't a gate. Now it's a numbered step of the release runbook.
+
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
 that. The snapshot uploader still needs its own fixture: it needs Btrfs

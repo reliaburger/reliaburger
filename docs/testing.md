@@ -241,10 +241,12 @@ check that everything acknowledged is still there.
 
 | Fixture | Driver | Record |
 |---|---|---|
-| Log and metrics exporters, council backups, lease stores | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-09-25](qualification/2026-09-25-v02-power-cut.md) |
+| Log and metrics exporters, council backups, lease stores | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-11](qualification/2026-10-11-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md)) |
 | Container and network ownership across a reboot | [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh) | same |
 
-The first run of these found two real data-loss bugs, both now fixed.
+The first run of these found two real data-loss bugs, both now fixed. They need
+a VM that can lose power, so no workflow runs them; they are step 5 of the
+[release gate](releasing.md#staging-a-candidate) instead.
 
 ## Before a release
 
