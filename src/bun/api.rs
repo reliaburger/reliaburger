@@ -797,7 +797,9 @@ pub fn router_with_upgrade(
         )
         .route(
             "/v1/batch/array/sync",
-            post(super::task_array_api::sync_handler),
+            post(super::task_array_api::sync_handler).layer(axum::extract::DefaultBodyLimit::max(
+                super::task_array_node::MAX_SYNC_REQUEST_BYTES,
+            )),
         )
         .route(
             "/v1/batch/array/{id}/local/results",

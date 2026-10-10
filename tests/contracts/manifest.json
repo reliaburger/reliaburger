@@ -7867,6 +7867,33 @@
       ]
     },
     {
+      "id": "issue-679-cron_in_one_namespace_fires_while_another_fills_the_bulk_cap",
+      "issue": 679,
+      "promise": "Cron fires use reserved headroom, so one tenant filling every bulk slot cannot lock out another tenant's schedule.",
+      "supported_paths": [
+        "Common job lifecycle on a real three-node council with per-namespace active-run caps."
+      ],
+      "refused_paths": [
+        "Bulk arrays past the bulk share are refused with a reason naming the reserved headroom."
+      ],
+      "boundaries": [
+        "Real multi-node consensus in the declared gate is required; synthetic evidence cannot qualify the reserve."
+      ],
+      "cases": [
+        {
+          "id": "common-cron_in_one_namespace_fires_while_another_fills_the_bulk_cap",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "cron_in_one_namespace_fires_while_another_fills_the_bulk_cap",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-638-losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
       "issue": 638,
       "promise": "Lost singleton owners remain unknown until exact acknowledged replay.",
