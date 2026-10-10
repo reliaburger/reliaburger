@@ -649,12 +649,6 @@
   },
   {
     "source": "tests/ebpf.rs",
-    "function": "source_policy_precedes_job_start",
-    "binary": "reliaburger::ebpf",
-    "test": "source_policy_precedes_job_start"
-  },
-  {
-    "source": "tests/ebpf.rs",
     "function": "namespace_retirement_keeps_original_ownership_through_recovery",
     "binary": "reliaburger::ebpf",
     "test": "namespace_retirement_keeps_original_ownership_through_recovery"

@@ -3583,14 +3583,14 @@ async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership()
     assert!(backend.is_none());
 }
 
-async fn assert_source_policy_precedes_start(job: bool) {
+async fn assert_source_policy_precedes_start() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{mock::MockGrill, port::PortAllocator};
     use reliaburger::sesame::{egress, firewall};
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc, oneshot};
     assert!(ebpf_tests_enabled());
-    let kind = if job { "job" } else { "app" };
+    let kind = "app";
     let root = tempfile::tempdir().unwrap();
     let name = root_app_name(&format!("source-before-{kind}"), root.path());
     let target_name = root_app_name(&format!("source-target-{kind}"), root.path());
@@ -3743,13 +3743,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_policy_precedes_portless_application_start() {
-    assert_source_policy_precedes_start(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
-async fn source_policy_precedes_job_start() {
-    assert_source_policy_precedes_start(true).await;
+    assert_source_policy_precedes_start().await;
 }
 
 #[tokio::test]

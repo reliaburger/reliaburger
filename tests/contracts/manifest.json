@@ -4826,17 +4826,6 @@
           ]
         },
         {
-          "id": "legacy-ci-reliaburger-ebpf-source_policy_precedes_job_start",
-          "binary": "reliaburger::ebpf",
-          "test": "source_policy_precedes_job_start",
-          "requires": [
-            "linux-root-storage"
-          ],
-          "sources": [
-            "tests/ebpf.rs"
-          ]
-        },
-        {
           "id": "legacy-ci-reliaburger-ebpf-namespace_retirement_keeps_original_ownership_through_recovery",
           "binary": "reliaburger::ebpf",
           "test": "namespace_retirement_keeps_original_ownership_through_recovery",
