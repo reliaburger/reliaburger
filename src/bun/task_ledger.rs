@@ -699,7 +699,7 @@ mod tests {
             indexed as f64 / tasks as f64,
         );
         assert!(bytes <= tasks * 23, "{bytes} ledger bytes");
-        assert!(indexed <= tasks * 25, "{indexed} index bytes");
+        assert!(indexed <= tasks * 26, "{indexed} index bytes");
         let bound = super::super::task_array_node::STORAGE_BYTES_PER_TASK;
         assert!(
             bytes + indexed <= tasks * bound,

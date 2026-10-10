@@ -216,9 +216,9 @@ outcomes and their result index are durable. Standalone admission reserves spars
 accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
 
-A worker holds at most 48 bytes of disk per accepted task while the cluster
+A worker holds at most 50 bytes of disk per accepted task while the cluster
 lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
-million tasks measured 22.6 bytes of ledger and 24.1 bytes of index per task,
+million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
 about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
 tasks' head and tail per chunk. All of it goes when the run retires. Task data
 counts toward disk pressure: past a quarter of the filesystem, or with the

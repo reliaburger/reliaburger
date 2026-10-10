@@ -82,42 +82,76 @@ impl TaskResultIndex {
     /// outcomes or survive after its source block has been discarded.
     pub fn rebuild(&self, ledger: &Path) -> Result<(), LedgerError> {
         self.file.set_len(0)?;
+        let mut pending = Vec::new();
         task_ledger::scan(ledger, |record| {
-            let mut raw = Vec::with_capacity(task_ledger::RECORD_BYTES);
-            task_ledger::encode(&record, &mut raw);
-            self.put(&record, raw.as_slice().try_into().map_err(error)?)
+            task_ledger::encode(&record, &mut pending);
+            if pending.len() >= SCAN_SLOTS as usize * task_ledger::RECORD_BYTES {
+                self.put(&pending)?;
+                pending.clear();
+            }
+            Ok(())
         })?;
+        self.put(&pending)?;
         self.file.sync_data()?;
         Ok(())
     }
 
-    /// Write one record unless the slot already holds a newer grant's.
-    fn put(
-        &self,
-        record: &TaskRecord,
-        raw: &[u8; task_ledger::RECORD_BYTES],
-    ) -> Result<(), LedgerError> {
-        let offset = u64::from(record.index) * SLOT_BYTES as u64;
-        let mut existing = [0u8; SLOT_BYTES];
-        let read = read_full(&self.file, &mut existing, offset)?;
-        // A short read is past the end of the file: an empty slot. A damaged
-        // slot can only be an unacknowledged write, so it is overwritten.
-        if read == SLOT_BYTES
-            && let Ok(Some(old)) = decode_slot(&existing, offset)
-            && old.grant_attempt > record.grant_attempt
-        {
-            return Ok(());
+    /// Write encoded records, each unless its slot already holds a newer
+    /// grant's. Records are applied in order, so a later one at the same
+    /// grant wins. Each run of adjacent indexes costs one read and one
+    /// write; a gap is never filled, so unwritten slots stay holes.
+    fn put(&self, bytes: &[u8]) -> Result<(), LedgerError> {
+        let mut records = bytes
+            .as_chunks::<{ task_ledger::RECORD_BYTES }>()
+            .0
+            .iter()
+            .map(|raw| Ok((task_ledger::decode(raw, 0)?, raw)))
+            .collect::<Result<Vec<_>, LedgerError>>()?;
+        // Stable: equal indexes keep their order.
+        records.sort_by_key(|(record, _)| record.index);
+        let mut start = 0;
+        while start < records.len() {
+            let mut end = start + 1;
+            while end < records.len() && records[end].0.index <= records[end - 1].0.index + 1 {
+                end += 1;
+            }
+            self.put_run(&records[start..end])?;
+            start = end;
         }
-        self.file.write_all_at(&slot(raw), offset)?;
+        Ok(())
+    }
+
+    /// Apply sorted records whose indexes leave no gap.
+    fn put_run(
+        &self,
+        run: &[(TaskRecord, &[u8; task_ledger::RECORD_BYTES])],
+    ) -> Result<(), LedgerError> {
+        let (Some((first, _)), Some((last, _))) = (run.first(), run.last()) else {
+            return Ok(());
+        };
+        let offset = u64::from(first.index) * SLOT_BYTES as u64;
+        let slots = usize::try_from(last.index - first.index + 1).map_err(error)?;
+        let mut buffer = vec![0u8; slots * SLOT_BYTES];
+        // Past the end of the file reads short: those slots are empty.
+        read_full(&self.file, &mut buffer, offset)?;
+        for (record, raw) in run {
+            let at = usize::try_from(record.index - first.index).map_err(error)? * SLOT_BYTES;
+            let existing = &mut buffer[at..at + SLOT_BYTES];
+            // A damaged slot can only be an unacknowledged write: overwrite it.
+            if let Ok(Some(old)) = decode_slot(existing, offset + at as u64)
+                && old.grant_attempt > record.grant_attempt
+            {
+                continue;
+            }
+            existing.copy_from_slice(&slot(raw));
+        }
+        self.file.write_all_at(&buffer, offset)?;
         Ok(())
     }
 
     /// Index already checksummed terminal records, with one fsync.
     pub fn append(&self, bytes: &[u8]) -> Result<(), LedgerError> {
-        for raw in bytes.as_chunks::<{ task_ledger::RECORD_BYTES }>().0 {
-            let record = task_ledger::decode(raw, 0)?;
-            self.put(&record, raw)?;
-        }
+        self.put(bytes)?;
         self.file.sync_data()?;
         Ok(())
     }

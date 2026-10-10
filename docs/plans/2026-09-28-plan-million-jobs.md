@@ -196,7 +196,7 @@ RSS delta, reporting bytes per node per second, and ledger bytes on disk.
 | Leader CPU for batch control | at most 1 core average | at most 0.5 core | Mayo |
 | Executor overhead per node beyond the tasks | at most 0.5 core | at most 0.5 core | Mayo |
 | Submission request | under 4 KiB | same | integration test |
-| Node ledger on disk per 1M tasks | at most 16 MiB, deleted after retirement; measured bound since #678: at most 48 bytes per task (ledger 22.6 + result index 24.1, about 45 MiB per 1M), deleted an hour after retirement on a leader timer | same | unit test and `make bench-task-arrays` |
+| Node ledger on disk per 1M tasks | at most 16 MiB, deleted after retirement; measured bound since #678: at most 50 bytes per task (measured ledger 22.4 + result index 25.0 on APFS, about 45 MiB per 1M), deleted an hour after retirement on a leader timer | same | unit test and `make bench-task-arrays` |
 | Log volume retained | at most 50 MB for the whole run | same | Ketchup |
 
 The laptop numbers are gated: the headline says "a million" only if M0 and the

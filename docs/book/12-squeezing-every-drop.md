@@ -926,7 +926,7 @@ self.file.write_all_at(&slot(raw), offset)?;
 
 `write_all_at` isn't a method of `File` itself. It belongs to the `FileExt` *trait*, which the standard library implements for `File` only on Unix, and a trait's methods are in scope only once you `use` the trait. That's how Rust adds platform-specific methods without a `#[cfg]` on every call: Windows code simply has no `write_all_at` to call. Positional reads and writes (`pread` and `pwrite` underneath) also take `&self`, not `&mut self`, because they don't move a shared file cursor. The API readers and the ledger writer share one `Arc<TaskResultIndex>`, and the borrow checker is happy for them to.
 
-A million tasks now cost 22.6 bytes of ledger and 24.1 of index, about 45 MiB. That still isn't the plan's 16 MiB per million (the ledger alone is over it), so we recorded the measured bound instead, 48 bytes a task, and `make bench-task-arrays` fails above it.
+A million tasks now cost 22.4 bytes of ledger and 25.0 of index on APFS, about 45 MiB. That still isn't the plan's 16 MiB per million (the ledger alone is over it), so we recorded the measured bound instead, 50 bytes a task (some headroom for filesystem block rounding), and `make bench-task-arrays` fails above it.
 
 Bytes per task only matter if they eventually go away. Workers already deleted a run's directory once the leader stopped listing it, but the leader only forgot a finished run when someone *submitted* something: pruning lived in the registration path. An idle cluster, or one running the same long array all day, kept everything. The fix is a new replicated write:
 

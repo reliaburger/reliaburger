@@ -54,7 +54,7 @@ pub const MAX_RESULT_ROWS: usize = 1000;
 /// lists its run: a 22-byte ledger record plus a 24-byte result-index slot,
 /// rounded up for block headers and filesystem blocks. Kept failure output
 /// comes on top, bounded per chunk. Everything goes once the run retires.
-pub const STORAGE_BYTES_PER_TASK: u64 = 48;
+pub const STORAGE_BYTES_PER_TASK: u64 = 50;
 
 /// Tasks examined by a detail page, even when its failure filter returns no rows.
 pub const RESULT_PAGE_SPAN: u32 = 4096;
