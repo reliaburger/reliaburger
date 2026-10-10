@@ -1422,6 +1422,7 @@ mod tests {
 
     fn template() -> Box<JobSpec> {
         Box::new(JobSpec {
+            runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: None,
             schedule: None,
@@ -1521,6 +1522,7 @@ mod tests {
     fn register_accepts_an_image_template() {
         let mut arrays = TaskArrays::default();
         let mut image = template();
+        image.runtime = crate::config::job::JobRuntime::Runc;
         image.exec = None;
         image.image = Some("alpine:3".to_string());
         let write = TaskArrayWrite::Register {
@@ -1723,7 +1725,7 @@ mod tests {
         for manifest in [false, true] {
             let mut arrays = TaskArrays::default();
             let config = crate::config::Config::parse(
-                "[app.web]\nimage='web:v1'\n[job.render]\nexec='/bin/true'\nrun_before=['app.web']",
+                "[app.web]\nimage='web:v1'\n[job.render]\nruntime='process'\nexec='/bin/true'\nrun_before=['app.web']",
             )
             .unwrap();
             let mut next = 1;

@@ -65,6 +65,10 @@ impl TestHarness {
             reliaburger::bun::task_array_node::TaskArrayNodeConfig {
                 root: jobs.path().join("tasks"),
                 policy: reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                    allowed_binaries: ["/bin/echo", "/bin/false", "/bin/sh", "/usr/bin/true"]
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                     mount_isolation: false,
                     ..Default::default()
                 },

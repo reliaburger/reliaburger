@@ -1,0 +1,27 @@
+{
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "window_seconds": 60,
+  "rows": [
+    {
+      "runtime": "process",
+      "concurrency": 1,
+      "batch_id": 13,
+      "admission_upper_bound": 1,
+      "receipt_chunk_size": 1000,
+      "drain_proof": {
+        "batch_id": 13,
+        "done": true,
+        "held": 0,
+        "active_commands": 0
+      }
+    }
+  ],
+  "complete": false,
+  "methodology": "Cold executors, warm image. Submit once, observe cold window after submit response, then immediately observe a second warm window with counter subtraction. Cancel/drain only afterwards. One active submission.",
+  "activity_caveat": "Active command snapshots are sampled at node sync and may miss short commands; configured concurrency is a cap, not an observation of continuous occupancy.",
+  "reusable_executor_pool_limit": 32,
+  "job_cpu_budget_millicores": 3000,
+  "binary_sha256": "ca99c4e0a7079d930770417d1a9da396306b3a883ba3f5e58b06f8448bb4d19e"
+}

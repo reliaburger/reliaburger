@@ -511,6 +511,25 @@ pub fn array_summary(
 ) -> serde_json::Value {
     let state = &record.state;
     let summary = state.summary();
+    let elapsed = record
+        .terminal_at_epoch_secs
+        .unwrap_or_else(epoch_now_secs)
+        .saturating_sub(state.submitted_at_epoch_secs);
+    let callers = nodes
+        .iter()
+        .try_fold(0u64, |sum, node| sum.checked_add(node.counters.running));
+    let active = if summary.status.is_terminal() {
+        Some(0)
+    } else if nodes.is_empty() {
+        None
+    } else {
+        nodes
+            .iter()
+            .filter(|node| node.refused.is_none())
+            .try_fold(0u64, |sum, node| {
+                sum.checked_add(node.counters.active_commands?)
+            })
+    };
     let failed: Vec<[u32; 2]> = state
         .failed_indices()
         .ranges()
@@ -531,6 +550,11 @@ pub fn array_summary(
         "retried": summary.retried,
         "queued": summary.queued,
         "held": summary.held,
+        "active_commands": active,
+        "other_in_flight_attempts": active.and_then(|count| callers.and_then(|callers| callers.checked_sub(count))),
+        "activity_semantics": "last_node_sync_verified_start_to_positive_cleanup",
+        "elapsed_seconds": elapsed,
+        "whole_run_successes_per_second": (elapsed > 0).then(|| summary.succeeded as f64 / elapsed as f64),
         "chunks": state.spec.chunk_count(),
         "chunks_done": summary.chunks_done,
         "failed_indices": failed,
@@ -544,6 +568,11 @@ pub fn array_summary(
         "age_seconds": epoch_now_secs().saturating_sub(state.submitted_at_epoch_secs),
         "details_retention_seconds": crate::meat::task_array_store::TERMINAL_RETENTION_SECS,
         "execution_semantics": "at_least_once",
+        "runtime": record.template.runtime,
+        "idle_executor_reservation": if matches!(record.template.runtime, crate::config::job::JobRuntime::SharedRunc | crate::config::job::JobRuntime::Process) {
+            super::reusable_executor::ExecutorProfile::new(&record.template).ok().map(|profile| serde_json::json!({"cpu_millicores":profile.reservation.cpu_millicores,"memory_bytes":profile.reservation.memory_bytes}))
+        } else { None },
+        "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
     })
 }
 
@@ -651,9 +680,35 @@ pub async fn manifest_summary(
             done = false;
         }
     }
+    let aggregate = |key: &str| {
+        (cohorts.len() == manifest.cohorts.len())
+            .then(|| {
+                cohorts
+                    .iter()
+                    .try_fold(0u64, |sum, cohort| sum.checked_add(cohort[key].as_u64()?))
+            })
+            .flatten()
+    };
+    let active = aggregate("active_commands");
+    let other = aggregate("other_in_flight_attempts");
+    let end = if done {
+        manifest
+            .cohorts
+            .iter()
+            .filter_map(|(_, id)| {
+                arrays
+                    .get(*id)
+                    .and_then(|record| record.terminal_at_epoch_secs)
+            })
+            .max()
+            .unwrap_or(manifest.submitted_at_epoch_secs)
+    } else {
+        epoch_now_secs()
+    };
+    let elapsed = end.saturating_sub(manifest.submitted_at_epoch_secs);
     serde_json::json!({ "batch_id":batch_id,"kind":"manifest","name":manifest.name,"namespace":manifest.namespace,"total":total,"succeeded":succeeded,"failed":failed,"not_run":not_run,"retried":retried,"queued":queued,"held":held,"done":done,
         "status":if unknown && !done {"Unknown"} else if stopping {"Stopping"} else if !done {"Running"} else if stopped_failed {"Failed"} else if not_run>0 {"Cancelled"} else if failed>0 {"CompletedWithFailures"} else {"Succeeded"},
-        "cohorts":cohorts,"duration_final_attempt_ms":{"bounds":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null],"counts":durations},"rates":service.rates(batch_id,(succeeded,failed)).await,"details_retention_seconds":crate::meat::task_array_store::TERMINAL_RETENTION_SECS,"execution_semantics":if manifest.common_jobs {"acknowledged_unknown_replay"} else {"at_least_once"} })
+        "active_commands":active,"other_in_flight_attempts":other,"elapsed_seconds":elapsed,"whole_run_successes_per_second":(elapsed>0).then(||succeeded as f64/elapsed as f64),"activity_semantics":"last_node_sync_verified_start_to_positive_cleanup","cohorts":cohorts,"duration_final_attempt_ms":{"bounds":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null],"counts":durations},"rates":service.rates(batch_id,(succeeded,failed)).await,"details_retention_seconds":crate::meat::task_array_store::TERMINAL_RETENTION_SECS,"execution_semantics":if manifest.common_jobs {"acknowledged_unknown_replay"} else {"at_least_once"} })
 }
 
 /// `POST /v1/batch/array/sync`: the leader's once-a-second call.
@@ -1136,6 +1191,7 @@ mod tests {
 
     fn template() -> JobSpec {
         JobSpec {
+            runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: Some(vec!["{index}".to_string()]),
             schedule: None,
@@ -1352,6 +1408,69 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert!(truncated);
+    }
+
+    #[test]
+    fn activity_requires_receipts_from_every_reporting_backend() {
+        let mut record = record_with_failures(&[]);
+        record.state = crate::meat::task_array_state::TaskArrayState::new(
+            crate::meat::task_array::TaskArraySpec::with_count(10),
+            100,
+        )
+        .unwrap();
+        record.terminal_at_epoch_secs = None;
+        assert!(array_summary(9, &record, &[])["active_commands"].is_null());
+        let mut nodes = vec![NodeView {
+            node: NodeId::new("first"),
+            slots: 8,
+            refused: None,
+            counters: super::super::task_array_node::NodeArrayCounters {
+                running: 8,
+                active_commands: Some(3),
+                ..Default::default()
+            },
+        }];
+        let summary = array_summary(9, &record, &nodes);
+        assert_eq!(summary["active_commands"], 3);
+        assert_eq!(summary["other_in_flight_attempts"], 5);
+        nodes.push(NodeView {
+            node: NodeId::new("unsupported"),
+            slots: 2,
+            refused: None,
+            counters: Default::default(),
+        });
+        assert!(array_summary(9, &record, &nodes)["active_commands"].is_null());
+        nodes[1].refused = Some("unsupported".into());
+        assert_eq!(array_summary(9, &record, &nodes)["active_commands"], 3);
+    }
+
+    #[test]
+    fn native_profile_summary_discloses_idle_helper_cost_without_claiming_live_usage() {
+        let record = record_with_failures(&[]);
+        let summary = array_summary(9, &record, &[]);
+        assert_eq!(summary["runtime"], "process");
+        assert_eq!(summary["idle_executor_reservation"]["cpu_millicores"], 1010);
+        assert_eq!(
+            summary["idle_executor_reservation"]["memory_bytes"],
+            72 << 20
+        );
+        assert_eq!(
+            summary["idle_executor_reservation_semantics"],
+            "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage"
+        );
+    }
+
+    #[test]
+    fn whole_run_rate_freezes_at_accepted_terminal_time_and_empty_activity_is_unknown() {
+        let mut record = record_with_failures(&[2, 3, 7]);
+        record.state.submitted_at_epoch_secs = 100;
+        record.terminal_at_epoch_secs = Some(110);
+        let summary = array_summary(5, &record, &[]);
+        assert_eq!(summary["elapsed_seconds"], 10);
+        assert_eq!(summary["whole_run_successes_per_second"], 0.7);
+        assert_eq!(summary["active_commands"], 0);
+        record.terminal_at_epoch_secs = Some(100);
+        assert!(array_summary(5, &record, &[])["whole_run_successes_per_second"].is_null());
     }
 
     #[test]

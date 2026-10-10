@@ -293,11 +293,15 @@ migration and no feature gate
   singleton jobs, arrays, cron and deployment hooks share durable runs, resource
   admission and accepted outcomes ([plan](plans/2026-10-07-plan-common-job-lifecycle.md),
   [qualification](qualification/2026-10-07-common-jobs/README.md)). This tick
-  records implementation; 0.2.0 isn't released. Reusable executors
-  [#639](https://github.com/reliaburger/reliaburger/issues/639), throughput
-  qualification and the high-volume demo
-  [#640](https://github.com/reliaburger/reliaburger/issues/640), and resident model
-  workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
+  records implementation; 0.2.0 isn't released. [#654](https://github.com/reliaburger/reliaburger/pull/654)
+  adds bounded native/shared executors and a four-part VM/process/container demonstration
+  ([raw results](qualification/2026-10-09-timed-job-scenarios/README.md)); it doesn't
+  qualify the daily target. Reusable executors
+  [#639](https://github.com/reliaburger/reliaburger/issues/639) are implemented,
+  alongside the reproducible throughput demo
+  [#640](https://github.com/reliaburger/reliaburger/issues/640). Sustained daily and
+  storage-bound qualification [#668](https://github.com/reliaburger/reliaburger/issues/668)
+  and resident model workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
   The million-task release gate and sustained 100m/day claim still require
   real-runtime qualification ([foundation evidence](qualification/2026-10-04-delegated-jobs/README.md)).
 - [ ] **0.3.0: "Bare metal in an hour"**

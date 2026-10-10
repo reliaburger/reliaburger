@@ -17,7 +17,7 @@ Small fixes, documentation improvements, and tests can go straight to a pull req
 
 ## Development Setup
 
-You need a current `Rust` toolchain and Cargo. The project uses `Rust` edition 2024. Some ignored acceptance suites additionally require Linux, runc, Buildah, network namespaces, eBPF support, or Apple Container; portable checks should not depend on those tools.
+You need a current `Rust` toolchain and Cargo. The project uses `Rust` edition 2024. On Linux, `build.rs` also compiles the static job executor helpers with `cc -static`, so install a C compiler and a static libc (`build-essential` on Debian and Ubuntu, `gcc glibc-static` on Fedora). Some ignored acceptance suites additionally require Linux, runc, Buildah, network namespaces, eBPF support, or Apple Container; portable checks should not depend on those tools.
 
 Build the binaries with:
 

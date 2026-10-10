@@ -34,11 +34,17 @@ backups use each backend's standard credential variables.
 |------|---------|---------|
 | `--config PATH` | none (all defaults) | node config file |
 | `--listen ADDR` | `127.0.0.1:9117` | API listen address |
-| `--runtime NAME` | `auto` | `auto`, `process`, or `runc` (Linux) |
+| `--runtime NAME` | `auto` | `auto`, `process`, `runc`, or `mixed` (Linux) |
 | `--cluster` | off | form or join a cluster using `[cluster]` |
 | `--compatibility` | | print the protocol and state formats this binary supports |
 
-`auto` picks runc on Linux when it's on the `PATH`, and ProcessGrill otherwise.
+Linux `--runtime mixed` enables both container and host backends. Auto may
+select both; explicit `--runtime runc` selects containers only. Jobs choose
+`runtime="runc"` (default), `runtime="process"` or `runtime="shared-runc"`.
+Process jobs refuse images and container jobs refuse host exec/script fields.
+
+Host workloads require an explicit allowlist and `mount_isolation = false`;
+CPU/memory limits and container egress enforcement remain unavailable to them.
 While no API token exists, Bun refuses any `--listen` address that isn't a
 loopback IP.
 
@@ -136,7 +142,7 @@ startup instead of being ignored.
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
 | `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |
-| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none) |
+| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none); host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
 | `[runtime]` | `stop_confirmation_timeout_secs` |
 
 ### Shorter certificates for soak runs

@@ -1,0 +1,7 @@
+{
+  "original_raw_pid": 2230615,
+  "original_pid_gone": true,
+  "signal_authority": "PID and frozen executable positively checked before SIGTERM; original child subsequently reaped",
+  "stopped_utc": "2026-10-09T14:22:59.791919+00:00",
+  "reason": "Restart all hours after correcting fresh receipt granularity and one-submission concurrency; unfinished raw run preserved"
+}

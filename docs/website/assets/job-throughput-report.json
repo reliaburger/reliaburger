@@ -1,0 +1,722 @@
+{
+  "all_windows_healthy": true,
+  "qualified_100m_per_day": false,
+  "source": "packaged relish bench scenarios",
+  "chapters": [
+    {
+      "scenario": "jobs-vm-baseline",
+      "start_seconds": 0.012143887812271714
+    },
+    {
+      "scenario": "jobs-containers",
+      "start_seconds": 60.04706553579308
+    },
+    {
+      "scenario": "jobs-shared-containers",
+      "start_seconds": 127.78877301886678
+    },
+    {
+      "scenario": "jobs-host-processes",
+      "start_seconds": 195.1429326168727
+    }
+  ],
+  "tiers": [
+    {
+      "schema_version": 1,
+      "scenario": "jobs-containers",
+      "started_at": "2026-10-09T18:33:38Z",
+      "requested_seconds": 60,
+      "concurrency": 27,
+      "cpu_request_millicores": 25,
+      "cpu_limit_millicores": 1000,
+      "memory_bytes": 33554432,
+      "receipt_chunk_size": 1,
+      "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+      "executable": null,
+      "executable_sha256": null,
+      "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+      "unique_accepted_successes": 213,
+      "verified_successes": 0,
+      "terminal_failures": 0,
+      "accepted_retries": 0,
+      "post_cutoff_drained": 0,
+      "batch_ids": [
+        87
+      ],
+      "active_submissions": [
+        87
+      ],
+      "drain_proofs": [
+        {
+          "batch_id": 87,
+          "done": true,
+          "held": 0,
+          "active_commands": 0
+        }
+      ],
+      "last_accepted_sample_seconds": 59.735825688,
+      "submission_names": [
+        "bench-jobs-10301cc7fa16d8a5c70c7e35fde98bde"
+      ],
+      "measurement_complete": true,
+      "interrupted": false,
+      "cleanup_verified": true,
+      "cleanup_failed_submissions": [],
+      "error": null,
+      "elapsed_including_drain_seconds": 67.688275632,
+      "successes_per_second": 3.55,
+      "extrapolated_runs_per_day": 306720.0,
+      "daily_projection": "extrapolation from this window; not an observed daily total",
+      "qualified_100m_per_day": false,
+      "application_probes": 68,
+      "application_failures": 0,
+      "resource_observations": [
+        {
+          "elapsed_seconds": 0.0009055049158632755,
+          "cpu_ticks": [
+            7319955,
+            5659,
+            7502992,
+            464694977,
+            1622937,
+            0,
+            646121,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 187981824,
+              "files_observed": 2438,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2652381184
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 181882880,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 30.09067598800175,
+          "cpu_ticks": [
+            7321084,
+            5659,
+            7511515,
+            464696026,
+            1623941,
+            0,
+            646253,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 29229056,
+              "files_observed": 2426,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2811621376
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 170987520,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 60.25071228900924,
+          "cpu_ticks": [
+            7322328,
+            5659,
+            7520721,
+            464696269,
+            1624951,
+            0,
+            646348,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 29196288,
+              "files_observed": 2433,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2811338752
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 163524608,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        }
+      ],
+      "service_latency_ms": {
+        "samples": 68,
+        "maximum": 7.44128692895174,
+        "p95": 5.645152879878879
+      },
+      "observation_boundary": "Service and resource observations span preparation, measured work and positive drain",
+      "runtime": "runc",
+      "post_cutoff_drain_proofs": [
+        {
+          "batch_id": 87,
+          "done": true,
+          "held": 0,
+          "active_commands": 0
+        }
+      ]
+    },
+    {
+      "schema_version": 1,
+      "scenario": "jobs-shared-containers",
+      "started_at": "2026-10-09T18:34:46Z",
+      "requested_seconds": 60,
+      "concurrency": 27,
+      "cpu_request_millicores": 25,
+      "cpu_limit_millicores": 1000,
+      "memory_bytes": 33554432,
+      "receipt_chunk_size": 1000,
+      "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+      "executable": null,
+      "executable_sha256": null,
+      "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+      "unique_accepted_successes": 58000,
+      "verified_successes": 0,
+      "terminal_failures": 0,
+      "accepted_retries": 0,
+      "post_cutoff_drained": 0,
+      "batch_ids": [
+        89
+      ],
+      "active_submissions": [
+        89
+      ],
+      "drain_proofs": [
+        {
+          "batch_id": 89,
+          "done": true,
+          "held": 0,
+          "active_commands": 0
+        }
+      ],
+      "last_accepted_sample_seconds": 59.770764942,
+      "submission_names": [
+        "bench-jobs-afe3c40c697ec6acc34ff0d1a79861ef"
+      ],
+      "measurement_complete": true,
+      "interrupted": false,
+      "cleanup_verified": true,
+      "cleanup_failed_submissions": [],
+      "error": null,
+      "elapsed_including_drain_seconds": 61.790159663,
+      "successes_per_second": 966.6666666666666,
+      "extrapolated_runs_per_day": 83520000.0,
+      "daily_projection": "extrapolation from this window; not an observed daily total",
+      "qualified_100m_per_day": false,
+      "application_probes": 62,
+      "application_failures": 0,
+      "resource_observations": [
+        {
+          "elapsed_seconds": 0.0010859218891710043,
+          "cpu_ticks": [
+            7322478,
+            5659,
+            7521736,
+            464697872,
+            1625099,
+            0,
+            646380,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 29196288,
+              "files_observed": 2434,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2811355136
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 186322944,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 30.07707678200677,
+          "cpu_ticks": [
+            7323297,
+            5659,
+            7527061,
+            464702353,
+            1626051,
+            0,
+            646487,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 48750592,
+              "files_observed": 2419,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2791071744
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 173772800,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 60.13809656095691,
+          "cpu_ticks": [
+            7324070,
+            5659,
+            7531140,
+            464708438,
+            1626693,
+            0,
+            646568,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 53026816,
+              "files_observed": 2423,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2786652160
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 225349632,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        }
+      ],
+      "service_latency_ms": {
+        "samples": 62,
+        "maximum": 3.1706420704722404,
+        "p95": 1.84155092574656
+      },
+      "observation_boundary": "Service and resource observations span preparation, measured work and positive drain",
+      "runtime": "shared-runc",
+      "post_cutoff_drain_proofs": [
+        {
+          "batch_id": 89,
+          "done": true,
+          "held": 0,
+          "active_commands": 0
+        }
+      ]
+    },
+    {
+      "schema_version": 1,
+      "scenario": "jobs-host-processes",
+      "started_at": "2026-10-09T18:35:54Z",
+      "requested_seconds": 60,
+      "concurrency": 27,
+      "cpu_request_millicores": 25,
+      "cpu_limit_millicores": 1000,
+      "memory_bytes": 33554432,
+      "receipt_chunk_size": 1000,
+      "image": null,
+      "executable": "/tmp/rb-host-executor-v4/host/busybox",
+      "executable_sha256": null,
+      "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+      "unique_accepted_successes": 294000,
+      "verified_successes": 0,
+      "terminal_failures": 0,
+      "accepted_retries": 0,
+      "post_cutoff_drained": 0,
+      "batch_ids": [
+        91
+      ],
+      "active_submissions": [
+        91
+      ],
+      "drain_proofs": [
+        {
+          "batch_id": 91,
+          "done": true,
+          "held": 0,
+          "active_commands": 0
+        }
+      ],
+      "last_accepted_sample_seconds": 59.753894451,
+      "submission_names": [
+        "bench-jobs-8aecddf2665137e256fb8749fd2af8cc"
+      ],
+      "measurement_complete": true,
+      "interrupted": false,
+      "cleanup_verified": true,
+      "cleanup_failed_submissions": [],
+      "error": null,
+      "elapsed_including_drain_seconds": 61.520302484,
+      "successes_per_second": 4900.0,
+      "extrapolated_runs_per_day": 423360000.0,
+      "daily_projection": "extrapolation from this window; not an observed daily total",
+      "qualified_100m_per_day": false,
+      "application_probes": 62,
+      "application_failures": 0,
+      "resource_observations": [
+        {
+          "elapsed_seconds": 0.0014120081905275583,
+          "cpu_ticks": [
+            7324142,
+            5659,
+            7531603,
+            464710486,
+            1626889,
+            0,
+            646615,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 34922496,
+              "files_observed": 2435,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2805514240
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 191664128,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 30.087619822006673,
+          "cpu_ticks": [
+            7325345,
+            5659,
+            7535979,
+            464716649,
+            1626950,
+            0,
+            646657,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 46436352,
+              "files_observed": 2434,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2773315584
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 198402048,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 60.190958586055785,
+          "cpu_ticks": [
+            7326703,
+            5659,
+            7540934,
+            464722122,
+            1626990,
+            0,
+            646688,
+            0,
+            0,
+            0
+          ],
+          "storage": {
+            "/tmp/rb-host-executor-v4/data": {
+              "allocated_bytes_observed": 59412480,
+              "files_observed": 2435,
+              "raced_entries": 0,
+              "complete": false,
+              "filesystem_available_bytes": 2761084928
+            }
+          },
+          "processes": [
+            {
+              "pid": 2960485,
+              "start_ticks": 119317256,
+              "complete": true,
+              "rss_bytes": 198754304,
+              "peak_rss_bytes": 303005696
+            },
+            {
+              "pid": 2960635,
+              "start_ticks": 119317979,
+              "complete": true,
+              "rss_bytes": 778240,
+              "peak_rss_bytes": 1703936
+            }
+          ]
+        }
+      ],
+      "service_latency_ms": {
+        "samples": 62,
+        "maximum": 5.203111795708537,
+        "p95": 3.3063089940696955
+      },
+      "observation_boundary": "Service and resource observations span preparation, measured work and positive drain",
+      "runtime": "process",
+      "post_cutoff_drain_proofs": [
+        {
+          "batch_id": 91,
+          "done": true,
+          "held": 0,
+          "active_commands": 0
+        }
+      ]
+    }
+  ],
+  "baseline": {
+    "schema_version": 1,
+    "scenario": "jobs-vm-baseline",
+    "started_at": "2026-10-09T18:32:38Z",
+    "requested_seconds": 60,
+    "concurrency": 27,
+    "cpu_request_millicores": null,
+    "cpu_limit_millicores": null,
+    "memory_bytes": null,
+    "receipt_chunk_size": null,
+    "image": null,
+    "executable": "/tmp/rb-host-executor-v4/host/busybox",
+    "executable_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
+    "measurement_boundary": "local Linux machine running Relish; raw child exits, no resource enforcement, ownership journal or accepted task ledger; compare only with jobs on this same machine and byte-identical BusyBox",
+    "unique_accepted_successes": 0,
+    "verified_successes": 993718,
+    "terminal_failures": 0,
+    "accepted_retries": 0,
+    "post_cutoff_drained": 27,
+    "batch_ids": [],
+    "active_submissions": [],
+    "drain_proofs": [],
+    "last_accepted_sample_seconds": null,
+    "submission_names": [],
+    "measurement_complete": true,
+    "interrupted": false,
+    "cleanup_verified": true,
+    "cleanup_failed_submissions": [],
+    "error": null,
+    "elapsed_including_drain_seconds": 60.005007675,
+    "successes_per_second": 16561.966666666667,
+    "extrapolated_runs_per_day": 1430953920.0,
+    "daily_projection": "extrapolation from this window; not an observed daily total",
+    "qualified_100m_per_day": false,
+    "application_probes": 60,
+    "application_failures": 0,
+    "resource_observations": [
+      {
+        "elapsed_seconds": 0.014204730046913028,
+        "cpu_ticks": [
+          7315018,
+          5659,
+          7486120,
+          464693279,
+          1622934,
+          0,
+          646118,
+          0,
+          0,
+          0
+        ],
+        "storage": {
+          "/tmp/rb-host-executor-v4/data": {
+            "allocated_bytes_observed": 187969536,
+            "files_observed": 2438,
+            "raced_entries": 0,
+            "complete": false,
+            "filesystem_available_bytes": 2652422144
+          }
+        },
+        "processes": [
+          {
+            "pid": 2960485,
+            "start_ticks": 119317256,
+            "complete": true,
+            "rss_bytes": 180174848,
+            "peak_rss_bytes": 303005696
+          },
+          {
+            "pid": 2960635,
+            "start_ticks": 119317979,
+            "complete": true,
+            "rss_bytes": 778240,
+            "peak_rss_bytes": 1703936
+          }
+        ]
+      },
+      {
+        "elapsed_seconds": 30.415151846129447,
+        "cpu_ticks": [
+          7317507,
+          5659,
+          7494597,
+          464694154,
+          1622936,
+          0,
+          646119,
+          0,
+          0,
+          0
+        ],
+        "storage": {
+          "/tmp/rb-host-executor-v4/data": {
+            "allocated_bytes_observed": 187981824,
+            "files_observed": 2438,
+            "raced_entries": 0,
+            "complete": false,
+            "filesystem_available_bytes": 2652409856
+          }
+        },
+        "processes": [
+          {
+            "pid": 2960485,
+            "start_ticks": 119317256,
+            "complete": true,
+            "rss_bytes": 181256192,
+            "peak_rss_bytes": 303005696
+          },
+          {
+            "pid": 2960635,
+            "start_ticks": 119317979,
+            "complete": true,
+            "rss_bytes": 778240,
+            "peak_rss_bytes": 1703936
+          }
+        ]
+      }
+    ],
+    "service_latency_ms": {
+      "samples": 60,
+      "maximum": 14.015688095241785,
+      "p95": 2.068383852019906
+    },
+    "observation_boundary": "Service and resource observations span preparation, measured work and positive drain",
+    "path": "Bare",
+    "failures": 0,
+    "elapsed_seconds": 60,
+    "actual_elapsed_including_drain_seconds": 60.005007675,
+    "verified_successes_per_second": 16561.966666666667
+  },
+  "recording_elapsed_seconds": 258.7799075078219,
+  "measurement_window_seconds": 60,
+  "unique_accepted_successes": 352213,
+  "daily_projection": "Extrapolation from the measured window; not an observed daily total",
+  "comparison_boundary": "Raw exits omit admission, limits, durable ownership and accepted outcomes; the baseline is a measured reference for this VM and command.",
+  "timing": "One monotonic recording clock; preparation and cancellation remain visible outside equal measurement windows"
+}

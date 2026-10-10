@@ -196,7 +196,9 @@ fn failed_only_results_discard_a_superseded_failure() {
             },
         )
         .unwrap();
-    let template = serde_json::from_value(serde_json::json!({ "exec": "/review/task" })).unwrap();
+    let template =
+        serde_json::from_value(serde_json::json!({ "runtime":"process","exec": "/review/task" }))
+            .unwrap();
     let record = TaskArrayRecord {
         terminal_at_epoch_secs: None,
         name: "review".into(),

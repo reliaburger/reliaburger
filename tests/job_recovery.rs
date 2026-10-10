@@ -149,15 +149,17 @@ async fn wait_app_state(client: &BunClient, expected: &str) {
 ///
 /// Status reads each pid from the process owner and marks an answer it
 /// couldn't complete in time `runtime_unknown` rather than hold the reply,
-/// so only that answer (or a failed request) is worth asking again. A
-/// complete answer with no pid is a running job reported without a process,
+/// so that answer (or a failed request) is worth asking again. A pending
+/// retry has no runtime binding yet, even if an earlier job-summary read
+/// reported its run as active. A complete running answer with no pid is a
+/// running job reported without a process,
 /// the product bug #358 fixed, and fails at once.
 async fn job_pid(client: &BunClient) -> u32 {
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     loop {
         let last_observed = match client.status().await {
             Ok(statuses) => match statuses.first() {
-                Some(status) if !status.runtime_unknown => {
+                Some(status) if status.state == "running" && !status.runtime_unknown => {
                     return status
                         .pid
                         .unwrap_or_else(|| panic!("a running job had no pid: {status:?}"));
@@ -191,6 +193,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -204,9 +209,9 @@ registry_port = 0
     let release = root.path().join("release");
     let start_retry = root.path().join("start-retry");
     let _release = ReleaseJob(release.clone());
-    let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    let mut config = Config::parse("[job.work]\nruntime = 'process'\nexec = '/bin/sh'\n").unwrap();
     let job = config.job.get_mut("work").unwrap();
-    job.command = Some(vec!["/bin/sh".into(), "-c".into(),
+    job.command = Some(vec!["-c".into(),
         "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 2400 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 2400 ]; do if [ -f \"$RELEASE_FILE\" ]; then if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 2 ]; then kill -TERM $$; else exit 0; fi; fi; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
     job.env.insert(
         "RUN_FILE".into(),
@@ -305,6 +310,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -316,9 +324,10 @@ registry_port = 0
         .unwrap();
         let release = root.path().join("release");
         let _release = ReleaseJob(release.clone());
-        let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+        let mut config =
+            Config::parse("[job.work]\nruntime = 'process'\nexec = '/bin/sh'\n").unwrap();
         let job = config.job.get_mut("work").unwrap();
-        job.command = Some(vec!["/bin/sh".into(), "-c".into(),
+        job.command = Some(vec!["-c".into(),
             "i=0; while [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; [ -f \"$RELEASE_FILE\" ]".into()]);
         job.env.insert(
             "RELEASE_FILE".into(),
@@ -372,6 +381,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -484,6 +496,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -879,4 +894,80 @@ async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
             "expired job lease did not recover: state={lease_state:?}, process={process:?}, attempts={attempts:?}\n{recovery_lines}"
         );
     }
+}
+
+/// Serve successive status snapshots without depending on child scheduling.
+struct PidStatusFixture {
+    client: BunClient,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PidStatusFixture {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl PidStatusFixture {
+    async fn start(states: Vec<serde_json::Value>) -> Self {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let states = Arc::new(states);
+        let router = axum::Router::new().route(
+            "/v1/status",
+            axum::routing::get(move || {
+                let states = states.clone();
+                let cursor = cursor.clone();
+                async move {
+                    let index = cursor.fetch_add(1, Ordering::SeqCst).min(states.len() - 1);
+                    axum::Json(vec![states[index].clone()])
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self {
+            client: BunClient::new(&format!("http://{address}")),
+            server,
+        }
+    }
+}
+
+fn pid_status(state: &str, pid: Option<u32>, unknown: bool) -> serde_json::Value {
+    serde_json::json!({"id":"run-1", "app_name":"work", "namespace":"default",
+        "state":state, "restart_count":1, "host_port":null, "pid":pid,
+        "runtime_unknown":unknown})
+}
+
+#[tokio::test]
+async fn pid_wait_accepts_a_pending_retry_before_its_running_process() {
+    let fixture = PidStatusFixture::start(vec![
+        pid_status("pending", None, false),
+        pid_status("running", Some(123), false),
+    ])
+    .await;
+    assert_eq!(job_pid(&fixture.client).await, 123);
+}
+
+#[tokio::test]
+async fn pid_wait_keeps_unknown_runtime_evidence_pending() {
+    let fixture = PidStatusFixture::start(vec![
+        pid_status("running", None, true),
+        pid_status("running", Some(123), false),
+    ])
+    .await;
+    assert_eq!(job_pid(&fixture.client).await, 123);
+}
+
+#[tokio::test]
+#[should_panic(expected = "a running job had no pid")]
+async fn pid_wait_still_refuses_a_known_running_process_without_a_pid() {
+    let fixture = PidStatusFixture::start(vec![pid_status("running", None, false)]).await;
+    job_pid(&fixture.client).await;
 }

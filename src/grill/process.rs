@@ -33,6 +33,46 @@ use super::records::{self, InstanceRecord};
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
+/// Variables a host command inherits from Bun, plus every `LC_*`.
+///
+/// Anything else in Bun's environment (cloud credentials, `RELIABURGER_*`
+/// settings) stays private to Bun. The workload's own `env` is applied on top.
+pub const HOST_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "LANG", "LANGUAGE", "TZ", "USER", "LOGNAME", "SHELL", "TMPDIR",
+];
+
+/// Whether a host command inherits this variable from Bun.
+pub fn inherited_by_host_commands(key: &str) -> bool {
+    HOST_ENVIRONMENT_ALLOWLIST.contains(&key) || key.starts_with("LC_")
+}
+
+/// The complete environment of a host command: Bun's allowlisted variables
+/// overlaid with the workload's `KEY=value` entries.
+///
+/// Every host backend (in-memory, owned and native executors) uses this, so a
+/// command sees the same environment wherever it runs.
+pub fn host_environment(workload: &[String]) -> std::collections::BTreeMap<String, String> {
+    host_environment_from(std::env::vars_os(), workload)
+}
+
+fn host_environment_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    workload: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut environment: std::collections::BTreeMap<String, String> = inherited
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| inherited_by_host_commands(key))
+        .collect();
+    environment.extend(
+        workload
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned())),
+    );
+    environment
+}
+
 #[cfg(test)]
 struct CaptureGate {
     entered: tokio::sync::watch::Sender<usize>,
@@ -331,6 +371,17 @@ impl ProcessGrill {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn executor_directory(&self) -> Result<PathBuf, GrillError> {
+        self.log_dir
+            .as_ref()
+            .map(|path| path.join("host-executors"))
+            .ok_or_else(|| GrillError::StateUnavailable {
+                instance: InstanceId("host-executor".into()),
+                reason: "host executor requires durable ownership".into(),
+            })
+    }
+
     /// Owner-backed lifecycle operations that are still running, including
     /// ones whose caller dropped its future: cancellation never cancels a
     /// queued mutation. Zero means none can still change owner state. Always
@@ -440,6 +491,14 @@ impl Default for ProcessGrill {
 }
 
 impl super::Grill for ProcessGrill {
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<Self> {
+        (self.control.is_some()
+            && nix::unistd::geteuid().is_root()
+            && Path::new("/sys/fs/cgroup/cgroup.controllers").exists())
+        .then(|| self.clone())
+    }
+
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         if let Some(control) = &self.control {
             return control.prepare(instance, spec).await.map_err(|error| {
@@ -525,12 +584,8 @@ impl super::Grill for ProcessGrill {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        // Set environment variables from OCI spec
-        for env_str in &entry.spec.process.env {
-            if let Some((key, value)) = env_str.split_once('=') {
-                cmd.env(key, value);
-            }
-        }
+        cmd.env_clear();
+        cmd.envs(host_environment(&entry.spec.process.env));
 
         // File-backed mode: append to log files that outlive this process
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
@@ -756,9 +811,12 @@ impl super::Grill for ProcessGrill {
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
         if let Some(control) = &self.control {
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Prepared => ContainerState::Pending,
                 OwnerPhase::Retiring { .. } => ContainerState::Stopping,
@@ -878,9 +936,12 @@ impl super::Grill for ProcessGrill {
             // An owner that didn't answer leaves the pid unknown, never
             // "no process" (#358).
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Running { pid } => Some(pid),
                 _ => None,
@@ -914,9 +975,12 @@ impl super::Grill for ProcessGrill {
             // An owner that didn't answer leaves the exit code unknown,
             // never "hasn't exited" (#389).
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Retired { exit_code } => exit_code,
                 _ => None,
@@ -952,7 +1016,9 @@ impl super::Grill for ProcessGrill {
                 .exec(instance, command)
                 .await
                 .map_err(|error| owner_error(instance, error));
-        } else {
+        }
+        // The same environment as the workload itself (see `host_environment`).
+        let environment = {
             let procs = self.processes.lock().await;
             let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
@@ -963,7 +1029,8 @@ impl super::Grill for ProcessGrill {
                     reason: format!("instance is not running (state: {})", entry.state),
                 });
             }
-        }
+            host_environment(&entry.spec.process.env)
+        };
 
         if command.is_empty() {
             return Err(GrillError::StartFailed {
@@ -975,6 +1042,8 @@ impl super::Grill for ProcessGrill {
         // Spawn the command directly (no namespace entry for ProcessGrill)
         let output = Command::new(&command[0])
             .args(&command[1..])
+            .env_clear()
+            .envs(environment)
             .output()
             .await
             .map_err(|e| GrillError::StartFailed {
@@ -1134,6 +1203,8 @@ mod tests {
 
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
+            reusable_executor: false,
+            host_process: false,
             port_mapping: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
@@ -1612,6 +1683,95 @@ mod tests {
         let logs = grill.logs(&id).await.unwrap();
         assert!(logs.contains("to-out"), "{logs:?}");
         assert!(logs.contains("to-err"), "{logs:?}");
+    }
+
+    #[test]
+    fn host_environment_keeps_the_allowlist_and_lets_the_workload_override_it() {
+        let inherited = [
+            ("PATH", "/usr/local/bin:/usr/bin"),
+            ("HOME", "/root"),
+            ("LC_ALL", "C.UTF-8"),
+            ("AWS_SECRET_ACCESS_KEY", "bun-only"),
+            ("RELIABURGER_JOIN_TOKEN", "bun-only"),
+        ]
+        .map(|(key, value)| (key.into(), value.into()));
+        let environment =
+            super::host_environment_from(inherited, &["PATH=/opt/job/bin".into(), "JOB=1".into()]);
+        assert_eq!(
+            environment.into_iter().collect::<Vec<_>>(),
+            [
+                ("HOME", "/root"),
+                ("JOB", "1"),
+                ("LC_ALL", "C.UTF-8"),
+                ("PATH", "/opt/job/bin"),
+            ]
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        );
+    }
+
+    /// One variable in this test process's environment that host commands
+    /// must not inherit (nextest sets `CARGO_*`, sudo sets `SUDO_*`).
+    pub(crate) fn private_variable() -> String {
+        std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .find(|key| !super::inherited_by_host_commands(key))
+            .expect("the test environment has a variable outside the allowlist")
+    }
+
+    #[tokio::test]
+    async fn exec_gets_the_workloads_environment_and_none_of_buns() {
+        use std::os::unix::fs::PermissionsExt;
+        let private = private_variable();
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("rb-exec-tool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf found\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", root.path().display());
+        let grill = ProcessGrill::new();
+        let id = InstanceId("exec-env-1".to_string());
+        let mut spec = sleep_spec("30");
+        spec.process.env = vec!["JOB=1".into(), format!("PATH={path}")];
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let env = grill.exec(&id, &["env".to_string()]).await.unwrap();
+        let resolved = grill.exec(&id, &["rb-exec-tool".to_string()]).await;
+        grill.kill(&id).await.unwrap();
+        assert!(env.lines().any(|line| line == "JOB=1"), "{env}");
+        assert!(
+            env.lines().any(|line| line == format!("PATH={path}")),
+            "{env}"
+        );
+        assert!(
+            !env.lines()
+                .any(|line| line.starts_with(&format!("{private}="))),
+            "{private} leaked: {env}"
+        );
+        assert_eq!(resolved.unwrap().trim(), "found");
+    }
+
+    #[tokio::test]
+    async fn host_commands_see_the_allowlisted_environment_only() {
+        let private = private_variable();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("env-1".to_string());
+        let mut spec = spec_with_args(vec!["env".to_string()]);
+        spec.process.env = vec!["JOB=1".into()];
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        let logs = grill.logs(&id).await.unwrap();
+        let path = std::env::var("PATH").unwrap();
+        assert!(
+            logs.lines().any(|line| line == format!("PATH={path}")),
+            "{logs}"
+        );
+        assert!(logs.lines().any(|line| line == "JOB=1"), "{logs}");
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.starts_with(&format!("{private}="))),
+            "{private} leaked: {logs}"
+        );
     }
 
     /// Read the first `count` lines `follow_logs` produces for `id`, as a

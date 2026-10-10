@@ -44,6 +44,51 @@ fn parse_endpoint(value: &str) -> Result<String, String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
+// Separating this parser keeps Clap's generated enum parser within the ordinary
+// Rust test-thread stack even as the scenario arguments grow.
+#[derive(clap::Args)]
+struct BenchOptions {
+    /// Timed job scenario instead of the ordinary suite (60s, concurrency 27).
+    #[arg(long, value_enum, conflicts_with_all = ["quick", "compare", "capacity", "disruptive", "yes"])]
+    scenario: Option<reliaburger::relish::bench_jobs::JobScenario>,
+    /// Measurement window for job scenarios; positive drain follows it.
+    #[arg(long, default_value_t = 60, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=86400))]
+    seconds: u32,
+    /// Per-node job cap, or local child cap for the VM baseline.
+    #[arg(long, default_value_t = 27, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=256))]
+    concurrency: u32,
+    /// Per-command CPU request in millicores; limit is one core, memory 32Mi.
+    #[arg(long, default_value_t = 25, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=1000))]
+    cpu_request: u32,
+    /// Digest-pinned BusyBox image for container job scenarios.
+    #[arg(long, default_value = reliaburger::relish::bench_jobs::DEFAULT_IMAGE, requires = "scenario")]
+    image: String,
+    /// BusyBox override: workers default to /bin/busybox; baseline extracts the pinned image.
+    #[arg(long, env = "RELIABURGER_BENCH_EXEC", requires = "scenario")]
+    exec: Option<PathBuf>,
+    /// Namespace for this benchmark's own job submission.
+    #[arg(long, default_value = "default", requires = "scenario")]
+    namespace: String,
+    /// Save strict JSON evidence without overwriting an existing file.
+    #[arg(long, env = "RELIABURGER_BENCH_REPORT", requires = "scenario")]
+    report: Option<PathBuf>,
+    /// Abbreviated suite for development and CI.
+    #[arg(long)]
+    quick: bool,
+    /// Compare with a previous JSON benchmark report.
+    #[arg(long)]
+    compare: Option<PathBuf>,
+    /// Deliberately schedule minimal workloads until the cluster is full.
+    #[arg(long, requires = "yes")]
+    capacity: bool,
+    /// Include the leader-failure reconstruction benchmark.
+    #[arg(long, requires = "yes")]
+    disruptive: bool,
+    /// Acknowledge capacity saturation and disruptive benchmark effects.
+    #[arg(long)]
+    yes: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Launch the interactive terminal UI.
@@ -404,6 +449,9 @@ enum Command {
         /// OCI image executed by the owned Linux runtime.
         #[arg(long, required_unless_present = "exec", conflicts_with = "exec")]
         image: Option<String>,
+        /// Job backend: runc (default), process (requires --exec), or shared-runc.
+        #[arg(long, value_enum, default_value_t = reliaburger::config::job::JobRuntime::Runc)]
+        runtime: reliaburger::config::job::JobRuntime,
         /// CPU request-limit range, such as 250m-500m.
         #[arg(long)]
         cpu: Option<String>,
@@ -601,23 +649,7 @@ enum Command {
         namespace: Option<String>,
     },
     /// Run reproducible performance benchmarks against the real data plane.
-    Bench {
-        /// Abbreviated suite for development and CI.
-        #[arg(long)]
-        quick: bool,
-        /// Compare with a previous JSON benchmark report.
-        #[arg(long)]
-        compare: Option<PathBuf>,
-        /// Deliberately schedule minimal workloads until the cluster is full.
-        #[arg(long, requires = "yes")]
-        capacity: bool,
-        /// Include the leader-failure reconstruction benchmark.
-        #[arg(long, requires = "yes")]
-        disruptive: bool,
-        /// Acknowledge capacity saturation and disruptive benchmark effects.
-        #[arg(long)]
-        yes: bool,
-    },
+    Bench(Box<BenchOptions>),
     /// Diagnose cluster health and correlate likely causes.
     Wtf {
         /// Scope application checks and log correlation to one app.
@@ -1926,6 +1958,7 @@ async fn main() -> ExitCode {
         },
         Command::Jobs { definitions } => commands::jobs(definitions, cli.output).await,
         Command::Run {
+            runtime,
             schedule,
             batch,
             count,
@@ -1943,6 +1976,7 @@ async fn main() -> ExitCode {
             args,
         } => {
             commands::run_task_array(commands::TaskArrayRun {
+                runtime,
                 schedule,
                 name: batch,
                 namespace,
@@ -2295,13 +2329,40 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
-        Command::Bench {
-            quick,
-            compare,
-            capacity,
-            disruptive,
-            yes,
-        } => {
+        Command::Bench(options) => {
+            let BenchOptions {
+                scenario,
+                seconds,
+                concurrency,
+                cpu_request,
+                image,
+                exec,
+                namespace,
+                report,
+                quick,
+                compare,
+                capacity,
+                disruptive,
+                yes,
+            } = *options;
+            if let Some(scenario) = scenario {
+                return finish_outcome(
+                    reliaburger::relish::bench_jobs::run(
+                        reliaburger::relish::bench_jobs::JobBenchArgs {
+                            scenario,
+                            seconds,
+                            concurrency,
+                            cpu_request,
+                            image,
+                            exec,
+                            namespace,
+                            report,
+                            output: cli.output,
+                        },
+                    )
+                    .await,
+                );
+            }
             return finish_outcome(
                 reliaburger::relish::bench_cmd::run(reliaburger::relish::bench_cmd::BenchArgs {
                     quick,
@@ -2859,16 +2920,79 @@ mod tests {
     }
 
     #[test]
+    fn job_bench_scenarios_have_usable_defaults_and_bounded_overrides() {
+        use reliaburger::relish::bench_jobs::JobScenario;
+        for (name, expected) in [
+            ("jobs-containers", JobScenario::Containers),
+            ("jobs-shared-containers", JobScenario::SharedContainers),
+            ("jobs-host-processes", JobScenario::HostProcesses),
+            ("jobs-vm-baseline", JobScenario::VmBaseline),
+        ] {
+            let cli = parse(&["relish", "bench", "--scenario", name]).unwrap();
+            let Command::Bench(options) = cli.command else {
+                panic!("expected bench");
+            };
+            assert!(matches!(*options, BenchOptions {
+                scenario: Some(scenario), seconds: 60, concurrency: 27,
+                cpu_request: 25, exec: None, ..
+            } if scenario == expected));
+        }
+        for args in [
+            vec!["--seconds", "0"],
+            vec!["--seconds", "86401"],
+            vec!["--concurrency", "0"],
+            vec!["--concurrency", "257"],
+            vec!["--cpu-request", "0"],
+            vec!["--cpu-request", "1001"],
+            vec!["--quick"],
+            vec!["--compare", "old.json"],
+            vec!["--capacity", "--yes"],
+            vec!["--disruptive", "--yes"],
+        ] {
+            let mut command = vec!["relish", "bench", "--scenario", "jobs-shared-containers"];
+            command.extend(args);
+            assert!(parse(&command).is_err(), "{command:?}");
+        }
+        assert!(parse(&["relish", "bench", "--seconds", "20"]).is_err());
+        let cli = parse(&[
+            "relish",
+            "bench",
+            "--scenario=jobs-shared-containers",
+            "--seconds",
+            "10",
+            "--concurrency",
+            "8",
+        ])
+        .unwrap();
+        let Command::Bench(options) = cli.command else {
+            panic!("expected bench");
+        };
+        assert!(matches!(
+            *options,
+            BenchOptions {
+                seconds: 10,
+                concurrency: 8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn parse_bench_command_defaults_and_explicit_risk_flags() {
         let bare = parse(&["relish", "bench"]).unwrap();
+        let Command::Bench(options) = bare.command else {
+            panic!("expected bench");
+        };
         assert!(matches!(
-            bare.command,
-            Command::Bench {
+            *options,
+            BenchOptions {
                 quick: false,
                 compare: None,
                 capacity: false,
                 disruptive: false,
                 yes: false,
+                scenario: None,
+                ..
             }
         ));
         assert!(parse(&["relish", "bench", "--capacity"]).is_err());
@@ -2885,14 +3009,19 @@ mod tests {
             "--yes",
         ])
         .unwrap();
+        let Command::Bench(options) = full.command else {
+            panic!("expected bench");
+        };
         assert!(matches!(
-            full.command,
-            Command::Bench {
+            *options,
+            BenchOptions {
                 quick: true,
                 compare: Some(ref path),
                 capacity: true,
                 disruptive: true,
                 yes: true,
+                scenario: None,
+                ..
             } if path == std::path::Path::new("base.json")
         ));
     }
@@ -4102,6 +4231,43 @@ mod tests {
         assert!(
             parse(&["relish", "run", "--count", "3", "--exec", "/bin/true"]).is_err(),
             "--batch is required"
+        );
+    }
+
+    #[test]
+    fn parse_run_container_isolation() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "many",
+            "--image",
+            "fixture",
+            "--runtime",
+            "shared-runc",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                runtime: reliaburger::config::job::JobRuntime::SharedRunc,
+                ..
+            }
+        ));
+        assert!(
+            parse(&[
+                "relish",
+                "run",
+                "--batch",
+                "many",
+                "--image",
+                "fixture",
+                "--runtime",
+                "unknown"
+            ])
+            .is_err()
         );
     }
 

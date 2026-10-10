@@ -78,6 +78,24 @@ impl Harness {
             cmd_rx,
             agent_shutdown,
         );
+        let process_policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: [
+                "/bin/sh",
+                "/bin/echo",
+                "/usr/bin/true",
+                "/bin/true",
+                "/usr/bin/false",
+                "/bin/false",
+                "/usr/bin/printf",
+                "/bin/sleep",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            mount_isolation: false,
+            ..Default::default()
+        };
+        agent.set_process_config(process_policy.clone());
         agent.set_node_capacity(8000, 16384);
         if let Some(directory) = options.records_dir {
             agent.set_records_dir(directory);
@@ -96,10 +114,7 @@ impl Harness {
         let node = reliaburger::bun::task_array_node::TaskArrayNode::new(
             reliaburger::bun::task_array_node::TaskArrayNodeConfig {
                 root: job_data.path().join("task-arrays"),
-                policy: reliaburger::config::process_workloads::ProcessWorkloadsConfig {
-                    mount_isolation: false,
-                    ..Default::default()
-                },
+                policy: process_policy,
                 default_concurrency: 8,
                 backoff: (Duration::from_millis(1), Duration::from_millis(5)),
                 group_commit: Default::default(),
@@ -562,7 +577,7 @@ async fn a_retired_worker_in_a_fresh_api_roster_never_receives_new_batch_work() 
     options.capacity_nodes = vec!["retired-worker".into()];
     let harness = Harness::start_with(options).await;
     let response = reqwest::Client::new().post(format!("{}/v1/batch",harness.base_url))
-        .json(&serde_json::json!({"jobs":[{"name":"retired-target","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}))
+        .json(&serde_json::json!({"jobs":[{"name":"retired-target","spec":{"runtime":"process","exec":"/usr/bin/true","command":[]}}]}))
         .send().await.unwrap();
     let status = response.status();
     let records = council.desired_state().await.batch_state.batches.len();
@@ -692,7 +707,7 @@ async fn simultaneous_api_admission_deduplicates_the_same_durable_batch_request(
         0,
         None,
     );
-    let body = serde_json::json!({"jobs":[{"name":"same-request","spec":{"image":"proc-grill:image-ignored","command":["true"]}}]}).to_string();
+    let body = serde_json::json!({"jobs":[{"name":"same-request","spec":{"runtime":"process","exec":"/usr/bin/true","command":[]}}]}).to_string();
     let request = || {
         Request::post("/v1/batch")
             .header("content-type", "application/json")
@@ -897,7 +912,7 @@ async fn owned_batch_retry_keeps_current_attempt_outcome_through_recovery() {
     let request = serde_json::json!({
         "batch_id": 99, "callback_base_url": callback_url,
         "jobs": [{"name": execution, "namespace": "team", "spec": {
-            "image": "proc-grill:image-ignored", "command": ["sh", "-c", command],
+            "runtime":"process","exec":"/bin/sh", "command": ["-c", command],
             "namespace": "team"
         }}],
         "execution_labels": {(execution): {"name": "migration", "namespace": "team"}}
@@ -1458,7 +1473,6 @@ async fn assert_clustered_runner_cannot_create_from_stale_or_foreign_ownership(m
     }
     if mode == "altered-spec" {
         spec.command = Some(vec![
-            "sh".into(),
             "-c".into(),
             format!("touch '{}'", changed_launches.display()),
         ]);
@@ -1550,11 +1564,10 @@ async fn internal_batch_dispatch_cannot_claim_an_ordinary_execution_identity() {
     // A batch-looking name remains ordinary when admitted through public apply.
     let execution = "batch-ordinary-execution";
     let mut config = Config::parse(&format!(
-        "[job.{execution}]\nimage='proc-grill:image-ignored'\n"
+        "[job.{execution}]\nruntime = \"process\"\nexec = \"/bin/sh\"\n"
     ))
     .unwrap();
     config.job.get_mut(execution).unwrap().command = Some(vec![
-        "sh".into(),
         "-c".into(),
         format!("printf 'launch\\n' >> '{}'", launches.display()),
     ]);
@@ -1776,7 +1789,7 @@ async fn an_uncertain_batch_checkpoint_refuses_dispatch_and_keeps_retries_fenced
         "batch_id": 99,
         "jobs": ([one, two].map(|execution| serde_json::json!({
             "name": execution, "namespace": "team", "spec": {
-                "image": "proc-grill:image-ignored", "command": ["sh", "-c", command], "namespace": "team"
+                "runtime":"process","exec":"/bin/sh", "command": ["-c", command], "namespace": "team"
             }
         }))),
         "execution_labels": {
@@ -1837,14 +1850,14 @@ async fn an_uncertain_batch_checkpoint_refuses_dispatch_and_keeps_retries_fenced
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn predictable_host_policy_refusal_keeps_the_whole_batch_unadmitted() {
     let mut invalid =
-        Config::parse("[job.invalid]\nnamespace='team'\nexec='/bin/echo'\ncommand=['rejected']\n")
+        Config::parse("[job.invalid]\nnamespace='team'\nruntime='process'\nexec='/unapproved/echo'\ncommand=['rejected']\n")
             .unwrap();
     predictable_policy_refusal_keeps_batch_unadmitted(invalid.job.remove("invalid").unwrap()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn predictable_process_limits_refusal_keeps_the_whole_batch_unadmitted() {
-    let mut invalid = Config::parse("[job.invalid]\nnamespace='team'\nimage='proc-grill:image-ignored'\ncommand=['true']\ncpu='100m'\n").unwrap();
+    let mut invalid = Config::parse("[job.invalid]\nnamespace='team'\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\ncpu='100m'\n").unwrap();
     predictable_policy_refusal_keeps_batch_unadmitted(invalid.job.remove("invalid").unwrap()).await;
 }
 
@@ -1862,8 +1875,8 @@ async fn predictable_policy_refusal_keeps_batch_unadmitted(
     let healthy = "batch-policy-healthy";
     let rejected = "batch-policy-invalid";
     let spec = serde_json::json!({
-        "image":"proc-grill:image-ignored", "namespace":"team",
-        "command":["sh", "-c", "printf healthy >> \"$1\"", "sh", launches]
+        "runtime":"process","exec":"/bin/sh", "namespace":"team",
+        "command":["-c", "printf healthy >> \"$1\"", "sh", launches]
     });
     let request = serde_json::json!({
         "batch_id":991,
@@ -1971,7 +1984,7 @@ async fn batch_log_rows_preserve_logical_scope_and_distinct_execution_ids() {
             .json(&serde_json::json!({
                 "batch_id": 99, "callback_base_url": null,
                 "jobs": [{"name": execution, "namespace": "team", "spec": {
-                    "image": "proc-grill:image-ignored", "command": ["sh", "-c", "echo logical-sentinel; sleep 5"], "namespace": "team"
+                    "runtime":"process","exec":"/bin/sh", "command": ["-c", "echo logical-sentinel; sleep 5"], "namespace": "team"
                 }}],
                 "execution_labels": {(execution): {"name": "migration", "namespace": "team"}}
             })).send().await.unwrap();
@@ -2024,7 +2037,7 @@ async fn committed_remote_ownership_cannot_relabel_a_local_ordinary_log_selector
         .0;
     // Exercise the remaining legacy node-local selector with an actual legacy
     // supervisor instance; common runs use run-ID and separate scoped selection.
-    let config = Config::parse(&format!("[job.{execution}]\nnamespace='team'\nimage='proc-grill:image-ignored'\ncommand=['sh','-c','echo ordinary-private-sentinel; sleep 10']")).unwrap();
+    let config = Config::parse(&format!("[job.{execution}]\nnamespace='team'\nruntime = \"process\"\nexec = \"/bin/sh\"\ncommand=['-c','echo ordinary-private-sentinel; sleep 10']")).unwrap();
     let (events, mut progress) = mpsc::channel(16);
     ordinary
         .cmd_tx
@@ -2298,7 +2311,7 @@ async fn batch_runner_status_and_logs_use_the_logical_scope_for_distinct_executi
             .json(&serde_json::json!({
                 "batch_id": 99, "callback_base_url": null,
                 "jobs": [{"name": execution, "namespace": "team", "spec": {
-                    "image": "proc-grill:image-ignored", "command": ["sh", "-c", "echo logical-sentinel; sleep 5"], "namespace": "team"
+                    "runtime":"process","exec":"/bin/sh", "command": ["-c", "echo logical-sentinel; sleep 5"], "namespace": "team"
                 }}],
                 "execution_labels": {(execution): {"name": "migration", "namespace": "team"}}
             })).send().await.unwrap();
@@ -2363,7 +2376,7 @@ async fn internal_batch_dispatch_refuses_missing_extra_invalid_or_cross_namespac
     ] {
         let mut body = serde_json::json!({
             "batch_id": 99, "callback_base_url": null,
-            "jobs": [{"name": "batch-111", "namespace": "team", "spec": {"image": "proc-grill:image-ignored", "command": ["true"], "namespace": "team"}}],
+            "jobs": [{"name": "batch-111", "namespace": "team", "spec": {"runtime":"process","exec":"/usr/bin/true", "command": [], "namespace": "team"}}],
         });
         if !labels.is_null() {
             body["execution_labels"] = labels;
@@ -2398,7 +2411,7 @@ async fn public_apply_cannot_supply_a_batch_execution_label() {
         let response = reqwest::Client::new()
             .post(format!("{}/v1/apply", harness.base_url))
             .body(format!(
-                "[job.batch-111]\nimage='proc-grill:image-ignored'\ncommand=['true']\n{field}\n"
+                "[job.batch-111]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\n{field}\n"
             ))
             .send()
             .await
@@ -2508,8 +2521,9 @@ async fn concurrent_batches_with_the_same_label_run_independent_jobs() {
     let harness = Harness::start().await;
     let jobs = jobs_from(
         r#"[job.shared]
-image = "proc-grill:image-ignored"
-command = ["sleep", "1"]
+runtime = "process"
+exec = "/bin/sleep"
+command = ["1"]
 "#,
     );
     let first = harness.client.submit_batch(&jobs).await.unwrap();
@@ -2532,7 +2546,7 @@ async fn a_maximum_length_batch_label_gets_a_valid_independent_execution_name() 
     let harness = Harness::start().await;
     let label = "m".repeat(63);
     let jobs = jobs_from(&format!(
-        "[job.{label}]\nimage='proc-grill:image-ignored'\ncommand=['true']\n"
+        "[job.{label}]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\n"
     ));
     let response = harness.client.submit_batch(&jobs).await.unwrap();
     let execution = response["executions"][&label]
@@ -2562,16 +2576,19 @@ async fn batch_of_proc_jobs_completes_locally() {
     let jobs = jobs_from(
         r#"
         [job.quick-1]
-        image = "proc-grill:image-ignored"
-        command = ["echo", "one"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = ["one"]
 
         [job.quick-2]
-        image = "proc-grill:image-ignored"
-        command = ["echo", "two"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = ["two"]
 
         [job.quick-3]
-        image = "proc-grill:image-ignored"
-        command = ["echo", "three"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = ["three"]
     "#,
     );
     let response = harness.client.submit_batch(&jobs).await.unwrap();
@@ -2597,8 +2614,9 @@ async fn batch_failing_job_reports_failed() {
     let jobs = jobs_from(
         r#"
         [job.doomed]
-        image = "proc-grill:image-ignored"
-        command = ["sh", "-c", "exit 1"]
+        runtime = "process"
+        exec = "/bin/sh"
+        command = ["-c", "exit 1"]
     "#,
     );
     let response = harness.client.submit_batch(&jobs).await.unwrap();
@@ -2631,9 +2649,10 @@ async fn batch_in_a_non_default_namespace_completes() {
     let jobs = jobs_from(
         r#"
         [job.spaced]
-        image = "proc-grill:image-ignored"
+        runtime = "process"
+        exec = "/bin/echo"
         namespace = "batchspace"
-        command = ["echo", "hi"]
+        command = ["hi"]
     "#,
     );
     let response = harness.client.submit_batch(&jobs).await.unwrap();
@@ -2654,9 +2673,9 @@ async fn conflicting_namespaces_are_rejected_at_submit() {
                 "name": "torn",
                 "namespace": "one",
                 "spec": {
-                    "image": "proc-grill:image-ignored",
+                    "runtime":"process","exec":"/bin/echo",
                     "namespace": "two",
-                    "command": ["echo", "hi"],
+                    "command": ["hi"],
                 },
             }],
         }))
@@ -2679,13 +2698,13 @@ async fn unschedulable_jobs_appear_in_the_batch() {
             "jobs": [
                 {
                     "name": "modest",
-                    "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "ok"] },
+                    "spec": { "runtime":"process","exec":"/bin/echo", "command": ["ok"] },
                 },
                 {
                     "name": "greedy",
                     "spec": {
-                        "image": "proc-grill:image-ignored",
-                        "command": ["echo", "never"],
+                        "runtime":"process","exec":"/bin/echo",
+                        "command": ["never"],
                         // More millicores than the fallback capacity
                         // (u64::MAX / 2) can ever satisfy.
                         "cpu": "9999999999999999999m",
@@ -2739,7 +2758,7 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
         "execution_labels": {"remote-1": {"name": "remote-1", "namespace": "default"}},
         "jobs": [{
             "name": "remote-1",
-            "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "remote"] },
+            "spec": { "runtime":"process","exec":"/bin/echo", "command": ["remote"] },
         }],
     });
     let response = http
@@ -2791,8 +2810,9 @@ async fn legacy_callbacks_cannot_forge_or_change_common_run_outcomes() {
     let jobs = jobs_from(
         r#"
         [job.steady]
-        image = "proc-grill:image-ignored"
-        command = ["echo", "hi"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = ["hi"]
     "#,
     );
     let response = harness.client.submit_batch(&jobs).await.unwrap();
@@ -2858,7 +2878,7 @@ async fn batch_internal_endpoints_require_the_system_principal() {
         "execution_labels": {"x": {"name": "x", "namespace": "default"}},
         "jobs": [{
             "name": "x",
-            "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "x"] },
+            "spec": { "runtime":"process","exec":"/bin/echo", "command": ["x"] },
         }],
     });
 
@@ -2901,8 +2921,9 @@ async fn cli_batch_wait_times_out_with_the_last_known_state() {
     let jobs = jobs_from(
         r#"
         [job.slowpoke]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "300"]
+        runtime = "process"
+        exec = "/bin/sleep"
+        command = ["300"]
     "#,
     );
     let response = harness.client.submit_batch(&jobs).await.unwrap();
@@ -2935,8 +2956,9 @@ async fn batch_ids_stay_monotonic_across_an_api_restart() {
     let jobs = jobs_from(
         r#"
         [job.first]
-        image = "proc-grill:image-ignored"
-        command = ["echo", "one"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = ["one"]
     "#,
     );
     let response = first.client.submit_batch(&jobs).await.unwrap();
@@ -3016,8 +3038,9 @@ async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
     let jobs = jobs_from(
         r#"
         [job.faraway]
-        image = "proc-grill:image-ignored"
-        command = ["echo", "far"]
+        runtime = "process"
+        exec = "/bin/echo"
+        command = ["far"]
     "#,
     );
     let response = leader.client.submit_batch(&jobs).await.unwrap();
@@ -3095,7 +3118,7 @@ async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
         "execution_labels": {"orphan": {"name": "orphan", "namespace": "default"}},
         "jobs": [{
             "name": "orphan",
-            "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "orphan"] },
+            "spec": { "runtime":"process","exec":"/bin/echo", "command": ["orphan"] },
         }],
     });
     let accepted = http
@@ -3207,7 +3230,7 @@ async fn assert_batch_follow_selects_committed_owner(
 
     let local = matches!(unavailable, Some("local-empty" | "local-capture"));
     let local_capture = unavailable == Some("local-capture");
-    let local_spec = Config::parse("[job.migration]\nimage='proc-grill:image-ignored'\nnamespace='team'\ncommand=['echo','worker-local-capture-sentinel']\n")
+    let local_spec = Config::parse("[job.migration]\nruntime = \"process\"\nexec = \"/bin/echo\"\nnamespace='team'\ncommand=['worker-local-capture-sentinel']\n")
         .unwrap().job.remove("migration").unwrap();
     use sha2::{Digest, Sha256};
     let digest = format!(
@@ -3618,8 +3641,8 @@ async fn assert_cluster_prerequisite_gate(exit_code: i32, overlap: bool) {
         started.display(),
         release.display()
     );
-    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n").unwrap();
-    config.job.get_mut("migrate").unwrap().command = Some(vec!["sh".into(), "-c".into(), command]);
+    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nruntime = \"process\"\nexec = \"/bin/sh\"\nrun_before=['app.api']\n").unwrap();
+    config.job.get_mut("migrate").unwrap().command = Some(vec!["-c".into(), command]);
     let client = harness.client.clone();
     let apply = tokio::spawn(async move { client.apply(&config).await });
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -3775,9 +3798,8 @@ async fn follower_forwarding_cannot_bypass_a_failed_cluster_prerequisite() {
     let scratch = tempfile::tempdir().unwrap();
     let started = scratch.path().join("started");
     let release = scratch.path().join("release");
-    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n").unwrap();
+    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nruntime = \"process\"\nexec = \"/bin/sh\"\nrun_before=['app.api']\n").unwrap();
     config.job.get_mut("migrate").unwrap().command = Some(vec![
-        "sh".into(),
         "-c".into(),
         format!(
             "touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; exit 1",
@@ -3886,9 +3908,8 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
     let attempts = scratch.path().join("attempts");
     let release = scratch.path().join("release");
     let replacement = scratch.path().join("replacement");
-    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n").unwrap();
+    let mut config = Config::parse("[app.api]\nimage='new'\n[job.migrate]\nruntime = \"process\"\nexec = \"/bin/sh\"\nrun_before=['app.api']\n").unwrap();
     config.job.get_mut("migrate").unwrap().command = Some(vec![
-        "sh".into(),
         "-c".into(),
         format!(
             "printf 'attempt\\n' >> '{}'; touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; exit 0",
@@ -3926,7 +3947,6 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
     .await;
     if mode == "spec" {
         config.job.get_mut("migrate").unwrap().command = Some(vec![
-            "sh".into(),
             "-c".into(),
             format!("touch '{}'; exit 0", replacement.display()),
         ]);
@@ -3935,7 +3955,6 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
         let job = config.job.get_mut("migrate").unwrap();
         job.run_before.clear();
         job.command = Some(vec![
-            "sh".into(),
             "-c".into(),
             format!("touch '{}'; exit 0", replacement.display()),
         ]);
@@ -4028,9 +4047,9 @@ async fn invalid_cluster_prerequisites_are_refused_before_any_app_commit() {
     .await;
     let http = reqwest::Client::new();
     for body in [
-        "[job.migrate]\nimage='proc-grill:image-ignored'\ncommand=['true']\nrun_before=['app.absent']\n",
-        "[app.web]\nimage='proc-grill:image-ignored'\nnamespace='production'\n[job.migrate]\nimage='proc-grill:image-ignored'\ncommand=['true']\nnamespace='other'\nrun_before=['app.web']\n",
-        "[app.web]\nimage='proc-grill:image-ignored'\n[job.migrate]\nimage='proc-grill:image-ignored'\ncommand=['true']\nrun_before=['job.web']\n",
+        "[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['app.absent']\n",
+        "[app.web]\nimage='proc-grill:image-ignored'\nnamespace='production'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nnamespace='other'\nrun_before=['app.web']\n",
+        "[app.web]\nimage='proc-grill:image-ignored'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['job.web']\n",
     ] {
         let response = http
             .post(format!("{}/v1/apply", harness.base_url))
@@ -4079,11 +4098,10 @@ async fn a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_
     })
     .await;
     let mut config = Config::parse(
-        "[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n",
+        "[app.api]\nimage='new'\n[job.migrate]\nruntime = \"process\"\nexec = \"/bin/sh\"\nrun_before=['app.api']\n",
     )
     .unwrap();
     config.job.get_mut("migrate").unwrap().command = Some(vec![
-        "sh".into(),
         "-c".into(),
         format!("printf 'failed\\n' >> '{}'; exit 1", attempts.display()),
     ]);
@@ -4143,7 +4161,6 @@ async fn a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_
         1
     );
     config.job.get_mut("migrate").unwrap().command = Some(vec![
-        "sh".into(),
         "-c".into(),
         format!("printf 'corrected\\n' >> '{}'; exit 0", attempts.display()),
     ]);
@@ -4240,10 +4257,10 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
         finished.display()
     );
     let mut config = Config::parse(
-        "[app.api]\nimage='new'\n[job.migrate]\nimage='proc-grill:image-ignored'\nrun_before=['app.api']\n",
+        "[app.api]\nimage='new'\n[job.migrate]\nruntime = \"process\"\nexec = \"/bin/sh\"\nrun_before=['app.api']\n",
     )
     .unwrap();
-    config.job.get_mut("migrate").unwrap().command = Some(vec!["sh".into(), "-c".into(), command]);
+    config.job.get_mut("migrate").unwrap().command = Some(vec!["-c".into(), command]);
     let client = harness.client.clone();
     let apply = tokio::spawn(async move { client.apply(&config).await });
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -4391,7 +4408,7 @@ async fn common_run_logs_keep_the_logical_scope_and_select_the_stable_run() {
     })
     .await;
     let jobs = jobs_from(
-        "[job.migration]\nimage='proc-grill:image-ignored'\ncommand=['sh','-c','echo selected-output']\nnamespace='team'",
+        "[job.migration]\nruntime = \"process\"\nexec = \"/bin/sh\"\ncommand=['-c','echo selected-output']\nnamespace='team'",
     );
     let response = harness.client.submit_batch(&jobs).await.unwrap();
     let run = response["executions"]["migration"].as_str().unwrap();
@@ -4458,7 +4475,7 @@ async fn common_jobs_execute_with_worker_evidence_independent_of_global_capacity
         let response = harness
             .client
             .submit_batch(&jobs_from(
-                "[job.worker-proof]\nimage='proc-grill:image-ignored'\ncommand=['/usr/bin/true']",
+                "[job.worker-proof]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]",
             ))
             .await
             .unwrap();

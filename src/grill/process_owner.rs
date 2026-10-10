@@ -425,6 +425,7 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
     }
     let error = Command::new(&record.command[0])
         .args(&record.command[1..])
+        .env_clear()
         .envs(&record.environment)
         .stdin(Stdio::null())
         .exec();
@@ -756,6 +757,8 @@ mod tests {
             launch: ProcessLaunch {
                 instance_id: super::super::InstanceId("default__web-0".into()),
                 spec: OciSpec {
+                    reusable_executor: false,
+                    host_process: false,
                     root: OciRoot {
                         path: "/".into(),
                         readonly: false,

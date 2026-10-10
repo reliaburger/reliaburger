@@ -84,7 +84,7 @@ impl ProcessControl {
         let launch = &record.launch;
         if launch.instance_id != *id
             || record.command != command(&launch.spec)
-            || record.environment != environment(&launch.spec)
+            || !recorded_environment_matches(&launch.spec, &record.environment)
         {
             return Err(io::Error::other(
                 "process intent conflicts with instance or command",
@@ -322,53 +322,73 @@ impl ProcessControl {
         self.run(id, |this, id| this.load(&id)).await
     }
 
-    pub(crate) async fn status(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
+    /// Absence is only an unpublished directory, never a missing journal or socket.
+    pub(crate) async fn status_if_present(
+        &self,
+        id: &InstanceId,
+    ) -> io::Result<Option<OwnerRecord>> {
         self.run(id, |this, id| {
-            let mut attempt = 1;
-            loop {
-                let record = this.finish_retirement(&id)?;
-                if !matches!(record.phase, OwnerPhase::Running { .. }) {
-                    return Ok(record);
+            let directory = this.directory(&id)?;
+            for path in [&this.root, &directory] {
+                match validate_directory(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error),
                 }
-                let result = request(&record, "status");
-                // The owner may commit completion and remove its socket between
-                // reading the record and connecting. Re-read that positive proof.
-                let current = this.finish_retirement(&id)?;
-                if current.nonce != record.nonce {
-                    return Err(io::Error::other(
-                        "process generation changed during inspection",
-                    ));
-                }
-                if matches!(current.phase, OwnerPhase::Retired { .. }) {
-                    return Ok(current);
-                }
-                // finish_retirement just failed to take the owner lock, so the
-                // owner is alive. A dropped connection only means it closed
-                // this client, never that the workload is gone: ask again.
-                let response = match result {
-                    Err(error) if dropped_connection(&error) && attempt < OWNER_REQUEST_ATTEMPTS => {
-                        attempt += 1;
-                        std::thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
-                    result => result?,
-                };
-                let phase: OwnerPhase = serde_json::from_value(
-                    response
-                        .get("phase")
-                        .cloned()
-                        .ok_or_else(|| io::Error::other("owner returned no phase"))?,
-                )?;
-                if !matches!((phase, &record.phase), (OwnerPhase::Running { pid: live }, OwnerPhase::Running { pid: recorded }) if live == *recorded)
-                {
-                    return Err(io::Error::other(
-                        "owner returned conflicting process identity",
-                    ));
-                }
-                return Ok(current);
             }
+            this.inspect_status(&id).map(Some)
         })
         .await
+    }
+
+    pub(crate) async fn status(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
+        self.run(id, |this, id| this.inspect_status(&id)).await
+    }
+
+    fn inspect_status(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
+        let mut attempt = 1;
+        loop {
+            let record = self.finish_retirement(id)?;
+            if !matches!(record.phase, OwnerPhase::Running { .. }) {
+                return Ok(record);
+            }
+            let result = request(&record, "status");
+            // The owner may commit completion and remove its socket between
+            // reading the record and connecting. Re-read that positive proof.
+            let current = self.finish_retirement(id)?;
+            if current.nonce != record.nonce {
+                return Err(io::Error::other(
+                    "process generation changed during inspection",
+                ));
+            }
+            if matches!(current.phase, OwnerPhase::Retired { .. }) {
+                return Ok(current);
+            }
+            // finish_retirement just failed to take the owner lock, so the
+            // owner is alive. A dropped connection only means it closed
+            // this client, never that the workload is gone: ask again.
+            let response = match result {
+                Err(error) if dropped_connection(&error) && attempt < OWNER_REQUEST_ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                result => result?,
+            };
+            let phase: OwnerPhase = serde_json::from_value(
+                response
+                    .get("phase")
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("owner returned no phase"))?,
+            )?;
+            if !matches!((phase, &record.phase), (OwnerPhase::Running { pid: live }, OwnerPhase::Running { pid: recorded }) if live == *recorded)
+            {
+                return Err(io::Error::other(
+                    "owner returned conflicting process identity",
+                ));
+            }
+            return Ok(current);
+        }
     }
 
     pub(crate) async fn signal(&self, id: &InstanceId, force: bool) -> io::Result<()> {
@@ -559,13 +579,31 @@ fn command(spec: &OciSpec) -> Vec<String> {
     }
 }
 
+/// Recorded in full so the exec gate needs nothing from its own environment,
+/// which it inherits from whichever Bun started the owner.
 fn environment(spec: &OciSpec) -> std::collections::BTreeMap<String, String> {
-    spec.process
+    super::process::host_environment(&spec.process.env)
+}
+
+/// Inherited defaults belong to the preparing Bun, not the recovering caller.
+/// The private record supplies that snapshot; workload overrides must still
+/// match exactly, and unrequested private variables must never be inherited.
+fn recorded_environment_matches(
+    spec: &OciSpec,
+    recorded: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let explicit: std::collections::BTreeMap<&str, &str> = spec
+        .process
         .env
         .iter()
-        .filter_map(|value| value.split_once('='))
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
+        .filter_map(|entry| entry.split_once('='))
+        .collect();
+    explicit
+        .iter()
+        .all(|(key, value)| recorded.get(*key).map(String::as_str) == Some(*value))
+        && recorded.keys().all(|key| {
+            explicit.contains_key(key.as_str()) || super::process::inherited_by_host_commands(key)
+        })
 }
 
 fn create_parent_directories(path: &Path) -> io::Result<()> {
@@ -765,6 +803,8 @@ mod tests {
     fn spec() -> OciSpec {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
+            reusable_executor: false,
+            host_process: false,
             root: OciRoot {
                 path: "/".into(),
                 readonly: false,
@@ -787,6 +827,79 @@ mod tests {
                 gid_mappings: None,
             },
             port_mapping: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_records_the_complete_host_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), "/unused".into());
+        let id = InstanceId("env-0".into());
+        let mut spec = spec();
+        spec.process.env = vec!["JOB=1".into()];
+        control.prepare(&id, &spec).await.unwrap();
+        let environment = control.load(&id).unwrap().environment;
+        assert_eq!(environment.get("JOB").map(String::as_str), Some("1"));
+        assert_eq!(environment.get("PATH"), std::env::var("PATH").ok().as_ref());
+        assert!(
+            environment
+                .keys()
+                .all(|key| key == "JOB" || super::super::process::inherited_by_host_commands(key)),
+            "{environment:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_recovery_preserves_inherited_environment_from_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), "/unused".into());
+        let id = InstanceId("saved-env-0".into());
+        let mut spec = spec();
+        spec.process.env = vec!["JOB=1".into()];
+        control.prepare(&id, &spec).await.unwrap();
+        let directory = control.directory(&id).unwrap();
+        let mut record = process_owner::load(&directory).unwrap();
+        // Model an owner prepared by another Bun, without changing global env.
+        record
+            .environment
+            .insert("PATH".into(), "/original-bun/bin".into());
+        record.environment.remove("HOME");
+        record
+            .environment
+            .insert("LC_SAVED".into(), "original".into());
+        process_owner::persist(&directory, &record).unwrap();
+        assert_eq!(control.load(&id).unwrap().environment, record.environment);
+        assert_eq!(control.inventory().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_recovery_rejects_conflicting_explicit_or_private_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), "/unused".into());
+        let id = InstanceId("invalid-env-0".into());
+        let mut spec = spec();
+        spec.process.env = vec!["JOB=old".into(), "JOB=1".into(), "PATH=/work/bin".into()];
+        control.prepare(&id, &spec).await.unwrap();
+        let directory = control.directory(&id).unwrap();
+        let record = process_owner::load(&directory).unwrap();
+        assert_eq!(
+            control.load(&id).unwrap().environment.get("JOB").unwrap(),
+            "1"
+        );
+        for (key, value) in [
+            ("JOB", Some("wrong")),
+            ("JOB", None),
+            ("PATH", Some("/other/bin")),
+            ("RELIABURGER_PRIVATE_SECRET", Some("private")),
+        ] {
+            let mut invalid = record.clone();
+            if let Some(value) = value {
+                invalid.environment.insert(key.into(), value.into());
+            } else {
+                invalid.environment.remove(key);
+            }
+            process_owner::persist(&directory, &invalid).unwrap();
+            assert!(control.load(&id).is_err(), "accepted invalid {key}");
         }
     }
 
@@ -867,6 +980,37 @@ mod tests {
             }
         }
         assert_eq!(still_held, 0, "operation locks still held after drop");
+    }
+
+    #[tokio::test]
+    async fn optional_status_distinguishes_absent_directories_from_broken_records() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__absent-0".into());
+        assert!(control.status_if_present(&id).await.unwrap().is_none());
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&control.root)
+            .unwrap();
+        assert!(control.status_if_present(&id).await.unwrap().is_none());
+        let directory = control.directory(&id).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        assert!(control.status_if_present(&id).await.is_err());
+        std::fs::write(directory.join("owner.json"), b"broken").unwrap();
+        assert!(control.status_if_present(&id).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn optional_status_does_not_treat_a_missing_live_socket_as_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__missing-socket-0".into());
+        let owner = ImpatientOwner::start(&control, &id, 0).await;
+        std::fs::remove_dir_all(&owner.socket_directory).unwrap();
+        assert!(control.status_if_present(&id).await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

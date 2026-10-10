@@ -13,6 +13,8 @@ fn runtime(directory: &Path) -> ProcessGrill {
 
 fn spec(script: &str) -> OciSpec {
     OciSpec {
+        reusable_executor: false,
+        host_process: false,
         root: OciRoot {
             path: "/".into(),
             readonly: false,
@@ -1315,4 +1317,61 @@ async fn exec_owner_can_launch_after_its_binary_has_been_unlinked() {
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
     assert_eq!(result.unwrap(), "mapped-image\n");
+}
+
+/// A variable in this test process that host commands must not inherit
+/// (nextest sets `CARGO_*`).
+fn private_variable() -> String {
+    std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .find(|key| !reliaburger::grill::process::inherited_by_host_commands(key))
+        .expect("the test environment has a variable outside the allowlist")
+}
+
+/// A directory holding an executable `rb-exec-tool` that prints `found`.
+fn tool_directory(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = root.join("tools");
+    std::fs::create_dir(&directory).unwrap();
+    let tool = directory.join("rb-exec-tool");
+    std::fs::write(&tool, "#!/bin/sh\nprintf found\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    directory
+}
+
+#[tokio::test]
+async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__exec-env-0".into());
+    let tools = tool_directory(directory.path());
+    let mut workload = spec("sleep 60");
+    workload.process.env = vec![
+        "JOB=1".into(),
+        format!("PATH={}:/usr/bin:/bin", tools.display()),
+    ];
+    grill.create(&id, &workload).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let env = grill.exec(&id, &["/usr/bin/env".into()]).await;
+    let resolved = grill.exec(&id, &["rb-exec-tool".into()]).await;
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    let env = env.unwrap();
+    let lines: Vec<&str> = env.lines().collect();
+    assert!(lines.contains(&"JOB=1"), "{env}");
+    assert!(
+        lines.contains(&format!("PATH={}:/usr/bin:/bin", tools.display()).as_str()),
+        "{env}"
+    );
+    if let Ok(home) = std::env::var("HOME") {
+        assert!(lines.contains(&format!("HOME={home}").as_str()), "{env}");
+    }
+    let private = private_variable();
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with(&format!("{private}="))),
+        "{private} leaked: {env}"
+    );
+    assert_eq!(resolved.unwrap(), "found");
 }

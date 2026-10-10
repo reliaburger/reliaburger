@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:9117")]
     listen: String,
 
-    /// Runtime to use: auto, process, runc (Linux).
+    /// Runtime to use: auto, process, runc or mixed (Linux).
     #[arg(long, default_value = "auto")]
     runtime: String,
 
@@ -765,11 +765,33 @@ fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg);
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    limit_malloc_arenas();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("failed to construct Tokio runtime: {error}"))?;
     runtime.block_on(run_agent(cli))
+}
+
+/// Cap glibc's malloc arenas before the runtime starts its threads.
+///
+/// glibc hands busy threads their own arena (up to eight per core) and keeps
+/// freed memory in each one. On a busy job node that held Bun's resident
+/// memory at 600 to 770 MiB, while live data was under 200 MiB: with two
+/// arenas, the same five-minute host-job run ended at about 190 MiB and ran
+/// as many jobs. An operator's own `MALLOC_ARENA_MAX` still wins.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // SAFETY: mallopt only tunes the allocator, and runs here before Bun
+    // starts any other thread. A value glibc rejects is reported by the return
+    // value, which we can ignore: the default arenas simply stay in place.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
 }
 
 /// Resolve the configured `cluster.join` seeds to socket addresses.
@@ -1034,6 +1056,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             (true, false)
         }
         AnyGrill::Runc(_) => (config.ebpf.enabled, config.ebpf.enabled),
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(runtime) if runtime.container().is_rootless() => {
+            if cli.cluster {
+                anyhow::bail!(
+                    "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
+                     or use rootful Linux Runc with eBPF for a container cluster \
+                     (relish setup --quickstart provisions a managed Linux VM on macOS)"
+                );
+            }
+            (true, false)
+        }
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(_) => (config.ebpf.enabled, config.ebpf.enabled),
         _ => (false, false),
     };
     #[cfg(not(target_os = "linux"))]
@@ -1056,6 +1091,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         AnyGrill::Process(_) => "process",
         #[cfg(target_os = "linux")]
         AnyGrill::Runc(_) => "runc",
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(_) => "runc+process",
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
@@ -2690,7 +2727,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .is_some(),
         // Host execution is deny-by-default: an empty allowlist refuses
         // every process workload.
-        process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
+        process_workloads: host_workloads_enabled(runtime_kind, &config.process_workloads),
         // CPU/memory/disk faults need writable cgroup v2 control files.
         cgroup_faults: {
             #[cfg(target_os = "linux")]
@@ -3474,17 +3511,18 @@ async fn select_runtime(
                     std::env::current_exe()?,
                 )),
                 #[cfg(target_os = "linux")]
-                DetectedRuntime::Runc { rootless } => AnyGrill::Runc(create_runc_runtime(
+                DetectedRuntime::Runc { rootless } => AnyGrill::with_host_processes(
+                    create_runc_runtime(instances_dir, image_directory, rootless, mirrors)?,
                     instances_dir,
-                    image_directory,
-                    rootless,
-                    mirrors,
-                )?),
+                    std::env::current_exe()?,
+                ),
             };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
                 #[cfg(target_os = "linux")]
                 AnyGrill::Runc(_) => "runc",
+                #[cfg(target_os = "linux")]
+                AnyGrill::Mixed(_) => "runc+process",
                 #[cfg(target_os = "macos")]
                 AnyGrill::Apple(_) => "apple-container",
             };
@@ -3499,13 +3537,20 @@ async fn select_runtime(
             )))
         }
         #[cfg(target_os = "linux")]
-        "runc" => {
+        "runc" | "mixed" => {
             let is_rootless = reliaburger::grill::rootless::is_rootless();
             let mode = if is_rootless { "rootless" } else { "root" };
-            println!("bun: using runc runtime ({mode})");
-
+            println!("bun: using {name} runtime ({mode})");
             let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
-            Ok(AnyGrill::Runc(grill))
+            if name == "mixed" {
+                Ok(AnyGrill::with_host_processes(
+                    grill,
+                    instances_dir,
+                    std::env::current_exe()?,
+                ))
+            } else {
+                Ok(AnyGrill::Runc(grill))
+            }
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
         other => anyhow::bail!("unknown runtime: {other}"),
@@ -3532,10 +3577,17 @@ fn create_runc_runtime(
     )?)
 }
 
+fn host_workloads_enabled(
+    runtime: &str,
+    policy: &reliaburger::config::process_workloads::ProcessWorkloadsConfig,
+) -> bool {
+    matches!(runtime, "process" | "runc+process") && !policy.allowed_binaries.is_empty()
+}
+
 async fn runtime_version(runtime: &str) -> Option<String> {
     match runtime {
         "process" => Some(env!("CARGO_PKG_VERSION").to_string()),
-        "runc" => bounded_version_command("runc", &["--version"]).await,
+        "runc" | "runc+process" => bounded_version_command("runc", &["--version"]).await,
         "apple" => bounded_version_command("container", &["--version"]).await,
         _ => None,
     }
@@ -3596,7 +3648,7 @@ async fn prepare_dns_runtime(
 
     let (runtime, nameserver, freebind) = configure_workload_dns(runtime, config.listen_addr)?;
     #[cfg(target_os = "linux")]
-    if let AnyGrill::Runc(grill) = &runtime {
+    if let Some(grill) = runtime.runc_runtime() {
         config.source_namespaces = grill.dns_source_namespaces();
     }
     if config.listen_addr.ip().is_unspecified() {
@@ -3636,6 +3688,18 @@ fn configure_workload_dns(
     use std::net::IpAddr;
 
     match runtime {
+        AnyGrill::Mixed(grill) => {
+            let (configured, nameserver, freebind) =
+                configure_workload_dns(AnyGrill::Runc(grill.container().clone()), listen_addr)?;
+            let AnyGrill::Runc(container) = configured else {
+                anyhow::bail!("DNS changed the selected container backend");
+            };
+            Ok((
+                AnyGrill::Mixed(grill.with_container(container)),
+                nameserver,
+                freebind,
+            ))
+        }
         AnyGrill::Runc(grill) => {
             let Some(gateway) = grill.dns_gateway_address() else {
                 anyhow::bail!(
@@ -3731,6 +3795,36 @@ mod tests {
         assert!(message.contains("0.1.0"), "{message}");
         assert!(message.contains("managed Linux VM"), "{message}");
         assert!(message.contains("relish setup --quickstart"), "{message}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn explicit_runc_disables_host_execution_and_mixed_enables_both() {
+        use reliaburger::grill::{Grill, records::RuntimeKind};
+        let root = tempfile::tempdir().unwrap();
+        for (mode, host) in [("runc", false), ("mixed", true)] {
+            let runtime = select_runtime(
+                mode,
+                &root.path().join(mode),
+                &root.path().join("images"),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                runtime.supports_runtime(RuntimeKind::Process),
+                host,
+                "{mode}"
+            );
+            assert!(runtime.supports_runtime(RuntimeKind::Runc));
+            let policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/true".into()],
+                ..Default::default()
+            };
+            let name = if host { "runc+process" } else { "runc" };
+            assert_eq!(host_workloads_enabled(name, &policy), host);
+            assert!(!host_workloads_enabled(name, &Default::default()));
+        }
     }
 
     #[cfg(target_os = "linux")]

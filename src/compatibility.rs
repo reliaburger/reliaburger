@@ -77,9 +77,13 @@ pub struct Compatibility {
 /// ownership ranges, duration buckets and indexed result pages (47/64).
 /// Reusable job definitions, immutable run provenance and atomic schedule
 /// occurrence claims in the common execution store (48/65, #638).
+/// Explicit per-job runtimes replacing inferred execution and container
+/// isolation (50/67, #639). The decaying recent-duration histogram that grant
+/// lookahead learns from (`TaskArrayState::recent_duration_counts`), which
+/// travels in Raft snapshots as well as on disk (51/68).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 48,
-    state: 65,
+    protocol: 51,
+    state: 68,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -313,6 +317,26 @@ mod tests {
             ensure_state_compatible(directory.path()),
             Err(CompatibilityError::StateMismatch { found, expected, .. })
                 if found == BEFORE_TASK_ARRAYS.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
+    }
+
+    #[test]
+    fn peers_and_state_from_before_the_decaying_histogram_are_refused() {
+        // #654's head wrote task-array snapshots without the recent histogram.
+        const BEFORE_RECENT_DURATIONS: Compatibility = Compatibility {
+            protocol: 50,
+            state: 67,
+        };
+        assert!(BEFORE_RECENT_DURATIONS.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_RECENT_DURATIONS.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_RECENT_DURATIONS.state && expected == CURRENT.state
         ));
         assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }

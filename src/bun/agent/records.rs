@@ -63,7 +63,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .get_instance(instance_id)
             .ok_or_else(|| fail("instance is missing"))?;
-        let runtime = self.supervisor.grill().runtime_kind();
+        let runtime = self.supervisor.grill().runtime_kind_for_host(
+            instance
+                .oci_spec
+                .as_ref()
+                .is_some_and(|spec| spec.host_process),
+        );
         // Apple workloads live in VMs. Record the launcher for provenance;
         // Apple adoption checks the named container, never this host PID.
         let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
@@ -139,7 +144,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             app_name: instance.app_name.clone(),
             reason,
         };
-        let runtime = self.supervisor.grill().runtime_kind();
+        let runtime = self.supervisor.grill().runtime_kind_for(&instance.oci_spec);
         let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
             Some(std::process::id())
         } else {
@@ -338,7 +343,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.retired_batch_executions = inventory.retired;
         self.require_discovery_recovery(!records.is_empty(), false)?;
         for job in jobs.values() {
-            if job.runtime != self.supervisor.grill().runtime_kind() {
+            if job.runtime
+                != self
+                    .supervisor
+                    .grill()
+                    .runtime_kind_for_host(job.spec.is_host())
+            {
                 return Err(BunError::AdoptionState(
                     "job attempt belongs to another runtime".into(),
                 ));
@@ -396,7 +406,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     record.instance_id,
                 )));
             }
-            if record.runtime != self.supervisor.grill().runtime_kind() {
+            if record.runtime != self.supervisor.grill().runtime_kind_for(&record.oci_spec) {
                 return Err(BunError::AdoptionState(format!(
                     "instance {} belongs to {:?}, but the selected runtime is {:?}",
                     record.instance_id,

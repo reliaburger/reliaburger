@@ -505,6 +505,19 @@ the real `curl … | sh` install against it on every host we advertise.
    runs found for 0.1.0, candidate by candidate, and the PR that fixed each
    failure.
 
+   The [job-soak extension plan](plans/2026-10-10-plan-release-job-soak.md)
+   runs fresh-container, shared-container and native host work alongside these
+   apps and faults. Accounting, independent effects, heartbeat/progress, exact
+   owner inventory, fault coverage and positive cleanup affect the verdict.
+   A six-run campaign uses a 2/3/3 per-node command budget, with separate finite
+   cron/hooks/publication fixtures. It opts the disposable nodes into mixed
+   runtime and allowlists a host BusyBox copy from the pinned container image.
+   The verifier binds each private VM address on TCP 8189 with a separate token.
+   Drain begins inside the final two minutes; tier and recovery budgets stay
+   unchanged. Missing support or incomplete coverage fails instead of skipping
+   a mode. A local smoke check is not staged fast/final acceptance, and global
+   storage bounds and the 24-hour job qualification remain #668.
+
    Either tier also fails on a slow agent loop. Every settle and heavy check
    reads each node's `bun_agent_loop_turn_seconds` histogram from
    `/v1/metrics`, and the checker fails the tier (`agent-loop-turn`) on any

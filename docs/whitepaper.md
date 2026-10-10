@@ -793,7 +793,9 @@ What the current binary actually enforces is a policy layer, not a sandbox:
 - **Deny-by-default binary allowlist** (`[process_workloads] allowed_binaries` in `node.toml`). An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is off on any node the operator hasn't explicitly opened up. Inline `script` workloads run through `/bin/sh`, which must itself be allowlisted.
 - **Signed-commit gating.** Inline scripts applied via Lettuce require signed commits (Section 14). When applied directly via `relish apply`, TOML files containing `script` fields require `host-exec` permission.
 
-Beyond that, the process is spawned in its own process group and its stdout/stderr are captured, but it runs directly on the host. **Status: kernel-level isolation is planned — not yet implemented.** The design target (a dedicated unprivileged `burger` user, a seccomp profile, cgroup resource limits, and network/PID/mount namespaces so process workloads sit inside the same primitives as containers) is not what the binary does today: there is no seccomp profile, no `burger` user, no `unshare`/namespace creation, and no cgroup limits on process workloads. Mount-namespace isolation is explicitly *refused* rather than silently skipped: a host workload that requests `mount_isolation` is rejected with an error until the feature lands.
+On rootful Linux, process batches use a bounded native executor pool. Each command starts as a fresh host process inside its resource-profile cgroup, with CPU, memory, swap and PID limits applied before execution. A durable owner holds the executor subtree until retirement. These jobs run as Bun's user and retain access to the host; they are trusted workloads, not a security sandbox. Every host backend passes only a short allowlist of Bun's environment (`PATH`, `HOME`, locale and a few more) plus the job's own variables.
+
+Process applications, ordinary process jobs and every host workload on platforms without the native backend still use the process owner directly. Explicit job resource limits are refused when that backend cannot enforce them. **Status: further kernel isolation is planned.** There is no dedicated `burger` user, seccomp profile or network/PID/mount namespace for host workloads. Mount-namespace isolation is explicitly refused when `mount_isolation` is requested.
 
 > For the full isolation model, security controls, and when-to-use-what guidance, see [design/agent-bun.md](design/agent-bun.md).
 
@@ -1000,7 +1002,7 @@ The Reliaburger column describes 0.1.6. Rows marked *Target* are design goals fr
 | **Non-container apps** | No | No | Yes (exec/raw_exec drivers) | No | **Yes (allowlisted host exec; sandboxing planned)** |
 | **Scheduling constraints** | nodeSelector, affinity/anti-affinity, taints/tolerations | Same | constraints, affinities | N/A | **Node labels with required/preferred (AND logic)** |
 | **Daemon mode** | DaemonSet (separate resource type) | Same | system scheduler | N/A | **replicas = "*" (same App resource)** |
-| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **Target: 100M+ per day (unmeasured; task arrays planned for 0.2.0)** |
+| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **Target: 100M+ per day (unqualified; task arrays implemented for 0.2.0)** |
 | **Leader recovery** | Automatic within quorum; backup for quorum loss | Same | Automatic within quorum; backup for quorum loss | N/A | **Automatic within quorum; operator restore from a sealed backup for quorum loss (§8.3)** |
 | **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Planned (Franchise — WAN gossip + Wrapper ingress; not yet implemented, see §21)** |
 | **K8s migration** | N/A | N/A | N/A | N/A | **Built-in (relish import/export with migration reports)** |
@@ -1054,7 +1056,7 @@ No. The new leader enters a learning period where it accepts StateReports from n
 
 ### Q6: Aren't exec (non-container) jobs a massive security risk?
 
-They would be, without constraints. The constraint that ships today is a policy gate, not a kernel sandbox. Process workloads require an explicit `admin` or `host-exec` Permission grant, and you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. Inline scripts additionally require signed commits when applied via GitOps. This deny-by-default posture ensures no host binary can execute without explicit operator approval. What's *not* here yet (planned, see Section 17): a dedicated unprivileged `burger` user, a seccomp profile, cgroup limits, and network/PID/mount namespaces. So treat a process workload as a binary the operator has explicitly whitelisted running on the host, not as a locked-down sandboxed process — for anything hostile, keep it in a container.
+They would be, without constraints. The constraint that ships today is a policy gate, not a kernel sandbox. Process workloads require an explicit `admin` or `host-exec` Permission grant, and you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. Inline scripts additionally require signed commits when applied via GitOps. This deny-by-default posture ensures no host binary can execute without explicit operator approval. On rootful Linux, process batches enforce CPU/memory limits through native executors. Host applications still need cgroup limits; a dedicated unprivileged `burger` user, a seccomp profile and network/PID/mount namespaces remain planned (see Section 17). So treat a process workload as a binary the operator has explicitly whitelisted running on the host, not as a locked-down sandboxed process — for anything hostile, keep it in a container.
 
 ### Q7: How does Pickle ensure image durability?
 
@@ -1105,6 +1107,53 @@ throughput target remains unqualified until real workloads sustain at least
 1,158 unique successful completions per second with headroom, concurrent apps,
 failure recovery and bounded memory and storage. A short simulated burst doesn't
 establish that result.
+
+### Short commands in reusable containers
+
+`runtime = "shared-runc"` selects bounded, built-in image executors
+beneath the common job path. Containers are compatible only within a pinned
+image, namespace, credentials and resource profile. Each command starts a
+separate process, born inside its own limited cgroup. Private scratch and IPC
+namespaces disappear with the task; descendants must retire before reuse.
+Fresh containers remain the default. PID and network namespace reuse is an
+explicit trade-off, rather than a new application worker protocol.
+
+Warm executors retain their resource requests and helper overhead while idle.
+They expire quickly and yield to waiting profiles, preserving application
+capacity and FIFO admission. Cancellation or uncertainty retires the original
+container before replacement. Rootful Linux allowlisted host batches use the same
+bounded executor design with a durable native helper and a fresh process per
+command. Explicit CPU/memory profiles are enforced before execution through
+task cgroups; helper resources stay charged while idle. Other platforms retain
+the original owned process backend and refuse unsupported explicit limits.
+Host commands retain host access and Bun's user; they require trusted workloads.
+Neither path removes process creation, durable outcomes or external-effect
+idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
+
+Fast delegated jobs use bounded grant lookahead derived from verified duration
+summaries, covering receipt acceptance and grant delivery without increasing
+control polling. Learned grant depth is capped at sixteen chunks; actual execution
+remains gated by per-node concurrency and resource admission. The trade-off is
+more granted work to reconcile after worker loss, with unchanged attempt fences.
+
+Fresh containers suit fully isolated independent work. Shared containers suit
+repeatable trusted tasks whose container startup would dominate the command.
+Host jobs trade isolation for speed with an explicit allowlisted binary. Jobs
+select `runtime = "runc"` by default, or opt into `shared-runc` or `process`; a
+process definition with an image is refused. Explicit Bun `--runtime runc`
+permits containers only, while `mixed` and Linux auto-detection can enable both.
+
+The [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
+give each path the same 60 seconds, concurrency and resource profile on one small
+VM, beside a raw-process reference. Every path runs a no-op command, so they
+measure per-job overhead, not the throughput of real work, and the record says
+what they don't establish: a universal ceiling, multi-node scaling, sustained
+headroom or bounded historical metadata. One-hour soaks of each path then ran
+sequentially beside the same application, with no terminal failures and every
+application probe answered. Disk use grew materially during them and the
+capped storage scans were incomplete, so they are saturation observations, not
+a daily qualification; that remains in #668.
+
 
 ### AI workloads: resident models and coordinated training
 

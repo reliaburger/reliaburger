@@ -1,0 +1,44 @@
+{
+  "source_commit": "029fd94df2de53d89308d01a17adc7b41928026f",
+  "source_patch_sha256": "f083a25d92b9dcb4c182d0954c8b0204c2ffc9112f75426eac72dfe5ccc6238c",
+  "harness_source_patch_sha256": "f083a25d92b9dcb4c182d0954c8b0204c2ffc9112f75426eac72dfe5ccc6238c",
+  "completed_utc": "2026-10-09T14:32:39.611840+00:00",
+  "production_binaries_reused_from": {
+    "source_commit": "029fd94df2de53d89308d01a17adc7b41928026f",
+    "source_patch_sha256": "6837cd65aba3362c3626e99c1ea2afb93a508a9cdf1a00b8071a5366caeb302d",
+    "measurement_sources": {
+      "examples/job-throughput.rs": "ba38cebebb778529f990e0d61f2083520d3930bf0ce67a5b977fada7bb0a46cd",
+      "scripts/demo/measure-jobs.py": "8af1fb377e494ae92cbb7dba1a99f509926b7bf2e847d8373afc7925576d74b9",
+      "scripts/demo/qualify-jobs.py": "50db7db6972dbb627819a3843234bbbcac2c4963fe15ba85bb6e880c899556fe",
+      "scripts/demo/record-job-tiers.py": "ddb9c1ecf60a599d57745276c61f75ff955107804897fde7b978aa1a08092fa7",
+      "scripts/demo/verify-job-recovery.py": "cad817d4b701a5304c03eaec804ffa330f6a10f046a805f9e46f510598034f4e"
+    },
+    "completed_utc": "2026-10-09T14:04:46.892436+00:00",
+    "binaries": {
+      "bun": "9ec5ec8ab663e251812ce26584ba05eafb021b825546bcb3b8c95f6f3f198863",
+      "relish": "ca99c4e0a7079d930770417d1a9da396306b3a883ba3f5e58b06f8448bb4d19e",
+      "job-throughput": "bd6f3aa05c45d1f698ff73be0c8226950eb68f4f2f0fbcd72ef87e2b662f7adf"
+    },
+    "harness_source_patch_sha256": "f83f72cf0f1ee7c5464eda20928205af07e99a39cf48e07761aefaa13e6fae11",
+    "harness_sources": {
+      "scripts/demo/measure-jobs.py": "8af1fb377e494ae92cbb7dba1a99f509926b7bf2e847d8373afc7925576d74b9",
+      "scripts/demo/qualify-jobs.py": "98b38410ca44ed07be7c43d67e4994b046e41ee2580b32f59b4206bc3c3a5732",
+      "scripts/demo/record-job-tiers.py": "5b6ebffffe1d5a79f6be8f9b548a3fc04fc00d18543d56cb9be83f1c843d34f8",
+      "scripts/demo/verify-job-recovery.py": "cad817d4b701a5304c03eaec804ffa330f6a10f046a805f9e46f510598034f4e"
+    },
+    "harness_frozen_utc": "2026-10-09T14:08:23.641288+00:00"
+  },
+  "production_runtime_source_unchanged": true,
+  "measurement_sources": {
+    "examples/job-throughput.rs": "ab494165dd1f5418feff35f8d1b840297e435cea854ff54de8b946b46dc842cc",
+    "scripts/demo/measure-jobs.py": "8af1fb377e494ae92cbb7dba1a99f509926b7bf2e847d8373afc7925576d74b9",
+    "scripts/demo/qualify-jobs.py": "f45513731bebe248430f15aa0d7b597964b6897e736b6badeba32d8d415067c4",
+    "scripts/demo/record-job-tiers.py": "18e3c2aa5b2851108b127e522764c815f241a64f8ddecd766229cc434d037fc8",
+    "scripts/demo/verify-job-recovery.py": "cad817d4b701a5304c03eaec804ffa330f6a10f046a805f9e46f510598034f4e"
+  },
+  "binaries": {
+    "bun": "9ec5ec8ab663e251812ce26584ba05eafb021b825546bcb3b8c95f6f3f198863",
+    "relish": "ca99c4e0a7079d930770417d1a9da396306b3a883ba3f5e58b06f8448bb4d19e",
+    "job-throughput": "1731b4fd7ced304c0b3174c23dcfb3a4f9aea2b272af385c03b0deed46bf0d79"
+  }
+}

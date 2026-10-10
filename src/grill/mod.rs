@@ -13,6 +13,7 @@ pub mod command;
 pub mod image;
 pub mod image_config;
 mod inventory;
+pub mod mixed;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
 // grill (a runtime whose `pid()` is `None`), which unit tests can't.
@@ -437,6 +438,34 @@ pub trait Grill: Send + Sync {
         records::RuntimeKind::Process
     }
 
+    /// The backend selected by the validated workload's execution kind.
+    fn runtime_kind_for_host(&self, _host: bool) -> records::RuntimeKind {
+        self.runtime_kind()
+    }
+    fn runtime_kind_for(&self, spec: &OciSpec) -> records::RuntimeKind {
+        self.runtime_kind_for_host(spec.host_process)
+    }
+    /// Whether recovery can route an original backend without a fallback.
+    fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
+        self.runtime_kind() == kind
+    }
+    /// Per-workload enforcement; host commands never occupy an OCI cgroup.
+    fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
+        !spec.host_process && self.honours_cgroup_path()
+    }
+
+    /// Owned rootful host backend capable of bounded native command executors.
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<ProcessGrill> {
+        None
+    }
+
+    /// Rootful owned runtime capable of the private reusable command protocol.
+    #[cfg(target_os = "linux")]
+    fn reusable_runtime(&self) -> Option<runc::RuncGrill> {
+        None
+    }
+
     /// Whether this runtime places workloads into the cgroup v2 path in
     /// the OCI spec (`cgroupsPath`). When true, the agent can create the
     /// cgroup directory itself, program the eBPF egress maps against its
@@ -580,12 +609,35 @@ pub enum AnyGrill {
     /// Linux runc-based container runtime.
     #[cfg(target_os = "linux")]
     Runc(runc::RuncGrill),
+    /// Per-workload runc and owned host-process execution.
+    #[cfg(target_os = "linux")]
+    Mixed(mixed::MixedGrill<runc::RuncGrill>),
     /// macOS Apple Container runtime.
     #[cfg(target_os = "macos")]
     Apple(apple::AppleContainerGrill),
 }
 
 impl AnyGrill {
+    #[cfg(target_os = "linux")]
+    pub fn runc_runtime(&self) -> Option<&runc::RuncGrill> {
+        match self {
+            Self::Runc(g) => Some(g),
+            Self::Mixed(g) => Some(g.container()),
+            _ => None,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn with_host_processes(
+        container: runc::RuncGrill,
+        instances: &std::path::Path,
+        executable: std::path::PathBuf,
+    ) -> Self {
+        Self::Mixed(mixed::MixedGrill::new(
+            container,
+            ProcessGrill::with_owner(instances.to_path_buf(), executable),
+            instances.join("runtime-routes"),
+        ))
+    }
     pub(crate) async fn tail_snapshot(&self, instance: &InstanceId) -> capture::TailSnapshot {
         if let Self::Process(runtime) = self {
             return runtime.tail_snapshot(instance).await;
@@ -605,17 +657,36 @@ impl AnyGrill {
         match self {
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => Some(g.image_store().clone()),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => Some(g.container().image_store().clone()),
             _ => None,
         }
     }
 }
 
 impl Grill for AnyGrill {
+    fn runtime_kind_for_host(&self, host: bool) -> records::RuntimeKind {
+        let _ = host;
+        #[cfg(target_os = "linux")]
+        if let Self::Mixed(g) = self {
+            return g.runtime_kind_for_host(host);
+        }
+        self.runtime_kind()
+    }
+    fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Self::Mixed(g) = self {
+            return g.supports_runtime(kind);
+        }
+        self.runtime_kind() == kind
+    }
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         match self {
             AnyGrill::Process(g) => g.create(instance, spec).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.create(instance, spec).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.create(instance, spec).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.create(instance, spec).await,
         }
@@ -626,6 +697,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.start(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.start(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.start(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.start(instance).await,
         }
@@ -636,6 +709,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.stop(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.stop(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.stop(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.stop(instance).await,
         }
@@ -646,6 +721,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.kill(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.kill(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.kill(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.kill(instance).await,
         }
@@ -656,6 +733,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.state(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.state(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.state(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.state(instance).await,
         }
@@ -666,6 +745,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.has_exited(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.has_exited(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.has_exited(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.has_exited(instance).await,
         }
@@ -680,6 +761,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.adopt(instance, record).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.adopt(instance, record).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.adopt(instance, record).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.adopt(instance, record).await,
         }
@@ -690,6 +773,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.launch_inventory().await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.launch_inventory().await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.launch_inventory().await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.launch_inventory().await,
         }
@@ -703,6 +788,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(runtime) => runtime.retain_network_reference(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => runtime.retain_network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(runtime) => runtime.retain_network_reference(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(runtime) => runtime.retain_network_reference(instance).await,
         }
@@ -716,6 +803,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(runtime) => runtime.network_reference(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => runtime.network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(runtime) => runtime.network_reference(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(runtime) => runtime.network_reference(instance).await,
         }
@@ -729,6 +818,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(runtime) => runtime.release_network_reference(reference).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => runtime.release_network_reference(reference).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(runtime) => runtime.release_network_reference(reference).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(runtime) => runtime.release_network_reference(reference).await,
         }
@@ -739,16 +830,36 @@ impl Grill for AnyGrill {
             AnyGrill::Process(_) => records::RuntimeKind::Process,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(_) => records::RuntimeKind::Runc,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(_) => records::RuntimeKind::Runc,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => records::RuntimeKind::Apple,
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<ProcessGrill> {
+        match self {
+            Self::Process(runtime) => runtime.host_executor_runtime(),
+            Self::Mixed(runtime) => runtime.host_executor_runtime(),
+            _ => None,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn reusable_runtime(&self) -> Option<runc::RuncGrill> {
+        match self {
+            Self::Runc(runtime) => runtime.reusable_runtime(),
+            Self::Mixed(runtime) => runtime.reusable_runtime(),
+            _ => None,
+        }
+    }
     fn honours_cgroup_path(&self) -> bool {
         match self {
             AnyGrill::Process(_) => false,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.honours_cgroup_path(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.honours_cgroup_path(),
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => false,
         }
@@ -759,6 +870,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.log_stem(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.log_stem(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.log_stem(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.log_stem(instance).await,
         }
@@ -772,6 +885,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.rootless_network_record(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.rootless_network_record(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.rootless_network_record(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.rootless_network_record(instance).await,
         }
@@ -782,6 +897,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.pid(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.pid(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.pid(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.pid(instance).await,
         }
@@ -792,6 +909,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.workload_cgroup(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.workload_cgroup(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.workload_cgroup(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.workload_cgroup(instance).await,
         }
@@ -802,6 +921,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.container_ip(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.container_ip(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.container_ip(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.container_ip(instance).await,
         }
@@ -812,6 +933,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.exit_code(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.exit_code(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.exit_code(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.exit_code(instance).await,
         }
@@ -822,6 +945,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.logs(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.logs(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.logs(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.logs(instance).await,
         }
@@ -837,6 +962,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.follow_logs(instance, lines_tx, resume).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.follow_logs(instance, lines_tx, resume).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.follow_logs(instance, lines_tx, resume).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.follow_logs(instance, lines_tx, resume).await,
         }
@@ -847,6 +974,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.exec(instance, command).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.exec(instance, command).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.exec(instance, command).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.exec(instance, command).await,
         }

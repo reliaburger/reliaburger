@@ -10,6 +10,8 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [Job retirement and record-read races](2026-10-10-job-retirement-read-races.md) | Retain filesystem cleanup across timeouts and validate atomically replaced records with one metadata inspection. | #654: review and GitHub checks |
+| [Jobs in the release soak](2026-10-10-plan-release-job-soak.md) | Exercise all job runtimes alongside apps and existing faults within the current V02 duration. | Staged fast/final qualification and resource-cap calibration |
 | [Container migration](2026-10-09-plan-container-migration.md) | The delivery plan for moving running workloads: who it's for, decisions, ordered spikes with go/no-go rules, and nine named milestones across 0.4.0, 0.4.1 and 0.5.0 (live moves). The [research](2026-09-28-research-container-migration.md) holds the CRIU findings, continuity contract and design reference; checked against main on 9 October. | [#268](https://github.com/reliaburger/reliaburger/pull/268): feasibility spikes, implementation and qualification |
 | [GitOps webhook admission](2026-10-04-gitops-webhook-admission.md) | Replicate authenticated triggers before 202, with bounded admission and generation-aware retry. | [#553](https://github.com/reliaburger/reliaburger/issues/553) |
 | [GitOps job refusal](2026-10-04-gitops-job-refusal.md) | Refuse unsupported jobs before publishing their dependent apps or advancing the applied revision. | #549 |
@@ -28,7 +30,8 @@ the detail is in the GitHub milestones and issues.
 | [Batch workload admission](2026-10-03-batch-workload-admission.md) | Enforce workload validation, scope and host-execution grants on batch submission. | #530 |
 | [Cluster migration prerequisites](2026-10-04-cluster-migration-prerequisites.md) | Execute migration gates before app desired-state writes, retaining operation ownership and refusing uncertain handovers. | [#534](https://github.com/reliaburger/reliaburger/issues/534) |
 | [Batch capacity reservations](2026-10-04-batch-capacity-reservations.md) | Shared, committed admission for app placements and batch executions, with unknown outcomes fenced across leader handover. | [#543](https://github.com/reliaburger/reliaburger/issues/543) |
-
+| [Persistent host job executors](2026-10-09-plan-host-job-executors.md) | Matched measurements, bounded native executors, event-driven cleanup and resource limits. | #640 |
+| [Reusable containers and throughput](2026-10-07-plan-reusable-executors-and-throughput.md) | Built-in command executors, matched throughput measurements, a prominent demo and sustained qualification. | [#639](https://github.com/reliaburger/reliaburger/issues/639), [#640](https://github.com/reliaburger/reliaburger/issues/640) |
 | [Common job lifecycle](2026-10-07-plan-common-job-lifecycle.md) | One durable definition/run/task/attempt path for singleton jobs, batches, cron and deployment hooks. | [#638](https://github.com/reliaburger/reliaburger/issues/638), implementation and validation |
 | [Resource-aware delegated jobs](2026-10-04-plan-delegated-jobs.md) | Resource budgets, mixed profiles, durable outcomes, summaries and the homepage demo, continuing #266. | Implementation and qualification |
 | [V02: sustained qualification](2026-09-25-v02-sustained.md) | The design, invariants and pass/fail thresholds of the sustained soak. `scripts/release/qualify-sustained.sh`, `sustained_check.py` and the [release runbook](../releasing.md) run every release against it. | Snapshot uploader under power cuts and the `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)) |
@@ -53,3 +56,5 @@ and the fleet control plane ([#265](https://github.com/reliaburger/reliaburger/p
 [archive/](archive/) holds the plans and reviews that led to 0.1.0. The
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
 is the summary of how that ended.
+
+- [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)

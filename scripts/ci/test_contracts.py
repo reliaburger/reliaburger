@@ -41,6 +41,18 @@ class Contracts(unittest.TestCase):
         with self.assertRaisesRegex(contracts.Invalid, expected):
             self.check()
 
+    def test_native_host_cases_have_exact_linux_gate_contracts(self):
+        root = Path(__file__).resolve().parents[2]
+        manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
+        cases = {(case['binary'], case['test']): case['requires']
+                 for contract in manifest['contracts'] for case in contract['cases']}
+        for name in (
+            'cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles',
+            'cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller',
+        ):
+            self.assertEqual(cases.get(('reliaburger::owned_task_arrays', name)),
+                             ['linux-root-storage'], name)
+
     def test_current_successful_discovered_execution_passes(self):
         self.assertEqual(self.check(), {('reliaburger', 'pickle::tests::bounded')})
 

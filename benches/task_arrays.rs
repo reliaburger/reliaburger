@@ -92,7 +92,7 @@ fn simulate_leader(nodes: usize) -> TaskArrayState {
                 let _ = state.complete(&holder, &result);
             }
         }
-        for (holder, chunks) in plan_grants(&state, &slots) {
+        for (holder, chunks) in plan_grants(&state, &slots, true) {
             let _ = state.grant(&holder, &chunks);
         }
     }

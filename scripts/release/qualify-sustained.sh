@@ -52,6 +52,9 @@ fi
 
 repository=$(cd "$(dirname "$0")/../.." && pwd)
 checker=$repository/scripts/release/sustained_check.py
+job_controller=$repository/scripts/release/job_soak.py
+job_inventory=$repository/scripts/release/job_soak_inventory.py
+jobs_pid=
 workloads_template=$repository/scripts/release/sustained/soak-workloads.toml
 podinfo=$repository/examples/kubernetes/podinfo.yaml
 base_url=
@@ -187,7 +190,11 @@ elif value.startswith("json:"):
     data[key] = json.loads(value[5:])
 else:
     data[key] = value
-json.dump(data, open(path, "w"), indent=1, sort_keys=True)
+import os
+with open(path+".new","w") as file:
+    json.dump(data,file,indent=1,sort_keys=True)
+    file.flush(); os.fsync(file.fileno())
+os.replace(path+".new",path)
 PY
 }
 meta_get() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$evidence/metadata.json" "$1" 2>/dev/null || true; }
@@ -335,6 +342,7 @@ api_get() {
 }
 kill_bun() {
     local node=$1
+    job_mark_fault "$node" "${current_slot:-agent-kill}"
     check expect "$evidence" restart "${vm[node]}"
     gsh "$node" 'kill -9 "$(systemctl show -p MainPID --value reliaburger.service)"'
 }
@@ -514,6 +522,7 @@ configure_nodes() {
     meta deviations+ 'node.toml `[testing] allowed_operations` adds `provision_isolated_workloads` (quickstart allows only inject_workload_faults and alter_node_state), so the catalogue pulse can lease test namespaces'
     meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
     meta deviations+ 'node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness'
+    meta deviations+ 'Bun runs with auto/mixed; host jobs opt in to a single pinned BusyBox copy under /var/lib/reliaburger/soak-jobs, mount_isolation=false. The independent verifier listens on each private VM address, TCP 8189, with a separate run token'
     meta deviations+ 'node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps'
     if [ -n "$operator_public" ]; then
         meta deviations+ "node.toml \`[upgrades] external_signing_key\` = a throwaway operator key the harness made for this run (\`$operator_public\`); the soak build's \`.sig\` gets that key's external signature beside the release one (D2)"
@@ -541,6 +550,8 @@ configure_nodes() {
             'testing.allowed_operations=["inject_workload_faults", "alter_node_state", "provision_isolated_workloads"]'
             'ingress.tls_cert="/etc/reliaburger/soak-tls/ingress.crt"'
             'ingress.tls_key="/etc/reliaburger/soak-tls/ingress.key"'
+            'process_workloads.allowed_binaries=["/var/lib/reliaburger/soak-jobs/busybox"]'
+            process_workloads.mount_isolation=false
         )
         [ -z "$label" ] || settings+=("node.labels.soak-volume=\"$label\"")
         [ "$leaf_supported" != yes ] || settings+=("security.leaf_lifetime_override_secs=$leaf_lifetime")
@@ -548,6 +559,24 @@ configure_nodes() {
         check toml-set "$evidence/config/node-$node.soak.toml" "${settings[@]}"
         push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem"
         gsh_in "$node" < <(printf 'set -e\numask 077\nmkdir -p /var/lib/reliaburger/soak-export\ncat > /etc/reliaburger/node.toml.new <<"TOML"\n%s\nTOML\nmv /etc/reliaburger/node.toml.new /etc/reliaburger/node.toml\n' "$(cat "$evidence/config/node-$node.soak.toml")")
+        gsh_in "$node" <<'GUEST'
+set -e
+python3 - <<'PYUNIT'
+from pathlib import Path
+import re
+path=Path('/etc/systemd/system/reliaburger.service')
+text=path.read_text()
+lines=[line for line in text.splitlines() if line.startswith('ExecStart=')]
+if len(lines)!=1: raise SystemExit('soak needs one explicit Bun ExecStart')
+line=lines[0]
+if re.search(r'--runtime(?:=|\s+)(?:auto|mixed)(?=\s|$)',line): pass
+elif re.search(r'--runtime(?:=|\s+)runc(?=\s|$)',line):
+    text=text.replace(line,re.sub(r'(--runtime(?:=|\s+))runc(?=\s|$)',r'\1mixed',line))
+    path.write_text(text)
+else: raise SystemExit('soak cannot safely select mixed runtime in Bun unit')
+PYUNIT
+systemctl daemon-reload
+GUEST
         # SIGKILL, not a graceful restart: systemd restarts bun with the new
         # file. A graceful `systemctl restart` currently wedges a node whose
         # retirement it interrupts (see the plan's product findings).
@@ -618,6 +647,7 @@ wait_cluster() {
 generation=0
 write_workloads() {
     sed "s/SOAK_GENERATION = \"[0-9]*\"/SOAK_GENERATION = \"$generation\"/" "$workloads_template" > "$evidence/workloads.toml"
+    [ ! -f "$evidence/jobs/installed" ] || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
 }
 
 apply_workloads() {
@@ -642,6 +672,72 @@ PY
     event --phase configure --target workloads --verdict ok --detail "generation $generation"
 }
 
+# The verifier is independent of Bun and starts before its listener baseline.
+prepare_jobs() {
+    mkdir -p "$evidence/jobs"
+    chmod 700 "$evidence/jobs"
+    [ -f "$evidence/jobs/.token" ] || (umask 077; openssl rand -hex 32 > "$evidence/jobs/.token")
+    python3 - "$evidence/jobs/nodes.json" "${vm[1]}" "${address[1]}" "${vm[2]}" "${address[2]}" "${vm[3]}" "${address[3]}" <<'PYNODES'
+import json,sys
+json.dump([dict(name=n,address=a) for n,a in zip(sys.argv[2::2],sys.argv[3::2])],open(sys.argv[1],'w'))
+PYNODES
+    local node
+    for node in 1 2 3; do
+        with_timeout 30 "$limactl" copy "$job_controller" "$job_inventory" "${vm[node]}:/var/tmp/" > /dev/null
+        gsh_in "$node" "${address[node]}" < <(printf 'set -e
+umask 077
+root=/var/lib/reliaburger/soak-jobs
+mkdir -p "$root"
+chmod 700 "$root"
+install -m 600 /var/tmp/job_soak.py /var/tmp/job_soak_inventory.py "$root/"
+cat > "$root/.token" <<"TOKEN"
+%s
+TOKEN
+' "$(cat "$evidence/jobs/.token")"; cat <<'GUEST'
+# Identity replicas have already pulled the pinned image on all three nodes.
+# Copy that exact image binary; never install an unrelated host BusyBox build.
+python3 - <<'PYBOX'
+from pathlib import Path
+import shutil,hashlib
+root=Path('/var/lib/reliaburger/images/rootfs/public.ecr.aws/docker/library/busybox/sha256%3A9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028')
+files=sorted(root.glob('gen-*/bin/busybox'))
+if not files or len({hashlib.sha256(file.read_bytes()).hexdigest() for file in files})!=1:
+    raise SystemExit('pinned BusyBox rootfs is missing or has inconsistent binary copies')
+shutil.copyfile(files[0],'/var/lib/reliaburger/soak-jobs/busybox')
+Path('/var/lib/reliaburger/soak-jobs/busybox').chmod(0o755)
+PYBOX
+cat > /etc/systemd/system/reliaburger-soak-audit.service <<UNIT
+[Unit]
+Description=Independent release job effect verifier
+After=network-online.target
+[Service]
+ExecStart=/usr/bin/python3 /var/lib/reliaburger/soak-jobs/job_soak.py serve --database /var/lib/reliaburger/soak-jobs/effects.sqlite --token-file /var/lib/reliaburger/soak-jobs/.token --address $1
+Restart=on-failure
+RestartSec=1
+UMask=0077
+MemoryMax=64M
+TasksMax=40
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now reliaburger-soak-audit.service >/dev/null
+/var/lib/reliaburger/soak-jobs/busybox true
+GUEST
+        ) || setup_fail "job verifier or pinned host executable setup failed on ${vm[node]}"
+    done
+    touch "$evidence/jobs/installed"
+}
+
+start_jobs() {
+    python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" > "$evidence/jobs/controller.log" 2>&1 &
+    jobs_pid=$!
+}
+job_mark_fault() {
+    [ -n "${jobs_pid:-}" ] || return 0
+    python3 "$job_controller" mark "$evidence/jobs" "${vm[$1]}" "$2" || event --phase harness-error --target jobs --detail 'could not record active fault overlap'
+}
+
 # --- evidence collection ---------------------------------------------------------
 
 # Everything one guest reports in a single shell: leak inventory, served
@@ -662,14 +758,18 @@ if [ "${pid:-0}" -gt 0 ]; then
     # self-upgrade's exec apart from the process it replaced.
     echo "bun_image $(cksum < /proc/"$pid"/auxv | cut -d' ' -f1)"
 fi
-runc --root /var/lib/reliaburger/data/instances/runc/state list -q 2>/dev/null | sed 's/^/runc /'
-ls /run/netns 2>/dev/null | sed 's/^/netns /'
-ip -o link show type veth | awk -F': ' '{split($2, name, "@"); print "veth " name[1]}'
-find /sys/fs/cgroup/reliaburger -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sed 's|^/sys/fs/cgroup/reliaburger/|cgroup |'
+if [ -f /var/lib/reliaburger/soak-jobs/job_soak_inventory.py ]; then
+    python3 /var/lib/reliaburger/soak-jobs/job_soak_inventory.py
+else
+    runc --root /var/lib/reliaburger/data/instances/runc/state list -q 2>/dev/null | sed 's/^/runc /'
+    ls /run/netns 2>/dev/null | sed 's/^/netns /'
+    ip -o link show type veth | awk -F': ' '{split($2, name, "@"); print "veth " name[1]}'
+    find /sys/fs/cgroup/reliaburger -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sed 's|^/sys/fs/cgroup/reliaburger/|cgroup |'
+    leases=/var/lib/reliaburger/data/instances/runc/bundles/.network-leases.json
+    [ ! -f "$leases" ] || python3 -c 'import json, sys; [print("lease", key) for key in json.load(open(sys.argv[1])).get("allocations", {})]' "$leases"
+fi
 find /sys/fs/bpf -mindepth 1 2>/dev/null | sed 's|^/sys/fs/bpf/|bpf |'
 ss -ltnH | awk '{print "listen " $4}'
-leases=/var/lib/reliaburger/data/instances/runc/bundles/.network-leases.json
-[ ! -f "$leases" ] || python3 -c 'import json, sys; [print("lease", key) for key in json.load(open(sys.argv[1])).get("allocations", {})]' "$leases"
 for directory in data images logs metrics volumes soak-export; do
     echo "disk $directory $(du -sk /var/lib/reliaburger/$directory 2>/dev/null | cut -f1)"
 done
@@ -727,6 +827,9 @@ new_snapshot() {
 
 collect_light() {
     local directory=$1
+    if [ -f "$evidence/jobs/snapshot.json" ]; then
+        cp "$evidence/jobs/snapshot.json" "$directory/jobs.json"
+    fi
     curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --max-time 5 -H 'Host: podinfo.localhost' \
         "http://127.0.0.1:$ingress_port/" > "$directory/http.txt" 2>/dev/null || true
     rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
@@ -915,6 +1018,7 @@ slot_deploy_kill() {
 power_offs=0
 power_off() {
     local node=$1
+    job_mark_fault "$node" "${current_slot:-power-off}"
     down[node]=1
     check power-cut "$evidence"
     "$limactl" stop --force "${vm[node]}" > "$evidence/snapshots/power-off-$node-$(date +%s).log" 2>&1 || true
@@ -1275,12 +1379,27 @@ teardown_cluster() {
 finish() {
     local result=$?
     trap - EXIT
+    if [ -n "${jobs_pid:-}" ]; then
+        if kill -0 "$jobs_pid" 2>/dev/null; then
+            kill "$jobs_pid" 2>/dev/null || true
+            meta notes+ 'Job controller was still running at teardown; positive drain must be present to pass'
+        else
+            wait "$jobs_pid" || result=1
+        fi
+    fi
     [ -z "${background_pid:-}" ] || kill "$background_pid" 2>/dev/null || true
     [ -f "$evidence/metadata.json" ] || { printf 'sustained: stopped before the soak started\n' >&2; exit "$result"; }
     meta finished_at "json:$(date +%s)"
     if [ "$keep" = true ]; then
         teardown="kept: RELIABURGER_HOME=${home:-none}"
     elif ! teardown_cluster; then
+        result=1
+    fi
+    if [ -n "${jobs_pid:-}" ] && kill -0 "$jobs_pid" 2>/dev/null; then
+        # Teardown is already over. Do not add another drain allowance or
+        # leave an orphan controller making requests after the harness exits.
+        kill -KILL "$jobs_pid" 2>/dev/null || true
+        wait "$jobs_pid" 2>/dev/null || true
         result=1
     fi
     meta teardown "$teardown"
@@ -1332,6 +1451,8 @@ if [ "$resume" = true ]; then
     home=$(meta_get home_path)
     [ "$(meta_get bootstrapped)" != true ] || bootstrapped=true
     discover
+    [ "$(meta_get job_soak)" = True ] || fail '--resume needs a job-enabled campaign; start a fresh qualification for this harness'
+    [ ! -f "$evidence/jobs/stop" ] || fail 'cannot resume a campaign already asked to drain'
     generation=$(meta_get generation); generation=${generation:-0}
     first_cycle=$(meta_get cycles); first_cycle=${first_cycle:-0}
     started_at=$(meta_get started_at)
@@ -1377,12 +1498,16 @@ PY
             || setup_fail "no release version to roll back to: the nodes report $(printf '%s' "$versions" | tr '\n' ' ')"
         meta release_version "$release_version"
     fi
+    prepare_jobs
     say 'waiting for the baseline to settle'
     open_window baseline
     settle baseline 600 || setup_fail 'the cluster did not settle for the baseline'
     check baseline "$evidence" "$last_snapshot"
     event --phase baseline --verdict ok --detail "${last_snapshot##*/}"
     registry push --tag baseline > "$evidence/snapshots/registry-push-baseline.json" 2>&1 || true
+    meta job_soak json:true
+    start_jobs
+    apply_workloads
     # A full check of the healthy cluster, before the first fault.
     observe heavy || true
     first_cycle=0
@@ -1391,6 +1516,8 @@ PY
     end=$(( started_at + duration ))
     next_rotation=$(( started_at + rotation ))
 fi
+meta job_stop_at "json:$(( end - 120 ))"
+[ -n "$jobs_pid" ] || start_jobs
 
 next_light=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))

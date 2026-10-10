@@ -873,6 +873,7 @@ Or for inline scripts:
 
 ```toml
 [job.db-backup]
+runtime = "process"
 script = """
 #!/bin/sh
 pg_dump production > /tmp/backup.sql

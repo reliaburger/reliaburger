@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "scenario": "jobs-host-processes",
+  "started_at": "2026-10-09T21:37:05Z",
+  "requested_seconds": 3600,
+  "concurrency": 27,
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "receipt_chunk_size": 1000,
+  "image": null,
+  "executable": "/tmp/rb-host-executor-v4/host/busybox",
+  "executable_sha256": null,
+  "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+  "unique_accepted_successes": 19145000,
+  "verified_successes": 0,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "post_cutoff_drained": 0,
+  "batch_ids": [
+    97,
+    99
+  ],
+  "active_submissions": [
+    99
+  ],
+  "drain_proofs": [
+    {
+      "batch_id": 97,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    },
+    {
+      "batch_id": 99,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "last_accepted_sample_seconds": 3599.865891445,
+  "submission_names": [
+    "bench-jobs-3731acccd35cce8e94966dce2b579dfe",
+    "bench-jobs-43cb832a26416a439e35e1d28b7b1ff9"
+  ],
+  "measurement_complete": true,
+  "interrupted": false,
+  "cleanup_verified": true,
+  "cleanup_failed_submissions": [],
+  "error": null,
+  "elapsed_including_drain_seconds": 3601.01533834,
+  "successes_per_second": 5318.055555555556,
+  "extrapolated_runs_per_day": 459480000.0,
+  "daily_projection": "extrapolation from this window; not an observed daily total",
+  "qualified_100m_per_day": false
+}

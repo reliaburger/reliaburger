@@ -105,8 +105,11 @@ pub struct NodeSyncRequest {
 /// Counters for one array on one node, since the node started it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeArrayCounters {
-    /// Attempts running now.
+    /// Executor callers, including preparation and resource wait.
     pub running: u64,
+    /// Last observed verified command starts awaiting positive cleanup.
+    /// Absent for runtimes without command-level start receipts.
+    pub active_commands: Option<u64>,
     /// Attempts started.
     pub attempts_started: u64,
     /// Tasks that succeeded.
@@ -192,6 +195,29 @@ pub enum NodeRunner {
 }
 
 impl TaskRunner for NodeRunner {
+    async fn active_commands(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        match self {
+            Self::Owned(runner) => runner.active_commands(batch_id, template).await,
+            Self::Process(_) | Self::Fake(_) => None,
+        }
+    }
+    async fn busy_slots(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        match self {
+            Self::Owned(runner) => runner.busy_slots(batch_id, template).await,
+            Self::Process(_) | Self::Fake(_) => None,
+        }
+    }
+    fn owns_admission(&self, task: &TaskInvocation) -> bool {
+        matches!(self, Self::Owned(runner) if runner.owns_admission(task))
+    }
     async fn run(
         &self,
         task: &TaskInvocation,
@@ -279,6 +305,9 @@ impl TaskArrayNode {
             u64::MAX,
             0,
         ));
+        if let NodeRunner::Owned(runner) = &runner {
+            runner.set_budget(budget.clone());
+        }
         Self {
             config,
             slots,
@@ -289,8 +318,23 @@ impl TaskArrayNode {
         }
     }
 
+    /// Bounded node-local executor phase distributions for measurement tooling.
+    #[cfg(target_os = "linux")]
+    pub fn executor_timings(
+        &self,
+        runtime: crate::config::job::JobRuntime,
+    ) -> Option<super::reusable_executor::timings::TimingSnapshot> {
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => runner.executor_timings(runtime),
+            _ => None,
+        }
+    }
+
     /// Use the exact admission ledger the node's supervisor uses for apps.
     pub fn with_budget(mut self, budget: Arc<super::execution_budget::ExecutionBudget>) -> Self {
+        if let NodeRunner::Owned(runner) = self.runner.as_ref() {
+            runner.set_budget(budget.clone());
+        }
         self.budget = budget;
         self
     }
@@ -445,6 +489,9 @@ impl TaskArrayNode {
 
     /// Whether this node may run the array's binary at all.
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
+        if let Some(template) = assignment.template.as_ref() {
+            template.validate_runtime().map_err(str::to_owned)?;
+        }
         if assignment
             .template
             .as_ref()
@@ -464,6 +511,20 @@ impl TaskArrayNode {
         }
         if !self.budget.capacity().fits(&assignment.resources) {
             return Err("task requests exceed this node's allocatable resources".into());
+        }
+        if let Some(template) = assignment.template.as_ref()
+            && template.runtime == crate::config::job::JobRuntime::SharedRunc
+        {
+            let profile = super::reusable_executor::ExecutorProfile::new(template)
+                .map_err(|error| error.to_string())?;
+            if !self.budget.capacity().fits(&profile.reservation) {
+                return Err("reusable profile plus helper exceeds node capacity".into());
+            }
+            return match self.runner.as_ref() {
+                NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
+                NodeRunner::Fake(_) => Ok(()),
+                _ => Err("shared-runc requires the rootful owned Linux runtime".into()),
+            };
         }
         if assignment
             .template
@@ -492,11 +553,22 @@ impl TaskArrayNode {
                 .template
                 .as_ref()
                 .is_some_and(|t| t.cpu.is_some() || t.memory.is_some())
+                && !runner.supports_host_limits()
             {
                 return Err(
                     "the host process runtime cannot enforce CPU or memory limits; use image tasks"
                         .into(),
                 );
+            }
+        }
+        if let NodeRunner::Owned(runner) = self.runner.as_ref()
+            && runner.supports_host_limits()
+            && let Some(template) = assignment.template.as_ref()
+        {
+            let profile = super::reusable_executor::ExecutorProfile::new(template)
+                .map_err(|error| error.to_string())?;
+            if !self.budget.capacity().fits(&profile.reservation) {
+                return Err("host profile plus helper exceeds node capacity".into());
             }
         }
         if !self.config.policy.is_binary_allowed(&assignment.program) {
@@ -713,23 +785,59 @@ impl TaskArrayNode {
             );
         }
         let counters = run.pool.counters();
+        let active_commands = self
+            .runner
+            .active_commands(assignment.batch_id, assignment.template.as_deref())
+            .await;
+        let busy_slots = self
+            .runner
+            .busy_slots(assignment.batch_id, assignment.template.as_deref())
+            .await;
         ArrayProgress {
             batch_id: assignment.batch_id,
             slots: {
+                let reusable = assignment.template.as_deref().filter(|template| {
+                    template.runtime == crate::config::job::JobRuntime::SharedRunc ||
+                        (template.runtime == crate::config::job::JobRuntime::Process &&
+                         matches!(self.runner.as_ref(), NodeRunner::Owned(runner) if runner.supports_host_limits()))
+                });
+                let resources = reusable
+                    .and_then(|template| {
+                        super::reusable_executor::ExecutorProfile::new(template).ok()
+                    })
+                    .map_or(assignment.resources, |profile| profile.reservation);
                 let available = self.budget.available();
-                let fits = (available.cpu_millicores / assignment.resources.cpu_millicores)
-                    .min(available.memory_bytes / assignment.resources.memory_bytes);
-                self.concurrency(&assignment.spec)
-                    .min(u32::try_from(fits).unwrap_or(u32::MAX))
-                    .saturating_add(
-                        u32::try_from(counters.running.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
-                    )
-                    .min(self.concurrency(&assignment.spec))
+                let fits = (available.cpu_millicores / resources.cpu_millicores)
+                    .min(available.memory_bytes / resources.memory_bytes);
+                #[cfg(target_os = "linux")]
+                let fits = match (reusable, self.runner.as_ref()) {
+                    (Some(template), NodeRunner::Owned(runner)) => {
+                        u64::from(runner.reusable_capacity(template).await)
+                    }
+                    _ => fits,
+                };
+                let cap = slot_cap(
+                    self.concurrency(&assignment.spec),
+                    assignment.spec.per_node_concurrency.is_some(),
+                    reusable.is_some(),
+                );
+                // A pool-run caller counts as running while it still waits
+                // for a slot or admission; only a slot with resources charged
+                // is in use. Started commands alone would miss millisecond
+                // commands that begin and end between samples.
+                let busy = match (reusable, busy_slots) {
+                    (Some(_), Some(held)) => held,
+                    _ => counters.running.load(Ordering::Relaxed),
+                };
+                cap.min(u32::try_from(fits).unwrap_or(u32::MAX))
+                    .saturating_add(u32::try_from(busy).unwrap_or(u32::MAX))
+                    .min(cap)
             },
             refused: None,
             finished,
             counters: NodeArrayCounters {
                 running: counters.running.load(Ordering::Relaxed),
+                active_commands,
                 attempts_started: counters.attempts_started.load(Ordering::Relaxed),
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
                 failed: counters.failed.load(Ordering::Relaxed),
@@ -1007,6 +1115,19 @@ async fn run_chunk(
         .insert((work.chunk.0, work.grant_attempt), outcome.result);
 }
 
+/// The most attempts this node advertises for one array at once.
+///
+/// Reusable runtimes can't exceed their executor pool, and without an
+/// explicit cap they stay below it (see `DEFAULT_REUSABLE_CONCURRENCY`).
+fn slot_cap(concurrency: u32, explicit: bool, reusable: bool) -> u32 {
+    use super::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
+    match (reusable, explicit) {
+        (false, _) => concurrency,
+        (true, true) => concurrency.min(MAX_EXECUTOR_SLOTS as u32),
+        (true, false) => concurrency.min(DEFAULT_REUSABLE_CONCURRENCY),
+    }
+}
+
 fn write_outputs(directory: &Path, outputs: &[(u32, u64, CapturedOutput)]) -> std::io::Result<()> {
     for (index, grant, output) in outputs {
         let mut bytes = output.head.clone();
@@ -1038,6 +1159,19 @@ mod tests {
     use super::*;
     use crate::bun::task_executor::AttemptOutcome;
     use crate::meat::index_set::IndexRangeSet;
+
+    #[test]
+    fn reusable_arrays_without_a_cap_stay_below_the_executor_pool() {
+        use crate::bun::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
+        assert!((DEFAULT_REUSABLE_CONCURRENCY as usize) < MAX_EXECUTOR_SLOTS);
+        assert_eq!(slot_cap(256, false, true), DEFAULT_REUSABLE_CONCURRENCY);
+        assert_eq!(slot_cap(8, false, true), 8);
+        // An explicit cap is honoured up to the pool size.
+        assert_eq!(slot_cap(32, true, true), MAX_EXECUTOR_SLOTS as u32);
+        assert_eq!(slot_cap(256, true, true), MAX_EXECUTOR_SLOTS as u32);
+        // Fresh containers are bounded only by the node budget.
+        assert_eq!(slot_cap(256, false, false), 256);
+    }
 
     const BINARY: &str = "/bin/sh";
 
@@ -1094,8 +1228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn singleton_images_use_the_configured_owned_runtime_without_claiming_unsupported_limits()
-    {
+    async fn image_tasks_are_refused_on_a_process_only_node_with_or_without_limits() {
         let dir = tempfile::tempdir().unwrap();
         let mut task = assignment(1, 1, &[(0, 1)]);
         task.template = Some(Box::new(
@@ -1108,7 +1241,10 @@ mod tests {
             TaskArrayNodeConfig::for_data_dir(dir.path(), ProcessWorkloadsConfig::default()),
             NodeRunner::Owned(Box::new(runner)),
         );
-        assert!(node.admit(&task).is_ok());
+        assert!(
+            node.admit(&task).is_err(),
+            "an image singleton must not fall back to the host backend"
+        );
         task.template.as_mut().unwrap().cpu = Some(crate::config::types::ResourceRange {
             request: 100,
             limit: 100,
@@ -1353,6 +1489,44 @@ mod tests {
         capped.spec.per_node_concurrency = Some(3);
         let progress = node.sync(&request(vec![capped])).await.arrays.remove(0);
         assert_eq!(progress.slots, 3);
+    }
+
+    #[tokio::test]
+    async fn reusable_advertisement_accounts_for_helper_overhead_and_pool_bound() {
+        use crate::bun::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
+        for (capacity, explicit, expected) in [
+            (crate::meat::Resources::new(300, 96 << 20, 0), None, 2),
+            (
+                crate::meat::Resources::new(256_000, 16 << 30, 0),
+                None,
+                DEFAULT_REUSABLE_CONCURRENCY,
+            ),
+            (
+                crate::meat::Resources::new(256_000, 16 << 30, 0),
+                Some(256),
+                MAX_EXECUTOR_SLOTS as u32,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut options = config(root.path(), policy(&[BINARY], false));
+            options.default_concurrency = 256;
+            let node = TaskArrayNode::new(options, NodeRunner::Fake(FakeRunner::always_succeeds()))
+                .with_budget(super::super::execution_budget::ExecutionBudget::new(
+                    capacity,
+                ));
+            let mut array = assignment(1, 1000, &[]);
+            array.resources = crate::meat::Resources::new(100, 32 << 20, 0);
+            array.spec.per_node_concurrency = explicit;
+            array.template = Some(Box::new(toml::from_str(
+                "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+            ).unwrap()));
+            let progress = node.sync(&request(vec![array])).await.arrays.remove(0);
+            assert_eq!(progress.refused, None);
+            assert_eq!(
+                progress.slots, expected,
+                "advertisement must include helper requests and the bounded executor count"
+            );
+        }
     }
 
     #[tokio::test]

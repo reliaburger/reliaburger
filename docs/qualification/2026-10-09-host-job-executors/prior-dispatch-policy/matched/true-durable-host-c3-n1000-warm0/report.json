@@ -1,0 +1,128 @@
+{
+  "path": "DurableHost",
+  "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+  "executable_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
+  "command": [
+    "/bin/busybox",
+    "true"
+  ],
+  "count": 1000,
+  "concurrency": 3,
+  "image_preparation_seconds_excluded": 0.136917181,
+  "warmth": "warm-images-cold-executors",
+  "warmup_count": 0,
+  "warmup_seconds_excluded": 4.2e-8,
+  "executor_timings_before": null,
+  "executor_timings_after": {
+    "admission": {
+      "samples": 1000,
+      "total_microseconds": 84,
+      "maximum_microseconds": 58,
+      "buckets": [
+        1000,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "startup": {
+      "samples": 3,
+      "total_microseconds": 135999,
+      "maximum_microseconds": 45361,
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "command": {
+      "samples": 1000,
+      "total_microseconds": 641179,
+      "maximum_microseconds": 57373,
+      "buckets": [
+        993,
+        0,
+        0,
+        0,
+        1,
+        0,
+        6,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "cleanup": {
+      "samples": 1000,
+      "total_microseconds": 52341,
+      "maximum_microseconds": 340,
+      "buckets": [
+        1000,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "elapsed_seconds": 0.464887135,
+  "verified_successes": 1000,
+  "failures": 0,
+  "retries": 0,
+  "verified_successes_per_second": 2151.0597405540166,
+  "container_cpu_request_millicores": 100,
+  "container_cpu_limit_millicores": 1000,
+  "container_memory_bytes": 33554432,
+  "resource_enforcement": "per-command CPU, memory, swap and PID limits before user code",
+  "bare_process_resource_limits": "none; profile fields are comparison inputs only",
+  "node_job_budget_cpu_millicores": 3000,
+  "service_probe_latency_ms": [
+    0.481503
+  ],
+  "durability": "worker grant fence, per-task ledger/index, verified chunk receipts; no Raft admission",
+  "optimised_build": true,
+  "qualified_100m_per_day": false,
+  "namespace_policy_hook": "not injected in direct runner; full Bun dispatch includes live namespace supervision"
+}

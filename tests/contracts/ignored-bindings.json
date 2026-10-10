@@ -1426,5 +1426,89 @@
     "function": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
     "binary": "reliaburger::owned_task_arrays",
     "test": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller"
+  },
+  {
+    "source": "src/bun/supervisor.rs",
+    "function": "cgroup_rootful_process_node_refuses_limited_ordinary_host_jobs",
+    "binary": "reliaburger",
+    "test": "bun::supervisor::tests::cgroup_rootful_process_node_refuses_limited_ordinary_host_jobs"
+  },
+  {
+    "source": "src/bun/supervisor.rs",
+    "function": "cgroup_rootful_process_node_refuses_container_runtimes",
+    "binary": "reliaburger",
+    "test": "bun::supervisor::tests::cgroup_rootful_process_node_refuses_container_runtimes"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_never_reuses_a_killed_task_cgroup",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_never_reuses_a_killed_task_cgroup"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_drains_output_buffered_at_exit",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_drains_output_buffered_at_exit"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_sockets_cannot_be_blocked_by_other_users",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_sockets_cannot_be_blocked_by_other_users"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_arrays_advertise_running_commands_not_queued_callers",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_arrays_advertise_running_commands_not_queued_callers"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands"
   }
 ]

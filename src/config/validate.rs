@@ -477,7 +477,12 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
         });
     }
 
-    Ok(())
+    job.validate_runtime()
+        .map_err(|reason| ConfigError::Validation {
+            field: "runtime".into(),
+            context: format!("job {name:?}"),
+            reason: reason.into(),
+        })
 }
 
 impl NodeConfig {
@@ -1645,8 +1650,11 @@ mod tests {
 
     #[test]
     fn validate_job_exec_only_passes() {
-        let job: crate::config::job::JobSpec =
-            toml::from_str(r#"exec = "/usr/bin/python3""#).unwrap();
+        let job: crate::config::job::JobSpec = toml::from_str(
+            r#"runtime = "process"
+exec = "/usr/bin/python3""#,
+        )
+        .unwrap();
         let mut config = Config::default();
         config.job.insert("test-job".to_string(), job);
         config.validate().unwrap();

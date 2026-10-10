@@ -1,0 +1,14 @@
+name = "demo-runc-60000"
+namespace = "default"
+[[cohort]]
+name = "commands"
+count = 60000
+chunk_size = 1
+max_attempts = 3
+per_node_concurrency = 4
+[cohort.template]
+runtime = "runc"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/busybox", "true"]
+cpu = "25m-1000m"
+memory = "32Mi"

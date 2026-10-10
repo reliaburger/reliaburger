@@ -200,6 +200,9 @@ impl TaskArraySpec {
 /// Check a homogeneous image or host template. Cron schedules, inline scripts
 /// and dependency hooks do not describe individual delegated tasks.
 pub fn validate_template(template: &JobSpec) -> Result<(), TaskArraySpecError> {
+    template
+        .validate_runtime()
+        .map_err(|field| TaskArraySpecError::TemplateField { field })?;
     // At most 64 active profiles are copied into a node sync. Bound each
     // template so argv/environment cannot turn that into an unbounded RPC.
     if serde_json::to_vec(template).map_or(true, |bytes| bytes.len() > 16 * 1024) {
@@ -267,6 +270,7 @@ mod tests {
 
     fn exec_template(args: &[&str]) -> JobSpec {
         JobSpec {
+            runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: Some(args.iter().map(|a| a.to_string()).collect()),
             schedule: None,
@@ -485,6 +489,7 @@ mod tests {
 
         let mut image = exec_template(&[]);
         image.exec = None;
+        image.runtime = crate::config::job::JobRuntime::Runc;
         image.image = Some("alpine:3".to_string());
         assert_eq!(validate_template(&image), Ok(()));
         image.exec = Some("/bin/true".into());

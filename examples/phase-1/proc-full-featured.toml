@@ -49,5 +49,6 @@ path = "/etc/myapp"
 
 # A one-shot migration job that runs independently.
 [job.db-seed]
-image = "proc-grill:image-ignored"
-command = ["echo", "seeding database..."]
+runtime = "process"
+exec = "/bin/echo"
+command = ["seeding database..."]

@@ -445,6 +445,38 @@ impl RuncGrill {
             _ => None,
         };
         let cleanup = context.seal(Duration::from_secs(15)).await?;
+        if record.spec.reusable_executor {
+            let helper = record
+                .spec
+                .linux
+                .host_cgroup_path()
+                .ok_or_else(|| io::Error::other("invalid reusable helper cgroup"))?;
+            if helper.file_name().and_then(|name| name.to_str()) != Some("helper") {
+                return Err(io::Error::other(
+                    "reusable executor does not own the expected helper leaf",
+                ));
+            }
+            let task = helper
+                .parent()
+                .ok_or_else(|| io::Error::other("missing executor cgroup branch"))?
+                .join("task");
+            if tokio::fs::try_exists(&task).await? {
+                if previous_boot {
+                    return Err(io::Error::other(
+                        "prior-boot executor has a conflicting task cgroup",
+                    ));
+                }
+                // The original launch is sealed and its entire descendant tree
+                // reaped. Retain intent until the independently limited sibling
+                // is empty; recovery must never clear this obligation early.
+                tokio::fs::write(task.join("cgroup.kill"), "1").await?;
+                let events = tokio::fs::read_to_string(task.join("cgroup.events")).await?;
+                if !events.lines().any(|line| line == "populated 0") {
+                    return Err(io::Error::other("reusable task cgroup has not retired"));
+                }
+                tokio::fs::remove_dir(&task).await?;
+            }
+        }
         let state = self.state_dir.join(&id.0);
         if tokio::fs::try_exists(&state).await? {
             if previous_boot {
@@ -824,6 +856,87 @@ impl RuncGrill {
                 ));
             }
             Ok(Some(cgroup_id))
+        })
+        .await
+    }
+
+    /// Bind a socket peer to the original helper launch, rather than a numeric
+    /// PID alone. Retain proc/cgroup descriptors across owner confirmation.
+    pub(crate) async fn authenticate_executor(
+        &self,
+        instance: &InstanceId,
+        peer: u32,
+    ) -> Result<(), GrillError> {
+        self.owned_operation(instance, move |runtime, id, context| async move {
+            let intent = context.intent().await?;
+            if intent.phase != IntentPhase::Owned
+                || !intent.spec.reusable_executor
+                || runtime.rootless
+            {
+                return Err(io::Error::other("socket peer has no reusable owned launch"));
+            }
+            let Some(CommandState::Running { pid: launcher }) =
+                context.role_state(RuntimeRole::Launcher).await?
+            else {
+                return Err(io::Error::other("executor launcher is not running"));
+            };
+            if runtime.owned_running_pid(&id, &context).await? != Some(peer) {
+                return Err(io::Error::other(
+                    "socket peer differs from the owned container init",
+                ));
+            }
+            let path = intent
+                .spec
+                .linux
+                .host_cgroup_path()
+                .ok_or_else(|| io::Error::other("invalid helper cgroup"))?;
+            let (_process, _cgroup) = tokio::task::spawn_blocking(move || {
+                use std::os::fd::AsRawFd;
+                let process = std::fs::File::open(format!("/proc/{peer}"))?;
+                let base = format!("/proc/self/fd/{}", process.as_raw_fd());
+                let status = std::fs::read_to_string(format!("{base}/status"))?;
+                let field = |name| status.lines().find_map(|line| line.strip_prefix(name));
+                let parent = field("PPid:").and_then(|value| value.trim().parse::<u32>().ok());
+                let nested = field("NSpid:").is_some_and(|value| {
+                    value.split_whitespace().count() >= 2
+                        && value.split_whitespace().last() == Some("1")
+                });
+                let internal = field("Uid:").is_some_and(|value| {
+                    value.split_whitespace().all(|uid| {
+                        uid.parse::<u32>().ok() == Some(crate::grill::userns::EXECUTOR_HOST_UID)
+                    })
+                });
+                let membership = std::fs::read_to_string(format!("{base}/cgroup"))?;
+                let expected = format!(
+                    "/{}",
+                    path.strip_prefix("/sys/fs/cgroup")
+                        .map_err(io::Error::other)?
+                        .display()
+                );
+                if parent != Some(launcher)
+                    || !nested
+                    || !internal
+                    || !membership
+                        .lines()
+                        .any(|line| line.strip_prefix("0::") == Some(&expected))
+                {
+                    return Err(io::Error::other(
+                        "executor socket source conflicts with its original owner",
+                    ));
+                }
+                let cgroup = std::fs::File::open(path)?;
+                Ok::<_, io::Error>((process, cgroup))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            if context.role_state(RuntimeRole::Launcher).await?
+                != Some(CommandState::Running { pid: launcher })
+            {
+                return Err(io::Error::other(
+                    "executor owner retired during socket binding",
+                ));
+            }
+            Ok(())
         })
         .await
     }

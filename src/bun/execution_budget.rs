@@ -69,6 +69,16 @@ impl ExecutionBudget {
         let state = self.state.lock().expect("budget poisoned");
         state.capacity.saturating_sub(&state.used)
     }
+    /// Idle executors yield their reservations to queued attempts.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_waiters(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .is_empty()
+    }
     /// Commit all dimensions atomically, or leave the ledger unchanged.
     pub fn try_acquire(self: &Arc<Self>, resources: Resources) -> Option<ResourceLease> {
         let mut state = self.state.lock().expect("budget poisoned");
@@ -78,6 +88,27 @@ impl ExecutionBudget {
         state.used = state.used.saturating_add(&resources);
         Some(ResourceLease {
             budget: Arc::clone(self),
+            resources,
+            release_on_drop: true,
+        })
+    }
+    /// Executor admission must not overtake an already queued owner.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn try_acquire_executor(
+        self: &Arc<Self>,
+        resources: Resources,
+    ) -> Option<ResourceLease> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.waiters.is_empty() || !state.capacity.saturating_sub(&state.used).fits(&resources)
+        {
+            return None;
+        }
+        state.used = state.used.saturating_add(&resources);
+        Some(ResourceLease {
+            budget: self.clone(),
             resources,
             release_on_drop: true,
         })
@@ -263,6 +294,35 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         );
+        assert_eq!(budget.available(), budget.capacity());
+    }
+    #[tokio::test]
+    async fn reusable_admission_respects_queued_owners_and_their_cancellation() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        let budget = ExecutionBudget::new(Resources::new(2000, 2048, 0));
+        let running = budget.try_acquire(Resources::new(1000, 1024, 0)).unwrap();
+        let cancel = CancellationToken::new();
+        let large = budget.acquire(Resources::new(2000, 2048, 0), &cancel);
+        tokio::pin!(large);
+        poll_fn(|cx| {
+            assert!(large.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            budget
+                .try_acquire_executor(Resources::new(500, 512, 0))
+                .is_none(),
+            "the immediate executor path cannot skip a larger queued owner"
+        );
+        cancel.cancel();
+        assert!(large.await.is_none());
+        let executor = budget
+            .try_acquire_executor(Resources::new(500, 512, 0))
+            .unwrap();
+        drop(executor);
+        drop(running);
         assert_eq!(budget.available(), budget.capacity());
     }
     #[test]

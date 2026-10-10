@@ -1,0 +1,143 @@
+{
+  "qualification_pass": false,
+  "reason": "Requires separate recovery, fault and bounded-cost evidence",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "workload_sha256": "f8252e70e4da0b3b043a7354b1e1f4903477d3759b6638d64fc6aac15537d739",
+  "command_prefix": [
+    "$HOST_HOME/github/reliaburger/target/host-executor-v6-release/relish"
+  ],
+  "timing": "Monotonic read-only window; the existing submission remains running",
+  "last_accepted_sample_seconds": 59.929593584965914,
+  "elapsed_seconds": 60.00029954407364,
+  "requested_seconds": 60,
+  "measurement_complete": true,
+  "window_pass": true,
+  "unique_accepted_successes": 320000,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "successes_per_second": 5333.333333333333,
+  "target_with_headroom": 1388.888888888889,
+  "throughput_pass": false,
+  "application_probes": 218,
+  "application_failures": 0,
+  "completed_submissions": 0,
+  "active_submissions": [
+    21
+  ],
+  "requires_evidence": [
+    "hardware/runtime/image-warmth",
+    "resource and storage bounds",
+    "worker loss",
+    "leader failover",
+    "delayed control",
+    "storage failure"
+  ],
+  "existing_batch_id": 21,
+  "initial_accepted_counts": [
+    300000,
+    0,
+    0
+  ],
+  "measurement_ownership": "read-only; submission remains owned by its caller",
+  "service_latency_ms": {
+    "samples": 218,
+    "maximum": 12.891439022496343,
+    "p95": 1.384648960083723
+  },
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.02662226790562272,
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 120807424,
+          "files_observed": 2384,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2794647552,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6965482,
+          5659,
+          6242285,
+          462936550,
+          1461324,
+          0,
+          614976,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 197664768,
+          "peak_rss_bytes": 226828288
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 2015232,
+          "peak_rss_bytes": 2015232
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.10987412300892,
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 133730304,
+          "files_observed": 2384,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2781483008,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6966784,
+          5659,
+          6247178,
+          462942126,
+          1461399,
+          0,
+          615042,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 197890048,
+          "peak_rss_bytes": 226828288
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 2015232,
+          "peak_rss_bytes": 2015232
+        }
+      ]
+    }
+  ],
+  "elapsed_including_observation_seconds": 60.00029954407364,
+  "post_cutoff_drain_proofs": [],
+  "elapsed_including_cancellation_seconds": 60.000385337043554,
+  "cleanup_failed_submissions": [],
+  "measurement_window_seconds": 60,
+  "conservative_cutoff": "Only summary responses received before the deadline are counted; subsequent cancellation/results earn no credit"
+}

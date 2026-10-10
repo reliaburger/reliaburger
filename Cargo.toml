@@ -25,8 +25,8 @@ path = "src/bin/testapp.rs"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-clap = { version = "4", features = ["derive"] }
-nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "dir", "mount", "term"] }
+clap = { version = "4", features = ["derive", "env"] }
+nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "dir", "mount", "term", "uio"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }

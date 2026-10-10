@@ -242,7 +242,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 name: name.into(),
                 namespace: namespace.into(),
                 spec: spec.clone(),
-                runtime: self.supervisor.grill().runtime_kind(),
+                runtime: self
+                    .supervisor
+                    .grill()
+                    .runtime_kind_for_host(spec.is_host()),
                 generation,
                 restart_count: 0,
                 phase: JobPhase::Preparing,

@@ -74,7 +74,7 @@ mod tests {
 
     const OP: &str = "0123456789abcdef0123456789abcdef";
     fn config() -> Config {
-        Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nexec='/bin/true'\nrun_before=['app.web']\n[job.notify]\nexec='/bin/true'").unwrap()
+        Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nruntime='process'\nexec='/bin/true'\nrun_before=['app.web']\n[job.notify]\nruntime='process'\nexec='/bin/true'").unwrap()
     }
     fn apply(store: &mut TaskArrays, write: TaskArrayWrite, next: &mut u64) {
         store

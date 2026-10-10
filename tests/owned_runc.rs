@@ -360,9 +360,12 @@ fn quote(path: &Path) -> String {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup() {
+    if let Some(root) = std::env::var_os("RELIABURGER_CANCELLED_PREPARATION_FIXTURE") {
+        cancelled_preparation(Path::new(&root)).await;
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    let id = instance(root.path());
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let real_ip = std::process::Command::new("sh")
@@ -381,28 +384,43 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
     );
     std::fs::write(bin.join("ip"), script).unwrap();
     std::fs::set_permissions(bin.join("ip"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let wrapper = root.path().join("owner-wrapper");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nPATH={}:\"$PATH\"; export PATH\nexec {} \"$@\"\n",
-            quote(&bin),
-            quote(Path::new(env!("CARGO_BIN_EXE_bun")))
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let runtime = RuncGrill::new(
-        root.path().join("bundles"),
-        ImageStore::new(root.path().join("images")),
-        false,
-        root.path().join("state"),
-        wrapper,
-    )
-    .unwrap();
+    // Runtime commands use the environment recorded by the caller. Install
+    // the fake ip in that caller's PATH, without changing this test process's
+    // environment or relying on an owner's wrapper to overwrite it later.
+    let caller = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("RELIABURGER_CANCELLED_PREPARATION_FIXTURE", root.path())
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(45), caller)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn cancelled_preparation(root: &Path) {
+    let id = instance(root);
+    let ready = root.join("prepare-ready");
+    let release = root.join("release-preparation");
+    let runtime = runtime(root);
     let creator = runtime.clone();
     let preparation_id = id.clone();
-    let specification = spec(root.path(), "exit 0");
+    let specification = spec(root, "exit 0");
     let caller = tokio::spawn(async move { creator.create(&preparation_id, &specification).await });
     wait_file(&ready).await;
     caller.abort();
@@ -421,14 +439,11 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
     })
     .await
     .unwrap();
-    assert_absent(root.path(), &id);
+    assert_absent(root, &id);
     // Positive retirement permits a new generation using the same name.
-    runtime
-        .create(&id, &spec(root.path(), "exit 7"))
-        .await
-        .unwrap();
+    runtime.create(&id, &spec(root, "exit 7")).await.unwrap();
     runtime.kill(&id).await.unwrap();
-    assert_absent(root.path(), &id);
+    assert_absent(root, &id);
 }
 
 #[tokio::test]

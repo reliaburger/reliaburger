@@ -514,7 +514,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )
                 .await
             }
-            None if self.supervisor.grill().honours_cgroup_path()
+            None if (self.supervisor.grill().honours_cgroup_path()
+                && !restart_spec
+                    .as_ref()
+                    .is_some_and(|s| s.exec.is_some() || s.script.is_some()))
                 || restart_spec
                     .as_ref()
                     .and_then(|spec| spec.egress.as_ref())

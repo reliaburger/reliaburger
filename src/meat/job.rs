@@ -518,7 +518,7 @@ mod tests {
 
     fn definition(count: u32, schedule: Option<&str>) -> JobDefinition {
         JobDefinition {
-            template: toml::from_str::<JobSpec>("exec = '/bin/true'").unwrap(),
+            template: toml::from_str::<JobSpec>("runtime = 'process'\nexec = '/bin/true'").unwrap(),
             tasks: crate::meat::task_array::TaskArraySpec::with_count(count),
             cron: schedule.map(|expression| CronPolicy {
                 expression: expression.into(),
@@ -560,7 +560,8 @@ mod tests {
 
     #[test]
     fn deployment_hooks_preserve_the_single_attempt_side_effect_policy() {
-        let hook: JobSpec = toml::from_str("exec='/bin/true'\nrun_before=['app.web']").unwrap();
+        let hook: JobSpec =
+            toml::from_str("runtime='process'\nexec='/bin/true'\nrun_before=['app.web']").unwrap();
         assert_eq!(JobDefinition::from_spec(hook).tasks.max_attempts, 1);
     }
 

@@ -284,6 +284,19 @@ in [the batch manual](docs/manual/14_batch-jobs.md). Point the cluster at a Git
 repository and the leader keeps it in sync, verifying commit signatures if you
 ask it to.
 
+Jobs choose how they run. `runtime = "runc"`, the default, starts a fresh
+container for every attempt. `runtime = "shared-runc"` reuses a bounded pool of
+containers, with each command still in its own process under its own limits.
+`runtime = "process"` runs an allowlisted host command; on rootful Linux, host
+batches reuse native executors that enforce CPU and memory limits. `bun
+--runtime mixed`, or `auto` when runc is installed, enables both kinds. The
+[job throughput demo](https://reliaburger.com/#job-throughput) runs each kind
+for 60 seconds on a small VM, and the
+[qualification record](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
+gives the rig, the limits and what the numbers do and don't show. All four
+one-hour soaks completed beside a live application; storage bounds and a real
+daily qualification remain in #668.
+
 Batch jobs retain distinct execution identities and their original scoped
 labels across retries and recovery. Finite durable history keeps replay fences;
 see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and job attempts share node CPU/memory admission. Committed grants and
@@ -301,6 +314,12 @@ one screen of problems and next steps. `relish path` walks the network path
 between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.
+
+`relish bench --scenario jobs-shared-containers` runs a timed job comparison
+(60 seconds at concurrency 27 by default), with fresh-container, host-process
+and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
+it measures per-job overhead rather than real work; see the batch manual for
+prerequisites and resource profiles.
 
 **Tested like it has to survive a bad day.** Beyond thousands of unit, property
 and snapshot tests, there are crash-recovery suites that kill the agent at every
@@ -368,8 +387,10 @@ detail in GitHub milestones and issues.
 
 ## Run it from source
 
-You'll need Rust 1.97 or later. This runs a process workload with no container
-runtime, on macOS or Linux:
+You'll need Rust 1.97 or later. On Linux the build also compiles two small
+static C helpers, so it needs a C compiler and a static libc (`build-essential`
+on Debian and Ubuntu, `gcc glibc-static` on Fedora). This runs a process
+workload with no container runtime, on macOS or Linux:
 
 ```sh
 git clone https://github.com/reliaburger/reliaburger

@@ -1,0 +1,100 @@
+{
+  "qualification_pass": false,
+  "reason": "Requires separate recovery, fault and bounded-cost evidence",
+  "kernel": "6.8.0-139-generic",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "workload_sha256": "80c9d1ba8d98d1da005ffc0966b1a767efbd1de11a046b606a1ede852ce53308",
+  "command_prefix": [
+    "$HOST_HOME/github/reliaburger/target/host-executor-v3-release/relish"
+  ],
+  "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
+  "last_accepted_sample_seconds": 29.214841327164322,
+  "elapsed_seconds": 30.000426440965384,
+  "requested_seconds": 30,
+  "measurement_complete": true,
+  "window_pass": true,
+  "unique_accepted_successes": 28000,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "successes_per_second": 933.3333333333334,
+  "target_with_headroom": 1388.888888888889,
+  "throughput_pass": false,
+  "application_probes": 29,
+  "application_failures": 0,
+  "completed_submissions": 0,
+  "active_submissions": [
+    1,
+    3
+  ],
+  "requires_evidence": [
+    "hardware/runtime/image-warmth",
+    "resource and storage bounds",
+    "worker loss",
+    "leader failover",
+    "delayed control",
+    "storage failure"
+  ],
+  "service_latency_ms": {
+    "samples": 29,
+    "maximum": 12.918299064040184,
+    "p95": 0.6727129220962524
+  },
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.07269992702640593,
+      "storage": {
+        "/tmp/rb-host-executor-v3/data": {
+          "allocated_bytes_observed": 5672960,
+          "files_observed": 463,
+          "raced_entries": 0,
+          "complete": true,
+          "filesystem_available_bytes": 2959593472,
+          "filesystem_total_bytes": 50884108288
+        }
+      },
+      "cpu": {
+        "cpu_ticks": [
+          6528907,
+          5659,
+          4939171,
+          462044733,
+          1445341,
+          0,
+          606931,
+          0,
+          0,
+          0
+        ]
+      },
+      "processes": [
+        {
+          "pid": 3448321,
+          "start_ticks": 119171637,
+          "complete": true,
+          "rss_bytes": 100577280,
+          "peak_rss_bytes": 100577280
+        }
+      ]
+    }
+  ],
+  "elapsed_including_observation_seconds": 30.000426440965384,
+  "post_cutoff_drain_proofs": [
+    {
+      "batch_id": 1,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    },
+    {
+      "batch_id": 3,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "elapsed_including_cancellation_seconds": 31.76206331816502,
+  "cleanup_failed_submissions": [],
+  "measurement_window_seconds": 30,
+  "conservative_cutoff": "Only summary responses received before the deadline are counted; subsequent cancellation/results earn no credit"
+}

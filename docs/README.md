@@ -474,7 +474,7 @@ Options:
 |------|---------|-------------|
 | `--config <path>` | (none) | Path to node config TOML file |
 | `--listen <addr>` | `127.0.0.1:9117` | API listen address |
-| `--runtime <name>` | `auto` | Runtime: `auto`, `process`, `runc` (Linux) |
+| `--runtime <name>` | `auto` | Runtime: `auto`, `process`, `runc` or `mixed` (Linux development) |
 
 Examples:
 
@@ -1254,6 +1254,12 @@ refusal for the next app ends the measurement successfully, followed by a final
 running check for every counted app. Missing evidence, expired leases, runtime
 failures and the hard safety limit fail the suite.
 
+`relish bench --scenario jobs-shared-containers` runs a timed job comparison
+(60 seconds at concurrency 27 by default), with fresh-container, host-process
+and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
+it measures per-job overhead rather than real work; see the batch manual for
+prerequisites and resource profiles.
+
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
@@ -1454,10 +1460,10 @@ Held cluster jobs conservatively reserve their CPU/memory requests on every app 
 
 [Batch jobs](manual/14_batch-jobs.md) explains compact arrays, atomic mixed-profile
 manifests, app/job resource accounting, watch summaries, indexed detail, retries
-and retention. The [burger demo](../examples/demo/burger/jobs.toml) and executable
-homepage tour (`scripts/demo/tour.sh --jobs`) run actual mixed-resource work beside
-a service. Build matching development binaries and use a fresh cluster (protocol
-48 / state 65); the published 0.1.4 recording predates this step. The
+and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
+mixed-resource work beside a service. The standalone landing-page job recording
+uses the built-in `relish bench` scenarios. Build matching development binaries
+and use a fresh cluster (protocol 51 / state 68). The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.
 
@@ -1465,5 +1471,28 @@ The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
 describes #638: ordinary singleton jobs, arrays, durable UTC cron and deployment
 hooks share the definition/run/task/attempt lifecycle, resource admission and
 accepted-result machinery. Standalone admission persists before acknowledgement;
-conservative jobs retain unknown ownership until acknowledged replay. Executor reuse (#639), sustained throughput/demo (#640)
-and resident model workers (#641) follow separately.
+conservative jobs retain unknown ownership until acknowledged replay.
+
+Linux image jobs can choose `runtime = "shared-runc"` to retain bounded,
+compatible owned containers while starting a separate limited process for each
+command. Idle profiles and helper resources stay charged to the application/task
+budget; uncertain cleanup retires the whole container before reuse. Fresh
+containers remain the default. Linux `--runtime mixed`, or `auto` with runc
+installed, accepts explicit `runtime = "process"` jobs alongside containers;
+explicit `--runtime runc` stays container-only and `--runtime process` host-only.
+On rootful Linux, host batches use bounded native executors that enforce
+explicit CPU/memory limits before each fresh command starts; ordinary host jobs
+and other platforms refuse limits. Host applications retain their existing
+runtime contract. Verified duration summaries let fast workers queue bounded
+lookahead across control-report rounds; execution still waits for concurrency
+and resources.
+
+The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+tracks reusable executors (#639), the demonstration (#640) and the
+still-unqualified sustained target (#668). The
+[timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
+record each runtime's per-job overhead for 60 seconds on a small VM, with the
+rig, profiles and limits, and four completed one-hour soaks beside a live
+application; global storage bounds and daily qualification remain in #668. The
+[earlier evidence](qualification/2026-10-08-job-measurements/README.md) keeps
+the recovery results. Resident model workers (#641) remain separate.

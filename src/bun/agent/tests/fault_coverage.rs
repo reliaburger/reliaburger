@@ -134,3 +134,24 @@ async fn an_injection_with_every_caller_named_answers_in_its_turn() {
     assert!(answer.try_recv().unwrap().is_ok());
     assert!(agent.follow_ups.is_empty());
 }
+
+#[test]
+fn delays_shape_container_callers_and_skip_host_processes() {
+    use crate::smoker::network::LocalCaller;
+    let caller = |id: &str| LocalCaller {
+        instance_id: id.into(),
+        app: "frontend".into(),
+        namespace: "default".into(),
+        cgroup_id: None,
+    };
+    // On a mixed node only the container has its own address and eth0.
+    let addressed = std::collections::HashSet::from(["default__frontend-0".to_string()]);
+    let kept = super::super::faults::delay_callers(
+        vec![
+            caller("default__frontend-0"),
+            caller("default__frontend-host-0"),
+        ],
+        &addressed,
+    );
+    assert_eq!(kept, vec![caller("default__frontend-0")]);
+}

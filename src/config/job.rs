@@ -10,9 +10,31 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{EnvValue, ResourceRange};
 
+/// The job execution backend. Image containers are the default; other backends are explicit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum JobRuntime {
+    /// A new owned container generation for each attempt.
+    #[default]
+    Runc,
+    /// An explicitly allowlisted host process, without a container image.
+    Process,
+    /// A separate command process inside a compatible reusable container.
+    SharedRunc,
+}
+
+impl JobRuntime {
+    fn is_fresh(&self) -> bool {
+        *self == Self::Runc
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobSpec {
+    /// Explicit execution backend; runc is the default.
+    #[serde(default, skip_serializing_if = "JobRuntime::is_fresh")]
+    pub runtime: JobRuntime,
     /// OCI image reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -53,9 +75,120 @@ pub struct JobSpec {
     pub script: Option<String>,
 }
 
+impl JobSpec {
+    /// Whether this job runs a host command rather than a container.
+    ///
+    /// For a validated spec that is exactly `runtime = "process"`. An
+    /// unvalidated one that names a host command anywhere counts as host too,
+    /// so routing and the `host-exec` permission check never treat a host
+    /// command as a container, whether or not validation ran first.
+    pub fn is_host(&self) -> bool {
+        self.runtime == JobRuntime::Process || self.exec.is_some() || self.script.is_some()
+    }
+
+    /// Refuse fields that contradict the explicitly selected execution backend.
+    pub fn validate_runtime(&self) -> Result<(), &'static str> {
+        match self.runtime {
+            JobRuntime::Process if self.image.is_some() => {
+                Err("runtime=process refuses image; use exec or script")
+            }
+            JobRuntime::Process if self.exec.is_some() == self.script.is_some() => {
+                Err("runtime=process requires exactly one of exec or script")
+            }
+            JobRuntime::Runc | JobRuntime::SharedRunc if self.image.is_none() => Err(
+                "runtime=runc/shared-runc requires an image; host exec/script requires runtime=process",
+            ),
+            JobRuntime::Runc | JobRuntime::SharedRunc
+                if self.exec.is_some() || self.script.is_some() =>
+            {
+                Err("container runtime refuses host exec/script; use runtime=process")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_jobs_are_named_by_runtime_and_unvalidated_host_fields_still_count() {
+        let host: JobSpec = toml::from_str("runtime='process'\nscript='true'").unwrap();
+        assert!(host.is_host());
+        let image: JobSpec = toml::from_str("image='fixture:v1'").unwrap();
+        assert!(!image.is_host());
+        // Invalid, refused by validate_runtime; never routed as a container.
+        let mislabelled: JobSpec = toml::from_str("exec='/bin/true'").unwrap();
+        assert!(mislabelled.validate_runtime().is_err());
+        assert!(mislabelled.is_host());
+    }
+
+    #[test]
+    fn container_reuse_is_explicit_and_fresh_is_the_default() {
+        let fresh: JobSpec = toml::from_str("image='fixture:v1'").unwrap();
+        assert_eq!(fresh.runtime, JobRuntime::Runc);
+        let reused: JobSpec = toml::from_str(
+            "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nruntime='shared-runc'",
+        ).unwrap();
+        assert_eq!(reused.runtime, JobRuntime::SharedRunc);
+        let encoded = toml::to_string(&reused).unwrap();
+        assert!(encoded.contains("runtime = \"shared-runc\""));
+        assert!(!toml::to_string(&fresh).unwrap().contains("runtime"));
+        assert!(
+            toml::from_str::<JobSpec>("image='fixture:v1'\nruntime='resident-worker'").is_err()
+        );
+    }
+
+    #[test]
+    fn container_reuse_refuses_host_execution_before_admission() {
+        let source = "[job.worker]\nexec='/bin/true'\nruntime='shared-runc'";
+        let error = crate::config::Config::parse(source)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(error.to_string().contains("shared-runc"));
+    }
+
+    #[test]
+    fn explicit_job_runtime_selects_the_backend_without_guessing_from_fields() {
+        for source in [
+            "[job.worker]\nruntime='runc'\nimage='fixture:v1'",
+            "[job.worker]\nruntime='shared-runc'\nimage='fixture:v1'",
+            "[job.worker]\nruntime='process'\nexec='/bin/true'",
+            "[job.worker]\nruntime='process'\nscript='true'",
+        ] {
+            crate::config::Config::parse(source)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+        for source in [
+            "[job.worker]\nruntime='process'\nimage='fixture:v1'",
+            "[job.worker]\nruntime='process'\nimage='fixture:v1'\nexec='/bin/true'",
+            "[job.worker]\nruntime='runc'\nexec='/bin/true'",
+            "[job.worker]\nruntime='shared-runc'\nscript='true'",
+            "[job.worker]\nexec='/bin/true'",
+        ] {
+            assert!(
+                crate::config::Config::parse(source)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn obsolete_isolation_field_is_refused_instead_of_selecting_a_backend() {
+        assert!(
+            crate::config::Config::parse(
+                "[job.worker]\nimage='fixture:v1'\nisolation='reusable-container'"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn parse_minimal_job() {
