@@ -181,8 +181,8 @@ output per thousand tasks, not a file per task.
 Plan for job data at the measured bytes per task in
 [Batch jobs](14_batch-jobs.md#execution-and-capacity-limits), multiplied by
 the tasks a node finishes in an hour plus whatever the retained runs hold.
-When job data passes a quarter of the filesystem, or the filesystem passes 95%
-full, the node keeps running the chunks it already holds but advertises no free
+When job data passes a quarter of the filesystem, or less than 1 GiB of it is
+free, the node keeps running the chunks it already holds but advertises no free
 slots, so it takes no new grants until retention frees space.
 
 ## GitOps

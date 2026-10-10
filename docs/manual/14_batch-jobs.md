@@ -221,8 +221,8 @@ lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
 million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
 about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
 tasks' head and tail per chunk. All of it goes when the run retires. Task data
-counts toward disk pressure: past a quarter of the filesystem, or with the
-filesystem 95% full, a worker finishes the chunks it holds but advertises no
+counts toward disk pressure: past a quarter of the filesystem, or with less
+than 1 GiB free, a worker finishes the chunks it holds but advertises no
 free slots, so it takes no new grants until retention frees space.
 
 After council disaster recovery advances the recovery epoch, workers with old

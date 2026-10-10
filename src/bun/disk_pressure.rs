@@ -67,6 +67,11 @@ pub fn dir_parquet_size(dir: &Path) -> u64 {
 /// new grants.
 pub const TASK_DATA_MAX_PERCENT: u64 = 25;
 
+/// Free space below which a worker stops taking new task grants, whatever
+/// its task data holds. Absolute, not a percentage: 5% of a large disk is
+/// tens of gigabytes, millions of tasks of headroom.
+pub const TASK_GRANT_MIN_FREE_BYTES: u64 = 1 << 30;
+
 /// Disk space allocated to every regular file under `dir`, at any depth.
 /// Allocated, not apparent, size: a sparse result index pays only for the
 /// slots it wrote. A missing or unreadable entry counts as empty; this is
@@ -91,9 +96,9 @@ pub fn dir_total_size(dir: &Path) -> u64 {
 
 /// Whether a worker holding `task_bytes` of task data on `filesystem` must
 /// stop taking new task grants: the data is over `max_percent` of the
-/// filesystem, or the filesystem itself is under pressure.
+/// filesystem, or less than [`TASK_GRANT_MIN_FREE_BYTES`] is free.
 pub fn task_data_pressured(task_bytes: u64, filesystem: FilesystemUsage, max_percent: u64) -> bool {
-    filesystem.is_pressured()
+    filesystem.available_bytes < TASK_GRANT_MIN_FREE_BYTES
         || u128::from(task_bytes) * 100
             > u128::from(filesystem.total_bytes) * u128::from(max_percent)
 }
@@ -367,7 +372,7 @@ mod tests {
         std::fs::write(array.join("ledger.index"), vec![0xab; 100_000]).unwrap();
         let filesystem = FilesystemUsage {
             total_bytes: 1_000_000,
-            available_bytes: 900_000,
+            available_bytes: TASK_GRANT_MIN_FREE_BYTES,
         };
         let before = dir_total_size(root.path());
         assert!((200_000..220_000).contains(&before), "{before}");
@@ -378,7 +383,7 @@ mod tests {
         assert!(bytes >= before + 100_000, "kept output is task data too");
         assert!(task_data_pressured(bytes, filesystem, 25));
 
-        // A nearly full filesystem refuses grants whatever task data holds.
+        // A filesystem short of free space refuses grants whatever task data holds.
         let full = FilesystemUsage {
             total_bytes: 1_000_000,
             available_bytes: 100,

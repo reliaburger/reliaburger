@@ -20,7 +20,7 @@
 //! submits more work.
 //!
 //! Task data counts toward disk pressure: when it grows past its share of
-//! the filesystem, or the filesystem itself is nearly full, the node
+//! the filesystem, or less than a gibibyte of it is free, the node
 //! advertises no free slots, so the leader grants it nothing new until
 //! retention frees the space.
 
