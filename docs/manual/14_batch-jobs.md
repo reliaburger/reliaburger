@@ -292,6 +292,10 @@ keeps at most 32 compatible containers. The compatibility key includes the
 pinned image, namespace, live credentials and resource profile. Each container
 runs one command at a time, as a separate process. Jobs, arrays, schedules and
 hooks keep their common run identities, retries and durable results.
+Once a container's retirement is proven, the worker deletes its runtime
+journal, bundle and route files, and at startup it sweeps any an interrupted
+retirement left behind, so executor metadata doesn't grow with every namespace
+that ever ran a job.
 
 The command is born in its task cgroup, with independent CPU and memory limits.
 It receives its own mount and IPC namespaces, empty environment before explicit
