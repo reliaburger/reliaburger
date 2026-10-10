@@ -2426,9 +2426,10 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
         }],
     };
     let telemetry = node.telemetry().clone();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    let mut last = None;
+    let found = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            node.sync(&request(false)).await;
+            last = Some(node.sync(&request(false)).await);
             let targets = telemetry.usage_targets();
             if targets.get(&labels).is_some_and(|(_, targets)| {
                 targets
@@ -2440,8 +2441,12 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .expect("the shared-runc executor never reported a cgroup");
+    .await;
+    assert!(
+        found.is_ok(),
+        "the shared-runc executor never reported a cgroup; last sync {last:?}, targets {:?}",
+        telemetry.usage_targets()
+    );
 
     let mut collector = SystemCollector::new();
     let mut cgroups = CgroupCpu::default();
