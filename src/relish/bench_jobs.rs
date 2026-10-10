@@ -77,6 +77,10 @@ pub struct JobBenchArgs {
     pub output: OutputFormat,
     /// Optional JSON evidence file, created without replacing an existing file.
     pub report: Option<PathBuf>,
+    /// Earlier report of the same scenario to compare this run with.
+    pub compare: Option<PathBuf>,
+    /// Largest drop in the window rate, in percent, that still passes.
+    pub tolerance_percent: u32,
 }
 impl JobBenchArgs {
     fn validate(&self) -> Result<(), RelishError> {
@@ -334,6 +338,128 @@ impl JobBenchReport {
             && self.error.is_none()
     }
 }
+
+/// Default allowed drop in accepted successes per second before `--compare`
+/// calls it a regression. Laptop VMs vary by about this much between sessions.
+pub const DEFAULT_TOLERANCE_PERCENT: u32 = 10;
+
+/// A scenario report measured against an earlier report of the same scenario.
+#[derive(Debug, Serialize)]
+pub struct JobBenchComparison {
+    /// The scenario both reports measured.
+    pub scenario: JobScenario,
+    /// The baseline's window rate.
+    pub baseline_successes_per_second: f64,
+    /// This run's window rate.
+    pub current_successes_per_second: f64,
+    /// Relative change; undefined from a zero baseline.
+    pub change_percent: Option<f64>,
+    /// Largest drop that still passes.
+    pub tolerance_percent: f64,
+    /// The rate fell by more than the tolerance.
+    pub regression: bool,
+    /// The settings differ, so the verdict is reported but never fails.
+    pub informational: bool,
+    /// Which settings differ between the two reports.
+    pub informational_reasons: Vec<String>,
+}
+impl JobBenchComparison {
+    /// Whether this comparison should fail the command.
+    pub fn failed(&self) -> bool {
+        self.regression && !self.informational
+    }
+}
+
+/// Compare `current` with `baseline`. Different scenarios, an incomplete
+/// baseline or a non-positive tolerance can't give a verdict; different
+/// settings give an informational one.
+pub fn compare_reports(
+    baseline: &JobBenchReport,
+    current: &JobBenchReport,
+    tolerance_percent: f64,
+) -> Result<JobBenchComparison, String> {
+    if !(tolerance_percent.is_finite() && tolerance_percent > 0.0 && tolerance_percent < 100.0) {
+        return Err("comparison tolerance must be between 0 and 100 percent".into());
+    }
+    if baseline.scenario != current.scenario {
+        return Err(format!(
+            "the baseline measured {}, not {}",
+            baseline.scenario.name(),
+            current.scenario.name()
+        ));
+    }
+    if baseline.schema_version != current.schema_version {
+        return Err(format!(
+            "baseline report schema {} differs from {}",
+            baseline.schema_version, current.schema_version
+        ));
+    }
+    if !baseline.healthy() {
+        return Err("the baseline measurement is incomplete, failed or not cleaned up".into());
+    }
+    let mut informational_reasons = Vec::new();
+    let mut differs = |what: &str, same: bool, old: String, new: String| {
+        if !same {
+            informational_reasons.push(format!("{what} differs: {old} in the baseline, {new} now"));
+        }
+    };
+    differs(
+        "window",
+        baseline.requested_seconds == current.requested_seconds,
+        format!("{} s", baseline.requested_seconds),
+        format!("{} s", current.requested_seconds),
+    );
+    differs(
+        "concurrency",
+        baseline.concurrency == current.concurrency,
+        baseline.concurrency.to_string(),
+        current.concurrency.to_string(),
+    );
+    differs(
+        "CPU request",
+        baseline.cpu_request_millicores == current.cpu_request_millicores,
+        format!("{:?}", baseline.cpu_request_millicores),
+        format!("{:?}", current.cpu_request_millicores),
+    );
+    differs(
+        "image",
+        baseline.image == current.image,
+        format!("{:?}", baseline.image),
+        format!("{:?}", current.image),
+    );
+    differs(
+        "executable",
+        baseline.executable == current.executable
+            && baseline.executable_sha256 == current.executable_sha256,
+        format!("{:?}", baseline.executable),
+        format!("{:?}", current.executable),
+    );
+    if !current.healthy() {
+        informational_reasons
+            .push("this measurement is incomplete, failed or not cleaned up".into());
+    }
+    let baseline_rate = baseline.successes_per_second;
+    let current_rate = current.successes_per_second;
+    let change_percent =
+        (baseline_rate > 0.0).then(|| (current_rate - baseline_rate) / baseline_rate * 100.0);
+    Ok(JobBenchComparison {
+        scenario: current.scenario,
+        baseline_successes_per_second: baseline_rate,
+        current_successes_per_second: current_rate,
+        change_percent,
+        tolerance_percent,
+        regression: change_percent.is_some_and(|change| change < -tolerance_percent),
+        informational: !informational_reasons.is_empty(),
+        informational_reasons,
+    })
+}
+
+#[derive(Serialize)]
+struct ComparedReport<'a> {
+    report: &'a JobBenchReport,
+    comparison: &'a JobBenchComparison,
+}
+
 fn failure(message: impl Into<String>) -> RelishError {
     RelishError::ApiError {
         status: 0,
@@ -624,6 +750,34 @@ async fn measure_raw(args: &JobBenchArgs, _cancel: &CancellationToken) -> JobBen
 /// Run one timed scenario and render a report even when measurement or cleanup fails.
 pub async fn run(args: JobBenchArgs) -> Result<CommandOutcome, RelishError> {
     args.validate()?;
+    // Read the baseline first: a missing or foreign baseline must not cost a
+    // measurement window or leave an empty reserved report behind.
+    let baseline = match &args.compare {
+        Some(path) => {
+            let bytes = tokio::fs::read(path).await.map_err(|error| {
+                failure(format!(
+                    "cannot read benchmark baseline {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let baseline: JobBenchReport = serde_json::from_slice(&bytes).map_err(|error| {
+                failure(format!(
+                    "benchmark baseline {} is not a job scenario report: {error}",
+                    path.display()
+                ))
+            })?;
+            if baseline.scenario != args.scenario {
+                return Err(failure(format!(
+                    "benchmark baseline {} measured {}, not {}",
+                    path.display(),
+                    baseline.scenario.name(),
+                    args.scenario.name()
+                )));
+            }
+            Some(baseline)
+        }
+        None => None,
+    };
     // Reserve the report before any work so a typo cannot overwrite older evidence.
     let mut evidence = match &args.report {
         Some(path) => Some(
@@ -677,32 +831,32 @@ pub async fn run(args: JobBenchArgs) -> Result<CommandOutcome, RelishError> {
             .await
             .map_err(|error| failure(format!("cannot sync benchmark evidence: {error}")))?;
     }
-    let rendered = match args.output {
-        OutputFormat::Json => json,
-        OutputFormat::Yaml => serde_yaml::to_string(&report).map_err(RelishError::SerialiseYaml)?,
-        OutputFormat::Human => format!(
-            "{}: {} {} in {} seconds ({:.1}/s)\n{} failures, {} retries; cleanup {}\n{} runs/day extrapolated — not an observed daily total{}",
-            args.scenario.name(),
-            report.count(),
-            if args.scenario == JobScenario::VmBaseline {
-                "raw successful exits"
-            } else {
-                "unique accepted successes"
-            },
-            args.seconds,
-            report.successes_per_second,
-            report.terminal_failures,
-            report.accepted_retries,
-            if report.cleanup_verified {
-                "verified"
-            } else {
-                "UNVERIFIED"
-            },
-            human_count(report.extrapolated_runs_per_day),
-            report
-                .error
-                .as_ref()
-                .map_or(String::new(), |error| format!("\nfailed: {error}"))
+    let comparison = match &baseline {
+        Some(baseline) => Some(
+            compare_reports(baseline, &report, f64::from(args.tolerance_percent))
+                .map_err(failure)?,
+        ),
+        None => None,
+    };
+    let rendered = match (args.output, &comparison) {
+        (OutputFormat::Json, None) => json,
+        (OutputFormat::Json, Some(comparison)) => serde_json::to_string_pretty(&ComparedReport {
+            report: &report,
+            comparison,
+        })
+        .map_err(RelishError::SerialiseJson)?,
+        (OutputFormat::Yaml, None) => {
+            serde_yaml::to_string(&report).map_err(RelishError::SerialiseYaml)?
+        }
+        (OutputFormat::Yaml, Some(comparison)) => serde_yaml::to_string(&ComparedReport {
+            report: &report,
+            comparison,
+        })
+        .map_err(RelishError::SerialiseYaml)?,
+        (OutputFormat::Human, comparison) => format!(
+            "{}{}",
+            render_human(&args, &report),
+            comparison.as_ref().map_or(String::new(), render_comparison)
         ),
     };
     println!("{rendered}");
@@ -716,11 +870,64 @@ pub async fn run(args: JobBenchArgs) -> Result<CommandOutcome, RelishError> {
             }
         );
     }
-    Ok(if report.healthy() {
-        CommandOutcome::Clean
+    Ok(
+        if report.healthy() && !comparison.as_ref().is_some_and(JobBenchComparison::failed) {
+            CommandOutcome::Clean
+        } else {
+            CommandOutcome::Problems
+        },
+    )
+}
+
+fn render_comparison(comparison: &JobBenchComparison) -> String {
+    let verdict = if comparison.informational {
+        "INFORMATIONAL"
+    } else if comparison.failed() {
+        "FAIL"
     } else {
-        CommandOutcome::Problems
-    })
+        "PASS"
+    };
+    let mut out = format!(
+        "\ncomparison: {verdict}: {:.1}/s -> {:.1}/s{} (tolerance {:.0}%)",
+        comparison.baseline_successes_per_second,
+        comparison.current_successes_per_second,
+        comparison.change_percent.map_or(
+            " (undefined from a zero baseline)".into(),
+            |change| format!(" ({change:+.1}%)")
+        ),
+        comparison.tolerance_percent
+    );
+    for reason in &comparison.informational_reasons {
+        out.push_str(&format!("\n  {reason}"));
+    }
+    out
+}
+
+fn render_human(args: &JobBenchArgs, report: &JobBenchReport) -> String {
+    format!(
+        "{}: {} {} in {} seconds ({:.1}/s)\n{} failures, {} retries; cleanup {}\n{} runs/day extrapolated — not an observed daily total{}",
+        args.scenario.name(),
+        report.count(),
+        if args.scenario == JobScenario::VmBaseline {
+            "raw successful exits"
+        } else {
+            "unique accepted successes"
+        },
+        args.seconds,
+        report.successes_per_second,
+        report.terminal_failures,
+        report.accepted_retries,
+        if report.cleanup_verified {
+            "verified"
+        } else {
+            "UNVERIFIED"
+        },
+        human_count(report.extrapolated_runs_per_day),
+        report
+            .error
+            .as_ref()
+            .map_or(String::new(), |error| format!("\nfailed: {error}"))
+    )
 }
 fn human_count(value: f64) -> String {
     for (scale, suffix) in [(1e9, "B"), (1e6, "M"), (1e3, "k")] {
@@ -757,6 +964,8 @@ mod tests {
             namespace: "default".into(),
             output: OutputFormat::Json,
             report: None,
+            compare: None,
+            tolerance_percent: DEFAULT_TOLERANCE_PERCENT,
         }
     }
 
@@ -821,6 +1030,85 @@ mod tests {
         let mut bad = summary;
         bad["retried"] = serde_json::Value::Null;
         assert!(counts.observe(&bad).is_err());
+    }
+
+    fn measured(scenario: JobScenario, successes: u64) -> JobBenchReport {
+        let mut report = JobBenchReport::new(&JobBenchArgs {
+            scenario,
+            seconds: 60,
+            ..args()
+        });
+        report.unique_accepted_successes = successes;
+        report.measurement_complete = true;
+        report.cleanup_verified = true;
+        report.finalise(61.0);
+        report
+    }
+
+    #[test]
+    fn scenario_report_compares_against_a_baseline() {
+        let baseline = measured(JobScenario::SharedContainers, 120_000);
+        let current = measured(JobScenario::SharedContainers, 114_000);
+        let comparison = compare_reports(&baseline, &current, 10.0).unwrap();
+        assert_eq!(comparison.baseline_successes_per_second, 2000.0);
+        assert_eq!(comparison.current_successes_per_second, 1900.0);
+        assert_eq!(comparison.change_percent, Some(-5.0));
+        assert!(!comparison.regression);
+        assert!(!comparison.informational);
+        assert!(!comparison.failed());
+    }
+
+    #[test]
+    fn compare_flags_a_throughput_regression() {
+        let baseline = measured(JobScenario::HostProcesses, 240_000);
+        let current = measured(JobScenario::HostProcesses, 180_000);
+        let comparison = compare_reports(&baseline, &current, 10.0).unwrap();
+        assert_eq!(comparison.change_percent, Some(-25.0));
+        assert!(comparison.regression);
+        assert!(comparison.failed());
+        // A faster run is never a regression.
+        let faster = compare_reports(&current, &baseline, 10.0).unwrap();
+        assert!(!faster.regression);
+    }
+
+    #[test]
+    fn compare_refuses_another_scenario_or_an_unusable_baseline() {
+        let baseline = measured(JobScenario::Containers, 600);
+        let current = measured(JobScenario::SharedContainers, 120_000);
+        assert!(compare_reports(&baseline, &current, 10.0).is_err());
+        let mut incomplete = measured(JobScenario::SharedContainers, 120_000);
+        incomplete.measurement_complete = false;
+        assert!(compare_reports(&incomplete, &current, 10.0).is_err());
+        assert!(compare_reports(&current, &current, 0.0).is_err());
+    }
+
+    #[test]
+    fn compare_is_informational_when_the_settings_differ() {
+        let baseline = measured(JobScenario::SharedContainers, 120_000);
+        let mut current = measured(JobScenario::SharedContainers, 60_000);
+        current.concurrency = 8;
+        let comparison = compare_reports(&baseline, &current, 10.0).unwrap();
+        assert!(comparison.informational);
+        assert!(comparison.regression, "the drop is still reported");
+        assert!(!comparison.failed(), "but unlike settings never fail");
+        assert!(
+            comparison
+                .informational_reasons
+                .iter()
+                .any(|reason| reason.contains("concurrency"))
+        );
+    }
+
+    #[test]
+    fn a_committed_rerun_report_parses_as_a_baseline() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/qualification/2026-10-09-timed-job-scenarios/five-round-rerun/review-fixes/r1-jobs-shared-containers.json"
+        );
+        let baseline: JobBenchReport =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(baseline.scenario, JobScenario::SharedContainers);
+        assert!(baseline.measurement_complete);
     }
 
     #[test]
