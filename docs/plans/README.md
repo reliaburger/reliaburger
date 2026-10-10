@@ -11,6 +11,7 @@ the detail is in the GitHub milestones and issues.
 | Plan | What it is | Still open |
 |---|---|---|
 | [Job retirement and record-read races](2026-10-10-job-retirement-read-races.md) | Retain filesystem cleanup across timeouts and validate atomically replaced records with one metadata inspection. | #654: review and GitHub checks |
+| [Jobs in the release soak](2026-10-10-plan-release-job-soak.md) | Exercise all job runtimes alongside apps and existing faults within the current V02 duration. | Staged fast/final qualification and resource-cap calibration |
 | [Container migration](2026-10-09-plan-container-migration.md) | The delivery plan for moving running workloads: who it's for, decisions, ordered spikes with go/no-go rules, and nine named milestones across 0.4.0, 0.4.1 and 0.5.0 (live moves). The [research](2026-09-28-research-container-migration.md) holds the CRIU findings, continuity contract and design reference; checked against main on 9 October. | [#268](https://github.com/reliaburger/reliaburger/pull/268): feasibility spikes, implementation and qualification |
 | [GitOps webhook admission](2026-10-04-gitops-webhook-admission.md) | Replicate authenticated triggers before 202, with bounded admission and generation-aware retry. | [#553](https://github.com/reliaburger/reliaburger/issues/553) |
 | [GitOps job refusal](2026-10-04-gitops-job-refusal.md) | Refuse unsupported jobs before publishing their dependent apps or advancing the applied revision. | #549 |
