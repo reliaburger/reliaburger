@@ -3,7 +3,7 @@
 Status: research, 11 October 2026. Checked against `main` at `b2affe93`. A
 follow-up to [the batch scheduler landscape](2026-10-11-research-batch-schedulers.md),
 which this page assumes you've read. The maintainer decided the release order
-on 11 October (see [Decisions](#decisions)); five questions remain before it
+on 11 October (see [Decisions](#decisions)); three questions remain before it
 becomes milestones.
 
 The question: what would make Reliaburger the obvious choice for running LLM
@@ -857,12 +857,48 @@ short recording with a laptop-sized step in the executable tour where one
 exists. Together they'd be a second
 tour on the homepage, beside the existing one, aimed at people with GPUs.
 
-Recording them needs real hardware: at least one multi-GPU node for 0.6.0
-and 0.7.0, and two to three GPU nodes with a spare from 0.8.0. The same
-machines run the `make test-gpu` gate. The maintainer has NVIDIA hardware
-for both; the exit tests above assume eight NVLink-connected data-centre
-GPUs per node and will be scaled to the actual machines when each release
-is planned.
+### Testing on real GPUs
+
+The maintainer's GPU hardware is one NVIDIA RTX 5080: a consumer Blackwell
+card with 16 GB of memory, no NVLink and no MIG. That's enough to prove
+everything that happens on one GPU, and not enough to prove anything that
+needs two. So the GPU releases are tested in three tiers:
+
+1. **The portable suite, everywhere.** A fake NVML and CDI backend lets CI
+   test device inventory, allocation, topology choice, XID handling, group
+   placement and failure without a GPU.
+2. **`make test-gpu`, on the RTX 5080.** A new gated target for everything
+   one real GPU can prove: CDI injection and cgroup isolation (a container
+   without a grant sees no GPU), NVML metrics, the health path, and vLLM
+   serving a model that fits in 16 GB (an 8B model in 8-bit, for example).
+   It also covers model artifacts in Pickle, generate-based readiness, scale
+   to zero and cold-start timing.
+3. **Rented multi-GPU machines, a few hours per release.** For what one card
+   can't show: tensor parallelism over NVLink, topology choice, a second
+   replica loading weights from a peer GPU node, multi-node groups, RDMA and
+   hot spares. The demo recordings for those beats happen in the same
+   session.
+
+What the 5080 can and can't prove, release by release:
+
+| Release | On the RTX 5080 | Needs rented hardware |
+|---|---|---|
+| 0.6.0 GPUs | Device inventory, CDI, isolation, metrics, `relish gpus`, a synthetic XID leading to a cordon | Several GPUs per job, NVLink topology, moving work to a healthy GPU |
+| 0.7.0 Models | `relish model run`, weights in Pickle, readiness, scale to zero, cold start, API keys and token limits | Peer-loaded replicas on a second GPU node, prefix routing across replicas |
+| 0.8.0 Groups | Group mechanics with CPU members (torchrun on its CPU backend across nodes) and one GPU member | Multi-node GPU training, RDMA, spares, verl at scale |
+| 0.9.0 Pipelines | GPU task arrays and the batch API on one card | Throughput across many GPUs |
+| 0.10.0 Fair share | Queues, preemption and grace periods on one card | Shares settling across many GPUs |
+
+Two caveats to check early. DCGM's diagnostics and error injection are
+built for data-centre GPUs, and we can't count on them on a GeForce card, so
+on the 5080 the health path gets a synthetic XID through the node's event
+watcher (ClusterMAX's graders inject synthetic XIDs the same way). And
+Blackwell consumer cards need a recent driver and CUDA 12.8 or later, which
+is a useful first case for the driver and CUDA compatibility check.
+
+The exit tests above describe the multi-GPU target. Each release's plan
+splits its exit test into the part the 5080 proves on every run and the part
+the rented session proves once before the release.
 
 ### Later
 
@@ -893,22 +929,19 @@ The maintainer decided on 11 October 2026:
 1. **A Models release.** 0.7.0 Models comes before pipelines.
 2. **Groups earlier.** Groups become their own release, 0.8.0, straight after
    Models; Pipelines moves to 0.9.0 and Fair share to 0.10.0.
-3. **Hardware.** The maintainer has NVIDIA hardware for the `make test-gpu`
-   gate and the demo recordings.
+3. **The GPU release carries all eight items**, health and metrics included.
+4. **Models are `[model.*]`**, shorthand that expands to an `[app.*]`.
+5. **Hardware.** One RTX 5080 runs `make test-gpu`; multi-GPU tests and
+   recordings use rented machines (see [Testing on real GPUs](#testing-on-real-gpus)).
 
 Still open:
 
-4. Grow 0.6.0 GPUs to the eight items above, or keep it to placement and
-   CDI and move health and metrics later?
-5. Where do GPU dev environments go? dstack, Lepton and GPUStack all win
+6. Where do GPU dev environments go? dstack, Lepton and GPUStack all win
    researchers with them.
-6. Do we commit to the endpoint picker protocol as Wrapper's extension point,
+7. Do we commit to the endpoint picker protocol as Wrapper's extension point,
    so llm-d's router plugs in, or build our own routing only?
-7. Is `[model.*]` shorthand over `[app.*]` the right shape, or should models
-   simply be apps with a few new fields?
-8. Which GPUs, and how many per node, does the test hardware have? The exit
-   tests are written for eight NVLink-connected GPUs per node; consumer cards
-   without NVLink, or fewer per node, change what 0.6.0 and 0.8.0 can prove.
+8. Is renting multi-GPU machines for a few hours per release acceptable, and
+   from which provider?
 
 ## Sources
 
