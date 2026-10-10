@@ -610,7 +610,8 @@ pub fn authorize_scoped(
 }
 
 /// Authorise one resolved workload before any desired write or dispatch.
-/// Scope is checked first, then Deploy, then HostExec for host binaries/scripts.
+/// Scope is checked first, then Deploy, then HostExec for host binaries,
+/// scripts and host-path sources.
 /// The caller supplies its authoritative permission snapshot and still owns
 /// role, lease, resource validation and transport admission.
 #[allow(clippy::result_large_err)]

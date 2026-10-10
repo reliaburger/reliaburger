@@ -1510,5 +1510,11 @@
     "function": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands"
+  },
+  {
+    "source": "src/bun/supervisor.rs",
+    "function": "runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted",
+    "binary": "reliaburger",
+    "test": "bun::supervisor::tests::runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted"
   }
 ]

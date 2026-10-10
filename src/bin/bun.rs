@@ -1346,6 +1346,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // policy and an operator's allowlist would be silently ignored — a
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
+    // Host-path sources are refused unless `[storage] allowed_host_paths`
+    // covers them, and never reach the node's own directories.
+    agent.set_host_path_policy(
+        reliaburger::bun::host_paths::HostPathPolicy::from_node_config(&config),
+    );
     // Bound fault durations by the `[smoker]` policy (default + maximum).
     agent.configure_perimeter(
         vec![

@@ -54,6 +54,12 @@ impl TestHarness {
         );
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // Tests mount host paths from their own temp directories; the
+        // managed volumes directory stays off limits, as on a real node.
+        agent.set_host_path_policy(reliaburger::bun::host_paths::HostPathPolicy::new(
+            vec![std::env::temp_dir()],
+            vec![volumes.path().to_path_buf()],
+        ));
         let deploy_history = agent.deploy_history_handle();
         let status_reader = agent.status_reader();
         let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));

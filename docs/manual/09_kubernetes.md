@@ -43,7 +43,11 @@ From the pod template it takes the first container's image, `command`, `args`,
 The report warns about everything it approximates or drops. The usual ones:
 
 - sidecars: only the first container is imported;
-- pod volumes and `fsGroup`: declare Reliaburger volumes instead;
+- pod volumes and `fsGroup`: declare Reliaburger volumes instead. A `hostPath`
+  volume gets a warning of its own, because its replacement, a hand-written
+  `source`, needs the `host-exec` permission and a `[storage]
+  allowed_host_paths` entry on every node that runs it (see
+  `images-and-volumes`);
 - `livenessProbe`, and `exec`, `tcpSocket` or gRPC readiness probes;
 - `env` from `valueFrom`: set the value, or encrypt it with
   `relish secret encrypt` (see `security`);

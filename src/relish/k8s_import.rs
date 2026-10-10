@@ -581,6 +581,22 @@ fn pod_spec_to_app(
                     .to_string(),
             });
         }
+        // A hostPath volume is the one kind a hand-written replacement can't
+        // just declare: a `source` needs the host-exec permission and an
+        // allowlist entry on every node that runs it.
+        for volume in ps.volumes.iter().flatten() {
+            if let Some(host_path) = &volume.host_path {
+                report.warnings.push(MigrationWarning {
+                    resource: resource.to_string(),
+                    message: format!(
+                        "hostPath volume {:?} ({}) is not imported; a hand-written `source` \
+                         needs the host-exec permission and a [storage] allowed_host_paths \
+                         entry in node.toml on every node that runs it",
+                        volume.name, host_path.path
+                    ),
+                });
+            }
+        }
     }
     if container.and_then(|c| c.liveness_probe.as_ref()).is_some() {
         report.warnings.push(MigrationWarning {
@@ -2723,6 +2739,40 @@ spec:
         // Pod-level runAsUser, container-level runAsGroup.
         assert_eq!(app.run_as_user, Some(100));
         assert_eq!(app.run_as_group, Some(101));
+    }
+
+    #[test]
+    fn host_path_volume_is_named_in_the_import_warning() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+spec:
+  template:
+    spec:
+      containers:
+      - name: agent
+        image: fluent-bit:3
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: scratch
+        emptyDir: {}
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(result.config.app["agent"].volumes.is_empty());
+        let warnings = warnings_of(&result);
+        let host_path: Vec<_> = warnings.iter().filter(|w| w.contains("hostPath")).collect();
+        assert_eq!(host_path.len(), 1, "{warnings:?}");
+        assert!(
+            host_path[0].starts_with("Deployment/agent")
+                && host_path[0].contains("\"varlog\" (/var/log)")
+                && host_path[0].contains("host-exec")
+                && host_path[0].contains("allowed_host_paths"),
+            "{warnings:?}"
+        );
     }
 
     #[test]

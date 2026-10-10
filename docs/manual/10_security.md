@@ -181,7 +181,7 @@ do only what the block lists:
 | `deploy` | apply, delete and roll back the listed apps, cancel their deploys |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
-| `host-exec` | jobs and process workloads that run host commands |
+| `host-exec` | jobs and process workloads that run host commands, and apps with a host-path `source` on a volume or `config_file` |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
 | `secret-write` | `relish secret rotate`, for the cluster or one namespace (needs `apps = ["*"]` and no `namespaces`) |

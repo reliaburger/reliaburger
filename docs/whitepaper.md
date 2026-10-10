@@ -319,6 +319,8 @@ volume = { path = "/data", size = "10Gi" }
 
 Reliaburger enforces volume size via Btrfs subvolume quotas or loop-mounted sparse files on ext4/xfs. Built-in volume snapshots use copy-on-write filesystem snapshots with scheduled upload jobs.
 
+A volume can instead name a host directory with `source`, as a config file can name a host file. Because every rootful container on a node shares one user-namespace id range, a host path would let one tenant mount another's managed volume, so host paths are gated twice: each node refuses any `source` not under a prefix in its `[storage] allowed_host_paths` (empty by default) and always refuses its own storage and security directories, and a token with a `[permission]` block needs `host-exec` to deploy one.
+
 ### 5.6 Permission
 
 Simplified access control. Permissions define who can perform which actions.
@@ -329,7 +331,7 @@ actions = ["deploy", "scale", "logs", "metrics"]
 apps = ["web", "api"]
 ```
 
-Valid actions: `deploy`, `scale`, `logs`, `metrics`, `exec`, `host-exec`, `admin`, `secret-read`, `secret-write`. The `host-exec` and `admin` actions are required for process workloads and cluster administration respectively.
+Valid actions: `deploy`, `scale`, `logs`, `metrics`, `exec`, `host-exec`, `admin`, `secret-read`, `secret-write`. The `host-exec` and `admin` actions are required for process workloads and cluster administration respectively; `host-exec` also covers apps that mount a host path with `source`.
 
 ### 5.7 Namespace
 

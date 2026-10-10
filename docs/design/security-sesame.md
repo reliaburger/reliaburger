@@ -919,7 +919,7 @@ session carries its token's name, so it rides the same spec. The route matrix in
 | Gate | Check | Routes |
 |------|-------|--------|
 | `App(action)` | `authorize_permission` on the path's app and namespace | logs (SSE, entries, cross-node query, WebSocket) → `logs`; app metrics and charts → `metrics`; delete, rollback → `deploy`; stop → `scale`; exec → `exec` |
-| `Body(action)` | the same, per app the body names | apply (`deploy`, plus `host-exec` for host commands), deploy cancel (`deploy`) |
+| `Body(action)` | the same, per app the body names | apply (`deploy`, plus `host-exec` for host commands and host-path `source`s), deploy cancel (`deploy`) |
 | `Cluster(action)` | `authorize_cluster_permission`: the action with `apps = ["*"]` and no `namespaces` | `/v1/logs/sql` → `logs`; `/v1/metrics*` store, rollups and cluster queries, `/v1/alerts`, the alerts fragment → `metrics`; secret rotation → `secret-write`; tokens, join tokens, upgrades, elections, decommission, image signing, log export, `[permission]`/`[namespace]` declarations and test-lease overrides → `admin` |
 | `Filtered(action)` | the route answers without the parts the spec doesn't grant | `/v1/top` rows → `metrics` per app; dashboard alert panel → cluster `metrics`; app page charts → `metrics` on that app |
 

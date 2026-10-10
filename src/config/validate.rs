@@ -537,11 +537,16 @@ impl NodeConfig {
             ("storage.metrics", &self.storage.metrics),
             ("storage.volumes", &self.storage.volumes),
         ];
-        for (field, path) in &paths {
+        let allowed_host_paths = self
+            .storage
+            .allowed_host_paths
+            .iter()
+            .map(|path| ("storage.allowed_host_paths", path));
+        for (field, path) in paths.into_iter().chain(allowed_host_paths) {
             if !path.is_absolute() {
                 return Err(ConfigError::NonAbsolutePath {
-                    field: (*field).to_string(),
-                    path: (*path).clone(),
+                    field: field.to_string(),
+                    path: path.clone(),
                 });
             }
         }

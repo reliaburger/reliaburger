@@ -1201,6 +1201,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.set_process_config(config);
     }
 
+    /// Thread the host-path policy built from `node.toml` into the supervisor.
+    /// Without this every volume or config-file `source` is refused.
+    pub fn set_host_path_policy(&mut self, policy: super::host_paths::HostPathPolicy) {
+        self.supervisor.set_host_path_policy(policy);
+    }
+
     /// Thread the parsed `[smoker]` duration limits in, so faults are bounded
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {

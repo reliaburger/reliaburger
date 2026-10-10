@@ -120,6 +120,9 @@ pub struct WorkloadSupervisor<G: Grill> {
     /// Process workload manager — validates exec binaries against the
     /// allowlist and manages script temp file lifecycle.
     process_manager: crate::grill::process_workload::ProcessManager,
+    /// Which host paths a volume or config-file `source` may mount
+    /// (`[storage] allowed_host_paths`); refuses every one by default.
+    host_paths: super::host_paths::HostPathPolicy,
     /// What this node can actually enforce (GPU, rootless limits).
     capabilities: PlatformCapabilities,
     budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
@@ -155,6 +158,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             health_checker: HealthChecker::new(),
             app_instances: HashMap::new(),
             process_manager: crate::grill::process_workload::ProcessManager::new(process_config),
+            host_paths: super::host_paths::HostPathPolicy::default(),
             capabilities: PlatformCapabilities::default(),
             budget: super::execution_budget::ExecutionBudget::new(crate::meat::Resources::new(
                 u64::MAX,
@@ -234,11 +238,18 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.process_manager = crate::grill::process_workload::ProcessManager::new(config);
     }
 
-    /// Full admission check for an app: host-exec/script allowlist, GPU
-    /// availability, rootless resource limits and egress enforcement.
-    /// Returns the first refusal.
+    /// Replace the host-path policy. The binary feeds the one built from
+    /// `node.toml` here; without it every host-path `source` is refused.
+    pub fn set_host_path_policy(&mut self, policy: super::host_paths::HostPathPolicy) {
+        self.host_paths = policy;
+    }
+
+    /// Full admission check for an app: host-exec/script allowlist, host-path
+    /// allowlist, GPU availability, rootless resource limits and egress
+    /// enforcement. Returns the first refusal.
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
+        self.admit_host_paths(app_name, spec)?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(
             app_name,
@@ -251,6 +262,21 @@ impl<G: Grill> WorkloadSupervisor<G> {
             spec.exec.is_some() || spec.script.is_some(),
         )?;
         self.admit_dns(app_name)?;
+        Ok(())
+    }
+
+    /// Refuse a volume or config-file `source` this node's
+    /// `[storage] allowed_host_paths` doesn't cover, or one that overlaps the
+    /// node's own storage and security directories.
+    fn admit_host_paths(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
+        for source in spec.host_path_sources() {
+            self.host_paths
+                .admit(source)
+                .map_err(|refusal| BunError::DeployFailed {
+                    app_name: app_name.to_string(),
+                    reason: format!("host path refused: {refusal}"),
+                })?;
+        }
         Ok(())
     }
 
@@ -1056,6 +1082,145 @@ mod tests {
             run_as_user: None,
             run_as_group: None,
         }
+    }
+
+    /// The audit scenario (#676): a deployer in `team-a` names team B's
+    /// managed volume as a host-path source. Even an operator who allowlists a
+    /// parent of the volumes directory can't open that path.
+    #[tokio::test]
+    async fn a_host_path_into_another_namespaces_volume_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let mut node = crate::config::NodeConfig::default();
+        node.storage.volumes = root.path().join("volumes");
+        node.storage.allowed_host_paths = vec![root.path().to_path_buf()];
+        std::fs::create_dir_all(node.storage.volumes.join("team-b/db")).unwrap();
+        let mut sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        sup.set_host_path_policy(super::super::host_paths::HostPathPolicy::from_node_config(
+            &node,
+        ));
+        let mut thief = basic_app_spec(None);
+        thief.volumes = vec![crate::config::types::VolumeSpec {
+            path: "/steal".into(),
+            source: Some(node.storage.volumes.join("team-b/db")),
+            size: None,
+        }];
+        let error = sup
+            .deploy_app("thief", "team-a", &thief, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no workload may mount"),
+            "{error}"
+        );
+        assert!(sup.list_instances().is_empty());
+    }
+
+    /// The same refusal on a real runc node (#676): nothing reaches runc, so
+    /// no bundle is written and runc owns no container for the app.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires runc and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted() {
+        assert!(
+            std::env::var("RELIABURGER_RUNC_TESTS").is_ok(),
+            "set RELIABURGER_RUNC_TESTS=1 after installing runc"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let owner = std::env::var_os("RELIABURGER_BUN_BINARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                // Unit tests run from target/<profile>/deps; Bun is built beside it.
+                let executable = std::env::current_exe().unwrap();
+                executable.parent().unwrap().parent().unwrap().join("bun")
+            });
+        let grill = crate::grill::runc::RuncGrill::new(
+            root.path().join("bundles"),
+            crate::grill::ImageStore::new(root.path().join("images")),
+            false,
+            root.path().join("state"),
+            owner,
+        )
+        .unwrap();
+        let mut node = crate::config::NodeConfig::default();
+        node.storage.volumes = root.path().join("volumes");
+        std::fs::create_dir_all(node.storage.volumes.join("team-b/db")).unwrap();
+        std::fs::create_dir_all(root.path().join("import")).unwrap();
+        let mut sup = WorkloadSupervisor::new(grill, PortAllocator::new(42000, 43000));
+        let thief = |source: std::path::PathBuf| {
+            let mut spec = basic_app_spec(None);
+            spec.volumes = vec![crate::config::types::VolumeSpec {
+                path: "/steal".into(),
+                source: Some(source),
+                size: None,
+            }];
+            spec
+        };
+
+        let unlisted = thief(root.path().join("import"));
+        let error = sup
+            .deploy_app("thief", "team-a", &unlisted, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("allowed_host_paths"), "{error}");
+
+        node.storage.allowed_host_paths = vec![root.path().to_path_buf()];
+        sup.set_host_path_policy(super::super::host_paths::HostPathPolicy::from_node_config(
+            &node,
+        ));
+        let crossing = thief(node.storage.volumes.join("team-b/db"));
+        let error = sup
+            .deploy_app("thief", "team-a", &crossing, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no workload may mount"),
+            "{error}"
+        );
+
+        assert!(sup.list_instances().is_empty());
+        assert!(
+            sup.grill()
+                .launch_inventory()
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            std::fs::read_dir(root.path().join("bundles"))
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_path_source_is_refused_without_an_allowlist_and_admitted_under_one() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("import");
+        let mut sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        let mut app = basic_app_spec(None);
+        app.config_file = vec![crate::config::types::ConfigFileSpec {
+            path: "/etc/app.yaml".into(),
+            content: None,
+            source: Some(import.join("app.yaml").to_string_lossy().into_owned()),
+        }];
+        let error = sup.admit_app("web", &app).unwrap_err();
+        assert!(error.to_string().contains("allowed_host_paths"), "{error}");
+        sup.set_host_path_policy(super::super::host_paths::HostPathPolicy::new(
+            vec![import],
+            vec![root.path().join("volumes")],
+        ));
+        sup.admit_app("web", &app).unwrap();
+        // A managed volume needs no allowlist entry at all.
+        let mut managed = basic_app_spec(None);
+        managed.volumes = vec![crate::config::types::VolumeSpec {
+            path: "/data".into(),
+            source: None,
+            size: None,
+        }];
+        WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000))
+            .admit_app("db", &managed)
+            .unwrap();
     }
 
     fn app_spec_with_health(port: u16) -> AppSpec {

@@ -2,6 +2,10 @@
 #
 # Two modes:
 #   - HostPath: specify `source` to bind-mount a host directory directly.
+#               The node refuses it unless its node.toml lists a covering
+#               prefix in `[storage] allowed_host_paths`, e.g.
+#               allowed_host_paths = ["/var/www"], and a token with a
+#               [permission] block also needs `host-exec`.
 #   - Managed:  omit `source` and Reliaburger picks a directory under
 #               storage.volumes/{namespace}/{app}/{path}.
 #

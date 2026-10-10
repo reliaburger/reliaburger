@@ -39,7 +39,11 @@ def caller_rule(source, kind):
             auth.as_deref(), app_name, namespace, host_execution, &permissions,
         )'''
         before = source[source.index('    let targets ='):start]
-        if before.count('spec.script.is_some() || spec.exec.is_some()') != 2:
+        # Apps delegate to AppSpec::needs_host_access (host commands plus
+        # host-path sources, #676); jobs name their host command fields.
+        if before.count('spec.needs_host_access()') != 1:
+            return False
+        if before.count('spec.script.is_some() || spec.exec.is_some()') != 1:
             return False
     else:
         start = source.index('    let permissions = super::api::permission_map(&state).await;')
@@ -68,6 +72,17 @@ class WorkloadAuthorizationPolicy(unittest.TestCase):
         start = source.index('    pub fn is_host(&self) -> bool {')
         body = compact(source[start:source.index('\n    }', start)])
         self.assertIn(compact('self.exec.is_some() || self.script.is_some()'), body)
+
+    def test_app_host_test_covers_host_commands_and_host_path_sources(self):
+        source = (ROOT / 'src/config/app.rs').read_text()
+        start = source.index('    pub fn needs_host_access(&self) -> bool {')
+        body = compact(source[start:source.index('\n    }', start)])
+        self.assertIn(compact('self.exec.is_some() || self.script.is_some()'), body)
+        self.assertIn(compact('self.host_path_sources().next().is_some()'), body)
+        start = source.index('    pub fn host_path_sources(&self)')
+        body = compact(source[start:source.index('\n    }', start)])
+        self.assertIn(compact('volume.source.as_deref()'), body)
+        self.assertIn(compact('file.source.as_deref()'), body)
 
     def test_batch_delegates_each_resolved_target_before_forwarding(self):
         source = (ROOT / 'src/bun/batch.rs').read_text()

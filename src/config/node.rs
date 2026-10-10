@@ -574,6 +574,13 @@ pub struct StorageSection {
     pub logs: PathBuf,
     pub metrics: PathBuf,
     pub volumes: PathBuf,
+    /// Absolute path prefixes a workload may bind-mount from this node with a
+    /// volume or config-file `source`. Empty (the default) refuses every host
+    /// path. Matching is by whole path component after resolving symlinks,
+    /// and the storage and security directories above are always refused,
+    /// even under a listed prefix.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_host_paths: Vec<PathBuf>,
     /// Scheduled volume snapshots (`[storage.snapshots]`).
     pub snapshots: SnapshotsSection,
 }
@@ -586,6 +593,7 @@ impl Default for StorageSection {
             logs: PathBuf::from("/var/lib/reliaburger/logs"),
             metrics: PathBuf::from("/var/lib/reliaburger/metrics"),
             volumes: PathBuf::from("/var/lib/reliaburger/volumes"),
+            allowed_host_paths: Vec::new(),
             snapshots: SnapshotsSection::default(),
         }
     }
@@ -1146,6 +1154,36 @@ pub struct AlertDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allowed_host_paths_defaults_to_empty() {
+        let config = NodeConfig::parse("").unwrap();
+        assert!(config.storage.allowed_host_paths.is_empty());
+        // An empty list stays out of a written node.toml.
+        let written = toml::to_string(&config.storage).unwrap();
+        assert!(!written.contains("allowed_host_paths"), "{written}");
+        let listed =
+            NodeConfig::parse("[storage]\nallowed_host_paths = [\"/srv/import\"]\n").unwrap();
+        assert_eq!(
+            listed.storage.allowed_host_paths,
+            vec![PathBuf::from("/srv/import")]
+        );
+    }
+
+    #[test]
+    fn allowed_host_paths_must_be_absolute() {
+        let config =
+            NodeConfig::parse("[storage]\nallowed_host_paths = [\"srv/import\"]\n").unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                super::super::error::ConfigError::NonAbsolutePath { ref field, .. }
+                    if field == "storage.allowed_host_paths"
+            ),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn image_mirrors_parse_and_refuse_urls() {

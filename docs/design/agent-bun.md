@@ -160,7 +160,15 @@ maps it into the node range and prepares every read-write volume:
   host gid, or world-writable. When the mode bits say the process can't write,
   Bun logs a warning naming the directory, its owner and the host uid to
   `chown` it to, then starts the container anyway: a read-mostly mount is
-  legitimate.
+  legitimate. Because every rootful container shares one id range, a host
+  path is also a tenant boundary (#676). The supervisor admits a volume or
+  `config_file` `source` only under a prefix in `[storage] allowed_host_paths`
+  (empty by default, so every host path is refused), matched by path
+  component after resolving symlinks, with `..` refused. It always refuses a
+  source that is under, or contains, the node's `[storage]`, identity and
+  script directories or the directories holding the master key and security
+  bootstrap. At apply, any `source` counts as host access, so a token with a
+  `[permission]` block needs `host-exec` as well as `deploy`.
 - **Rootless runc** skips all of this: the volume was created by the user
   whose id is the container's only mapped id (container root).
 
@@ -1032,7 +1040,7 @@ before their Phase 15 cases can use this contract.
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
-9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem. Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
+9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was already checked against `[storage] allowed_host_paths` at admission). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container via containerd sharing the main container's network namespace and volumes. Wait for exit code 0. If any fails, transition to `Failed` and emit event.
 11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
 12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
@@ -1350,6 +1358,7 @@ join = ["10.0.1.5:9443"]
 | `[storage]` | `logs` | `/var/lib/reliaburger/logs` | absolute path | Application logs (Ketchup). Append-heavy. |
 | `[storage]` | `metrics` | `/var/lib/reliaburger/metrics` | absolute path | Time-series data (Mayo). Append-heavy, random reads. |
 | `[storage]` | `volumes` | `/var/lib/reliaburger/volumes` | absolute path | Persistent app data. Must be reliable. |
+| `[storage]` | `allowed_host_paths` | `[]` | list of absolute paths | Prefixes a volume or config-file `source` may mount from. Empty refuses every host path; the storage, identity, script and key directories are refused even under a listed prefix. |
 | `[resources]` | `reserved_cpu` | `"500m"` | resource string (millicores) | CPU reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_memory` | `"512Mi"` | resource string (bytes) | Memory reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
