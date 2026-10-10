@@ -89,8 +89,10 @@ council makes `start`, `status` and `rollback` act on that single node. Any
 other failure, such as a timeout or a 5xx, stops the command with that error:
 an upgrade that silently fell back to the connected node alone would skip the
 rolling order, the quorum checks and the run record. On a single node, a
-downloaded binary is staged in a fresh private directory for the node to read,
-and removed once the node has answered.
+downloaded binary is staged in a fresh directory only relish's user can open,
+and removed once the node has answered. So bun has to be able to read it: run
+bun as root, or as the same user that runs relish. Otherwise download and
+countersign the binary yourself and use `--binary` from a path bun can read.
 
 relish pushes the binary to the registry of the node it's connected to and
 tells the other nodes to fetch it from that node's cluster address. From a
