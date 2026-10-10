@@ -1066,3 +1066,81 @@ async fn standalone_restart_retains_runs_requests_and_the_next_identity() {
             > id
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daily_named_arrays_keep_working_past_the_definition_cap() {
+    // `relish run --batch render-$DATE` every day: each date is a new job
+    // name. One-off definitions expire with their last run, so the
+    // namespace's definition cap never fills up.
+    let harness = Harness::start(Options::processes(false)).await;
+    let days = reliaburger::meat::job::MAX_JOB_DEFINITIONS_PER_NAMESPACE + 6;
+    for wave in (0..days).collect::<Vec<_>>().chunks(10) {
+        let mut ids = Vec::new();
+        for day in wave {
+            let mut array = shell_array(1, 1, "exit 0");
+            array["name"] = json!(format!("render-day-{day}"));
+            ids.push(harness.submit_ok(array).await);
+        }
+        for id in ids {
+            assert_eq!(harness.wait_done(id, 60).await["status"], "Succeeded");
+        }
+    }
+    let (status, body) = harness.get("/v1/jobs/definitions").await;
+    assert_eq!(status, 200);
+    let definitions: Value = serde_json::from_slice(&body).unwrap();
+    let held = definitions["definitions"].as_array().unwrap().len();
+    assert!(
+        held < reliaburger::meat::job::MAX_JOB_DEFINITIONS_PER_NAMESPACE,
+        "{held} definitions still held"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_blocked_job_shows_its_reason_in_status() {
+    let harness = Harness::start(Options {
+        council: true,
+        runner: NodeRunner::Fake(FakeRunner::new(Duration::from_secs(60), |_| {
+            AttemptOutcome::Exited { code: 0 }
+        })),
+        allowed: vec![SHELL],
+        slots: 4,
+    })
+    .await;
+    let council = harness.council.clone().unwrap();
+    // Two CPUs for the namespace; each task asks for one.
+    council
+        .write(reliaburger::council::RaftRequest::NamespaceSpec {
+            name: "tenant".into(),
+            spec: Box::new(reliaburger::config::NamespaceSpec {
+                cpu: Some("2".into()),
+                memory: None,
+                gpu: None,
+                max_apps: None,
+                max_replicas: None,
+                secret_key: false,
+            }),
+        })
+        .await
+        .unwrap();
+    let mut array = shell_array(100, 1, "exit 0");
+    array["namespace"] = json!("tenant");
+    array["template"]["cpu"] = json!("1");
+    let batch_id = harness.submit_ok(array).await;
+
+    let summary = harness
+        .wait_until(batch_id, 30, |s| s["quota_blocked_reason"].is_string())
+        .await;
+    let reason = summary["quota_blocked_reason"].as_str().unwrap();
+    assert!(reason.contains("\"tenant\""), "{reason}");
+    assert!(reason.contains("CPU quota"), "{reason}");
+    // The quota holds: no more than two attempts are ever granted out.
+    for _ in 0..10 {
+        let summary = harness.status(batch_id).await;
+        assert!(
+            summary["held"].as_u64().unwrap() <= 2,
+            "more than the quota in flight: {summary}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(harness.status(batch_id).await["held"], 2);
+}
