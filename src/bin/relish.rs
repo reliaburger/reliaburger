@@ -407,7 +407,7 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
-    /// List bounded job run summaries and rates, or durable schedule definitions.
+    /// List bounded job run summaries and rates, or durable definitions with their last outcomes.
     Jobs {
         #[arg(long)]
         definitions: bool,

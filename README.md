@@ -109,7 +109,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish batch logs --index <INDEX> <ID>`: Print a failed task's output (the first and last 2 KiB)
 - `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
 - `relish batch-status <ID>`: Show the progress of a submitted batch
-- `relish jobs`: List bounded job run summaries and rates, or durable schedule definitions
+- `relish jobs`: List bounded job run summaries and rates, or durable definitions with their last outcomes
 
 **Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
 
@@ -263,7 +263,9 @@ registries, and `relish build` builds images from your config straight into it.
 
 **Metrics, logs and alerts, nothing to install.** Each node scrapes its own
 workloads, including anything with `prometheus.io` annotations. Alert rules
-evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
+evaluate in the agent and call webhooks, optionally HMAC-signed. Jobs report
+one event per run, page through the same webhooks when a run fails, and keep
+their recent outcomes after the details are pruned. Logs are
 captured on each node, streamed cluster-wide with `relish logs -f`, and
 exported as Parquet to disk or object storage, where SQL can query them.
 
