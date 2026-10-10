@@ -202,7 +202,7 @@ cgroup path rather than fabricating a path runc cannot write.
 |-----------|----------------|-----|
 | **runc** | Runtime (external binary, Linux) | Low-level OCI container execution (namespaces, cgroups, seccomp). Grill writes the OCI bundle and calls `runc` directly; its `state` persists container liveness across Bun restarts. No containerd. |
 | **Apple Container** | Runtime (external, macOS) | OCI container lifecycle on macOS. Grill re-adopts a running workload via `container inspect` after a Bun exec. |
-| **Linux kernel 5.7+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE |
+| **Linux kernel 5.8+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE, the boot-time clock helper. Reusable job executors need `clone3(CLONE_INTO_CGROUP)` (5.7) and the cgroup v2 freezer (5.2), inside the same minimum; they use `cgroup.kill` (5.14) when present and otherwise freeze and kill each task. Bun turns the executor pools off on an older kernel, and the native host pool off without `CONFIG_PROC_CHILDREN` (`src/grill/kernel.rs`) |
 | **Mustard (gossip)** | Internal subsystem | Failure detection, leader discovery, cluster membership, metadata propagation (protocol version, node labels) |
 | **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
 | **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Worker nodes receive state via the reporting tree, not directly from Raft. |
@@ -1862,7 +1862,7 @@ Bun Restart
 
 ### 12.2 Evaluation Notes
 
-**`libbpf-rs` vs `aya`:** Both provide eBPF support in Rust. `libbpf-rs` wraps the C `libbpf` library and provides CO-RE support, meaning eBPF programs compiled once run on different kernel versions without recompilation. `aya` is a pure Rust implementation that avoids the C dependency but is younger and has less battle-tested kernel compatibility. For a system that must run on kernel 5.7+ across diverse distributions, `libbpf-rs`'s maturity and CO-RE support are the safer choice. Revisit if `aya` matures to equivalent kernel coverage.
+**`libbpf-rs` vs `aya`:** Both provide eBPF support in Rust. `libbpf-rs` wraps the C `libbpf` library and provides CO-RE support, meaning eBPF programs compiled once run on different kernel versions without recompilation. `aya` is a pure Rust implementation that avoids the C dependency but is younger and has less battle-tested kernel compatibility. For a system that must run on kernel 5.8+ across diverse distributions, `libbpf-rs`'s maturity and CO-RE support are the safer choice. Revisit if `aya` matures to equivalent kernel coverage.
 
 **`nftnl` GPL concern:** The `nftnl` crate has a GPL-2.0 license. If this is incompatible with the project's licensing, the alternative is to invoke the `nft` CLI as a subprocess for nftables management. This is slightly less performant (process spawn per rule change) but avoids the license issue. Atomic rule application is still possible via `nft -f <file>`.
 
