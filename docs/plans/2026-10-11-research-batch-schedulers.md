@@ -52,8 +52,8 @@ project's workflow makes meaningful.
 | [Ray](https://github.com/ray-project/ray) | Python distributed runtime | 44.0k | ~6,150 commits; 2.59.0 (Oct 2026) | PyTorch Foundation | Amazon, Uber, many ML teams |
 | AWS, Google and Azure Batch | Managed batch queues | closed | | The clouds | Nextflow and Airflow users |
 | [SkyPilot](https://github.com/skypilot-org/skypilot) | Launch ML jobs on any cloud | 10.7k | v0.14.0 (Oct 2026) | SkyPilot | ML teams chasing GPUs |
-| [Argo Workflows](https://github.com/argoproj/argo-workflows) | DAGs of pods on Kubernetes | 17.0k | v4.1.5 (Oct 2026) | CNCF Graduated | 217 organisations listed |
-| [Airflow](https://github.com/apache/airflow) | Python DAG orchestrator | 47.1k | | Apache | 5,800+ survey respondents |
+| [Argo Workflows](https://github.com/argoproj/argo-workflows) | DAGs of pods on Kubernetes | 17.0k | v4.1.5 (Oct 2026) | CNCF Graduated | 217 organisations in [USERS.md](https://github.com/argoproj/argo-workflows/blob/main/USERS.md) |
+| [Airflow](https://github.com/apache/airflow) | Python DAG orchestrator | 47.1k | | Apache | 5,800+ [survey](https://airflow.apache.org/blog/airflow-survey-2025/) respondents |
 
 Three ownership changes stand out. NVIDIA now owns Slurm
 ([heise](https://heise.de/-11115881)) and the Run:ai scheduler. IBM owns Nomad
@@ -131,7 +131,8 @@ Jobs and machines both advertise requirements (ClassAds) and a matchmaker
 pairs them. DAGMan runs workflows. The CMS global pool peaks around 350,000
 cores across more than 70 sites
 ([CHEP 2021](https://www.epj-conferences.org/10.1051/epjconf/202125102055)),
-and OSPool ran about 192 million jobs in a year. Its limits are per submit
+and OSPool ran about 192 million jobs in a year
+([slides](https://indico.nikhef.nl/event/5744/contributions/22865/attachments/8803/12882/09%2024%20Nikhef%20Phil.pdf)). Its limits are per submit
 node: a single `schedd` saturated around 50,000 running jobs in CMS tests
 ([arXiv](https://arxiv.org/pdf/2405.14631)), at roughly 1 MB of memory per
 running job. The learning curve (ClassAds, many daemons) is its reputation.
@@ -140,7 +141,8 @@ running job. The learning curve (ClassAds, many daemons) is its reputation.
 
 - **OpenPBS / PBS Pro** has queues, fair share, backfill, preemption,
   reservations and arrays, and is strong in government and engineering
-  simulation. Siemens bought Altair for about $10B in March 2025. The open
+  simulation. Siemens bought Altair for about $10B in March 2025
+([NAFEMS](https://www.nafems.org/about-us/media/news/industrynews1003/siemens-completes-10-billion-acquisition-of-altair-engineering/)). The open
   source line hasn't released since June 2023.
 - **LSF** is proprietary and priced per core. It has polished fair share and
   licence-aware scheduling for chip design tools. Cost is the recurring
@@ -150,7 +152,7 @@ running job. The learning curve (ClassAds, many daemons) is its reputation.
   survives at legacy life-science and chip design sites.
 - **Flux** (LLNL) nests schedulers: any job can be a Flux instance with its
   own scheduler, which lifts the throughput ceiling for large ensembles. It
-  runs El Capitan's early-access systems. It's pre-1.0 with 691 open issues.
+  runs El Capitan's early-access systems ([LLNL](https://software.llnl.gov/news/2024/03/21/flux/)). It's pre-1.0 with 691 open issues.
 
 ## Kubernetes batch add-ons
 
@@ -187,7 +189,8 @@ of work is a Pod object in etcd. Four projects fill the gap, and they stack.
 
 Underneath sit the job APIs: Indexed Job (Kubernetes' array, with per-index
 retry budgets), JobSet, Kubeflow Trainer and LeaderWorkerSet. Upstream is
-adding gang scheduling itself (KEP-4671, alpha in 1.35 and 1.36), which takes
+adding gang scheduling itself (KEP-4671, alpha in 1.35 and 1.36;
+[Kubernetes blog](https://kubernetes.io/blog/2026/05/13/kubernetes-v1-36-advancing-workload-aware-scheduling/)), which takes
 one selling point away from Volcano and YuniKorn. Quota and fair share stay
 out of tree.
 
@@ -269,7 +272,7 @@ Mesos is where DRF went into production
 ([NSDI 2011](https://www.usenix.org/conference/nsdi11/dominant-resource-fairness-fair-allocation-multiple-resource-types)),
 and it ran Twitter, Apple's Siri and Uber. It's gone now. A 2021 vote to
 retire it was reversed after a burst of interest that never produced a
-release, and in August 2025 the Apache board terminated the project; it moved
+release ([The New Stack](https://thenewstack.io/apache-mesos-narrowly-avoids-a-move-to-the-attic-for-now/)), and in August 2025 the Apache board terminated the project; it moved
 to the [Attic](https://attic.apache.org/projects/mesos.html) that October.
 Marathon, Chronos, Aurora and Metronome are all archived. Uber finished
 moving to Kubernetes in 2024 and called the Mesos base "outdated"
@@ -311,7 +314,7 @@ Its batch gaps are exactly where task arrays help:
   restart the leader" ([#18113](https://github.com/hashicorp/nomad/issues/18113)).
 
 Then there's the licence. Nomad moved to the source-available BUSL in August
-2023, IBM closed its HashiCorp purchase in February 2025, and no credible open
+2023 ([licence FAQ](https://www.hashicorp.com/license-faq)), IBM closed its HashiCorp purchase in February 2025, and no credible open
 fork exists. "Nomad is kind of dead and Apache Mesos is basically dead"
 ([HN, June 2026](https://news.ycombinator.com/item?id=48484694)) is unfair to
 an active project, but it's what people say. Nomad's fans are loyal, though:
@@ -360,9 +363,11 @@ The complaints are about latency and opacity. AWS users report jobs waiting
 in `RUNNABLE` for "3 to 6 hours"
 ([re:Post](https://repost.aws/questions/QU56MiZPbhR7W1Hor5CEHT-A/aws-batch-jobs-in-runnable-for-several-hours)),
 and even the happy path spends about a minute between `SUBMITTED` and
-`RUNNABLE`. Azure Batch isn't being retired, but it's shedding features
-(low-priority VMs, custom images, older GPU series), and Microsoft is ending
-HPC Pack support in August 2027, which leaves on-premises Windows HPC sites
+`RUNNABLE` ([re:Post](https://www.repost.aws/questions/QUTDkVA7QGS-eSjVqicZ721Q/start-up-times-for-aws-batch-jobs-with-big-outliers)). Azure Batch isn't being retired, but it's shedding features
+(low-priority VMs, custom images, older GPU series; Microsoft's
+[retirement tracker](https://github.com/Azure/Batch/issues/140)), and Microsoft is ending
+HPC Pack support in August 2027
+([announcement, reposted](https://argonsys.com/microsoft-cloud/library/retirement-of-microsoft-hpc-pack/)), which leaves on-premises Windows HPC sites
 looking for something new.
 
 [SkyPilot](https://github.com/skypilot-org/skypilot) and Modal are the newer
@@ -386,9 +391,10 @@ end up being used as job schedulers, and none of them is good at it at volume:
 - **Airflow** caps dynamic task mapping at 1,024 by default, and its own
   improvement proposal admits that "with thousands of tasks… it causes
   starvation" ([AIP-100](https://cwiki.apache.org/confluence/spaces/AIRFLOW/pages/406618462/AIP-100+Eliminate+Scheduler+Queueing+Starvation+On+Concurrency+Limits)).
-- **Flyte** has map tasks with `min_success_ratio`, so an array can succeed
+- **Flyte** has map tasks with
+  [`min_success_ratio`](https://flyte.readthedocs.io/en/v1.11.0/api/flytekit/generated/flytekit.map_task.html), so an array can succeed
   if, say, 95% of its tasks do.
-- **Nextflow** submits arrays only to Slurm, PBS, LSF, Grid Engine, AWS Batch
+- **Nextflow** submits [arrays](https://docs.seqera.io/nextflow/reference/process/directives/array) only to Slurm, PBS, LSF, Grid Engine, AWS Batch
   and Google Batch. Its bioinformatics users already think in arrays.
 
 The pattern is clear. Batch users want simple dependencies *in* the scheduler
@@ -465,7 +471,7 @@ Against the best of each family:
 | Adopters | Everyone above | None yet |
 
 The last three rows matter most and no milestone fixes them quickly. Our
-real-container evidence is 1,064 tasks in 747 seconds on a 4-vCPU VM with a
+real-container evidence ([qualification](../qualification/2026-10-04-delegated-jobs/README.md)) is 1,064 tasks in 747 seconds on a 4-vCPU VM with a
 debug build. That shows correctness, not throughput.
 
 We also found a stale claim of our own. `docs/design/scheduler-meat.md` §9.1
@@ -590,6 +596,16 @@ The scheduling model batch users take for granted, inside one cluster:
 > cluster loses a replica, and the whole run is one binary with no external
 > services.
 
+### For LLM inference and training
+
+The follow-up, [LLM inference and training](2026-10-11-research-llm-workloads.md),
+looks at the same question for GPU work and proposes changing this plan: a
+larger GPU release, a new 0.7.0 "Models" release for serving before
+pipelines, and groups (multi-node training, multi-node inference and RL) with
+fair share. It also sketches what each release would look like, how we'd
+build it and the demo for the landing page. The maintainer hasn't decided on
+those changes yet.
+
 ### What we'd have then
 
 With those three releases, Reliaburger is the obvious choice for a team that
@@ -628,10 +644,128 @@ or issues are created.
 
 ## Sources
 
-Each project's repository, documentation, issues, adopter and maintainer
-files, and release lists, read with the GitHub API on 11 October 2026; the
-vendor, CNCF, conference and news pages linked inline. Reliaburger's own code
-and documentation at `b2affe93`, with paths inline.
+GitHub figures (stars, activity, releases, issue counts) come from the
+[GitHub REST API](https://docs.github.com/en/rest) on 11 October 2026.
+Reliaburger's own code and documentation are at
+[`b2affe93`](https://github.com/reliaburger/reliaburger/tree/b2affe93), with paths inline.
+Every other source is linked where it's used, and listed here by section.
+
+**None**
+
+- [armadaproject/armada](https://github.com/armadaproject/armada)
+
+**The landscape at a glance**
+
+- [SchedMD/slurm](https://github.com/SchedMD/slurm)
+- [htcondor/htcondor](https://github.com/htcondor/htcondor)
+- [openpbs/openpbs](https://github.com/openpbs/openpbs)
+- [flux-framework/flux-core](https://github.com/flux-framework/flux-core)
+- [kubernetes-sigs/kueue](https://github.com/kubernetes-sigs/kueue)
+- [volcano-sh/volcano](https://github.com/volcano-sh/volcano)
+- [apache/yunikorn-core](https://github.com/apache/yunikorn-core)
+- [kai-scheduler/KAI-Scheduler](https://github.com/kai-scheduler/KAI-Scheduler)
+- [hashicorp/nomad](https://github.com/hashicorp/nomad)
+- [apache/mesos](https://github.com/apache/mesos)
+- [ray-project/ray](https://github.com/ray-project/ray)
+- [skypilot-org/skypilot](https://github.com/skypilot-org/skypilot)
+- [argoproj/argo-workflows](https://github.com/argoproj/argo-workflows)
+- [argoproj/argo-workflows: USERS.md](https://github.com/argoproj/argo-workflows/blob/main/USERS.md)
+- [apache/airflow](https://github.com/apache/airflow)
+- [airflow.apache.org: airflow-survey-2025](https://airflow.apache.org/blog/airflow-survey-2025/)
+- [heise.de: -11115881](https://heise.de/-11115881)
+- [heise.de: -10303743](https://heise.de/-10303743)
+- [Hacker News item 46277190](https://news.ycombinator.com/item?id=46277190)
+
+**HPC schedulers**
+
+- [newsletter.semianalysis.com: clustermax-30-the-industry-standard](https://newsletter.semianalysis.com/p/clustermax-30-the-industry-standard)
+- [arXiv 2407.21783](https://arxiv.org/pdf/2407.21783)
+- [slurm.schedmd.com: job_array](https://slurm.schedmd.com/job_array.html)
+- [slurm.schedmd.com: high_throughput](https://slurm.schedmd.com/high_throughput.html)
+- [support.schedmd.com: show_bug.cgi](https://support.schedmd.com/show_bug.cgi?id=13706)
+- [advisories.egi.eu: Advisory-EGI-SVG-2026-04](https://advisories.egi.eu/Advisory-EGI-SVG-2026-04)
+- [Hacker News item 25910178](https://news.ycombinator.com/item?id=25910178)
+- [SlinkyProject/slurm-operator](https://github.com/SlinkyProject/slurm-operator)
+- [nebius/soperator](https://github.com/nebius/soperator)
+- [epj-conferences.org: 202125102055](https://www.epj-conferences.org/10.1051/epjconf/202125102055)
+- [indico.nikhef.nl: 09%2024%20Nikhef%20Phil](https://indico.nikhef.nl/event/5744/contributions/22865/attachments/8803/12882/09%2024%20Nikhef%20Phil.pdf)
+- [arXiv 2405.14631](https://arxiv.org/pdf/2405.14631)
+- [nafems.org: siemens-completes-10-billion-acquisition-of-altair-engineering](https://www.nafems.org/about-us/media/news/industrynews1003/siemens-completes-10-billion-acquisition-of-altair-engineering/)
+- [beowulf.org: 037071](https://beowulf.org/pipermail/beowulf/2022-March/037071.html)
+- [software.llnl.gov: flux](https://software.llnl.gov/news/2024/03/21/flux/)
+
+**Kubernetes batch add-ons**
+
+- [infoq.com: netflix-kueue-kubernetes-batch](https://infoq.com/news/2026/08/netflix-kueue-kubernetes-batch)
+- [kubernetes-sigs/kueue release v0.20.1](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.1)
+- [volcano-sh/volcano issue #2700](https://github.com/volcano-sh/volcano/issues/2700)
+- [volcano-sh/volcano issue #4970](https://github.com/volcano-sh/volcano/issues/4970)
+- [kubernetes.io: kubernetes-v1-36-advancing-workload-aware-scheduling](https://kubernetes.io/blog/2026/05/13/kubernetes-v1-36-advancing-workload-aware-scheduling/)
+- [skypilot.ai: slurm-vs-k8s](https://skypilot.ai/blog/slurm-vs-k8s/)
+
+**Armada**
+
+- [cncf.io: armada-how-to-run-millions-of-batch-jobs-over-thousands-of-compute-nodes-using-kubernetes](https://www.cncf.io/blog/2021/01/25/armada-how-to-run-millions-of-batch-jobs-over-thousands-of-compute-nodes-using-kubernetes/)
+- [armadaproject/armada discussion #1112](https://github.com/armadaproject/armada/discussions/1112)
+- [armadaproject/armada: ADOPTERS.md](https://github.com/armadaproject/armada/blob/master/ADOPTERS.md)
+- [infracloud.io: batch-scheduling-on-kubernetes](https://www.infracloud.io/blogs/batch-scheduling-on-kubernetes/)
+- [docs.rafay.co: compare-custom-schedulers-for-kubernetes](https://docs.rafay.co/blog/2024/10/11/compare-custom-schedulers-for-kubernetes/)
+- [armadaproject/armada issue #3677](https://github.com/armadaproject/armada/issues/3677)
+- [armadaproject/armada issue #4761](https://github.com/armadaproject/armada/issues/4761)
+- [armadaproject/armada issue #2726](https://github.com/armadaproject/armada/issues/2726)
+- [armadaproject/armada issue #2910](https://github.com/armadaproject/armada/issues/2910)
+
+**General-purpose orchestrators**
+
+- [usenix.org: dominant-resource-fairness-fair-allocation-multiple-resource-types](https://www.usenix.org/conference/nsdi11/dominant-resource-fairness-fair-allocation-multiple-resource-types)
+- [thenewstack.io: apache-mesos-narrowly-avoids-a-move-to-the-attic-for-now](https://thenewstack.io/apache-mesos-narrowly-avoids-a-move-to-the-attic-for-now/)
+- [attic.apache.org: mesos](https://attic.apache.org/projects/mesos.html)
+- [uber.com: ubers-journey-to-ray-on-kubernetes-ray-setup](https://www.uber.com/blog/ubers-journey-to-ray-on-kubernetes-ray-setup/)
+- [Hacker News item 9654174](https://news.ycombinator.com/item?id=9654174)
+- [hashicorp.com: hashicorp-nomad-meets-the-2-million-container-challenge](https://www.hashicorp.com/blog/hashicorp-nomad-meets-the-2-million-container-challenge)
+- [hashicorp/nomad issue #18773](https://github.com/hashicorp/nomad/issues/18773)
+- [discuss.hashicorp.com: 36256](https://discuss.hashicorp.com/t/batch-jobs-improve-performances-and-number-of-concurrent-executions/36256)
+- [hashicorp/nomad issue #18113](https://github.com/hashicorp/nomad/issues/18113)
+- [hashicorp.com: license-faq](https://www.hashicorp.com/license-faq)
+- [Hacker News item 48484694](https://news.ycombinator.com/item?id=48484694)
+- [Hacker News item 41362413](https://news.ycombinator.com/item?id=41362413)
+- [aws.amazon.com: amazons-exabyte-scale-migration-from-apache-spark-to-ray-on-amazon-ec2](https://aws.amazon.com/blogs/opensource/amazons-exabyte-scale-migration-from-apache-spark-to-ray-on-amazon-ec2)
+- [nscale.com: nscale-acquires-anyscale](https://www.nscale.com/press-releases/nscale-acquires-anyscale)
+- [docs.ray.io: gcs](https://docs.ray.io/en/latest/ray-core/fault_tolerance/gcs.html)
+- [ray-project/ray issue #60159](https://github.com/ray-project/ray/issues/60159)
+
+**Cloud batch services**
+
+- [docs.aws.amazon.com: service_limits](https://docs.aws.amazon.com/batch/latest/userguide/service_limits.html)
+- [docs.aws.amazon.com: scheduling-policies](https://docs.aws.amazon.com/batch/latest/userguide/scheduling-policies.html)
+- [docs.cloud.google.com: quotas](https://docs.cloud.google.com/batch/quotas)
+- [learn.microsoft.com: batch-task-dependencies](https://learn.microsoft.com/en-us/azure/batch/batch-task-dependencies)
+- [repost.aws: aws-batch-jobs-in-runnable-for-several-hours](https://repost.aws/questions/QU56MiZPbhR7W1Hor5CEHT-A/aws-batch-jobs-in-runnable-for-several-hours)
+- [repost.aws: start-up-times-for-aws-batch-jobs-with-big-outliers](https://www.repost.aws/questions/QUTDkVA7QGS-eSjVqicZ721Q/start-up-times-for-aws-batch-jobs-with-big-outliers)
+- [Azure/Batch issue #140](https://github.com/Azure/Batch/issues/140)
+- [argonsys.com: retirement-of-microsoft-hpc-pack](https://argonsys.com/microsoft-cloud/library/retirement-of-microsoft-hpc-pack/)
+- [skypilot-org/skypilot issue #10123](https://github.com/skypilot-org/skypilot/issues/10123)
+
+**Workflow engines**
+
+- [argoproj/argo-workflows issue #1186](https://github.com/argoproj/argo-workflows/issues/1186)
+- [argo-workflows.readthedocs.io: scaling](https://argo-workflows.readthedocs.io/en/latest/scaling/)
+- [cwiki.apache.org: AIP-100+Eliminate+Scheduler+Queueing+Starvation+On+Concurrency+Limits](https://cwiki.apache.org/confluence/spaces/AIRFLOW/pages/406618462/AIP-100+Eliminate+Scheduler+Queueing+Starvation+On+Concurrency+Limits)
+- [flyte.readthedocs.io: flytekit.map_task](https://flyte.readthedocs.io/en/v1.11.0/api/flytekit/generated/flytekit.map_task.html)
+- [docs.seqera.io: array](https://docs.seqera.io/nextflow/reference/process/directives/array)
+
+**Where Reliaburger stands**
+
+- [reliaburger/reliaburger issue #359](https://github.com/reliaburger/reliaburger/issues/359)
+- [reliaburger/reliaburger issue #679](https://github.com/reliaburger/reliaburger/issues/679)
+- [reliaburger/reliaburger issue #711](https://github.com/reliaburger/reliaburger/issues/711)
+- [reliaburger/reliaburger issue #640](https://github.com/reliaburger/reliaburger/issues/640)
+- [reliaburger/reliaburger issue #668](https://github.com/reliaburger/reliaburger/issues/668)
+- [reliaburger/reliaburger issue #690](https://github.com/reliaburger/reliaburger/issues/690)
+
+**What it would take**
+
+- [reliaburger/reliaburger issue #680](https://github.com/reliaburger/reliaburger/issues/680)
 
 Not verified, so don't quote them as fact: Slurm's current TOP500 share (the
 oft-quoted 60% dates from about 2021); G-Research's node and GPU counts; any
