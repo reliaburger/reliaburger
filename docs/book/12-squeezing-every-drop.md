@@ -910,6 +910,116 @@ require matching binaries and a fresh cluster. Executor reuse, throughput
 qualification and resident model workers remain separate issues; these semantics
 don't establish 100m accepted successes/day.
 
+### Fair shares: one tenant can't starve the rest
+
+The whitepaper promises that one team can't starve the cluster. For apps that
+was true: namespace quotas stop the placement pass. For jobs it wasn't. Every
+namespace shared one cap of 64 active runs and 256 job definitions, and quotas
+never looked at jobs at all. Sixty-four long arrays in one namespace blocked
+everyone's cron jobs and deployment hooks. A refused cron fire left a line on
+stderr and nothing else. And a daily `relish run --batch render-$DATE` broke on
+day 257, because every name made a definition that lived for ever. Issue #679
+fixed all four, following decisions D20 to D22.
+
+Where should a job quota bite? Jobs never enter the app placement pass; the
+task-array leader hands out chunks once a second. So that's where the charge
+goes. `GrantBudget::new` builds one `QuotaLedger` per tick from the replicated
+namespaces, charges every app placement first, then every attempt already in
+flight, and only then lets runs plan new grants, oldest first. Apps go first on
+purpose: a namespace's jobs use what its apps leave, so a job can never push out
+an app that fits.
+
+What does an attempt "in flight" cost? A chunk of 1,024 tasks doesn't run 1,024
+at once; a node runs at most its slots for that array. So the charge per node is
+`min(tasks held, slots)`, and `fit_grants` walks the planned chunks, adding each
+only while the extra attempts it would start fit the room left. Once a node holds
+a full round of its slots, deeper chunks cost nothing more, so the lookahead
+window from earlier in the chapter survives a quota. A run whose grants were held
+back gets a durable `quota_blocked` reason, and `relish batch-status` shows it.
+The reason is only rewritten when the *limit* it names changes: the usage numbers
+inside a `QuotaError` move with every finished task, and writing a Raft entry per
+tick to say "still blocked" would be silly.
+
+Capacity is split into two classes. A run's trigger decides which:
+
+```rust
+enum Admission {
+    Bulk,
+    Triggered,
+}
+
+impl Admission {
+    fn of(trigger: Option<&RunTrigger>) -> Self {
+        match trigger {
+            Some(RunTrigger::Cron { .. } | RunTrigger::Hook { .. }) => Self::Triggered,
+            Some(RunTrigger::Manual { .. }) | None => Self::Bulk,
+        }
+    }
+}
+```
+
+The `|` inside a pattern matches either variant, and `{ .. }` ignores their
+fields. Because the `match` is exhaustive, a new trigger kind won't compile
+until somebody decides which class it belongs to. Bulk runs stop 32 slots short
+of the global cap and at 64 per namespace; cron fires and hooks may use every
+slot. A cron fire refused even then becomes a *skipped occurrence*: the same
+transaction advances the cursor and records `skipped: capacity` with the minute,
+and the leader emits a `job-skipped` event. Nothing retries for the rest of the
+minute, and nothing vanishes.
+
+We also raised the global cap from 64 to 128, but only as far as a test could
+justify. `control_state_stays_within_budget_at_the_global_cap` fills the store
+with the largest active run it accepts (a 16 KiB template, ten thousand failure
+ranges, 64 holders) and checks two budgets: the replicated job state stays under
+32 MiB, half a Raft frame, and one node's sync call stays under the 8 MiB body
+limit the sync route now declares. At 128 those are about 18 MiB and 4 MiB; 256
+would break the first. Writing that test turned up a latent bug: the sync route
+had axum's default 2 MiB body limit, which 64 large templates could already
+exceed.
+
+Definitions without a schedule or a hook now expire in the same deterministic
+`prune` that drops their last run (D22). The prune needs the deployments to
+know which names are still owned, while it mutates the job catalogue:
+
+```rust
+let deployments = &self.deployments;
+self.jobs.expire_one_off(|namespace, name| {
+    deployments.values().any(|record| record.blocks(name, namespace))
+});
+```
+
+That looks like it borrows `self` twice, once shared and once mutable. It
+compiles because Rust tracks borrows per field: `self.deployments` and
+`self.jobs` are different places, so a shared borrow of one and a mutable
+borrow of the other don't overlap. Calling a `&self` *method* inside the
+closure would borrow all of `self` and fail.
+
+To mark hooks, `JobDefinition` gained a `hook` flag. Definitions are hashed into
+every run's digest, so adding a field could have changed every existing digest.
+`#[serde(default, skip_serializing_if = "std::ops::Not::not")]` leaves the field
+out when it's false; `Not::not` is the function behind `!`, used here as a
+predicate. A compile-time check keeps the run-receipt backstop above anything
+retention can hold:
+
+```rust
+const _: () = assert!(
+    MAX_JOB_RUNS >= MAX_ACTIVE_ARRAYS + MAX_TERMINAL_ARRAYS * 64
+);
+```
+
+`const _` is an unnamed constant evaluated by the compiler, so a future change
+to either bound that breaks the inequality fails the build, not a cluster.
+
+Finally, the cron loop used to take sixteen due schedules and *then* skip the
+ones a pending deployment blocked, so sixteen blocked schedules could starve
+the rest every tick. `due_schedules` now filters first and starts after the last
+key it fired, wrapping round with `iter().cycle().skip(start).take(n)`, so a
+long list takes turns. The tests read like the issue: one namespace can't take
+every active run, a cron fire uses the reserved headroom, a refused one is
+recorded as skipped, daily named arrays keep working past the definition cap,
+and on a real three-node cluster a cron job fires while other tenants fill
+every bulk slot.
+
 ## Lessons from the phase
 
 **Optimisation is an audit with a deliverable.** The single most consistent finding of this phase wasn't a speed-up. It was library-not-wired: `add_port_mapping` with no production callers, `VolumeManager` with no production callers, an HTTPS-only pull client that made cluster images undeployable, a CLI that sent job names to a cluster that had never heard of the jobs. Well-tested libraries pass review; only tracing the live path from the user's artefact to the kernel finds the missing arrow. If you take one habit from this chapter: when you're asked to optimise something, first prove it runs.
