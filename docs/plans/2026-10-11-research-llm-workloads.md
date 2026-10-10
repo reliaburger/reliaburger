@@ -3,8 +3,8 @@
 Status: research, 11 October 2026. Checked against `main` at `b2affe93`. A
 follow-up to [the batch scheduler landscape](2026-10-11-research-batch-schedulers.md),
 which this page assumes you've read. The maintainer decided the release order
-on 11 October (see [Decisions](#decisions)); three questions remain before it
-becomes milestones.
+on 11 October (see [Decisions](#decisions)) and is re-reading the analysis
+before it becomes milestones.
 
 The question: what would make Reliaburger the obvious choice for running LLM
 inference *and* training on your own GPUs? Which projects would we have to
@@ -325,7 +325,8 @@ anyone else who needs it. NIXL and LMCache inside the engines.
   which has a standalone mode without Kubernetes in progress. If Wrapper can
   call an external picker, llm-d's router and Dynamo-style pickers plug in,
   and we get precise KV-event routing and disaggregated routing without
-  building them.
+  building them. Decided for later: 0.7.0 builds its own routing, and the
+  picker hook waits for the standalone mode or a user who asks.
 - ModelPack and Docker Model Runner artifacts for weights.
 - An OpenAI-compatible batch API (`/v1/batches`) on top of task arrays.
 
@@ -490,7 +491,7 @@ Serving LLMs on one node per replica, from a model name to an endpoint:
 3. **Wrapper for inference.** Long-lived streams with configurable timeouts,
    streamed request bodies, routing by the OpenAI `model` field and LoRA
    adapter, prefix- and load-aware scoring from the engines' standard
-   metrics, 429 load shedding, and a hook for an external endpoint picker.
+   metrics, and 429 load shedding.
 4. **Autoscaling on engine metrics**: queue depth, KV-cache use, running
    requests, and latency targets; scale to zero with the ingress holding
    requests during a cold start.
@@ -521,7 +522,7 @@ idle_unload = "15m"
 
 [model.qwen3.ingress]
 host = "qwen3.models.example.com"
-routing = "prefix-affinity"           # or "least-loaded", or picker = "http://llm-d-router:9002"
+routing = "prefix-affinity"           # or "least-loaded"
 api_keys = true
 token_rate_limit = "200k/min"
 ```
@@ -561,8 +562,8 @@ hand if you want something the shorthand doesn't cover.
   engine's metrics; feed queue depth and KV-cache use into the routing table
   (`src/wrapper/routing.rs`) and hash the first few kilobytes of the prompt
   for prefix affinity, following the published "sticky until saturated"
-  design. Answer 429 when every replica is saturated. For anything smarter,
-  call an external picker over the endpoint picker protocol.
+  design. Answer 429 when every replica is saturated. An external picker is
+  later work.
 - *Autoscaling.* `src/meat/autoscaler.rs` gains engine-metric signals read
   from Mayo and allows `min = 0` for models. To scale from zero, Wrapper
   holds requests in a bounded queue per route, tells the leader, and
@@ -594,6 +595,18 @@ llama.cpp` and a chat completion with `curl`.
 > latency target. Traffic stops and the model scales to zero; the next
 > request is held, answered, and the cold start is reported. All without
 > leaving the binary.
+
+### 0.7.1: GPU dev environments
+
+A small release straight after Models: `relish dev start --gpu 1 --image
+pytorch:2.9 --idle 2h` gives a researcher a GPU container to work in over
+SSH, VS Code Remote or Jupyter, with a persistent home volume. It's an
+ordinary app with an SSH server; Sesame issues short-lived SSH certificates
+from the cluster CA, Wrapper passes the connection through, and an idle
+timeout (no SSH sessions and an idle GPU) gives the GPU back. Without it,
+researchers SSH straight into GPU machines outside the scheduler and hold
+GPUs for days. Once fair share exists, dev environments get their own
+priority class.
 
 ### 0.8.0: Groups
 
@@ -859,51 +872,106 @@ tour on the homepage, beside the existing one, aimed at people with GPUs.
 
 ### Testing on real GPUs
 
-The maintainer's GPU hardware is one NVIDIA RTX 5080: a consumer Blackwell
-card with 16 GB of memory, no NVLink and no MIG. That's enough to prove
-everything that happens on one GPU, and not enough to prove anything that
-needs two. So the GPU releases are tested in three tiers:
+The maintainer decided on 11 October to validate on GPUs rented by the hour
+rather than on owned hardware. Reliaburger installs its own binary as root,
+loads eBPF programs and runs runc, so every option below is a full VM or
+bare metal with root. Container-only offerings (standard RunPod pods,
+Vast.ai, Modal) and managed-Kubernetes clusters (Together's GPU clusters,
+CoreWeave) can't host it. Prices were checked on 11 October 2026.
+
+There are four tiers:
 
 1. **The portable suite, everywhere.** A fake NVML and CDI backend lets CI
    test device inventory, allocation, topology choice, XID handling, group
    placement and failure without a GPU.
-2. **`make test-gpu`, on the RTX 5080.** A new gated target for everything
-   one real GPU can prove: CDI injection and cgroup isolation (a container
-   without a grant sees no GPU), NVML metrics, the health path, and vLLM
-   serving a model that fits in 16 GB (an 8B model in 8-bit, for example).
-   It also covers model artifacts in Pickle, generate-based readiness, scale
-   to zero and cold-start timing.
-3. **Rented multi-GPU machines, a few hours per release.** For what one card
-   can't show: tensor parallelism over NVLink, topology choice, a second
-   replica loading weights from a peer GPU node, multi-node groups, RDMA and
-   hot spares. The demo recordings for those beats happen in the same
-   session.
+2. **`make test-gpu`, on one rented data-centre GPU per run.** A GitHub
+   workflow, triggered by a label or by changes to GPU paths rather than on
+   every pull request, starts a fresh AWS `g6.xlarge` (one L4, 24 GB)
+   through [RunsOn](https://runs-on.com/pricing/), which launches ephemeral
+   EC2 runners in our own AWS account and is free for open-source projects.
+   It's a real VM with root and our own machine image, so the kernel is
+   pinned, and it's torn down after every job. The L4 costs about
+   [$0.81 an hour on demand and $0.59 on spot](https://instances.vantage.sh/aws/ec2/g6.xlarge),
+   so a 45-minute gate costs well under a dollar. Spot for pull requests,
+   on-demand for release gates. A `g6e.xlarge` (L40S, 48 GB) covers models
+   that don't fit. The runner-up is GitHub's own T4 runner
+   ([$3.12 an hour](https://docs.github.com/en/billing/reference/actions-runner-pricing)),
+   which needs no setup but needs a paid plan, can't change the kernel and
+   carries an old GPU.
+3. **An eight-GPU NVLink node, a few hours per release.** For tensor
+   parallelism, topology choice, health handling across devices and the
+   demo recordings: [Lambda](https://lambda.ai/pricing) 8×H100 SXM at $31.92
+   a node-hour (B200 at $53.52 for recordings), Ubuntu VMs with sudo and an
+   API to launch from a workflow. Eight-GPU nodes are often sold out, so the
+   workflow polls for capacity. Runners-up: [Nebius](https://nebius.com/prices)
+   at $30.80 (H100) or $36.00 (H200), which also covers tier 4 with one
+   account, and [Hyperstack](https://www.hyperstack.cloud/gpu-pricing) at
+   $25.60, the cheapest list price.
+4. **Two or three eight-GPU nodes with InfiniBand, twice in total.** For
+   groups, RDMA and hot spares in 0.8.0, and fair share across nodes in
+   0.10.0: [Nebius](https://docs.nebius.com/compute/clusters/gpu), the only
+   provider we verified with hourly, self-serve InfiniBand between root VMs
+   and no minimum size or term, at about $92 an hour for three H100 nodes.
+   The runner-up is [Crusoe](https://docs.cloud.crusoe.ai/networking/infiniband/managing-infiniband-networks)
+   at a similar price. AWS Capacity Blocks have a
+   [24-hour minimum, paid up front](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-blocks-purchase.html),
+   and use EFA rather than InfiniBand; Lambda's 1-Click Clusters have a
+   [two-week, 16-GPU minimum](https://lambda.ai/pricing). Both are out.
 
-What the 5080 can and can't prove, release by release:
+What each tier proves, release by release:
 
-| Release | On the RTX 5080 | Needs rented hardware |
-|---|---|---|
-| 0.6.0 GPUs | Device inventory, CDI, isolation, metrics, `relish gpus`, a synthetic XID leading to a cordon | Several GPUs per job, NVLink topology, moving work to a healthy GPU |
-| 0.7.0 Models | `relish model run`, weights in Pickle, readiness, scale to zero, cold start, API keys and token limits | Peer-loaded replicas on a second GPU node, prefix routing across replicas |
-| 0.8.0 Groups | Group mechanics with CPU members (torchrun on its CPU backend across nodes) and one GPU member | Multi-node GPU training, RDMA, spares, verl at scale |
-| 0.9.0 Pipelines | GPU task arrays and the batch API on one card | Throughput across many GPUs |
-| 0.10.0 Fair share | Queues, preemption and grace periods on one card | Shares settling across many GPUs |
+| Release | One GPU (`make test-gpu`) | Eight-GPU node | Multi-node InfiniBand |
+|---|---|---|---|
+| 0.6.0 GPUs | Inventory, CDI, isolation, metrics, `relish gpus`, an injected XID leading to a cordon | Several GPUs per job, NVLink topology, moving work to a healthy GPU | – |
+| 0.7.0 Models | `relish model run`, weights in Pickle, readiness, scale to zero, cold start, keys and token limits | Tensor-parallel serving, peer-loaded replicas, prefix routing across replicas | – |
+| 0.8.0 Groups | Group mechanics with CPU members and one GPU member | Groups within a node | Multi-node training, RDMA, spares, verl |
+| 0.9.0 Pipelines | GPU task arrays and the batch API | Batch filling idle GPUs beside a served model | – |
+| 0.10.0 Fair share | Queues, preemption and grace periods | Shares settling across eight GPUs | Shares across nodes |
 
-Two caveats to check early. DCGM's diagnostics and error injection are
-built for data-centre GPUs, and we can't count on them on a GeForce card, so
-on the 5080 the health path gets a synthetic XID through the node's event
-watcher (ClusterMAX's graders inject synthetic XIDs the same way). And
-Blackwell consumer cards need a recent driver and CUDA 12.8 or later, which
-is a useful first case for the driver and CUDA compatibility check.
-
-The exit tests above describe the multi-GPU target. Each release's plan
-splits its exit test into the part the 5080 proves on every run and the part
+The L4 is a data-centre card, so DCGM's diagnostics and error injection
+should work on it, which the 0.6.0 plan confirms first. Each release's plan
+splits its exit test into the part the gate proves on every run and the part
 the rented session proves once before the release.
+
+**Budget.** Assuming debugging on real hardware takes about two and a half
+times as long as the validation itself:
+
+| Release | One GPU (gate runs and a dev box) | Eight-GPU node | Multi-node InfiniBand | Total |
+|---|---|---|---|---|
+| 0.6.0 GPUs | $140 | 21 h, $670 | – | $810 |
+| 0.7.0 Models | $100 | 24 h, $770 | – | $870 |
+| 0.8.0 Groups | $100 | 10 h, $320 | 2 nodes × 8 h and 3 nodes × 5 h, $950 | $1,370 |
+| 0.9.0 Pipelines | $100 | 10 h, $320 | – | $420 |
+| 0.10.0 Fair share | $100 | 12 h, $385 | 2 nodes × 4 h, $250 | $735 |
+| **All five** | | | | **about $4,200** |
+
+With 25% contingency for setup, idle debugging time, storage and failed
+launches, plan on **about $5,250**, roughly $1,050 per release, peaking near
+$1,700 for 0.8.0. A **monthly cap of $1,500**, with alerts at 50%, 80% and
+100%, fits every month except the one with the 0.8.0 multi-node sessions,
+which needs a one-off raise to $2,000. These are estimates from list prices
+on 11 October 2026; GPU prices have been falling.
+
+**Cost controls**, all scripted rather than remembered:
+
+- *Teardown in CI.* The gate's runners are ephemeral. For the large nodes,
+  the workflow creates the machine, and an `if: always()` step destroys it
+  through the provider's API, with a job timeout and a concurrency group.
+- *A watchdog on every machine.* A shutdown timer set at launch. On Lambda,
+  Nebius and others a stopped machine keeps billing until it's deleted, so
+  the watchdog calls the delete API rather than just powering off.
+- *A reaper.* A scheduled workflow every 30 minutes deletes any machine,
+  disk or filesystem whose `ttl` tag has expired.
+- *Hard limits.* Prepaid balances on Nebius, AWS Budgets with a deny action,
+  and a GitHub Actions spending limit.
+- *Planned sessions.* Model weights staged on cheap storage first, images
+  built in advance, and a checklist, so expensive multi-node hours aren't
+  spent on setup.
 
 ### Later
 
-GPU dev environments (SSH and VS Code with an idle timeout), disaggregated
-prefill and decode through the picker hook, LoRA adapters pulled from Pickle,
+An external endpoint picker for Wrapper, disaggregated prefill and decode
+through it, LoRA adapters pulled from Pickle,
 fast restore of warm engines (CRIU with cuda-checkpoint, once NVIDIA's own
 version stops being slower than a cold start on large models), AMD through
 CDI, GB200 NVL72 compute domains, and a Slurm-style submission shim.
@@ -931,17 +999,17 @@ The maintainer decided on 11 October 2026:
    Models; Pipelines moves to 0.9.0 and Fair share to 0.10.0.
 3. **The GPU release carries all eight items**, health and metrics included.
 4. **Models are `[model.*]`**, shorthand that expands to an `[app.*]`.
-5. **Hardware.** One RTX 5080 runs `make test-gpu`; multi-GPU tests and
-   recordings use rented machines (see [Testing on real GPUs](#testing-on-real-gpus)).
+5. **GPU dev environments** are a small release of their own, 0.7.1.
+6. **Routing.** 0.7.0 builds its own inference routing in Wrapper; the
+   external endpoint picker moves to "Later".
+7. **Hardware: rent by the hour.** Validation runs on GPU machines rented by
+   the hour, not on the maintainer's own card: RunsOn with AWS L4s for the
+   gate, Lambda for eight-GPU nodes and Nebius for InfiniBand, with a budget
+   of about $5,250 for 0.6.0 to 0.10.0 (see
+   [Testing on real GPUs](#testing-on-real-gpus)).
 
-Still open:
-
-6. Where do GPU dev environments go? dstack, Lepton and GPUStack all win
-   researchers with them.
-7. Do we commit to the endpoint picker protocol as Wrapper's extension point,
-   so llm-d's router plugs in, or build our own routing only?
-8. Is renting multi-GPU machines for a few hours per release acceptable, and
-   from which provider?
+Still open: the maintainer is re-reading the analysis before any milestones
+or issues are created.
 
 ## Sources
 
@@ -1029,6 +1097,15 @@ The landscape sources are in
 - [docs.pytorch.org: run](https://docs.pytorch.org/docs/main/elastic/run.html)
 - [docs.vllm.ai: parallelism_scaling](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)
 - [reliaburger/reliaburger issue #677](https://github.com/reliaburger/reliaburger/issues/677)
+- [runs-on.com: pricing](https://runs-on.com/pricing/)
+- [instances.vantage.sh: g6.xlarge](https://instances.vantage.sh/aws/ec2/g6.xlarge)
+- [docs.github.com: actions-runner-pricing](https://docs.github.com/en/billing/reference/actions-runner-pricing)
+- [lambda.ai: pricing](https://lambda.ai/pricing)
+- [nebius.com: prices](https://nebius.com/prices)
+- [hyperstack.cloud: gpu-pricing](https://www.hyperstack.cloud/gpu-pricing)
+- [docs.nebius.com: gpu](https://docs.nebius.com/compute/clusters/gpu)
+- [docs.cloud.crusoe.ai: managing-infiniband-networks](https://docs.cloud.crusoe.ai/networking/infiniband/managing-infiniband-networks)
+- [docs.aws.amazon.com: capacity-blocks-purchase](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-blocks-purchase.html)
 
 Not verified, so don't quote them as fact: the count of components in the
 Kubernetes inference stack (our own tally, not a published one); vendor
@@ -1036,5 +1113,6 @@ benchmark claims (llm-d's routing and disaggregation figures, NVIDIA's
 Dynamo projection), which are each project's own measurements; Dragonfly's
 origin-traffic figure, from a CNCF post by its maintainers; the ClusterMAX
 3.0 criteria, read from a summary because the primary page wasn't reachable;
-and the size of the 8–256 GPU segment, for which we found no credible
-figure.
+the size of the 8–256 GPU segment, for which we found no credible figure;
+and rental prices quoted from aggregators (the AWS L4 rates) rather than
+providers' own pages.
