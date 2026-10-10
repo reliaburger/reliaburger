@@ -765,11 +765,33 @@ fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg);
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    limit_malloc_arenas();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("failed to construct Tokio runtime: {error}"))?;
     runtime.block_on(run_agent(cli))
+}
+
+/// Cap glibc's malloc arenas before the runtime starts its threads.
+///
+/// glibc hands busy threads their own arena (up to eight per core) and keeps
+/// freed memory in each one. On a busy job node that held Bun's resident
+/// memory at 600 to 770 MiB, while live data was under 200 MiB: with two
+/// arenas, the same five-minute host-job run ended at about 190 MiB and ran
+/// as many jobs. An operator's own `MALLOC_ARENA_MAX` still wins.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // SAFETY: mallopt only tunes the allocator, and runs here before Bun
+    // starts any other thread. A value glibc rejects is reported by the return
+    // value, which we can ignore: the default arenas simply stay in place.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
 }
 
 /// Resolve the configured `cluster.join` seeds to socket addresses.
