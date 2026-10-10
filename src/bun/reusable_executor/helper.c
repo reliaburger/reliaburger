@@ -49,10 +49,23 @@ static void child_changed(int signal_number) {
     errno = saved;
 }
 
+/* Socket writes use MSG_NOSIGNAL: if Bun closes the control connection while
+ * a command's output is being forwarded, the write fails with EPIPE and the
+ * helper still reaches its cleanup, rather than dying of SIGPIPE. Ignoring
+ * SIGPIPE process-wide would leak into every command through exec. */
+#ifndef MSG_NOSIGNAL
+/* macOS (the portable protocol fixture) has no MSG_NOSIGNAL; main() sets
+ * SO_NOSIGPIPE on the control socket instead. */
+#define MSG_NOSIGNAL 0
+#endif
+static ssize_t put(int fd, const void *at, size_t count) {
+    ssize_t result = send(fd, at, count, MSG_NOSIGNAL);
+    return result < 0 && errno == ENOTSOCK ? write(fd, at, count) : result;
+}
 static int all(int fd, void *buffer, size_t count, int writing) {
     unsigned char *at = buffer;
     while (count) {
-        ssize_t result = writing ? write(fd, at, count) : read(fd, at, count);
+        ssize_t result = writing ? put(fd, at, count) : read(fd, at, count);
         if (result < 0 && errno == EINTR) continue;
         if (result <= 0) return -1;
         at += result;
@@ -394,6 +407,10 @@ int main(int argc, char **argv) {
     if (sigaction(SIGCHLD, &notification, NULL)) return 125;
     int control = socket(AF_UNIX, SOCK_STREAM, 0);
     if (control < 0 || fcntl(control, F_SETFD, FD_CLOEXEC)) return 125;
+#ifdef SO_NOSIGPIPE
+    int quiet = 1;
+    if (setsockopt(control, SOL_SOCKET, SO_NOSIGPIPE, &quiet, sizeof(quiet))) return 125;
+#endif
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     memcpy(address.sun_path, argv[1], strlen(argv[1]) + 1);
     if (connect(control, (struct sockaddr *)&address, sizeof(address)) ||

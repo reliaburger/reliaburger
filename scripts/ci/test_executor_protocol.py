@@ -148,6 +148,15 @@ class ExecutorProtocol(unittest.TestCase):
         self.connection.sendall(command(1, ['/bin/true\0ignored']))
         self.assertEqual(self.connection.recv(1), b'')
 
+    def test_closed_connection_during_output_reaches_cleanup_instead_of_sigpipe(self):
+        self.connection.sendall(command(1, ['/bin/sh', '-c', 'while :; do echo flood; done']))
+        self.assertEqual(exact(self.connection, 9), b"\x01" + struct.pack("!Q", 1))
+        exact(self.connection, 9)  # the first output frame: the command is writing
+        self.connection.close()
+        self.process.wait(timeout=5)
+        self.assertEqual(self.process.returncode, 125,
+                         'the helper must clean up and exit, not die of SIGPIPE')
+
 
 @unittest.skipUnless(sys.platform == 'linux', 'host child ownership requires Linux')
 class NativeHostExecutorProtocol(ExecutorProtocol):
