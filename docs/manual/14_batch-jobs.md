@@ -302,7 +302,8 @@ slot or resource admission does not consume the command's attempt timeout;
 cold preparation counts after the full profile is reserved. Abandoned ownership remains
 quarantined until recovery retires the original generation. Host execution,
 rootless runtimes and GPU requests cannot select this mode. Kubernetes export
-refuses it because an ordinary Job cannot preserve this contract.
+turns it into an ordinary Job, which starts a fresh Pod for every attempt, and
+reports the reused container as unsupported: a Job cannot preserve this contract.
 
 Summaries include `runtime` and `idle_executor_reservation`. The reservation is
 per compatible executor profile, including its helper, rather than live node
