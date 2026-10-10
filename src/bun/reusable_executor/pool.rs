@@ -184,8 +184,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .filter_map(|(index, slot)| Some((index, slot.retiring.take()?)))
             .collect();
         for (index, mut context) in stuck {
-            if self.retirement_step(&mut context).await {
-                self.finish_retirement(&mut context).await;
+            if self.retirement_step(&mut context).await
+                && self.finish_retirement(&mut context).await
+            {
                 self.release(index, None).await;
             } else {
                 self.slots.lock().await[index].retiring = Some(context);
