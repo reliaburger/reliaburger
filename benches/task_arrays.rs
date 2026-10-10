@@ -88,6 +88,7 @@ fn simulate_leader(nodes: usize) -> TaskArrayState {
                     failed_indices: failed,
                     not_run: 0,
                     retried: 0,
+                    retry_causes: Default::default(),
                 };
                 let _ = state.complete(&holder, &result);
             }

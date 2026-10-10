@@ -2626,6 +2626,22 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         count("not_run"),
         count("retried"),
     ));
+    let causes: Vec<String> = [
+        ("exit_code", "non-zero exit"),
+        ("signal", "signal"),
+        ("timeout", "timeout"),
+        ("unknown", "unknown outcome"),
+        ("unrecorded", "not recorded across a restart"),
+    ]
+    .into_iter()
+    .filter_map(|(key, label)| {
+        let value = summary["retry_causes"][key].as_u64()?;
+        (value > 0).then(|| format!("{value} {label}"))
+    })
+    .collect();
+    if !causes.is_empty() {
+        out.push_str(&format!("  retry causes: {}\n", causes.join(", ")));
+    }
     out.push_str(&format!(
         "  chunks: {} of {} done; {} tasks held by nodes, {} queued\n",
         count("chunks_done"),
@@ -4322,6 +4338,8 @@ mod task_array_tests {
             "kind": "array", "name": "render", "namespace": "default",
             "status": "Running", "total": 100000, "succeeded": 51200,
             "failed": 5, "not_run": 0, "retried": 12, "queued": 40000,
+            "retry_causes": { "exit_code": 10, "signal": 2, "timeout": 0,
+                              "unknown": 0, "unrecorded": 0 },
             "held": 8800, "chunks": 98, "chunks_done": 50,
             "failed_indices": [[7, 7], [1000, 1002]],
             "nodes": [
@@ -4335,6 +4353,7 @@ mod task_array_tests {
             format_array_summary(3, &summary),
             "task array 3 (render in default): Running\n\
              \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 12 retries\n\
+             \x20 retry causes: 10 non-zero exit, 2 signal\n\
              \x20 chunks: 50 of 98 done; 8800 tasks held by nodes, 40000 queued\n\
              \x20 failed indices: 7, 1000-1002 and 1 more (see relish batch results 3 --failed)\n\
              \x20 node-1: 8 slots, 8 running, 51200 succeeded, 5 failed\n\

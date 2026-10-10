@@ -211,6 +211,8 @@ pub(crate) fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskReco
         exit_code: (exit_code != NO_EXIT_CODE).then_some(exit_code),
         run_ms: u32_at(10),
         output: None,
+        // The ledger keeps attempt counts only; see `TaskRecord::retry_causes`.
+        retry_causes: Default::default(),
     })
 }
 
@@ -461,6 +463,7 @@ mod tests {
             },
             run_ms: index.wrapping_mul(3),
             output: None,
+            retry_causes: Default::default(),
         }
     }
 

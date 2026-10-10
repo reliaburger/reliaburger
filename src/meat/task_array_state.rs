@@ -75,6 +75,43 @@ impl TaskArrayStatus {
     }
 }
 
+/// Why retried attempts failed: one count per extra attempt, by the failed
+/// attempt's outcome. A fixed set of counters, never a per-task log, so a
+/// recovered retry keeps its cause without per-success storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryCauses {
+    /// The command exited non-zero.
+    pub exit_code: u64,
+    /// The command was killed by a signal it didn't choose, including the
+    /// kernel's memory-limit kill.
+    pub signal: u64,
+    /// The attempt ran past the task timeout and was killed.
+    pub timeout: u64,
+    /// The attempt's exit status couldn't be established (replayable work).
+    pub unknown: u64,
+    /// Read back from a node's ledger after a restart, which keeps attempt
+    /// counts but not why the earlier attempts failed.
+    pub unrecorded: u64,
+}
+
+impl RetryCauses {
+    /// All counted retries, or `None` if the sum overflows.
+    pub fn total(&self) -> Option<u64> {
+        [self.signal, self.timeout, self.unknown, self.unrecorded]
+            .into_iter()
+            .try_fold(self.exit_code, u64::checked_add)
+    }
+
+    /// Add another set of counts, saturating rather than wrapping.
+    pub fn add(&mut self, other: &Self) {
+        self.exit_code = self.exit_code.saturating_add(other.exit_code);
+        self.signal = self.signal.saturating_add(other.signal);
+        self.timeout = self.timeout.saturating_add(other.timeout);
+        self.unknown = self.unknown.saturating_add(other.unknown);
+        self.unrecorded = self.unrecorded.saturating_add(other.unrecorded);
+    }
+}
+
 /// What a node reports when it has finished one chunk. Every task in the
 /// chunk is accounted for exactly once: succeeded, failed or not run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +132,9 @@ pub struct ChunkResult {
     pub not_run: u32,
     /// Extra attempts spent on retries across the chunk.
     pub retried: u32,
+    /// Why those extra attempts were needed; sums to `retried`.
+    #[serde(default)]
+    pub retry_causes: RetryCauses,
 }
 
 /// Outcome of a valid chunk completion.
@@ -137,6 +177,12 @@ pub enum TaskArrayError {
     Stopped,
     #[error("execution owner must contain 1–128 bytes without control characters")]
     InvalidOwner,
+    #[error("chunk {chunk} reports {retried} retries but retry causes for {causes}")]
+    RetryCauseMismatch {
+        chunk: u32,
+        retried: u64,
+        causes: u64,
+    },
 }
 
 /// Aggregate progress of one array, computed without touching tasks.
@@ -152,6 +198,8 @@ pub struct TaskArraySummary {
     pub not_run: u64,
     /// Extra attempts spent on retries.
     pub retried: u64,
+    /// Why the retried attempts failed; sums to `retried`.
+    pub retry_causes: RetryCauses,
     /// Tasks in chunks not yet granted.
     pub queued: u64,
     /// Tasks in chunks nodes hold (running or about to).
@@ -187,6 +235,8 @@ pub struct TaskArrayState {
     failed: u64,
     not_run: u64,
     retried: u64,
+    #[serde(default)]
+    retry_causes: RetryCauses,
     stopped: Option<StopReason>,
     duration_counts: [u64; 16],
     /// [`Self::duration_counts`], decayed; grant lookahead learns from this.
@@ -283,6 +333,9 @@ impl TaskArrayState {
         if self.stopped.is_some() && !self.queued.is_empty() {
             return Err("stopped run retains queued work".into());
         }
+        if self.retry_causes.total() != Some(self.retried) {
+            return Err("retry causes disagree with the retry count".into());
+        }
         Ok(())
     }
 
@@ -307,6 +360,7 @@ impl TaskArrayState {
             failed: 0,
             not_run: 0,
             retried: 0,
+            retry_causes: RetryCauses::default(),
             stopped: None,
             duration_counts: [0; 16],
             recent_duration_counts: [0; 16],
@@ -453,6 +507,14 @@ impl TaskArrayState {
         {
             return Err(TaskArrayError::IndexOutsideChunk { chunk });
         }
+        let causes = result.retry_causes.total().unwrap_or(u64::MAX);
+        if causes != u64::from(result.retried) {
+            return Err(TaskArrayError::RetryCauseMismatch {
+                chunk,
+                retried: u64::from(result.retried),
+                causes,
+            });
+        }
 
         self.release(node, chunk);
         self.attempts.remove(&chunk);
@@ -482,6 +544,7 @@ impl TaskArrayState {
         self.failed += failed;
         self.not_run += u64::from(result.not_run);
         self.retried += u64::from(result.retried);
+        self.retry_causes.add(&result.retry_causes);
         self.record_failures(&result.failed_indices);
         self.failed_overflow += failed - result.failed_indices.len();
         if let Some(limit) = self.spec.max_failed_indexes
@@ -591,6 +654,7 @@ impl TaskArrayState {
             failed: self.failed,
             not_run: self.not_run,
             retried: self.retried,
+            retry_causes: self.retry_causes,
             queued: self.tasks_in(&self.queued),
             held,
             chunks_done: self.done.len(),
@@ -1146,6 +1210,7 @@ mod tests {
                         failed_indices: failed,
                         not_run: 0,
                         retried: 0,
+                        retry_causes: RetryCauses::default(),
                     };
                     state.complete(&holder, &result).unwrap();
                 }
@@ -1192,6 +1257,7 @@ mod tests {
             failed_indices: IndexRangeSet::new(),
             not_run: 0,
             retried: 0,
+            retry_causes: RetryCauses::default(),
         }
     }
 
@@ -1244,6 +1310,10 @@ mod tests {
         result.failed_count = 2;
         result.failed_indices = IndexRangeSet::from_range(2042..=2043);
         result.retried = 7;
+        result.retry_causes = RetryCauses {
+            exit_code: 7,
+            ..RetryCauses::default()
+        };
         assert_eq!(
             state.complete(&node("n1"), &result),
             Ok(CompletionOutcome::Applied)
@@ -1255,6 +1325,69 @@ mod tests {
         assert_eq!(summary.chunks_done, 1);
         assert_eq!(summary.held, 2000);
         assert_eq!(state.failed_indices(), &chunks(2042..=2043));
+    }
+
+    #[test]
+    fn retry_causes_accumulate_per_cause_across_chunks() {
+        let mut state = TaskArrayState::new(spec(2000, 1000), 1).unwrap();
+        state.grant(&node("n1"), &chunks(0..=1)).unwrap();
+        let mut first = all_ok(&state, 0);
+        first.retried = 3;
+        first.retry_causes = RetryCauses {
+            exit_code: 1,
+            signal: 2,
+            ..RetryCauses::default()
+        };
+        let mut second = all_ok(&state, 1);
+        second.retried = 4;
+        second.retry_causes = RetryCauses {
+            signal: 1,
+            timeout: 1,
+            unknown: 1,
+            unrecorded: 1,
+            ..RetryCauses::default()
+        };
+        state.complete(&node("n1"), &first).unwrap();
+        state.complete(&node("n1"), &second).unwrap();
+        let summary = state.summary();
+        assert_eq!(summary.retried, 7);
+        assert_eq!(
+            summary.retry_causes,
+            RetryCauses {
+                exit_code: 1,
+                signal: 3,
+                timeout: 1,
+                unknown: 1,
+                unrecorded: 1,
+            }
+        );
+        state.validate_snapshot().unwrap();
+    }
+
+    #[test]
+    fn a_report_whose_retry_causes_disagree_with_its_retries_is_refused() {
+        let mut state = TaskArrayState::new(spec(1000, 1000), 1).unwrap();
+        state.grant(&node("n1"), &chunks(0..=0)).unwrap();
+        let mut result = all_ok(&state, 0);
+        result.retried = 2;
+        result.retry_causes.exit_code = 1;
+        let before = state.clone();
+        assert_eq!(
+            state.complete(&node("n1"), &result),
+            Err(TaskArrayError::RetryCauseMismatch {
+                chunk: 0,
+                retried: 2,
+                causes: 1
+            })
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn a_snapshot_whose_retry_causes_disagree_is_refused() {
+        let mut state = TaskArrayState::new(spec(1000, 1000), 1).unwrap();
+        state.retry_causes.timeout = 1;
+        assert!(state.validate_snapshot().is_err());
     }
 
     #[test]
@@ -1438,6 +1571,7 @@ mod tests {
                 failed_indices: failures,
                 not_run: 0,
                 retried: 0,
+                retry_causes: Default::default(),
             };
             state.complete(&node("n1"), &result).unwrap();
         }
