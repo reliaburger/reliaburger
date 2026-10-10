@@ -1598,13 +1598,26 @@ the comparison fair, not because it's the best setting for each runtime. The
 host plateau also says the next limit is work supply through grants and
 receipts, not process creation.
 
-**An hour is not a day.** A one-hour run beside a live application completed
-with no failures, no retries and the service still answering. It still doesn't
-qualify 100 million successes a day. Every bounded storage scan in it was
-incomplete, so it doesn't prove storage stays bounded. And a fixed pool of 32
-live slots doesn't bound history: slot identities include the namespace, so
-rotating through new namespaces leaves retired ownership and routing journals
-behind. The 24-hour run, faults and collection of that history remain in #640.
+**A minute isn't an hour.** Each path then ran for an hour at admitted speed,
+one after another, beside the same live application. No path had a terminal
+failure and the application answered every probe. The hours also showed how
+much a cold minute understates a warm pool: shared containers averaged more
+than three times their first-minute rate over the hour. And the VM's CPU was
+only a little over half busy for the public paths, against more than 90% for
+raw processes, so the next limit is feeding work and accepting receipts, not
+starting processes.
+
+**An hour is not a day.** Storage is the unfinished part. Free disk in the VM
+fell to about 200 MiB by the end of the host hour, and every bounded storage
+scan was incomplete, so none of this proves storage stays bounded. A fixed pool
+of 32 live slots doesn't bound history either: slot identities include the
+namespace, so rotating through new namespaces leaves retired ownership and
+routing journals behind. The fresh-container hour also recorded four retries
+that later succeeded, and we couldn't say why: a bulk success record keeps the
+final outcome and the attempt count, not the earlier failure's reason. At this
+volume you want bounded summaries of failure causes, not millions of log lines
+for successful jobs. A real daily run, faults and collection of that history
+remain in #668.
 
 **Keep the failures.** One rerun of the direct matrix forgot its private
 hostname wrapper, collided with the live node and produced a thousand startup
@@ -1624,6 +1637,17 @@ keep watching the work we own. Ctrl-C triggers a `CancellationToken` that stops
 submission and observation without skipping cleanup. The raw baseline keeps its
 child waiters in a Tokio `JoinSet`, a set of spawned tasks you can await as
 they finish, and drains exits after the deadline without crediting them.
+
+Adding the benchmark's flags taught a Rust lesson of its own. Clap's derive
+macro generates the parser from the command enum, and with every benchmark
+option inline the generated code overflowed the test threads' default stack,
+in tests for unrelated commands too. A Rust enum is as large as its largest
+variant, and that size lands on the stack wherever the value is built. The
+options moved into their own `#[derive(clap::Args)]` struct, held as
+`Bench(Box<BenchOptions>)`. `Box<T>` puts the value on the heap and stores only
+a pointer, so every variant shrank back to a few words. When you add a
+specialised command, keep running the ordinary command tests: generated code
+can change their stack use too.
 
 Inside each pool, admission, cold setup, command execution and cleanup each
 record into a fixed sixteen-bucket histogram of `AtomicU64` counters, so

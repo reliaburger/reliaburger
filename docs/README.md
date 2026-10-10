@@ -1488,9 +1488,11 @@ lookahead across control-report rounds; execution still waits for concurrency
 and resources.
 
 The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
-tracks #639 and the still-unqualified sustained target (#640). The
+tracks reusable executors (#639), the demonstration (#640) and the
+still-unqualified sustained target (#668). The
 [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
 record each runtime's per-job overhead for 60 seconds on a small VM, with the
-rig, profiles and limits, and the
+rig, profiles and limits, and four completed one-hour soaks beside a live
+application; global storage bounds and daily qualification remain in #668. The
 [earlier evidence](qualification/2026-10-08-job-measurements/README.md) keeps
 the recovery results. Resident model workers (#641) remain separate.

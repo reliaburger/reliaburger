@@ -1,0 +1,64 @@
+jobs-vm-baseline: 60 seconds, concurrency 27 locally; image/executable preparation precedes the window; positive drain follows it
+0.0s: 1 raw successful exits within the window; 0 failures
+5.0s: 81686 raw successful exits within the window; 0 failures
+10.0s: 163183 raw successful exits within the window; 0 failures
+15.0s: 245040 raw successful exits within the window; 0 failures
+20.0s: 329421 raw successful exits within the window; 0 failures
+25.0s: 410079 raw successful exits within the window; 0 failures
+30.0s: 494397 raw successful exits within the window; 0 failures
+35.0s: 577917 raw successful exits within the window; 0 failures
+40.0s: 658835 raw successful exits within the window; 0 failures
+45.0s: 741806 raw successful exits within the window; 0 failures
+50.0s: 825560 raw successful exits within the window; 0 failures
+55.0s: 909377 raw successful exits within the window; 0 failures
+jobs-vm-baseline: 993718 raw successful exits in 60 seconds (16562.0/s)
+0 failures, 0 retries; cleanup verified
+1.4B runs/day extrapolated — not an observed daily total
+jobs-containers: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.1s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+10.2s: 12 unique accepted successes, 0 failures, 0 retries; 1.2/s
+15.4s: 36 unique accepted successes, 0 failures, 0 retries; 2.3/s
+20.4s: 53 unique accepted successes, 0 failures, 0 retries; 2.6/s
+25.6s: 76 unique accepted successes, 0 failures, 0 retries; 3.0/s
+30.7s: 97 unique accepted successes, 0 failures, 0 retries; 3.2/s
+35.9s: 118 unique accepted successes, 0 failures, 0 retries; 3.3/s
+41.1s: 138 unique accepted successes, 0 failures, 0 retries; 3.4/s
+46.2s: 156 unique accepted successes, 0 failures, 0 retries; 3.4/s
+51.4s: 176 unique accepted successes, 0 failures, 0 retries; 3.4/s
+56.5s: 198 unique accepted successes, 0 failures, 0 retries; 3.5/s
+jobs-containers: 213 unique accepted successes in 60 seconds (3.5/s)
+0 failures, 0 retries; cleanup verified
+306.7k runs/day extrapolated — not an observed daily total
+jobs-shared-containers: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.3s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+10.4s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+15.6s: 4000 unique accepted successes, 0 failures, 0 retries; 256.6/s
+20.8s: 8000 unique accepted successes, 0 failures, 0 retries; 384.5/s
+26.0s: 11000 unique accepted successes, 0 failures, 0 retries; 423.1/s
+31.2s: 15000 unique accepted successes, 0 failures, 0 retries; 481.0/s
+36.4s: 17000 unique accepted successes, 0 failures, 0 retries; 466.9/s
+41.6s: 23000 unique accepted successes, 0 failures, 0 retries; 553.3/s
+46.7s: 29000 unique accepted successes, 0 failures, 0 retries; 621.6/s
+51.7s: 40000 unique accepted successes, 0 failures, 0 retries; 773.6/s
+56.7s: 50000 unique accepted successes, 0 failures, 0 retries; 881.1/s
+jobs-shared-containers: 58000 unique accepted successes in 60 seconds (966.7/s)
+0 failures, 0 retries; cleanup verified
+83.5M runs/day extrapolated — not an observed daily total
+jobs-host-processes: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.1s: 8000 unique accepted successes, 0 failures, 0 retries; 1573.2/s
+10.2s: 20000 unique accepted successes, 0 failures, 0 retries; 1966.9/s
+15.2s: 52000 unique accepted successes, 0 failures, 0 retries; 3414.2/s
+20.3s: 84000 unique accepted successes, 0 failures, 0 retries; 4140.7/s
+25.3s: 102000 unique accepted successes, 0 failures, 0 retries; 4026.0/s
+30.4s: 134000 unique accepted successes, 0 failures, 0 retries; 4407.8/s
+35.5s: 166000 unique accepted successes, 0 failures, 0 retries; 4681.9/s
+40.5s: 182000 unique accepted successes, 0 failures, 0 retries; 4492.4/s
+45.6s: 214000 unique accepted successes, 0 failures, 0 retries; 4696.1/s
+50.6s: 246000 unique accepted successes, 0 failures, 0 retries; 4859.4/s
+55.7s: 262000 unique accepted successes, 0 failures, 0 retries; 4703.4/s
+jobs-host-processes: 294000 unique accepted successes in 60 seconds (4900.0/s)
+0 failures, 0 retries; cleanup verified
+423.4M runs/day extrapolated — not an observed daily total

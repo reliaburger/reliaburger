@@ -1148,7 +1148,11 @@ give each path the same 60 seconds, concurrency and resource profile on one smal
 VM, beside a raw-process reference. Every path runs a no-op command, so they
 measure per-job overhead, not the throughput of real work, and the record says
 what they don't establish: a universal ceiling, multi-node scaling, sustained
-headroom or bounded historical metadata.
+headroom or bounded historical metadata. One-hour soaks of each path then ran
+sequentially beside the same application, with no terminal failures and every
+application probe answered. Disk use grew materially during them and the
+capped storage scans were incomplete, so they are saturation observations, not
+a daily qualification; that remains in #668.
 
 
 ### AI workloads: resident models and coordinated training

@@ -1,0 +1,10 @@
+{
+  "positive_node_and_kernel_retirement_verified": true,
+  "private_archive_retained": true,
+  "private_archive_mode": "0600",
+  "archive_sha256": "2548ecfdb31287f0d4f48f53586d05fcebb560c0e32e7f9b0a7172756a38b561",
+  "cleanup_scope": "only positively retired original v4 benchmark data; no live node, unrelated workload or benchmark evidence removed",
+  "filesystem_free_bytes_before": 225873920,
+  "filesystem_free_bytes_after": 2772729856,
+  "completed_utc": "2026-10-09T22:43:52.068265+00:00"
+}

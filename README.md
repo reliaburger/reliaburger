@@ -293,7 +293,9 @@ batches reuse native executors that enforce CPU and memory limits. `bun
 [job throughput demo](https://reliaburger.com/#job-throughput) runs each kind
 for 60 seconds on a small VM, and the
 [qualification record](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
-gives the rig, the limits and what the numbers do and don't show.
+gives the rig, the limits and what the numbers do and don't show. All four
+one-hour soaks completed beside a live application; storage bounds and a real
+daily qualification remain in #668.
 
 Batch jobs retain distinct execution identities and their original scoped
 labels across retries and recovery. Finite durable history keeps replay fences;
