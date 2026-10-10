@@ -301,6 +301,116 @@ and state formats, so it needs matching binaries and a fresh cluster
 qualification and resident model workers remain separate issues; these semantics
 don't establish 100m accepted successes/day.
 
+### Fair shares: one tenant can't starve the rest
+
+The whitepaper promises that one team can't starve the cluster. For apps that
+was true: namespace quotas stop the placement pass. For jobs it wasn't. Every
+namespace shared one cap of 64 active runs and 256 job definitions, and quotas
+never looked at jobs at all. Sixty-four long arrays in one namespace blocked
+everyone's cron jobs and deployment hooks. A refused cron fire left a line on
+stderr and nothing else. And a daily `relish run --batch render-$DATE` broke on
+day 257, because every name made a definition that lived for ever. Issue #679
+fixed all four, following decisions D20 to D22.
+
+Where should a job quota bite? Jobs never enter the app placement pass; the
+task-array leader hands out chunks once a second. So that's where the charge
+goes. `GrantBudget::new` builds one `QuotaLedger` per tick from the replicated
+namespaces, charges every app placement first, then every attempt already in
+flight, and only then lets runs plan new grants, oldest first. Apps go first on
+purpose: a namespace's jobs use what its apps leave, so a job can never push out
+an app that fits.
+
+What does an attempt "in flight" cost? A chunk of 1,024 tasks doesn't run 1,024
+at once; a node runs at most its slots for that array. So the charge per node is
+`min(tasks held, slots)`, and `fit_grants` walks the planned chunks, adding each
+only while the extra attempts it would start fit the room left. Once a node holds
+a full round of its slots, deeper chunks cost nothing more, so the lookahead
+window from earlier in the chapter survives a quota. A run whose grants were held
+back gets a durable `quota_blocked` reason, and `relish batch-status` shows it.
+The reason is only rewritten when the *limit* it names changes: the usage numbers
+inside a `QuotaError` move with every finished task, and writing a Raft entry per
+tick to say "still blocked" would be silly.
+
+Capacity is split into two classes. A run's trigger decides which:
+
+```rust
+enum Admission {
+    Bulk,
+    Triggered,
+}
+
+impl Admission {
+    fn of(trigger: Option<&RunTrigger>) -> Self {
+        match trigger {
+            Some(RunTrigger::Cron { .. } | RunTrigger::Hook { .. }) => Self::Triggered,
+            Some(RunTrigger::Manual { .. }) | None => Self::Bulk,
+        }
+    }
+}
+```
+
+The `|` inside a pattern matches either variant, and `{ .. }` ignores their
+fields. Because the `match` is exhaustive, a new trigger kind won't compile
+until somebody decides which class it belongs to. Bulk runs stop 32 slots short
+of the global cap and at 64 per namespace; cron fires and hooks may use every
+slot. A cron fire refused even then becomes a *skipped occurrence*: the same
+transaction advances the cursor and records `skipped: capacity` with the minute,
+and the leader emits a `job-skipped` event. Nothing retries for the rest of the
+minute, and nothing vanishes.
+
+We also raised the global cap from 64 to 128, but only as far as a test could
+justify. `control_state_stays_within_budget_at_the_global_cap` fills the store
+with the largest active run it accepts (a 16 KiB template, ten thousand failure
+ranges, 64 holders) and checks two budgets: the replicated job state stays under
+32 MiB, half a Raft frame, and one node's sync call stays under the 8 MiB body
+limit the sync route now declares. At 128 those are about 18 MiB and 4 MiB; 256
+would break the first. Writing that test turned up a latent bug: the sync route
+had axum's default 2 MiB body limit, which 64 large templates could already
+exceed.
+
+Definitions without a schedule or a hook now expire in the same deterministic
+`prune` that drops their last run (D22). The prune needs the deployments to
+know which names are still owned, while it mutates the job catalogue:
+
+```rust
+let deployments = &self.deployments;
+self.jobs.expire_one_off(|namespace, name| {
+    deployments.values().any(|record| record.blocks(name, namespace))
+});
+```
+
+That looks like it borrows `self` twice, once shared and once mutable. It
+compiles because Rust tracks borrows per field: `self.deployments` and
+`self.jobs` are different places, so a shared borrow of one and a mutable
+borrow of the other don't overlap. Calling a `&self` *method* inside the
+closure would borrow all of `self` and fail.
+
+To mark hooks, `JobDefinition` gained a `hook` flag. Definitions are hashed into
+every run's digest, so adding a field could have changed every existing digest.
+`#[serde(default, skip_serializing_if = "std::ops::Not::not")]` leaves the field
+out when it's false; `Not::not` is the function behind `!`, used here as a
+predicate. A compile-time check keeps the run-receipt backstop above anything
+retention can hold:
+
+```rust
+const _: () = assert!(
+    MAX_JOB_RUNS >= MAX_ACTIVE_ARRAYS + MAX_TERMINAL_ARRAYS * 64
+);
+```
+
+`const _` is an unnamed constant evaluated by the compiler, so a future change
+to either bound that breaks the inequality fails the build, not a cluster.
+
+Finally, the cron loop used to take sixteen due schedules and *then* skip the
+ones a pending deployment blocked, so sixteen blocked schedules could starve
+the rest every tick. `due_schedules` now filters first and starts after the last
+key it fired, wrapping round with `iter().cycle().skip(start).take(n)`, so a
+long list takes turns. The tests read like the issue: one namespace can't take
+every active run, a cron fire uses the reserved headroom, a refused one is
+recorded as skipped, daily named arrays keep working past the definition cap,
+and on a real three-node cluster a cron job fires while other tenants fill
+every bulk slot.
+
 ## Short jobs without fresh containers
 
 What does a job that runs for five milliseconds cost? Until now, a whole
@@ -491,7 +601,7 @@ async fn slot(
                 })
             })
             .flatten();
-        let selected = warm.or_else(|| slots.iter().position(|slot| !slot.busy));
+        let selected = warm.or_else(|| choose_cold_slot(&slots));
         if let Some(index) = selected {
             // ... charge the budget for an empty slot before any image I/O
             slots[index].busy = true;
@@ -508,8 +618,12 @@ async fn slot(
 ```
 
 The function prefers a free slot whose container already has our key. Failing
-that, it takes any free slot, which may hold an incompatible container to
-retire. If nothing's free, it waits for a change and tries again.
+that, `choose_cold_slot` takes an empty slot, and only when there's none does
+it pick the free slot whose container has been idle longest, which it will
+retire. Our first version took the first free slot it found, so with two
+profiles taking turns, each could throw out the other's warm container while
+an empty slot sat next to it. If nothing's free, it waits for a change and
+tries again.
 
 `holder` records which run has the slot, but only once there are resources
 behind it: a reservation charged right here, or a container that already holds
@@ -530,9 +644,55 @@ Without it, a steady stream of tiny jobs could keep reusing warm containers
 forever while a large job waited for capacity that never came free.
 
 `Option::take` moves the container context out of the slot and leaves `None`
-behind. The caller now owns it. If the caller's future is dropped halfway
-through a command, the slot is still `busy` with no context, and stays
-quarantined rather than being handed to someone else.
+behind. The caller now owns it. So what happens if the caller's future is
+dropped halfway through a command? Our first version left the slot `busy` with
+no context and its reservation quarantined, which was safe but permanent: only
+a Bun restart freed them. Nothing in production drops that future today
+(chunks are cancelled by token, not by abort), but a latent leak is still a
+leak.
+
+The fix is a *drop guard*. `run` wraps the slot and its context in a
+`Checkout` the moment it gets them, and every normal exit hands them back
+through `Checkout::release` or `Checkout::retire`, which set a `returned`
+flag. Rust runs a value's `Drop::drop` when it goes out of scope, and that
+includes being dropped mid-`.await` inside an abandoned future, like a Go
+`defer` that also fires when someone else stops your goroutine. If `returned`
+is still false there, the guard moves the context into the slot's `retiring`
+place, and the eviction loop retires it on its next tick, the same as any
+executor that missed its retirement deadline:
+
+```rust
+impl<G: Grill + Clone + 'static> Drop for Checkout<G> {
+    fn drop(&mut self) {
+        if self.returned {
+            return;
+        }
+        let pool = self.pool.clone();
+        let index = self.index;
+        let context = self.context.take();
+        // Drop can't wait for the slot lock, so a task finishes the hand-over.
+        let handoff = async move {
+            let mut slots = pool.slots.lock().await;
+            match context {
+                Some(context) => { /* ... clear the holder, park it in `retiring` */ }
+                None => vacate(&mut slots[index], None),
+            }
+            drop(slots);
+            pool.changed.notify_waiters();
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(handoff);
+        }
+    }
+}
+```
+
+`drop` is synchronous, so it can't `.await` the tokio mutex. It moves what it
+needs into an `async move` block and spawns that instead. This is also why
+`run` now takes `self: &Arc<Self>` rather than `&self`: the spawned task has to
+own a reference to the pool, and cloning the `Arc` gives it one. The guard owns
+the context the whole time, even while a retirement borrows it, so there's no
+moment where dropping the future loses it.
 
 The waiting is the subtle part. `Notify::notified()` creates a future, and
 `enable()` registers it *before* we look at the slots. Without that, a slot
@@ -634,6 +794,43 @@ we act on proof that something is gone, never on the absence of news. A
 timeout, a cancellation or a missing receipt retires the whole container
 instead. Recovery after a Bun restart carries the same obligation, including
 the sibling task cgroup, before any work is replayed.
+
+**Kernels without `cgroup.kill`.** `cgroup.kill` arrived in Linux 5.14. On
+Debian 11's 5.10, the file doesn't exist, and cgroupfs won't create files, so
+`std::fs::write` (which opens with `O_CREAT`) fails with `EACCES`. Our check
+only forgave `NotFound`, so retirement failed forever. Every idle executor was
+evicted after a second and quarantined with its slot busy and its reservation
+charged to the budget apps share. Thirty-two executors later, the node could
+schedule nothing at all.
+
+`src/grill/kernel.rs` now asks the kernel once, the first time a runner wants
+an executor. It reads the release for `clone3(CLONE_INTO_CGROUP)` (5.7, inside
+the node's 5.8 minimum), checks `/proc/thread-self/children` for the host
+helper, and makes a scratch cgroup to try writing its `cgroup.kill`. Any error
+from that write means "unsupported", not just a missing file. The answer lives
+in a `static OnceLock`, Rust's thread-safe run-once cell, like Go's
+`sync.Once` with the value attached. Missing `clone3` or the children file
+turns the pool off, so jobs take the fresh path or refuse with a reason.
+Missing `cgroup.kill` doesn't: retirement falls back to freezing the task
+group, so nothing in it can fork, then sending `SIGKILL` to every pid in
+`cgroup.procs`. A frozen process still dies of a fatal signal. The retirement
+loop repeats that until `cgroup.events` says `populated 0`, which is the same
+proof it waited for before. The write also opens the file without `O_CREAT`
+now, so a missing interface file says so instead of hiding behind `EACCES`.
+
+**Cancelling a cold start.** Preparing a cold executor can take as long as an
+image pull. That work used to run outside any `select!`, so cancelling an
+array waited for the pull to finish. Now the pull runs as its own task and the
+attempt races it against cancellation and the deadline. An interrupted attempt
+walks away and lets the pull finish filling the cache, rather than dropping it
+halfway through unpacking a layer. Starting the helper is different: runc
+calls must never be abandoned halfway, or retirement can't tell what they left
+behind. So `start` takes a `stop` token that it checks between runtime calls
+and races only against the ten-second wait for the helper to connect. Either
+way the half-started context is retired, and the slot and reservation come
+back. The same change moved the start-up filesystem work (creating
+directories, permissions, `chown`, preparing cgroups) onto the blocking pool
+with `spawn_blocking`, off the async worker threads.
 
 Retirement can't wait forever either. A process stuck in an uninterruptible
 kernel wait, say on a hung NFS mount, ignores `SIGKILL` until the kernel lets
@@ -1261,10 +1458,6 @@ should shrink to nothing before the release ships.
   accepted task leaves a little behind on the node: ledger entries, captured
   output, executor metadata. At 0.2.0 rates that adds up to a full disk within
   hours, and nothing reclaims it between runs.
-- **Fairness across namespaces**
-  ([#679](https://github.com/reliaburger/reliaburger/issues/679)). Job limits
-  are cluster-wide and namespace quotas ignore jobs, so one tenant's arrays can
-  starve everybody else's cron jobs and deployment hooks.
 - **App placement that sees jobs**
   ([#681](https://github.com/reliaburger/reliaburger/issues/681)). Job attempts
   reserve CPU and memory in each node's own budget, which the leader's app

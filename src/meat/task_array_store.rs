@@ -30,9 +30,23 @@ pub const TERMINAL_RETENTION_SECS: u64 = 3600;
 /// 160 KiB of failed-index ranges, so this bounds the snapshot too.
 pub const MAX_TERMINAL_ARRAYS: usize = 20;
 
-/// Most arrays running at once. The leader syncs every node for every
-/// running array once a second, so this bounds that work.
-pub const MAX_ACTIVE_ARRAYS: usize = 64;
+/// Most runs active at once across the cluster. The leader syncs every node
+/// for every running array once a second, and every active run sits in the
+/// replicated state, so this bounds both. The state-size test
+/// `control_state_stays_within_budget_at_the_global_cap` justifies the number.
+pub const MAX_ACTIVE_ARRAYS: usize = 128;
+
+/// Active-run slots only cron fires and deployment jobs may use. Arrays,
+/// batches and manual runs stop at `MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS`,
+/// so bulk work can never lock out schedules and deployments.
+pub const RESERVED_TRIGGERED_RUNS: usize = 32;
+
+/// Most active arrays, batches and manual runs one namespace may hold, so one
+/// tenant can't take every slot. Cron fires and deployment jobs don't count.
+pub const MAX_ACTIVE_RUNS_PER_NAMESPACE: usize = 64;
+
+/// Most named jobs in one finite batch (`relish batch` with several jobs).
+pub const MAX_FINITE_BATCH_JOBS: usize = 64;
 
 /// One submitted array: what to run, and how far it has got.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,6 +61,10 @@ pub struct TaskArrayRecord {
     pub state: TaskArrayState,
     /// Timestamp of the accepted terminal transition, supplied by the leader.
     pub terminal_at_epoch_secs: Option<u64>,
+    /// Why the leader is granting this run nothing more: its namespace quota
+    /// is used up. Cleared once a grant fits again or the run finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_blocked: Option<crate::meat::quota::QuotaError>,
 }
 
 /// One homogeneous resource profile in a mixed submission.
@@ -154,6 +172,12 @@ pub enum TaskArrayWrite {
         node: NodeId,
         now_epoch_secs: u64,
     },
+    /// The leader held grants back for the namespace quota (`Some`), or no
+    /// longer does (`None`).
+    QuotaBlocked {
+        batch_id: u64,
+        reason: Option<crate::meat::quota::QuotaError>,
+    },
 }
 
 impl TaskArrayWrite {
@@ -174,6 +198,8 @@ pub enum TaskArrayApplied {
     JobRecorded,
     /// A new array exists under this id.
     Registered { batch_id: u64 },
+    /// A run's quota-blocked reason changed.
+    QuotaRecorded,
     /// A sync went through. Refused items are stale (a lost node's late
     /// report, a grant raced by a cancel) and are skipped, not fatal.
     Synced {
@@ -202,8 +228,37 @@ pub enum TaskArrayStoreError {
     Invalid(#[from] TaskArraySpecError),
     #[error("a task array needs a name")]
     EmptyName,
-    #[error("{active} task arrays are already running; the limit is {MAX_ACTIVE_ARRAYS}")]
-    TooManyActive { active: usize },
+    #[error(
+        "{active} runs are already active; arrays, batches and manual runs may use {limit} \
+         of the {MAX_ACTIVE_ARRAYS} slots, the rest are kept for cron fires and deployments"
+    )]
+    TooManyActive { active: usize, limit: usize },
+    #[error(
+        "namespace {namespace:?} already has {active} active runs; the limit is \
+         {MAX_ACTIVE_RUNS_PER_NAMESPACE} per namespace"
+    )]
+    NamespaceFull { namespace: String, active: usize },
+}
+
+/// Which share of the active-run slots a new run may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Arrays, batches and manual runs: bounded per namespace, and kept out
+    /// of the reserved headroom.
+    Bulk,
+    /// Cron fires and deployment jobs: may use every slot.
+    Triggered,
+}
+
+impl Admission {
+    fn of(trigger: Option<&super::job::RunTrigger>) -> Self {
+        match trigger {
+            Some(super::job::RunTrigger::Cron { .. } | super::job::RunTrigger::Hook { .. }) => {
+                Self::Triggered
+            }
+            Some(super::job::RunTrigger::Manual { .. }) | None => Self::Bulk,
+        }
+    }
 }
 
 /// The replicated set of task arrays, keyed by batch id.
@@ -508,11 +563,7 @@ impl TaskArrays {
                         "manifest exceeds the task-count bound".into(),
                     ));
                 }
-                if self.active().count() + cohorts.len() > MAX_ACTIVE_ARRAYS {
-                    return Err(TaskArrayStoreError::TooManyActive {
-                        active: self.active().count(),
-                    });
-                }
+                self.check_capacity(namespace, Admission::Bulk, cohorts.len())?;
                 self.prune(*submitted_at_epoch_secs);
                 let batch_id = allocate_id();
                 let mut identities = Vec::new();
@@ -527,6 +578,7 @@ impl TaskArrays {
                             template: cohort.template.clone(),
                             state,
                             terminal_at_epoch_secs: None,
+                            quota_blocked: None,
                         },
                     );
                     identities.push((cohort.name.clone(), id));
@@ -576,15 +628,13 @@ impl TaskArrays {
                 validate_template(template)?;
                 let state = TaskArrayState::new(spec.clone(), *submitted_at_epoch_secs)?;
                 self.prune(*submitted_at_epoch_secs);
-                let active = self.active().count();
-                if active >= MAX_ACTIVE_ARRAYS {
-                    return Err(TaskArrayStoreError::TooManyActive { active });
-                }
+                self.check_capacity(namespace, Admission::Bulk, 1)?;
                 let batch_id = allocate_id();
                 self.arrays.insert(
                     batch_id,
                     TaskArrayRecord {
                         terminal_at_epoch_secs: None,
+                        quota_blocked: None,
                         name: name.clone(),
                         namespace: namespace.clone(),
                         template: (**template).clone(),
@@ -682,6 +732,15 @@ impl TaskArrays {
                 }
                 self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Requeued { chunks })
+            }
+            TaskArrayWrite::QuotaBlocked { batch_id, reason } => {
+                let record = self.record_mut(*batch_id)?;
+                record.quota_blocked = if record.state.status().is_terminal() {
+                    None
+                } else {
+                    reason.clone()
+                };
+                Ok(TaskArrayApplied::QuotaRecorded)
             }
             TaskArrayWrite::Requeue {
                 batch_id,
@@ -881,9 +940,17 @@ impl TaskArrays {
                 now_epoch_secs,
             } => {
                 let state = TaskArrayState::new(definition.tasks, now_epoch_secs)?;
-                let active = self.active().count();
-                if active >= MAX_ACTIVE_ARRAYS {
-                    return Err(TaskArrayStoreError::TooManyActive { active });
+                let admission = Admission::of(Some(&run.trigger));
+                if let Err(full) = retained.check_capacity(&run.namespace, admission, 1) {
+                    let super::job::RunTrigger::Cron { minute } = run.trigger else {
+                        return Err(full);
+                    };
+                    // A refused cron fire still claims its minute, so the
+                    // leader doesn't retry it all minute and lose it silently.
+                    self.prune(now_epoch_secs);
+                    jobs.record_skip(&run.namespace, &run.name, minute);
+                    self.jobs = jobs;
+                    return Ok(TaskArrayApplied::JobRecorded);
                 }
                 // Every fallible check completes before pruning, allocating or publishing.
                 self.prune(now_epoch_secs);
@@ -896,6 +963,7 @@ impl TaskArrays {
                         template: definition.template,
                         state,
                         terminal_at_epoch_secs: None,
+                        quota_blocked: None,
                     },
                 );
                 jobs.record_run(batch_id, run);
@@ -911,6 +979,7 @@ impl TaskArrays {
         let record = self.record_mut(id)?;
         if record.state.status().is_terminal() && record.terminal_at_epoch_secs.is_none() {
             record.terminal_at_epoch_secs = Some(now.max(record.state.submitted_at_epoch_secs));
+            record.quota_blocked = None;
         }
         let state = record.state.clone();
         if let Some(run) = self.jobs.run_mut(id) {
@@ -987,6 +1056,46 @@ impl TaskArrays {
         }
         self.jobs
             .retain_runs(&self.arrays.keys().copied().collect());
+        let deployments = &self.deployments;
+        self.jobs.expire_one_off(|namespace, name| {
+            deployments
+                .values()
+                .any(|record| record.blocks(name, namespace))
+        });
+    }
+
+    /// Refuse a new run when its share of the active-run slots is full.
+    /// Bulk work stops short of the reserved headroom and at its namespace's
+    /// cap; cron fires and deployment jobs may use every slot.
+    fn check_capacity(
+        &self,
+        namespace: &str,
+        admission: Admission,
+        adding: usize,
+    ) -> Result<(), TaskArrayStoreError> {
+        let mut active = 0;
+        let mut namespace_bulk = 0;
+        for (id, record) in self.active() {
+            active += 1;
+            let trigger = self.jobs.run(id).map(|run| &run.trigger);
+            if record.namespace == namespace && Admission::of(trigger) == Admission::Bulk {
+                namespace_bulk += 1;
+            }
+        }
+        let limit = match admission {
+            Admission::Bulk => MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS,
+            Admission::Triggered => MAX_ACTIVE_ARRAYS,
+        };
+        if active + adding > limit {
+            return Err(TaskArrayStoreError::TooManyActive { active, limit });
+        }
+        if admission == Admission::Bulk && namespace_bulk + adding > MAX_ACTIVE_RUNS_PER_NAMESPACE {
+            return Err(TaskArrayStoreError::NamespaceFull {
+                namespace: namespace.to_string(),
+                active: namespace_bulk,
+            });
+        }
+        Ok(())
     }
 
     /// Active deployment intent, excluding bounded terminal receipts.
@@ -1030,7 +1139,7 @@ impl TaskArrays {
                     || request_id.len() > 128
                     || request_id.chars().any(char::is_control)
                     || jobs.is_empty()
-                    || jobs.len() > MAX_ACTIVE_ARRAYS
+                    || jobs.len() > MAX_FINITE_BATCH_JOBS
                 {
                     return Err(refuse(
                         "finite batches require a request identity and 1–64 named jobs; use resource profiles for larger submissions",
@@ -1558,18 +1667,342 @@ mod tests {
         );
     }
 
-    #[test]
-    fn register_refuses_past_the_active_limit() {
-        let mut arrays = TaskArrays::default();
-        let mut ids = counter();
-        for _ in 0..MAX_ACTIVE_ARRAYS {
-            arrays.apply(&register(4, 4, 1), &mut ids).unwrap();
+    fn register_in(namespace: &str) -> TaskArrayWrite {
+        TaskArrayWrite::Register {
+            name: "render".to_string(),
+            namespace: namespace.to_string(),
+            template: template(),
+            spec: TaskArraySpec::with_count(4),
+            submitted_at_epoch_secs: 1,
+        }
+    }
+
+    /// Fill every bulk slot: whole namespaces of arrays, then the rest.
+    fn fill_bulk(arrays: &mut TaskArrays, ids: &mut impl FnMut() -> u64) {
+        let bulk = MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS;
+        for i in 0..bulk {
+            let namespace = format!("bulk-{}", i / MAX_ACTIVE_RUNS_PER_NAMESPACE);
+            arrays.apply(&register_in(&namespace), &mut *ids).unwrap();
         }
         assert_eq!(
-            arrays.apply(&register(4, 4, 1), &mut ids),
+            arrays.apply(&register_in("latecomer"), &mut *ids),
             Err(TaskArrayStoreError::TooManyActive {
-                active: MAX_ACTIVE_ARRAYS
+                active: bulk,
+                limit: bulk,
             })
+        );
+    }
+
+    fn job_put(
+        namespace: &str,
+        name: &str,
+        cron: Option<&str>,
+        trigger: Option<super::super::job::RunTrigger>,
+        now_epoch_secs: u64,
+    ) -> TaskArrayWrite {
+        let mut definition = super::super::job::JobDefinition::from_spec(*template());
+        definition.cron = cron.map(|expression| super::super::job::CronPolicy {
+            expression: expression.into(),
+            overlap: super::super::job::OverlapPolicy::Allow,
+            missed: super::super::job::MissedRunPolicy::Skip,
+        });
+        TaskArrayWrite::Job(Box::new(super::super::job::JobWrite::Put {
+            name: name.into(),
+            namespace: namespace.into(),
+            definition: Box::new(definition),
+            trigger,
+            now_epoch_secs,
+        }))
+    }
+
+    fn cron_fire(namespace: &str, name: &str, minute: i64) -> TaskArrayWrite {
+        TaskArrayWrite::Job(Box::new(super::super::job::JobWrite::Fire {
+            name: name.into(),
+            namespace: namespace.into(),
+            revision: 1,
+            minute,
+            now_epoch_secs: u64::try_from(minute).unwrap() * 60,
+        }))
+    }
+
+    #[test]
+    fn one_namespace_cannot_take_every_active_run() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        for _ in 0..MAX_ACTIVE_RUNS_PER_NAMESPACE {
+            arrays.apply(&register_in("greedy"), &mut ids).unwrap();
+        }
+        let refused = arrays.apply(&register_in("greedy"), &mut ids);
+        assert_eq!(
+            refused,
+            Err(TaskArrayStoreError::NamespaceFull {
+                namespace: "greedy".into(),
+                active: MAX_ACTIVE_RUNS_PER_NAMESPACE,
+            })
+        );
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("\"greedy\""), "{message}");
+        assert!(
+            message.contains(&MAX_ACTIVE_RUNS_PER_NAMESPACE.to_string()),
+            "{message}"
+        );
+        // Everyone else still gets in.
+        assert!(arrays.apply(&register_in("modest"), &mut ids).is_ok());
+    }
+
+    #[test]
+    fn cron_fire_uses_reserved_headroom_when_bulk_runs_fill_the_cap() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                &mut ids,
+            )
+            .unwrap();
+        fill_bulk(&mut arrays, &mut ids);
+        assert!(matches!(
+            arrays.apply(&cron_fire("ops", "nightly", 3), &mut ids),
+            Ok(TaskArrayApplied::Registered { .. })
+        ));
+    }
+
+    #[test]
+    fn hook_registers_when_bulk_arrays_fill_the_cap() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        fill_bulk(&mut arrays, &mut ids);
+        let config = crate::config::Config::parse(
+            "[app.web]\nimage='web:v1'\n[job.migrate]\nruntime='process'\nexec='/bin/true'\nrun_before=['app.web']",
+        )
+        .unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployBegin {
+                    operation_id: "b".repeat(32),
+                    config: Box::new(config),
+                    now_epoch_secs: 2,
+                },
+                &mut ids,
+            )
+            .unwrap();
+        let hook = arrays.deployment(&"b".repeat(32)).unwrap().hook_runs["migrate"];
+        assert!(arrays.get(hook).is_some());
+    }
+
+    #[test]
+    fn refused_cron_fire_is_recorded_as_skipped_capacity() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                &mut ids,
+            )
+            .unwrap();
+        fill_bulk(&mut arrays, &mut ids);
+        // Deployment-style runs take the reserved slots too.
+        for i in 0..RESERVED_TRIGGERED_RUNS {
+            let trigger = super::super::job::RunTrigger::Hook {
+                operation_id: format!("op-{i}"),
+            };
+            arrays
+                .apply(
+                    &job_put("deploys", &format!("hook-{i}"), None, Some(trigger), 120),
+                    &mut ids,
+                )
+                .unwrap();
+        }
+        assert_eq!(arrays.active().count(), MAX_ACTIVE_ARRAYS);
+
+        let mut allocated = false;
+        let applied = arrays.apply(&cron_fire("ops", "nightly", 3), || {
+            allocated = true;
+            0
+        });
+        assert_eq!(applied, Ok(TaskArrayApplied::JobRecorded));
+        assert!(!allocated, "a skipped occurrence spends no id");
+        let record = arrays.jobs().definition("ops", "nightly").unwrap();
+        assert_eq!(record.last_observed_minute, Some(3));
+        assert_eq!(
+            record.skipped,
+            Some(super::super::job::SkippedOccurrence {
+                minute: 3,
+                reason: super::super::job::SkipReason::Capacity,
+            })
+        );
+        assert_eq!(record.skipped_count, 1);
+        // The same minute again is a no-op, not a second skip.
+        arrays
+            .apply(&cron_fire("ops", "nightly", 3), &mut ids)
+            .unwrap();
+        assert_eq!(
+            arrays
+                .jobs()
+                .definition("ops", "nightly")
+                .unwrap()
+                .skipped_count,
+            1
+        );
+        // Once a slot frees, the next occurrence runs; the skip stays visible.
+        let first = arrays.active().next().unwrap().0;
+        arrays
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    batch_id: first,
+                    now_epoch_secs: 200,
+                },
+                &mut ids,
+            )
+            .unwrap();
+        assert!(matches!(
+            arrays.apply(&cron_fire("ops", "nightly", 4), &mut ids),
+            Ok(TaskArrayApplied::Registered { .. })
+        ));
+        assert_eq!(
+            arrays
+                .jobs()
+                .definition("ops", "nightly")
+                .unwrap()
+                .skipped
+                .map(|skip| skip.minute),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_quota_blocked_reason_lasts_until_the_run_finishes() {
+        let mut arrays = TaskArrays::default();
+        let id = registered(&mut arrays, &register(4, 4, 1), 1);
+        let reason = crate::meat::quota::QuotaError::CpuExceeded {
+            namespace: "default".into(),
+            current: 2000,
+            requested: 1000,
+            limit: 2000,
+        };
+        arrays
+            .apply(
+                &TaskArrayWrite::QuotaBlocked {
+                    batch_id: id,
+                    reason: Some(reason.clone()),
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(arrays.get(id).unwrap().quota_blocked, Some(reason));
+        let reopened: TaskArrays =
+            serde_json::from_value(serde_json::to_value(&arrays).unwrap()).unwrap();
+        assert_eq!(reopened, arrays);
+        arrays
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    batch_id: id,
+                    now_epoch_secs: 5,
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(arrays.get(id).unwrap().quota_blocked, None);
+    }
+
+    /// The largest template admission accepts: big argv and environment.
+    fn largest_template() -> JobSpec {
+        let mut template = *template();
+        template.command = Some(vec!["x".repeat(3584); 2]);
+        for i in 0..8 {
+            template.env.insert(
+                format!("VALUE_{i}"),
+                crate::config::types::EnvValue::Plain("v".repeat(1000)),
+            );
+        }
+        assert!(validate_template(&template).is_ok());
+        assert!(serde_json::to_vec(&template).unwrap().len() > 14 * 1024);
+        template
+    }
+
+    /// An active run as large as the store lets one get: the largest
+    /// template, and as many failed-index ranges as it keeps.
+    fn largest_active_record() -> TaskArrayRecord {
+        use super::super::task_array_state::MAX_FAILED_RANGES;
+        let spec = TaskArraySpec {
+            chunk_size: 512,
+            ..TaskArraySpec::with_count(super::super::task_array::MAX_TASK_COUNT)
+        };
+        let mut state = TaskArrayState::new(spec, 1).unwrap();
+        let mut chunk = 0;
+        while state.failed_indices().range_count() < MAX_FAILED_RANGES {
+            let set = IndexRangeSet::from_range(chunk..=chunk);
+            state.grant(&node("n1"), &set).unwrap();
+            let range = state.spec.chunk_range(ChunkId(chunk)).unwrap();
+            let mut failures = IndexRangeSet::new();
+            for index in range.clone().step_by(2) {
+                failures.insert(index);
+            }
+            let tasks = range.end() - range.start() + 1;
+            let result = ChunkResult {
+                duration_counts: [0; 16],
+                chunk: ChunkId(chunk),
+                attempt: 1,
+                succeeded: tasks - failures.len() as u32,
+                failed_count: failures.len() as u32,
+                failed_indices: failures,
+                not_run: 0,
+                retried: 0,
+            };
+            state.complete(&node("n1"), &result).unwrap();
+            chunk += 1;
+        }
+        // Many nodes each hold a chunk, so the grant map is full too.
+        for holder in 0..64 {
+            let set = IndexRangeSet::from_range(chunk..=chunk);
+            state
+                .grant(&node(&format!("node-{holder:03}")), &set)
+                .unwrap();
+            chunk += 1;
+        }
+        assert!(!state.status().is_terminal());
+        TaskArrayRecord {
+            name: "a".repeat(63),
+            namespace: "n".repeat(63),
+            template: largest_template(),
+            state,
+            terminal_at_epoch_secs: None,
+            quota_blocked: Some(crate::meat::quota::QuotaError::CpuExceeded {
+                namespace: "n".repeat(63),
+                current: u64::MAX,
+                requested: u64::MAX,
+                limit: u64::MAX,
+            }),
+        }
+    }
+
+    /// Replicated job state at the global active-run cap must fit a Raft
+    /// snapshot frame with room to spare, and every node's sync call must
+    /// fit the sync route's body limit. These two budgets are what justify
+    /// `MAX_ACTIVE_ARRAYS`.
+    #[test]
+    fn control_state_stays_within_budget_at_the_global_cap() {
+        const SNAPSHOT_BUDGET: usize = 32 * 1024 * 1024;
+        let record = largest_active_record();
+        let mut arrays = TaskArrays::default();
+        for id in 1..=MAX_ACTIVE_ARRAYS as u64 {
+            arrays.arrays.insert(id, record.clone());
+        }
+        let snapshot = serde_json::to_vec(&arrays).unwrap();
+        assert!(
+            snapshot.len() <= SNAPSHOT_BUDGET,
+            "{} bytes of job state at the cap",
+            snapshot.len()
+        );
+        // The snapshot is accepted back: the cap is inside the store's own bounds.
+        let reopened: TaskArrays = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(reopened.active().count(), MAX_ACTIVE_ARRAYS);
+
+        let request = crate::bun::task_array_leader::sync_request_for(&arrays, &node("node-000"));
+        let bytes = serde_json::to_vec(&request).unwrap().len();
+        assert!(
+            bytes <= crate::bun::task_array_node::MAX_SYNC_REQUEST_BYTES,
+            "{bytes} bytes in one node's sync call at the cap"
         );
     }
 
