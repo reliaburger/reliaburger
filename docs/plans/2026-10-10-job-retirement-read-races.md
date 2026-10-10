@@ -24,8 +24,8 @@ path, keeping Bun's admission injector environment private. Prove the wrappers
 work with a cleared environment and run `make test-rootless-runc` as well.
 
 Both race regressions failed against the old logic and pass with the fixes.
-Portable `make ci` passed on macOS: 6,212 tests, two doctests and 373 script
-tests, plus formatting, strict lint and ignored-test ownership checks. Linux
+Portable `make ci` passed on macOS: the test suite, doctests and script tests,
+plus formatting, strict lint and ignored-test ownership checks. Linux
 strict lint passed with all features and with no default features; all 30
 focused pool, durable-record and mixed-runtime tests passed with eBPF enabled.
 All 11 rootless runtime tests passed, including the corrected OCI crash wrapper.
@@ -34,13 +34,13 @@ The test VM needed its inactive Rust recovery cache reclaimed and the same
 AppArmor namespace setting used by CI. The first full Linux attempt stopped on
 a full disk; the rootless attempt also hit that space limit and the restrictive
 namespace setting. These attempts are not passing qualification. The full
-privileged Linux gate then passed 101 tests before a new container collided with
+privileged Linux gate then ran until a new container collided with
 an address still routed to a retained benchmark workload. Qualification is
 being rerun serially in private mount and hostname namespaces, with a separate
 `/etc/hostname` giving the test runtime a different node subnet. The retained
 workload and VM hostname are unchanged.
 
-The isolated gate passed 142 tests, then exposed another fixture's late PATH
+The isolated gate then exposed another fixture's late PATH
 override. The cancellation fixture now sets its fake `ip` in an isolated
 caller's environment before recording runtime commands, rather than overriding
 PATH in the owner wrapper. Its cancellation and positive-retirement assertions
@@ -66,8 +66,8 @@ all explicit workload overrides (last value wins), and reject unrequested privat
 variables. Requalify automatic restart interruption and the full portable checks.
 
 
-Full portable `make ci` passes after both CI fixes: 6,214 tests, two doctests,
-373 script tests, formatting, both strict lint configurations and ignored-test
+Full portable `make ci` passes after both CI fixes: the test suite, doctests,
+script tests, formatting, both strict lint configurations and ignored-test
 ownership checks. All 54 Linux process/backend/owner/control tests pass with
 eBPF enabled. The actual OCI interruption binaries are being rebuilt for local
 isolated execution; GitHub must produce its own fresh source-bound receipts.
@@ -98,8 +98,8 @@ removing individual entries did not separate publication. The reverse Mach-O
 replacement invalidated an OCI attempt (two fixtures passed, eighteen runtime
 cases failed). Retain those failures as rig errors, not qualification.
 
-The subsequent portable run completed with Linux compilation stopped: all
-6,216 tests, two doctests, 373 script tests, formatting, both strict lint
+The subsequent portable run completed with Linux compilation stopped: the
+test suite, doctests, script tests, formatting, both strict lint
 configurations and ignored-test ownership checks passed. After it finished,
 replace the macOS `debug` symlink with an independent APFS clone of its validated
 Mach-O artifacts, preserving the original link for recovery. Restore ELF Linux
