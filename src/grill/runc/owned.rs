@@ -469,11 +469,16 @@ impl RuncGrill {
                 // The original launch is sealed and its entire descendant tree
                 // reaped. Retain intent until the independently limited sibling
                 // is empty; recovery must never clear this obligation early.
-                tokio::fs::write(task.join("cgroup.kill"), "1").await?;
-                let events = tokio::fs::read_to_string(task.join("cgroup.events")).await?;
-                if !events.lines().any(|line| line == "populated 0") {
-                    return Err(io::Error::other("reusable task cgroup has not retired"));
-                }
+                let group = task.clone();
+                tokio::task::spawn_blocking(move || {
+                    let method = crate::grill::kernel::executor_support().group_kill;
+                    crate::grill::kernel::kill_group(&group, method)
+                })
+                .await
+                .map_err(io::Error::other)?
+                .map_err(|error| {
+                    io::Error::other(format!("reusable task cgroup has not retired: {error}"))
+                })?;
                 tokio::fs::remove_dir(&task).await?;
             }
         }

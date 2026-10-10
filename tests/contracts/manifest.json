@@ -8059,17 +8059,17 @@
       ]
     },
     {
-      "id": "issue-639-cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+      "id": "issue-639-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
       "issue": 639,
-      "promise": "Dropped native callers quarantine capacity and require positive original retirement before replacement.",
+      "promise": "A dropped native caller hands its executor to eviction, which retires it and frees its capacity without a restart; a later restart reuses only the originally retired identity.",
       "supported_paths": [
         "Rootful Linux native executors on cgroup v2"
       ],
       "cases": [
         {
-          "id": "native-cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+          "id": "native-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
           "binary": "reliaburger::owned_task_arrays",
-          "test": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+          "test": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
           "requires": [
             "linux-root-storage"
           ],
@@ -8198,6 +8198,44 @@
       ],
       "boundaries": [
         "These cases need root and cgroup v2 in the Linux gate; portable runs cannot substitute."
+      ]
+    },
+    {
+      "id": "issue-682-cold-preparation-is-interruptible",
+      "issue": 682,
+      "promise": "Cancellation and the attempt deadline interrupt a reusable executor's cold preparation, and the half-started executor is retired with its slot and reservation returned.",
+      "supported_paths": [
+        "Rootful Linux native host executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "cold-preparation-cgroup_cancel_during_cold_preparation_retires_the_context",
+          "binary": "reliaburger",
+          "test": "bun::reusable_executor::pool::tests::cgroup_cancel_during_cold_preparation_retires_the_context",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/reusable_executor/pool.rs"
+          ]
+        },
+        {
+          "id": "cold-preparation-cgroup_deadline_during_cold_preparation_retires_the_context",
+          "binary": "reliaburger",
+          "test": "bun::reusable_executor::pool::tests::cgroup_deadline_during_cold_preparation_retires_the_context",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/reusable_executor/pool.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A runtime call is never abandoned halfway; preparation stops only between runtime calls or while waiting for the helper to connect."
+      ],
+      "boundaries": [
+        "The helper never connects in these cases; a slow image pull shares the same interruption but isn't exercised by the gate."
       ]
     }
   ]

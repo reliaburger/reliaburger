@@ -21,7 +21,9 @@ Every node must meet the following minimum specification:
 
 - **OS / Architecture**: Ubuntu 24.04+ or Debian 12+, on x86_64 or aarch64.
   Other distributions may work, but we haven't tested them.
-- **Kernel**: Linux 5.8 or later with cgroup v2 enabled.
+- **Kernel**: Linux 5.8 or later with cgroup v2 enabled. Job executors use
+  `cgroup.kill` from 5.14 when it's there and fall back to freezing and killing
+  each task on older kernels, so 5.8 is the minimum for them too.
 - **Privileges**: Root or `sudo` access on all three nodes.
 - **BPF filesystem**: `bpffs` mounted at `/sys/fs/bpf`.
 - **Resources**: At least 2 CPU cores, 2 GiB RAM, and 10 GiB available disk space per node.

@@ -342,10 +342,12 @@ pub(crate) async fn admit_template_image(
         let mut config = crate::config::Config::default();
         config.job.insert("task".into(), template.clone());
         super::api::bind_images(state, binder, &mut config).await?;
-        *template = config
-            .job
-            .remove("task")
-            .expect("binder retains job template");
+        *template = config.job.remove("task").ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image binding lost the job template",
+            )
+        })?;
     }
     pin_template_image(state, template)
         .await
@@ -404,10 +406,12 @@ async fn pin_template_image(
         )
         .map_err(|e| e.to_string())?
         {
-            template.image = Some(crate::meat::scheduler::pin_image_reference(
-                template.image.as_deref().expect("image checked"),
-                &digest,
-            ));
+            let image = template
+                .image
+                .as_deref()
+                .ok_or("signature check returned a digest for a job without an image")?;
+            let pinned = crate::meat::scheduler::pin_image_reference(image, &digest);
+            template.image = Some(pinned);
         }
     }
     Ok(())
@@ -1067,13 +1071,12 @@ pub async fn logs_handler(
         let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
         return forward_get_to_leader(&state, council, &path, &headers).await;
     }
-    if index >= record.state.spec.count {
+    let Some(chunk) = record.state.spec.chunk_of(index) else {
         return error(
             StatusCode::NOT_FOUND,
             format!("task array {batch_id} has no task {index}"),
         );
-    }
-    let chunk = record.state.spec.chunk_of(index).expect("validated index");
+    };
     let Some((owner, grant)) = record.state.accepted_grant(chunk) else {
         return error(StatusCode::NOT_FOUND, "task has no accepted outcome yet");
     };

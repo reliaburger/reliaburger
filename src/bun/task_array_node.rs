@@ -364,10 +364,11 @@ impl TaskArrayNode {
     /// and the reason.
     pub async fn sync(&self, request: &NodeSyncRequest) -> NodeSyncResponse {
         let mut arrays = self.arrays.lock().await;
-        let path = self.config.root.join("control.json");
+        let root = self.config.root.clone();
+        let path = root.join("control.json");
         let version = request.version;
         let checked = tokio::task::spawn_blocking(move || {
-            let directory = path.parent().expect("control has parent");
+            let directory = root.as_path();
             std::fs::create_dir_all(directory)?;
             // The directory entry itself must survive before a fence can.
             let parent = directory
@@ -578,7 +579,7 @@ impl TaskArrayNode {
             ));
         }
         if self.config.policy.mount_isolation {
-            // TODO(million-jobs M7): run tasks inside the mount namespace
+            // TODO(#714): run tasks inside the mount namespace
             // the ordinary process workloads use.
             return Err(
                 "task arrays don't run under [process_workloads] mount_isolation yet".to_string(),
@@ -594,7 +595,10 @@ impl TaskArrayNode {
             assignment.held.iter().map(|h| h.chunk.0).collect();
         let (ledger, resumed, highest) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(directory.join("output"))?;
-            std::fs::File::open(directory.parent().expect("array has parent"))?.sync_all()?;
+            let parent = directory
+                .parent()
+                .ok_or_else(|| std::io::Error::other("array directory has no parent"))?;
+            std::fs::File::open(parent)?.sync_all()?;
             let path = directory.join("ledger");
             let resumed = if path.exists() {
                 let mut records = Vec::new();
@@ -1000,7 +1004,10 @@ fn persist_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     file.write_all(&serde_json::to_vec(value)?)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
-    std::fs::File::open(path.parent().expect("fence has parent"))?.sync_all()
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("fence file has no parent directory"))?;
+    std::fs::File::open(parent)?.sync_all()
 }
 
 fn refused(batch_id: u64, reason: String) -> ArrayProgress {

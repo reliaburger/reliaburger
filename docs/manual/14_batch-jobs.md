@@ -299,8 +299,15 @@ the helper. It yields to waiting requests and expires after one idle second.
 A timeout, cancellation, lost policy or uncertain receipt retires the whole
 container before its resources can be used again. Waiting for a compatible
 slot or resource admission does not consume the command's attempt timeout;
-cold preparation counts after the full profile is reserved. Abandoned ownership remains
-quarantined until recovery retires the original generation. Host execution,
+cold preparation counts after the full profile is reserved. Cancellation and
+the timeout interrupt cold preparation too: an attempt stuck behind a slow
+image pull or a helper that never connects stops there, and the half-started
+container is retired. The pull itself carries on in the background and warms
+the image cache. If the caller disappears in the middle of a command, the idle
+eviction loop retires its container and frees the slot and reservation without
+a restart. Only a container whose task cgroup never empties (a command stuck in
+an uninterruptible kernel wait) stays quarantined, holding its slot and
+reservation, until it finally retires. Host execution,
 rootless runtimes and GPU requests cannot select this mode. Kubernetes export
 turns it into an ordinary Job, which starts a fresh Pod for every attempt, and
 reports the reused container as unsupported: a Job cannot preserve this contract.
@@ -313,6 +320,23 @@ Host jobs report `process`. On rootful Linux runc, memory-limited image jobs dis
 in both fresh and reused execution. A job exceeding its RAM limit can be OOM-killed; it cannot silently
 spill into swap and consume unaccounted disk I/O. Choose the memory range for
 the actual working set, including model weights.
+
+Some limits are fixed rather than derived from the profile. Each command's
+task cgroup allows 256 processes and threads (`pids.max`); threads count, so a
+JVM or another heavily threaded command may need fresh containers instead. The
+helper's own cgroup allows 16, outside the command's limits. `/tmp` and
+`/dev/shm` are 16 MiB tmpfs mounts, and regular files written anywhere are
+capped at 1 MiB.
+
+Reusable executors need Linux 5.8 or later, the same minimum as the rest of
+the node. Bun checks the kernel the first time it is asked for an executor and
+logs what it found. On an older kernel the pools are off: `shared-runc` jobs
+fail with a reason, and host jobs use the original owned process backend,
+which refuses explicit CPU and memory ranges. A kernel without `cgroup.kill`
+(before 5.14, such as Debian 11's 5.10) keeps its pools: retirement freezes the
+task cgroup and kills each process in it instead. Native host executors also
+need `CONFIG_PROC_CHILDREN`, which every mainstream distribution kernel
+enables; without it host jobs take the fallback path too.
 
 Compare accepted-success rates over the whole run and service
 latency alongside launch rates; container reuse alone does not qualify the
