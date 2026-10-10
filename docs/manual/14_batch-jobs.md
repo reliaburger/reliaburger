@@ -329,7 +329,8 @@ allowlisted workloads.
 Every host command, on every backend, starts with only `PATH`, `HOME`, `LANG`,
 `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun's
 environment, then the job's own `env`. Other Bun variables, such as cloud
-credentials, never reach a command.
+credentials, never reach a command. `relish exec` into a host workload gets
+that workload's environment, as `docker exec` would.
 Other platforms retain the original owned process backend and refuse explicit
 resource ranges. This change applies to jobs; host applications keep their
 existing runtime contract. GPU jobs remain refused;

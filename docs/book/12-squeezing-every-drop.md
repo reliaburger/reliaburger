@@ -1402,7 +1402,13 @@ answer was "too much" in three places:
   variables (`PATH`, `HOME`, the locale and a few more) and lays the job's
   `env` over it. The in-process backend calls `Command::env_clear()` first,
   because Rust's `std::process::Command`, like `subprocess` in Python,
-  otherwise inherits the parent's whole environment.
+  otherwise inherits the parent's whole environment. Clearing has a cost if
+  you miss a caller, and we did: the owner's exec gate now cleared its
+  environment too, but `relish exec` built its owner record with an empty map,
+  so an exec'd `/usr/bin/env` printed nothing. #654's author caught it in
+  review. Exec now copies the workload's own recorded environment, the
+  in-memory backend's exec applies the same function, and tests run a command
+  found only on the workload's custom `PATH`.
 - **The socket.** The helper's socket used to live in `/tmp` under a
   predictable name. Authentication stopped impersonation, but not another user
   creating that name first, which made Bun refuse the slot forever: a cheap

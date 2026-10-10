@@ -1016,7 +1016,9 @@ impl super::Grill for ProcessGrill {
                 .exec(instance, command)
                 .await
                 .map_err(|error| owner_error(instance, error));
-        } else {
+        }
+        // The same environment as the workload itself (see `host_environment`).
+        let environment = {
             let procs = self.processes.lock().await;
             let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
@@ -1027,7 +1029,8 @@ impl super::Grill for ProcessGrill {
                     reason: format!("instance is not running (state: {})", entry.state),
                 });
             }
-        }
+            host_environment(&entry.spec.process.env)
+        };
 
         if command.is_empty() {
             return Err(GrillError::StartFailed {
@@ -1039,6 +1042,8 @@ impl super::Grill for ProcessGrill {
         // Spawn the command directly (no namespace entry for ProcessGrill)
         let output = Command::new(&command[0])
             .args(&command[1..])
+            .env_clear()
+            .envs(environment)
             .output()
             .await
             .map_err(|e| GrillError::StartFailed {
@@ -1711,6 +1716,37 @@ mod tests {
             .filter_map(|(key, _)| key.into_string().ok())
             .find(|key| !super::inherited_by_host_commands(key))
             .expect("the test environment has a variable outside the allowlist")
+    }
+
+    #[tokio::test]
+    async fn exec_gets_the_workloads_environment_and_none_of_buns() {
+        use std::os::unix::fs::PermissionsExt;
+        let private = private_variable();
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("rb-exec-tool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf found\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", root.path().display());
+        let grill = ProcessGrill::new();
+        let id = InstanceId("exec-env-1".to_string());
+        let mut spec = sleep_spec("30");
+        spec.process.env = vec!["JOB=1".into(), format!("PATH={path}")];
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let env = grill.exec(&id, &["env".to_string()]).await.unwrap();
+        let resolved = grill.exec(&id, &["rb-exec-tool".to_string()]).await;
+        grill.kill(&id).await.unwrap();
+        assert!(env.lines().any(|line| line == "JOB=1"), "{env}");
+        assert!(
+            env.lines().any(|line| line == format!("PATH={path}")),
+            "{env}"
+        );
+        assert!(
+            !env.lines()
+                .any(|line| line.starts_with(&format!("{private}="))),
+            "{private} leaked: {env}"
+        );
+        assert_eq!(resolved.unwrap().trim(), "found");
     }
 
     #[tokio::test]
