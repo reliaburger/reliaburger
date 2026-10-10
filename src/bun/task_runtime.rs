@@ -288,6 +288,47 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         self
     }
 
+    /// Forget the metadata of this node's retired executor identities, and of
+    /// runtime routes no launch owns, so a restart reclaims what an
+    /// interrupted retirement kept (#678). Call it before the first task:
+    /// anything unretired or live is skipped and kept. Returns how many
+    /// identities were forgotten.
+    pub async fn forget_retired_executors(&self) -> usize {
+        let app = format!("executor-{}", self.prefix);
+        let ours = |id: &crate::grill::InstanceId| {
+            crate::grill::InstanceIdentity::parse(&id.0).is_some_and(|identity| {
+                identity.app == app
+                    || identity
+                        .app
+                        .strip_prefix(app.as_str())
+                        .is_some_and(|rest| rest.starts_with('-'))
+            })
+        };
+        let mut candidates: Vec<_> = match self.runtime.launch_inventory().await {
+            Ok(launches) => launches
+                .unwrap_or_default()
+                .into_iter()
+                .map(|launch| launch.instance_id)
+                .filter(|id| ours(id))
+                .collect(),
+            Err(error) => {
+                eprintln!("bun: executor metadata sweep: inventory unavailable: {error}");
+                Vec::new()
+            }
+        };
+        match self.runtime.unlaunched_metadata().await {
+            Ok(ids) => candidates.extend(ids),
+            Err(error) => eprintln!("bun: executor metadata sweep: routes unavailable: {error}"),
+        }
+        let mut forgotten = 0;
+        for id in candidates {
+            if self.runtime.forget_retired(&id).await.is_ok() {
+                forgotten += 1;
+            }
+        }
+        forgotten
+    }
+
     /// Resolve an active singleton without exposing a reusable slot as its public identity.
     pub fn singleton_instance(&self, run: u64) -> Option<crate::grill::InstanceId> {
         self.singletons
@@ -894,6 +935,12 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         if let Some(run) = run_id {
             self.retire_singleton(run).await;
         }
+        // The generation has retired and its output and followers are done,
+        // so its journal and routing files own nothing. Keeping them would
+        // leave a slot's worth per namespace that ever ran a job (#678).
+        if let Err(error) = self.runtime.forget_retired(&id).await {
+            eprintln!("batch executor {id}: metadata kept: {error}");
+        }
         self.slots
             .lock()
             .expect("executor slots poisoned")
@@ -998,10 +1045,11 @@ mod tests {
         let result = work.await.unwrap();
         assert_eq!(result.outcome, AttemptOutcome::Cancelled);
         assert!(runner.singleton_instance(42).is_none());
-        assert_eq!(
-            runner.runtime.state(&id).await.unwrap(),
-            ContainerState::Stopped
-        );
+        // Retired and then forgotten: the slot identity keeps no metadata.
+        assert!(matches!(
+            runner.runtime.state(&id).await,
+            Err(crate::grill::GrillError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

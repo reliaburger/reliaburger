@@ -857,6 +857,23 @@ impl super::Grill for ProcessGrill {
         Ok(entry.state)
     }
 
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if let Some(control) = &self.control {
+            control
+                .forget_retired(instance)
+                .await
+                .map_err(|error| owner_error(instance, error))?;
+        }
+        let mut processes = self.processes.lock().await;
+        if processes
+            .get(instance)
+            .is_some_and(|entry| entry.state == ContainerState::Stopped)
+        {
+            processes.remove(instance);
+        }
+        Ok(())
+    }
+
     async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
         let Some(control) = &self.control else {
             return Ok(None);
