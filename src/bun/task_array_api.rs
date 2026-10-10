@@ -192,6 +192,7 @@ pub async fn submit_handler(
             missed: Default::default(),
         }),
         replay_unknown: true,
+        hook: false,
     };
     if let Err(response) = super::job_api::admit_definition(
         &state,
@@ -296,6 +297,7 @@ pub async fn manifest_handler(
             tasks: cohort.spec.clone(),
             cron: None,
             replay_unknown: true,
+            hook: false,
         };
         if let Err(response) = super::job_api::admit_definition(
             &state,
@@ -577,6 +579,8 @@ pub fn array_summary(
             super::reusable_executor::ExecutorProfile::new(&record.template).ok().map(|profile| serde_json::json!({"cpu_millicores":profile.reservation.cpu_millicores,"memory_bytes":profile.reservation.memory_bytes}))
         } else { None },
         "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
+        "quota_blocked": record.quota_blocked,
+        "quota_blocked_reason": record.quota_blocked.as_ref().map(ToString::to_string),
     })
 }
 
@@ -1170,6 +1174,7 @@ pub async fn summaries(
             serde_json::json!({"kind":"schedule", "name":name, "namespace":namespace,
             "status":"Scheduled", "batch_id":null, "revision":record.revision,
             "cron":cron, "last_observed_minute":record.last_observed_minute,
+            "skipped":record.skipped, "skipped_count":record.skipped_count,
             "total":record.definition.tasks.count}),
         );
     }
@@ -1258,6 +1263,7 @@ mod tests {
             template: template(),
             state,
             terminal_at_epoch_secs: Some(1),
+            quota_blocked: None,
         };
         let (start, end, owners) = result_window(&record, &ResultsQuery::default());
         assert_eq!((start, end, owners.len()), (0, 8, 8));
@@ -1369,6 +1375,7 @@ mod tests {
             .unwrap();
         TaskArrayRecord {
             terminal_at_epoch_secs: None,
+            quota_blocked: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: template(),
