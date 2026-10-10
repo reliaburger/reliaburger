@@ -599,12 +599,14 @@ The scheduling model batch users take for granted, inside one cluster:
 ### For LLM inference and training
 
 The follow-up, [LLM inference and training](2026-10-11-research-llm-workloads.md),
-looks at the same question for GPU work and proposes changing this plan: a
-larger GPU release, a new 0.7.0 "Models" release for serving before
-pipelines, and groups (multi-node training, multi-node inference and RL) with
-fair share. It also sketches what each release would look like, how we'd
-build it and the demo for the landing page. The maintainer hasn't decided on
-those changes yet.
+looks at the same question for GPU work and changes this plan. The
+maintainer decided on 11 October to add a 0.7.0 "Models" release for
+serving and to bring groups (multi-node training, multi-node inference and
+RL) forward as their own release. The order is now 0.6.0 GPUs, 0.7.0
+Models, 0.8.0 Groups, 0.9.0 Pipelines and 0.10.0 Fair share; the version
+numbers in the sections above are the original ones. The follow-up also
+sketches what each release would look like, how we'd build it and the demo
+for the landing page.
 
 ### What we'd have then
 
@@ -632,6 +634,9 @@ The maintainer decided on 11 October 2026:
 4. **A Python client before 1.0.** Yes.
 5. **Pipelines before fair share**: 0.6.0 GPUs, 0.7.0 Pipelines, 0.8.0 Fair
    share.
+   Later the same day, the [LLM follow-up](2026-10-11-research-llm-workloads.md#decisions)
+   inserted Models and Groups: 0.6.0 GPUs, 0.7.0 Models, 0.8.0 Groups,
+   0.9.0 Pipelines, 0.10.0 Fair share.
 6. **Integrations live in this repository until 1.0**: the Python client, the
    Airflow provider and the Nextflow executor (for example under `clients/`
    and `integrations/`), tested by the same CI against the same binary and

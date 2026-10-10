@@ -2,8 +2,9 @@
 
 Status: research, 11 October 2026. Checked against `main` at `b2affe93`. A
 follow-up to [the batch scheduler landscape](2026-10-11-research-batch-schedulers.md),
-which this page assumes you've read. For discussion: it proposes changes to
-the release plan that the maintainer hasn't decided yet.
+which this page assumes you've read. The maintainer decided the release order
+on 11 October (see [Decisions](#decisions)); five questions remain before it
+becomes milestones.
 
 The question: what would make Reliaburger the obvious choice for running LLM
 inference *and* training on your own GPUs? Which projects would we have to
@@ -354,13 +355,16 @@ Pipelines and 0.8.0 Fair share. For LLM workloads, three things change:
 2. **A new "Models" release for serving**, before pipelines. Single-node
    serving (a 70B model on four to eight GPUs) is what most 8–256 GPU teams
    want first, and it's where our registry and ingress pay off.
-3. **Groups land with fair share.** Gangs were already in the fair-share
-   release; for LLMs they have to carry ranks and a leader address, roles,
-   topology domains and hot spares, because the same group runs multi-node
-   inference, multi-node training and RL.
+3. **Groups become their own release, straight after Models.** Gangs were
+   part of the fair-share release; for LLMs they have to carry ranks and a
+   leader address, roles, topology domains and hot spares, because the same
+   group runs multi-node inference, multi-node training and RL. That's too
+   important to wait behind pipelines and fair share.
 
-So the order becomes 0.6.0 GPUs, 0.7.0 Models, 0.8.0 Pipelines and 0.9.0
-Fair share and groups. Each release below says what it contains, what using
+So the order becomes 0.6.0 GPUs, 0.7.0 Models, 0.8.0 Groups, 0.9.0
+Pipelines and 0.10.0 Fair share. The maintainer decided the Models release
+and moving groups earlier on 11 October. Pipelines still comes before fair
+share, as decided on the landscape page. Each release below says what it contains, what using
 it would look like, how we'd build it, the demo we'd put on the landing page,
 and the exit test that proves it.
 
@@ -591,7 +595,117 @@ llama.cpp` and a chat completion with `curl`.
 > request is held, answered, and the cold start is reported. All without
 > leaving the binary.
 
-### 0.8.0: Pipelines
+### 0.8.0: Groups
+
+Multi-node work as one unit, which multi-node inference, multi-node training
+and RL all need. Groups were part of the fair-share release; the maintainer
+brought them forward on 11 October, so they come straight after Models:
+
+1. All-or-nothing placement with ranks, size and leader address injected (the
+   [torchrun](https://docs.pytorch.org/docs/main/elastic/run.html) and
+   [vLLM multi-node](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)
+   contracts), a stable name for rank 0, and group restart with a retry
+   budget.
+2. Roles within a group (trainer ranks, inference servers with health checks
+   and service names, CPU sandboxes), so a Ray cluster, an RL job or a
+   prefill and decode pair starts as one unit.
+3. Topology domains from node labels (NVLink domain, rack, switch), required
+   or preferred.
+4. RDMA for training: InfiniBand or RoCE devices, memlock, `/sys` and host
+   networking, the way Slurm sites run NCCL today.
+5. Checkpoint-aware lifecycle: SIGTERM with a configurable grace period on
+   drain and group restart, and a `$CHECKPOINT_DIR` convention for resume.
+   The fair-share release reuses the same grace period for preemption.
+6. Hot spares: a pool of reserved nodes, and when a member's node fails, the
+   group restarts on a spare from the latest checkpoint without a human.
+7. Health as prolog and epilog: DCGM diagnostics before a group starts and
+   after it fails, with "lemon" nodes taken out.
+
+**What you'd write.** A multi-node fine-tune is a group whose members get
+their rank from the environment:
+
+```toml
+[group.finetune]
+members = 2                       # nodes
+gpu = 8                           # per member
+image = "trl:0.20"
+command = ["torchrun", "--nnodes=${RB_GROUP_SIZE}", "--node-rank=${RB_RANK}",
+           "--rdzv-endpoint=${RB_LEADER}:29500", "train.py"]
+topology = { same = "rack" }
+network = "rdma"
+checkpoint = { dir = "/ckpt", grace = "120s" }
+restart = { attempts = 5, use_spares = true }
+```
+
+An RL job is a group with roles, so verl's Ray cluster starts as one unit:
+
+```toml
+[[group.rl.role]]
+name = "head"
+image = "verl:0.7"
+command = ["ray", "start", "--head", "--block"]
+port = 6379
+
+[[group.rl.role]]
+name = "worker"
+count = 4
+gpu = 8
+image = "verl:0.7"
+command = ["ray", "start", "--address=${RB_ROLE_HEAD}:6379", "--block"]
+```
+
+And a model too big for one node is a `[model.*]` from 0.7.0 with
+`members = 2`: the shorthand expands to a group running vLLM's multi-node
+mode, with tensor parallelism inside each node and pipeline parallelism
+across them.
+
+**How we'd build it.**
+
+- *Placement.* A group run in Raft holds one slot per member. The leader
+  places all members in one decision and one Raft entry, or none, so there
+  are no partial reservations to deadlock on. If a group can't fit, it waits
+  without holding anything; reserving capacity for a large waiting group is
+  the fair-share release's backfill.
+- *Identity.* Each member gets `RB_RANK`, `RB_GROUP_SIZE` and `RB_LEADER`,
+  each role's address is in `RB_ROLE_<NAME>`, and rank 0 gets a stable name
+  through Onion's DNS.
+- *Failure.* Any member failing bumps the group's generation, which fences
+  every member, the same way stale task-array grants are fenced today. The
+  leader sends every member SIGTERM, waits for the grace period, then places
+  the group again, spares first. Roles can opt out: a crashed rollout server
+  restarts in place instead of taking the trainers down with it.
+- *Topology.* Nodes label themselves with their NVLink domain from NVML, and
+  operators add rack and switch labels. `same = "rack"` is a filter that all
+  members share one value of a label.
+- *RDMA.* `network = "rdma"` means the host network namespace, InfiniBand
+  devices through CDI, memlock and `/sys`. Host networking weakens
+  isolation, so it needs an explicit namespace permission, in line with the
+  namespace isolation work in
+  [#677](https://github.com/reliaburger/reliaburger/issues/677).
+- *Spares.* Nodes labelled as spares run only task-array work, which is
+  requeued when a group needs the node. Graceful preemption of that work
+  arrives with fair share.
+- *Prolog and epilog.* The DCGM quick diagnostic runs on every member's node
+  before a group starts, and a longer one on the failed member's node after
+  a failure. The leader counts failures per node over a window and cordons
+  repeat offenders.
+
+**The demo: "Kill a node mid-training."** A recording of a two-node
+fine-tune with its loss curve in Brioche. `relish fault kill-node gpu-2
+--acknowledge`: the group stops, a spare joins, training resumes from the
+last checkpoint, and the loss curve picks up where it left off, with the
+lost minutes printed and no human in the loop. Second beat: a verl RL run
+starts as one group next to the served model from 0.7.0, and its rollout
+servers show up in `relish status` like any other service.
+
+> Exit test: a 16-GPU fine-tuning job across two nodes and a verl RL job
+> (Ray, with vLLM rollouts) share a cluster with a served model. Kill a node
+> under the fine-tuning job: it restarts on a hot spare from its latest
+> checkpoint within five minutes, with no human. Kill one rollout server: it
+> restarts in place and the RL job carries on. The served model never drops
+> below its minimum replicas.
+
+### 0.9.0: Pipelines
 
 As decided on the landscape page: array dependencies, partial success, a
 Python client and OpenAPI spec, and an Airflow provider and Nextflow
@@ -673,32 +787,15 @@ Nextflow config, both green.
 > Reliaburger-specific code beyond choosing the executor. Kill a node mid-run
 > and both pipelines still finish, with each accepted result recorded once.
 
-### 0.9.0: Fair share and groups
+### 0.10.0: Fair share
 
-The fair-share scope from the landscape page (queues, decayed DRF, backfill,
-priority and preemption, node selectors, retries by failure kind, usage),
-with the gang item grown into groups:
+The fair-share scope from the landscape page, now that groups exist to share:
+queues, decayed DRF, backfill, priority classes and preemption, node
+selectors for task arrays, retries by failure kind, and usage by queue and
+namespace. Groups and task arrays are both scheduled through the queues.
 
-1. All-or-nothing placement with ranks, size and leader address injected (the
-   [torchrun](https://docs.pytorch.org/docs/main/elastic/run.html) and
-   [vLLM multi-node](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)
-   contracts), a stable name for rank 0, and
-   group restart with a retry budget.
-2. Roles within a group (trainer ranks, inference servers with health checks
-   and service names, CPU sandboxes), so a Ray cluster, an RL job or a
-   prefill and decode pair starts as one unit.
-3. Topology domains from node labels (NVLink domain, rack, switch), required
-   or preferred.
-4. RDMA for training: InfiniBand or RoCE devices, memlock, `/sys` and host
-   networking, the way Slurm sites run NCCL today.
-5. Checkpoint-aware lifecycle: SIGTERM with a configurable grace period on
-   preemption or drain, and a `$CHECKPOINT_DIR` convention for resume.
-6. Hot spares: a pool of idle nodes, and when a member's node fails, the
-   group restarts on a spare from the latest checkpoint without a human.
-7. Health as prolog and epilog: DCGM diagnostics before a group starts and
-   after it fails, with "lemon" nodes taken out.
-
-**What you'd write.** Queues are a few lines:
+**What you'd write.** Queues are a few lines, and any job, array or group
+names one:
 
 ```toml
 [queue.research]
@@ -707,114 +804,65 @@ weight = 2
 [queue.product]
 weight = 1
 guaranteed = { gpu = 8 }
-```
 
-A multi-node fine-tune is a group whose members get their rank from the
-environment:
-
-```toml
 [group.finetune]
 queue = "research"
-members = 2                       # nodes
-gpu = 8                           # per member
-image = "trl:0.20"
-command = ["torchrun", "--nnodes=${RB_GROUP_SIZE}", "--node-rank=${RB_RANK}",
-           "--rdzv-endpoint=${RB_LEADER}:29500", "train.py"]
-topology = { same = "rack" }
-network = "rdma"
-checkpoint = { dir = "/ckpt", grace = "120s" }
-restart = { attempts = 5, use_spares = true }
-```
-
-And an RL job is a group with roles, so verl's Ray cluster starts as one
-unit:
-
-```toml
-[group.rl]
-queue = "research"
-
-[[group.rl.role]]
-name = "head"
-image = "verl:0.7"
-command = ["ray", "start", "--head", "--block"]
-port = 6379
-
-[[group.rl.role]]
-name = "worker"
-count = 4
-gpu = 8
-image = "verl:0.7"
-command = ["ray", "start", "--address=${RB_ROLE_HEAD}:6379", "--block"]
+priority = "preemptible"
+# ...the rest as in 0.8.0
 ```
 
 **How we'd build it.**
 
 - *Queues and fair share.* Queue definitions live in Raft. `plan_grants`
-  orders candidate chunks by each queue's dominant share over CPU, memory
-  and GPUs, using usage counters that decay with a configured half-life. The
-  leader keeps them in memory and rebuilds them from Mayo's usage history
-  after a failover, so fair share doesn't add Raft writes per grant.
-- *Backfill.* The head of the queue that doesn't fit gets a reservation on
-  specific nodes; smaller chunks may use those nodes if their task timeout
-  ends before the reservation's expected start. The timeout plays the role
-  of Slurm's time limit.
+  orders candidate chunks and groups by each queue's dominant share over
+  CPU, memory and GPUs, using usage counters that decay with a configured
+  half-life. The leader keeps them in memory and rebuilds them from Mayo's
+  usage history after a failover, so fair share doesn't add Raft writes per
+  grant.
+- *Backfill.* The head of the queue that doesn't fit, often a large group,
+  gets a reservation on specific nodes; smaller chunks may use those nodes
+  if their task timeout ends before the reservation's expected start. The
+  timeout plays the role of Slurm's time limit.
 - *Preemption.* The leader revokes a victim's grant, and the existing fencing
   for stale grants handles the race with a late completion. The node sends
-  SIGTERM, waits for the grace period, then SIGKILL, and records a
-  `Preempted` outcome that doesn't spend an attempt. The protected fraction
-  and the rate limit live in the planning step.
-- *Groups.* A group run in Raft holds one slot per member. The leader places
-  all members in one decision and one Raft entry, or none, so there are no
-  partial reservations to deadlock on. Each member gets `RB_RANK`,
-  `RB_GROUP_SIZE` and `RB_LEADER`, and rank 0 gets a stable name through
-  Onion's DNS. Any member failing bumps the group's generation, which fences
-  every member; the leader stops them all and places the group again,
-  spares first.
-- *Topology.* Nodes label themselves with their NVLink domain from NVML, and
-  operators add rack and switch labels. `same = "rack"` is a filter that all
-  members share one value of a label.
-- *RDMA.* `network = "rdma"` means the host network namespace, InfiniBand
-  devices through CDI, memlock and `/sys`. Host networking weakens
-  isolation, so it needs an explicit namespace permission, in line with the
-  namespace isolation work in
-  [#677](https://github.com/reliaburger/reliaburger/issues/677).
-- *Spares.* Nodes labelled as spares only run preemptible work; a group
-  restart preempts it.
-- *Prolog and epilog.* The DCGM quick diagnostic runs on every member's node
-  before a group starts, and a longer one on the failed member's node after
-  a failure. The leader counts failures per node over a window and cordons
-  repeat offenders.
+  SIGTERM, waits for the grace period that groups introduced, then SIGKILL,
+  and records a `Preempted` outcome that doesn't spend an attempt. The
+  protected fraction and the rate limit live in the planning step. Apps sit
+  above every batch class.
+- *Usage.* CPU-, memory- and GPU-hours per queue and namespace go into Mayo,
+  which feeds both the decay and `relish usage` for chargeback.
 
-**The demo: "Kill a node mid-training."** A recording of a two-node
-fine-tune with its loss curve in Brioche. `relish fault kill-node gpu-2
---acknowledge`: the group stops, a spare joins, training resumes from the
-last checkpoint, and the loss curve picks up where it left off, with the
-lost minutes printed and no human in the loop. Second beat: team B submits a
-job; team A's job checkpoints in its grace period and yields, and the
-dashboard shows the shares settle at the queues' 2:1 weights. Third beat, if
-there's time: a verl RL run starts as one group next to the served model
-from 0.7.0.
+**The demo: "Two teams, one cluster, no arguments."** Team A floods its
+queue with a million CPU tasks and a big fine-tune. Team B submits its own
+group. Brioche shows team A's fine-tune checkpointing in its grace period
+and yielding, team B's group starting, and the two queues' shares settling
+at their 2:1 weights. The served model's latency graph doesn't move.
 
-> Exit test: a 16-GPU fine-tuning job across two nodes and a verl RL job
-> (Ray, with vLLM rollouts) share a cluster with a served model. Kill a node
-> under the fine-tuning job: it restarts on a hot spare from its latest
-> checkpoint within five minutes, with no human. Team B's job preempts team
-> A's at fair share, and team A's job checkpoints in its grace period and
-> resumes later. The served model never drops below its minimum replicas.
+> Exit test: on one cluster with GPU nodes, team A floods its queue with a
+> million CPU tasks. Team B, with equal weight, submits 10,000 tasks and gets
+> within 5% of half the cluster inside a minute, through fair-share
+> preemption. A high-priority eight-GPU group pinned to one rack label then
+> starts on all eight devices at once or not at all. Preempted work gets its
+> grace period, keeps its attempt budget and still finishes. No service on
+> the cluster loses a replica.
 
 ### A landing page for AI work
 
-Put together, the four demos tell one story in the order a team meets it.
+Put together, the five demos tell one story in the order a team meets it.
 Get a GPU working and survive its failure (0.6.0). Serve a model from one
-command and watch it scale to zero (0.7.0). Fill the idle GPUs with batch
-work overnight (0.8.0). Share the cluster between teams and survive a dead
-node mid-training (0.9.0). Each is a short recording with a laptop-sized
-step in the executable tour where one exists. Together they'd be a second
+command and watch it scale to zero (0.7.0). Survive a dead node
+mid-training (0.8.0). Fill the idle GPUs with batch work overnight (0.9.0).
+Share the cluster between teams without arguments (0.10.0). Each is a
+short recording with a laptop-sized step in the executable tour where one
+exists. Together they'd be a second
 tour on the homepage, beside the existing one, aimed at people with GPUs.
 
-Recording them needs real hardware: at least one eight-GPU node for 0.6.0
-and 0.7.0, and two to three nodes with a spare for 0.9.0. The same machines
-would run the `make test-gpu` gate. That's a budget decision, below.
+Recording them needs real hardware: at least one multi-GPU node for 0.6.0
+and 0.7.0, and two to three GPU nodes with a spare from 0.8.0. The same
+machines run the `make test-gpu` gate. The maintainer has NVIDIA hardware
+for both; the exit tests above assume eight NVLink-connected data-centre
+GPUs per node and will be scaled to the actual machines when each release
+is planned.
 
 ### Later
 
@@ -834,27 +882,33 @@ dstack orchestrates GPU jobs, GPUStack serves models, SkyPilot needs a
 Kubernetes or Slurm to sit on. Reliaburger would be the cluster, and run the
 whole product.
 
-After 0.9.0, it fine-tunes, runs RL and trains across nodes with automatic
+After 0.8.0, it fine-tunes, runs RL and trains across nodes with automatic
 recovery, which covers most teams below a few hundred GPUs. It still isn't
 the choice for a frontier pre-training run, and we should say that plainly.
 
-## Decisions for the maintainer
+## Decisions
 
-1. Grow 0.6.0 GPUs to the eight items above, or keep it to placement and
+The maintainer decided on 11 October 2026:
+
+1. **A Models release.** 0.7.0 Models comes before pipelines.
+2. **Groups earlier.** Groups become their own release, 0.8.0, straight after
+   Models; Pipelines moves to 0.9.0 and Fair share to 0.10.0.
+3. **Hardware.** The maintainer has NVIDIA hardware for the `make test-gpu`
+   gate and the demo recordings.
+
+Still open:
+
+4. Grow 0.6.0 GPUs to the eight items above, or keep it to placement and
    CDI and move health and metrics later?
-2. Insert 0.7.0 Models before Pipelines, renumbering Pipelines to 0.8.0 and
-   Fair share to 0.9.0?
-3. Should groups (multi-node inference, multi-node training, RL) wait for the
-   fair-share release, or come earlier on their own?
-4. Where do GPU dev environments go? dstack, Lepton and GPUStack all win
+5. Where do GPU dev environments go? dstack, Lepton and GPUStack all win
    researchers with them.
-5. Do we commit to the endpoint picker protocol as Wrapper's extension point,
+6. Do we commit to the endpoint picker protocol as Wrapper's extension point,
    so llm-d's router plugs in, or build our own routing only?
-6. Do we get GPU hardware for the `make test-gpu` gate and the demo
-   recordings (one eight-GPU node at first, two or three nodes for 0.9.0), and
-   do we rent it per release or keep it?
 7. Is `[model.*]` shorthand over `[app.*]` the right shape, or should models
    simply be apps with a few new fields?
+8. Which GPUs, and how many per node, does the test hardware have? The exit
+   tests are written for eight NVLink-connected GPUs per node; consumer cards
+   without NVLink, or fewer per node, change what 0.6.0 and 0.8.0 can prove.
 
 ## Sources
 
