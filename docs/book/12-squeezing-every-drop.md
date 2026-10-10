@@ -1325,12 +1325,20 @@ already opened the old inode then sees a link count of zero. That is a normal
 replacement, while two links still mean an unsafe hard-linked record. Checking
 for zero links and *then* inspecting metadata again for privacy leaves a gap:
 the rename can happen between the two inspections. We now decide whether to
-retry and whether to accept the record from one metadata snapshot. The reader
-reopens at most eight times, checks ownership and permissions on every accepted
-record, and still refuses symlinks. A deterministic test renames the journal at
-the validation boundary; the unsafe-replacement tests keep the security checks
-honest. A rename after an accepted snapshot can leave us reading the complete
-old record, which is a valid concurrent observation.
+retry and whether to accept the record from one metadata snapshot. An
+`Exclusive` reader, which requires a single link, reopens at most eight times
+and checks ownership and permissions on every accepted record. All readers
+still refuse symlinks. A deterministic test renames the journal at the validation
+boundary; the unsafe-replacement tests keep the security checks honest.
+
+A local upgrade qualification exposed another distinction: `Regular` and
+`OwnerOnly` readers do not require a live link. Reopening on every rename could
+exhaust their budget even though the already-open record was complete and met
+its privacy policy. Those readers now validate and read that snapshot directly.
+The complete old record is a valid concurrent observation, just as it would be
+if the rename happened after validation. Tests replace the path at every
+inspection and require one bounded snapshot read; a separate test refuses an
+unsafe original snapshot even when its replacement has valid permissions.
 
 Environment filtering also exposed a test dependency. The OCI crash fixture's
 runc wrapper read `OCI_CRASH_ROOT` from Bun's environment, which belongs to the
@@ -1343,6 +1351,9 @@ wrapper, after recording the command's environment. That override no longer
 reaches the command. The test now starts an isolated caller with the fake tool
 already on its `PATH`, so the recorded environment includes it without changing
 the test runner's environment.
+The reviewed OCI test registry pins the source file's hash as well as each
+test's identity. Changing the fixture also requires refreshing that pin after
+review and runtime validation; otherwise CI correctly refuses the old approval.
 
 **What the real Linux tests found.** Most of the bugs in this path were
 invisible to mocks:
@@ -1500,6 +1511,14 @@ answer was "too much" in three places:
   review. Exec now copies the workload's own recorded environment, the
   in-memory backend's exec applies the same function, and tests run a command
   found only on the workload's custom `PATH`.
+  Recovery exposed a second mistake: validating that saved environment by
+  rebuilding it from the recovering Bun's defaults. A restart with a different
+  `PATH` rejected a valid owner before it could retire. Inherited values are a
+  snapshot of the preparing Bun. Recovery now checks every explicit workload
+  override against that snapshot and rejects unrequested variables outside the
+  allowlist; it does not compare inherited values with the new caller. Tests
+  preserve a historical `PATH` and missing `HOME`, while rejecting changed or
+  missing workload values and an injected private variable.
 - **The socket.** The helper's socket used to live in `/tmp` under a
   predictable name. Authentication stopped impersonation, but not another user
   creating that name first, which made Bun refuse the slot forever: a cheap

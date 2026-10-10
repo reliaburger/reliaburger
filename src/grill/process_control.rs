@@ -84,7 +84,7 @@ impl ProcessControl {
         let launch = &record.launch;
         if launch.instance_id != *id
             || record.command != command(&launch.spec)
-            || record.environment != environment(&launch.spec)
+            || !recorded_environment_matches(&launch.spec, &record.environment)
         {
             return Err(io::Error::other(
                 "process intent conflicts with instance or command",
@@ -585,6 +585,27 @@ fn environment(spec: &OciSpec) -> std::collections::BTreeMap<String, String> {
     super::process::host_environment(&spec.process.env)
 }
 
+/// Inherited defaults belong to the preparing Bun, not the recovering caller.
+/// The private record supplies that snapshot; workload overrides must still
+/// match exactly, and unrequested private variables must never be inherited.
+fn recorded_environment_matches(
+    spec: &OciSpec,
+    recorded: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let explicit: std::collections::BTreeMap<&str, &str> = spec
+        .process
+        .env
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .collect();
+    explicit
+        .iter()
+        .all(|(key, value)| recorded.get(*key).map(String::as_str) == Some(*value))
+        && recorded.keys().all(|key| {
+            explicit.contains_key(key.as_str()) || super::process::inherited_by_host_commands(key)
+        })
+}
+
 fn create_parent_directories(path: &Path) -> io::Result<()> {
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
@@ -826,6 +847,60 @@ mod tests {
                 .all(|key| key == "JOB" || super::super::process::inherited_by_host_commands(key)),
             "{environment:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn owner_recovery_preserves_inherited_environment_from_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), "/unused".into());
+        let id = InstanceId("saved-env-0".into());
+        let mut spec = spec();
+        spec.process.env = vec!["JOB=1".into()];
+        control.prepare(&id, &spec).await.unwrap();
+        let directory = control.directory(&id).unwrap();
+        let mut record = process_owner::load(&directory).unwrap();
+        // Model an owner prepared by another Bun, without changing global env.
+        record
+            .environment
+            .insert("PATH".into(), "/original-bun/bin".into());
+        record.environment.remove("HOME");
+        record
+            .environment
+            .insert("LC_SAVED".into(), "original".into());
+        process_owner::persist(&directory, &record).unwrap();
+        assert_eq!(control.load(&id).unwrap().environment, record.environment);
+        assert_eq!(control.inventory().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_recovery_rejects_conflicting_explicit_or_private_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), "/unused".into());
+        let id = InstanceId("invalid-env-0".into());
+        let mut spec = spec();
+        spec.process.env = vec!["JOB=old".into(), "JOB=1".into(), "PATH=/work/bin".into()];
+        control.prepare(&id, &spec).await.unwrap();
+        let directory = control.directory(&id).unwrap();
+        let record = process_owner::load(&directory).unwrap();
+        assert_eq!(
+            control.load(&id).unwrap().environment.get("JOB").unwrap(),
+            "1"
+        );
+        for (key, value) in [
+            ("JOB", Some("wrong")),
+            ("JOB", None),
+            ("PATH", Some("/other/bin")),
+            ("RELIABURGER_PRIVATE_SECRET", Some("private")),
+        ] {
+            let mut invalid = record.clone();
+            if let Some(value) = value {
+                invalid.environment.insert(key.into(), value.into());
+            } else {
+                invalid.environment.remove(key);
+            }
+            process_owner::persist(&directory, &invalid).unwrap();
+            assert!(control.load(&id).is_err(), "accepted invalid {key}");
+        }
     }
 
     /// A live owner that hangs up on its first clients without answering, the

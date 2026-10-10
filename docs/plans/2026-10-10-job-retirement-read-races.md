@@ -50,3 +50,76 @@ both groups passed. Both strict Linux lint configurations were repeated and
 passed after the fixture correction. Formatting and ignored-test ownership
 checks also passed. Implementation and local qualification are complete; #654
 remains open for review and its fresh GitHub checks.
+
+The first pushed head's CI policy check caught a missed source-pin refresh for
+`tests/owned_runc.rs`: the script suite had run before the final fixture edit.
+Reproduce that refusal, refresh only that reviewed file's 17 registry pins after
+its runtime suite passes, and rerun the full portable checks. Preserve the test
+identities, ownership mappings and rejection of later unreviewed source changes.
+
+
+The actual OCI interruption gate also exposed a production recovery bug:
+`ProcessControl::load` regenerated host defaults from its current caller rather
+than validating the recorded preparation snapshot. The new regression fails
+against the old logic. Preserve inherited values from the private record, require
+all explicit workload overrides (last value wins), and reject unrequested private
+variables. Requalify automatic restart interruption and the full portable checks.
+
+
+Full portable `make ci` passes after both CI fixes: 6,214 tests, two doctests,
+373 script tests, formatting, both strict lint configurations and ignored-test
+ownership checks. All 54 Linux process/backend/owner/control tests pass with
+eBPF enabled. The actual OCI interruption binaries are being rebuilt for local
+isolated execution; GitHub must produce its own fresh source-bound receipts.
+
+
+The isolated owner suites passed 20 owned-runc and five owned-network cases.
+A temporary disk-image setup first blocked the non-root capacity payload with
+mode 0700 on its parent; mode 1777, matching `/tmp`, restored the same case.
+The actual Bun interruption run then passed seven of eight cases, including
+the original automatic-restart failure and three-node upgrade/rollback. The
+single-node upgrade hit the eight-reopen record budget on the disk image and
+passed on private Linux tmpfs. Retain that failed attempt rather than claiming
+a clean full-gate pass.
+
+Deterministic regressions expose the reader policy problem: nonexclusive reads
+needlessly follow every replacement instead of accepting their valid atomic
+snapshot. Apply the link/reopen requirement only to `Exclusive`; keep the same
+privacy checks for the already-open `Regular`/`OwnerOnly` snapshot. Both new
+regressions fail before this correction. Repeat portable CI and all three actual
+OCI binary groups, including the previously interrupted upgrade case, afterward.
+
+
+The first portable repeat after the snapshot fix stopped on the unchanged
+invalid-UTF8 diagnostic control, whose `bun --compatibility` child exited
+unsuccessfully. Its path and Linux Bun resolved to the same inode and ELF bytes.
+The underlying cause was a macOS `debug` directory symlink to the Linux cache;
+removing individual entries did not separate publication. The reverse Mach-O
+replacement invalidated an OCI attempt (two fixtures passed, eighteen runtime
+cases failed). Retain those failures as rig errors, not qualification.
+
+The subsequent portable run completed with Linux compilation stopped: all
+6,216 tests, two doctests, 373 script tests, formatting, both strict lint
+configurations and ignored-test ownership checks passed. After it finished,
+replace the macOS `debug` symlink with an independent APFS clone of its validated
+Mach-O artifacts, preserving the original link for recovery. Restore ELF Linux
+outputs and repeat all actual OCI cases. Record both rig and reader failures in
+`docs/flakes.md`; no per-test deadline or retry-policy increase addresses them.
+
+
+Final Linux qualification passed all 20 owned-runc and five owned-network cases,
+then seven Bun OCI interruption cases, including the original automatic-restart
+failure and the previously interrupted single-node upgrade. The last three-node
+case hit a separate initial voter-promotion timeout: three live gossip members,
+two Raft voters. Its unchanged final-source isolated run passed on private Linux
+tmpfs in 89.13 seconds. Track the unexplained promotion/teardown flake in #673
+(0.2.1), retaining the failed receipt; the disk-image run is not a clean full-gate
+pass. All runtime cases are covered through these resumed executions. The local
+outer Bun-suite watchdog was 600 seconds for large debug copies, versus CI's
+420; no per-test deadline or automatic retry policy was changed.
+
+#672 merged into #654 during qualification (remote head `1cf7e4f7`), adding the
+release-job soak and landing-page commands. It changes no Rust source or tests.
+Rebase these CI repairs onto that head and repeat both CI/release Python suites,
+formatting and ignored-test ownership checks. Preserve the full portable and
+runtime results above; fresh GitHub checks must produce their own receipts.

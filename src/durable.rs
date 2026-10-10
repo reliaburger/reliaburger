@@ -75,11 +75,10 @@ fn open_record(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// Records are replaced by atomic rename, and a reader that doesn't hold the
-/// writer's lock can open the old file just before the rename. That file then
-/// has no links left, which isn't tampering (a hard-linked copy has two or
-/// more): open the path again to read the replacement. Bounded, so a path
-/// that keeps changing still fails validation rather than spinning.
+/// Atomic replacement can unlink an already-open, complete record. Regular
+/// and owner-only readers validate that snapshot, which needs no live link.
+/// Exclusive readers require one link and therefore reopen a replacement;
+/// the bound prevents endless spinning on an actively replaced path.
 fn open_validated(
     mut file: File,
     path: &Path,
@@ -92,7 +91,7 @@ fn open_validated(
         // One snapshot decides both replacement and privacy. Rechecking link
         // count in validate_file would race another rename after this check.
         let metadata = file.metadata()?;
-        if metadata.nlink() == 0 {
+        if access == Access::Exclusive && metadata.nlink() == 0 {
             if replacements == 8 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -258,6 +257,49 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::io::read_to_string(current).unwrap(), "2");
+    }
+
+    #[test]
+    fn nonexclusive_reads_keep_a_valid_atomic_snapshot_during_replacement() {
+        for access in [Access::Regular, Access::OwnerOnly] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("owner.json");
+            write(&path, b"1", 0o600);
+            let mut inspections = 0;
+            let snapshot = open_validated(open_record(&path).unwrap(), &path, access, |_| {
+                let replacement = dir.path().join(format!("replacement-{inspections}"));
+                write(&replacement, b"2", 0o600);
+                std::fs::rename(replacement, &path).unwrap();
+                inspections += 1;
+            })
+            .unwrap();
+            assert_eq!(inspections, 1);
+            assert_eq!(std::io::read_to_string(snapshot).unwrap(), "1");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "2");
+        }
+    }
+
+    #[test]
+    fn an_unlinked_snapshot_still_has_to_pass_its_own_privacy_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.json");
+        let replacement = dir.path().join("replacement.json");
+        write(&path, b"1", 0o644);
+        write(&replacement, b"2", 0o600);
+        let mut replaced = false;
+        let error = open_validated(
+            open_record(&path).unwrap(),
+            &path,
+            Access::OwnerOnly,
+            |_| {
+                if !replaced {
+                    std::fs::rename(&replacement, &path).unwrap();
+                    replaced = true;
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
