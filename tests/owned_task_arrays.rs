@@ -179,7 +179,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     let kernel = Arc::new(tokio::sync::Mutex::new(
         OnionEbpf::load_embedded(Path::new("/sys/fs/cgroup")).unwrap(),
     ));
-    let policy = TaskNamespacePolicy::recover(kernel.clone(), root)
+    let policy = TaskNamespacePolicy::recover(kernel.clone(), root, Default::default(), None)
         .await
         .unwrap();
     let runner = Arc::new(
@@ -390,7 +390,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     // The startup pass clears only recorded, same-boot ancestry after owners retire.
     drop(runner);
     drop(policy);
-    TaskNamespacePolicy::recover(kernel.clone(), root)
+    TaskNamespacePolicy::recover(kernel.clone(), root, Default::default(), None)
         .await
         .unwrap();
     assert!(

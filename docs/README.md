@@ -528,11 +528,15 @@ lease ownership must also be unscoped, for both inspection and cleanup.
 configuration; no security switch needs hand-editing:
 
 ```sh
-target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
 sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
-The output directory is created if it doesn't exist. Leave Bun running and,
+The output directory is created if it doesn't exist. As root on Linux with
+`runc` installed, `relish init` also turns on `[ebpf]` and `[dns]`, so
+namespace isolation is enforced from the first deploy (build Bun with
+`--features ebpf`; it refuses to start a rootful runc node without the data
+path). Leave Bun running and,
 from another terminal, mint the first administrator token over the generated
 cluster CA before doing anything else:
 
@@ -944,6 +948,7 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
+| [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
 
 ### Images, the pull-through cache, and cluster registries (Phase 12)
 

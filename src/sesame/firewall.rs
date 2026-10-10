@@ -7,7 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use crate::onion::types::{FirewallKey, FirewallValue, ServiceEntry};
+use crate::onion::types::{
+    DestinationKey, DestinationValue, FirewallKey, FirewallValue, NAMESPACE_CONTESTED, ServiceEntry,
+};
 
 /// The action value for ALLOW in the firewall map.
 pub const FIREWALL_ALLOW: u32 = 1;
@@ -61,54 +63,205 @@ pub fn resolve_firewall_rules(
     services: &[ServiceEntry],
     cgroup_ids: &HashMap<(String, String), Vec<u64>>,
 ) -> Vec<ResolvedFirewallRule> {
+    let destinations: Vec<IsolatedDestination<'_>> =
+        services.iter().map(IsolatedDestination::from).collect();
+    resolve_destination_rules(&destinations, cgroup_ids)
+}
+
+/// [`resolve_firewall_rules`] for any isolated destination, services and
+/// jobs alike.
+pub fn resolve_destination_rules(
+    destinations: &[IsolatedDestination<'_>],
+    cgroup_ids: &HashMap<(String, String), Vec<u64>>,
+) -> Vec<ResolvedFirewallRule> {
     let mut rules = Vec::new();
-
-    for service in services {
-        let dst_app_id = service.app_id;
-
-        match &service.firewall_allow_from {
+    for destination in destinations {
+        let grant = |rules: &mut Vec<ResolvedFirewallRule>, cgroups: &[u64]| {
+            rules.extend(cgroups.iter().map(|&cg| ResolvedFirewallRule {
+                src_cgroup_id: cg,
+                dst_app_id: destination.app_id,
+                action: FIREWALL_ALLOW,
+            }));
+        };
+        match destination.allow_from {
             None => {
                 // Default: allow all apps in the same namespace
                 for ((namespace, app), cgroups) in cgroup_ids {
-                    if namespace == &service.namespace && app != &service.app_name {
-                        for &cg in cgroups {
-                            rules.push(ResolvedFirewallRule {
-                                src_cgroup_id: cg,
-                                dst_app_id,
-                                action: FIREWALL_ALLOW,
-                            });
-                        }
+                    if namespace == destination.namespace && app != destination.name {
+                        grant(&mut rules, cgroups);
                     }
                 }
             }
             Some(allow_list) => {
-                // Explicit allow list
+                // Support "namespace/app" or just "app" (same namespace)
                 for allowed_name in allow_list {
-                    // Support "namespace/app" or just "app" (same namespace)
-                    let (target_ns, target_app) =
-                        if let Some((ns, app)) = allowed_name.split_once('/') {
-                            (ns, app)
-                        } else {
-                            (service.namespace.as_str(), allowed_name.as_str())
-                        };
-
+                    let (target_ns, target_app) = allowed_name
+                        .split_once('/')
+                        .unwrap_or((destination.namespace, allowed_name.as_str()));
                     if let Some(cgroups) =
                         cgroup_ids.get(&(target_ns.to_string(), target_app.to_string()))
                     {
-                        for &cg in cgroups {
-                            rules.push(ResolvedFirewallRule {
-                                src_cgroup_id: cg,
-                                dst_app_id,
-                                action: FIREWALL_ALLOW,
-                            });
-                        }
+                        grant(&mut rules, cgroups);
                     }
                 }
             }
         }
     }
-
     rules
+}
+
+/// A destination namespace isolation protects, and who may reach it from
+/// other namespaces. Services and jobs both become one.
+#[derive(Debug, Clone, Copy)]
+pub struct IsolatedDestination<'a> {
+    /// Namespace that owns the destination.
+    pub namespace: &'a str,
+    /// App or job name.
+    pub name: &'a str,
+    /// Identity `firewall_map` grants name.
+    pub app_id: u32,
+    /// `allow_from` sources; `None` keeps namespace-default isolation.
+    pub allow_from: Option<&'a [String]>,
+}
+
+impl<'a> From<&'a ServiceEntry> for IsolatedDestination<'a> {
+    fn from(service: &'a ServiceEntry) -> Self {
+        Self {
+            namespace: &service.namespace,
+            name: &service.app_name,
+            app_id: service.app_id,
+            allow_from: service.firewall_allow_from.as_deref(),
+        }
+    }
+}
+
+/// The `firewall_map` identity of a workload that publishes no service, such
+/// as a job. Service identities are VIPs (`127.128.0.0/16` as a host-order
+/// `u32`, below `0x8000_0000`), so setting the top bit keeps the two apart.
+pub fn workload_app_id(namespace: &str, name: &str) -> u32 {
+    0x8000_0000 | (crate::onion::vip::name_to_id(&format!("{namespace}/{name}")) & 0x7fff_ffff)
+}
+
+/// A workload on this node with its own (container) address, which belongs
+/// to its namespace on every port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalWorkload {
+    /// The workload's own address.
+    pub address: std::net::Ipv4Addr,
+    /// Owning namespace.
+    pub namespace: String,
+    /// App or job name; for a delegated task, its runtime instance.
+    pub name: String,
+    /// The owner's `firewall_map` identity: its service's, when it publishes
+    /// one, so one `allow_from` grant covers its VIP and real addresses.
+    pub app_id: u32,
+}
+
+/// The forward-path plan for `crate::firewall::isolation`: local workload
+/// addresses by namespace, and the address pairs `allow_from` opens.
+pub fn isolation_plan(
+    workloads: &[LocalWorkload],
+    destinations: &[IsolatedDestination<'_>],
+) -> crate::firewall::isolation::IsolationPlan {
+    let mut plan = crate::firewall::isolation::IsolationPlan::default();
+    for workload in workloads {
+        plan.namespaces
+            .entry(crate::onion::vip::name_to_id(&workload.namespace))
+            .or_default()
+            .insert(workload.address);
+    }
+    for destination in destinations {
+        let Some(allow_from) = destination.allow_from else {
+            continue;
+        };
+        let targets = workloads
+            .iter()
+            .filter(|workload| workload.app_id == destination.app_id);
+        for target in targets {
+            for source in allow_from {
+                let (namespace, name) = source
+                    .split_once('/')
+                    .unwrap_or((destination.namespace, source.as_str()));
+                plan.granted.extend(
+                    workloads
+                        .iter()
+                        .filter(|workload| workload.namespace == namespace && workload.name == name)
+                        .map(|workload| (workload.address, target.address)),
+                );
+            }
+        }
+    }
+    plan
+}
+
+/// Every real destination the connect hooks hold to namespace isolation,
+/// for `destination_map`:
+///
+/// - each backend in the service view: a local container address and port,
+///   or a remote node address and published host port;
+/// - each backend the cluster catalogue lists on any node, this one
+///   included, at its node address and published host port (the DNAT
+///   target another node's workload would dial);
+/// - every port of each local workload address.
+///
+/// An address two owners claim at once (a stale catalogue meeting a reused
+/// port) becomes contested and denies every namespaced caller.
+pub fn destination_entries(
+    services: &[ServiceEntry],
+    catalog: &crate::onion::catalog::EndpointCatalog,
+    workloads: &[LocalWorkload],
+) -> std::collections::BTreeMap<DestinationKey, DestinationValue> {
+    let mut entries = std::collections::BTreeMap::new();
+    let mut claim = |key: DestinationKey, value: DestinationValue| {
+        entries
+            .entry(key)
+            .and_modify(|current: &mut DestinationValue| {
+                if *current != value {
+                    *current = DestinationValue {
+                        app_id: 0,
+                        namespace_id: NAMESPACE_CONTESTED,
+                    };
+                }
+            })
+            .or_insert(value);
+    };
+    for service in services {
+        let owner = DestinationValue {
+            app_id: service.app_id,
+            namespace_id: service.namespace_id,
+        };
+        for backend in &service.backends {
+            claim(
+                DestinationKey::new(backend.node_ip, backend.host_port),
+                owner,
+            );
+        }
+    }
+    for (qualified, service) in &catalog.services {
+        let Some(id) = crate::onion::service_id::ServiceId::parse(qualified) else {
+            continue;
+        };
+        let owner = DestinationValue {
+            app_id: u32::from(service.vip.0),
+            namespace_id: crate::onion::vip::name_to_id(&id.namespace),
+        };
+        for backend in &service.backends {
+            claim(
+                DestinationKey::new(backend.node_ip, backend.host_port),
+                owner,
+            );
+        }
+    }
+    for workload in workloads {
+        claim(
+            DestinationKey::any_port(workload.address),
+            DestinationValue {
+                app_id: workload.app_id,
+                namespace_id: crate::onion::vip::name_to_id(&workload.namespace),
+            },
+        );
+    }
+    entries
 }
 
 /// Resolve cgroup-to-namespace mappings for all running instances.
@@ -173,7 +326,10 @@ pub enum FirewallMapError {
 /// absent. The connect hook is already implemented in `ebpf/onion_connect.bpf.c`.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod maps {
-    use super::{FirewallKey, FirewallMapError, FirewallValue, LiveFirewallState};
+    use super::{
+        DestinationKey, DestinationValue, FirewallKey, FirewallMapError, FirewallValue,
+        LiveFirewallState,
+    };
     use aya::maps::HashMap;
 
     fn deletion_result(result: Result<(), aya::maps::MapError>) -> Result<(), FirewallMapError> {
@@ -343,6 +499,65 @@ mod maps {
         Ok(())
     }
 
+    fn destination_map(
+        bpf: &mut aya::Ebpf,
+    ) -> Result<HashMap<&mut aya::maps::MapData, DestinationKey, DestinationValue>, FirewallMapError>
+    {
+        Ok(HashMap::try_from(bpf.map_mut("destination_map").ok_or(
+            FirewallMapError::MapNotFound {
+                map_name: "destination_map",
+            },
+        )?)?)
+    }
+
+    /// Record who owns one real destination.
+    pub fn write_destination_entry(
+        bpf: &mut aya::Ebpf,
+        key: DestinationKey,
+        value: DestinationValue,
+    ) -> Result<(), FirewallMapError> {
+        destination_map(bpf)?.insert(key, value, 0)?;
+        Ok(())
+    }
+
+    /// Forget one real destination; an absent key is already forgotten.
+    pub fn delete_destination_entry(
+        bpf: &mut aya::Ebpf,
+        key: DestinationKey,
+    ) -> Result<(), FirewallMapError> {
+        deletion_result(destination_map(bpf)?.remove(&key))
+    }
+
+    /// Read every real destination the kernel currently holds to isolation.
+    pub fn list_destination_entries(
+        bpf: &mut aya::Ebpf,
+    ) -> Result<std::collections::BTreeMap<DestinationKey, DestinationValue>, FirewallMapError>
+    {
+        let map = destination_map(bpf)?;
+        map.iter().collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Converge `destination_map` to `desired`. New and changed owners are
+    /// written before departed ones are deleted, and `keys` remembers every
+    /// key this node attempted, so a failure never forgets one it may own.
+    pub fn reconcile_destination_map(
+        bpf: &mut aya::Ebpf,
+        desired: &std::collections::BTreeMap<DestinationKey, DestinationValue>,
+        keys: &mut std::collections::HashSet<DestinationKey>,
+    ) -> Result<(), FirewallMapError> {
+        let mut map = destination_map(bpf)?;
+        for (key, value) in desired {
+            keys.insert(*key);
+            map.insert(*key, *value, 0)?;
+        }
+        let wanted: std::collections::HashSet<DestinationKey> = desired.keys().copied().collect();
+        for key in super::keys_to_delete(keys, &wanted) {
+            deletion_result(map.remove(&key))?;
+            keys.remove(&key);
+        }
+        Ok(())
+    }
+
     /// Read the exact namespace and allow values the live connect hook would
     /// consult for one source/destination pair.
     pub fn read_firewall_state(
@@ -426,6 +641,181 @@ mod tests {
             }],
             firewall_allow_from: allow_from,
         }
+    }
+
+    fn catalog_with(
+        namespace: &str,
+        name: &str,
+        vip: Ipv4Addr,
+        backends: &[(&str, Ipv4Addr, u16)],
+    ) -> crate::onion::catalog::EndpointCatalog {
+        let mut catalog = crate::onion::catalog::EndpointCatalog::new();
+        catalog.services.insert(
+            crate::onion::service_id::ServiceId::new(namespace, name).qualified(),
+            crate::onion::catalog::CatalogService {
+                vip: VirtualIP(vip),
+                port: 8080,
+                backends: backends
+                    .iter()
+                    .map(|(node, ip, port)| crate::onion::catalog::CatalogBackend {
+                        execution: None,
+                        node_id: (*node).into(),
+                        node_ip: *ip,
+                        host_port: *port,
+                        healthy: true,
+                    })
+                    .collect(),
+            },
+        );
+        catalog
+    }
+
+    #[test]
+    fn destinations_cover_backend_addresses_and_published_host_ports() {
+        let mut local = make_service("db", "backend", 7, 70, None);
+        local.backends[0].node_ip = Ipv4Addr::new(10, 88, 0, 5);
+        local.backends[0].host_port = 5432;
+        let catalog = catalog_with(
+            "backend",
+            "db",
+            Ipv4Addr::new(127, 128, 0, 7),
+            &[
+                ("this-node", Ipv4Addr::new(192, 168, 0, 1), 31000),
+                ("other-node", Ipv4Addr::new(192, 168, 0, 2), 31001),
+            ],
+        );
+        let entries = destination_entries(&[local], &catalog, &[]);
+        let owner = |ip, port| entries.get(&DestinationKey::new(ip, port)).copied();
+        // The local container address and port.
+        assert_eq!(
+            owner(Ipv4Addr::new(10, 88, 0, 5), 5432),
+            Some(DestinationValue {
+                app_id: 7,
+                namespace_id: 70
+            })
+        );
+        // Every node's published host port, this node's included.
+        let catalogued = DestinationValue {
+            app_id: u32::from(Ipv4Addr::new(127, 128, 0, 7)),
+            namespace_id: crate::onion::vip::name_to_id("backend"),
+        };
+        assert_eq!(
+            owner(Ipv4Addr::new(192, 168, 0, 1), 31000),
+            Some(catalogued)
+        );
+        assert_eq!(
+            owner(Ipv4Addr::new(192, 168, 0, 2), 31001),
+            Some(catalogued)
+        );
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn container_addresses_are_owned_on_every_port() {
+        let job = workload_app_id("batch", "crawler");
+        let entries = destination_entries(
+            &[],
+            &crate::onion::catalog::EndpointCatalog::new(),
+            &[LocalWorkload {
+                address: Ipv4Addr::new(10, 88, 0, 9),
+                namespace: "batch".into(),
+                name: "crawler".into(),
+                app_id: job,
+            }],
+        );
+        assert_eq!(
+            entries.get(&DestinationKey::any_port(Ipv4Addr::new(10, 88, 0, 9))),
+            Some(&DestinationValue {
+                app_id: job,
+                namespace_id: crate::onion::vip::name_to_id("batch")
+            })
+        );
+    }
+
+    #[test]
+    fn the_forward_path_opens_only_what_allow_from_grants() {
+        let workload = |last: u8, namespace: &str, name: &str| LocalWorkload {
+            address: Ipv4Addr::new(10, 88, 0, last),
+            namespace: namespace.into(),
+            name: name.into(),
+            app_id: workload_app_id(namespace, name),
+        };
+        let workloads = [
+            workload(2, "batch", "crawler"),
+            workload(3, "frontend", "scraper"),
+            workload(4, "frontend", "other"),
+        ];
+        let allow = vec!["frontend/scraper".to_string()];
+        let plan = isolation_plan(
+            &workloads,
+            &[IsolatedDestination {
+                namespace: "batch",
+                name: "crawler",
+                app_id: workload_app_id("batch", "crawler"),
+                allow_from: Some(&allow),
+            }],
+        );
+        assert_eq!(
+            plan.granted,
+            std::collections::BTreeSet::from([(
+                Ipv4Addr::new(10, 88, 0, 3),
+                Ipv4Addr::new(10, 88, 0, 2)
+            )])
+        );
+        assert_eq!(
+            plan.namespaces[&crate::onion::vip::name_to_id("frontend")].len(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_address_two_owners_claim_denies_every_namespace() {
+        let first = make_service("db", "backend", 7, 70, None);
+        let second = make_service("cache", "other", 8, 80, None);
+        // Both name 10.0.1.1:30000, the test service's backend address.
+        let entries = destination_entries(
+            &[first, second],
+            &crate::onion::catalog::EndpointCatalog::new(),
+            &[],
+        );
+        assert_eq!(
+            entries.get(&DestinationKey::new(Ipv4Addr::new(10, 0, 1, 1), 30000)),
+            Some(&DestinationValue {
+                app_id: 0,
+                namespace_id: NAMESPACE_CONTESTED
+            })
+        );
+    }
+
+    #[test]
+    fn job_identities_never_collide_with_service_identities() {
+        let job = workload_app_id("default", "nightly");
+        assert!(
+            job >= 0x8000_0000,
+            "service app ids are VIPs below 0x8000_0000"
+        );
+        assert_eq!(job, workload_app_id("default", "nightly"));
+        assert_ne!(job, workload_app_id("other", "nightly"));
+    }
+
+    #[test]
+    fn job_allow_from_grants_named_sources_another_namespace() {
+        let allow = vec!["frontend/scraper".to_string()];
+        let destination = IsolatedDestination {
+            namespace: "batch",
+            name: "crawler",
+            app_id: workload_app_id("batch", "crawler"),
+            allow_from: Some(&allow),
+        };
+        let cgroups = [
+            cg("frontend", "scraper", vec![41]),
+            cg("frontend", "other", vec![42]),
+        ]
+        .into();
+        let rules = resolve_destination_rules(&[destination], &cgroups);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].src_cgroup_id, 41);
+        assert_eq!(rules[0].dst_app_id, destination.app_id);
     }
 
     #[test]

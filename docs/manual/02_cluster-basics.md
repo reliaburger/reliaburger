@@ -16,11 +16,15 @@ the rest of this chapter is for servers.
 `app.toml` and an mTLS-required `reliaburger.toml`:
 
 ```sh
-relish init cluster --cluster-name prod --node-id node-01
+sudo relish init cluster --cluster-name prod --node-id node-01
 ```
 
-Open `cluster/reliaburger.toml` and set `enabled = true` under `[ebpf]` (and
-under `[dns]` and `[ingress]` if you want them; see `networking`). Back up
+Run as root on Linux with `runc` installed, `relish init` writes `[ebpf]` and
+`[dns]` with `enabled = true`: namespace isolation and egress allowlists need
+the eBPF data path, and Bun refuses to start this node if it can't load it.
+Anywhere else it leaves both off, and the node refuses `allow_from` and egress
+allowlists rather than run them unenforced. Turn on `[ingress]` if you want it
+(see `networking`). Back up
 `cluster/prod-master.key`: every node needs it, and it unlocks the cluster's
 CA and secret keys. Then start the node:
 

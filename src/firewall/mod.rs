@@ -1,3 +1,6 @@
+/// The `reliaburger_isolation` table: namespace isolation between local
+/// workloads on the forward path, for traffic the eBPF socket hooks never see.
+pub mod isolation;
 /// nftables perimeter firewall.
 ///
 /// Blocks external access to Reliaburger's own ports: container host

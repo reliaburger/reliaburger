@@ -1,14 +1,23 @@
 //! Cached namespace ancestry for delegated containers. Bind before create/start;
 //! keep bindings while an owner is uncertain, and clear the previous boot's
 //! journal only after startup has retired all old delegated runtime owners.
+//!
+//! A lease also carries the rest of a task's network policy: the egress
+//! allowlist of its cgroup and the namespace ownership of its address. Both
+//! are released with the lease once the runtime has retired.
 use crate::onion::ebpf::loader::OnionEbpf;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
 const MAX_NAMESPACES: usize = 256;
+/// How long a task's egress allowlist may take to resolve before the
+/// attempt is refused.
+const EGRESS_DNS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 #[derive(Default)]
 struct Binding {
     cgroup: u64,
@@ -22,25 +31,188 @@ struct Journal {
     namespaces: BTreeMap<String, u64>,
 }
 
+/// Network state the delegated job runtimes hold on this node, shared with
+/// the agent. The agent's kernel reconciliation keeps it: task addresses
+/// stay in `destination_map` with their jobs' `allow_from` grants, and the
+/// sweep leaves task egress allowlists alone.
+#[derive(Default)]
+pub struct DelegatedNetwork {
+    state: Mutex<DelegatedState>,
+    changed: AtomicBool,
+}
+
+/// A point-in-time copy of [`DelegatedNetwork`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegatedState {
+    /// Each task container address and who owns it.
+    pub addresses: BTreeMap<Ipv4Addr, DelegatedAddress>,
+    /// Task cgroups holding an egress allowlist.
+    pub egress_cgroups: BTreeSet<u64>,
+}
+
+/// The owner of one task container address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedAddress {
+    /// Namespace of the job the task runs for.
+    pub namespace: String,
+    /// The runtime instance holding the address; its destination identity.
+    pub owner: String,
+    /// Sources in other namespaces the job's `allow_from` admits.
+    pub allow_from: Option<Vec<String>>,
+}
+
+impl DelegatedNetwork {
+    /// Copy the current state.
+    pub async fn snapshot(&self) -> DelegatedState {
+        self.state.lock().await.clone()
+    }
+
+    /// Whether the state changed since the last call, so the agent should
+    /// reconcile the kernel maps again.
+    pub fn take_changed(&self) -> bool {
+        self.changed.swap(false, Ordering::AcqRel)
+    }
+
+    async fn update(&self, change: impl FnOnce(&mut DelegatedState)) {
+        change(&mut *self.state.lock().await);
+        self.changed.store(true, Ordering::Release);
+    }
+}
+
 /// Shared with the agent's exact kernel map, never a second attached program.
 pub struct TaskNamespacePolicy {
     kernel: Arc<Mutex<OnionEbpf>>,
     bindings: Mutex<BTreeMap<String, Binding>>,
     path: PathBuf,
     boot: String,
+    network: Arc<DelegatedNetwork>,
+    workload_dns: Option<Ipv4Addr>,
 }
 /// Deliberately has no Drop release: an abandoned runtime still owns its source.
 pub struct NamespaceLease {
     policy: Arc<TaskNamespacePolicy>,
     namespace: String,
+    egress_cgroup: Option<u64>,
+    address: Option<Ipv4Addr>,
 }
 impl NamespaceLease {
-    /// Call only after runtime retirement is confirmed.
+    /// Call only after runtime retirement is confirmed. Lifts the task's
+    /// egress allowlist and address ownership before the namespace binding.
     pub async fn retired(self) {
+        if let Some(cgroup) = self.egress_cgroup {
+            let mut kernel = self.policy.kernel.lock().await;
+            if let Err(error) =
+                crate::sesame::egress::delete_cgroup_egress_state(&mut kernel.bpf, cgroup)
+            {
+                // The agent's sweep scrubs an allowlist no owner claims.
+                eprintln!("sesame: retired task egress for cgroup {cgroup} remains: {error}");
+            }
+        }
+        if let Some(address) = self.address {
+            let mut kernel = self.policy.kernel.lock().await;
+            if let Err(error) = crate::sesame::firewall::delete_destination_entry(
+                &mut kernel.bpf,
+                crate::onion::types::DestinationKey::any_port(address),
+            ) {
+                eprintln!("sesame: retired task address {address} remains owned: {error}");
+            }
+        }
+        let (cgroup, address) = (self.egress_cgroup, self.address);
+        self.policy
+            .network
+            .update(|state| {
+                if let Some(cgroup) = cgroup {
+                    state.egress_cgroups.remove(&cgroup);
+                }
+                if let Some(address) = address {
+                    state.addresses.remove(&address);
+                }
+            })
+            .await;
         let mut bindings = self.policy.bindings.lock().await;
         if let Some(binding) = bindings.get_mut(&self.namespace) {
             binding.users -= 1;
         }
+    }
+
+    /// Hold the task cgroup at `cgroup` to `allow` (plus the node's DNS
+    /// responder) before anything runs in it. A name that doesn't resolve
+    /// refuses the attempt rather than starting it deny-all.
+    pub async fn enforce_egress(&mut self, cgroup: &Path, allow: &[String]) -> std::io::Result<()> {
+        use crate::sesame::egress;
+        if allow.is_empty() {
+            return Ok(());
+        }
+        let cgroup_id = egress::cgroup_id_of_path(cgroup)
+            .ok_or_else(|| std::io::Error::other("task cgroup identity is unavailable"))?;
+        let entries = allow.to_vec();
+        let lookup = tokio::task::spawn_blocking(move || egress::resolve_egress_entries(&entries));
+        let mut destinations = tokio::time::timeout(EGRESS_DNS_PATIENCE, lookup)
+            .await
+            .map_err(|_| std::io::Error::other("egress allowlist did not resolve in time"))?
+            .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)?;
+        destinations.extend(egress::implicit_destinations(self.policy.workload_dns));
+        let merged = egress::merge_cidr_ports(&destinations).map_err(std::io::Error::other)?;
+        // Claim the cgroup before writing it, so the sweep never mistakes a
+        // half-written allowlist for an abandoned one.
+        self.policy
+            .network
+            .update(|state| {
+                state.egress_cgroups.insert(cgroup_id);
+            })
+            .await;
+        self.egress_cgroup = Some(cgroup_id);
+        let mut kernel = self.policy.kernel.lock().await;
+        if !(kernel.is_attached()
+            && kernel.connect6_attached()
+            && kernel.sendmsg4_attached()
+            && kernel.sendmsg6_attached())
+        {
+            return Err(std::io::Error::other(
+                "egress enforcement needs every connect and sendmsg hook",
+            ));
+        }
+        // Enforced with no entries denies everything, so the flag goes first.
+        egress::set_egress_enforced(&mut kernel.bpf, cgroup_id).map_err(std::io::Error::other)?;
+        egress::delete_cgroup_egress_entries(&mut kernel.bpf, cgroup_id)
+            .map_err(std::io::Error::other)?;
+        egress::write_egress_destinations(&mut kernel.bpf, cgroup_id, &destinations, &merged)
+            .map_err(std::io::Error::other)
+    }
+
+    /// Record that the task's container `address` belongs to this lease's
+    /// namespace on every port, with the job's `allow_from` grants.
+    pub async fn publish_address(
+        &mut self,
+        address: Ipv4Addr,
+        owner: &str,
+        allow_from: Option<Vec<String>>,
+    ) -> std::io::Result<()> {
+        let namespace = self.namespace.clone();
+        let app_id = crate::sesame::firewall::workload_app_id(&namespace, owner);
+        let entry = DelegatedAddress {
+            namespace: namespace.clone(),
+            owner: owner.to_string(),
+            allow_from,
+        };
+        self.policy
+            .network
+            .update(|state| {
+                state.addresses.insert(address, entry);
+            })
+            .await;
+        self.address = Some(address);
+        let mut kernel = self.policy.kernel.lock().await;
+        crate::sesame::firewall::write_destination_entry(
+            &mut kernel.bpf,
+            crate::onion::types::DestinationKey::any_port(address),
+            crate::onion::types::DestinationValue {
+                app_id,
+                namespace_id: crate::onion::vip::name_to_id(&namespace),
+            },
+        )
+        .map_err(std::io::Error::other)
     }
 }
 impl TaskNamespacePolicy {
@@ -68,7 +240,12 @@ impl TaskNamespacePolicy {
         .map_err(std::io::Error::other)?
     }
     /// Startup must first retire old delegated owners. Never erase a live source.
-    pub async fn recover(kernel: Arc<Mutex<OnionEbpf>>, data: &Path) -> std::io::Result<Arc<Self>> {
+    pub async fn recover(
+        kernel: Arc<Mutex<OnionEbpf>>,
+        data: &Path,
+        network: Arc<DelegatedNetwork>,
+        workload_dns: Option<Ipv4Addr>,
+    ) -> std::io::Result<Arc<Self>> {
         let path = data.join("batch-namespaces.json");
         let read_path = path.clone();
         let (journal, boot) = tokio::task::spawn_blocking(move || {
@@ -107,6 +284,8 @@ impl TaskNamespacePolicy {
             bindings: Mutex::new(BTreeMap::new()),
             path,
             boot,
+            network,
+            workload_dns,
         });
         policy.persist(&BTreeMap::new()).await?;
         Ok(policy)
@@ -205,6 +384,8 @@ impl TaskNamespacePolicy {
         Ok(NamespaceLease {
             policy: self.clone(),
             namespace: namespace.into(),
+            egress_cgroup: None,
+            address: None,
         })
     }
     /// A lost source binding must stop the original owner before another attempt.

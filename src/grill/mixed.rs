@@ -531,7 +531,14 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         self.container.honours_cgroup_path()
     }
     fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
-        !spec.host_process && self.container.honours_cgroup_path_for(spec)
+        if spec.host_process {
+            self.host.places_host_processes()
+        } else {
+            self.container.honours_cgroup_path_for(spec)
+        }
+    }
+    fn places_host_processes(&self) -> bool {
+        self.host.places_host_processes()
     }
     #[cfg(target_os = "linux")]
     fn host_executor_runtime(&self) -> Option<super::ProcessGrill> {

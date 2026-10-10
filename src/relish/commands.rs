@@ -537,6 +537,51 @@ pub enum InitSecurityMode {
     DevelopmentPlaintext,
 }
 
+/// What `relish init` needs to know about the host it writes a node config
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitHost {
+    /// The host runs Linux, where the eBPF data path exists.
+    pub linux: bool,
+    /// `relish init` runs as root, as Bun will on a rootful runc node.
+    pub root: bool,
+    /// `runc` is on `PATH`.
+    pub runc: bool,
+}
+
+impl InitHost {
+    /// Inspect the current host.
+    pub fn detect() -> Self {
+        let runc = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|directory| directory.join("runc").is_file())
+        });
+        Self {
+            linux: cfg!(target_os = "linux"),
+            root: nix::unistd::geteuid().is_root(),
+            runc,
+        }
+    }
+
+    /// Whether a node here runs rootful runc and so can load the eBPF data
+    /// path.
+    fn runs_rootful_runc(self) -> bool {
+        self.linux && self.root && self.runc
+    }
+}
+
+/// Turn on the eBPF data path and the DNS responder for a rootful runc
+/// node. Namespace isolation is enforced only with eBPF, and Bun refuses to
+/// start such a node when eBPF fails to load, so isolation is on by default
+/// rather than silently absent. An egress allowlist resolves names through
+/// the DNS responder. Elsewhere both stay off, and Bun refuses `allow_from`
+/// and egress allowlists instead of running them unenforced.
+pub fn enable_node_data_path(config: &mut crate::config::node::NodeConfig, host: InitHost) {
+    if host.runs_rootful_runc() {
+        config.ebpf.enabled = true;
+        config.dns.enabled = true;
+    }
+}
+
 /// Initialise a new cluster with starter config files and PKI, using mTLS for
 /// its internal transports.
 pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishError> {
@@ -631,6 +676,7 @@ pub fn init_with_security(
     // address — bun otherwise refuses to bind them (C7).
     node_config.security.allow_insecure_cluster =
         security_mode == InitSecurityMode::DevelopmentPlaintext;
+    enable_node_data_path(&mut node_config, InitHost::detect());
     let security_header = match security_mode {
         InitSecurityMode::MutualTls => "# Internal cluster transports require mTLS.\n",
         InitSecurityMode::DevelopmentPlaintext => {
@@ -2269,6 +2315,8 @@ pub fn task_array_request(
             namespace: None,
             exec: run.exec,
             script: None,
+            firewall: None,
+            egress: None,
         },
         spec: run.spec,
     })
@@ -3865,6 +3913,44 @@ spec:
         init(dir.path(), "test-cluster", "node-01").unwrap();
         assert!(dir.path().join("reliaburger.toml").exists());
         assert!(dir.path().join("app.toml").exists());
+    }
+
+    #[test]
+    fn init_enables_ebpf_and_dns_on_rootful_linux() {
+        let rootful = InitHost {
+            linux: true,
+            root: true,
+            runc: true,
+        };
+        let mut config = crate::config::node::NodeConfig::default();
+        enable_node_data_path(&mut config, rootful);
+        assert!(config.ebpf.enabled, "namespace isolation needs eBPF");
+        assert!(
+            config.dns.enabled,
+            "allowlisted workloads resolve through Bun"
+        );
+
+        for host in [
+            InitHost {
+                linux: false,
+                ..rootful
+            },
+            InitHost {
+                root: false,
+                ..rootful
+            },
+            InitHost {
+                runc: false,
+                ..rootful
+            },
+        ] {
+            let mut config = crate::config::node::NodeConfig::default();
+            enable_node_data_path(&mut config, host);
+            assert!(
+                !config.ebpf.enabled && !config.dns.enabled,
+                "{host:?} can't load eBPF, so it must not be told to"
+            );
+        }
     }
 
     #[test]

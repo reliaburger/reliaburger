@@ -5874,6 +5874,72 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-cross_namespace_connect_to_container_ip_is_denied",
+          "binary": "reliaburger::ebpf",
+          "test": "cross_namespace_connect_to_container_ip_is_denied",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-cross_namespace_connect_to_node_host_port_is_denied",
+          "binary": "reliaburger::ebpf",
+          "test": "cross_namespace_connect_to_node_host_port_is_denied",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-allow_from_opens_the_real_address_path_too",
+          "binary": "reliaburger::ebpf",
+          "test": "allow_from_opens_the_real_address_path_too",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-exec_workload_is_held_to_its_namespace",
+          "binary": "reliaburger::ebpf",
+          "test": "exec_workload_is_held_to_its_namespace",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-egress_allowlist_still_resolves_dns",
+          "binary": "reliaburger::ebpf",
+          "test": "egress_allowlist_still_resolves_dns",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-job_egress_allowlist_is_enforced",
+          "binary": "reliaburger::ebpf",
+          "test": "job_egress_allowlist_is_enforced",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-dns_responder_resolves_internal_name",
           "binary": "reliaburger::ebpf",
           "test": "dns_responder_resolves_internal_name",

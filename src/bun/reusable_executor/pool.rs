@@ -659,6 +659,17 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             );
         }
         prepare_cgroups(&context.base, profile)?;
+        // Every command this executor runs lands in `task`, so the
+        // allowlist the profile key carries goes there before any does.
+        #[cfg(feature = "ebpf")]
+        if let Some(lease) = context.namespace.as_mut() {
+            lease
+                .enforce_egress(
+                    &context.base.join("task"),
+                    crate::bun::task_runtime::egress_allow(template),
+                )
+                .await?;
+        }
         let path = context.base.join("helper");
         let mut spec = crate::grill::oci::generate_job_oci_spec(
             "executor",
@@ -719,6 +730,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         spec.mounts.extend(scratch_mounts());
         self.lifecycle.create(&context.id, &spec).await?;
+        #[cfg(feature = "ebpf")]
+        if let Some(lease) = context.namespace.as_mut()
+            && let Some(address) = self.lifecycle.container_ip(&context.id).await
+        {
+            lease
+                .publish_address(
+                    address,
+                    &context.id.0,
+                    crate::bun::task_runtime::allow_from(template),
+                )
+                .await?;
+        }
         self.lifecycle.start(&context.id).await?;
         let (mut connection, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await

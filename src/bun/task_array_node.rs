@@ -491,6 +491,20 @@ impl TaskArrayNode {
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
         if let Some(template) = assignment.template.as_ref() {
             template.validate_runtime().map_err(str::to_owned)?;
+            // An allowlist or allow_from this node can't hold would leave
+            // every attempt to fail at launch; refuse the array up front.
+            let enforced = match self.runner.as_ref() {
+                NodeRunner::Owned(runner) => runner.enforces_network_policy(template),
+                NodeRunner::Fake(_) => true,
+                NodeRunner::Process(_) => {
+                    super::task_runtime::egress_allow(template).is_empty()
+                        && super::task_runtime::allow_from(template)
+                            .is_none_or(|sources| sources.is_empty())
+                }
+            };
+            if !enforced {
+                return Err(super::task_runtime::NETWORK_POLICY_UNENFORCEABLE.into());
+            }
         }
         if assignment
             .template
@@ -1225,6 +1239,33 @@ mod tests {
             stopping: false,
             replay_unknown: true,
         }
+    }
+
+    #[tokio::test]
+    async fn templates_with_network_policy_need_a_node_that_enforces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = assignment(1, 1, &[(0, 1)]);
+        task.template = Some(Box::new(
+            toml::from_str(
+                "image='proc-grill:image-ignored'\ncommand=['true']\n[egress]\nallow=['192.0.2.1:443']",
+            )
+            .unwrap(),
+        ));
+        let runner = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
+            crate::grill::ProcessGrill::new(),
+        ));
+        let node = TaskArrayNode::new(
+            TaskArrayNodeConfig::for_data_dir(dir.path(), ProcessWorkloadsConfig::default()),
+            NodeRunner::Owned(Box::new(runner)),
+        );
+        let refused = node.admit(&task).unwrap_err();
+        assert!(refused.contains("egress and allow_from"), "{refused}");
+        let template = task.template.as_mut().unwrap();
+        template.egress = None;
+        template.firewall = Some(crate::config::app::FirewallSpec {
+            allow_from: vec!["frontend/web".into()],
+        });
+        assert!(node.admit(&task).unwrap_err().contains("allow_from"));
     }
 
     #[tokio::test]

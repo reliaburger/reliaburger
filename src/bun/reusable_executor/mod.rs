@@ -258,6 +258,34 @@ mod tests {
         assert_ne!(ExecutorKey::new(&next).unwrap(), key);
     }
     #[test]
+    fn tasks_with_different_egress_never_share_an_executor() {
+        let first = template();
+        let key = ExecutorKey::new(&first).unwrap();
+        let mut allowed = first.clone();
+        allowed.egress = Some(crate::config::app::EgressSpec {
+            allow: vec!["api.example.com:443".into()],
+            allow_franchise: Vec::new(),
+        });
+        let allowed_key = ExecutorKey::new(&allowed).unwrap();
+        assert_ne!(
+            allowed_key, key,
+            "an allowlist must not reuse an open executor"
+        );
+        let mut other = allowed.clone();
+        other.egress.as_mut().unwrap().allow = vec!["db.example.com:5432".into()];
+        assert_ne!(ExecutorKey::new(&other).unwrap(), allowed_key);
+        let mut ingress = first.clone();
+        ingress.firewall = Some(crate::config::app::FirewallSpec {
+            allow_from: vec!["frontend/web".into()],
+        });
+        assert_ne!(ExecutorKey::new(&ingress).unwrap(), key);
+        // The same policy with a different command still shares.
+        let mut same = allowed.clone();
+        same.command = Some(vec!["another".into()]);
+        assert_eq!(ExecutorKey::new(&same).unwrap(), allowed_key);
+    }
+
+    #[test]
     fn pools_require_resolved_credentials_and_pinned_images() {
         let mut job = template();
         job.image = Some("fixture:latest".into());

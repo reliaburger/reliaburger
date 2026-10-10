@@ -13,6 +13,7 @@ OK [crashloops] no applications have three timestamped restarts in 15 minutes
 OK [deploys] no deploy has been active for more than 15 minutes
 OK [disks] all observed storage domains are below 85% usage
 OK [faults] no active Smoker faults
+OK [namespace-isolation] one namespace in use; nothing to keep apart
 OK [registry] Pickle is reachable and its known layers meet the redundancy target
 OK [replicas] every app runs its desired replicas
 OK [services] all deployed services have a healthy backend

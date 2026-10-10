@@ -406,6 +406,51 @@ fn parse_prefix(entry: &str, len_str: &str, max: u8) -> Result<u8, EgressError> 
     Ok(prefix_len)
 }
 
+/// The DNS port workloads' resolvers use; `resolv.conf` can't name another.
+pub const DNS_PORT: u16 = 53;
+
+/// What every allowlist permits besides its own entries: the node's DNS
+/// responder on port 53, over UDP and TCP (the maps don't distinguish), so
+/// a workload can resolve the names on its list and `.internal` names.
+/// Without `[dns]` there is no responder to permit.
+pub fn implicit_destinations(workload_dns: Option<Ipv4Addr>) -> Vec<EgressDestination> {
+    workload_dns
+        .map(|ip| EgressDestination::Ip {
+            ip: IpAddr::V4(ip),
+            port: DNS_PORT,
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Check an allowlist entry's syntax without resolving it: the config
+/// validation every workload kind shares. A hostname must be a plausible DNS
+/// name; whether it resolves is only known when the workload starts.
+pub fn validate_egress_entry(entry: &str) -> Result<(), EgressError> {
+    match parse_static(entry)? {
+        StaticParse::Resolved(_) => Ok(()),
+        StaticParse::NeedsDns { host, .. } => {
+            let plausible = !host.is_empty()
+                && host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                });
+            if plausible {
+                Ok(())
+            } else {
+                Err(EgressError::InvalidFormat {
+                    entry: entry.to_string(),
+                    reason: format!("{host:?} is not a hostname or IP address"),
+                })
+            }
+        }
+    }
+}
+
 /// Parse an egress allowlist entry (see the module docs for the accepted
 /// forms). Hostnames resolve to one destination per A/AAAA record.
 pub fn parse_egress_entry(entry: &str) -> Result<Vec<EgressDestination>, EgressError> {
@@ -572,6 +617,15 @@ impl EgressEnforcementCapability {
     /// Whether this node can enforce a dual-stack allowlist before start.
     pub fn can_enforce_allowlist(self) -> bool {
         self.connect_ipv4 && self.connect_ipv6 && self.udp_ipv4 && self.udp_ipv6 && self.pre_start
+    }
+
+    /// Whether this node can hold workloads to namespace isolation. It needs
+    /// what an allowlist needs: the same four hooks (a v4-mapped address on
+    /// an IPv6 socket, or unconnected UDP, would otherwise walk around the
+    /// check) and a runtime that binds the namespace before the workload
+    /// starts.
+    pub fn can_enforce_isolation(self) -> bool {
+        self.can_enforce_allowlist()
     }
 }
 
@@ -1072,6 +1126,16 @@ mod tests {
 
     fn ip_dest(ip: IpAddr, port: u16) -> EgressDestination {
         EgressDestination::Ip { ip, port }
+    }
+
+    #[test]
+    fn allowlists_always_permit_the_workload_resolver() {
+        let resolver = Ipv4Addr::new(10, 88, 0, 1);
+        assert_eq!(
+            implicit_destinations(Some(resolver)),
+            vec![ip_dest(IpAddr::V4(resolver), 53)]
+        );
+        assert!(implicit_destinations(None).is_empty());
     }
 
     fn cidr_dest(network: IpAddr, prefix_len: u8, port: u16) -> EgressDestination {

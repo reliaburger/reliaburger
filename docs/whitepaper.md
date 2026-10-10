@@ -362,8 +362,8 @@ init`. The command writes files; it doesn't start Bun for you.
 
 ```sh
 # Build, generate a secure one-node cluster, then start it on Linux.
-$ cargo build --bins
-$ target/debug/relish init cluster --cluster-name prod --node-id node-01
+$ cargo build --bins --features ebpf
+$ sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
 $ sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 
 # In another terminal, create the first administrator and deploy the generated app.
@@ -377,7 +377,10 @@ $ target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 The API is HTTPS on `127.0.0.1:9117`; ports 9443, 9444 and 9445 are gossip,
 Raft and reporting, not the operator API. On Apple Silicon, use `--runtime
 apple` as your ordinary user instead of the `sudo ... --runtime runc` line.
-This bootstraps a real but non-resilient one-voter cluster.
+This bootstraps a real but non-resilient one-voter cluster. Run as root on
+Linux with `runc` installed, `relish init` turns on `[ebpf]` and `[dns]`, so
+namespace isolation holds from the first deploy; Bun refuses to start a
+rootful runc node whose eBPF data path fails to load.
 
 Adding a node is a separate two-part operation. Put its node-specific config
 and cluster master key on the machine, including the existing node's gossip
@@ -580,7 +583,7 @@ From an application's perspective, connecting to another service is identical to
 
 Virtual IPs are allocated per namespace-qualified service (not per instance) from 127.128.0.0/16, within the loopback range so packets are guaranteed to be intercepted locally and never leak onto the network (~65K unique services, expandable to /10 for ~4M). The connect hook runs in the kernel, so a Bun crash doesn't break existing connections. The service map becomes stale for new connections until Bun restarts. Systemd manages Bun with automatic restart (default: 5-second delay), `OOMScoreAdjust=-900` to protect it from the OOM killer, and re-populates the eBPF maps from the reporting tree on startup.
 
-**External DNS:** Non-`.internal` names use the host's configured resolvers. Egress allowlists implicitly permit DNS (UDP/TCP port 53) to the host's configured nameservers.
+**External DNS:** The responder forwards non-`.internal` names to the node's configured upstream. Egress allowlists implicitly permit DNS (UDP and TCP port 53) to the node's responder, so an allowlisted app can still resolve the names on its list. Without `[dns]` there is no responder, and an allowlist must name its resolver itself.
 
 > For BPF map layouts, eBPF program details, and the `firewall_map`, see [design/discovery-onion.md](design/discovery-onion.md).
 
@@ -619,8 +622,10 @@ Worker nodes use a CSR model: they generate a keypair locally, send a CSR to the
 Three layers of built-in firewall:
 
 1. **Cluster perimeter** (nftables): external traffic enters only through Wrapper
-2. **Namespace isolation** (eBPF): cross-namespace traffic blocked by default
-3. **Per-app firewall** (eBPF `allow_from`): fine-grained ingress control within a namespace
+2. **Namespace isolation** (eBPF, backed by nftables): cross-namespace traffic is blocked by default, at service VIPs and at real addresses alike: a backend's container address on any port and a published host port on any node. The socket hooks hold containers, delegated job tasks and host `exec`/`script` workloads (which start inside their own cgroup) to it; a forward-path nftables table catches traffic between local containers that never meets a socket hook, such as raw sockets or a host port reached through DNAT. Processes outside Reliaburger's cgroups (host daemons, Bun itself) stay outside the policy, and a host workload running as root can leave its cgroup, so isolation keeps honest host commands in bounds rather than containing hostile ones.
+3. **Cross-namespace grants** (eBPF `allow_from`): an app or job names the apps in other namespaces that may connect to it. `allow_from` only opens cross-namespace paths; apps in one namespace always reach each other. Finer control inside a namespace would reuse the same real-address mechanism, and may come later.
+
+Isolation needs the eBPF data path. `relish init` enables it on rootful Linux runc, where a load failure stops Bun. A node that can't enforce isolation (rootless runc, ProcessGrill, macOS) refuses `allow_from`, and `relish wtf` warns when a cluster with more than one namespace has such a node.
 
 **Egress is unrestricted by default.** An app with no `egress` block can reach any external destination. Declaring an `egress` block flips that app to deny-by-default: only the listed destinations are permitted, and everything else is blocked. Use it to contain data exfiltration from compromised containers.
 
@@ -979,7 +984,7 @@ The Reliaburger column describes 0.1.6. Rows marked *Target* are design goals fr
 | **GitOps** | Separate (ArgoCD/Flux) | Separate | Separate | N/A | **Built-in (Lettuce)** |
 | **Image registry** | Separate (Harbor etc.) | Separate | Separate | Docker Hub | **Built-in (Pickle)** |
 | **Service discovery** | CoreDNS + kube-proxy | Same as K8s | Built-in (since 1.3) or Consul | Docker DNS | **Built-in (Onion eBPF, near-zero overhead)** |
-| **Network security** | NetworkPolicy (CNI-dependent) | Same | Consul Connect | None | **Built-in eBPF + nftables (namespace isolation + per-app rules + opt-in egress allowlists)** |
+| **Network security** | NetworkPolicy (CNI-dependent) | Same | Consul Connect | None | **Built-in eBPF + nftables (namespace isolation on VIPs and real addresses + cross-namespace `allow_from` + opt-in egress allowlists, for apps and jobs)** |
 | **Image builds** | Separate (Tekton, Jenkins, external CI) | Same | Separate | `docker build` | **Built-in (build jobs → Pickle)** |
 | **Terminal UI** | None (k9s is third-party) | Same | None | None | **Built-in (relish TUI)** |
 | **Change planning** | `kubectl diff` (limited) | Same | Built-in (`nomad job plan`) | None | **Built-in (`relish apply --dry-run`)** |
@@ -1208,7 +1213,7 @@ Reliaburger supports directory-mode configuration where each app lives in its ow
 
 ### Q11: Doesn't the eBPF approach require a modern kernel? What about older systems?
 
-Yes, Onion requires Linux kernel 5.8 or later. This covers every actively-maintained Linux distribution as of 2026: Ubuntu 22.04+ (kernel 5.15), Debian 12+ (kernel 6.1), RHEL 9+ (kernel 5.14), Amazon Linux 2023 (kernel 6.1). Older distributions like RHEL 8 (kernel 4.18) remain under extended life support until 2029 but ship a kernel that predates the eBPF features Onion requires. The kernel requirement is a hard line. Bun refuses to start on older kernels with a clear error. This is a deliberate trade-off: eBPF socket interception eliminates the need for a DNS server and proxy process entirely, which is worth more than supporting legacy kernel versions.
+Yes, Onion requires Linux kernel 5.8 or later. This covers every actively-maintained Linux distribution as of 2026: Ubuntu 22.04+ (kernel 5.15), Debian 12+ (kernel 6.1), RHEL 9+ (kernel 5.14), Amazon Linux 2023 (kernel 6.1). Older distributions like RHEL 8 (kernel 4.18) remain under extended life support until 2029 but ship a kernel that predates the eBPF features Onion requires. The kernel requirement is a hard line where it matters: a rootful runc node with `[ebpf]` enabled (the default `relish init` writes there) refuses to start on an older kernel, with a clear error. Without eBPF, Bun still starts, but the node can't enforce namespace isolation or egress allowlists, so it refuses `allow_from` and allowlists. This is a deliberate trade-off: eBPF socket interception removes the proxy from the data path and the overlay from the network, which is worth more than supporting legacy kernel versions. It doesn't remove DNS: Bun still runs a small userspace responder for `.internal` names, because a cgroup socket hook can rewrite addresses but can't answer a query.
 
 ### Q12: The design goals mention GPU scheduling. Does it support fractional GPUs?
 

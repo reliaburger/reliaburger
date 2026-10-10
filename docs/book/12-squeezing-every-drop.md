@@ -822,6 +822,22 @@ Main's finite evidence registry now names both runtime cases and the cluster
 worker-loss case explicitly. A repository regression check catches missing
 bindings and stale reviewed OCI source fingerprints before aggregation.
 
+### Network policy for jobs
+
+Jobs are the 0.2.0 headline workload, and for most of the release they couldn't say where they were allowed to connect. An app could carry `[egress] allow = [...]` and `[firewall] allow_from = [...]`; a `JobSpec` had neither, so a million crawler tasks ran with the network wide open. Decision D26 gave jobs both, with the same types and the same validation as apps (`validate_network_policy` now checks either kind: every egress entry parses without a DNS lookup, every `allow_from` source is `app` or `namespace/app`).
+
+Programming them was the interesting part, because a job runs in three different places.
+
+A job the agent runs directly goes through the same create → program → start path as an app. `apply_network_pre_start` used to take its allowlist from the app spec, and a job has none, so the job's start now prepares the allowlist itself and the loop takes it from that resolution when there's no app spec. A retry does the same from the recorded job spec.
+
+A fresh task attempt holds a `NamespaceLease` from the delegated runtime. The lease grew two methods: `enforce_egress` programs the task cgroup after `runc create` and before `start`, while runc holds the process, and `publish_address` records that the task's container address belongs to the job's namespace on every port, with its `allow_from`. Both are undone in `retired()`, which only runs once the runtime has proven the attempt gone. A name that doesn't resolve within five seconds refuses the attempt. Apps start deny-all and let the re-resolver fill in the allowlist later; a short task has no later, so refusing is the honest answer.
+
+A reusable executor is the subtle one. Its commands all land in the executor's `task` cgroup, so the allowlist goes there once, when the executor starts. That only works if every command the executor runs wants the same allowlist, and the executor key already hashes the whole template minus the fields that may vary per command. `egress` and `firewall` aren't on that list, so two templates with different policies get different keys and never share a container. `tasks_with_different_egress_never_share_an_executor` pins it.
+
+The agent's kernel reconciliation has to know about all of this, or its sweep would scrub a task's allowlist as an orphan and its reconcile would forget a task's address. So the agent owns a small `DelegatedNetwork` that the runtimes write into: the task cgroups holding an allowlist, and the task addresses with their owners. A runtime claims a cgroup *before* writing it, and the sweep reads the claims *after* reading the kernel, so anything the kernel showed is already claimed. An `AtomicBool` change flag makes the agent's next tick reconcile when a task's address appears, which is how a job's `allow_from` grant reaches the kernel.
+
+A node that can't enforce either refuses the whole array at admission instead of failing every attempt, and `runtime = "process"` refuses both: a host task shares the node's network and runs as root, so an allowlist or a grant there would promise a boundary the task can step out of. `job_egress_allowlist_is_enforced` runs both the agent path and a task lease in the Lima VM.
+
 ### Definitions, runs and durable trigger identities
 
 A template and a count describe work, but not why it runs. A manually submitted
