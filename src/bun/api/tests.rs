@@ -366,7 +366,7 @@ async fn setup_with_auth_readiness_and_leases(
     .await
 }
 
-async fn setup_with_auth_readiness_leases_and_events(
+pub(super) async fn setup_with_auth_readiness_leases_and_events(
     tokens: Vec<crate::sesame::types::ApiToken>,
     service_token: Option<String>,
     readiness: crate::bun::readiness::ReadinessTracker,
@@ -386,7 +386,7 @@ async fn setup_with_auth_readiness_leases_and_events(
     .await
 }
 
-async fn setup_with_auth_leases_events_and_council(
+pub(super) async fn setup_with_auth_leases_events_and_council(
     tokens: Vec<crate::sesame::types::ApiToken>,
     service_token: Option<String>,
     readiness: crate::bun::readiness::ReadinessTracker,
@@ -445,7 +445,7 @@ fn a_user_token(role: crate::sesame::types::ApiRole) -> (crate::sesame::types::A
     named_user_token("u", role)
 }
 
-fn named_user_token(
+pub(super) fn named_user_token(
     name: &str,
     role: crate::sesame::types::ApiRole,
 ) -> (crate::sesame::types::ApiToken, String) {
@@ -620,7 +620,7 @@ async fn protected_route_returns_200_with_a_valid_token() {
     shutdown.cancel();
 }
 
-fn lease_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+pub(super) fn lease_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
     crate::bun::capabilities::StaticCapabilities {
         test_policy: crate::testkit::safety::ClusterTestPolicy {
             safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
@@ -677,7 +677,7 @@ fn node_pressure_static_capabilities() -> crate::bun::capabilities::StaticCapabi
     }
 }
 
-fn workload_fault_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+pub(super) fn workload_fault_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
     crate::bun::capabilities::StaticCapabilities {
         test_policy: crate::testkit::safety::ClusterTestPolicy {
             safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
@@ -1674,11 +1674,11 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
 }
 
 /// One request the fake leader received: path, bearer, loop marker, body.
-type SeenAtLeader = (String, Option<String>, bool, String);
+pub(super) type SeenAtLeader = (String, Option<String>, bool, String);
 
 /// Serve a fake leader API on `listener` that accepts every request and
 /// records what it saw.
-fn serve_recording_leader(
+pub(super) fn serve_recording_leader(
     listener: tokio::net::TcpListener,
 ) -> Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>> {
     let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));

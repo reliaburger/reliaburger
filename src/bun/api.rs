@@ -45,6 +45,7 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 // the helpers at the bottom of this file are the ones several groups share.
 pub(crate) mod apply;
 mod apps;
+pub(crate) mod audit;
 mod ca;
 mod deploys;
 mod discovery;
@@ -68,6 +69,7 @@ mod upgrade;
 use apply::{apply_handler, cluster_apply};
 pub(crate) use apply::{bind_images, leader_api_url};
 use apps::{delete_handler, exec_handler, stop_handler};
+use audit::audit_handler;
 use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
     cluster_deploy_history, deploy_cancel_handler, deploys_active_handler, deploys_history_handler,
@@ -640,6 +642,7 @@ pub fn router_with_upgrade(
             post(super::job_api::disable_schedule_handler),
         )
         .route("/v1/events", get(events_handler))
+        .route("/v1/audit", get(audit_handler))
         .route("/v1/ws/events", get(ws_events_handler))
         .route("/v1/ws/logs/{app}/{namespace}", get(ws_logs_handler))
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
@@ -850,6 +853,11 @@ pub fn router_with_upgrade(
             "/v1/ca/rotation/finalize",
             post(ca_rotation_finalize_handler),
         )
+        // Inside the auth layer, so it sees who the caller is (#685).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            audit::audit_layer,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::sesame::auth::auth_middleware,
@@ -1088,36 +1096,102 @@ pub(super) async fn record_caller_audit(
     auth: Option<&crate::sesame::auth::AuthContext>,
     kind: crate::bun::events::EventKind,
     action: &str,
-    mut details: std::collections::BTreeMap<String, String>,
+    details: std::collections::BTreeMap<String, String>,
     message: String,
 ) {
+    record_caller_action(
+        state,
+        auth,
+        CallerAction {
+            kind,
+            severity: crate::bun::events::EventSeverity::Info,
+            action,
+            app: None,
+            namespace: None,
+            node: None,
+            details,
+            message,
+        },
+    )
+    .await;
+}
+
+/// One audited action a caller asked for, before attribution.
+pub(super) struct CallerAction<'a> {
+    pub(super) kind: crate::bun::events::EventKind,
+    pub(super) severity: crate::bun::events::EventSeverity,
+    pub(super) action: &'a str,
+    pub(super) app: Option<String>,
+    pub(super) namespace: Option<String>,
+    /// The node the action targets; `None` records this node.
+    pub(super) node: Option<String>,
+    pub(super) details: std::collections::BTreeMap<String, String>,
+    pub(super) message: String,
+}
+
+/// The principal an audit record names, and the token name it adds to the
+/// details: the caller's, or `local-bootstrap` before any token exists.
+pub(super) fn audit_principal(auth: Option<&crate::sesame::auth::AuthContext>) -> (String, String) {
+    match auth {
+        Some(auth) => (auth.principal_id.clone(), auth.token_name.clone()),
+        None => ("local-bootstrap".to_string(), "local-bootstrap".to_string()),
+    }
+}
+
+/// Record `action`, attributed to the caller and to the address the request
+/// came from, in the event ring and this node's durable audit log. Returns
+/// once the log has the record on disk, or has given up; a failed write is
+/// logged and counted but never fails the caller's action.
+pub(super) async fn record_caller_action(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    action: CallerAction<'_>,
+) {
+    let (principal, token_name) = audit_principal(auth);
+    let mut details = action.details;
+    details.insert("token_name".to_string(), token_name);
+    write_audit(
+        state,
+        crate::bun::events::AuditEvent {
+            timestamp: unix_now_seconds(),
+            kind: action.kind,
+            severity: action.severity,
+            action: action.action.to_string(),
+            principal,
+            app: action.app,
+            namespace: action.namespace,
+            node: Some(action.node.unwrap_or_else(|| local_node_name(state))),
+            source_address: crate::bun::audit::caller_address(),
+            details,
+            message: action.message,
+        },
+    )
+    .await;
+}
+
+/// Put `event` in the event ring and the durable audit log, then wait for
+/// the log to sync it. The ring's lock is released before the wait.
+pub(super) async fn write_audit(state: &ApiState, event: crate::bun::events::AuditEvent) {
     let Some(events) = &state.events else {
         return;
     };
-    let (principal, token_name) = match auth {
-        Some(auth) => (auth.principal_id.clone(), auth.token_name.clone()),
-        None => ("local-bootstrap".to_string(), "local-bootstrap".to_string()),
+    let action = event.action.clone();
+    let (has_log, receipt) = {
+        let mut store = events.write().await;
+        let has_log = store.audit_log().is_some();
+        (has_log, store.record_audit(event))
     };
-    details.insert("token_name".to_string(), token_name);
-    let timestamp = std::time::SystemTime::now()
+    if has_log && !receipt.written().await {
+        eprintln!("bun: audit record {action} is not on disk; the action went ahead");
+    }
+}
+
+/// Seconds since the Unix epoch, for audit timestamps.
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    events
-        .write()
-        .await
-        .record_audit(crate::bun::events::AuditEvent {
-            timestamp,
-            kind,
-            severity: crate::bun::events::EventSeverity::Info,
-            action: action.to_string(),
-            principal,
-            app: None,
-            namespace: None,
-            node: Some(local_node_name(state)),
-            details,
-            message,
-        });
+        .as_secs()
 }
 
 /// Ask every live member except this node for `path`.
@@ -1239,6 +1313,9 @@ pub(crate) fn copy_forwarded_auth(
 async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
     local_statuses(state).await.unwrap_or_default()
 }
+
+#[cfg(test)]
+mod audit_tests;
 
 #[cfg(test)]
 mod permission_tests;

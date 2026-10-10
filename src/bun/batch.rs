@@ -816,6 +816,21 @@ pub async fn batch_submit_handler(
     if let Err((status, error)) = validate_batch_jobs(&state, &jobs, &headers).await {
         return (status, Json(serde_json::json!({"error": error}))).into_response();
     }
+    let namespaces: std::collections::BTreeSet<&str> =
+        jobs.iter().map(|job| job.namespace()).collect();
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        app: None,
+        namespace: (namespaces.len() == 1)
+            .then(|| namespaces.first().map(|namespace| namespace.to_string()))
+            .flatten(),
+        details: std::collections::BTreeMap::from([
+            ("jobs".to_string(), jobs.len().to_string()),
+            (
+                "namespaces".to_string(),
+                namespaces.iter().copied().collect::<Vec<_>>().join(","),
+            ),
+        ]),
+    });
     let permissions = super::api::permission_map(&state).await;
     for job in &jobs {
         if let Err(response) = crate::sesame::auth::authorize_workload(

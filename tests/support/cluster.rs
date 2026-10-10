@@ -406,7 +406,16 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // The API answers status from the loop's published snapshot, and reads
     // the agent's event ring and deploy history, as Bun does.
     let status_reader = agent.status_reader();
-    let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
+    let mut events = reliaburger::bun::events::EventStore::new();
+    // Each node keeps its own durable audit log under its data directory.
+    events.set_audit_log(
+        reliaburger::bun::audit::AuditLog::open(
+            reconciler_state_dir.join(reliaburger::bun::audit::AUDIT_DIRECTORY),
+            reliaburger::bun::audit::AuditLimits::from_total(1 << 20),
+        )
+        .expect("open the node's audit log"),
+    );
+    let event_store = Arc::new(RwLock::new(events));
     agent.set_event_store(Arc::clone(&event_store));
     let deploy_history = agent.deploy_history_handle();
     let agent_task = reliaburger::bun::readiness::spawn_owned(

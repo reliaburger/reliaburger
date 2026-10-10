@@ -1,4 +1,9 @@
 //! Bounded, in-memory cluster events for the Relish TUI.
+//!
+//! The ring forgets: it keeps the newest [`EVENT_BUFFER_CAP`] events and a
+//! restart empties it. Audit records pass through it too, so the TUI and the
+//! live stream show them, but their durable copy goes to the node's audit log
+//! ([`crate::bun::audit`]), which job and health events can't evict.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -31,6 +36,9 @@ pub struct ClusterEvent {
     /// Authenticated principal responsible for an audited action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// The address an audited request came from, as this node saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address: Option<String>,
     /// Stable action-specific facts for machine consumers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub details: BTreeMap<String, String>,
@@ -39,6 +47,7 @@ pub struct ClusterEvent {
 }
 
 /// Named input for a structured, authenticated audit event.
+#[derive(Debug, Clone)]
 pub struct AuditEvent {
     /// Unix timestamp in seconds.
     pub timestamp: u64,
@@ -56,6 +65,9 @@ pub struct AuditEvent {
     pub namespace: Option<String>,
     /// Related node, when applicable.
     pub node: Option<String>,
+    /// The address the request came from, when a client asked for the
+    /// action. `None` for the cluster's own actions (expiry, sweeps).
+    pub source_address: Option<std::net::SocketAddr>,
     /// Stable action-specific facts.
     pub details: BTreeMap<String, String>,
     /// Human-readable description.
@@ -88,6 +100,9 @@ pub enum EventKind {
     Secret,
     /// A workload identity or image signature was issued.
     Identity,
+    /// An operator changed the cluster: apply, delete, exec, upgrade,
+    /// snapshot, job submission and the other audited actions.
+    Operation,
 }
 
 /// Importance of an event.
@@ -107,6 +122,9 @@ pub struct EventStore {
     buffer: VecDeque<ClusterEvent>,
     next_sequence: u64,
     live: broadcast::Sender<ClusterEvent>,
+    /// The node's durable audit log, when it has one. Every audit record
+    /// goes there as well as into the ring.
+    audit: Option<crate::bun::audit::AuditLog>,
 }
 
 impl Default for EventStore {
@@ -123,7 +141,18 @@ impl EventStore {
             buffer: VecDeque::with_capacity(EVENT_BUFFER_CAP),
             next_sequence: 1,
             live,
+            audit: None,
         }
+    }
+
+    /// Send every audit record to `log` as well as the ring.
+    pub fn set_audit_log(&mut self, log: crate::bun::audit::AuditLog) {
+        self.audit = Some(log);
+    }
+
+    /// The durable audit log, when this node keeps one.
+    pub fn audit_log(&self) -> Option<&crate::bun::audit::AuditLog> {
+        self.audit.as_ref()
     }
 
     /// Record an event, returning its assigned sequence number.
@@ -150,6 +179,7 @@ impl EventStore {
             node,
             action: None,
             principal: None,
+            source_address: None,
             details: BTreeMap::new(),
             message,
         };
@@ -162,7 +192,16 @@ impl EventStore {
     }
 
     /// Record a machine-readable audit event with authenticated attribution.
-    pub fn record_audit(&mut self, audit: AuditEvent) -> u64 {
+    ///
+    /// The event goes into the ring and, when the node has one, to its
+    /// durable audit log. The receipt says when the log has it on disk; an
+    /// API handler waits for that before answering (after releasing this
+    /// store's lock), while the cluster's own background actions drop it.
+    pub fn record_audit(&mut self, audit: AuditEvent) -> crate::bun::audit::AuditReceipt {
+        let receipt = match &self.audit {
+            Some(log) => log.submit(audit.clone()),
+            None => crate::bun::audit::AuditReceipt::none(),
+        };
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         let event = ClusterEvent {
@@ -175,6 +214,7 @@ impl EventStore {
             node: audit.node,
             action: Some(audit.action),
             principal: Some(audit.principal),
+            source_address: audit.source_address.map(|address| address.to_string()),
             details: audit.details,
             message: audit.message,
         };
@@ -183,7 +223,7 @@ impl EventStore {
         }
         self.buffer.push_back(event.clone());
         let _ = self.live.send(event);
-        sequence
+        receipt
     }
 
     /// Return recent matching events in chronological order.
@@ -249,6 +289,53 @@ mod tests {
         let events = store.recent(10, Some("web"), Some(EventSeverity::Warning));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].app.as_deref(), Some("web"));
+    }
+
+    #[tokio::test]
+    async fn job_events_cannot_evict_audit_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::bun::audit::AuditLog::open(
+            dir.path().join("audit"),
+            crate::bun::audit::AuditLimits::from_total(1 << 20),
+        )
+        .unwrap();
+        let mut store = EventStore::new();
+        store.set_audit_log(log.clone());
+        let receipt = store.record_audit(AuditEvent {
+            timestamp: 1,
+            kind: EventKind::Token,
+            severity: EventSeverity::Info,
+            action: "token.created".to_string(),
+            principal: "token:admin".to_string(),
+            app: None,
+            namespace: None,
+            node: Some("node-1".to_string()),
+            source_address: None,
+            details: BTreeMap::new(),
+            message: "token ci created".to_string(),
+        });
+        assert!(receipt.written().await);
+        // A busy array's completions push the record out of the ring...
+        for index in 0..EVENT_BUFFER_CAP + 10 {
+            store.record(
+                2,
+                EventKind::JobCompleted,
+                EventSeverity::Info,
+                Some(format!("job-{index}")),
+                Some("default".to_string()),
+                None,
+                "completed".to_string(),
+            );
+        }
+        let ring = store.recent(EVENT_BUFFER_CAP, None, None);
+        assert!(ring.iter().all(|event| event.action.is_none()));
+        // ...but the audit log still has it.
+        let records = log
+            .query(crate::bun::audit::AuditFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action, "token.created");
     }
 
     #[tokio::test]

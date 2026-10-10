@@ -595,6 +595,19 @@ impl NodeConfig {
             });
         }
 
+        // A log smaller than a few records would drop each record as soon
+        // as the next arrived, which is no audit trail at all (#685).
+        if self.storage.audit_max_bytes < crate::bun::audit::MIN_AUDIT_MAX_BYTES {
+            return Err(ConfigError::Validation {
+                field: "storage.audit_max_bytes".into(),
+                context: "node config".into(),
+                reason: format!(
+                    "must be at least {} bytes",
+                    crate::bun::audit::MIN_AUDIT_MAX_BYTES
+                ),
+            });
+        }
+
         // Retaining zero would delete every snapshot the moment it was
         // taken (or, with an upload destination, the moment it shipped).
         let snapshots = &self.storage.snapshots;
@@ -1144,6 +1157,22 @@ mod tests {
             nc.validate(),
             Err(ConfigError::NonAbsolutePath { .. })
         ));
+    }
+
+    #[test]
+    fn audit_log_bound_has_a_floor() {
+        let mut nc = NodeConfig::default();
+        assert_eq!(
+            nc.storage.audit_max_bytes,
+            crate::bun::audit::DEFAULT_AUDIT_MAX_BYTES
+        );
+        nc.storage.audit_max_bytes = 1024;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.audit_max_bytes"), "{error}");
+        nc.storage.audit_max_bytes = crate::bun::audit::MIN_AUDIT_MAX_BYTES;
+        assert!(nc.validate().is_ok());
+        let parsed = NodeConfig::parse("[storage]\naudit_max_bytes = 1048576\n").unwrap();
+        assert_eq!(parsed.storage.audit_max_bytes, 1 << 20);
     }
 
     #[test]

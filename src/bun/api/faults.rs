@@ -197,6 +197,9 @@ pub(super) async fn apply_fault_locally(
         .unwrap_or_else(|| request.fault_type.to_string());
     let audit_duration_seconds = request.duration.as_secs();
     let audit_reason = request.reason.clone();
+    let audit_namespace = request.namespace.clone();
+    let audit_include_leader = request.include_leader;
+    let audit_override_safety = request.override_safety;
     match ask_agent(&state.cmd_tx, |response| AgentCommand::InjectFault {
         reservation: reservation.map(Box::new),
         request,
@@ -206,44 +209,61 @@ pub(super) async fn apply_fault_locally(
     .await
     {
         Ok(Ok(summary)) => {
-            if let Some(events) = &state.events {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let mut details = std::collections::BTreeMap::from([
-                    ("fault_id".to_string(), summary.id.to_string()),
-                    ("fault_type".to_string(), audit_fault_type.clone()),
-                    (
-                        "duration_seconds".to_string(),
-                        audit_duration_seconds.to_string(),
-                    ),
-                ]);
-                if let Some(instance) = audit_target_instance {
-                    details.insert("target_instance".to_string(), instance);
-                }
-                if let Some(reason) = audit_reason {
-                    details.insert("reason".to_string(), reason);
-                }
-                events
-                    .write()
-                    .await
-                    .record_audit(crate::bun::events::AuditEvent {
-                        timestamp,
-                        kind: crate::bun::events::EventKind::Fault,
-                        severity: crate::bun::events::EventSeverity::Warning,
-                        action: "fault.injected".to_string(),
-                        principal: audit_principal.clone(),
-                        app: (!audit_target_service.is_empty()).then_some(audit_target_service),
-                        namespace: None,
-                        node: audit_target_node,
-                        details,
-                        message: format!(
-                            "fault {} ({}) injected for {}s by principal {}",
-                            summary.id, summary.fault_type, audit_duration_seconds, audit_principal
-                        ),
-                    });
+            let mut details = std::collections::BTreeMap::from([
+                ("fault_id".to_string(), summary.id.to_string()),
+                ("fault_type".to_string(), audit_fault_type.clone()),
+                (
+                    "duration_seconds".to_string(),
+                    audit_duration_seconds.to_string(),
+                ),
+            ]);
+            if let Some(instance) = audit_target_instance {
+                details.insert("target_instance".to_string(), instance);
             }
+            if let Some(reason) = audit_reason {
+                details.insert("reason".to_string(), reason);
+            }
+            // Design §6.3: an override is logged with extra prominence, so
+            // the flags are always present and the record is raised to
+            // Critical when either is set.
+            details.insert(
+                "include_leader".to_string(),
+                audit_include_leader.to_string(),
+            );
+            details.insert(
+                "override_safety".to_string(),
+                audit_override_safety.to_string(),
+            );
+            let overridden = audit_include_leader || audit_override_safety;
+            record_fault_audit(
+                state,
+                auth,
+                FaultAudit {
+                    action: "fault.injected",
+                    severity: if overridden {
+                        crate::bun::events::EventSeverity::Critical
+                    } else {
+                        crate::bun::events::EventSeverity::Warning
+                    },
+                    app: (!audit_target_service.is_empty()).then_some(audit_target_service),
+                    namespace: audit_namespace,
+                    node: audit_target_node,
+                    details,
+                    message: format!(
+                        "fault {} ({}) injected for {}s by principal {}{}",
+                        summary.id,
+                        summary.fault_type,
+                        audit_duration_seconds,
+                        audit_principal,
+                        if overridden {
+                            " with safety overrides"
+                        } else {
+                            ""
+                        }
+                    ),
+                },
+            )
+            .await;
             Ok(summary)
         }
         Ok(Err(e)) => Err((
@@ -255,39 +275,39 @@ pub(super) async fn apply_fault_locally(
     }
 }
 
+/// A fault action to audit, attributed to its caller by
+/// [`record_fault_audit`].
 pub(super) struct FaultAudit<'a> {
     pub(super) action: &'a str,
-    pub(super) principal: &'a str,
     pub(super) severity: crate::bun::events::EventSeverity,
     pub(super) app: Option<String>,
+    pub(super) namespace: Option<String>,
     pub(super) node: Option<String>,
     pub(super) details: std::collections::BTreeMap<String, String>,
     pub(super) message: String,
 }
 
-pub(super) async fn record_fault_audit(state: &ApiState, audit: FaultAudit<'_>) {
-    let Some(events) = &state.events else {
-        return;
-    };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    events
-        .write()
-        .await
-        .record_audit(crate::bun::events::AuditEvent {
-            timestamp,
+/// Record a fault action in the ring and the durable audit log.
+pub(super) async fn record_fault_audit(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    audit: FaultAudit<'_>,
+) {
+    record_caller_action(
+        state,
+        auth,
+        CallerAction {
             kind: crate::bun::events::EventKind::Fault,
             severity: audit.severity,
-            action: audit.action.to_string(),
-            principal: audit.principal.to_string(),
+            action: audit.action,
             app: audit.app,
-            namespace: None,
+            namespace: audit.namespace,
             node: audit.node,
             details: audit.details,
             message: audit.message,
-        });
+        },
+    )
+    .await;
 }
 
 /// Re-evaluate node safety from API-owned live cluster state before routing.
@@ -1241,11 +1261,12 @@ pub(super) async fn fault_clear_handler(
             }
             record_fault_audit(
                 &state,
+                auth.as_deref(),
                 FaultAudit {
                     action: "fault.cleared",
-                    principal,
                     severity: crate::bun::events::EventSeverity::Info,
                     app: None,
+                    namespace: None,
                     node: query.node,
                     details: std::collections::BTreeMap::from([(
                         "fault_id".to_string(),
@@ -1508,11 +1529,12 @@ pub(super) async fn fault_clear_all_handler(
             };
             record_fault_audit(
                 &state,
+                auth.as_deref(),
                 FaultAudit {
                     action,
-                    principal,
                     severity: crate::bun::events::EventSeverity::Info,
                     app: service,
+                    namespace: params.get("namespace").cloned(),
                     node: None,
                     details,
                     message: format!("{msg} by principal {principal}"),

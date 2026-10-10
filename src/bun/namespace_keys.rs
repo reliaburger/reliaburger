@@ -165,6 +165,7 @@ async fn record(
         app: None,
         namespace: Some(namespace.to_string()),
         node: Some(node.to_string()),
+        source_address: None,
         details: std::collections::BTreeMap::from([
             ("scope".to_string(), "namespace".to_string()),
             ("namespace".to_string(), namespace.to_string()),

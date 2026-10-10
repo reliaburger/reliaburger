@@ -1295,7 +1295,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
-    let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
+    let mut events = reliaburger::bun::events::EventStore::new();
+    // The audit trail is durable and bounded on its own, so a busy job
+    // queue can't push it out of the event ring's memory (#685). A node
+    // that can't open it still runs; `GET /v1/audit` says it keeps no log.
+    let audit_directory = data_base.join(reliaburger::bun::audit::AUDIT_DIRECTORY);
+    match reliaburger::bun::audit::AuditLog::open(
+        audit_directory.clone(),
+        reliaburger::bun::audit::AuditLimits::from_total(config.storage.audit_max_bytes),
+    ) {
+        Ok(log) => events.set_audit_log(log),
+        Err(error) => eprintln!(
+            "bun: audit log at {} unavailable, audit records stay in memory only: {error}",
+            audit_directory.display()
+        ),
+    }
+    let event_store = Arc::new(RwLock::new(events));
     agent.set_event_store(Arc::clone(&event_store));
     let loop_meter = agent.loop_meter();
     // `/v1/status` reads the loop's published snapshot through this.

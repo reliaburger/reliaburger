@@ -262,7 +262,7 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
 
 /// Parse a point in time for `--flag`: raw epoch seconds, or a duration like
 /// `30s`, `5m`, `2h`, `1d` before now.
-fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
+pub(super) fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
     if value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty() {
         return value.parse::<u64>().map_err(|e| RelishError::InvalidFlag {
             flag: flag.to_string(),

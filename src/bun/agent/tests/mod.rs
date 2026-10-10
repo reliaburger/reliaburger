@@ -10899,6 +10899,56 @@ async fn node_fault_expiry_restores_the_transport_gate() {
 }
 
 #[tokio::test]
+async fn expired_fault_records_fault_expired() {
+    let (mut agent, _gate, _) = test_cluster_fault_agent().await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = crate::bun::audit::AuditLog::open(
+        dir.path().join("audit"),
+        crate::bun::audit::AuditLimits::from_total(1 << 20),
+    )
+    .unwrap();
+    let mut store = crate::bun::events::EventStore::new();
+    store.set_audit_log(log.clone());
+    let events = Arc::new(tokio::sync::RwLock::new(store));
+    agent.set_event_store(Arc::clone(&events));
+    let rule = register_fault(
+        &mut agent,
+        crate::smoker::types::FaultType::NodeKill {
+            kill_containers: false,
+        },
+        std::time::Duration::from_millis(1),
+    );
+    agent.apply_fault(&rule).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    agent.expire_faults().await;
+
+    let ring = events.read().await.recent(10, None, None);
+    let expired = ring
+        .iter()
+        .find(|event| event.action.as_deref() == Some("fault.expired"))
+        .expect("expiry is in the event ring");
+    assert_eq!(expired.principal.as_deref(), Some("system"));
+    assert_eq!(expired.details.get("fault_id"), Some(&rule.id.to_string()));
+    // The agent loop doesn't wait for the disk, so the durable copy lands
+    // shortly after.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let filter = crate::bun::audit::AuditFilter {
+            action: Some("fault.expired".to_string()),
+            ..crate::bun::audit::AuditFilter::default()
+        };
+        if log.query(filter).await.unwrap().len() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fault.expired never reached the audit log"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn node_fault_refuses_without_a_duration() {
     let (mut agent, _gate, _readiness) = test_cluster_fault_agent().await;
     let rule = register_fault(

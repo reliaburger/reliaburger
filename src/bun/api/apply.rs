@@ -296,6 +296,10 @@ pub(super) async fn apply_handler(
     // Check every workload before any Raft write or agent command. A job in
     // a mixed manifest must not bypass admission after its apps have committed.
     // Host execution includes both explicit binaries and inline scripts.
+    // The record of this apply names the manifest's workloads and, when
+    // there is just one, its namespace (#685).
+    crate::bun::audit::annotate(audit::manifest_audit_note(&config));
+
     let permissions = permission_map(&state).await;
     let targets = config
         .app
