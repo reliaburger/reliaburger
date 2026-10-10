@@ -26,7 +26,10 @@ pub(crate) enum Access {
 
 /// Refuse an open file that isn't a regular file with the given privacy.
 pub(crate) fn validate_file(file: &File, access: Access) -> io::Result<()> {
-    let metadata = file.metadata()?;
+    validate_metadata(&file.metadata()?, access)
+}
+
+fn validate_metadata(metadata: &std::fs::Metadata, access: Access) -> io::Result<()> {
     let owned = || metadata.uid() == nix::unistd::geteuid().as_raw();
     let valid = metadata.is_file()
         && match access {
@@ -77,14 +80,32 @@ fn open_record(path: &Path) -> io::Result<File> {
 /// has no links left, which isn't tampering (a hard-linked copy has two or
 /// more): open the path again to read the replacement. Bounded, so a path
 /// that keeps changing still fails validation rather than spinning.
-fn reopen_if_replaced(mut file: File, path: &Path) -> io::Result<File> {
-    for _ in 0..8 {
-        if file.metadata()?.nlink() != 0 {
-            break;
+fn open_validated(
+    mut file: File,
+    path: &Path,
+    access: Access,
+    mut before_validation: impl FnMut(&File),
+) -> io::Result<File> {
+    let mut replacements = 0;
+    loop {
+        before_validation(&file);
+        // One snapshot decides both replacement and privacy. Rechecking link
+        // count in validate_file would race another rename after this check.
+        let metadata = file.metadata()?;
+        if metadata.nlink() == 0 {
+            if replacements == 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record replaced too often while reading",
+                ));
+            }
+            file = open_record(path)?;
+            replacements += 1;
+        } else {
+            validate_metadata(&metadata, access)?;
+            return Ok(file);
         }
-        file = open_record(path)?;
     }
-    Ok(file)
 }
 
 /// Read a whole record of at most `limit` bytes.
@@ -92,10 +113,9 @@ fn reopen_if_replaced(mut file: File, path: &Path) -> io::Result<File> {
 /// A missing file is `NotFound`; a symlink, wrong file type or wrong privacy is
 /// `InvalidData`; a record over the limit is `FileTooLarge`.
 pub(crate) fn read_bounded(path: &Path, limit: u64, access: Access) -> io::Result<Vec<u8>> {
-    let file = reopen_if_replaced(open_record(path)?, path)?;
     let context =
         |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
-    validate_file(&file, access).map_err(context)?;
+    let file = open_validated(open_record(path)?, path, access, |_| {}).map_err(context)?;
     let too_large = || {
         io::Error::new(
             io::ErrorKind::FileTooLarge,
@@ -162,7 +182,8 @@ mod tests {
         // ...and the writer atomically replaces it before validation.
         std::fs::rename(write("second", "new"), &path).unwrap();
         assert!(super::validate_file(&opened, super::Access::Exclusive).is_err());
-        let current = super::reopen_if_replaced(opened, &path).unwrap();
+        let current =
+            super::open_validated(opened, &path, super::Access::Exclusive, |_| {}).unwrap();
         super::validate_file(&current, super::Access::Exclusive).unwrap();
         assert_eq!(std::io::read_to_string(current).unwrap(), "new");
     }
@@ -189,9 +210,9 @@ mod tests {
             std::fs::rename(write("old", "1", 0o600), &path).unwrap();
             let opened = super::open_record(&path).unwrap();
             std::fs::rename(replacement, &path).unwrap();
-            super::reopen_if_replaced(opened, &path).and_then(|file| {
-                super::validate_file(&file, super::Access::Exclusive).map(|_| file)
-            })
+            super::open_validated(opened, &path, super::Access::Exclusive, |_| {}).and_then(
+                |file| super::validate_file(&file, super::Access::Exclusive).map(|_| file),
+            )
         };
         let symlink = dir.path().join("symlink");
         std::os::unix::fs::symlink(write("target", "1", 0o600), &symlink).unwrap();
@@ -207,7 +228,8 @@ mod tests {
         std::fs::rename(write("removed", "1", 0o600), &path).unwrap();
         let opened = super::open_record(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let error = super::reopen_if_replaced(opened, &path).unwrap_err();
+        let error =
+            super::open_validated(opened, &path, super::Access::Exclusive, |_| {}).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
@@ -217,6 +239,47 @@ mod tests {
         let _ = std::fs::remove_file(path);
         std::fs::write(path, bytes).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn replacement_after_the_preliminary_check_is_retried_at_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("route.json");
+        let replacement = dir.path().join("replacement.json");
+        write(&path, b"1", 0o600);
+        write(&replacement, b"2", 0o600);
+        let opened = open_record(&path).unwrap();
+        let mut inspected = 0;
+        let current = open_validated(opened, &path, Access::Exclusive, |_| {
+            if inspected == 0 {
+                std::fs::rename(&replacement, &path).unwrap();
+            }
+            inspected += 1;
+        })
+        .unwrap();
+        assert_eq!(std::io::read_to_string(current).unwrap(), "2");
+    }
+
+    #[test]
+    fn continuous_replacement_stops_after_eight_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("route.json");
+        write(&path, b"1", 0o600);
+        let mut inspections = 0;
+        let error = open_validated(
+            open_record(&path).unwrap(),
+            &path,
+            Access::Exclusive,
+            |_| {
+                let replacement = dir.path().join(format!("replacement-{inspections}"));
+                write(&replacement, b"2", 0o600);
+                std::fs::rename(replacement, &path).unwrap();
+                inspections += 1;
+            },
+        )
+        .unwrap_err();
+        assert_eq!(inspections, 9);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

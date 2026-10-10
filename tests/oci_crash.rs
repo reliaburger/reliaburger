@@ -463,7 +463,9 @@ fn install_wrappers(root: &Path) {
         let script = format!(
             r#"#!/bin/bash
 set -eu
-root=$OCI_CRASH_ROOT
+# Runtime commands receive a filtered environment. This wrapper belongs to
+# the fixture beside bin/, so it doesn't need Bun's private admission variable.
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 phase=$(cat "$root/phase")
 arguments=" $* "
 if [[ '{program}' == runc && "$arguments" == *' run '* ]]; then

@@ -1287,17 +1287,30 @@ happens to be paused. Nothing inside gets a chance to clean up. Go has no
 equivalent: a goroutine only stops if it checks its `context`. Python's
 `asyncio.wait_for` is closer, but it at least raises `CancelledError` inside
 the task. So everything under the timeout has to be *cancel-safe*: dropping it
-halfway must leave nothing inconsistent. Two pieces weren't.
+halfway must leave nothing inconsistent. Three pieces weren't.
 
 The first was the runtime calls themselves. If an abandoned `kill` were simply
 started again on the next attempt, a runtime that hangs would collect one stuck
 call per retry. The `state`-then-`kill` probe now runs as its own spawned task,
 and the context keeps its `JoinHandle`. Awaiting a `&mut JoinHandle` doesn't
 consume it, so a cancelled attempt leaves the handle in place. The next attempt
-waits on that same probe instead of starting another. The second was releasing
-the executor's namespace binding. That takes a lock and then decrements a
-counter, and cutting it off in between would leak the binding. It now runs in
-its own task, once retirement is proven.
+waits on that same probe instead of starting another.
+
+Filesystem cleanup needs the same ownership. Tokio's `fs` functions hand work
+to a blocking thread; dropping the future that awaits a removal doesn't stop
+that thread. Our first fix kept the caller's wait bounded, but a retry could
+start another removal while the old one was still outstanding. Executor paths
+come from the slot number. Once reused, the same path names the next executor,
+so a delayed removal could delete its files. The context now also retains one
+cleanup `JoinHandle`, awaited by mutable reference. A timeout leaves that handle,
+the slot and its reservation together. Only completion permits reuse. The
+regression test holds cleanup at a gate across repeated timeouts, retires another
+executor alongside it, then opens the gate and checks that capacity comes back.
+It doesn't need a hung disk to exercise that ownership rule.
+
+The third was releasing the executor's namespace binding. That takes a lock
+and then decrements a counter, and cutting it off in between would leak the
+binding. It now runs in its own task, once retirement is proven.
 
 The eviction loop had the same flaw one level up: it retired executors one
 after another, so a single stuck one held up all the rest. Each executor now
@@ -1305,6 +1318,31 @@ gets one second per eviction tick, and if it hasn't retired by then, it goes
 back into quarantine and the loop moves on. The tests use a fake runtime whose
 `kill` never returns. With the old loop, both tests hang until their guard
 fires.
+
+Reading the mixed-runtime route journal exposed a different race. The writer
+publishes a complete record by renaming it over the previous one. A reader that
+already opened the old inode then sees a link count of zero. That is a normal
+replacement, while two links still mean an unsafe hard-linked record. Checking
+for zero links and *then* inspecting metadata again for privacy leaves a gap:
+the rename can happen between the two inspections. We now decide whether to
+retry and whether to accept the record from one metadata snapshot. The reader
+reopens at most eight times, checks ownership and permissions on every accepted
+record, and still refuses symlinks. A deterministic test renames the journal at
+the validation boundary; the unsafe-replacement tests keep the security checks
+honest. A rename after an accepted snapshot can leave us reading the complete
+old record, which is a valid concurrent observation.
+
+Environment filtering also exposed a test dependency. The OCI crash fixture's
+runc wrapper read `OCI_CRASH_ROOT` from Bun's environment, which belongs to the
+admission injector, not runtime commands. The rootless gate correctly lost it.
+The wrapper now finds its fixture beside its own executable. Bun keeps the
+private variable for the injector, and descendants keep their filtered
+environment. Fixing the test's dependency preserves the boundary we're testing.
+Another cancellation fixture put a fake `ip` on `PATH` inside the owner
+wrapper, after recording the command's environment. That override no longer
+reaches the command. The test now starts an isolated caller with the fake tool
+already on its `PATH`, so the recorded environment includes it without changing
+the test runner's environment.
 
 **What the real Linux tests found.** Most of the bugs in this path were
 invisible to mocks:

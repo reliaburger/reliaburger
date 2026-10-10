@@ -82,6 +82,9 @@ struct Context {
     /// awaited again rather than started again, so a runtime call that never
     /// returns leaves one stuck task behind, not one per retry.
     probe: Option<tokio::task::JoinHandle<bool>>,
+    /// Filesystem cleanup may continue after the caller times out. Keep its
+    /// handle until completion before releasing or reusing the slot.
+    cleanup: Option<tokio::task::JoinHandle<bool>>,
     #[cfg(feature = "ebpf")]
     namespace: Option<crate::bun::task_namespace::NamespaceLease>,
 }
@@ -413,33 +416,49 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         context.lease.confirm_retired();
         true
     }
-    /// Remove the emptied groups and files. The task group must really be
-    /// gone: one that survived `cgroup.kill` must never be reused (see
-    /// `prepare_cgroups`). Each removal tolerates a previous attempt's.
-    async fn remove_files(&self, context: &Context) -> bool {
-        for directory in [
-            context.base.join("task"),
-            context.base.join("helper"),
-            context.base.clone(),
-        ] {
-            match tokio::fs::remove_dir(&directory).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    eprintln!(
-                        "executor {}: cannot remove {}: {error}",
-                        context.id.0,
-                        directory.display()
-                    );
+    /// Keep one cleanup operation across timeouts. Blocking filesystem work
+    /// cannot be cancelled by dropping its async wait; a retry must await it
+    /// before the fixed slot paths can be reused for another executor.
+    async fn remove_files(&self, context: &mut Context) -> bool {
+        let cleanup = context.cleanup.get_or_insert_with(|| {
+            let base = context.base.clone();
+            let directory = context.directory.clone();
+            let socket_path = context.socket_path.clone();
+            let id = context.id.clone();
+            tokio::task::spawn_blocking(move || {
+                // The task group must really be gone, even after cgroup.kill.
+                // Removing a surviving group then reusing it is unsafe (see
+                // prepare_cgroups). Missing paths are valid after a retry.
+                let removed = |result: std::io::Result<()>, path: &Path| match result {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => {
+                        eprintln!(
+                            "executor {}: cannot remove {}: {error}",
+                            id.0,
+                            path.display()
+                        );
+                        false
+                    }
+                };
+                for path in [base.join("task"), base.join("helper"), base] {
+                    if !removed(std::fs::remove_dir(&path), &path) {
+                        return false;
+                    }
+                }
+                if let Some(path) = socket_path
+                    && !removed(std::fs::remove_file(&path), &path)
+                {
                     return false;
                 }
-            }
-        }
-        if let Some(path) = &context.socket_path {
-            let _ = tokio::fs::remove_file(path).await;
-        }
-        let _ = tokio::fs::remove_dir_all(&context.directory).await;
-        true
+                removed(std::fs::remove_dir_all(&directory), &directory)
+            })
+        });
+        // Await by reference so the outer retirement timeout leaves the
+        // handle in the context, alongside the quarantined reservation.
+        let removed = cleanup.await.unwrap_or(false);
+        context.cleanup = None;
+        removed
     }
     /// Retire within `budget` and free the slot, or quarantine it with its
     /// lease for the eviction loop to retry.
@@ -871,6 +890,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 sequence: 0,
                 idle_since: tokio::time::Instant::now(),
                 probe: None,
+                cleanup: None,
                 #[cfg(feature = "ebpf")]
                 namespace: None,
             };
@@ -1449,9 +1469,113 @@ mod tests {
             sequence: 0,
             idle_since: tokio::time::Instant::now(),
             probe: None,
+            cleanup: None,
             #[cfg(feature = "ebpf")]
             namespace: None,
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_cleanup_keeps_its_slot_and_reservation_until_the_same_operation_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let mut old = context(&budget, InstanceId("rbtest-cleaning".into()), root.path());
+        std::fs::create_dir(&old.directory).unwrap();
+        let directory = old.directory.clone();
+        let (resume, gate) = std::sync::mpsc::channel();
+        let started = Arc::new(AtomicUsize::new(0));
+        let calls = started.clone();
+        // A cleanup that has already started owns a fixed slot path. Blocking
+        // filesystem work must survive timeout without losing its obligation.
+        old.cleanup = Some(tokio::task::spawn_blocking(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if gate.recv().is_err() {
+                return false;
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+            true
+        }));
+        let handle = old.cleanup.as_ref().unwrap().id();
+        for _ in 0..2 {
+            assert!(!pool.retire(&mut old, Duration::from_millis(20)).await);
+            assert_eq!(old.cleanup.as_ref().unwrap().id(), handle);
+            assert_ne!(budget.available(), budget.capacity());
+            assert!(old.directory.exists());
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        {
+            let mut slots = pool.slots.lock().await;
+            slots[0].busy = true;
+            slots[0].retiring = Some(old);
+            slots[1].busy = true;
+            slots[1].retiring = Some(context(
+                &budget,
+                InstanceId("rbtest-already-gone".into()),
+                root.path(),
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.slots.lock().await[1].busy {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            pool.slots.lock().await[0].busy,
+            "unfinished cleanup allowed slot reuse"
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            budget.available(),
+            budget.capacity().saturating_sub(&reservation())
+        );
+        resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.slots.lock().await[0].busy {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(budget.available(), budget.capacity());
+        // Only after positive cleanup can the path be used by a new executor.
+        let directory = root.path().join("rbtest-cleaning");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("new-generation"), "alive").unwrap();
+        tokio::task::yield_now().await;
+        assert!(directory.join("new-generation").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_filesystem_cleanup_keeps_capacity_until_a_successful_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let mut old = context(
+            &budget,
+            InstanceId("rbtest-cleanup-error".into()),
+            root.path(),
+        );
+        // A nonempty directory at the socket path cannot be unlinked as a
+        // socket. Successful cgroup removal alone must not release capacity.
+        let socket = root.path().join("bad-socket");
+        std::fs::create_dir(&socket).unwrap();
+        std::fs::write(socket.join("still-present"), "owned").unwrap();
+        old.socket_path = Some(socket.clone());
+        assert!(!pool.retire(&mut old, Duration::from_secs(5)).await);
+        assert_ne!(budget.available(), budget.capacity());
+        assert!(
+            old.cleanup.is_none(),
+            "completed failed cleanup was retained"
+        );
+        std::fs::remove_dir_all(&socket).unwrap();
+        assert!(pool.retire(&mut old, Duration::from_secs(5)).await);
+        // Retirement proves that dropping the lease is safe; releasing the
+        // context actually returns its reservation to the execution budget.
+        drop(old);
+        assert_eq!(budget.available(), budget.capacity());
     }
 
     #[tokio::test]
