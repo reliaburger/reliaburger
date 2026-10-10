@@ -1453,9 +1453,21 @@
   },
   {
     "source": "tests/owned_task_arrays.rs",
-    "function": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+    "function": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
     "binary": "reliaburger::owned_task_arrays",
-    "test": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller"
+    "test": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart"
+  },
+  {
+    "source": "src/bun/reusable_executor/pool.rs",
+    "function": "cgroup_cancel_during_cold_preparation_retires_the_context",
+    "binary": "reliaburger",
+    "test": "bun::reusable_executor::pool::tests::cgroup_cancel_during_cold_preparation_retires_the_context"
+  },
+  {
+    "source": "src/bun/reusable_executor/pool.rs",
+    "function": "cgroup_deadline_during_cold_preparation_retires_the_context",
+    "binary": "reliaburger",
+    "test": "bun::reusable_executor::pool::tests::cgroup_deadline_during_cold_preparation_retires_the_context"
   },
   {
     "source": "src/bun/supervisor.rs",
