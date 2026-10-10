@@ -533,6 +533,8 @@ Each running node watches its jobs to a terminal state by polling instance statu
 
 The first version of completion reporting was deliberately forgiving: reporting into an unknown batch id was a recorded no-op, because a leader restart lost the in-memory tracker and late reports from running nodes must not explode. That was a trade we wrote down at the time — batch status was best-effort across leader changes — and it didn't survive the 12b review. Forgiving turns out to be another word for forgeable, and "best-effort across restarts" is another word for lost. The section below ("When the leader forgets") replaces both halves. `relish batch` prints the batch id; `relish batch-status <id>` shows the live summary, and `--wait` polls it to a terminal state.
 
+This engine didn't outlive 0.2.0. Once every job became a task array, a second way to run jobs was one too many, and "One budget, two schedulers" at the end of this chapter retires it.
+
 ## Building where the tools are
 
 The build endpoint arrived with the wiring merge in a working-but-synchronous form: fetch the context blob, run `buildah bud` and `buildah push`, answer when done. Its own comment admitted the flaw — it "matches the CLI's 300 s client timeout". Real image builds routinely take longer, and a build that outlives the HTTP request strands the client mid-response with the build still running. Client timeouts are a design forcing function: any operation that can exceed them must become *submit-and-poll*, and pretending otherwise just moves the failure to the worst possible moment.
@@ -628,6 +630,8 @@ If you haven't seen it, `matches!` is a macro that asks "does this value fit thi
 Because the other half of the JOB3 finding was delivery. A completion callback was fire-and-forget: one POST, result ignored. Dispatch was too — if the target node was down, its jobs stayed "pending" until the one-hour watch timeout shrugged them into `failed`. Both ends now retry with bounded backoff, and dispatch that exhausts its retries fails the affected jobs immediately, with the truth, instead of letting them age out. But retries only shrink the window; they can't close it. The node could die *after* running the job and *before* any callback lands. For that there's a pull backstop: the leader runs a per-batch watcher that polls the assigned nodes' status APIs — the same instance-status read `relish status` uses — and applies whatever terminal outcomes it finds through the same validated, idempotent report path. Push is the fast path; pull is the guarantee. And because the watcher's identity is just "a task in the leader's process", a restarted leader resumes it lazily: a status read on a non-terminal batch with no live watcher spawns one from the durable record. The integration test for this is pleasingly literal — register a batch in Raft, run its job on another node with the callbacks aimed at a dead port, build a fresh API process over the same council, and watch the batch complete anyway.
 
 Two smaller batch repairs ride along. Unschedulable jobs used to vanish — the response listed them once and the tracker never heard of them; they're now first-class records with a terminal `Unschedulable` status that shows up in every summary. And the job namespace, which used to travel in two independent places (the submission field and the job spec — the agent deployed into one while the watcher matched on the other, stranding the batch for an hour if they disagreed), is resolved once at submit: a conflict is a 400, and the resolved value is written into both places so dispatch, deploy and watching can't diverge. While we were in the area, the allocator's profile groups moved from a `HashMap` to a `BTreeMap`, which closes an old low-priority finding: the same submission now produces the same assignment plan every time, instead of depending on hash iteration order.
+
+(The batch half of this section, `batch_state`, `BatchRegister` and the pull watcher, went with the old engine in 0.2.0; only the shared id counter survives, as `BatchIds`.)
 
 Builds got the same treatment with one extra wrinkle: a build can be submitted to any node, and only the leader can write to Raft. Batch dodges this because submissions are already leader-forwarded; a build has to run where `buildah` is. So build tracking gets a small internal endpoint, `/v1/build/track` (system principal only), that a builder whose council handle is a follower uses to route its register/update through the leader. Reads need no forwarding at all — every council member holds a replica of the state. And "resumes or terminates honestly" for a build means terminates: a `Running` record whose runner is this node, with no live runner task in this process, can only mean the node restarted mid-build, so the first status read rewrites it to `failed: builder restarted mid-build` — durably — rather than serving `running` until the heat death of the universe.
 
@@ -1901,3 +1905,187 @@ fixing the test couldn't hide the real missing-PID bug it was written to catch.
 wrong. They measured something else: unequal reservations, unequal counts,
 receipt chunks bigger than the window, a no-op instead of real work. Writing
 down what a number *doesn't* show turned out to be most of the work.
+
+## One budget, two schedulers
+
+Here's a cluster that looks healthy and isn't. Three nodes, 8000 millicores
+each. Someone submits a task array, and the leader grants its chunks to the
+first node, whose executor fills its CPU with eight one-core attempts. A minute
+later you deploy an app with three one-core replicas. The leader spreads them
+one per node, the first node's agent tries to start its replica, and the
+execution budget says no. Every few seconds the node's reconciler retries,
+the budget says no again, and the leader, seeing a ready node with an app
+placed on it, keeps the placement exactly where it is. One replica stays down
+for as long as the array runs, beside two nodes with seven spare cores each.
+
+Nothing in that story is a crash. Each piece did what it was built to do.
+The node had *one* ledger, the `ExecutionBudget` from earlier in this chapter,
+shared by app replicas, task attempts and reusable executors. The cluster had
+*two* schedulers: the leader's app scheduler and the task-array grant loop.
+And only one of them could see the ledger. A node's `StateReport` summed the
+CPU and memory requests of its app instances, nothing else, so to the app
+scheduler a node full of job attempts looked empty.
+
+### Reporting what jobs hold, and only that
+
+The obvious fix is to report the whole budget: "this node has 8000 millicores
+used". That would count apps twice. The leader already reconciles app
+placements against reports one instance at a time (`reserve_commitments` adds
+only the part of each committed placement that a report hasn't accounted for),
+and that per-instance view is what lets it resize a replica in place or tell a
+placement that's started from one that hasn't. So the report keeps app
+requests where they were and grows a second, separate figure:
+
+```rust
+/// Capacity held by job work in a node's execution budget: task attempts
+/// and reusable executors, never app replicas.
+pub struct JobReservations {
+    pub cpu_millicores: u64,
+    pub memory_bytes: u64,
+}
+```
+
+The budget has to know which of its leases are which. Each `ResourceLease`
+now carries a tag:
+
+```rust
+enum LeaseOwner {
+    Application,
+    Job,
+}
+```
+
+That's a *fieldless enum*: the Rust version of a C enum, two named values and
+no data, which we can compare with `==` because it derives `PartialEq`.
+`try_acquire` and `adopt`, the paths the supervisor uses for app replicas,
+create `Application` leases; `acquire` and `try_acquire_executor`, the task
+executor's and the executor pool's paths, create `Job` leases and add to a
+separate `job_used` total. The lease's `Drop` (the destructor Rust runs when a
+value goes out of scope) subtracts from `job_used` only for a `Job` lease. A
+quarantined attempt, whose retirement nobody has proved, never runs that
+subtraction, so its capacity stays counted on both totals, which is the point
+of quarantine.
+
+On the leader, `build_cluster_cache` adds the two figures before planning:
+
+```rust
+allocated: Resources {
+    cpu_millicores: u64::from(usage.cpu_used_millicores)
+        .saturating_add(report.job_reservations.cpu_millicores),
+    memory_bytes: (u64::from(usage.memory_used_mb) * 1024 * 1024)
+        .saturating_add(report.job_reservations.memory_bytes),
+    gpus: 0,
+},
+```
+
+`saturating_add` stops at `u64::MAX` instead of wrapping round to zero, which
+in a capacity sum would turn "impossibly full" into "empty".
+
+### When the race goes the wrong way
+
+Reports are seconds old by the time the leader reads them, and attempts start
+whenever the grant loop says so. A replica can still be placed on a node that
+had room at planning time and doesn't by the time its agent tries. Holding
+that placement is the bug from the opening paragraph, just rarer.
+
+`try_acquire` doesn't queue (an app replica waiting behind task attempts would
+just be the same outage, slower), so the agent turns the refusal into
+evidence. When a fresh deploy fails with `BunError::Capacity`, it records the
+app's name and namespace with a timestamp; a successful deploy clears the
+entry, and an entry older than a minute drops out of the reports. The next
+`StateReport` carries a `CapacityRefusal`, `build_cluster_cache` copies it into
+the scheduler's cache, and the rule that decides whether a committed placement
+stays put learns one more reason to say no:
+
+```rust
+if keeps_volume_home(placement, spec, self.retired) {
+    return true;
+}
+if cache.capacity_refused(&placement.node_id, app_id) {
+    return false;
+}
+```
+
+The order matters. An app with a managed volume still waits for the node that
+holds its data, refusal or not: moving it would start it on an empty volume,
+and that's the #423 bug we already paid for once. Everything else moves, and
+because the node now reports what its jobs hold, the scheduler doesn't put the
+replica straight back. Running attempts are never stopped to make room. A job
+is somebody's work in progress; an app replica can start somewhere else.
+
+We tested this the way the bug report described it. One test hands an
+in-process leader scheduler two reports, one node full of job reservations and
+one idle, and checks where the app lands. Another starts a real three-node
+cluster whose executors share their agents' budgets, fills one node with an
+array, and deploys a three-replica app. Both tests fail without the fix,
+which we checked by switching the addition off and watching the replica land
+on the full node, and pass with it.
+
+### Retiring the engine this chapter started with
+
+Earlier in this chapter we wired a batch engine: a leader-side `BatchTracker`,
+node-to-node `/v1/batch/run` dispatch, completion callbacks, a pull watcher as
+a backstop, and `batch_state` in Raft with its `BatchRegister` reservations.
+Then task arrays arrived, every job became a task array, and `relish batch`
+moved to the common lifecycle. The old engine didn't go away. Leased test
+applies still used it, so the tracker, the routes, the watcher and the agent's
+own job ledger stayed live beside the "one job lifecycle" this release is
+about.
+
+Two ways to run a job are one too many. They don't just cost code: each one
+has its own capacity view, its own failure modes and its own audit findings.
+So 0.2.0 deletes the old one. The tracker, the two routes, the watcher,
+`batch_state`, `BatchRegister` and the allocator are gone. The one thing worth
+keeping was the id counter, because arrays, runs and manifests share one id
+space so that `relish batch-status 12` names exactly one thing. That counter
+is now a type of its own, `BatchIds`, and lives in `DesiredState` on its own.
+
+The agent stopped running jobs altogether. Its job ledger, cron schedules,
+batch executions and prerequisite runner existed for the node-local path; with
+every job on the common lifecycle, a deploy that names a job is refused before
+it touches a runtime. That removed about seventeen thousand lines, most of
+them tests for states that can no longer happen, which is the cheapest kind of
+bug fix there is.
+
+The prerequisite claims went with them. A leased apply with jobs used to write
+a claim to Raft, holding its manifest and the leadership term that admitted it,
+until the jobs settled. A claim from an earlier term could never be released,
+there could be at most 64, and each one reserved its jobs' resources on every
+candidate node. A few leader changes during leased applies and capacity
+quietly leaked away. We could have added `relish council release-claim` for an
+operator to clear them. Instead leased applies now go through `JobApplyCommit`,
+the same deployment record every other apply uses, which already survives
+leader changes, so the claims, their state field and their four Raft request
+types simply don't exist any more.
+
+### Test leases for jobs
+
+That left the leases themselves. `relish test`'s job cases hold a *job lease*,
+and until now it lived only on the node that issued it, because that was the
+node that would run the jobs. On the common lifecycle the leader admits the
+jobs, so the leader has to be able to check the lease. With a council, a job
+lease is now a Raft record like an application lease.
+
+The ordering is what keeps cleanup honest. A leased job apply first writes
+`TestLeaseJobs`, which attaches the jobs to the lease, and only then writes the
+deployment. The state machine refuses a job in a test lease namespace unless an
+active job lease owns it, so there's no way to create work a lease's cleanup
+can't find. Cleanup cancels any unsettled deployment that owns a leased job and
+forgets its definition, then waits until the leader has settled the cancelled
+deployment before it removes the lease record. Standalone nodes keep the lease
+in their own store and do the same through the node's task arrays.
+
+### Lessons
+
+**Two schedulers sharing a ledger must share a view of it.** The budget was
+correct, the scheduler was correct, and the cluster still left a replica
+down. Whenever two decision-makers spend the same resource, ask what each of
+them can see.
+
+**Report the part the reader can't reconcile, not the total.** Summing
+everything would have looked simpler and counted every app twice.
+
+**When the new path lands, delete the old one.** The old batch engine survived
+because one caller still used it, and it kept collecting findings for the
+whole time it was alive. Moving that last caller was most of the work; the
+deletion itself was the easy part.

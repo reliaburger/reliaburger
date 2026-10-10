@@ -1454,7 +1454,10 @@ machines.
 They're one part of a release's acceptance, not all of it; the
 [release runbook](releasing.md) lists the gates a candidate has to pass.
 
-Held cluster jobs conservatively reserve their CPU/memory requests on every app or batch placement candidate until positive settlement. This can over-reserve; it does not add initial node-local job capacity admission.
+Apps and jobs share each node's execution budget. State reports carry what a
+node's task attempts and executors hold, and the leader counts it when it
+places app replicas; a node that can't fit a placement reports the refusal and
+the replica moves.
 
 ### Delegated jobs (0.2.0 development preview)
 

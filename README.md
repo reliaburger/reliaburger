@@ -297,10 +297,12 @@ gives the rig, the limits and what the numbers do and don't show. All four
 one-hour soaks completed beside a live application; storage bounds and a real
 daily qualification remain in #668.
 
-Batch jobs retain distinct execution identities and their original scoped
-labels across retries and recovery. Finite durable history keeps replay fences;
-see [batch execution ownership](docs/book/08-breaking-things-on-purpose.md). Apps and job attempts share node CPU/memory admission. Committed grants and
-accepted outcomes survive leader changes; retired nodes receive no new work.
+Every job, from `relish apply`, `relish batch` or a cron schedule, takes one
+lifecycle: the leader records a run and grants its tasks to nodes with room.
+Apps and job attempts share each node's CPU and memory budget, and app
+placement counts what jobs hold, so a replica never lands on a node jobs have
+filled. Committed grants and accepted outcomes survive leader changes; retired
+nodes receive no new work.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary

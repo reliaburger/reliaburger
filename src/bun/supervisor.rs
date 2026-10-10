@@ -1712,32 +1712,6 @@ mod tests {
         sup.admit_app("image", &image).unwrap();
     }
 
-    /// A rootful owned process node: the only kind that can run native
-    /// executors, so the only kind where admission could think limits apply.
-    #[cfg(target_os = "linux")]
-    fn rootful_process_supervisor(
-        root: &std::path::Path,
-    ) -> WorkloadSupervisor<crate::grill::ProcessGrill> {
-        use crate::grill::Grill;
-        let grill = crate::grill::ProcessGrill::with_owner(
-            root.join("owners"),
-            root.join("bun-is-never-started"),
-        );
-        assert!(
-            grill.host_executor_runtime().is_some(),
-            "this test needs root and cgroup v2"
-        );
-        WorkloadSupervisor::with_process_config(
-            grill,
-            PortAllocator::new(30000, 31000),
-            crate::config::process_workloads::ProcessWorkloadsConfig {
-                allowed_binaries: vec!["/bin/true".into()],
-                mount_isolation: false,
-                script_dir: root.join("scripts"),
-            },
-        )
-    }
-
     #[test]
     fn mixed_admission_does_not_promise_container_egress_enforcement_for_host_commands() {
         let root = tempfile::tempdir().unwrap();
