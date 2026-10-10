@@ -1083,7 +1083,7 @@ advance the durable cursor. It survives leadership changes, definition updates,
 pruning and clock rollback. Standalone uses the same state machine with private
 fsync'd JSON. Deployment hooks create common runs too; app publication waits for
 accepted success even after the submitting leader leaves.
-[Chapter 12](12-squeezing-every-drop.md#definitions-runs-and-durable-trigger-identities)
+[Chapter 17](17-a-million-jobs.md#definitions-runs-and-durable-trigger-identities)
 walks through these contracts.
 
 A cron step can be larger than the field it advances. `59/255` still means

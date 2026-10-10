@@ -304,6 +304,7 @@ migration and no feature gate
   and resident model workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
   The million-task release gate and sustained 100m/day claim still require
   real-runtime qualification ([foundation evidence](qualification/2026-10-04-delegated-jobs/README.md)).
+  [Chapter 17](book/17-a-million-jobs.md).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
