@@ -1918,7 +1918,6 @@ async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
 #[ignore = "requires root and cgroup v2; run with make test-linux"]
 async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
     use reliaburger::bun::task_executor::{AttemptOutcome, TaskRunner};
-    use std::sync::atomic::{AtomicBool, Ordering};
     let root = tempfile::Builder::new()
         .prefix("rb-native-stuck-")
         .tempdir()
@@ -1934,27 +1933,23 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
         .await;
     assert!(first.outcome.succeeded(), "{first:?}");
     let task = task_cgroup(&first.output.head);
-    // Keep the task group populated faster than cgroup.kill can empty it.
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let refill = std::thread::spawn({
-        let stop = stop.clone();
-        let procs = task.join("cgroup.procs");
-        move || {
-            let mut children = Vec::new();
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok(child) = std::process::Command::new("/bin/sleep").arg("60").spawn() {
-                    let _ = std::fs::write(&procs, child.id().to_string());
-                    children.push(child);
-                }
-                children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            for mut child in children {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    });
+    // The warm executor runs the next command in this same task group. Make
+    // the group report itself populated forever, as a task in uninterruptible
+    // sleep would: bind a file saying "populated 1" over its cgroup.events.
+    // Racing real processes against cgroup.kill can't do this reliably: a fast
+    // kernel empties the group between respawns, and retirement rightly
+    // succeeds.
+    let fake = root.path().join("populated");
+    std::fs::write(&fake, "populated 1\nfrozen 0\n").unwrap();
+    let events = task.join("cgroup.events");
+    nix::mount::mount(
+        Some(&fake),
+        &events,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .unwrap();
     let started = std::time::Instant::now();
     let stuck = tokio::time::timeout(
         Duration::from_secs(30),
@@ -1976,8 +1971,7 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
         budget.capacity(),
         "a quarantined executor released its reservation"
     );
-    stop.store(true, Ordering::Relaxed);
-    refill.join().unwrap();
+    nix::mount::umount(&events).unwrap();
     wait_until("the eviction loop retires the quarantined executor", || {
         budget.available() == budget.capacity()
     })
