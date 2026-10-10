@@ -354,7 +354,7 @@ prefix. The controls replace that path after the old line was read, then require
 the replacement to start at zero. They also hold directory confirmation and
 checkpoint publication separately. These are the specified append-only capture
 and restart guarantees; they don't make arbitrary file rotation or unflushed
-memory durable. The [qualification record template](../qualification/2026-10-04-final-codebase-qualification.template.md)
+memory durable. The [final codebase qualification record](../qualification/2026-10-04-final-codebase-qualification.md)
 keeps the actual execution and physical interruption results pending until the
 matching gates run.
 

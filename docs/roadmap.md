@@ -314,6 +314,7 @@ migration and no feature gate
   state, leader memory and CPU, executor overhead, ledger bytes, retained
   logs) without gating on them; that plan is
   [archived](plans/archive/2026-09-28-plan-million-jobs.md).
+  [Chapter 17](book/17-a-million-jobs.md).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
