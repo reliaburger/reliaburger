@@ -846,6 +846,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_round_trip_the_recent_histogram_and_need_it() {
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        complete_in_bucket(&mut state, 0..=7, 2);
+        let encoded = serde_json::to_value(&state).unwrap();
+        let decoded: TaskArrayState = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, state);
+        // A snapshot from before the field can't be read, which is why the
+        // field came with a compatibility generation bump.
+        let mut old = encoded;
+        old.as_object_mut()
+            .unwrap()
+            .remove("recent_duration_counts");
+        assert!(serde_json::from_value::<TaskArrayState>(old).is_err());
+    }
+
+    #[test]
     fn recent_durations_stay_bounded_and_never_exceed_the_totals() {
         let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
         complete_in_bucket(&mut state, 0..=49, 3);

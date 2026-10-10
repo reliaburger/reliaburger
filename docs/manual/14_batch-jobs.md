@@ -1,7 +1,7 @@
 # Batch jobs
 
 Development preview for 0.2.0. Build matching development binaries and start a
-fresh cluster: protocol 50 and state 67 change control messages and durable
+fresh cluster: protocol 51 and state 68 change control messages and durable
 state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.

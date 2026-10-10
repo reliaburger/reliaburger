@@ -1463,7 +1463,7 @@ manifests, app/job resource accounting, watch summaries, indexed detail, retries
 and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
 mixed-resource work beside a service. The standalone landing-page job recording
 uses the built-in `relish bench` scenarios. Build matching development binaries
-and use a fresh cluster (protocol 50 / state 67). The
+and use a fresh cluster (protocol 51 / state 68). The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.
 
