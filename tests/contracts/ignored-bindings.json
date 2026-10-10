@@ -1405,6 +1405,12 @@
   },
   {
     "source": "tests/owned_task_arrays.rs",
+    "function": "runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
     "function": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner",
     "binary": "reliaburger::owned_task_arrays",
     "test": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner"
