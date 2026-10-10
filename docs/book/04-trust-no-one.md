@@ -735,9 +735,11 @@ When you deploy an app with `firewall.allow_from`:
 allow_from = ["api", "frontend/web"]
 ```
 
-Bun resolves `"api"` to its cgroup IDs and writes allow rules to the BPF map. The eBPF connect hook checks this map on every `connect()` syscall. If the source cgroup isn't in the map for the destination app, the connection is denied with `EPERM`.
+Bun resolves `"frontend/web"` to that app's cgroup IDs and writes allow rules to the BPF map. The eBPF connect hook consults this map when a caller from one namespace reaches a destination in another. If the source cgroup has no grant for the destination app, the connection is denied with `EPERM`.
 
-The default behaviour (no `allow_from` specified) permits all apps in the same namespace to connect to each other — namespace isolation without any configuration.
+Apps in the same namespace always reach each other, with or without `allow_from`; that's namespace isolation without any configuration. An earlier draft of the whitepaper promised `allow_from` would also narrow callers *inside* a namespace. The code never did, and in the 0.2.0 audit we chose to drop the promise rather than half-build it (decision D4). `allow_from` opens cross-namespace paths, nothing more. Finer control would reuse the real-address map from Chapter 3, so it may come back later.
+
+Two things turned this from "advertised" into "on by default". First, `relish init` now writes `[ebpf]` and `[dns]` enabled when it runs as root on Linux with `runc` installed, and Bun refuses to start a rootful runc node whose eBPF data path fails to load. Before, the generated config had eBPF off, so a cluster built the documented way enforced nothing and said nothing. Second, a node that *can't* enforce isolation (rootless runc, ProcessGrill, macOS) refuses `allow_from` at deploy, the same way it refuses an egress allowlist, and `relish wtf` warns when a cluster with more than one namespace has such a node. A grant that opens a path through a wall that isn't there would be worse than useless: it would tell you the wall exists.
 
 ## The perimeter firewall
 

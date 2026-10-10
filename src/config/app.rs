@@ -118,6 +118,19 @@ pub struct AppSpec {
 }
 
 impl AppSpec {
+    /// Whether this app needs a node that enforces network policy in the
+    /// kernel: an egress allowlist, or `allow_from` grants across namespaces.
+    /// Placement keeps such an app off nodes that would refuse it.
+    pub fn requires_network_policy(&self) -> bool {
+        self.egress
+            .as_ref()
+            .is_some_and(|egress| !egress.allow.is_empty())
+            || self
+                .firewall
+                .as_ref()
+                .is_some_and(|firewall| !firewall.allow_from.is_empty())
+    }
+
     /// The ordinals this node's replicas take: the ones the leader assigned,
     /// or `0..replicas` on a standalone node. A daemon set runs one replica
     /// per node, so without an assignment it is ordinal 0.

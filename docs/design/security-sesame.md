@@ -526,6 +526,20 @@ pub struct CrlEntry {
 
 ### 4.7 Firewall Rules
 
+> **As built (#677).** The listing below is the original design. The binary
+> keys `firewall_map` by `(source cgroup, destination app id)` and grants only
+> cross-namespace paths (D4): apps in one namespace always reach each other,
+> and `allow_from` names `app` or `namespace/app` sources from other
+> namespaces. Apps and jobs both take `[firewall] allow_from`; a job's
+> destination identity is `0x8000_0000 | hash(namespace/name)`, a service's
+> its VIP. Isolation covers real destinations as well as VIPs through
+> `destination_map` (see the Onion design, §4), and the
+> `reliaburger_isolation` nftables table repeats the check on the forward
+> path between local containers, for traffic that never meets a socket hook.
+> A node that can't enforce isolation refuses `allow_from` at deploy and in
+> task-array admission. Config validation checks every `allow_from` source and
+> egress entry for apps and jobs alike.
+
 ```rust
 /// A per-app eBPF firewall rule controlling inbound connections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1107,6 +1121,13 @@ Current status: egress enforcement is opt-in per app. With no `[app.NAME.egress]
 block, Bun allows external egress. Once an app declares a non-empty allowlist,
 the following contract applies and there is no warning-only fallback.
 
+Jobs take the same `[job.NAME.egress]` block, with the same contract (D26).
+The agent programs a job's cgroup before it starts, and a delegated task's
+namespace lease programs the task cgroup (a reusable executor's `task`
+cgroup) before its command runs. The egress policy is part of the reusable
+executor profile key, so commands with different policies never share an
+executor. Host (`runtime = "process"`) jobs and apps refuse an allowlist.
+
 When Bun processes an app's `[app.NAME.egress]` block:
 
 1. Each entry is parsed: exact IPv4/IPv6 destinations (`1.2.3.4:443`, `[2001:db8::1]:443`), CIDRs (`10.0.0.0/8:443`, `[2001:db8::/32]:443` — host bits rejected), or hostnames resolved via DNS keeping both A and AAAA records.
@@ -1117,6 +1138,7 @@ When Bun processes an app's `[app.NAME.egress]` block:
 6. Bun reports the four hooks and pre-start runtime support as a typed live node capability. The scheduler filters policy-bearing workloads using it, and the agent repeats the check immediately before start so a stale report can't open a gap.
 7. Every one-second agent tick verifies the live hooks and each protected cgroup's enforcement flag. It repairs a missing flag once and verifies the result. Hook loss, an unreadable map or failed repair stops the affected workload, records the affected app and makes the node unready until all four hooks recover. The slower kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60) still scrubs stale state and rebuilds all entries.
 8. `allow_franchise` remains unimplemented. Bun refuses it explicitly rather than starting a workload with unrestricted cross-cluster egress.
+9. Every allowlist implicitly permits the node's DNS responder (the address Bun installs in workloads' `resolv.conf`) on port 53, so a workload can resolve the hostnames on its list and `.internal` names. Without `[dns]` there is no responder, and the allowlist must name its resolver.
 
 ### 5.10 Image Signing Trust Roots
 

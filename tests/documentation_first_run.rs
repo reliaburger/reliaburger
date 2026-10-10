@@ -157,6 +157,10 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
     node.storage.metrics = root.path().join("metrics");
     node.storage.volumes = root.path().join("volumes");
     node.images.registry_port = 0;
+    // Run as root on a runc host, `relish init` enables eBPF and DNS. This
+    // portable fixture runs the process runtime, which has neither.
+    node.ebpf.enabled = false;
+    node.dns.enabled = false;
 
     let (mut bun, address) = spawn_bun_with_port_retry(true, || {
         let [gossip_port, raft_port, reporting_port] = reserve_ports();
@@ -288,6 +292,10 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     node.storage.metrics = root.path().join("metrics");
     node.storage.volumes = root.path().join("volumes");
     node.images.registry_port = 0;
+    // Run as root on a runc host, `relish init` enables eBPF and DNS. This
+    // portable fixture runs the process runtime, which has neither.
+    node.ebpf.enabled = false;
+    node.dns.enabled = false;
 
     let (mut bun, address) = spawn_bun_with_port_retry(true, || {
         let [gossip_port, raft_port, reporting_port] = reserve_ports();

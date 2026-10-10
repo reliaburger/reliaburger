@@ -1452,6 +1452,8 @@ fn pod_to_jobspec(
         namespace: metadata_namespace.cloned(),
         exec: None,
         script: None,
+        firewall: None,
+        egress: None,
     }
 }
 

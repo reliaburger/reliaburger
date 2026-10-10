@@ -31,9 +31,11 @@ ProcessGrill don't get `.internal`.
 
 ## Who may connect
 
-Apps in the same namespace can reach each other; other namespaces can't. Open
-a specific cross-namespace path with `allow_from`, naming apps as
-`namespace/app`:
+Apps in the same namespace can reach each other; other namespaces can't. That
+holds for every address a workload has, not just its VIP: a backend's
+container address (any port), and a published host port on any node, which is
+what `relish resolve` prints. Open a specific cross-namespace path with
+`allow_from`, naming apps as `namespace/app`:
 
 ```toml
 [app.db]
@@ -46,8 +48,29 @@ allow_from = ["shop/api"]
 ```
 
 `allow_from` only opens cross-namespace paths; it doesn't restrict callers in
-the same namespace. The eBPF connect hook enforces it, so without `[ebpf]`
-there's no enforcement at all.
+the same namespace. One grant covers the VIP and the real addresses alike.
+
+The eBPF hooks enforce all of this, so isolation needs `[ebpf]`. `relish init`
+turns `[ebpf]` and `[dns]` on when it runs as root on Linux with `runc`
+installed, and Bun won't start a rootful runc node whose eBPF data path fails
+to load. A node that can't enforce isolation (rootless runc, ProcessGrill,
+macOS) refuses `allow_from`, and `relish wtf` warns when a cluster with more
+than one namespace has such a node.
+
+What isolation covers:
+
+- containers on rootful runc, and their delegated job tasks;
+- `exec` and `script` workloads on the owned process runtime as root, which
+  start inside their own workload cgroup. They run as root, so a hostile one
+  can leave its cgroup: isolation keeps honest host commands honest, it
+  doesn't contain hostile ones;
+- traffic between containers on one node that never meets a socket hook (raw
+  sockets, a host port reached through DNAT), checked again on the forward
+  path by the `reliaburger_isolation` nftables table.
+
+What it doesn't cover: processes outside Reliaburger's cgroups, such as host
+daemons, SSH sessions or Bun itself. They can reach any workload, as root on
+the node always could.
 
 Egress is open unless an app lists what it may reach. Every entry needs a port:
 
@@ -56,9 +79,14 @@ Egress is open unless an app lists what it may reach. Every entry needs a port:
 allow = ["api.stripe.com:443", "10.0.0.0/8:5432", "[2001:db8::1]:443"]
 ```
 
-An egress allowlist only works on rootful runc with eBPF, and Bun refuses to
-deploy an app with one anywhere else rather than run it unguarded.
-`allow_franchise` (cross-cluster egress) parses but is refused.
+An allowlist always lets the workload reach the node's DNS responder on port
+53, over UDP and TCP, so it can resolve the names on its list (and
+`.internal` names). Without `[dns]` there's no responder to allow: list your
+resolver yourself. An egress allowlist only works on rootful runc with eBPF,
+and Bun refuses to deploy an app with one anywhere else rather than run it
+unguarded. `allow_franchise` (cross-cluster egress) parses but is refused.
+Jobs take the same `[job.NAME.egress]` and `[job.NAME.firewall]` tables (see
+[Batch jobs](14_batch-jobs.md)).
 
 ## Ingress
 

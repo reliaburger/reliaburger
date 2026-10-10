@@ -449,9 +449,21 @@ pub trait Grill: Send + Sync {
     fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
         self.runtime_kind() == kind
     }
-    /// Per-workload enforcement; host commands never occupy an OCI cgroup.
+    /// Per-workload enforcement: whether this workload's process will run in
+    /// the cgroup its spec names, so the agent can bind policy to it first.
     fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
-        !spec.host_process && self.honours_cgroup_path()
+        if spec.host_process {
+            self.places_host_processes()
+        } else {
+            self.honours_cgroup_path()
+        }
+    }
+
+    /// Whether host commands (`exec`/`script`) start inside the cgroup their
+    /// spec names, which lets namespace isolation hold them too. Only the
+    /// owned process runtime on rootful cgroup v2 Linux does.
+    fn places_host_processes(&self) -> bool {
+        false
     }
 
     /// Owned rootful host backend capable of bounded native command executors.
@@ -860,6 +872,17 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.honours_cgroup_path(),
             #[cfg(target_os = "linux")]
             AnyGrill::Mixed(g) => g.honours_cgroup_path(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
+        }
+    }
+    fn places_host_processes(&self) -> bool {
+        match self {
+            AnyGrill::Process(g) => g.places_host_processes(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.places_host_processes(),
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => false,
         }

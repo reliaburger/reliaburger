@@ -124,6 +124,53 @@ pub struct FirewallValue {
     pub action: u32,
 }
 
+/// The `destination_map` port meaning "every port of this address".
+pub const DESTINATION_ANY_PORT: u16 = 0;
+
+/// The `destination_map` namespace of an address two owners claim at once.
+/// No source namespace ever equals it, so the connect hooks refuse every
+/// namespaced caller rather than guess which owner is current.
+pub const NAMESPACE_CONTESTED: u32 = u32::MAX;
+
+/// Key for the `destination_map` BPF hash map: a real IPv4 destination.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DestinationKey {
+    /// Destination address in network byte order.
+    pub ip: u32,
+    /// Destination port in network byte order, or [`DESTINATION_ANY_PORT`].
+    pub port: u16,
+    /// Alignment padding.
+    pub _pad: u16,
+}
+
+impl DestinationKey {
+    /// The key for `address:port` (host byte order in, network order stored).
+    pub fn new(address: Ipv4Addr, port: u16) -> Self {
+        Self {
+            ip: u32::from(address).to_be(),
+            port: port.to_be(),
+            _pad: 0,
+        }
+    }
+
+    /// The key covering every port of `address`.
+    pub fn any_port(address: Ipv4Addr) -> Self {
+        Self::new(address, DESTINATION_ANY_PORT)
+    }
+}
+
+/// Value for the `destination_map` BPF hash map: who owns the destination.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DestinationValue {
+    /// Destination identity `firewall_map` grants name (the service's
+    /// `app_id`, or a job's).
+    pub app_id: u32,
+    /// Owning namespace, or [`NAMESPACE_CONTESTED`].
+    pub namespace_id: u32,
+}
+
 /// Key of the single `view_lease_map` entry.
 pub const VIEW_LEASE_KEY: u32 = 0;
 
@@ -183,6 +230,10 @@ unsafe impl aya::Pod for FirewallKey {}
 unsafe impl aya::Pod for FirewallValue {}
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for ViewLeaseValue {}
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+unsafe impl aya::Pod for DestinationKey {}
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+unsafe impl aya::Pod for DestinationValue {}
 
 // ---------------------------------------------------------------------------
 // Rust-side service state (userspace, not sent to BPF directly)
@@ -363,6 +414,16 @@ mod tests {
     #[test]
     fn firewall_value_size() {
         assert_eq!(std::mem::size_of::<FirewallValue>(), 4);
+    }
+
+    #[test]
+    fn destination_key_and_value_match_the_kernel_layout() {
+        assert_eq!(std::mem::size_of::<DestinationKey>(), 8);
+        assert_eq!(std::mem::size_of::<DestinationValue>(), 8);
+        let key = DestinationKey::new(Ipv4Addr::new(10, 0, 2, 2), 8080);
+        assert_eq!(key.ip, u32::from(Ipv4Addr::new(10, 0, 2, 2)).to_be());
+        assert_eq!(key.port, 8080u16.to_be());
+        assert_eq!(DestinationKey::any_port(Ipv4Addr::LOCALHOST).port, 0);
     }
 
     #[test]

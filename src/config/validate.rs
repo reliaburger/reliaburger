@@ -248,6 +248,11 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             name: name.to_string(),
         });
     }
+    validate_network_policy(
+        &format!("app {name:?}"),
+        app.firewall.as_ref(),
+        app.egress.as_ref(),
+    )?;
 
     // Ordinals come from the leader's placements, never from a config file.
     if app.ordinals.is_some() {
@@ -427,8 +432,48 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     Ok(())
 }
 
+/// Check the network policy apps and jobs share: every egress entry parses
+/// (without resolving names), and every `allow_from` source is `app` or
+/// `namespace/app` made of workload labels.
+fn validate_network_policy(
+    context: &str,
+    firewall: Option<&super::app::FirewallSpec>,
+    egress: Option<&super::app::EgressSpec>,
+) -> Result<(), ConfigError> {
+    for entry in egress.map_or(&[][..], |egress| egress.allow.as_slice()) {
+        crate::sesame::egress::validate_egress_entry(entry).map_err(|error| {
+            ConfigError::Validation {
+                field: "egress".to_string(),
+                context: context.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    for source in firewall.map_or(&[][..], |firewall| firewall.allow_from.as_slice()) {
+        let valid = match source.split_once('/') {
+            Some((namespace, app)) => valid_workload_label(namespace) && valid_workload_label(app),
+            None => valid_workload_label(source),
+        };
+        if !valid {
+            return Err(ConfigError::Validation {
+                field: "firewall.allow_from".to_string(),
+                context: context.to_string(),
+                reason: format!(
+                    "{source:?} must be an app name or namespace/app, each a lowercase DNS label"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
     validate_label(name, "job", "name")?;
+    validate_network_policy(
+        &format!("job {name:?}"),
+        job.firewall.as_ref(),
+        job.egress.as_ref(),
+    )?;
     validate_label(
         job.namespace.as_deref().unwrap_or("default"),
         name,
@@ -1646,6 +1691,44 @@ mod tests {
             err,
             ConfigError::Validation { ref reason, .. } if reason.contains("mutually exclusive")
         ));
+    }
+
+    #[test]
+    fn job_egress_is_validated_like_an_app() {
+        let invalid = [
+            ("egress", "allow = [\"no-port.example.com\"]", "egress"),
+            ("egress", "allow = [\"10.0.0.1/8:443\"]", "egress"),
+            ("egress", "allow = [\"2001:db8::1:443\"]", "egress"),
+            (
+                "firewall",
+                "allow_from = [\"Not_A_Label\"]",
+                "firewall.allow_from",
+            ),
+            (
+                "firewall",
+                "allow_from = [\"a/b/c\"]",
+                "firewall.allow_from",
+            ),
+        ];
+        for (table, body, field) in invalid {
+            for kind in ["app", "job"] {
+                let source =
+                    format!("[{kind}.work]\nimage = \"fixture:v1\"\n[{kind}.work.{table}]\n{body}");
+                let error = Config::parse(&source).unwrap().validate().unwrap_err();
+                assert!(
+                    matches!(&error, ConfigError::Validation { field: actual, .. } if actual == field),
+                    "{kind} accepted {table} {body:?}: {error}"
+                );
+            }
+        }
+        for kind in ["app", "job"] {
+            let source = format!(
+                "[{kind}.work]\nimage = \"fixture:v1\"\n\
+                 [{kind}.work.egress]\nallow = [\"api.example.com:443\", \"10.0.0.0/8:5432\", \"[2001:db8::1]:443\"]\n\
+                 [{kind}.work.firewall]\nallow_from = [\"web\", \"frontend/scraper\"]"
+            );
+            Config::parse(&source).unwrap().validate().unwrap();
+        }
     }
 
     #[test]

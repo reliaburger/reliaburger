@@ -73,6 +73,14 @@ pub struct JobSpec {
     /// Inline script content (Phase 8: process workloads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
+    /// Apps in other namespaces allowed to connect to this job's addresses,
+    /// with the same meaning as an app's `[firewall]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firewall: Option<super::app::FirewallSpec>,
+    /// Destinations this job may reach outside the cluster, with the same
+    /// meaning as an app's `[egress]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress: Option<super::app::EgressSpec>,
 }
 
 impl JobSpec {
@@ -225,6 +233,37 @@ mod tests {
         "#;
         let j: JobSpec = toml::from_str(toml_str).unwrap();
         assert_eq!(j.run_before, vec!["app.api", "app.web"]);
+    }
+
+    #[test]
+    fn job_accepts_egress_and_allow_from() {
+        let job: JobSpec = toml::from_str(
+            r#"
+            image = "fetcher:v1"
+
+            [firewall]
+            allow_from = ["web", "frontend/scraper"]
+
+            [egress]
+            allow = ["api.example.com:443", "10.20.0.0/16:5432"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            job.firewall.as_ref().unwrap().allow_from,
+            vec!["web", "frontend/scraper"]
+        );
+        assert_eq!(
+            job.egress.as_ref().unwrap().allow,
+            vec!["api.example.com:443", "10.20.0.0/16:5432"]
+        );
+        // Both survive the round trip into Raft desired state.
+        let encoded = toml::to_string(&job).unwrap();
+        assert_eq!(toml::from_str::<JobSpec>(&encoded).unwrap(), job);
+        // Absent policy stays absent on the wire.
+        let plain: JobSpec = toml::from_str("image='fetcher:v1'").unwrap();
+        let plain_encoded = toml::to_string(&plain).unwrap();
+        assert!(!plain_encoded.contains("egress") && !plain_encoded.contains("firewall"));
     }
 
     #[test]

@@ -1489,6 +1489,12 @@ Two subtleties took a second pass to get right, and both were the same shape of 
 
 Two honesty notes. First, this is eBPF-only. A build without the feature, a non-Linux host, or a runtime that can't join a prepared cgroup now refuses `[egress]` before it creates a workload. The old warning-and-continue path was honest in its log message but wrong in its outcome. Second, verifying this needs the kernel. The `egress_denied_by_default_allowed_when_listed` test in `tests/ebpf.rs` runs in the Lima VM: it loads the real programs, allows a single `127.0.0.1:port` for the test's own cgroup, and asserts that listed TCP and UDP destinations work while unlisted ones fail with `EPERM`. As with the connect rewrite in Chapter 3, `EPERM`, not `ECONNREFUSED`, is what a BPF `return 0` becomes.
 
+### An allowlist that can't resolve its own names
+
+Here's a fun one. Deploy an app with `allow = ["api.stripe.com:443"]` and watch it fail to reach Stripe. Not because the allowlist is wrong: because the app can't *look up* `api.stripe.com`. Workloads resolve through the node's DNS responder, at the runc gateway on port 53, and that address wasn't on the list. So `getaddrinfo` came back `EPERM`: glibc connects its UDP socket first, so connect4 refused it, and musl sends unconnected datagrams, so sendmsg4 did. `.internal` names failed the same way. The whitepaper had promised that allowlists "implicitly permit DNS" all along.
+
+The fix is one function, `implicit_destinations`, and the discipline to call it everywhere an allowlist is built. It returns the node's resolver on port 53 (the maps don't distinguish UDP from TCP, so that covers both), and the agent chains it into the union it programs for every enforced cgroup. Bun learns the resolver's address when it binds the responder, before any recovery reprograms an allowlist. Without `[dns]` there's no responder, so there's nothing implicit to allow, and the manual says to list your resolver yourself. `egress_allowlist_still_resolves_dns` checks both halves in the Lima VM: the agent programs the resolver into an app's allowlist, and the kernel then lets UDP and TCP through to it while still refusing an unlisted destination.
+
 ### The IPv6 bypass
 
 Here's an uncomfortable question we had to ask about all of the above: what happens when the workload calls `connect()` on an IPv6 socket?

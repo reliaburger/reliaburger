@@ -1271,7 +1271,7 @@ fn node_can_run(
     spec: &AppSpec,
     dns_required: bool,
 ) -> bool {
-    let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+    let requires_egress = spec.requires_network_policy();
     node.ready
         && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!dns_required || node.capabilities.dns.can_resolve_internal())
@@ -1332,7 +1332,7 @@ fn daemon_eligible_count(
         .as_ref()
         .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
         .unwrap_or_default();
-    let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+    let requires_egress = spec.requires_network_policy();
     crate::meat::scheduler::daemon_candidates(
         cache,
         app_id,

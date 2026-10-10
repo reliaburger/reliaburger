@@ -491,6 +491,15 @@ impl Default for ProcessGrill {
 }
 
 impl super::Grill for ProcessGrill {
+    /// The owned execution gate joins the spec's cgroup before it runs the
+    /// command, on rootful cgroup v2 Linux.
+    fn places_host_processes(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.host_executor_runtime().is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     #[cfg(target_os = "linux")]
     fn host_executor_runtime(&self) -> Option<Self> {
         (self.control.is_some()

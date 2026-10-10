@@ -477,6 +477,16 @@ impl LoopStalls {
     }
 }
 
+/// The forward-path isolation ruleset (`crate::firewall::isolation`) `nft`
+/// holds, the task applying one, and the newest one waiting for it.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[derive(Debug, Default)]
+struct IsolationRules {
+    applied: Option<String>,
+    applying: Option<tokio::task::Id>,
+    waiting: Option<String>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
@@ -559,6 +569,22 @@ pub struct BunAgent<G: Grill> {
     /// reconcile-and-prune reason (NET5). eBPF only.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
+    /// `destination_map` keys (real workload addresses) this node has
+    /// written, so the reconcile deletes the departed ones. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    destination_bpf_keys: std::collections::HashSet<crate::onion::types::DestinationKey>,
+    /// Task addresses and allowlists the delegated job runtimes hold, which
+    /// the kernel reconciliation and sweep must keep. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    delegated_network: std::sync::Arc<crate::bun::task_namespace::DelegatedNetwork>,
+    /// Forward-path isolation ruleset `nft` last applied, the task applying
+    /// one, and the newest one waiting for it. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    isolation_rules: IsolationRules,
+    /// The address workloads resolve names through (the node's DNS
+    /// responder), which every egress allowlist implicitly permits on
+    /// port 53. `None` when `[dns]` is off.
+    workload_dns: Option<std::net::Ipv4Addr>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Exclusive publication checkpoint, or a fence after an uncertain write.
@@ -841,6 +867,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            destination_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            delegated_network: Default::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            isolation_rules: Default::default(),
+            workload_dns: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
@@ -984,6 +1017,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            destination_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            delegated_network: Default::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            isolation_rules: Default::default(),
+            workload_dns: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
@@ -1285,6 +1325,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(runner)
     }
+    /// The network state delegated job runtimes share with this agent.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub fn delegated_network(
+        &self,
+    ) -> std::sync::Arc<crate::bun::task_namespace::DelegatedNetwork> {
+        self.delegated_network.clone()
+    }
+
+    /// The resolver every egress allowlist implicitly permits.
+    pub fn workload_dns(&self) -> Option<std::net::Ipv4Addr> {
+        self.workload_dns
+    }
+
     /// The same kernel owner used by apps, for delegated source ancestry.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn delegated_namespace_kernel(
@@ -1329,6 +1382,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// No-op without the eBPF data path.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
+
+    /// Record the DNS nameserver workloads use, so every egress allowlist
+    /// can resolve names through it. Call before recovery reprograms any
+    /// allowlist.
+    pub fn set_workload_dns(&mut self, nameserver: std::net::Ipv4Addr) {
+        self.workload_dns = Some(nameserver);
+    }
 
     /// Enable on-disk instance records under `dir` ({data_dir}/instances).
     /// Call before deploying anything; also enables `adopt_recorded_instances`.
@@ -1603,7 +1663,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall();
-        if self.namespace_firewall_stale {
+        if self.namespace_firewall_stale || self.delegated_network_changed() {
             self.sync_firewall_ebpf().await;
         }
         self.reresolve_egress();

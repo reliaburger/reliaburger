@@ -118,7 +118,7 @@ impl Scheduler {
         let resources = self.extract_resources(spec);
         let (required, preferred) = self.parse_labels(spec);
         let image = spec.image.as_deref();
-        let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+        let requires_egress = spec.requires_network_policy();
         let requirements = WorkloadRequirements {
             resources: &resources,
             labels: &required,
@@ -558,6 +558,33 @@ mod tests {
             .expect("the capable node should remain eligible");
 
         assert_eq!(decision.placements[0].node_id, NodeId::new("guarded"));
+    }
+
+    #[test]
+    fn allow_from_only_uses_nodes_that_enforce_namespace_isolation() {
+        let mut cluster = ClusterStateCache::new();
+        let incapable = node_state("plain", 2000, 4096, BTreeMap::new());
+        let mut capable = node_state("isolating", 2000, 4096, BTreeMap::new());
+        capable.capabilities.egress = crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        };
+        cluster.set_node(incapable);
+        cluster.set_node(capable);
+
+        let mut spec = default_spec();
+        spec.firewall = Some(crate::config::app::FirewallSpec {
+            allow_from: vec!["shop/api".to_string()],
+        });
+
+        let decision = Scheduler::new(cluster)
+            .schedule_app(&AppId::new("db", "storage"), &spec)
+            .expect("the isolating node should remain eligible");
+
+        assert_eq!(decision.placements[0].node_id, NodeId::new("isolating"));
     }
 
     #[test]

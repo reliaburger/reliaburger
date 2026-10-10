@@ -248,27 +248,144 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .into_iter()
             .cloned()
             .collect();
+        // LOOP-INLINE: in-memory lock held only to copy a small map, no I/O
+        let delegated = self.delegated_network.snapshot().await;
+        let mut jobs = self.isolated_jobs();
+        jobs.extend(delegated.addresses.values().filter_map(|task| {
+            Some((
+                task.namespace.clone(),
+                task.owner.clone(),
+                task.allow_from.clone()?,
+            ))
+        }));
+        let destinations: Vec<_> = services
+            .iter()
+            .map(crate::sesame::firewall::IsolatedDestination::from)
+            .chain(jobs.iter().map(|(namespace, name, allow_from)| {
+                crate::sesame::firewall::IsolatedDestination {
+                    namespace,
+                    name,
+                    app_id: crate::sesame::firewall::workload_app_id(namespace, name),
+                    allow_from: Some(allow_from),
+                }
+            }))
+            .collect();
         let ns_entries = crate::sesame::firewall::resolve_cgroup_namespace_entries(&cgroup_ids);
         let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(
-            &crate::sesame::firewall::resolve_firewall_rules(&services, &cgroup_ids),
+            &crate::sesame::firewall::resolve_destination_rules(&destinations, &cgroup_ids),
+        );
+        let mut workloads = self.local_workloads(&services);
+        workloads.extend(delegated.addresses.iter().map(|(address, task)| {
+            crate::sesame::firewall::LocalWorkload {
+                address: *address,
+                namespace: task.namespace.clone(),
+                name: task.owner.clone(),
+                app_id: crate::sesame::firewall::workload_app_id(&task.namespace, &task.owner),
+            }
+        }));
+        let addresses = crate::sesame::firewall::destination_entries(
+            &services,
+            &self.cluster_catalog,
+            &workloads,
+        );
+        let isolation = crate::firewall::isolation::generate_ruleset(
+            &crate::sesame::firewall::isolation_plan(&workloads, &destinations),
         );
 
         let mut ebpf = handle.lock().await;
-        if let Err(error) = crate::sesame::firewall::reconcile_firewall_maps(
+        // Grants and source identities first, then the destinations they
+        // protect: a new destination never appears before its grants.
+        let reconciled = crate::sesame::firewall::reconcile_firewall_maps(
             &mut ebpf.bpf,
             &ns_entries,
             &fw_entries,
             &mut self.cgroup_ns_bpf_keys,
             &mut self.firewall_bpf_keys,
-        ) {
+        )
+        .and_then(|()| {
+            crate::sesame::firewall::reconcile_destination_map(
+                &mut ebpf.bpf,
+                &addresses,
+                &mut self.destination_bpf_keys,
+            )
+        });
+        drop(ebpf);
+        if let Err(error) = reconciled {
             eprintln!("sesame: firewall reconciliation failed: {error}");
         } else {
             self.namespace_firewall_stale = false;
         }
+        self.apply_isolation_rules(isolation);
+    }
+
+    /// Jobs on this node that open their addresses to named sources in
+    /// other namespaces: `(namespace, name, allow_from)`.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn isolated_jobs(&self) -> Vec<(String, String, Vec<String>)> {
+        self.recorded_jobs
+            .values()
+            .filter_map(|job| {
+                let allow_from = job.spec.firewall.as_ref()?.allow_from.clone();
+                Some((job.namespace.clone(), job.name.clone(), allow_from))
+            })
+            .collect()
+    }
+
+    /// Every local workload address and its owner: each instance with its
+    /// own container address belongs, on every port, to its namespace. A
+    /// workload that publishes a service carries the service's identity, so
+    /// one `allow_from` grant covers its VIP and its real addresses alike.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn local_workloads(
+        &self,
+        services: &[crate::onion::types::ServiceEntry],
+    ) -> Vec<crate::sesame::firewall::LocalWorkload> {
+        self.supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| !matches!(instance.state, ContainerState::Stopped))
+            .filter_map(|instance| {
+                let address = instance.container_ip?;
+                let app_id = services
+                    .iter()
+                    .find(|service| {
+                        service.namespace == instance.namespace
+                            && service.app_name == instance.app_name
+                    })
+                    .map_or_else(
+                        || {
+                            crate::sesame::firewall::workload_app_id(
+                                &instance.namespace,
+                                &instance.app_name,
+                            )
+                        },
+                        |service| service.app_id,
+                    );
+                Some(crate::sesame::firewall::LocalWorkload {
+                    address,
+                    namespace: instance.namespace.clone(),
+                    name: instance.app_name.clone(),
+                    app_id,
+                })
+            })
+            .collect()
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn sync_firewall_ebpf(&mut self) {}
+
+    /// Whether a delegated job runtime changed its addresses or allowlists
+    /// since the last look, so the kernel maps need reconciling.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) fn delegated_network_changed(&self) -> bool {
+        self.delegated_network.take_changed()
+    }
+
+    /// No delegated runtime shares network state without the eBPF data path.
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    pub(super) fn delegated_network_changed(&self) -> bool {
+        false
+    }
 
     /// Register a rolled-out app's service and its replacement backends. The
     /// caller restores the previous reservation if this refuses.

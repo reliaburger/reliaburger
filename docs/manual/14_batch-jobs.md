@@ -340,12 +340,36 @@ GPU placement is tracked separately in #359. Test-lease workloads retain their
 lease-aware admission; unowned lease namespaces and images are refused here.
 
 With eBPF enabled, image tasks inherit their namespace before starting. They
-may reach services in that namespace; cross-namespace services are refused.
-Batch templates currently have no explicit cross-namespace grant or egress
-allowlist fields. Without eBPF, namespace network enforcement is unavailable,
-as it is for ordinary apps. The worker caches at most 256 namespace bindings,
-evicts only idle bindings, and journals them for cleanup after old executors
-retire at startup. Losing the source binding stops its original runtime owner.
+may reach services in that namespace; cross-namespace services are refused,
+at their VIPs and their real addresses alike. A job, or a batch template,
+takes the same network policy an app does:
+
+```toml
+[job.crawl]
+image = "registry.example.com/crawler@sha256:..."
+runtime = "shared-runc"
+
+[job.crawl.egress]
+allow = ["api.example.com:443"]
+
+[job.crawl.firewall]
+allow_from = ["frontend/dashboard"]
+```
+
+The egress allowlist goes into the task's cgroup before its command runs, and
+always permits the node's DNS responder on port 53. A name that doesn't
+resolve within five seconds refuses the attempt rather than starting it
+without its allowlist. Reused executors run commands with the same allowlist
+only: the policy is part of the executor profile, so two templates that differ
+in `egress` or `firewall` never share a container. A job publishes no service,
+so `allow_from` names the apps in other namespaces that may reach the task's
+own container address. Both need a container task on rootful Linux runc with
+eBPF: nodes that can't enforce them refuse the array, and `runtime =
+"process"` refuses both. Without eBPF, namespace network enforcement is
+unavailable, as it is for ordinary apps. The worker caches at most 256
+namespace bindings, evicts only idle bindings, and journals them for cleanup
+after old executors retire at startup. Losing the source binding stops its
+original runtime owner.
 
 Local packing is non-preemptive. Existing applications have reserved requests;
 new deployments and rolling replacements also need free capacity. There is no

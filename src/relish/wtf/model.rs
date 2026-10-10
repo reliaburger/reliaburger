@@ -346,6 +346,26 @@ pub struct ClusterEvidence {
     pub registry: Evidence<Vec<RegistryObservation>>,
     /// API token lifetimes, never secrets.
     pub tokens: Evidence<Vec<TokenObservation>>,
+    /// Which namespaces exist and which nodes can keep them apart.
+    pub isolation: Evidence<IsolationObservation>,
+}
+
+/// Namespace isolation across the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationObservation {
+    /// Every namespace with a desired app.
+    pub namespaces: Vec<String>,
+    /// Whether each node that reported can enforce isolation.
+    pub nodes: Vec<NodeIsolation>,
+}
+
+/// One node's ability to hold workloads to namespace isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeIsolation {
+    /// Node identity.
+    pub node_id: String,
+    /// The node's live eBPF hooks and runtime can enforce isolation.
+    pub enforced: bool,
 }
 
 /// One API token's lifetime, as `GET /v1/token/list` reports it.

@@ -47,6 +47,11 @@ the nodes that answered run and names the one that didn't. If the nodes that
 answered disagree, the `version-skew` warning carries the silent node in its
 details.
 
+When desired apps span more than one namespace, `wtf` checks that every node
+can keep them apart. A node without the live eBPF hooks (rootless runc,
+ProcessGrill, eBPF off) gets a `namespace-isolation` warning naming it: there,
+any namespace's workloads reach any other's, and `allow_from` is refused.
+
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
 fenced out of a council `relish council recover` replaced, when nodes serve
