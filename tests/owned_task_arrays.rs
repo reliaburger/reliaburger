@@ -91,7 +91,8 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
                 .starts_with("rbtest-batch__executor-")
         })
         .count();
-    assert_eq!(retained, 2, "retired runtime metadata grew with task count");
+    // Retired executors are forgotten (#678): nothing remains, at any task count.
+    assert_eq!(retained, 0, "retired runtime metadata was kept");
     let inventory = runtime.launch_inventory().await.unwrap().unwrap();
     assert!(
         inventory.len() <= 2,
