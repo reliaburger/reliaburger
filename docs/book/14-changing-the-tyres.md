@@ -690,7 +690,7 @@ relish upgrade resume                  # carry on after a pause
 
 `check` fetches the **release metadata** — a static JSON file listing versions and per-platform artefacts (`{os}-{arch}` keys from `std::env::consts`, so the binary knows its own platform). The metadata is served over HTTPS but deliberately *not* signed: it can at worst advertise versions that don't exist, because nothing executes without the per-binary dual signatures from §14.2. Signing the metadata (TUF-style freshness guarantees) is real hardening we consciously deferred; the trust anchor is the binary signature, full stop.
 
-`start` has two personalities. The network flow downloads the artefact, checks its hash against the metadata, and takes the signatures from the metadata entry. The air-gapped flow reads a local file and its `.sig` envelope. Either way relish then asks the connected node a question that shapes everything after: *are you a cluster?* (`GET /v1/upgrade/cluster` answers 503 on a single node.) Single node → build a `LocalFile` directive and POST it straight to §14.6's node-level endpoint. Cluster → push the binary as a content-addressed blob to the leader's Pickle registry (a plain monolithic Distribution-API upload — the same registry that serves container images happily serves *our own* binary, which has a pleasing circularity), then POST the plan to `/v1/upgrade/start` and let the orchestrator walk.
+`start` has two personalities. The network flow downloads the artefact, checks its hash against the metadata, and takes the signatures from the metadata entry. (As first written it also picked the artefact by relish's own platform, took the operator's signature from metadata that never carries one, and read any error as "single node". "The headline command that couldn't", at the end of this chapter, fixes all three.) The air-gapped flow reads a local file and its `.sig` envelope. Either way relish then asks the connected node a question that shapes everything after: *are you a cluster?* (`GET /v1/upgrade/cluster` answers 503 on a single node.) Single node → build a `LocalFile` directive and POST it straight to §14.6's node-level endpoint. Cluster → push the binary as a content-addressed blob to the leader's Pickle registry (a plain monolithic Distribution-API upload — the same registry that serves container images happily serves *our own* binary, which has a pleasing circularity), then POST the plan to `/v1/upgrade/start` and let the orchestrator walk.
 
 Notice what relish deliberately does **not** do: verify the signatures itself. It could — it embeds the same release keys — but the nodes *must* verify regardless (relish is outside their trust boundary), and a relish-side check would give integration tests signed with throwaway keys a false failure. One verification, in the place that matters.
 
@@ -1561,3 +1561,106 @@ We didn't upgrade the leader first on a two-voter council either. The leader exe
 `plan::tests` pins the arithmetic: `a_two_voter_council_is_refused_before_the_run_is_recorded` checks the variant's fields and that the message asks for three voters, and `one_voter_or_three_and_more_can_roll` walks the sizes that pass, zero included. `bun::api`'s `a_two_voter_council_refuses_to_roll_and_three_voters_can` checks the wiring: it forms an in-memory Raft council of two voters and one of three, and the handlers' check reads each one's configured voters, refusing the pair with a 409 that asks for a third node and letting the trio through.
 
 We first wrote that as a real-binary test in the cluster upgrade suite, and it timed out waiting for the second node to vote. Three minutes in, the council still had one voter. The suite's own forwarding test says why in a comment: its harness keeps a one-voter council, so it can't build a two-voter one at all. We kept the in-memory version rather than teach the harness to grow its council for one assertion.
+
+
+## The headline command that couldn't
+
+`relish upgrade start v0.2.0` is the command the whole chapter builds up to, and the 0.2.0 audit ([#687](https://github.com/reliaburger/reliaburger/issues/687)) found that it had never worked against a published release. Three things were wrong, and each one alone was enough.
+
+The first was the signature. A network upgrade needs two: the release's and the operator's (§14.2). `package.py` writes the release one into `metadata.json` and, quite properly, `null` for the operator's, because only the operator holds that key. The version form copied that `null` straight into the directive, and `--sig` only worked with `--binary`. Every node then refused with `ExternalKeyRequired` or `ExternalSignatureInvalid`. The only working path was to download the binary by hand, countersign it, and roll it with `--binary`.
+
+The second was the platform. relish chose the artefact with `platform_key()`, which is `std::env::consts::OS` and `ARCH` of the machine relish runs on. From a Mac that's `macos-aarch64`, and there is no bun for macOS in the metadata, so the command found nothing. From an x86_64 admin box upgrading arm64 nodes it found something worse: the wrong architecture, which then failed the `--compatibility` probe on every node.
+
+The third was the fallback. relish decides between a cluster and a single node by asking `GET /v1/upgrade/cluster`, and it treated *any* error as "no council here". A timeout or a 502 in a real cluster turned a rolling upgrade into a single-node one, aimed at whichever node relish happened to be connected to. Possibly the leader. No ordering, no quorum check, no run record, and in the network form a directive pointing at a temp file that existed only on the laptop.
+
+### Asking the nodes
+
+The fix for the platform is to ask the right machine. `/v1/version` now carries `platform`, and relish asks every live node through the connected node's relay (the same one `relish wtf` uses), so it works from a laptop that can't reach the guests directly. Then it picks one artefact per platform present:
+
+```rust
+let mut chosen = BTreeMap::new();
+for node in nodes {
+    let (platform, artifact) = release
+        .platforms
+        .get_key_value(&node.platform)
+        .ok_or_else(|| /* names the node and its platform */)?;
+    chosen.insert(platform.as_str(), artifact);
+}
+Ok(chosen.into_iter().collect())
+```
+
+`get_key_value` returns the map's own copy of the key as well as the value, both borrowed from `release`. That matters for the return type, `Vec<(&'a str, &'a PlatformArtifact)>`: the `'a` says both halves live as long as the metadata does, which the node's own `String` wouldn't. A `BTreeMap` rather than a `HashMap` gives a sorted, deterministic order, so the download log and the tests don't depend on hashing.
+
+One artefact per platform means the cluster run has to carry several builds, and each node has to get its own. `ClusterUpgradeState` used to hold one `binary_sha256` and one pair of signatures. It now holds `binaries: Vec<PlatformBinary>`, and every `NodeUpgradeRecord` remembers its node's `platform`, filled in from the probes the leader already makes at start, or from the orchestrator's first poll. The choice itself is strict:
+
+```rust
+match platform {
+    Some(platform) => binaries.iter().find(|binary| binary.platform == platform),
+    None => match binaries {
+        [only] => Some(only),
+        _ => None,
+    },
+}
+```
+
+`[only]` is a *slice pattern*: it matches a slice of exactly one element and binds it. A node whose platform we know gets exactly its own build or nothing; one we haven't heard from yet gets the only build if there is just one. "Nothing" becomes a refused directive that pauses the run with `the upgrade carries no v0.2.0 build for platform linux-aarch64`, which beats handing it an x86_64 binary. The leader checks the same thing before it records the run, so in practice that refusal comes back to relish as a 409.
+
+The orchestrator change ran into the borrow checker in a way worth showing. The walk loops over `state.nodes.iter_mut()` and, inside the loop, needs to build a directive from the rest of `state`. Rust won't let you hold a mutable borrow of one field while also borrowing the whole struct. Cloning `state` every tick would work but copies the node list, which can be thousands long. Instead:
+
+```rust
+let nodes = std::mem::take(&mut state.nodes);
+let binaries = state.clone();
+state.nodes = nodes;
+```
+
+`std::mem::take` moves the vector out and leaves an empty one in its place, so the clone copies everything but the nodes. Then the vector goes back. Three lines, no `unsafe`, and the compiler is satisfied that nobody can see the node list half-moved.
+
+### The operator's signature
+
+The version form now takes `--external-key`: relish downloads each build, checks its hash against the metadata, and countersigns it with the operator's key, using the same `signing::countersign` that `relish dev countersign-binary` uses. Or the operator countersigns beforehand and passes the envelope with `--sig`, as long as every node shares one platform (one envelope signs one binary). If neither is given, and the metadata comes from a public host that has no operator signature, relish stops before downloading anything and says which flag to pass. Better one clear refusal on the laptop than a 409 from every node.
+
+### Only "no council" means single node
+
+The fallback now reads the answer as a type, not a hope:
+
+```rust
+pub fn topology(answer: Result<serde_json::Value, RelishError>) -> Result<Topology, RelishError> {
+    match answer {
+        Ok(state) => Ok(Topology::Cluster(state)),
+        Err(RelishError::ApiError { status: 503, ref body }) if says_no_council(body) => {
+            Ok(Topology::SingleNode)
+        }
+        Err(error) => Err(error),
+    }
+}
+```
+
+The middle arm combines three things. It destructures the error variant and matches the literal `503` in its `status` field at the same time. `ref body` borrows the field instead of moving it out, because the guard (`if says_no_council(body)`) runs before Rust knows the arm is taken, and if the guard fails the last arm still needs the whole `error`. And the guard compares the body's `error` with `crate::upgrade::NO_COUNCIL`, the same constant the bun handlers answer with, so the two sides can't drift apart. `start`, `status` and `rollback` all go through `topology`, and every other failure surfaces as itself.
+
+### Staging that cleans up after itself
+
+On a single node the downloaded binary has to land somewhere the local bun can read. It used to go to `$TMPDIR/reliaburger-upgrade-<sha>` with `std::fs::write`, a predictable name that follows a symlink someone planted there, and it was never removed. Now `StagedBinary` holds a `tempfile::TempDir`, created owner-only with a random name, and writes the file with `create_new`, which refuses anything already at the path. `TempDir` deletes the directory in its `Drop` implementation, so the staged copy disappears as soon as the `StagedBinary` goes out of scope, after the node has answered (it reads the file before it does). That's RAII (resource acquisition is initialisation): the value owns the resource, so the cleanup can't be forgotten on an early `return` or a `?`.
+
+### Same format only, until 1.0
+
+Fixing all of that still leaves an honest problem. Every release from 0.1.0 to 0.2.0 changed the cluster protocol or the state format, and nodes refuse a binary with another pair. So no published release has ever rolled onto another, and none could. The maintainer's decision (D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674)) was to say so plainly: until 1.0, self-upgrade works between builds of the same format, and a format change needs a fresh cluster. Shipping a patch release that keeps its predecessor's pair, and qualifying a real published-to-published walk on it, is a goal rather than a 0.2.0 gate.
+
+Two changes make that rule visible before anyone hits a refusal. `package.py` now publishes each release's `compatibility` pair in `metadata.json`, read from `CURRENT` in `src/compatibility.rs`, and `relish upgrade check` compares it with what the cluster speaks. A 0.1.6 operator asking about 0.2.0 gets `v0.2.0 changes the cluster formats (protocol 46 -> 51, state 63 -> 68), so it needs a fresh cluster`, not a command the cluster will refuse. `start` refuses the same release before it downloads anything. The [release guide](../releasing.md#upgrading-from-016) has the recreate procedure and the list of what doesn't survive it.
+
+The other change is the version number. Builds from main said `0.1.6` while speaking 51/68, so a tip `relish setup --quickstart` downloaded released 0.1.6 nodes that refused it, its refusals named "reliaburger v0.1.6" next to the new pair, and a dev `bun-v0.1.6` collided in the binary store with the real one. Main is now `0.2.0-dev`. `BinaryVersion::is_pre_release` asks semver whether the version has a pre-release part, and quickstart refuses a pre-release without `--development-binaries` or a candidate mirror, because there is nothing correct to download for it.
+
+### Tests
+
+`relish::upgrade::tests` covers each finding. `version_form_carries_the_countersigned_external_signature` checks that both `--external-key` and a countersigned `--sig` produce a signature `verify_binary` accepts with the operator's key, and that neither, an envelope for other bytes, or one never countersigned is refused. `artefact_is_chosen_per_node_platform_not_cli_host` gives an arm64 cluster, a mixed one and a node on a platform the release lacks. `a_cluster_timeout_does_not_fall_back_to_single_node` and `only_no_council_answer_selects_the_single_node_path` pin `topology`. `check_reports_a_format_change_as_needing_a_fresh_cluster` renders `check` for both pairs, and `network_download_is_staged_privately_and_removed` checks the directory's mode and that dropping the value removes it.
+
+On the bun side, `upgrade::orchestrator`'s `each_node_is_directed_to_the_build_for_its_own_platform` and `a_node_whose_platform_has_no_build_fails_instead_of_taking_another` drive the walk with mock nodes on two platforms, and `upgrade::plan`'s `each_node_is_compared_with_the_build_for_its_platform` does the same for the start-time checks. `metadata_json_carries_the_compatibility_pair` in `scripts/release/test_package.py` packages a release and compares the pair with the source. Quickstart's `a_dev_version_without_development_binaries_is_refused` pins the new refusal.
+
+The gated cluster suite gained `version_form_rolls_the_nodes_platform_build_countersigned_by_relish`. It serves release metadata from a local HTTP server, with the real build under the nodes' platform and a decoy under another, and runs `relish upgrade start v0.2.0 --external-key` against four real nodes. A copy of the metadata one protocol generation on is refused with "fresh cluster" before anything is recorded; the real one completes. Every node in that harness runs on the test host's platform, so it can't show a mixed cluster; the unit tests do that.
+
+### What we decided not to do
+
+We didn't make the leader download the release. It would know every node's platform without asking, but it would need outbound internet access that air-gapped clusters don't have, and the operator's key would have to live on the cluster. Keeping download and countersigning on the operator's machine keeps that key off every node.
+
+We didn't let `--binary` cover a mixed cluster. One file is one architecture's build. Taking a `--binary` per platform would be possible, but the version form already does that job with less to get wrong.
+
+And we didn't sign the metadata. It's still a list of things that exist, and the binary signatures are still the trust anchor. The new `compatibility` field can at worst make `check` give wrong advice; the nodes' own `--compatibility` probe is what actually refuses.

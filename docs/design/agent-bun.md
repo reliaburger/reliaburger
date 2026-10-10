@@ -1268,11 +1268,24 @@ Three decisions shape everything that follows, and each earns its keep against t
 The whole rolling walk lives in Raft under `DesiredState.active_upgrade`, so a leader change mid-run is a *resume*, not a restart: whichever node holds leadership drives the loop from the replicated state. Each tick polls reality first (`GET /v1/version` per node) and takes at most one round of actions, which makes every directive idempotent by observation.
 
 ```
-1. Start: relish verifies the binary (SHA-256 + dual signatures) and pushes
-   it to the leader's Pickle. The leader records the plan in Raft. The plan's
-   per-node ROLE and ADDRESS are derived server-side from gossip membership
-   and the Raft voter set — a client can't upgrade a node under a false
-   identity (a spoofed address or a mislabelled leader is rejected).
+1. Start: relish asks every node its platform (`platform` in
+   GET /v1/version, through the connected node's relay), downloads one
+   release build per platform present, checks each against the metadata's
+   SHA-256, adds the operator's signature (--external-key, or a countersigned
+   --sig) and pushes each to the connected node's Pickle. The start request
+   carries `binaries`, one PlatformBinary { platform, sha256, signatures }
+   per platform. The leader records the plan in Raft with each node's
+   platform; the orchestrator directs every node to its own platform's build
+   and refuses a node whose platform has none. The plan's per-node ROLE and
+   ADDRESS are derived server-side from gossip membership and the Raft voter
+   set — a client can't upgrade a node under a false identity (a spoofed
+   address or a mislabelled leader is rejected).
+
+   relish takes the single-node path only on the node's explicit 503
+   "no council on this node" from GET /v1/upgrade/cluster; any other error
+   stops the command. Until 1.0 a rolling upgrade works only between builds
+   with the same protocol and state pair; `metadata.json` names each
+   release's pair, and relish refuses a release with another one.
 
 2. Workers, in batches of --parallel (default 1):
    direct each, then wait until it polls back healthy at the target AND

@@ -97,6 +97,19 @@ class ReleasePackageTests(unittest.TestCase):
         result = subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-keyform", "DER", "-inkey", str(self.key), "-in", str(path), "-sigfile", str(signature)], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_metadata_json_carries_the_compatibility_pair(self):
+        # `relish upgrade check` compares this pair with the cluster's: a
+        # release with another pair needs a fresh cluster, not a rolling upgrade.
+        self.package()
+        source = (Path(__file__).resolve().parents[2] / "src/compatibility.rs").read_text()
+        block = source[source.index("pub const CURRENT"):]
+        expected = {
+            "protocol": int(block.split("protocol:")[1].split(",")[0]),
+            "state": int(block.split("state:")[1].split(",")[0]),
+        }
+        bun = json.loads((self.assets / "metadata.json").read_text())
+        self.assertEqual(bun["releases"][0]["compatibility"], expected)
+
     def test_installer_pins_cli_hash_and_refuses_modified_download(self):
         self.package()
         installer = self.assets / "install.sh"

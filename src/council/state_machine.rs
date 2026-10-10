@@ -7097,9 +7097,7 @@ mod tests {
         crate::upgrade::types::ClusterUpgradeState {
             upgrade_id: upgrade_id.to_string(),
             target_version: "v0.2.0".parse().unwrap(),
-            binary_sha256: "abc123".to_string(),
-            embedded_signature: "sig".to_string(),
-            external_signature: None,
+            binaries: Vec::new(),
             parallel: 1,
             direction: crate::upgrade::types::UpgradeDirection::Upgrade,
             phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,

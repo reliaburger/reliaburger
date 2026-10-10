@@ -188,7 +188,10 @@ candidate verification and the matching installer environment variable.
 ## Development qualification
 
 To try a change that isn't in a release, build Linux `bun` and `relish` with
-`--features ebpf` and supply their directory explicitly:
+`--features ebpf` and supply their directory explicitly. A build from main
+carries a `-dev` version (such as `0.2.0-dev`), and setup refuses to download
+release nodes for it, because none exist and the last release speaks older
+cluster formats:
 
 ```sh
 RELIABURGER_HOME=/absolute/path/to/isolated-state \

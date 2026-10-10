@@ -31,6 +31,11 @@ pub use version::{BinaryVersion, resolve_running_version};
 /// (single path segment — the registry routes require it).
 pub const BINARY_BLOB_REPO: &str = "reliaburger-bun";
 
+/// The `error` a node without a council answers the cluster upgrade
+/// endpoints with, as a 503. It is the one answer that tells `relish upgrade`
+/// it is talking to a single node; every other failure is a failure.
+pub const NO_COUNCIL: &str = "no council on this node";
+
 /// Does this HTTP status mean "not right now" rather than "no"?
 ///
 /// Server errors, request timeouts and rate limits say nothing about the

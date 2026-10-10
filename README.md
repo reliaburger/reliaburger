@@ -306,8 +306,12 @@ accepted outcomes survive leader changes; retired nodes receive no new work.
 workers first, then council members one at a time, leader last. The new binary
 adopts running workloads without restarting them, and a crash-looping upgrade
 reverts itself. Network upgrades need two Ed25519 signatures: the release's
-and your own. A release with other cluster formats, or a rollback to a version
-some node doesn't hold, is refused before anything is recorded.
+and your own, which `--external-key` adds as relish downloads the build for
+each node's platform. Until 1.0 it works only between builds with the same
+cluster formats; every release so far changed them, so moving between
+releases means a fresh cluster. A release with other cluster formats, or a
+rollback to a version some node doesn't hold, is refused before anything is
+recorded.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
 one screen of problems and next steps. `relish path` walks the network path

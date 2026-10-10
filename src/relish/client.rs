@@ -112,6 +112,12 @@ pub struct AgentVersion {
     /// its self-upgrade manager, which is what hashes it.
     #[serde(default)]
     pub binary_sha256: Option<String>,
+    /// `{os}-{arch}` the agent runs on: which release artefact fits it.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// The cluster formats the agent speaks.
+    #[serde(default)]
+    pub compatibility: Option<crate::compatibility::Compatibility>,
 }
 
 /// Client for the Bun agent HTTP API.

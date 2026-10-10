@@ -10,14 +10,25 @@ cluster, and getting the council back when everything else has gone wrong.
 The new binary adopts running workloads without restarting them, and one that
 crash-loops on boot reverts to the previous version by itself.
 
+Until 1.0 it works only between builds of the same format. Every build speaks
+one cluster protocol and one state format (`bun --compatibility` prints them),
+and a node takes only a binary with its own pair. Every release from 0.1.0 to
+0.2.0 changed one or the other, so none of them can roll onto the release
+before it: moving between them means a fresh cluster, as described below.
+`relish upgrade` is for a later build with the same pair, such as a patch release that doesn't
+change a format, or your own rebuild. `relish upgrade check` tells you which
+case you're in.
+
 ```sh
-relish upgrade check                  # is there a newer release?
-relish upgrade plan v0.2.0            # the rolling order and an estimate
-relish upgrade start v0.2.0           # download, verify, roll
+relish upgrade check                  # is there a newer release, and can it roll?
+relish upgrade plan v0.2.1            # the rolling order and an estimate
+relish upgrade start v0.2.1 --external-key keys/release.key
+                                      # download, countersign, verify, roll
+relish upgrade start --binary ./bun-v0.2.1   # a local, countersigned binary
 relish upgrade status
 relish upgrade resume                 # continue a paused upgrade
 relish upgrade abort                  # end a paused upgrade that moved no node
-relish upgrade rollback v0.1.0        # also replaces a paused upgrade
+relish upgrade rollback v0.2.0        # also replaces a paused upgrade
 ```
 
 To see what a node runs, ask it. `bun --version` and `relish --version` print
@@ -44,17 +55,42 @@ It needs three things on every node:
   `relish dev keygen --out keys/` (or
   `openssl genpkey -algorithm ed25519 -outform DER -out operator.key`) and
   countersign each release binary with
-  `relish dev countersign-binary --external-key keys/release.key bun-v0.2.0`.
-  That adds your signature to the release's `bun-v0.2.0.sig` and leaves the
+  `relish dev countersign-binary --external-key keys/release.key bun-v0.2.1`.
+  That adds your signature to the release's `bun-v0.2.1.sig` and leaves the
   release signature as it is; it also prints the `ed25519:…` public key to
   put in node.toml.
 
-`relish upgrade start --binary ./bun-v0.2.0` rolls a local binary instead of
-downloading one, with its signatures in `bun-v0.2.0.sig` beside it (or
+Published release metadata carries only the release's signature, never yours,
+so the version form needs your key or your envelope. With
+`--external-key keys/release.key`, relish countersigns each binary it
+downloads before pushing it. Or countersign the downloaded binary yourself and
+pass the envelope with `--sig bun-v0.2.1.sig`, which works when every node
+runs on the same platform. Without either, `start` stops before it downloads
+anything and says so.
+
+relish downloads the build for the platform each node reports
+(`platform` in `GET /v1/version`, such as `linux-aarch64`), not for the
+machine relish runs on: from a Mac it still fetches the Linux builds the nodes
+need. A cluster that mixes architectures gets one build per platform, each
+node fetches its own, and `start` refuses before recording anything if the
+release has no build for one of them.
+
+`relish upgrade start --binary ./bun-v0.2.1` rolls a local binary instead of
+downloading one, with its signatures in `bun-v0.2.1.sig` beside it (or
 `--sig`). On a single node that's an air-gapped upgrade and needs only the
 release signature. In a cluster the other nodes fetch the binary from the
 registry, which counts as the network, so every node wants both signatures:
-countersign it first.
+countersign it first. One local file is one platform's build, so the cluster
+form refuses `--binary` when the nodes run on more than one platform.
+
+relish asks the node it's connected to whether it belongs to a cluster
+(`GET /v1/upgrade/cluster`). Only the node's own answer that it has no
+council makes `start`, `status` and `rollback` act on that single node. Any
+other failure, such as a timeout or a 5xx, stops the command with that error:
+an upgrade that silently fell back to the connected node alone would skip the
+rolling order, the quorum checks and the run record. On a single node, a
+downloaded binary is staged in a fresh private directory for the node to read,
+and removed once the node has answered.
 
 relish pushes the binary to the registry of the node it's connected to and
 tells the other nodes to fetch it from that node's cluster address. From a
@@ -97,6 +133,15 @@ recorded:
 refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58. …
 ```
 
+From 0.2.0 the release metadata names each release's pair (`compatibility` in
+`metadata.json`), so relish can tell sooner. `relish upgrade check` reports a
+release with another pair as needing a fresh cluster instead of offering the
+command, and `relish upgrade start <version>` refuses it before downloading:
+
+```text
+v0.2.1 changes the cluster formats (protocol 51 -> 52, state 68 -> 68), so it needs a fresh cluster, not `relish upgrade start`; see …
+```
+
 A cluster `rollback` never downloads anything: each node goes back to a binary
 already in its binary directory. So the leader first asks every node which
 versions it holds (`installed_versions` in `GET /v1/version`) and refuses a
@@ -137,6 +182,12 @@ it the same way
 And 0.1.6: protocol 46 and state format 63. A 0.1.5 cluster's leader refuses
 it the same way
 ([upgrading from 0.1.5](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-015)).
+And 0.2.0: protocol 51 and state format 68. A 0.1.6 cluster's leader refuses
+it the same way, and moving means recreating the cluster, which loses
+everything the council held
+([upgrading from 0.1.6](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-016)).
+So no published release has yet rolled in place onto another; the first that
+can will be a release that keeps 0.2.0's pair.
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it

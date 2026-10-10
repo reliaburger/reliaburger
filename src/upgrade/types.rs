@@ -100,9 +100,11 @@ pub struct NodeUpgradeStatus {
 pub struct ClusterUpgradeState {
     pub upgrade_id: String,
     pub target_version: BinaryVersion,
-    pub binary_sha256: String,
-    pub embedded_signature: String,
-    pub external_signature: Option<String>,
+    /// The target's build for each platform the cluster runs on, one entry
+    /// per platform. A cluster of one architecture has one entry; a mixed
+    /// cluster has one per architecture. Empty for rollbacks (each node
+    /// returns to a binary already on its disk).
+    pub binaries: Vec<PlatformBinary>,
     /// Worker batch size (council members always go one at a time).
     pub parallel: u32,
     pub direction: UpgradeDirection,
@@ -120,6 +122,17 @@ pub struct ClusterUpgradeState {
 }
 
 impl ClusterUpgradeState {
+    /// The build a node on `platform` should run.
+    ///
+    /// A node whose platform is known gets the entry for exactly that
+    /// platform, or nothing: pushing an x86_64 binary to an arm64 node is the
+    /// mistake this exists to prevent. A node not yet probed (`None`) gets the
+    /// only entry when there is just one, and nothing when the choice is
+    /// ambiguous.
+    pub fn binary_for(&self, platform: Option<&str>) -> Option<&PlatformBinary> {
+        select_binary(&self.binaries, platform)
+    }
+
     /// Should the scheduler avoid placing new work on this node right now?
     pub fn is_node_cordoned(&self, node_id: &str) -> bool {
         self.nodes.iter().any(|record| {
@@ -129,6 +142,34 @@ impl ClusterUpgradeState {
                     NodeUpgradePhase::Directed | NodeUpgradePhase::Verifying
                 )
         })
+    }
+}
+
+/// One platform's build of an upgrade target: its digest and signatures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformBinary {
+    /// `{os}-{arch}` as nodes report it on `/v1/version` (`linux-x86_64`).
+    pub platform: String,
+    /// Hex SHA-256 of the binary; also its content address in Pickle.
+    pub sha256: String,
+    /// Base64 Ed25519 signature from the release key set.
+    pub embedded_signature: String,
+    /// Base64 Ed25519 signature from the operator's external key.
+    pub external_signature: Option<String>,
+}
+
+/// The build in `binaries` for a node on `platform`; see
+/// [`ClusterUpgradeState::binary_for`].
+pub fn select_binary<'a>(
+    binaries: &'a [PlatformBinary],
+    platform: Option<&str>,
+) -> Option<&'a PlatformBinary> {
+    match platform {
+        Some(platform) => binaries.iter().find(|binary| binary.platform == platform),
+        None => match binaries {
+            [only] => Some(only),
+            _ => None,
+        },
     }
 }
 
@@ -180,6 +221,11 @@ pub struct NodeUpgradeRecord {
     /// API address for directives and version polling.
     pub address: String,
     pub role: NodeRole,
+    /// `{os}-{arch}` the node reports, which picks its entry in
+    /// [`ClusterUpgradeState::binaries`]. Filled in at start, or from the
+    /// first poll for a node that didn't answer then.
+    #[serde(default)]
+    pub platform: Option<String>,
     /// Populated from the first `/v1/version` poll.
     pub from_version: Option<BinaryVersion>,
     pub phase: NodeUpgradePhase,

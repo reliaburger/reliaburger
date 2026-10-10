@@ -18,9 +18,10 @@ fn run(args: &[&str]) -> Output {
 fn version_reports_the_compiled_binary() {
     let output = run(&["--version"]);
     assert!(output.status.success());
+    let version = env!("CARGO_PKG_VERSION");
     let expected = match reliaburger::upgrade::version::build_commit() {
-        Some(commit) => format!("relish 0.1.6 ({})\n", &commit[..7]),
-        None => "relish 0.1.6\n".to_string(),
+        Some(commit) => format!("relish {version} ({})\n", &commit[..7]),
+        None => format!("relish {version}\n"),
     };
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     assert!(output.stderr.is_empty());

@@ -232,6 +232,7 @@ mod tests {
             node_id: node.to_string(),
             address: "127.0.0.1:9117".to_string(),
             role: NodeRole::Worker,
+            platform: None,
             from_version: None,
             phase,
             since: None,
@@ -240,9 +241,7 @@ mod tests {
         let upgrade = ClusterUpgradeState {
             upgrade_id: "up-1".to_string(),
             target_version: "v0.2.0".parse().unwrap(),
-            binary_sha256: String::new(),
-            embedded_signature: String::new(),
-            external_signature: None,
+            binaries: Vec::new(),
             parallel: 1,
             direction: UpgradeDirection::Upgrade,
             phase: ClusterUpgradePhase::UpgradingWorkers,

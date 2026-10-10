@@ -52,6 +52,29 @@ const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// Budget for everything after the downloads: VMs, nodes, quorum and demo.
 const CLUSTER_DEADLINE: Duration = Duration::from_secs(300);
 
+/// Refuse to fetch release binaries for a development build.
+///
+/// A build from main carries a `-dev` version (`0.2.0-dev`) and speaks
+/// main's cluster formats. No release of that version exists, and the last
+/// published one speaks older formats, so there is nothing right to
+/// download: such a build has to bring its own nodes. A pre-release from an
+/// explicit mirror (a release candidate) is fine.
+fn check_release_source(
+    version: &BinaryVersion,
+    development_binaries: bool,
+    release_mirror: bool,
+) -> Result<()> {
+    if version.is_pre_release() && !development_binaries && !release_mirror {
+        bail!(
+            "relish {version} is a development build, and no release of it exists to \
+             download; build Linux bun and relish and pass --development-binaries <dir> \
+             (see docs/quickstart.md, \"Development qualification\"), or install a \
+             released relish"
+        );
+    }
+    Ok(())
+}
+
 /// Create or resume a cluster, preserving checkpoints. Building the cluster
 /// has a five-minute deadline; downloads have their own, because their speed
 /// depends on the network rather than on us.
@@ -60,6 +83,11 @@ pub async fn run(options: Options) -> Result<()> {
         bail!("a release mirror cannot be combined with development binaries");
     }
     let version = env!("CARGO_PKG_VERSION").parse::<BinaryVersion>()?;
+    check_release_source(
+        &version,
+        options.development_binaries.is_some(),
+        options.release_mirror.is_some(),
+    )?;
     let mut downloader = Downloader::new(DOWNLOAD_STALL)?;
     if let Some(mirror) = &options.release_mirror {
         downloader = downloader.with_release_mirror(&version, mirror)?;
@@ -870,6 +898,22 @@ async fn probe_demo(port: u16) -> Result<()> {
 mod tests {
     use super::*;
     use crate::bun::agent::{CouncilMemberInfo, CouncilStatus};
+
+    #[test]
+    fn a_dev_version_without_development_binaries_is_refused() {
+        let dev: BinaryVersion = "0.2.0-dev".parse().unwrap();
+        let refused = check_release_source(&dev, false, false).unwrap_err();
+        assert!(
+            refused.to_string().contains("--development-binaries"),
+            "{refused}"
+        );
+        // With its own nodes, or a candidate mirror, it may go ahead.
+        assert!(check_release_source(&dev, true, false).is_ok());
+        assert!(check_release_source(&dev, false, true).is_ok());
+        // A release downloads its own release.
+        let release: BinaryVersion = "0.2.0".parse().unwrap();
+        assert!(check_release_source(&release, false, false).is_ok());
+    }
 
     #[test]
     fn readiness_requires_every_owned_voter_and_an_owned_leader() {

@@ -696,6 +696,9 @@ pub(super) async fn version_handler(State(state): State<ApiState>) -> impl IntoR
             // with the same version are told apart at a glance.
             "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
+            // Which release artefact fits this node: `relish upgrade`
+            // picks each node's build by it, not by the CLI host's.
+            "platform": crate::upgrade::metadata::platform_key(),
             "upgrade_in_flight": manager.upgrade_in_flight(),
             // Ids this node attempted and reverted — the orchestrator
             // reads these to detect node-side reverts.
@@ -712,6 +715,7 @@ pub(super) async fn version_handler(State(state): State<ApiState>) -> impl IntoR
             "version": crate::upgrade::version::compiled_version().to_string(),
             "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
+            "platform": crate::upgrade::metadata::platform_key(),
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
             // No upgrade manager, so no way to apply a directive at all.

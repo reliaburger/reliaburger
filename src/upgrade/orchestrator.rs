@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use super::types::{
     BinarySource, ClusterUpgradePhase, ClusterUpgradeState, DirectiveRetry, NodeRole,
-    NodeUpgradePhase, NodeUpgradeRecord, UpgradeDirection, UpgradeDirective,
+    NodeUpgradePhase, NodeUpgradeRecord, PlatformBinary, UpgradeDirection, UpgradeDirective,
 };
 use super::version::BinaryVersion;
 
@@ -70,6 +70,8 @@ pub struct NodeProbe {
     /// Versions in the node's binary store, when it reports them. A
     /// cluster rollback is refused up front if a node lacks the target.
     pub installed_versions: Option<Vec<BinaryVersion>>,
+    /// `{os}-{arch}` the node runs on, which picks its build of the target.
+    pub platform: Option<String>,
 }
 
 /// Effects the orchestrator performs on nodes. Mocked in unit tests; the
@@ -239,8 +241,14 @@ async fn poll_and_drive_group<C: NodeControl>(
     let target = state.target_version.clone();
     let direction = state.direction;
     let state_upgrade_id = state.upgrade_id.clone();
-    let state_sha256 = state.binary_sha256.clone();
-    let directive = build_directive(state);
+    // Each node gets the build for its own platform (mixed-architecture
+    // clusters carry one per platform), so the expected digest and the
+    // directive are worked out per node rather than once per run. Take a
+    // copy of the run without its node list to build them from: the loops
+    // below borrow `state.nodes` mutably, so they can't also borrow `state`.
+    let nodes = std::mem::take(&mut state.nodes);
+    let binaries = state.clone();
+    state.nodes = nodes;
     let budget = if role == NodeRole::Worker {
         state.parallel.max(1) as usize
     } else {
@@ -271,6 +279,9 @@ async fn poll_and_drive_group<C: NodeControl>(
 
         if record.from_version.is_none() {
             record.from_version = Some(probe.version.clone());
+        }
+        if record.platform.is_none() {
+            record.platform = probe.platform.clone();
         }
 
         // The node itself says it attempted and reverted this run: failed,
@@ -304,11 +315,15 @@ async fn poll_and_drive_group<C: NodeControl>(
             // would otherwise be called Healthy without a swap. Start-time
             // checks refuse that up front; this catches a node that changed
             // underneath the walk.
+            let expected = binaries
+                .binary_for(record.platform.as_deref())
+                .map(|binary| binary.sha256.as_str());
             if direction == UpgradeDirection::Upgrade
                 && !probe
                     .binary_sha256
                     .as_deref()
-                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&state_sha256))
+                    .zip(expected)
+                    .is_some_and(|(sha, expected)| sha.eq_ignore_ascii_case(expected))
             {
                 set_phase(
                     record,
@@ -432,7 +447,12 @@ async fn poll_and_drive_group<C: NodeControl>(
             continue;
         }
         let sent = match direction {
-            UpgradeDirection::Upgrade => control.direct_upgrade(&record.address, &directive).await,
+            UpgradeDirection::Upgrade => {
+                match directive_for(&binaries, record.platform.as_deref()) {
+                    Ok(directive) => control.direct_upgrade(&record.address, &directive).await,
+                    Err(reason) => Err(DirectiveError::Refused(reason)),
+                }
+            }
             UpgradeDirection::Rollback => control.direct_rollback(&record.address, &target).await,
         };
         match sent {
@@ -466,6 +486,7 @@ async fn poll_and_drive_group<C: NodeControl>(
         for record in state.nodes.iter().filter(|n| n.role == role) {
             if record.phase == NodeUpgradePhase::Directed
                 && !directed_this_tick.contains(&record.node_id)
+                && let Ok(directive) = directive_for(&binaries, record.platform.as_deref())
             {
                 let _ = control.direct_upgrade(&record.address, &directive).await;
             }
@@ -473,14 +494,30 @@ async fn poll_and_drive_group<C: NodeControl>(
     }
 }
 
-/// The directive every node gets for a cluster upgrade run.
-pub fn build_directive(state: &ClusterUpgradeState) -> UpgradeDirective {
+/// The directive a node on `platform` gets for a cluster upgrade run, or
+/// why there is none: the run carries no build for that platform.
+pub fn directive_for(
+    state: &ClusterUpgradeState,
+    platform: Option<&str>,
+) -> Result<UpgradeDirective, String> {
+    match state.binary_for(platform) {
+        Some(binary) => Ok(build_directive(state, binary)),
+        None => Err(format!(
+            "the upgrade carries no {} build for platform {}",
+            state.target_version,
+            platform.unwrap_or("unknown")
+        )),
+    }
+}
+
+/// The directive for one platform's build of a cluster upgrade run.
+pub fn build_directive(state: &ClusterUpgradeState, binary: &PlatformBinary) -> UpgradeDirective {
     UpgradeDirective {
         upgrade_id: state.upgrade_id.clone(),
         target_version: state.target_version.clone(),
-        binary_sha256: state.binary_sha256.clone(),
-        embedded_signature: state.embedded_signature.clone(),
-        external_signature: state.external_signature.clone(),
+        binary_sha256: binary.sha256.clone(),
+        embedded_signature: binary.embedded_signature.clone(),
+        external_signature: binary.external_signature.clone(),
         source: BinarySource::Pickle {
             registry_address: state.registry_address.clone(),
         },
@@ -770,6 +807,8 @@ impl NodeControl for HttpNodeControl {
                 .collect()
         });
 
+        let platform = value["platform"].as_str().map(String::from);
+
         Some(NodeProbe {
             version,
             healthy,
@@ -778,6 +817,7 @@ impl NodeControl for HttpNodeControl {
             binary_sha256,
             accepts_network_upgrades,
             installed_versions,
+            platform,
         })
     }
 
@@ -1046,6 +1086,8 @@ mod tests {
     struct MockControl {
         nodes: Mutex<HashMap<String, NodeProbe>>,
         directives: Mutex<Vec<String>>,
+        /// The binary digest each address was directed to install.
+        directed_binaries: Mutex<HashMap<String, String>>,
         rollbacks: Mutex<Vec<String>>,
         /// Scripted directive answers per address, consumed in order; an
         /// address with none left accepts.
@@ -1064,6 +1106,7 @@ mod tests {
                     binary_sha256: Some(fixture_sha256(version).to_string()),
                     accepts_network_upgrades: true,
                     installed_versions: None,
+                    platform: Some("linux-x86_64".to_string()),
                 },
             );
         }
@@ -1079,6 +1122,7 @@ mod tests {
                     binary_sha256: Some(fixture_sha256(version).to_string()),
                     accepts_network_upgrades: true,
                     installed_versions: None,
+                    platform: Some("linux-x86_64".to_string()),
                 },
             );
         }
@@ -1117,9 +1161,13 @@ mod tests {
         async fn direct_upgrade(
             &self,
             address: &str,
-            _directive: &UpgradeDirective,
+            directive: &UpgradeDirective,
         ) -> Result<(), DirectiveError> {
             self.directives.lock().unwrap().push(address.to_string());
+            self.directed_binaries
+                .lock()
+                .unwrap()
+                .insert(address.to_string(), directive.binary_sha256.clone());
             self.answer(address)
         }
 
@@ -1138,6 +1186,7 @@ mod tests {
             node_id: id.to_string(),
             address: format!("addr-{id}"),
             role,
+            platform: None,
             from_version: None,
             phase,
             since: None,
@@ -1149,9 +1198,12 @@ mod tests {
         ClusterUpgradeState {
             upgrade_id: "up-1".to_string(),
             target_version: v("0.2.0"),
-            binary_sha256: "abc".to_string(),
-            embedded_signature: "sig".to_string(),
-            external_signature: Some("ext".to_string()),
+            binaries: vec![PlatformBinary {
+                platform: "linux-x86_64".to_string(),
+                sha256: "abc".to_string(),
+                embedded_signature: "sig".to_string(),
+                external_signature: Some("ext".to_string()),
+            }],
             parallel,
             direction: UpgradeDirection::Upgrade,
             phase: ClusterUpgradePhase::UpgradingWorkers,
@@ -1252,6 +1304,66 @@ mod tests {
             .collect();
         assert_eq!(directed, vec!["w1", "w2"]);
         assert_eq!(state.nodes[2].phase, NodeUpgradePhase::Pending);
+    }
+
+    /// Mark `address` as running on `platform`.
+    fn on_platform(control: &MockControl, address: &str, platform: &str) {
+        control
+            .nodes
+            .lock()
+            .unwrap()
+            .get_mut(address)
+            .unwrap()
+            .platform = Some(platform.to_string());
+    }
+
+    #[tokio::test]
+    async fn each_node_is_directed_to_the_build_for_its_own_platform() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.1.0", true, false);
+        control.set("addr-w2", "0.1.0", true, false);
+        on_platform(&control, "addr-w2", "linux-aarch64");
+        let mut state = cluster_state(
+            vec![
+                record("w1", NodeRole::Worker, NodeUpgradePhase::Pending),
+                record("w2", NodeRole::Worker, NodeUpgradePhase::Pending),
+            ],
+            2,
+        );
+        state.binaries.push(PlatformBinary {
+            platform: "linux-aarch64".to_string(),
+            sha256: "arm".to_string(),
+            embedded_signature: "sig".to_string(),
+            external_signature: Some("ext".to_string()),
+        });
+
+        let state = step(state, &control, &context()).await;
+
+        let directed = control.directed_binaries.lock().unwrap().clone();
+        assert_eq!(directed["addr-w1"], "abc");
+        assert_eq!(directed["addr-w2"], "arm");
+        assert_eq!(state.nodes[1].platform.as_deref(), Some("linux-aarch64"));
+    }
+
+    #[tokio::test]
+    async fn a_node_whose_platform_has_no_build_fails_instead_of_taking_another() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.1.0", true, false);
+        on_platform(&control, "addr-w1", "linux-aarch64");
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+
+        let state = step(state, &control, &context()).await;
+
+        match &state.nodes[0].phase {
+            NodeUpgradePhase::Failed { reason } => {
+                assert!(reason.contains("linux-aarch64"), "{reason}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(control.directed().is_empty());
     }
 
     #[tokio::test]
@@ -2116,7 +2228,7 @@ mod tests {
     }
 
     fn directive() -> UpgradeDirective {
-        build_directive(&cluster_state(Vec::new(), 1))
+        directive_for(&cluster_state(Vec::new(), 1), None).unwrap()
     }
 
     #[tokio::test]
