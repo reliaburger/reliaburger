@@ -1733,8 +1733,8 @@ fn limit_malloc_arenas() {
 have different allocators and no such knob. Calling a C function is `unsafe`
 in Rust because the compiler can't check what C does. The `// SAFETY:` comment
 records why this call is fine, and an operator's own `MALLOC_ARENA_MAX` still
-wins. Bun then ended the run at 169 MiB, against 587 MiB for #654, and accepted
-about as many jobs: its hot paths wait on I/O, not on the allocator.
+wins. Bun now ends the same run at 165 MiB, against 587 MiB for #654, and
+accepts at least as many jobs: its hot paths wait on I/O, not on the allocator.
 
 **Keep the failures.** One rerun of the direct matrix forgot its private
 hostname wrapper, collided with the live node and produced a thousand startup
