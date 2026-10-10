@@ -1197,9 +1197,8 @@ pub async fn batch_status_handler(
                     .iter()
                     .map(|(_, id)| arrays.get(*id))
                     .collect();
-                summary["state_bytes"] = serde_json::json!(
-                    cohorts.and_then(|records| super::task_array_api::state_bytes(records))
-                );
+                summary["state_bytes"] =
+                    serde_json::json!(cohorts.and_then(super::task_array_api::state_bytes));
                 return Json(summary).into_response();
             }
             (
