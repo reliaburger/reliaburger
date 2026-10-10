@@ -1682,11 +1682,12 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Dropping a caller closes its private connection; recovery reuses only an
-/// originally retired slot identity, never a recovered numeric PID.
+/// Dropping a caller hands its executor to the eviction loop, which retires
+/// it and returns the reservation without a restart. A restart afterwards
+/// reuses only the originally retired slot identity, never a recovered PID.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root and cgroup v2; run with make test-linux"]
-async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller() {
+async fn cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart() {
     use reliaburger::bun::{
         execution_budget::ExecutionBudget,
         task_executor::{TaskInvocation, TaskRunner},
@@ -1753,10 +1754,13 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
     })
     .await
     .expect("dropped connection did not retire the original subtree");
-    assert!(
-        budget.available() != budget.capacity(),
-        "lost caller released its quarantined reservation"
-    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while budget.available() != budget.capacity() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the dropped caller's reservation waited for a restart");
     drop(runner);
     let recovered_budget = ExecutionBudget::new(budget.capacity());
     let recovered = OwnedRunner::for_data_dir(AnyGrill::Process(runtime.clone()), &root)

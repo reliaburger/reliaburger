@@ -8059,17 +8059,17 @@
       ]
     },
     {
-      "id": "issue-639-cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+      "id": "issue-639-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
       "issue": 639,
-      "promise": "Dropped native callers quarantine capacity and require positive original retirement before replacement.",
+      "promise": "A dropped native caller hands its executor to eviction, which retires it and frees its capacity without a restart; a later restart reuses only the originally retired identity.",
       "supported_paths": [
         "Rootful Linux native executors on cgroup v2"
       ],
       "cases": [
         {
-          "id": "native-cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+          "id": "native-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
           "binary": "reliaburger::owned_task_arrays",
-          "test": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
+          "test": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
           "requires": [
             "linux-root-storage"
           ],

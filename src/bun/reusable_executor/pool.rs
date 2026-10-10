@@ -4,6 +4,7 @@ use super::{ExecutorError, ExecutorKey, ExecutorProfile, HELPER_MEMORY_BYTES, pr
 use crate::bun::execution_budget::{ExecutionBudget, ResourceLease};
 use crate::bun::task_executor::{Attempt, AttemptOutcome, CapturedOutput, TaskInvocation};
 use crate::config::job::JobSpec;
+use crate::grill::kernel::GroupKill;
 use crate::grill::runc::RuncGrill;
 use crate::grill::{ContainerState, Grill, InstanceId, InstanceIdentity};
 use std::path::{Path, PathBuf};
@@ -88,10 +89,13 @@ struct Context {
     #[cfg(feature = "ebpf")]
     namespace: Option<crate::bun::task_namespace::NamespaceLease>,
 }
-/// A dropped in-flight future leaves its slot and resource lease quarantined.
+/// A fixed set of executor slots. A dropped [`ReusablePool::run`] future
+/// hands its executor to the eviction loop to retire (see [`Checkout`]).
 pub(crate) struct ReusablePool<G> {
     lifecycle: G,
     runtime: Runtime,
+    /// How retirement empties a task group on this kernel.
+    group_kill: GroupKill,
     timings: Timings,
     prefix: String,
     budget: Arc<ExecutionBudget>,
@@ -113,6 +117,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     ) -> Arc<Self> {
         Self::with_runtime(
             Runtime::Container(runtime),
+            crate::grill::kernel::executor_support().group_kill,
             lifecycle,
             prefix,
             count,
@@ -133,6 +138,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     ) -> Arc<Self> {
         Self::with_runtime(
             Runtime::Host(runtime),
+            crate::grill::kernel::executor_support().group_kill,
             lifecycle,
             prefix,
             count,
@@ -143,6 +149,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     }
     fn with_runtime(
         runtime: Runtime,
+        group_kill: GroupKill,
         lifecycle: G,
         prefix: String,
         count: usize,
@@ -153,6 +160,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     ) -> Arc<Self> {
         let pool = Arc::new(Self {
             runtime,
+            group_kill,
             timings: Timings::default(),
             lifecycle,
             prefix,
@@ -226,12 +234,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
     }
     async fn release(&self, index: usize, context: Option<Context>) {
-        let mut slots = self.slots.lock().await;
-        slots[index].key = context.as_ref().map(|context| context.key);
-        slots[index].context = context;
-        slots[index].busy = false;
-        slots[index].holder = None;
-        slots[index].active_run = None;
+        vacate(&mut self.slots.lock().await[index], context);
         self.changed.notify_waiters();
     }
     /// Slots this run's callers hold with resources charged. Unlike
@@ -307,7 +310,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     })
                 })
                 .flatten();
-            let selected = warm.or_else(|| slots.iter().position(|slot| !slot.busy));
+            let selected = warm.or_else(|| choose_cold_slot(&slots));
             if let Some(index) = selected {
                 // Charge an empty context before image I/O can let another
                 // caller spend the same apparent capacity. If a compatible
@@ -336,17 +339,6 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             drop(slots);
             tokio::select! { biased; () = cancel.cancelled() => return None, () = changed => {} }
         }
-    }
-    /// Retire the incompatible executor a caller found in its slot, or
-    /// quarantine it. Its reservation goes with it, so the slot stops counting
-    /// towards [`Self::busy_slots`] until the caller's own is admitted.
-    async fn retire_previous(&self, index: usize, mut old: Context) -> bool {
-        if !self.retire(&mut old, RETIREMENT_DEADLINE).await {
-            self.quarantine(index, old, RETIREMENT_DEADLINE).await;
-            return false;
-        }
-        self.slots.lock().await[index].holder = None;
-        true
     }
     /// Wait for the reservation of a slot checked out without one. The slot
     /// counts towards [`Self::busy_slots`] only from here: until admission
@@ -388,10 +380,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         // The runtime owns helper retirement; Bun owns the sibling task group.
         // Removing/reusing a group requires emptiness, independently of PID 1.
-        match empty_task(&context.base.join("task")) {
-            Ok(()) => true,
-            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-        }
+        // cgroupfs is an in-memory kernel interface, so this never waits on a
+        // disk (see wait_empty_task).
+        crate::grill::kernel::kill_group(&context.base.join("task"), self.group_kill).is_ok()
     }
     /// Retire within `budget`, every runtime call and file removal included;
     /// false leaves the executor, its lease and its namespace binding held.
@@ -470,22 +461,19 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
     }
     async fn quarantine(&self, index: usize, context: Context, budget: Duration) {
-        eprintln!(
-            "executor {} did not retire within {budget:?}; its slot and reservation stay quarantined until it does",
-            context.id.0
-        );
         let mut slots = self.slots.lock().await;
-        slots[index].holder = None;
-        slots[index].retiring = Some(context);
+        quarantine(&mut slots[index], context, budget);
     }
+    /// Start a native host executor. Gives up at its next safe point once
+    /// `stop` is cancelled; the caller then retires the context.
     async fn start_host(
         &self,
         context: &mut Context,
         template: &JobSpec,
         profile: ExecutorProfile,
+        stop: &CancellationToken,
     ) -> Result<(), ExecutorError> {
         use sha2::{Digest, Sha256};
-        use std::os::unix::fs::PermissionsExt;
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
@@ -499,8 +487,13 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        std::fs::create_dir_all(&context.directory)?;
-        std::fs::set_permissions(&context.directory, std::fs::Permissions::from_mode(0o700))?;
+        let directory = context.directory.clone();
+        blocking(move || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        })
+        .await?;
         let helper = context.directory.join("helper");
         install_helper(helper.clone(), HOST_HELPER).await?;
         // Socket credentials and the durable owner's unreaped helper identity
@@ -508,28 +501,38 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         // so two Buns on one host never share a name.
         let mut name = Sha256::new();
         name.update(context.directory.as_os_str().as_encoded_bytes());
-        let socket = host_socket_directory()?.join(&hex::encode(name.finalize())[..32]);
-        match std::fs::symlink_metadata(&socket) {
-            Ok(metadata) => {
-                use std::os::unix::fs::{FileTypeExt, MetadataExt};
-                if !metadata.file_type().is_socket()
-                    || metadata.uid() != crate::grill::userns::EXECUTOR_HOST_UID
-                {
-                    return Err(ExecutorError::Configuration("foreign host executor socket"));
+        let name = hex::encode(name.finalize())[..32].to_string();
+        let socket = blocking(move || -> std::io::Result<PathBuf> {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let socket = host_socket_directory()?.join(name);
+            match std::fs::symlink_metadata(&socket) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_socket()
+                        || metadata.uid() != crate::grill::userns::EXECUTOR_HOST_UID
+                    {
+                        return Err(std::io::Error::other("foreign host executor socket"));
+                    }
+                    std::fs::remove_file(&socket)?;
                 }
-                std::fs::remove_file(&socket)?;
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+            Ok(socket)
+        })
+        .await?;
         let listener = UnixListener::bind(&socket)?;
         context.socket_path = Some(socket.clone());
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-        std::os::unix::fs::lchown(
-            &socket,
-            Some(crate::grill::userns::EXECUTOR_HOST_UID),
-            Some(crate::grill::userns::EXECUTOR_HOST_UID),
-        )?;
+        let owned = socket.clone();
+        blocking(move || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o600))?;
+            std::os::unix::fs::lchown(
+                &owned,
+                Some(crate::grill::userns::EXECUTOR_HOST_UID),
+                Some(crate::grill::userns::EXECUTOR_HOST_UID),
+            )
+        })
+        .await?;
         #[cfg(feature = "ebpf")]
         if let Some(policy) = &self.policy {
             context.namespace = Some(
@@ -541,7 +544,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     .await?,
             );
         }
-        prepare_cgroups(&context.base, profile)?;
+        let base = context.base.clone();
+        blocking(move || prepare_cgroups(&base, profile)).await?;
         let mut spec = crate::grill::oci::generate_job_oci_spec(
             "executor",
             template.namespace.as_deref().unwrap_or("default"),
@@ -562,11 +566,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 .into_owned(),
         ];
         spec.process.overrides = None;
-        self.lifecycle.create(&context.id, &spec).await?;
-        self.lifecycle.start(&context.id).await?;
-        let (mut connection, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-            .await
-            .map_err(|_| ExecutorError::Protocol("host helper connection timed out".into()))??;
+        let mut connection = self.launch(&context.id, &spec, &listener, stop).await?;
         let peer = connection.peer_cred()?;
         let peer_pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
         let Runtime::Host(runtime) = &self.runtime else {
@@ -587,27 +587,61 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 "host helper protocol mismatch".into(),
             ));
         }
-        std::fs::remove_file(&socket)?;
+        tokio::fs::remove_file(&socket).await?;
         context.socket_path = None;
         let native = connection.into_std()?;
-        protocol::send_directory(&native, &std::fs::File::open(context.base.join("task"))?)?;
+        let task = tokio::fs::File::open(context.base.join("task"))
+            .await?
+            .into_std()
+            .await;
+        protocol::send_directory(&native, &task)?;
         context.connection = Some(UnixStream::from_std(native)?);
         Ok(())
     }
+    /// Create and start the helper, then wait for it to connect. `stop`
+    /// is checked between runtime calls, never during one, and interrupts
+    /// the wait for the connection.
+    async fn launch(
+        &self,
+        id: &InstanceId,
+        spec: &crate::grill::oci::OciSpec,
+        listener: &UnixListener,
+        stop: &CancellationToken,
+    ) -> Result<UnixStream, ExecutorError> {
+        let interrupted = || ExecutorError::Configuration("executor preparation interrupted");
+        if stop.is_cancelled() {
+            return Err(interrupted());
+        }
+        self.lifecycle.create(id, spec).await?;
+        if stop.is_cancelled() {
+            return Err(interrupted());
+        }
+        self.lifecycle.start(id).await?;
+        tokio::select! { biased;
+            () = stop.cancelled() => Err(interrupted()),
+            accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()) => {
+                let (connection, _) = accepted
+                    .map_err(|_| ExecutorError::Protocol("helper connection timed out".into()))??;
+                Ok(connection)
+            }
+        }
+    }
+    /// Start an executor container. Gives up at its next safe point once
+    /// `stop` is cancelled; the caller then retires the context.
     async fn start(
         &self,
         context: &mut Context,
         template: &JobSpec,
         profile: ExecutorProfile,
+        stop: &CancellationToken,
     ) -> Result<(), ExecutorError> {
         if self.runtime.host() {
-            return self.start_host(context, template, profile).await;
+            return self.start_host(context, template, profile, stop).await;
         }
         let Runtime::Container(runtime) = &self.runtime else {
             return Err(ExecutorError::Configuration("container backend missing"));
         };
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::PermissionsExt;
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
@@ -621,32 +655,39 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        tokio::fs::create_dir_all(&context.directory).await?;
-        std::fs::set_permissions(&context.directory, std::fs::Permissions::from_mode(0o700))?;
-        std::os::unix::fs::lchown(
-            &context.directory,
-            Some(crate::grill::userns::EXECUTOR_HOST_UID),
-            Some(crate::grill::userns::EXECUTOR_HOST_UID),
-        )?;
-        let bootstrap = context.directory.join("bootstrap");
-        std::fs::create_dir(&bootstrap)?;
-        std::fs::set_permissions(&bootstrap, std::fs::Permissions::from_mode(0o755))?;
+        let directory = context.directory.clone();
+        let (bootstrap, source) = blocking(move || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+            std::os::unix::fs::lchown(
+                &directory,
+                Some(crate::grill::userns::EXECUTOR_HOST_UID),
+                Some(crate::grill::userns::EXECUTOR_HOST_UID),
+            )?;
+            let bootstrap = directory.join("bootstrap");
+            std::fs::create_dir(&bootstrap)?;
+            std::fs::set_permissions(&bootstrap, std::fs::Permissions::from_mode(0o755))?;
+            Ok((bootstrap, std::fs::File::open(&directory)?))
+        })
+        .await?;
         let helper = bootstrap.join("helper");
         install_helper(helper.clone(), HELPER).await?;
-        let source = std::fs::File::open(&context.directory)?;
         // A /proc/fd alias keeps AF_UNIX's address bounded, independent of the
         // configured data-directory length. The source descriptor stays open.
         let socket_path = format!("/proc/self/fd/{}/control", source.as_raw_fd());
         let listener = UnixListener::bind(&socket_path)?;
-        std::fs::set_permissions(
-            context.directory.join("control"),
-            std::fs::Permissions::from_mode(0o600),
-        )?;
-        std::os::unix::fs::lchown(
-            context.directory.join("control"),
-            Some(crate::grill::userns::EXECUTOR_HOST_UID),
-            Some(crate::grill::userns::EXECUTOR_HOST_UID),
-        )?;
+        let control = context.directory.join("control");
+        blocking(move || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o600))?;
+            std::os::unix::fs::lchown(
+                &control,
+                Some(crate::grill::userns::EXECUTOR_HOST_UID),
+                Some(crate::grill::userns::EXECUTOR_HOST_UID),
+            )
+        })
+        .await?;
         #[cfg(feature = "ebpf")]
         if let Some(policy) = &self.policy {
             context.namespace = Some(
@@ -658,7 +699,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     .await?,
             );
         }
-        prepare_cgroups(&context.base, profile)?;
+        let base = context.base.clone();
+        blocking(move || prepare_cgroups(&base, profile)).await?;
         let path = context.base.join("helper");
         let mut spec = crate::grill::oci::generate_job_oci_spec(
             "executor",
@@ -718,11 +760,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             });
         }
         spec.mounts.extend(scratch_mounts());
-        self.lifecycle.create(&context.id, &spec).await?;
-        self.lifecycle.start(&context.id).await?;
-        let (mut connection, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-            .await
-            .map_err(|_| ExecutorError::Protocol("helper connection timed out".into()))??;
+        let mut connection = self.launch(&context.id, &spec, &listener, stop).await?;
         let peer = connection.peer_cred()?;
         if peer.uid() != crate::grill::userns::EXECUTOR_HOST_UID {
             return Err(ExecutorError::Protocol(
@@ -739,14 +777,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         if &magic != b"RBEX0001" {
             return Err(ExecutorError::Protocol("helper protocol mismatch".into()));
         }
-        std::fs::remove_file(context.directory.join("control"))?;
+        tokio::fs::remove_file(context.directory.join("control")).await?;
         let native = connection.into_std()?;
-        protocol::send_directory(&native, &std::fs::File::open(context.base.join("task"))?)?;
+        let task = tokio::fs::File::open(context.base.join("task"))
+            .await?
+            .into_std()
+            .await;
+        protocol::send_directory(&native, &task)?;
         context.connection = Some(UnixStream::from_std(native)?);
         Ok(())
     }
     pub(crate) async fn run<F>(
-        &self,
+        self: &Arc<Self>,
         task: &TaskInvocation,
         mut template: JobSpec,
         timeout: Duration,
@@ -794,22 +836,29 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 ran: None,
             };
         };
-        let mut context = match existing {
-            Some(old) if old.key != key || self.budget.has_waiters() => {
-                if !self.retire_previous(index, old).await {
-                    return failed(ExecutorError::Configuration(
-                        "the slot's previous executor has not retired",
-                    ));
-                }
-                None
-            }
-            other => other,
+        // From here every exit hands the slot back through `checkout`, and a
+        // dropped future hands it to the eviction loop.
+        let mut checkout = Checkout {
+            pool: self.clone(),
+            index,
+            context: existing,
+            returned: false,
         };
+        if checkout
+            .context
+            .as_ref()
+            .is_some_and(|old| old.key != key || self.budget.has_waiters())
+            && !checkout.retire_previous().await
+        {
+            return failed(ExecutorError::Configuration(
+                "the slot's previous executor has not retired",
+            ));
+        }
         // Match fresh execution: waiting for compatible slots or admission is
         // not command run time. Cold preparation starts its clock only once the
         // complete profile is charged; warm work starts after borrowing its slot.
         let mut deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
-        if context.is_none() {
+        if checkout.context.is_none() {
             let lease = match reservation {
                 Some(lease) => Some(lease),
                 None => {
@@ -823,7 +872,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 }
             };
             let Some(lease) = lease else {
-                self.release(index, None).await;
+                checkout.release().await;
                 return Attempt {
                     outcome: AttemptOutcome::Cancelled,
                     output: CapturedOutput::default(),
@@ -833,19 +882,43 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
             drop(admission_timer.take());
             let startup_timer = self.timings.start(Phase::Startup);
+            // Cold preparation can take as long as an image pull, so cancel
+            // and the deadline interrupt it, as they do a fresh launch.
+            let interrupted = || async {
+                tokio::select! { biased;
+                    () = cancel.cancelled() => AttemptOutcome::Cancelled,
+                    () = crate::bun::task_executor::wait_deadline(deadline) => AttemptOutcome::TimedOut,
+                }
+            };
             let image = match &self.runtime {
                 Runtime::Host(_) => None,
-                Runtime::Container(runtime) => match runtime
-                    .image_store()
-                    .pull_and_unpack(template.image.as_deref().unwrap_or_default())
-                    .await
-                {
-                    Ok(image) => Some(image),
-                    Err(error) => {
-                        self.release(index, None).await;
-                        return failed(ExecutorError::Protocol(error.to_string()));
+                Runtime::Container(runtime) => {
+                    // The pull runs as its own task, so an interrupted attempt
+                    // leaves it to finish filling the image cache instead of
+                    // dropping it halfway through unpacking a layer.
+                    let store = runtime.image_store().clone();
+                    let reference = template.image.clone().unwrap_or_default();
+                    let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+                    let pulled = tokio::select! { biased;
+                        outcome = interrupted() => Err(Attempt {
+                            outcome,
+                            output: CapturedOutput::default(),
+                            ran: None,
+                        }),
+                        pulled = pull => match pulled {
+                            Ok(Ok(image)) => Ok(image),
+                            Ok(Err(error)) => Err(failed(ExecutorError::Protocol(error.to_string()))),
+                            Err(error) => Err(failed(ExecutorError::Protocol(error.to_string()))),
+                        },
+                    };
+                    match pulled {
+                        Ok(image) => Some(image),
+                        Err(attempt) => {
+                            checkout.release().await;
+                            return attempt;
+                        }
                     }
-                },
+                }
             };
             let namespace = template.namespace.as_deref().unwrap_or("default");
             let app = format!(
@@ -857,19 +930,20 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let base = match crate::grill::cgroup::instance_cgroup_path(namespace, &app, &id) {
                 Ok(base) => base,
                 Err(error) => {
-                    self.release(index, None).await;
+                    checkout.release().await;
                     return failed(error.into());
                 }
             };
-            let mut new = Context {
+            let directory = match self.runtime.directory() {
+                Ok(directory) => directory.join(&id.0),
+                Err(error) => {
+                    checkout.release().await;
+                    return failed(error);
+                }
+            };
+            let new = checkout.context.insert(Context {
                 key,
-                directory: match self.runtime.directory() {
-                    Ok(directory) => directory.join(&id.0),
-                    Err(error) => {
-                        self.release(index, None).await;
-                        return failed(error);
-                    }
-                },
+                directory,
                 id,
                 base,
                 image,
@@ -882,19 +956,32 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 cleanup: None,
                 #[cfg(feature = "ebpf")]
                 namespace: None,
+            });
+            // `stop` asks start to give up at its next safe point. It never
+            // abandons a runtime call halfway, so retirement sees whatever
+            // that call left behind.
+            let stop = CancellationToken::new();
+            let stopped = {
+                let started = self.start(new, &template, profile, &stop);
+                tokio::pin!(started);
+                tokio::select! { biased;
+                    outcome = interrupted() => {
+                        stop.cancel();
+                        let _ = (&mut started).await;
+                        Some(Attempt { outcome, output: CapturedOutput::default(), ran: None })
+                    }
+                    result = &mut started => result.err().map(failed),
+                }
             };
-            let start = self.start(&mut new, &template, profile).await;
-            if let Err(error) = start {
-                self.retire_and_release(index, new, RETIREMENT_DEADLINE)
-                    .await;
-                return failed(error);
+            if let Some(attempt) = stopped {
+                checkout.retire().await;
+                return attempt;
             }
-            context = Some(new);
             drop(startup_timer);
         }
         drop(admission_timer.take());
-        let Some(mut context) = context else {
-            self.release(index, None).await;
+        let Some(context) = checkout.context.as_mut() else {
+            checkout.release().await;
             return failed(ExecutorError::Configuration("missing executor context"));
         };
         if let Some(refresh) = refresh {
@@ -902,8 +989,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 ExecutorKey::new(template).is_ok_and(|live| live == context.key)
             });
             let Some(refreshed) = refreshed else {
-                self.retire_and_release(index, context, RETIREMENT_DEADLINE)
-                    .await;
+                checkout.retire().await;
                 return failed(ExecutorError::Configuration(
                     "namespace credentials no longer authorise this command",
                 ));
@@ -959,8 +1045,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         let (sequence, mut bytes) = match preparation {
             Ok(encoded) => encoded,
             Err(error) => {
-                self.retire_and_release(index, context, RETIREMENT_DEADLINE)
-                    .await;
+                checkout.retire().await;
                 return failed(error);
             }
         };
@@ -1087,12 +1172,13 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             AttemptOutcome::Cancelled | AttemptOutcome::TimedOut | AttemptOutcome::Unknown { .. }
         ) || self.budget.has_waiters()
         {
-            self.retire_and_release(index, context, RETIREMENT_DEADLINE)
-                .await;
+            checkout.retire().await;
         } else {
-            context.sequence = sequence;
-            context.idle_since = tokio::time::Instant::now();
-            self.release(index, Some(context)).await;
+            if let Some(context) = checkout.context.as_mut() {
+                context.sequence = sequence;
+                context.idle_since = tokio::time::Instant::now();
+            }
+            checkout.release().await;
         }
         Attempt {
             outcome,
@@ -1100,6 +1186,141 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             ran,
         }
     }
+}
+
+/// Hand a slot back, holding `context` warm or empty.
+fn vacate(slot: &mut Slot, context: Option<Context>) {
+    slot.key = context.as_ref().map(|context| context.key);
+    slot.context = context;
+    slot.busy = false;
+    slot.holder = None;
+    slot.active_run = None;
+}
+
+/// Leave a busy slot's executor for the eviction loop to retire. Its
+/// reservation stays charged until it does.
+fn quarantine(slot: &mut Slot, context: Context, budget: Duration) {
+    eprintln!(
+        "executor {} did not retire within {budget:?}; its slot and reservation stay quarantined until it does",
+        context.id.0
+    );
+    slot.holder = None;
+    slot.active_run = None;
+    slot.retiring = Some(context);
+}
+
+/// The slot a caller with no warm match takes: an empty one first, so a
+/// warm executor of another profile isn't thrown away while there's room,
+/// then the executor that has been idle longest.
+fn choose_cold_slot(slots: &[Slot]) -> Option<usize> {
+    let free = || slots.iter().enumerate().filter(|(_, slot)| !slot.busy);
+    free()
+        .find(|(_, slot)| slot.context.is_none())
+        .or_else(|| free().min_by_key(|(_, slot)| slot.context.as_ref().map(|c| c.idle_since)))
+        .map(|(index, _)| index)
+}
+
+/// A slot checked out by [`ReusablePool::run`], with the executor it holds.
+///
+/// Every normal exit hands the slot back through [`Checkout::release`] or
+/// [`Checkout::retire`]. If the run future is dropped first, dropping this
+/// moves the executor into the slot's `retiring` place, so the eviction loop
+/// retires it and frees the slot and its lease without a Bun restart. A slot
+/// with no executor yet is simply released.
+struct Checkout<G: Grill + Clone + 'static> {
+    pool: Arc<ReusablePool<G>>,
+    index: usize,
+    context: Option<Context>,
+    returned: bool,
+}
+impl<G: Grill + Clone + 'static> Checkout<G> {
+    /// Hand the slot back, keeping its executor (if any) warm.
+    async fn release(mut self) {
+        let mut slots = self.pool.slots.lock().await;
+        vacate(&mut slots[self.index], self.context.take());
+        self.returned = true;
+        drop(slots);
+        self.pool.changed.notify_waiters();
+    }
+    /// Retire the executor and free the slot, or quarantine both.
+    async fn retire(mut self) {
+        let retired = match self.context.as_mut() {
+            Some(context) => self.pool.retire(context, RETIREMENT_DEADLINE).await,
+            None => true,
+        };
+        let mut slots = self.pool.slots.lock().await;
+        match self.context.take() {
+            Some(context) if !retired => {
+                quarantine(&mut slots[self.index], context, RETIREMENT_DEADLINE)
+            }
+            // A retired context's lease returns its reservation as it drops.
+            _ => vacate(&mut slots[self.index], None),
+        }
+        self.returned = true;
+        drop(slots);
+        self.pool.changed.notify_waiters();
+    }
+    /// Retire the incompatible executor a caller found in its slot, keeping
+    /// the slot, or quarantine it and give the slot up. Its reservation goes
+    /// with it, so the slot stops counting towards
+    /// [`ReusablePool::busy_slots`] until the caller's own is admitted.
+    async fn retire_previous(&mut self) -> bool {
+        let Some(old) = self.context.as_mut() else {
+            return true;
+        };
+        let retired = self.pool.retire(old, RETIREMENT_DEADLINE).await;
+        let mut slots = self.pool.slots.lock().await;
+        let Some(old) = self.context.take() else {
+            return true;
+        };
+        if retired {
+            slots[self.index].holder = None;
+            drop(old);
+        } else {
+            quarantine(&mut slots[self.index], old, RETIREMENT_DEADLINE);
+            self.returned = true;
+        }
+        retired
+    }
+}
+impl<G: Grill + Clone + 'static> Drop for Checkout<G> {
+    fn drop(&mut self) {
+        if self.returned {
+            return;
+        }
+        let pool = self.pool.clone();
+        let index = self.index;
+        let context = self.context.take();
+        // Drop can't wait for the slot lock, so a task finishes the hand-over.
+        let handoff = async move {
+            let mut slots = pool.slots.lock().await;
+            match context {
+                Some(context) => {
+                    let slot = &mut slots[index];
+                    slot.holder = None;
+                    slot.active_run = None;
+                    slot.retiring = Some(context);
+                }
+                None => vacate(&mut slots[index], None),
+            }
+            drop(slots);
+            pool.changed.notify_waiters();
+        };
+        // Outside a runtime (only when the runtime itself is shutting down)
+        // the context drops here, and its lease stays quarantined as before.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(handoff);
+        }
+    }
+}
+
+/// Run blocking filesystem work on the blocking pool, not an async worker.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, ExecutorError> {
+    Ok(tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ExecutorError::Protocol(error.to_string()))??)
 }
 
 /// Write an executor helper binary and make it and its directory entry
@@ -1258,14 +1479,6 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
     }
     Ok(())
 }
-fn empty_task(task: &Path) -> std::io::Result<()> {
-    std::fs::write(task.join("cgroup.kill"), "1")?;
-    let events = std::fs::read_to_string(task.join("cgroup.events"))?;
-    if !events.lines().any(|line| line == "populated 0") {
-        return Err(std::io::Error::other("task cgroup still populated"));
-    }
-    Ok(())
-}
 
 /// After the helper's cleanup receipt the group is normally already empty, so
 /// the first read usually succeeds. Back off from 1 ms rather than spin, and
@@ -1421,15 +1634,55 @@ mod tests {
         lifecycle: HangingKill,
         budget: &Arc<ExecutionBudget>,
     ) -> Arc<ReusablePool<HangingKill>> {
+        pool_with(process, lifecycle, budget, GroupKill::CgroupKill, 2)
+    }
+
+    fn pool_with<L: Grill + Clone + 'static>(
+        process: &ProcessGrill,
+        lifecycle: L,
+        budget: &Arc<ExecutionBudget>,
+        group_kill: GroupKill,
+        slots: usize,
+    ) -> Arc<ReusablePool<L>> {
         ReusablePool::with_runtime(
             Runtime::Host(process.clone()),
+            group_kill,
             lifecycle,
             "rbtest".into(),
-            2,
+            slots,
             budget.clone(),
             #[cfg(feature = "ebpf")]
             None,
         )
+    }
+
+    /// A slot checked out of `pool` the way `run` checks one out.
+    async fn checkout(
+        pool: &Arc<ReusablePool<HangingKill>>,
+        context: Option<Context>,
+    ) -> Checkout<HangingKill> {
+        let cancel = CancellationToken::new();
+        let (index, _, lease) = pool
+            .slot(key(1), reservation(), Some(7), &cancel)
+            .await
+            .unwrap();
+        drop(lease);
+        Checkout {
+            pool: pool.clone(),
+            index,
+            context,
+            returned: false,
+        }
+    }
+
+    async fn wait_for_free_slot(pool: &Arc<ReusablePool<HangingKill>>, index: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.slots.lock().await[index].busy {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the slot was never handed back");
     }
 
     /// An executor whose helper is a real `sleep` the in-memory backend
@@ -1744,7 +1997,14 @@ mod tests {
     async fn retiring_another_profiles_executor_stops_the_slot_counting_until_admitted() {
         let root = tempfile::tempdir().unwrap();
         let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
-        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        // One slot, so the caller has to take the other profile's executor.
+        let pool = pool_with(
+            &ProcessGrill::new(),
+            HangingKill::default(),
+            &budget,
+            GroupKill::CgroupKill,
+            1,
+        );
         // An idle executor of another profile, already exited, holds the slot's
         // reservation; an app holds everything else.
         let mut old = context(&budget, InstanceId("rbtest-gone".into()), root.path());
@@ -1762,7 +2022,14 @@ mod tests {
             1,
             "the old executor is still charged"
         );
-        assert!(pool.retire_previous(index, existing.unwrap()).await);
+        let mut checkout = Checkout {
+            pool: pool.clone(),
+            index,
+            context: existing,
+            returned: false,
+        };
+        assert!(checkout.retire_previous().await);
+        assert!(checkout.context.is_none());
         assert_eq!(pool.busy_slots(7).await, 0, "counted with nothing charged");
         // Only the retired executor's reservation is free, which is all it needs.
         drop(app);
@@ -1772,5 +2039,259 @@ mod tests {
                 .is_some()
         );
         assert_eq!(pool.busy_slots(7).await, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_slot_is_chosen_before_evicting_a_warm_executor() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let mut warm = context(&budget, InstanceId("rbtest-warm".into()), root.path());
+        warm.key = key(2);
+        pool.release(0, Some(warm)).await;
+        let cancel = CancellationToken::new();
+        let (index, existing, _) = pool
+            .slot(key(1), reservation(), Some(7), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(index, 1, "took the warm slot while an empty one was free");
+        assert!(existing.is_none());
+        assert!(
+            pool.slots.lock().await[0]
+                .context
+                .as_ref()
+                .is_some_and(|context| context.key == key(2)),
+            "the other profile's warm executor was disturbed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_longest_idle_executor_is_evicted_when_no_slot_is_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let now = tokio::time::Instant::now();
+        for (index, idle) in [(0, 10), (1, 500)] {
+            let mut warm = context(
+                &budget,
+                InstanceId(format!("rbtest-warm-{index}")),
+                root.path(),
+            );
+            warm.key = key(2 + index as u8);
+            warm.idle_since = now - Duration::from_millis(idle);
+            pool.release(index, Some(warm)).await;
+        }
+        let cancel = CancellationToken::new();
+        let (index, existing, _) = pool
+            .slot(key(1), reservation(), Some(7), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(index, 1);
+        assert!(existing.is_some_and(|context| context.key == key(3)));
+    }
+
+    #[tokio::test]
+    async fn dropped_run_future_hands_its_slot_to_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        // An executor that has already exited and left nothing behind, held
+        // by a run whose future is dropped mid-command.
+        let held = context(&budget, InstanceId("rbtest-dropped".into()), root.path());
+        let checkout = checkout(&pool, Some(held)).await;
+        let index = checkout.index;
+        assert_ne!(budget.available(), budget.capacity());
+        drop(checkout);
+        wait_for_free_slot(&pool, index).await;
+        assert_eq!(
+            budget.available(),
+            budget.capacity(),
+            "the dropped run's lease stayed quarantined"
+        );
+        let slot = &pool.slots.lock().await[index];
+        assert!(slot.context.is_none() && slot.retiring.is_none());
+        assert_eq!(slot.holder, None);
+    }
+
+    #[tokio::test]
+    async fn dropped_run_future_without_an_executor_releases_its_slot() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let checkout = checkout(&pool, None).await;
+        let index = checkout.index;
+        drop(checkout);
+        wait_for_free_slot(&pool, index).await;
+        assert_eq!(budget.available(), budget.capacity());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_run_whose_executor_hangs_stays_quarantined() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let process = ProcessGrill::new();
+        let pool = pool(&process, HangingKill::default(), &budget);
+        let id = running(&process, "rbtest-dropped-hanging").await;
+        let checkout = checkout(&pool, Some(context(&budget, id.clone(), root.path()))).await;
+        let index = checkout.index;
+        drop(checkout);
+        // Give the hand-over and a couple of eviction ticks time to run.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(pool.slots.lock().await[index].busy);
+        assert_ne!(budget.available(), budget.capacity());
+        process.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_falls_back_to_kill_and_reap_without_cgroup_kill() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool_with(
+            &ProcessGrill::new(),
+            HangingKill::default(),
+            &budget,
+            GroupKill::FreezeAndKill,
+            1,
+        );
+        // The helper is gone; one command survives in a task group that,
+        // as before Linux 5.14, has no cgroup.kill.
+        let mut context = context(&budget, InstanceId("rbtest-no-kill".into()), root.path());
+        let mut survivor = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let task = context.base.join("task");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(task.join("cgroup.freeze"), "0").unwrap();
+        std::fs::write(task.join("cgroup.procs"), format!("{}\n", survivor.id())).unwrap();
+        std::fs::write(task.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(
+            !pool.retirement_step(&mut context).await,
+            "retired a populated group"
+        );
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            survivor.wait().unwrap().signal(),
+            Some(nix::sys::signal::Signal::SIGKILL as i32)
+        );
+        assert_eq!(
+            std::fs::read_to_string(task.join("cgroup.freeze")).unwrap(),
+            "1"
+        );
+        assert!(!task.join("cgroup.kill").exists());
+        std::fs::write(task.join("cgroup.events"), "populated 0\nfrozen 1\n").unwrap();
+        assert!(pool.retirement_step(&mut context).await);
+    }
+
+    /// A lifecycle whose helper never connects, so a cold start waits on
+    /// the full accept timeout unless something interrupts it.
+    #[derive(Clone, Default)]
+    struct SilentHelper;
+    impl Grill for SilentHelper {
+        async fn create(&self, _: &InstanceId, _: &OciSpec) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn start(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn kill(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn state(&self, id: &InstanceId) -> Result<ContainerState, GrillError> {
+            Err(GrillError::NotFound {
+                instance: id.clone(),
+            })
+        }
+    }
+
+    /// Run one host command through a pool whose helper never connects, and
+    /// check the interruption came well before the 10 s accept timeout and
+    /// left nothing held.
+    async fn interrupt_cold_start(
+        namespace: &str,
+        timeout: Duration,
+        cancel_after: Option<Duration>,
+    ) -> Attempt {
+        let root = tempfile::Builder::new()
+            .prefix("rb-cold-interrupt-")
+            .tempdir()
+            .unwrap();
+        let process = ProcessGrill::with_owner(root.path().join("owners"), "/bin/false".into());
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool_with(
+            &process,
+            SilentHelper,
+            &budget,
+            crate::grill::kernel::executor_support().group_kill,
+            1,
+        );
+        let template: JobSpec = toml::from_str(
+            &format!(
+            "runtime='process'\nexec='/bin/true'\nnamespace='{namespace}'\ncpu='100m-1000m'\nmemory='32Mi'"
+        ),
+        )
+        .unwrap();
+        let task = TaskInvocation {
+            template: Some(Box::new(template.clone())),
+            index: 0,
+            attempt: 1,
+            program: "/bin/true".into(),
+            args: vec![],
+            env: vec![],
+            run: None,
+        };
+        let cancel = CancellationToken::new();
+        if let Some(after) = cancel_after {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                cancel.cancel();
+            });
+        }
+        let singletons = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let started = std::time::Instant::now();
+        let attempt = pool
+            .run(
+                &task,
+                template,
+                timeout,
+                &cancel,
+                None::<fn() -> std::future::Ready<Result<JobSpec, String>>>,
+                CommandReporting {
+                    sink: None,
+                    singletons: &singletons,
+                },
+            )
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cold start ran to its accept timeout: {attempt:?}"
+        );
+        assert!(!pool.slots.lock().await[0].busy, "the slot stayed busy");
+        assert!(pool.slots.lock().await[0].context.is_none());
+        assert_eq!(budget.available(), budget.capacity());
+        attempt
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    async fn cgroup_cancel_during_cold_preparation_retires_the_context() {
+        let attempt = interrupt_cold_start(
+            "rbtest-cold-cancel",
+            Duration::from_secs(60),
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+        assert_eq!(attempt.outcome, AttemptOutcome::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    async fn cgroup_deadline_during_cold_preparation_retires_the_context() {
+        let attempt =
+            interrupt_cold_start("rbtest-cold-deadline", Duration::from_millis(300), None).await;
+        assert_eq!(attempt.outcome, AttemptOutcome::TimedOut);
     }
 }
