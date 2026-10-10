@@ -118,37 +118,97 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
                 .path(&id)
                 .map_err(|e| Self::error(&id, e))?
                 .with_extension("lock");
-            let lock = tokio::task::spawn_blocking(move || {
-                match std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(&directory)
-                {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e),
-                }
-                durable::validate_directory(&directory)?;
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .mode(0o600)
-                    .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                    .open(path)?;
-                durable::validate_file(&file, Access::Exclusive)?;
-                FileLock::lock_within(file, Duration::from_secs(30)).map_err(io::Error::from)
-            })
-            .await
-            .map_err(|e| Self::error(&id, e))?
-            .map_err(|e| Self::error(&id, e))?;
+            let lock = tokio::task::spawn_blocking(move || lock_route(&directory, &path))
+                .await
+                .map_err(|e| Self::error(&id, e))?
+                .map_err(|e| Self::error(&id, e))?;
             let result = operation(this, id).await;
             drop(lock);
             result
         })
         .await
         .map_err(|e| Self::error(&error_id, e))?
+    }
+    /// Delete the route and lock files of an instance whose original backend
+    /// has positively retired, after the backend forgets its own journal.
+    async fn forget_route(&self, id: &InstanceId) -> Result<(), GrillError> {
+        let this = self.clone();
+        let id = id.clone();
+        let error_id = id.clone();
+        // Detached for the same reason as `operation`: the claim must outlive
+        // a cancelled caller until the deletion it authorises has finished.
+        tokio::spawn(async move {
+            let directory = this.directory.clone();
+            let route_path = this.path(&id).map_err(|e| Self::error(&id, e))?;
+            let path = route_path.with_extension("lock");
+            let lock_path = path.clone();
+            let lock = tokio::task::spawn_blocking(move || lock_route(&directory, &lock_path))
+                .await
+                .map_err(|e| Self::error(&id, e))?
+                .map_err(|e| Self::error(&id, e))?;
+            if let Some(route) = this.load(&id).await? {
+                let host = route.runtime == RuntimeKind::Process;
+                // Absent from the original backend's inventory, or stopped
+                // without a published address: nothing it owns can remain.
+                this.prove_retired(&id, host, true).await?;
+                if host {
+                    this.host.forget_retired(&id).await?;
+                } else {
+                    this.container.forget_retired(&id).await?;
+                }
+            }
+            let directory = this.directory.clone();
+            tokio::task::spawn_blocking(move || {
+                match std::fs::remove_file(&route_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                lock.remove(&path)?;
+                std::fs::File::open(&directory)?.sync_all()
+            })
+            .await
+            .map_err(|e| Self::error(&id, e))?
+            .map_err(|e| Self::error(&id, e))
+        })
+        .await
+        .map_err(|e| Self::error(&error_id, e))?
+    }
+    /// Route identities with no launch in either backend: an interrupted
+    /// forget, or an instance whose journal its backend already removed.
+    async fn orphan_routes(&self) -> Result<Vec<InstanceId>, GrillError> {
+        let directory = self.directory.clone();
+        let inventory = InstanceId("inventory".into());
+        let mut ids = tokio::task::spawn_blocking(move || {
+            let mut ids = Vec::new();
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ids),
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let name = entry?.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if let Some(stem) = name.strip_suffix(".json") {
+                    ids.push(InstanceId(stem.to_string()));
+                }
+            }
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| Self::error(&inventory, e))?
+        .map_err(|e| Self::error(&inventory, e))?;
+        let mut launched = std::collections::HashSet::new();
+        for backend in [
+            self.container.launch_inventory().await?,
+            self.host.launch_inventory().await?,
+        ] {
+            let backend = backend
+                .ok_or_else(|| Self::error(&inventory, "backend inventory is unavailable"))?;
+            launched.extend(backend.into_iter().map(|launch| launch.instance_id));
+        }
+        ids.retain(|id| !launched.contains(id));
+        Ok(ids)
     }
     fn selected_blocking(&self, id: &InstanceId) -> Result<Route, GrillError> {
         self.load_blocking(id)?
@@ -221,6 +281,36 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
             ));
         }
         Ok(())
+    }
+}
+/// Take the exclusive claim on one route. Only `forget_route` unlinks a lock
+/// file, and only while holding it, so a file unlinked after we opened it
+/// authorises nothing: lock the current one instead.
+fn lock_route(directory: &std::path::Path, path: &std::path::Path) -> io::Result<FileLock> {
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    durable::validate_directory(directory)?;
+    loop {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(path)?;
+        durable::validate_file(&file, Access::Exclusive)?;
+        let lock = FileLock::lock_within(file, Duration::from_secs(30)).map_err(io::Error::from)?;
+        if lock.still_names(path)? {
+            return Ok(lock);
+        }
     }
 }
 impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGrill<C, H> {
@@ -448,6 +538,12 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
             this.container.release_network_reference(&reference).await
         })
         .await
+    }
+    async fn forget_retired(&self, id: &InstanceId) -> Result<(), GrillError> {
+        self.forget_route(id).await
+    }
+    async fn unlaunched_metadata(&self) -> Result<Vec<InstanceId>, GrillError> {
+        self.orphan_routes().await
     }
     async fn launch_inventory(&self) -> Result<Option<Vec<RuntimeLaunch>>, GrillError> {
         let container = self.container.launch_inventory().await?.ok_or_else(|| {
@@ -969,5 +1065,82 @@ mod tests {
         runtime.host.release_execs(1);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(runtime.exec(&id, &command).await.unwrap(), "first");
+    }
+
+    fn launch(id: &InstanceId, host: bool) -> RuntimeLaunch {
+        RuntimeLaunch {
+            generation: super::super::RuntimeGeneration::try_from("a".repeat(64)).unwrap(),
+            instance_id: id.clone(),
+            spec: spec(host),
+            network_reference: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn route_and_lock_files_are_removed_after_retirement() {
+        for host in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = pair(root.path()).await;
+            let id = InstanceId("tenant-a__executor-0".into());
+            runtime.create(&id, &spec(host)).await.unwrap();
+            runtime.start(&id).await.unwrap();
+            let backend = if host {
+                &runtime.host
+            } else {
+                &runtime.container
+            };
+            backend.set_launch_inventory(vec![launch(&id, host)]).await;
+            let route = root.path().join("routes").join(format!("{}.json", id.0));
+            let lock = route.with_extension("lock");
+            assert!(route.exists() && lock.exists());
+
+            backend.set_state(&id, ContainerState::Running);
+            assert!(
+                runtime.forget_retired(&id).await.is_err(),
+                "a running instance was forgotten"
+            );
+            assert!(route.exists(), "a refused forget deleted the route");
+
+            backend.set_state(&id, ContainerState::Stopped);
+            runtime.forget_retired(&id).await.unwrap();
+            assert!(!route.exists(), "route kept after retirement");
+            assert!(!lock.exists(), "lock kept after retirement");
+            assert!(
+                backend
+                    .calls()
+                    .contains(&("forget_retired".to_string(), id.clone())),
+                "the backend journal was not forgotten"
+            );
+            // The identity starts afresh, exactly as on a new node.
+            backend.set_launch_inventory(vec![]).await;
+            runtime.create(&id, &spec(host)).await.unwrap();
+            assert!(route.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_route_without_a_launch_is_unlaunched_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let live = InstanceId("default__web-0".into());
+        let orphan = InstanceId("tenant-b__executor-3".into());
+        runtime.create(&live, &spec(false)).await.unwrap();
+        runtime.create(&orphan, &spec(false)).await.unwrap();
+        runtime
+            .container
+            .set_launch_inventory(vec![launch(&live, false)])
+            .await;
+        assert_eq!(
+            runtime.unlaunched_metadata().await.unwrap(),
+            vec![orphan.clone()]
+        );
+        runtime.forget_retired(&orphan).await.unwrap();
+        assert!(runtime.unlaunched_metadata().await.unwrap().is_empty());
+        let routes: Vec<_> = std::fs::read_dir(root.path().join("routes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(routes.len(), 2, "{routes:?}");
+        assert!(routes.iter().all(|name| name.starts_with("default__web-0")));
     }
 }
