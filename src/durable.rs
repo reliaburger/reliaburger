@@ -65,15 +65,34 @@ pub(crate) fn validate_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn open_record(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Records are replaced by atomic rename, and a reader that doesn't hold the
+/// writer's lock can open the old file just before the rename. That file then
+/// has no links left, which isn't tampering (a hard-linked copy has two or
+/// more): open the path again to read the replacement. Bounded, so a path
+/// that keeps changing still fails validation rather than spinning.
+fn reopen_if_replaced(mut file: File, path: &Path) -> io::Result<File> {
+    for _ in 0..8 {
+        if file.metadata()?.nlink() != 0 {
+            break;
+        }
+        file = open_record(path)?;
+    }
+    Ok(file)
+}
+
 /// Read a whole record of at most `limit` bytes.
 ///
 /// A missing file is `NotFound`; a symlink, wrong file type or wrong privacy is
 /// `InvalidData`; a record over the limit is `FileTooLarge`.
 pub(crate) fn read_bounded(path: &Path, limit: u64, access: Access) -> io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
+    let file = reopen_if_replaced(open_record(path)?, path)?;
     let context =
         |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
     validate_file(&file, access).map_err(context)?;
@@ -120,6 +139,33 @@ pub(crate) fn read_json_if_exists<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_record_replaced_after_opening_is_read_again_not_refused() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("route.json");
+        let write = |name: &str, body: &str| {
+            let file = dir.path().join(name);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file)
+                .unwrap();
+            std::fs::write(&file, body).unwrap();
+            file
+        };
+        std::fs::rename(write("first", "old"), &path).unwrap();
+        // A lock-free reader opens the record...
+        let opened = super::open_record(&path).unwrap();
+        // ...and the writer atomically replaces it before validation.
+        std::fs::rename(write("second", "new"), &path).unwrap();
+        assert!(super::validate_file(&opened, super::Access::Exclusive).is_err());
+        let current = super::reopen_if_replaced(opened, &path).unwrap();
+        super::validate_file(&current, super::Access::Exclusive).unwrap();
+        assert_eq!(std::io::read_to_string(current).unwrap(), "new");
+    }
 
     use super::*;
 
