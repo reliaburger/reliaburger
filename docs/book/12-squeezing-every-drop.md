@@ -935,8 +935,8 @@ tiny commands, the setup *is* the job.
 
 How big is the gap? On one four-vCPU VM, in the same sixty seconds, fresh
 containers finished a couple of hundred BusyBox `true` jobs. Native host
-executors finished about a quarter of a million. That's the one number this
-section quotes; the rest live in the
+executors finished about a quarter of a million. That's the one throughput
+comparison this section quotes; the rest live in the
 [timed-scenario record](../qualification/2026-10-09-timed-job-scenarios/README.md),
 next to what they do and don't prove.
 
@@ -1047,6 +1047,19 @@ read the atomically published route files, or ask the original backend for its
 retirement receipt, and change nothing. Anything that changes execution
 authority keeps the stronger fence. A snapshot is observation.
 
+Lock-free reading has its own trap. Route files are replaced the safe way:
+write a temporary file, then `rename` it over the old one, so a reader sees the
+old route or the new one, never half of each. The reader opens the file, then
+checks it's a private file with exactly one link, the guard against someone
+planting a hard link to a file they control. But a reader that opens the old
+file a moment before the rename is left holding a file that has just lost its
+only name, and its link count reads zero. Our check called that tampering, and
+the orchestrator logged "state unavailable" for an executor about once a run.
+A planted hard link has *two or more* links; zero means "replaced while you
+were looking". `read_bounded` now opens the path again in that case, a bounded
+number of times, and the test reproduces the exact interleaving: open, rename,
+validate.
+
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
 secrets catalogue skipped all its container tests. Now the classifier sees the
@@ -1081,6 +1094,7 @@ async fn slot(
     &self,
     key: ExecutorKey,
     reservation: crate::meat::Resources,
+    holder: Option<u64>,
     cancel: &CancellationToken,
 ) -> Option<(usize, Option<Context>, Option<ResourceLease>)> {
     loop {
@@ -1104,6 +1118,7 @@ async fn slot(
         if let Some(index) = selected {
             // ... charge the budget for an empty slot before any image I/O
             slots[index].busy = true;
+            slots[index].holder = holder;
             slots[index].key = Some(key);
             return Some((index, slots[index].context.take(), lease));
         }
@@ -1115,7 +1130,9 @@ async fn slot(
 
 The function prefers a free slot whose container already has our key. Failing
 that, it takes any free slot, which may hold an incompatible container to
-retire. If nothing's free, it waits for a change and tries again.
+retire. If nothing's free, it waits for a change and tries again. `holder`
+records which run checked the slot out; we'll need it when nodes report their
+capacity.
 
 A few Rust details carry weight. `bool::then` turns `true` into `Some(value)`
 and `false` into `None`, and `.flatten()` collapses the resulting
