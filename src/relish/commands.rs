@@ -2357,7 +2357,7 @@ pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), Re
 /// attempt. Quantiles merge bucket counts and report bucket upper bounds.
 pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     if summary["kind"] == "schedule" {
-        return format!(
+        let mut line = format!(
             "{}/{}: UTC schedule {}, {} tasks per occurrence; revision {}",
             summary["namespace"].as_str().unwrap_or("default"),
             summary["name"].as_str().unwrap_or("?"),
@@ -2365,6 +2365,13 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
             summary["total"],
             summary["revision"]
         );
+        if let Some(minute) = summary["skipped"]["minute"].as_i64() {
+            line.push_str(&format!(
+                " | skipped: capacity ({} so far, latest at minute {minute})",
+                summary["skipped_count"].as_u64().unwrap_or(1)
+            ));
+        }
+        return line;
     }
 
     let rate = summary["rates"]["successes_per_second"]
@@ -2410,6 +2417,9 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
         " | {} queued, {} held",
         summary["queued"], summary["held"]
     ));
+    if let Some(reason) = summary["quota_blocked_reason"].as_str() {
+        output.push_str(&format!(" | quota blocked: {reason}"));
+    }
     let failure_rate = summary["rates"]["failures_per_second"]
         .as_f64()
         .map_or("unknown".into(), |r| format!("{r:.1}/s"));
@@ -2633,6 +2643,9 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         count("held"),
         count("queued"),
     ));
+    if let Some(reason) = summary["quota_blocked_reason"].as_str() {
+        out.push_str(&format!("  waiting for quota: {reason}\n"));
+    }
     if let Some(ranges) = summary["failed_indices"].as_array()
         && !ranges.is_empty()
     {
@@ -4360,6 +4373,19 @@ mod task_array_tests {
         }
         let unknown = format_batch_watch(&serde_json::json!({"kind":"array"}));
         assert!(unknown.contains("unknown active commands"));
+    }
+
+    #[test]
+    fn status_says_why_a_run_waits_and_which_occurrences_were_skipped() {
+        let reason = "namespace \"tenant\" would exceed CPU quota: 2000+1000 > 2000m";
+        let run = serde_json::json!({"kind":"array","batch_id":4,"status":"Running","quota_blocked_reason":reason});
+        assert!(format_batch_watch(&run).contains(&format!("quota blocked: {reason}")));
+        assert!(format_array_summary(4, &run).contains(&format!("waiting for quota: {reason}")));
+        let schedule = serde_json::json!({"kind":"schedule","name":"nightly","namespace":"ops","cron":{"expression":"0 2 * * *"},"total":1,"revision":1,"skipped":{"minute":29000000,"reason":"capacity"},"skipped_count":2});
+        assert!(
+            format_batch_watch(&schedule)
+                .contains("skipped: capacity (2 so far, latest at minute 29000000)")
+        );
     }
 
     #[test]

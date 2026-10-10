@@ -7932,6 +7932,7 @@ mod tests {
                 tasks: spec,
                 cron: None,
                 replay_unknown: false,
+                hook: false,
             }),
             trigger: Some(RunTrigger::Manual {
                 request_id: request_id.into(),
