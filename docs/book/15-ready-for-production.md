@@ -5703,7 +5703,7 @@ runner's output path. Record the exact unchanged diagnostic separately, with
 zero retries and the original deadlines. Bounded phase labels, actual child
 observation and owned capture completion explain more than an arbitrary timeout
 increase. They mustn't print tokens, security files or secret arguments. The
-[dated qualification template](../qualification/2026-10-04-final-codebase-qualification.template.md)
+[dated qualification record](../qualification/2026-10-04-final-codebase-qualification.md)
 leaves actual Rust, coverage, OCI and current CI results pending until their
 matching execution records exist.
 
