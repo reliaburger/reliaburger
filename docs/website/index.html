@@ -282,14 +282,18 @@
         <table><caption>Four scenarios, 60 seconds each. Same VM, BusyBox command
           and concurrency cap of 27. Daily figures are extrapolated.</caption>
           <thead><tr><th scope="col">Execution</th><th scope="col">Best for</th><th scope="col">Completed in 60 seconds</th><th scope="col">Rate</th><th scope="col">Extrapolated runs/day</th><th scope="col">Retries</th></tr></thead>
-          <tbody><tr><th scope="row">VM baseline</th><td>Measured raw-process ceiling on this VM</td><td>876,671 raw exits</td><td>14,611.2/s</td><td>1.3B</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>Fully isolated, independent jobs</td><td>196 accepted jobs</td><td>3.3/s</td><td>282.2k</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>Repeatable tasks; amortised container startup</td><td>23,000 accepted jobs</td><td>383.3/s</td><td>33.1M</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>Maximum speed for trusted commands; no isolation</td><td>246,000 accepted jobs</td><td>4,100.0/s</td><td>354.2M</td><td>0</td></tr></tbody>
+          <tbody><tr><th scope="row">VM baseline</th><td>Raw-process reference on this VM</td><td>876,671 raw exits</td><td>14,611.2/s</td><td>1.3B</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>Fully isolated, independent jobs</td><td>196 accepted jobs</td><td>3.3/s</td><td>282.2k</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>Repeatable tasks; amortised container startup</td><td>23,000 accepted jobs</td><td>383.3/s</td><td>33.1M</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>Maximum speed for trusted commands; no isolation</td><td>246,000 accepted jobs</td><td>4,100.0/s</td><td>354.2M</td><td>0</td></tr></tbody>
         </table></div>
         <p>Testing rig: a local Lima VM on an Apple M2 Max host (12 physical cores,
           32 GiB host RAM), with 4 vCPU and 8 GiB allocated to Ubuntu 24.04 aarch64,
-          Linux 6.8 and runc 1.4. These figures measure BusyBox <code>true</code>;
-          benchmark your real commands on your own hardware when sizing a cluster.</p>
-        <p>The VM baseline shows the measured raw-process ceiling for this VM and
-          command. It counts successful exits without resource enforcement,
+          Linux 6.8 and runc 1.4. These figures measure the per-job overhead of BusyBox
+          <code>true</code>, a command that does no work; benchmark your real commands
+          on your own hardware when sizing a cluster. An independent five-round rerun
+          on another laptop VM reproduced the raw and host-job rates and measured the
+          container paths several times faster; with 13 ms of real work per task, host
+          jobs reached three quarters of the raw rate.</p>
+        <p>The VM baseline is a raw-process reference for this VM and command, not a
+          ceiling. It counts successful exits without resource enforcement,
           durable ownership or task ledgers. Public rows count unique accepted successes
           received within the window; their rate gap includes those guarantees.
           Runs/day multiplies the minute count by 1,440; it isn't an observed daily total.</p>

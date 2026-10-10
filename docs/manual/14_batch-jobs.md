@@ -666,6 +666,13 @@ Fresh receipt chunks contain one job; fast paths use 1,000 jobs. This reporting
 choice makes slow progress visible and amortises fast outcomes, so the rate gap
 also includes receipt granularity. Chunk size never decides how many jobs fit.
 
+An independent rerun on another laptop VM (five interleaved rounds per build)
+reproduced the raw and host-job rates and measured both container paths three
+to four times faster. With about 13 ms of real CPU work per task, host jobs
+reached about three quarters of the raw-process rate, against about a quarter
+with the no-op command. See the
+[qualification record](../qualification/2026-10-09-timed-job-scenarios/README.md#independent-five-round-rerun).
+
 Daily projections multiply the minute count by 1,440. Raw exits omit admission,
 limits, durable ownership and task ledgers. The measured baseline is a reference
 for this VM and executable; it isn't a universal physical limit. Only completions
