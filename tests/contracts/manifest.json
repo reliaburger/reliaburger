@@ -6618,6 +6618,178 @@
       "boundaries": [
         "Real runtime regression; this does not qualify sustained production throughput."
       ]
+    },
+    {
+      "id": "issue-681",
+      "issue": 681,
+      "promise": "App placement counts the capacity job leases hold, and every job, leased or not, takes the common job lifecycle.",
+      "supported_paths": [
+        "State reports carry task and executor reservations apart from app requests; the leader adds them to each node's allocated total.",
+        "A node that cannot fit a placement reports the refusal and the leader moves the replica.",
+        "Job test leases live in Raft with a council; their jobs join the lease before admission and cleanup stops and forgets them."
+      ],
+      "refused_paths": [
+        "The pre-0.2.0 node-to-node batch routes are gone.",
+        "A job in a test lease namespace is refused unless an active job lease owns it."
+      ],
+      "boundaries": [
+        "Single scheduling passes, the in-process leader scheduler and a real three-node cluster with a shared executor budget; leadership change through a snapshot reload."
+      ],
+      "cases": [
+        {
+          "id": "issue-681-job_reservations_count_task_and_executor_leases_but_not_apps",
+          "binary": "reliaburger",
+          "test": "bun::execution_budget::tests::job_reservations_count_task_and_executor_leases_but_not_apps",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/execution_budget.rs"
+          ]
+        },
+        {
+          "id": "issue-681-state_report_carries_task_and_executor_reservations",
+          "binary": "reliaburger",
+          "test": "reporting::worker::tests::state_report_carries_task_and_executor_reservations",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/reporting/worker.rs",
+            "src/reporting/types.rs"
+          ]
+        },
+        {
+          "id": "issue-681-capacity_refusal_and_job_reservations_reach_the_state_snapshot",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::capacity_refusal_and_job_reservations_reach_the_state_snapshot",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/status.rs",
+            "src/bun/agent/deploy_ops.rs"
+          ]
+        },
+        {
+          "id": "issue-681-app_replica_avoids_a_node_whose_budget_is_held_by_job_leases",
+          "binary": "reliaburger",
+          "test": "cluster::orchestrate::tests::app_replica_avoids_a_node_whose_budget_is_held_by_job_leases",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/cluster/orchestrate.rs"
+          ]
+        },
+        {
+          "id": "issue-681-capacity_refusal_from_the_agent_moves_the_replica",
+          "binary": "reliaburger",
+          "test": "cluster::orchestrate::tests::capacity_refusal_from_the_agent_moves_the_replica",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/cluster/orchestrate.rs",
+            "src/meat/cluster_state.rs"
+          ]
+        },
+        {
+          "id": "issue-681-leased_apply_with_jobs_uses_the_common_job_lifecycle",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::leased_apply_with_jobs_uses_the_common_job_lifecycle",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api/apply.rs",
+            "src/bun/job_apply.rs",
+            "src/testkit/lease.rs"
+          ]
+        },
+        {
+          "id": "issue-681-standalone_job_lease_owns_its_jobs_and_cleanup_forgets_them",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::standalone_job_lease_owns_its_jobs_and_cleanup_forgets_them",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/job_apply.rs",
+            "src/testkit/lease.rs"
+          ]
+        },
+        {
+          "id": "issue-681-legacy_batch_routes_are_gone",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::legacy_batch_routes_are_gone",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api.rs",
+            "src/bun/batch.rs"
+          ]
+        },
+        {
+          "id": "issue-681-leased_job_apply_survives_leader_change_without_reserving_capacity",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::leased_job_apply_survives_leader_change_without_reserving_capacity",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs",
+            "src/meat/admission.rs"
+          ]
+        },
+        {
+          "id": "issue-681-a_job_in_a_lease_namespace_needs_the_lease_to_own_it",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::a_job_in_a_lease_namespace_needs_the_lease_to_own_it",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-681-an_app_deploys_beside_a_job_filled_node_on_another_node",
+          "binary": "reliaburger::suite",
+          "test": "agent_cluster::an_app_deploys_beside_a_job_filled_node_on_another_node",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/agent_cluster.rs",
+            "src/cluster/orchestrate.rs"
+          ]
+        },
+        {
+          "id": "issue-681-app_replica_lands_on_the_idle_node_while_another_runs_an_array",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "app_replica_lands_on_the_idle_node_while_another_runs_an_array",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ]
     }
   ]
 }

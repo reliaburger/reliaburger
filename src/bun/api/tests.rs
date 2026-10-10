@@ -5564,6 +5564,33 @@ async fn service_principal_is_refused_from_rotating_secrets() {
     shutdown.cancel();
 }
 
+/// The pre-0.2.0 node-to-node batch endpoints are gone: jobs reach nodes
+/// only as task-array grants, so even the service principal finds nothing
+/// to dispatch to or report into.
+#[tokio::test]
+async fn legacy_batch_routes_are_gone() {
+    let (app, shutdown, _council) = setup_with_service_token("legacy-batch-routes").await;
+    for uri in ["/v1/batch/run", "/v1/batch/1/report"] {
+        let status = post_status(
+            app.clone(),
+            uri,
+            "rbrg_service",
+            r#"{"batch_id":1,"jobs":[],"job_name":"x","namespace":"default","status":"completed"}"#,
+        )
+        .await;
+        // `/v1/batch/run` still matches the GET-only `/v1/batch/{id}` path,
+        // so axum answers 405 there; either way no handler takes the POST.
+        assert!(
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{uri}: {status}"
+        );
+    }
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn service_principal_is_accepted_on_a_system_route() {
     // AUTH4 must not weaken node-to-node fan-out: the service token still
@@ -8085,8 +8112,7 @@ async fn an_admitted_job_only_apply_owns_its_name_before_executor_dispatch() {
         None,
     );
     let ownership = tokio::spawn(async move {
-        while let Some(command) = commands.recv().await {
-            let _ = command;
+        if commands.recv().await.is_some() {
             panic!("admission must not invoke the agent");
         }
     });

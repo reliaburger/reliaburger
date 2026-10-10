@@ -1422,6 +1422,12 @@
     "test": "losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt"
   },
   {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "app_replica_lands_on_the_idle_node_while_another_runs_an_array",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "app_replica_lands_on_the_idle_node_while_another_runs_an_array"
+  },
+  {
     "source": "tests/owned_task_arrays.rs",
     "function": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
     "binary": "reliaburger::owned_task_arrays",
@@ -1456,18 +1462,6 @@
     "function": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller"
-  },
-  {
-    "source": "src/bun/supervisor.rs",
-    "function": "cgroup_rootful_process_node_refuses_limited_ordinary_host_jobs",
-    "binary": "reliaburger",
-    "test": "bun::supervisor::tests::cgroup_rootful_process_node_refuses_limited_ordinary_host_jobs"
-  },
-  {
-    "source": "src/bun/supervisor.rs",
-    "function": "cgroup_rootful_process_node_refuses_container_runtimes",
-    "binary": "reliaburger",
-    "test": "bun::supervisor::tests::cgroup_rootful_process_node_refuses_container_runtimes"
   },
   {
     "source": "tests/owned_task_arrays.rs",

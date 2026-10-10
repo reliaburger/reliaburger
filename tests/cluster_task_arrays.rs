@@ -91,6 +91,7 @@ async fn start_node(
         labels: Default::default(),
         keep_data_dir: false,
         task_arrays: Some(service(data)),
+        task_arrays_on_agent_budget: None,
     })
     .await
 }
@@ -360,6 +361,7 @@ async fn start_common_node(
             Duration::from_millis(100),
             Duration::from_secs(3),
         ))),
+        task_arrays_on_agent_budget: None,
     })
     .await
 }
@@ -695,4 +697,188 @@ async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another
         owner
     );
     root.cancel();
+}
+
+/// A node whose task-array executor shares its agent's execution budget, as
+/// Bun wires it. `executor: false` leaves the node without one, so arrays
+/// run only on the nodes that have it.
+async fn shared_budget_node(
+    index: usize,
+    seeds: Vec<std::net::SocketAddr>,
+    root: &CancellationToken,
+    data: &std::path::Path,
+    executor: bool,
+) -> WiredNode {
+    let directory = data.join("task-arrays");
+    let build: Option<cluster_support::TaskArraysOnBudget> = executor.then(|| {
+        Box::new(move |budget| {
+            let node = TaskArrayNode::new(
+                TaskArrayNodeConfig {
+                    root: directory,
+                    policy: ProcessWorkloadsConfig {
+                        allowed_binaries: vec![BINARY.into()],
+                        mount_isolation: false,
+                        ..Default::default()
+                    },
+                    default_concurrency: 8,
+                    backoff: (Duration::from_millis(1), Duration::from_millis(5)),
+                    group_commit: GroupCommit::default(),
+                },
+                // Each attempt holds its lease long enough to fill the node.
+                NodeRunner::Fake(FakeRunner::new(Duration::from_secs(120), |_| {
+                    AttemptOutcome::Exited { code: 0 }
+                })),
+            )
+            .with_budget(budget);
+            Arc::new(TaskArrayService::with_timings(
+                Some(Arc::new(node)),
+                Duration::from_millis(100),
+                Duration::from_secs(10),
+            ))
+        }) as cluster_support::TaskArraysOnBudget
+    });
+    start_wired_node(WiredNodeOptions {
+        name: format!("shared{index}"),
+        gossip_port: BASE_PORT + 200 + index as u16 * 10,
+        seeds,
+        shutdown: root.child_token(),
+        data_dir_prefix: "rb-shared-budget",
+        stale_report_timeout_secs: 10,
+        metrics_rollup: None,
+        scheduler: Some(reliaburger::config::node::ReconstructionSection {
+            report_threshold_percent: 95,
+            learning_period_timeout_secs: 2,
+            large_cluster_timeout_secs: 4,
+            large_cluster_node_count: 5000,
+        }),
+        lease_reaper: false,
+        membership: MembershipSource::Gossip,
+        service_identity: Some(SERVICE_TOKEN.into()),
+        operator_token: None,
+        fault_injection: false,
+        labels: Default::default(),
+        keep_data_dir: false,
+        task_arrays: Some(Arc::new(TaskArrayService::with_timings(
+            None,
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+        ))),
+        task_arrays_on_agent_budget: build,
+    })
+    .await
+}
+
+/// Task attempts and app replicas lease from one budget per node. With one
+/// node's budget full of an array's attempts, the leader places an app's
+/// replicas on the other two: the full node's state report carries its job
+/// reservations, and the leader counts them as allocated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a real multi-node cluster; run with make test-cluster"]
+async fn app_replica_lands_on_the_idle_node_while_another_runs_an_array() {
+    assert!(cluster_tests_enabled());
+    let root = CancellationToken::new();
+    let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (index, directory) in data.iter().enumerate() {
+        let seeds = if index == 0 {
+            vec![]
+        } else {
+            vec![local(BASE_PORT + 200)]
+        };
+        nodes.push(shared_budget_node(index, seeds, &root, directory.path(), index == 0).await);
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&nodes).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    wait_until(
+        "gossip sees everyone",
+        Duration::from_secs(60),
+        async || {
+            for node in &nodes {
+                if node.membership_table.read().await.len() < 3 {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    let leader = nodes
+        .iter()
+        .position(|node| *node.thinks_leader.borrow())
+        .expect("a leader");
+
+    // Fill shared0's 8000m with eight 1000m attempts that sleep.
+    let http = reqwest::Client::new();
+    let answer: Value = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/batch/array",
+            nodes[leader].api_port
+        ))
+        .json(&json!({
+            "name": "filler",
+            "template": { "runtime": "process", "exec": BINARY, "cpu": "1000m" },
+            "spec": { "count": 64 },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(answer["batch_id"].is_u64(), "{answer}");
+    wait_until(
+        "the leader sees shared0's budget held by jobs",
+        Duration::from_secs(60),
+        async || {
+            nodes[leader]
+                .aggregated_rx
+                .borrow()
+                .reports
+                .get(&reliaburger::meat::NodeId::new("shared0"))
+                .is_some_and(|report| report.job_reservations.cpu_millicores >= 8000)
+        },
+    )
+    .await;
+
+    let app = reliaburger::meat::AppId::new("web", "default");
+    nodes[leader]
+        .council
+        .write(reliaburger::council::RaftRequest::AppSpec {
+            app_id: app.clone(),
+            spec: Box::new(
+                toml::from_str(
+                    "image = 'proc-grill:image-ignored'\ncommand = ['sleep', '600']\ncpu = '1000m'\nreplicas = 3",
+                )
+                .unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    let mut placed = Vec::new();
+    wait_until("the app is placed", Duration::from_secs(60), async || {
+        placed = nodes[leader]
+            .council
+            .desired_state()
+            .await
+            .scheduling
+            .get(&app)
+            .map(|placements| {
+                placements
+                    .iter()
+                    .map(|placement| placement.node_id.0.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        placed.len() == 3
+    })
+    .await;
+    root.cancel();
+    assert!(
+        placed.iter().all(|node| node != "shared0"),
+        "a replica landed on the node jobs had filled: {placed:?}"
+    );
 }

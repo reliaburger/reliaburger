@@ -435,13 +435,6 @@ async fn proxy_response(result: Result<reqwest::Response, reqwest::Error>) -> Re
     }
 }
 
-/// Whether it is safe to send our service token to `base_url` as a batch
-/// callback. When a membership table exists, the URL must match a known
-/// member (keeps the token from going to an attacker-chosen callback if a
-/// node is compromised). With no membership table (standalone / single-node),
-/// there are no peers to validate against, so the `require_system` gate on the
-/// caller is the guarantee and any callback is accepted.
-
 #[cfg(test)]
 mod tests {
     use super::*;
