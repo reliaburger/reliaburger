@@ -910,18 +910,29 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     }
     answers.sort_by(|a, b| a.0.cmp(&b.0));
     remember_views(state, &answers, &arrays).await;
-    let mut budget = quotas.and_then(|(namespaces, scheduling)| {
-        GrantBudget::new(&namespaces, &scheduling, &arrays, |batch_id, node| {
-            answers
-                .iter()
-                .find(|(answered, _)| answered == node)?
-                .1
-                .arrays
-                .iter()
-                .find(|progress| progress.batch_id == batch_id)
-                .map(|progress| progress.slots)
-        })
-    });
+    let mut budget = None;
+    if let Some((namespaces, scheduling)) = quotas
+        && !namespaces.is_empty()
+    {
+        // The latest slots each node reported, this tick or earlier: a
+        // node that missed one sync keeps its last word, rather than being
+        // charged every task it holds and blocking its namespace for a tick.
+        let reported: HashMap<(u64, NodeId), u32> = state
+            .task_arrays
+            .views
+            .lock()
+            .await
+            .iter()
+            .flat_map(|(batch_id, views)| {
+                views
+                    .iter()
+                    .map(|(node, view)| ((*batch_id, node.clone()), view.slots))
+            })
+            .collect();
+        budget = GrantBudget::new(&namespaces, &scheduling, &arrays, |batch_id, node| {
+            reported.get(&(batch_id, node.clone())).copied()
+        });
+    }
 
     for (batch_id, record) in arrays.active() {
         let for_array: Vec<(NodeId, &ArrayProgress)> = answers
