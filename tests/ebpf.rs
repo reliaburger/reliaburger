@@ -1132,11 +1132,12 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
         .update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
         .expect("write backend entry");
 
-    // Put the test process's cgroup in a *different* namespace than the
-    // destination service. Any id that differs from the service's forces the
-    // hook's cross-namespace branch.
-    let src_cgroup = reliaburger::sesame::egress::cgroup_id_of_pid(std::process::id())
-        .expect("failed to resolve own cgroup id");
+    // Put a probe cgroup in a *different* namespace than the destination
+    // service. Any id that differs from the service's forces the hook's
+    // cross-namespace branch. The probe, not the test process, is bound, so
+    // concurrent tests sharing the runner's cgroup are untouched.
+    let probe = ProbeCgroup::new("isolation-default");
+    let src_cgroup = probe.id;
     let src_ns = entry.namespace_id.wrapping_add(1);
     firewall::write_cgroup_namespace_entry(&mut ebpf.bpf, src_cgroup, src_ns)
         .expect("write cgroup-namespace entry");
@@ -1144,12 +1145,9 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     let vip_dst = SocketAddr::new(entry.vip.0.into(), entry.port);
 
     // Cross-namespace, no allow entry → denied with EPERM.
-    let blocked = TcpStream::connect_timeout(&vip_dst, Duration::from_secs(2));
+    let blocked = probe.connect(vip_dst);
     assert!(
-        matches!(
-            blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&blocked),
         "cross-namespace connect should be denied with EPERM, got {blocked:?}"
     );
 
@@ -1162,15 +1160,14 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     }]) {
         firewall::write_firewall_entry(&mut ebpf.bpf, key, value).expect("write firewall entry");
     }
-    let allowed = TcpStream::connect_timeout(&vip_dst, Duration::from_secs(2));
+    let allowed = probe.connect(vip_dst);
     assert!(
         allowed.is_ok(),
         "allowed cross-namespace connect should reach the backend: {allowed:?}"
     );
 
-    // Forget the namespace mapping so the harness's own connections aren't
-    // caught by a lingering isolation identity on a reused cgroup.
-    firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, src_cgroup).ok();
+    // Forget the probe's identity so a reused cgroup id inherits nothing.
+    firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, src_cgroup).ok();
     ebpf.detach().unwrap();
 }
 
@@ -1178,7 +1175,7 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn namespace_grant_cannot_authorise_a_same_named_destination() {
-    use reliaburger::sesame::{egress, firewall};
+    use reliaburger::sesame::firewall;
     use std::collections::HashMap;
     assert!(ebpf_tests_enabled());
     let mut ebpf = OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap();
@@ -1210,7 +1207,8 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
             .update_backends_bpf(&mut ebpf, entry.vip, entry.port, entry)
             .unwrap();
     }
-    let cgroup = egress::cgroup_id_of_pid(std::process::id()).unwrap();
+    let probe = ProbeCgroup::new("grant-identity");
+    let cgroup = probe.id;
     firewall::write_cgroup_namespace_entry(
         &mut ebpf.bpf,
         cgroup,
@@ -1234,14 +1232,8 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
     let private = services
         .resolve(&ServiceId::new("private", "database"))
         .unwrap();
-    let allowed = TcpStream::connect_timeout(
-        &SocketAddr::new(permitted.vip.0.into(), port),
-        Duration::from_secs(2),
-    );
-    let denied = TcpStream::connect_timeout(
-        &SocketAddr::new(private.vip.0.into(), port),
-        Duration::from_secs(2),
-    );
+    let allowed = probe.connect(SocketAddr::new(permitted.vip.0.into(), port));
+    let refused = probe.connect(SocketAddr::new(private.vip.0.into(), port));
     firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, cgroup).unwrap();
     ebpf.detach().unwrap();
     assert!(
@@ -1249,8 +1241,8 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
         "explicitly allowed destination failed: {allowed:?}"
     );
     assert!(
-        matches!(denied, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
-        "grant to permitted/database also authorised private/database"
+        denied(&refused),
+        "grant to permitted/database also authorised private/database: {refused:?}"
     );
 }
 
