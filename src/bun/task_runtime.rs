@@ -154,6 +154,23 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         }
         .map(|pool| pool.timings())
     }
+    /// The reusable pool that runs `template`: `Some(None)` before that pool
+    /// exists, `None` when the template doesn't run through a pool here.
+    #[cfg(target_os = "linux")]
+    fn pool_for(
+        &self,
+        template: &crate::config::job::JobSpec,
+    ) -> Option<Option<&std::sync::Arc<super::reusable_executor::ReusablePool<G>>>> {
+        use crate::config::job::JobRuntime;
+        if template.runtime == JobRuntime::SharedRunc && self.runtime.reusable_runtime().is_some() {
+            Some(self.reusable.get())
+        } else if template.runtime == JobRuntime::Process && self.supports_host_limits() {
+            Some(self.host.get())
+        } else {
+            None
+        }
+    }
+
     /// Compatible idle contexts already own their complete resource request.
     #[cfg(target_os = "linux")]
     pub(crate) async fn reusable_capacity(&self, template: &crate::config::job::JobSpec) -> u32
@@ -394,20 +411,26 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         batch_id: u64,
         template: Option<&crate::config::job::JobSpec>,
     ) -> Option<u64> {
-        let template = template?;
         #[cfg(target_os = "linux")]
-        if (template.runtime == crate::config::job::JobRuntime::SharedRunc
-            && self.runtime.reusable_runtime().is_some())
-            || (template.runtime == crate::config::job::JobRuntime::Process
-                && self.supports_host_limits())
-        {
-            let pool = if template.runtime == crate::config::job::JobRuntime::Process {
-                self.host.get()
-            } else {
-                self.reusable.get()
-            };
+        if let Some(pool) = self.pool_for(template?) {
             return Some(match pool {
                 Some(pool) => pool.active_commands(batch_id).await,
+                None => 0,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (batch_id, template);
+        None
+    }
+    async fn busy_slots(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = self.pool_for(template?) {
+            return Some(match pool {
+                Some(pool) => pool.busy_slots(batch_id).await,
                 None => 0,
             });
         }
@@ -434,6 +457,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: "owned tasks require a runtime template".into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         };
         let resolved = match self.resolve_template(template).await {
@@ -444,6 +468,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         reason: "cannot decrypt this job's namespace secrets".into(),
                     },
                     output: CapturedOutput::default(),
+                    ran: None,
                 };
             }
         };
@@ -459,6 +484,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: reason.into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         }
         if !self.runtime.supports_runtime(backend) {
@@ -467,6 +493,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: "selected job runtime is unavailable on this node".into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         }
         if resolved.runtime == crate::config::job::JobRuntime::SharedRunc
@@ -533,20 +560,8 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         },
                     )
                     .await;
-                if task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_TASK_COUNT")
-                    .is_some_and(|(_, value)| value == "1")
-                    && let Some(run) = task
-                        .env
-                        .iter()
-                        .rev()
-                        .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                        .and_then(|(_, value)| value.parse().ok())
-                {
-                    self.retire_singleton(run).await;
+                if let Some(run) = task.run.as_ref().filter(|run| run.is_singleton()) {
+                    self.retire_singleton(run.batch_id).await;
                 }
                 return result;
             }
@@ -555,12 +570,14 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     reason: "shared-runc requires the owned rootful Linux runtime".into(),
                 },
                 output: CapturedOutput::default(),
+                ran: None,
             };
         }
         let Some(slot) = self.slot(cancel).await else {
             return Attempt {
                 outcome: AttemptOutcome::Cancelled,
                 output: CapturedOutput::default(),
+                ran: None,
             };
         };
         let namespace = template.namespace.as_deref().unwrap_or("default");
@@ -584,21 +601,12 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         if let Some(script) = &mut spec.script {
             *script = script.replace("{index}", &task.index.to_string());
         }
-        let singleton = task
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "RELIABURGER_TASK_COUNT")
-            .is_some_and(|(_, value)| value == "1");
-        let run_id = singleton
-            .then(|| {
-                task.env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                    .and_then(|(_, value)| value.parse::<u64>().ok())
-            })
-            .flatten();
+        let run_id = task
+            .run
+            .as_ref()
+            .filter(|run| run.is_singleton())
+            .map(|run| run.batch_id);
+        let singleton = run_id.is_some();
         // Omitted requests have concrete conservative defaults, including limits.
         if template.image.is_some() && (!singleton || self.runtime.honours_cgroup_path()) {
             spec.cpu.get_or_insert(crate::config::types::ResourceRange {
@@ -741,19 +749,14 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 let runtime = self.runtime.clone();
                 let id = id.clone();
                 let app = task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
-                    .map(|(_, value)| value.clone())
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.job_name.clone())
                     .unwrap_or_else(|| "job".into());
                 let log_instance = task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                    .and_then(|(_, value)| value.parse::<u64>().ok())
-                    .map_or_else(|| id.0.clone(), |id| format!("run-{id}"));
+                    .run
+                    .as_ref()
+                    .map_or_else(|| id.0.clone(), |run| format!("run-{}", run.batch_id));
                 let namespace = namespace.to_string();
                 let offsets = self.capture_offsets.clone();
                 tokio::spawn(async move {
@@ -896,7 +899,11 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             .expect("executor slots poisoned")
             .push_back(slot);
         self.available.notify_one();
-        Attempt { outcome, output }
+        Attempt {
+            outcome,
+            output,
+            ran: None,
+        }
     }
 }
 
@@ -947,6 +954,7 @@ mod tests {
             program: "/unused".into(),
             args: vec!["worker".into()],
             env: vec![],
+            run: None,
         }
     }
     #[tokio::test]
@@ -962,6 +970,11 @@ mod tests {
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -1006,6 +1019,11 @@ mod tests {
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -1067,6 +1085,11 @@ mod tests {
                 ("RELIABURGER_TASK_COUNT".into(), "1".into()),
                 ("RELIABURGER_BATCH_ID".into(), id.to_string()),
             ];
+            task.run = Some(crate::bun::task_executor::RunIdentity {
+                batch_id: id,
+                task_count: 1,
+                job_name: None,
+            });
             let attempt = runner
                 .run(&task, Duration::ZERO, &CancellationToken::new())
                 .await;
@@ -1091,6 +1114,11 @@ mod tests {
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -1136,6 +1164,11 @@ mod tests {
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
             ("RELIABURGER_JOB_NAME".into(), "migrate".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: Some("migrate".into()),
+        });
         let result = runner
             .run(&task, Duration::from_secs(5), &CancellationToken::new())
             .await;

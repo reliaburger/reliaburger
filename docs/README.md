@@ -1254,10 +1254,11 @@ refusal for the next app ends the measurement successfully, followed by a final
 running check for every counted app. Missing evidence, expired leases, runtime
 failures and the hard safety limit fail the suite.
 
-Run a built-in timed job comparison with `relish bench --scenario jobs-shared-containers`
-(defaults: 60 seconds, concurrency 27). Fresh-container, trusted host-process
-and local Linux VM-baseline scenarios are also available; see the batch manual
-for prerequisites, resource profiles and matched comparisons.
+`relish bench --scenario jobs-shared-containers` runs a timed job comparison
+(60 seconds at concurrency 27 by default), with fresh-container, host-process
+and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
+it measures per-job overhead rather than real work; see the batch manual for
+prerequisites and resource profiles.
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
@@ -1462,7 +1463,7 @@ manifests, app/job resource accounting, watch summaries, indexed detail, retries
 and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
 mixed-resource work beside a service. The standalone landing-page job recording
 uses the built-in `relish bench` scenarios. Build matching development binaries
-and use a fresh cluster (protocol 50 / state 67). The
+and use a fresh cluster (protocol 51 / state 68). The
 [implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
 and the still-unqualified 100m/day sustained throughput target.
 
@@ -1476,26 +1477,22 @@ Linux image jobs can choose `runtime = "shared-runc"` to retain bounded,
 compatible owned containers while starting a separate limited process for each
 command. Idle profiles and helper resources stay charged to the application/task
 budget; uncertain cleanup retires the whole container before reuse. Fresh
-containers remain the default. Linux `--runtime mixed` or auto-selected mixed nodes accept explicit
-`runtime="process"` jobs alongside containers through the owned process backend;
-explicit `--runtime runc` stays container-only;
-rootful Linux process jobs use bounded native executors and enforce explicit
-CPU/memory limits before each fresh command starts. Other platforms refuse
-unsupported limits. Host applications retain their existing runtime contract.
-Verified duration summaries let fast workers queue bounded lookahead across
-control-report rounds; execution still waits for concurrency and resources.
-The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
-tracks reusable executors (#639), the demonstration (#640), and the still-
-unqualified sustained target (#668). The standalone [four-part recording](https://reliaburger.com/#job-throughput)
-measures each scenario for 60 seconds: 993,718 raw exits, 213 fresh-container,
-58,000 shared-container and 294,000 native host accepted successes. Public
-windows have no failures or retries. [Raw measurements](qualification/2026-10-09-timed-job-scenarios/README.md)
-retain the actual hardware, concurrency, receipt policy, daily extrapolations
-and four completed sequential one-hour saturation runs. The host hour accepted
-19,145,000 successes and the shared hour 11,799,000; all application probes
-succeeded. Global storage bounds and a real daily qualification remain in #668.
-[Earlier comparisons and recovery evidence](qualification/2026-10-08-job-measurements/README.md)
-retain failed experiments and remaining qualification work.
-Resident model workers (#641) remain separate.
+containers remain the default. Linux `--runtime mixed`, or `auto` with runc
+installed, accepts explicit `runtime = "process"` jobs alongside containers;
+explicit `--runtime runc` stays container-only and `--runtime process` host-only.
+On rootful Linux, host batches use bounded native executors that enforce
+explicit CPU/memory limits before each fresh command starts; ordinary host jobs
+and other platforms refuse limits. Host applications retain their existing
+runtime contract. Verified duration summaries let fast workers queue bounded
+lookahead across control-report rounds; execution still waits for concurrency
+and resources.
 
-The [equal-window measurement plan](plans/archive/2026-10-09-plan-timed-job-scenarios.md) compares all four scenarios for 60 seconds, then one hour each. Daily counts are labelled extrapolations.
+The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+tracks reusable executors (#639), the demonstration (#640) and the
+still-unqualified sustained target (#668). The
+[timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
+record each runtime's per-job overhead for 60 seconds on a small VM, with the
+rig, profiles and limits, and four completed one-hour soaks beside a live
+application; global storage bounds and daily qualification remain in #668. The
+[earlier evidence](qualification/2026-10-08-job-measurements/README.md) keeps
+the recovery results. Resident model workers (#641) remain separate.

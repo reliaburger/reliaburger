@@ -1,6 +1,0 @@
-jobs-vm-baseline: 1 seconds, concurrency 27 locally; image/executable preparation precedes the window; positive drain follows it
-preparing the pinned BusyBox image in the local cache; excluded from the raw window
-0.0s: 1 raw successful exits within the window; 0 failures
-jobs-vm-baseline: 16370 raw successful exits in 1 seconds (16370.0/s)
-0 failures, 0 retries; cleanup verified
-1.4B runs/day extrapolated — not an observed daily total

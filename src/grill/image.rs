@@ -1692,6 +1692,9 @@ mod tests {
         }
     }
 
+    // Rust 1.99 renamed `fetch_update` to `try_update`; the 1.97 baseline
+    // doesn't have the new name yet, so keep the old one until it does.
+    #[allow(deprecated)]
     async fn registry_response(
         State(state): State<RegistryState>,
         request: Request,

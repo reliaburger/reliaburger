@@ -61,7 +61,9 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
         }
         Ok(self.directory.join(format!("{}.json", id.0)))
     }
-    fn load(&self, id: &InstanceId) -> Result<Option<Route>, GrillError> {
+    /// Route files are tiny, but reading one is still blocking file I/O, so
+    /// async callers use [`Self::load`], which runs this on the blocking pool.
+    fn load_blocking(&self, id: &InstanceId) -> Result<Option<Route>, GrillError> {
         let path = self.path(id).map_err(|e| Self::error(id, e))?;
         durable::validate_directory(&self.directory).map_err(|e| Self::error(id, e))?;
         let route: Option<Route> = durable::read_json_if_exists(&path, 65536, Access::Exclusive)
@@ -79,12 +81,23 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
         }
         Ok(route)
     }
-    fn store(&self, route: &Route) -> Result<(), GrillError> {
+    async fn load(&self, id: &InstanceId) -> Result<Option<Route>, GrillError> {
+        let this = self.clone();
+        let owned = id.clone();
+        tokio::task::spawn_blocking(move || this.load_blocking(&owned))
+            .await
+            .map_err(|e| Self::error(id, e))?
+    }
+    async fn store(&self, route: &Route) -> Result<(), GrillError> {
         let id = &route.instance;
         let bytes = serde_json::to_vec(route).map_err(|e| Self::error(id, e))?;
         let path = self.path(id).map_err(|e| Self::error(id, e))?;
-        crate::sesame::identity::atomic_write_mode(&path, &bytes, Some(0o600))
-            .map_err(|e| Self::error(id, e))
+        tokio::task::spawn_blocking(move || {
+            crate::sesame::identity::atomic_write_mode(&path, &bytes, Some(0o600))
+        })
+        .await
+        .map_err(|e| Self::error(id, e))?
+        .map_err(|e| Self::error(id, e))
     }
     async fn operation<
         T: Send + 'static,
@@ -137,8 +150,13 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
         .await
         .map_err(|e| Self::error(&error_id, e))?
     }
-    fn selected(&self, id: &InstanceId) -> Result<Route, GrillError> {
-        self.load(id)?
+    fn selected_blocking(&self, id: &InstanceId) -> Result<Route, GrillError> {
+        self.load_blocking(id)?
+            .ok_or_else(|| Self::error(id, "mixed-runtime route is absent"))
+    }
+    async fn selected(&self, id: &InstanceId) -> Result<Route, GrillError> {
+        self.load(id)
+            .await?
             .ok_or_else(|| Self::error(id, "mixed-runtime route is absent"))
     }
     async fn backend_state(
@@ -221,7 +239,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
             } else {
                 this.container.runtime_kind()
             };
-            match this.load(&id)? {
+            match this.load(&id).await? {
                 Some(old) if old.runtime != runtime => {
                     this.prove_retired(
                         &id,
@@ -246,20 +264,20 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
                 committed: false,
                 retired: false,
             };
-            this.store(&route)?;
+            this.store(&route).await?;
             if host {
                 this.host.create(&id, &spec).await?;
             } else {
                 this.container.create(&id, &spec).await?;
             }
             route.committed = true;
-            this.store(&route)
+            this.store(&route).await
         })
         .await
     }
     async fn start(&self, id: &InstanceId) -> Result<(), GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if !route.committed {
                 return Err(Self::error(&id, "backend creation is incomplete"));
             }
@@ -273,7 +291,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn stop(&self, id: &InstanceId) -> Result<(), GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.stop(&id).await
             } else {
@@ -284,7 +302,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn kill(&self, id: &InstanceId) -> Result<(), GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.kill(&id).await
             } else {
@@ -295,7 +313,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn state(&self, id: &InstanceId) -> Result<ContainerState, GrillError> {
         self.operation(id, |this, id| async move {
-            let Some(mut route) = this.load(&id)? else {
+            let Some(mut route) = this.load(&id).await? else {
                 return Err(this.absent_error(&id).await);
             };
             let host = route.runtime == RuntimeKind::Process;
@@ -305,7 +323,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
                 && (host || this.container.network_reference(&id).await?.is_none())
             {
                 route.retired = true;
-                this.store(&route)?;
+                this.store(&route).await?;
             }
             Ok(state)
         })
@@ -313,7 +331,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn has_exited(&self, id: &InstanceId) -> Result<bool, GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.has_exited(&id).await
             } else {
@@ -324,7 +342,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn pid(&self, id: &InstanceId) -> Result<Option<u32>, GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.pid(&id).await
             } else {
@@ -335,7 +353,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn exit_code(&self, id: &InstanceId) -> Result<Option<i32>, GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.exit_code(&id).await
             } else {
@@ -346,7 +364,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn logs(&self, id: &InstanceId) -> Result<String, GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.logs(&id).await
             } else {
@@ -357,7 +375,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     async fn workload_cgroup(&self, id: &InstanceId) -> Result<Option<u64>, GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.workload_cgroup(&id).await
             } else {
@@ -371,7 +389,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         id: &InstanceId,
     ) -> Result<Option<NetworkReference>, GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.retain_network_reference(&id).await
             } else {
@@ -385,7 +403,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         id: &InstanceId,
     ) -> Result<Option<NetworkReference>, GrillError> {
         self.operation(id, |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime == RuntimeKind::Process {
                 this.host.network_reference(&id).await
             } else {
@@ -398,7 +416,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     async fn adopt(&self, id: &InstanceId, record: &InstanceRecord) -> Result<bool, GrillError> {
         let record = record.clone();
         self.operation(id, move |this, id| async move {
-            let route = this.selected(&id)?;
+            let route = this.selected(&id).await?;
             if route.runtime != record.runtime
                 || record.runtime != this.runtime_kind_for(&record.oci_spec)
             {
@@ -421,7 +439,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     ) -> Result<(), GrillError> {
         let reference = reference.clone();
         self.operation(&reference.instance_id.clone(), move |this, id| async move {
-            if this.selected(&id)?.runtime == RuntimeKind::Process {
+            if this.selected(&id).await?.runtime == RuntimeKind::Process {
                 return Err(Self::error(
                     &id,
                     "host commands do not own container addresses",
@@ -459,7 +477,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
             launches
                 .into_iter()
                 .map(|(is_host, launch)| {
-                    let route = this.selected(&launch.instance_id)?;
+                    let route = this.selected_blocking(&launch.instance_id)?;
                     Ok((is_host, launch, route))
                 })
                 .collect::<Result<Vec<_>, GrillError>>()
@@ -524,7 +542,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         self.container.reusable_runtime()
     }
     async fn log_stem(&self, id: &InstanceId) -> Option<PathBuf> {
-        let route = self.selected(id).ok()?;
+        let route = self.selected(id).await.ok()?;
         if route.runtime == RuntimeKind::Process {
             self.host.log_stem(id).await
         } else {
@@ -532,14 +550,14 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         }
     }
     async fn rootless_network_record(&self, id: &InstanceId) -> Option<RootlessNetworkRecord> {
-        if self.selected(id).ok()?.runtime == RuntimeKind::Process {
+        if self.selected(id).await.ok()?.runtime == RuntimeKind::Process {
             None
         } else {
             self.container.rootless_network_record(id).await
         }
     }
     async fn container_ip(&self, id: &InstanceId) -> Option<std::net::Ipv4Addr> {
-        if self.selected(id).ok()?.runtime == RuntimeKind::Process {
+        if self.selected(id).await.ok()?.runtime == RuntimeKind::Process {
             None
         } else {
             self.container.container_ip(id).await
@@ -553,7 +571,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     ) {
         // A follower must not retain the lifecycle claim while waiting for output:
         // stop/kill need that claim to retire its original producer.
-        if let Ok(route) = self.selected(id) {
+        if let Ok(route) = self.selected(id).await {
             if route.runtime == RuntimeKind::Process {
                 self.host.follow_logs(id, tx, resume).await;
             } else {
@@ -562,15 +580,14 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         }
     }
     async fn exec(&self, id: &InstanceId, command: &[String]) -> Result<String, GrillError> {
-        let command = command.to_vec();
-        self.operation(id, move |this, id| async move {
-            if this.selected(&id)?.runtime == RuntimeKind::Process {
-                this.host.exec(&id, &command).await
-            } else {
-                this.container.exec(&id, &command).await
-            }
-        })
-        .await
+        // Like follow_logs, exec doesn't take the lifecycle claim: it may run
+        // for minutes, and stop/kill need the claim. It also stays in the
+        // caller's future, so the agent's exec timeout drops the backend call.
+        if self.selected(id).await?.runtime == RuntimeKind::Process {
+            self.host.exec(id, command).await
+        } else {
+            self.container.exec(id, command).await
+        }
     }
 }
 
@@ -925,5 +942,32 @@ mod tests {
         // Created is still owned and must be killed before switching.
         runtime.kill(&id).await.unwrap();
         runtime.create(&id, &spec(false)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_stays_in_the_callers_future_and_never_blocks_lifecycle_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let id = InstanceId("default__worker-0".into());
+        runtime.create(&id, &spec(true)).await.unwrap();
+        runtime.host.set_exec_outputs(["first".to_string()]);
+        runtime.host.block_execs();
+        let command = ["sleep".to_string(), "3600".to_string()];
+        let mut exec = Box::pin(runtime.exec(&id, &command));
+        tokio::select! {
+            _ = &mut exec => panic!("blocked exec returned"),
+            () = runtime.host.wait_for_execs(1) => {}
+        }
+        // A long exec must not hold the claim that stop/kill need.
+        tokio::time::timeout(Duration::from_secs(2), runtime.kill(&id))
+            .await
+            .expect("kill waited for a running exec")
+            .unwrap();
+        // Dropping the caller's future drops the backend exec too, so the
+        // agent's exec timeout reaches the process.
+        drop(exec);
+        runtime.host.release_execs(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runtime.exec(&id, &command).await.unwrap(), "first");
     }
 }

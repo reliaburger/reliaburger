@@ -6,7 +6,7 @@
   "logical_cpus": 4,
   "workload_sha256": "dd393449e3fd3692bc692ac053ee15540f9a927050cf3e442f55859607c1c0bb",
   "command_prefix": [
-    "/Users/miko/github/reliaburger/target/host-executor-v6-release/relish"
+    "$HOST_HOME/github/reliaburger/target/host-executor-v6-release/relish"
   ],
   "timing": "Monotonic read-only window; the existing submission remains running",
   "last_accepted_sample_seconds": 59.94829799910076,

@@ -245,7 +245,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 runtime: self
                     .supervisor
                     .grill()
-                    .runtime_kind_for_host(spec.exec.is_some() || spec.script.is_some()),
+                    .runtime_kind_for_host(spec.is_host()),
                 generation,
                 restart_count: 0,
                 phase: JobPhase::Preparing,

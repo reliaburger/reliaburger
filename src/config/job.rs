@@ -76,6 +76,16 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
+    /// Whether this job runs a host command rather than a container.
+    ///
+    /// For a validated spec that is exactly `runtime = "process"`. An
+    /// unvalidated one that names a host command anywhere counts as host too,
+    /// so routing and the `host-exec` permission check never treat a host
+    /// command as a container, whether or not validation ran first.
+    pub fn is_host(&self) -> bool {
+        self.runtime == JobRuntime::Process || self.exec.is_some() || self.script.is_some()
+    }
+
     /// Refuse fields that contradict the explicitly selected execution backend.
     pub fn validate_runtime(&self) -> Result<(), &'static str> {
         match self.runtime {
@@ -101,6 +111,18 @@ impl JobSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_jobs_are_named_by_runtime_and_unvalidated_host_fields_still_count() {
+        let host: JobSpec = toml::from_str("runtime='process'\nscript='true'").unwrap();
+        assert!(host.is_host());
+        let image: JobSpec = toml::from_str("image='fixture:v1'").unwrap();
+        assert!(!image.is_host());
+        // Invalid, refused by validate_runtime; never routed as a container.
+        let mislabelled: JobSpec = toml::from_str("exec='/bin/true'").unwrap();
+        assert!(mislabelled.validate_runtime().is_err());
+        assert!(mislabelled.is_host());
+    }
 
     #[test]
     fn container_reuse_is_explicit_and_fresh_is_the_default() {

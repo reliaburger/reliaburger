@@ -822,7 +822,7 @@ pub async fn batch_submit_handler(
             auth.as_deref(),
             &job.name,
             job.namespace(),
-            job.spec.exec.is_some() || job.spec.script.is_some(),
+            job.spec.is_host(),
             &permissions,
         ) {
             return response;

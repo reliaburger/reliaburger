@@ -400,10 +400,13 @@ pub fn sync_request_for(arrays: &TaskArrays, node: &NodeId) -> NodeSyncRequest {
 /// the node still holds at that attempt are included; grants are planned
 /// as if those results had already been applied, so a node that just
 /// finished a chunk gets the next one in the same entry.
+/// `replay_unknown` is the run's policy: without it, grants keep the small
+/// window (see [`plan_grants`]).
 pub fn plan_sync(
     batch_id: u64,
     record: &TaskArrayRecord,
     answers: &[(NodeId, &ArrayProgress)],
+    replay_unknown: bool,
 ) -> Option<TaskArrayWrite> {
     let mut preview = record.state.clone();
     let mut results = Vec::new();
@@ -423,7 +426,7 @@ pub fn plan_sync(
             slots: progress.slots,
         })
         .collect();
-    let grants = plan_grants(&preview, &slots);
+    let grants = plan_grants(&preview, &slots, replay_unknown);
     if results.is_empty() && grants.is_empty() {
         return None;
     }
@@ -740,7 +743,11 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                 eprintln!("bun: task array {batch_id}: owner-loss write failed: {error}");
             }
         }
-        if let Some(write) = plan_sync(batch_id, record, &for_array)
+        let replay_unknown = arrays
+            .jobs()
+            .run(batch_id)
+            .is_none_or(|run| run.replay_unknown);
+        if let Some(write) = plan_sync(batch_id, record, &for_array, replay_unknown)
             && let Err(error) = write_task_array(state, write).await
         {
             eprintln!("bun: task array {batch_id}: sync write failed: {error}");
@@ -956,6 +963,7 @@ mod tests {
             1,
             &record,
             &[(node("a"), &answers[0]), (node("b"), &answers[1])],
+            true,
         )
         .unwrap();
         let TaskArrayWrite::Sync {
@@ -979,7 +987,7 @@ mod tests {
             .grant(&node("a"), &IndexRangeSet::from_range(0..=1))
             .unwrap();
         let answer = progress(4, vec![done(0, 1, 10)]);
-        let write = plan_sync(1, &record, &[(node("a"), &answer)]).unwrap();
+        let write = plan_sync(1, &record, &[(node("a"), &answer)], true).unwrap();
         assert_eq!(
             write,
             TaskArrayWrite::Sync {
@@ -992,6 +1000,34 @@ mod tests {
     }
 
     #[test]
+    fn runs_without_automatic_replay_are_granted_the_small_window() {
+        let mut record = record(100_000, 1000);
+        record
+            .state
+            .grant(&node("a"), &IndexRangeSet::from_range(0..=1))
+            .unwrap();
+        let fast = |chunk| {
+            let mut result = done(chunk, 1, 1000);
+            result.duration_counts[0] = 1000;
+            result
+        };
+        let answer = progress(27, vec![fast(0), fast(1)]);
+        let grants =
+            |replay_unknown| match plan_sync(1, &record, &[(node("a"), &answer)], replay_unknown) {
+                Some(TaskArrayWrite::Sync { grants, .. }) => grants,
+                other => panic!("expected a sync, got {other:?}"),
+            };
+        assert_eq!(
+            grants(true),
+            vec![(node("a"), IndexRangeSet::from_range(2..=17))]
+        );
+        assert_eq!(
+            grants(false),
+            vec![(node("a"), IndexRangeSet::from_range(2..=3))]
+        );
+    }
+
+    #[test]
     fn nothing_to_say_writes_nothing() {
         let mut record = record(20, 10);
         record
@@ -999,7 +1035,7 @@ mod tests {
             .grant(&node("a"), &IndexRangeSet::from_range(0..=1))
             .unwrap();
         let answer = progress(4, vec![]);
-        assert_eq!(plan_sync(1, &record, &[(node("a"), &answer)]), None);
+        assert_eq!(plan_sync(1, &record, &[(node("a"), &answer)], true), None);
     }
 
     #[test]
@@ -1014,7 +1050,7 @@ mod tests {
         // Chunk 0 is already done; chunk 1 went back to the queue at
         // attempt 2, so "a"'s attempt-1 report is stale.
         let answer = progress(0, vec![done(0, 1, 10), done(1, 1, 10)]);
-        assert_eq!(plan_sync(1, &record, &[(node("a"), &answer)]), None);
+        assert_eq!(plan_sync(1, &record, &[(node("a"), &answer)], true), None);
     }
 
     #[test]

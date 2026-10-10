@@ -205,6 +205,16 @@ impl TaskRunner for NodeRunner {
             Self::Process(_) | Self::Fake(_) => None,
         }
     }
+    async fn busy_slots(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        match self {
+            Self::Owned(runner) => runner.busy_slots(batch_id, template).await,
+            Self::Process(_) | Self::Fake(_) => None,
+        }
+    }
     fn owns_admission(&self, task: &TaskInvocation) -> bool {
         matches!(self, Self::Owned(runner) if runner.owns_admission(task))
     }
@@ -775,6 +785,14 @@ impl TaskArrayNode {
             );
         }
         let counters = run.pool.counters();
+        let active_commands = self
+            .runner
+            .active_commands(assignment.batch_id, assignment.template.as_deref())
+            .await;
+        let busy_slots = self
+            .runner
+            .busy_slots(assignment.batch_id, assignment.template.as_deref())
+            .await;
         ArrayProgress {
             batch_id: assignment.batch_id,
             slots: {
@@ -805,20 +823,23 @@ impl TaskArrayNode {
                     } else {
                         u32::MAX
                     });
+                // A pool-run caller counts as running while it still waits
+                // for a slot or admission; only a slot with resources charged
+                // is in use. Started commands alone would miss millisecond
+                // commands that begin and end between samples.
+                let busy = match (reusable, busy_slots) {
+                    (Some(_), Some(held)) => held,
+                    _ => counters.running.load(Ordering::Relaxed),
+                };
                 cap.min(u32::try_from(fits).unwrap_or(u32::MAX))
-                    .saturating_add(
-                        u32::try_from(counters.running.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
-                    )
+                    .saturating_add(u32::try_from(busy).unwrap_or(u32::MAX))
                     .min(cap)
             },
             refused: None,
             finished,
             counters: NodeArrayCounters {
                 running: counters.running.load(Ordering::Relaxed),
-                active_commands: self
-                    .runner
-                    .active_commands(assignment.batch_id, assignment.template.as_deref())
-                    .await,
+                active_commands,
                 attempts_started: counters.attempts_started.load(Ordering::Relaxed),
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
                 failed: counters.failed.load(Ordering::Relaxed),
@@ -1183,8 +1204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn singleton_images_use_the_configured_owned_runtime_without_claiming_unsupported_limits()
-    {
+    async fn image_tasks_are_refused_on_a_process_only_node_with_or_without_limits() {
         let dir = tempfile::tempdir().unwrap();
         let mut task = assignment(1, 1, &[(0, 1)]);
         task.template = Some(Box::new(

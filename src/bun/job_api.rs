@@ -87,7 +87,7 @@ pub(crate) async fn admit_definition(
         auth,
         name,
         namespace,
-        definition.template.exec.is_some() || definition.template.script.is_some(),
+        definition.template.is_host(),
         &permissions,
     )?;
     if state.council.is_none() {
@@ -149,7 +149,7 @@ pub async fn submit_handler(
         auth,
         &request.name,
         &namespace,
-        request.definition.template.exec.is_some() || request.definition.template.script.is_some(),
+        request.definition.template.is_host(),
         &permissions,
     ) {
         return response;
@@ -224,7 +224,7 @@ pub async fn replay_handler(
         auth,
         &record.name,
         &record.namespace,
-        record.template.exec.is_some() || record.template.script.is_some(),
+        record.template.is_host(),
         &permissions,
     ) {
         return response;

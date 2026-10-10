@@ -101,13 +101,6 @@ pub fn export_kubernetes(config: &Config) -> Result<ExportResult, RelishError> {
     }
 
     for (name, job) in &config.job {
-        if job.runtime == crate::config::job::JobRuntime::SharedRunc {
-            return Err(RelishError::UnsupportedExport {
-                reason: format!(
-                    "job {name} selects shared-runc; a Kubernetes Job or CronJob cannot express that execution contract"
-                ),
-            });
-        }
         export_job(name, job, &mut docs, &mut report)?;
     }
 
@@ -435,6 +428,21 @@ fn export_job(
     docs: &mut Vec<String>,
     report: &mut ExportReport,
 ) -> Result<(), RelishError> {
+    use crate::config::job::JobRuntime;
+    if job.runtime == JobRuntime::Process {
+        // A Job needs an image; an image-less one would only fail at apply time.
+        report.unsupported.push(format!(
+            "[job.{name}] runtime = \"process\" host command — no K8s equivalent, not exported"
+        ));
+        return Ok(());
+    }
+    if job.runtime == JobRuntime::SharedRunc {
+        // Reuse is an optimisation: a fresh Pod per attempt runs the same
+        // commands with at least the same isolation, only slower to start.
+        report.unsupported.push(format!(
+            "[job.{name}] runtime = \"shared-runc\" container reuse — exported as a Job with a fresh Pod per attempt"
+        ));
+    }
     let app_namespace = job.namespace.clone();
     // Env and resources go through the same helpers as the app path — the job
     // exporter used to drop both, so a job with a memory limit and database
@@ -511,12 +519,6 @@ fn export_job(
             "[job.{name}] run_before — use Argo Workflows or init containers"
         ));
     }
-    if job.exec.is_some() || job.script.is_some() {
-        report.unsupported.push(format!(
-            "[job.{name}] exec/script process workloads — no K8s equivalent"
-        ));
-    }
-
     Ok(())
 }
 
@@ -829,13 +831,32 @@ mod tests {
     }
 
     #[test]
-    fn export_refuses_to_silently_replace_reusable_commands_with_fresh_pods() {
+    fn shared_runc_jobs_export_as_ordinary_jobs_and_say_so() {
         let config = parse_config("[job.worker]\nimage='fixture:v1'\nruntime='shared-runc'");
+        let result = export_kubernetes(&config).unwrap();
+        assert_eq!(result.report.resources_created, vec!["Job/worker"]);
+        assert!(result.yaml.contains("image: fixture:v1"));
         assert!(
-            export_kubernetes(&config)
-                .unwrap_err()
-                .to_string()
-                .contains("shared-runc")
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("shared-runc") && u.contains("fresh Pod"))
+        );
+    }
+
+    #[test]
+    fn host_process_jobs_are_reported_but_not_exported_without_an_image() {
+        let config = parse_config("[job.backup]\nruntime='process'\nexec='/usr/bin/backup'");
+        let result = export_kubernetes(&config).unwrap();
+        assert!(result.report.resources_created.is_empty());
+        assert!(result.yaml.is_empty(), "{}", result.yaml);
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("[job.backup]") && u.contains("not exported"))
         );
     }
 

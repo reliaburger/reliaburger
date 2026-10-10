@@ -52,6 +52,28 @@ pub struct TaskInvocation {
     pub args: Vec<String>,
     /// Environment: the template's plain variables plus the task identity.
     pub env: Vec<(String, String)>,
+    /// The run this attempt belongs to, for runners that log or track per
+    /// run. The command sees the same facts as `RELIABURGER_*` variables.
+    pub run: Option<RunIdentity>,
+}
+
+/// Typed copy of the run facts a runner needs, parsed once where the
+/// invocation is built rather than searched for in `env` by every runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIdentity {
+    /// The task array (batch) id.
+    pub batch_id: u64,
+    /// Tasks in the whole array; 1 means a singleton job run.
+    pub task_count: u32,
+    /// The job's name, when the leader supplied one.
+    pub job_name: Option<String>,
+}
+
+impl RunIdentity {
+    /// A single-task run, whose output and logs are kept as the job's own.
+    pub fn is_singleton(&self) -> bool {
+        self.task_count == 1
+    }
 }
 
 /// How one attempt ended.
@@ -120,6 +142,10 @@ pub struct Attempt {
     pub outcome: AttemptOutcome,
     /// What it wrote.
     pub output: CapturedOutput,
+    /// How long the command itself ran, when the runner can tell that apart
+    /// from waiting for a slot, admission and setup. `None` means the caller's
+    /// own measurement around [`TaskRunner::run`] is the best available.
+    pub ran: Option<Duration>,
 }
 
 /// Runs one attempt of one task.
@@ -136,6 +162,16 @@ pub trait TaskRunner: Send + Sync + 'static {
     /// Unknown on backends without a command-level receipt; callers include
     /// resource wait and preparation, so their count cannot substitute for this.
     fn active_commands(
+        &self,
+        _batch_id: u64,
+        _template: Option<&crate::config::job::JobSpec>,
+    ) -> impl Future<Output = Option<u64>> + Send {
+        async { None }
+    }
+
+    /// Reusable-pool slots this run's callers hold, from checkout to release.
+    /// `None` when the runner doesn't run this template through a pool.
+    fn busy_slots(
         &self,
         _batch_id: u64,
         _template: Option<&crate::config::job::JobSpec>,
@@ -199,6 +235,7 @@ impl TaskRunner for ProcessRunner {
                         reason: error.to_string(),
                     },
                     output: CapturedOutput::default(),
+                    ran: None,
                 };
             }
         };
@@ -233,7 +270,11 @@ impl TaskRunner for ProcessRunner {
         .await;
         readers.abort_all();
         let output = output.lock().await.clone();
-        Attempt { outcome, output }
+        Attempt {
+            outcome,
+            output,
+            ran: None,
+        }
     }
 }
 
@@ -360,6 +401,7 @@ impl TaskRunner for FakeRunner {
         Attempt {
             outcome,
             output: CapturedOutput::default(),
+            ran: None,
         }
     }
 }
@@ -761,7 +803,10 @@ impl<R: TaskRunner> TaskAttempts<R> {
             self.counters.running.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
             let result = self.runner.run(&invocation, timeout, &self.cancel).await;
-            let run_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            // A pool-run task waits for its slot and admission inside `run`, so
+            // prefer the runner's own measurement of the command.
+            let ran = result.ran.unwrap_or_else(|| started.elapsed());
+            let run_ms = u32::try_from(ran.as_millis()).unwrap_or(u32::MAX);
             self.counters.running.fetch_sub(1, Ordering::Relaxed);
             if let Some(lease) = resource_lease.as_mut() {
                 lease.confirm_retired();
@@ -829,6 +874,12 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value)),
         );
+        let job_name = work
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
+            .map(|(_, value)| value.clone());
         TaskInvocation {
             template: work.template.clone(),
             index,
@@ -836,6 +887,11 @@ impl<R: TaskRunner> TaskAttempts<R> {
             program: work.program.clone(),
             args: expand_argv(&work.args, index),
             env,
+            run: Some(RunIdentity {
+                batch_id: work.batch_id,
+                task_count: work.spec.count,
+                job_name,
+            }),
         }
     }
 }
@@ -877,6 +933,7 @@ mod tests {
             program: PathBuf::from(program),
             args: args.iter().map(|a| a.to_string()).collect(),
             env: vec![("GREETING".to_string(), "hello".to_string())],
+            run: None,
         }
     }
 
@@ -1046,6 +1103,7 @@ mod tests {
                         tail: vec![b'y'; OUTPUT_KEEP_BYTES],
                         total_bytes: (OUTPUT_KEEP_BYTES * 2) as u64,
                     },
+                    ran: None,
                 }
             }
         }
@@ -1073,6 +1131,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_run_tasks_record_the_command_time_not_their_slot_wait() {
+        // A reusable pool waits for a slot and admission inside `run`.
+        struct Queued;
+        impl TaskRunner for Queued {
+            fn owns_admission(&self, _: &TaskInvocation) -> bool {
+                true
+            }
+            async fn run(&self, _: &TaskInvocation, _: Duration, _: &CancellationToken) -> Attempt {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 0 },
+                    output: CapturedOutput::default(),
+                    ran: Some(Duration::from_millis(5)),
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(Queued), fast(1));
+        let result = pool
+            .run_chunk(&work(1, 1, 0), &CancellationToken::new())
+            .await;
+        assert_eq!(result.records[0].run_ms, 5);
+    }
+
+    #[tokio::test]
     async fn singleton_success_preserves_selected_output() {
         struct Writes;
         impl TaskRunner for Writes {
@@ -1084,6 +1166,7 @@ mod tests {
                         tail: vec![],
                         total_bytes: 6,
                     },
+                    ran: None,
                 }
             }
         }

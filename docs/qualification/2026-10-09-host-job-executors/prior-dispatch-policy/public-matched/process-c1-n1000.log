@@ -1,6 +1,0 @@
-usage: measure-jobs.py [-h] [--relish RELISH] --service-url SERVICE_URL
-                       --output OUTPUT [--timeout TIMEOUT] --warmth
-                       {cold-images-and-executors,warm-images-cold-executors,warm-images-and-executors}
-                       [--observe-dir OBSERVE_DIR] [--observe-pid OBSERVE_PID]
-                       manifest
-measure-jobs.py: error: argument --warmth: invalid choice: 'warm-images-after-three-second-idle-wait' (choose from 'cold-images-and-executors', 'warm-images-cold-executors', 'warm-images-and-executors')

@@ -65,15 +65,34 @@ pub(crate) fn validate_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn open_record(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Records are replaced by atomic rename, and a reader that doesn't hold the
+/// writer's lock can open the old file just before the rename. That file then
+/// has no links left, which isn't tampering (a hard-linked copy has two or
+/// more): open the path again to read the replacement. Bounded, so a path
+/// that keeps changing still fails validation rather than spinning.
+fn reopen_if_replaced(mut file: File, path: &Path) -> io::Result<File> {
+    for _ in 0..8 {
+        if file.metadata()?.nlink() != 0 {
+            break;
+        }
+        file = open_record(path)?;
+    }
+    Ok(file)
+}
+
 /// Read a whole record of at most `limit` bytes.
 ///
 /// A missing file is `NotFound`; a symlink, wrong file type or wrong privacy is
 /// `InvalidData`; a record over the limit is `FileTooLarge`.
 pub(crate) fn read_bounded(path: &Path, limit: u64, access: Access) -> io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
+    let file = reopen_if_replaced(open_record(path)?, path)?;
     let context =
         |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
     validate_file(&file, access).map_err(context)?;
@@ -120,6 +139,77 @@ pub(crate) fn read_json_if_exists<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_record_replaced_after_opening_is_read_again_not_refused() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("route.json");
+        let write = |name: &str, body: &str| {
+            let file = dir.path().join(name);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file)
+                .unwrap();
+            std::fs::write(&file, body).unwrap();
+            file
+        };
+        std::fs::rename(write("first", "old"), &path).unwrap();
+        // A lock-free reader opens the record...
+        let opened = super::open_record(&path).unwrap();
+        // ...and the writer atomically replaces it before validation.
+        std::fs::rename(write("second", "new"), &path).unwrap();
+        assert!(super::validate_file(&opened, super::Access::Exclusive).is_err());
+        let current = super::reopen_if_replaced(opened, &path).unwrap();
+        super::validate_file(&current, super::Access::Exclusive).unwrap();
+        assert_eq!(std::io::read_to_string(current).unwrap(), "new");
+    }
+
+    /// Reading again only follows an atomic replacement. The file it finds
+    /// still has to pass every check a first open would.
+    #[test]
+    fn a_replacement_read_again_is_still_refused_when_unsafe() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("route.json");
+        let write = |name: &str, body: &str, mode: u32| {
+            let file = dir.path().join(name);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&file)
+                .unwrap();
+            std::fs::write(&file, body).unwrap();
+            file
+        };
+        let replaced_by = |replacement: &Path| {
+            std::fs::rename(write("old", "1", 0o600), &path).unwrap();
+            let opened = super::open_record(&path).unwrap();
+            std::fs::rename(replacement, &path).unwrap();
+            super::reopen_if_replaced(opened, &path).and_then(|file| {
+                super::validate_file(&file, super::Access::Exclusive).map(|_| file)
+            })
+        };
+        let symlink = dir.path().join("symlink");
+        std::os::unix::fs::symlink(write("target", "1", 0o600), &symlink).unwrap();
+        assert!(replaced_by(&symlink).is_err(), "followed a symlink");
+        let linked = write("linked", "1", 0o600);
+        std::fs::hard_link(&linked, dir.path().join("second-link")).unwrap();
+        assert!(replaced_by(&linked).is_err(), "accepted a hard link");
+        let shared = write("shared", "1", 0o644);
+        assert!(replaced_by(&shared).is_err(), "accepted mode 0644");
+        let corrupt = replaced_by(&write("corrupt", "{not json", 0o600)).unwrap();
+        assert!(serde_json::from_reader::<_, u32>(corrupt).is_err());
+        // Removed without a replacement: the record is gone, not tampered with.
+        std::fs::rename(write("removed", "1", 0o600), &path).unwrap();
+        let opened = super::open_record(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let error = super::reopen_if_replaced(opened, &path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
     use super::*;
 

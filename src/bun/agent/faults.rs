@@ -170,6 +170,20 @@ pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError
     }
 }
 
+/// Delays shape each caller's own container `eth0`. A host process on a
+/// mixed node shares the host's network, so it has nothing to shape: leave it
+/// out instead of failing the whole injection on it.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_callers(
+    callers: Vec<crate::smoker::network::LocalCaller>,
+    addressed: &std::collections::HashSet<String>,
+) -> Vec<crate::smoker::network::LocalCaller> {
+    callers
+        .into_iter()
+        .filter(|caller| addressed.contains(&caller.instance_id))
+        .collect()
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Populate the gossip + Raft blocklists to partition this node
     /// from the named peers. Returns how many addresses were blocked.
@@ -1171,9 +1185,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 rule.target_service
             ));
         }
-        let callers: Vec<String> = self
-            .local_callers()
-            .await
+        let callers: Vec<String> = delay_callers(self.local_callers().await, &self.addressed())
             .into_iter()
             .filter(|caller| {
                 crate::smoker::network::applies_to_caller(rule, &caller.app, &caller.namespace)
@@ -1198,6 +1210,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             None => Ok(()),
             Some(error) => Err(format!("cannot delay traffic: {error}")),
         }
+    }
+
+    /// Instances with their own container address, the only ones a delay
+    /// can shape.
+    #[cfg(target_os = "linux")]
+    fn addressed(&self) -> std::collections::HashSet<String> {
+        self.supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| instance.container_ip.is_some())
+            .map(|instance| instance.id.0.clone())
+            .collect()
     }
 
     /// Remove any delay tree a previous Bun left on this node's containers.
@@ -1268,7 +1292,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if !delaying && self.network_faults.delays.is_empty() {
             return Vec::new();
         }
-        let callers = self.local_callers().await;
+        let callers = delay_callers(self.local_callers().await, &self.addressed());
         let services = self.merged_service_map();
         let desired = desired_delays(
             self.fault_registry.iter(),

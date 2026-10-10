@@ -5,7 +5,7 @@
   "operator_declared_warmth": "warm-images-cold-executors",
   "workload_sha256": "36199dff5250bdbf1330cbb40d350fac83669fe0ccbc41073f98d60108c570e9",
   "command": [
-    "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+    "$HOST_HOME/github/reliaburger/target/host-executor-v2-release/relish",
     "--output",
     "json",
     "batch",

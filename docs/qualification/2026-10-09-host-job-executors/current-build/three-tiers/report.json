@@ -109,7 +109,7 @@
       "operator_declared_warmth": "warm-images-cold-executors",
       "workload_sha256": "1269952912f442f54699ee1159277ceec7db691bf45bc9848d7915dd508b2b38",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v2-release/relish",
         "--output",
         "json",
         "batch",
@@ -138,7 +138,7 @@
       "operator_declared_warmth": "warm-images-cold-executors",
       "workload_sha256": "6eb2bb335d9e2a6441e22488571b80a0cd2888e3ea12ccdae92af53797f65c85",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v2-release/relish",
         "--output",
         "json",
         "batch",
@@ -167,7 +167,7 @@
       "operator_declared_warmth": "warm-images-cold-executors",
       "workload_sha256": "9fc74987843f66f78009ef9c3b71423f00e6180c1160a749d71460d3a650704f",
       "command": [
-        "/Users/miko/github/reliaburger/target/host-executor-v2-release/relish",
+        "$HOST_HOME/github/reliaburger/target/host-executor-v2-release/relish",
         "--output",
         "json",
         "batch",

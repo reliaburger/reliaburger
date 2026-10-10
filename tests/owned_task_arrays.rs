@@ -105,6 +105,7 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
         program: "/unused".into(),
         args: vec!["/bin/sh".into(), "-c".into(), "sleep 60 & wait".into()],
         env: vec![],
+        run: None,
     };
     let running = {
         let runner = runner.clone();
@@ -255,6 +256,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
         program: "/unused".into(),
         args: vec!["/bin/sh".into(), "-c".into(), command],
         env: vec![],
+        run: None,
     };
     let outcome = runner.run(&invocation(format!("test \"$(wget -qO- -T 2 http://{}:{port}/)\" = ok && ! wget -qO- -T 2 http://{}:{port}/", vip(&namespace), vip(&other))), Duration::from_secs(30), &CancellationToken::new()).await;
     assert_eq!(
@@ -327,11 +329,16 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
         AttemptOutcome::Unknown { reason } => reason.as_str(),
         _ => "",
     };
+    // A fresh container's owner reports the loss in its output; a reusable
+    // executor's pool reports it as the attempt's reason.
+    let reported = if isolation == "shared-runc" {
+        reason.to_string()
+    } else {
+        String::from_utf8_lossy(&retired.output.head).into_owned()
+    };
     assert!(
-        reason.contains("namespace enforcement was lost")
-            || String::from_utf8_lossy(&retired.output.head)
-                .contains("namespace enforcement was lost"),
-        "{retired:?}"
+        reported.contains("namespace enforcement was lost"),
+        "{isolation}: {retired:?}"
     );
     for owner in runtime.launch_inventory().await.unwrap().unwrap() {
         assert_eq!(
@@ -783,6 +790,11 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
             ("RELIABURGER_TASK_COUNT".into(), "2".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let cancel = CancellationToken::new();
     let first = runner.run(&task, Duration::from_secs(20), &cancel).await;
@@ -1366,6 +1378,11 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
             ("RELIABURGER_TASK_COUNT".into(), "2".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let active_cancel = CancellationToken::new();
     let active = tokio::spawn({
@@ -1484,6 +1501,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
                     .into(),
             ],
             env: vec![],
+            run: None,
         };
         let outcome = runner.run(&task, Duration::from_secs(10), &cancel).await;
         assert!(outcome.outcome.succeeded(), "{outcome:?}");
@@ -1524,13 +1542,46 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         }
     }
     eprintln!("native repeated commands complete");
+    // Same environment contract as the other host backends: Bun's allowlisted
+    // variables plus the job's own, and nothing else of Bun's.
+    let private = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .find(|key| {
+            // The shell itself sets these.
+            !["PWD", "OLDPWD", "SHLVL", "_"].contains(&key.as_str())
+                && !reliaburger::grill::process::inherited_by_host_commands(key)
+        })
+        .expect("the test environment has a variable outside the allowlist");
+    let environment = TaskInvocation {
+        template: Some(Box::new(template.clone())),
+        index: 128,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exec /usr/bin/env".into()],
+        env: vec![("JOB".into(), "1".into())],
+        run: None,
+    };
+    let outcome = runner
+        .run(&environment, Duration::from_secs(10), &cancel)
+        .await;
+    assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    let text = String::from_utf8_lossy(&outcome.output.head);
+    let path = format!("PATH={}", std::env::var("PATH").unwrap());
+    assert!(text.lines().any(|line| line == path), "{text}");
+    assert!(text.lines().any(|line| line == "JOB=1"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with(&format!("{private}="))),
+        "{private} leaked: {text}"
+    );
     let timings = runner.executor_timings(JobRuntime::Process).unwrap();
     assert_eq!(
         timings.startup.samples, 1,
         "one owner per command regressed"
     );
-    assert_eq!(timings.command.samples, 128);
-    assert_eq!(timings.cleanup.samples, 128);
+    assert_eq!(timings.command.samples, 129);
+    assert_eq!(timings.cleanup.samples, 129);
     let memory_hog = TaskInvocation {
         template: Some(Box::new(template.clone())),
         index: 128,
@@ -1541,6 +1592,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
             "exec /usr/bin/python3 -c 'value=bytearray(67108864)'".into(),
         ],
         env: vec![],
+        run: None,
     };
     let outcome = runner
         .run(&memory_hog, Duration::from_secs(10), &cancel)
@@ -1583,6 +1635,16 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
             .unwrap()
             .contains("/helper")
     );
+    // Host helpers keep only CAP_KILL (5), CAP_SETGID (6) and CAP_SETUID (7).
+    let status = std::fs::read_to_string(format!("/proc/{alive}/status")).unwrap();
+    for set in ["CapEff", "CapPrm"] {
+        assert!(
+            status
+                .lines()
+                .any(|line| line == format!("{set}:\t00000000000000e0")),
+            "{status}"
+        );
+    }
     let cancel_command = CancellationToken::new();
     let task = TaskInvocation {
         template: Some(Box::new(template)),
@@ -1591,6 +1653,11 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "setsid /bin/sh -c 'sleep 30' & wait".into()],
         env: vec![("RELIABURGER_BATCH_ID".into(), "77".into())],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 77,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let execution = runner.run(&task, Duration::from_secs(10), &cancel_command);
     let trigger = async {
@@ -1652,6 +1719,11 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "setsid /bin/sh -c 'sleep 30' & wait".into()],
         env: vec![("RELIABURGER_BATCH_ID".into(), "88".into())],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 88,
+            task_count: 2,
+            job_name: None,
+        }),
     };
     let execution = {
         let runner = runner.clone();
@@ -1714,4 +1786,546 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
     .unwrap();
     assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A native runner with one slot, so every command reuses the same executor
+/// identity and cgroup path.
+fn one_slot_native_runner(
+    root: &std::path::Path,
+) -> (
+    reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::AnyGrill>,
+    std::sync::Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
+    reliaburger::config::job::JobSpec,
+    reliaburger::grill::ProcessGrill,
+) {
+    use reliaburger::grill::{AnyGrill, ProcessGrill};
+    let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    let budget = reliaburger::bun::execution_budget::ExecutionBudget::new(
+        reliaburger::meat::Resources::new(1000, 128 << 20, 0),
+    );
+    let runner = reliaburger::bun::task_runtime::OwnedRunner::with_slot_count(
+        AnyGrill::Process(runtime.clone()),
+        1,
+    )
+    .with_budget(budget.clone());
+    let template = toml::from_str(
+        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native'\ncpu='100m-1000m'\nmemory='32Mi'",
+    )
+    .unwrap();
+    (runner, budget, template, runtime)
+}
+
+fn shell_task(
+    template: &reliaburger::config::job::JobSpec,
+    index: u32,
+    script: &str,
+) -> reliaburger::bun::task_executor::TaskInvocation {
+    reliaburger::bun::task_executor::TaskInvocation {
+        template: Some(Box::new(template.clone())),
+        index,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![],
+        run: None,
+    }
+}
+
+/// The task cgroup a native command ran in, from its `/proc/self/cgroup`.
+fn task_cgroup(output: &[u8]) -> std::path::PathBuf {
+    let text = String::from_utf8_lossy(output);
+    let path = text
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap_or_else(|| panic!("no cgroup line: {text}"));
+    std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'))
+}
+
+async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
+/// Retirement writes `cgroup.kill`; on Linux 6.8 a killed group keeps its
+/// kill sequence, so a reused one would SIGKILL the next command at birth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
+    use reliaburger::bun::task_executor::TaskRunner;
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-fresh-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, _) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cold = std::time::Instant::now();
+    let first = runner
+        .run(
+            &shell_task(&template, 0, "cat /proc/self/cgroup"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    // The pool reports the command alone, not the cold helper start.
+    assert!(
+        first.ran.is_some_and(|ran| ran < cold.elapsed()),
+        "{first:?}"
+    );
+    let task = task_cgroup(&first.output.head);
+    wait_until("idle eviction retires the executor", || {
+        !task.exists() && budget.available() == budget.capacity()
+    })
+    .await;
+    // Plant a killed, empty task cgroup where the next executor will look.
+    std::fs::create_dir_all(&task).unwrap();
+    std::fs::write(task.join("cgroup.kill"), "1").unwrap();
+    let planted = std::fs::metadata(&task).unwrap().ino();
+    let second = runner
+        .run(
+            &shell_task(&template, 1, "cat /proc/self/cgroup"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(second.outcome.succeeded(), "{second:?}");
+    assert_eq!(task_cgroup(&second.output.head), task);
+    assert_ne!(
+        std::fs::metadata(&task).unwrap().ino(),
+        planted,
+        "the executor adopted a killed task cgroup"
+    );
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
+/// A task group that never empties (as with a task in uninterruptible sleep)
+/// must not hang the caller; the slot and its lease stay quarantined until
+/// the eviction loop finally retires it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskRunner};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-stuck-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, _) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let first = runner
+        .run(
+            &shell_task(&template, 0, "cat /proc/self/cgroup"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    let task = task_cgroup(&first.output.head);
+    // Keep the task group populated faster than cgroup.kill can empty it.
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let refill = std::thread::spawn({
+        let stop = stop.clone();
+        let procs = task.join("cgroup.procs");
+        move || {
+            let mut children = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(child) = std::process::Command::new("/bin/sleep").arg("60").spawn() {
+                    let _ = std::fs::write(&procs, child.id().to_string());
+                    children.push(child);
+                }
+                children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            for mut child in children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let stuck = tokio::time::timeout(
+        Duration::from_secs(30),
+        runner.run(
+            &shell_task(&template, 1, "sleep 30"),
+            Duration::from_secs(1),
+            &cancel,
+        ),
+    )
+    .await
+    .expect("retirement blocked the caller");
+    assert!(
+        matches!(stuck.outcome, AttemptOutcome::TimedOut),
+        "{stuck:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_ne!(
+        budget.available(),
+        budget.capacity(),
+        "a quarantined executor released its reservation"
+    );
+    stop.store(true, Ordering::Relaxed);
+    refill.join().unwrap();
+    wait_until("the eviction loop retires the quarantined executor", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+    let after = runner
+        .run(
+            &shell_task(&template, 2, "printf ok"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(after.outcome.succeeded(), "{after:?}");
+    assert_eq!(after.output.head, b"ok");
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
+/// Output still buffered in an enlarged pipe at exit must all arrive; output
+/// that never stops after exit is cut off with a visible marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_drains_output_buffered_at_exit() {
+    use nix::sys::signal::{Signal, kill};
+    use reliaburger::bun::task_executor::TaskRunner;
+    use reliaburger::grill::Grill;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-drain-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let warm = runner
+        .run(
+            &shell_task(&template, 0, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(warm.outcome.succeeded(), "{warm:?}");
+    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
+        .instance_id
+        .clone();
+    let helper = nix::unistd::Pid::from_raw(runtime.pid(&id).await.unwrap().unwrap() as i32);
+    // Stop the helper while the command fills a 1 MiB pipe (F_SETPIPE_SZ is
+    // 1031) and exits, so all 500,000 bytes are still buffered when the
+    // helper sees the exit. Running, it would drain them as they arrive.
+    let python = shell_task(
+        &template,
+        1,
+        "exec /usr/bin/python3 -c 'import fcntl, os, time; fcntl.fcntl(1, 1031, 1 << 20); time.sleep(0.5); os.write(1, b\"x\" * 500000)'",
+    );
+    let buffered = runner.run(&python, Duration::from_secs(10), &cancel);
+    let pause = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        kill(helper, Signal::SIGSTOP).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        kill(helper, Signal::SIGCONT).unwrap();
+    };
+    let (buffered, ()) = tokio::join!(buffered, pause);
+    assert!(buffered.outcome.succeeded(), "{buffered:?}");
+    assert_eq!(buffered.output.total_bytes, 500_000);
+    let endless = runner
+        .run(
+            &shell_task(&template, 2, "/usr/bin/yes & sleep 0.2; exit 0"),
+            Duration::from_secs(30),
+            &cancel,
+        )
+        .await;
+    assert!(endless.outcome.succeeded(), "{endless:?}");
+    let tail = &endless.output.tail;
+    assert!(
+        tail.ends_with(b"\n[reliaburger: output written after exit truncated]\n"),
+        "{} bytes, tail {:?}",
+        endless.output.total_bytes,
+        String::from_utf8_lossy(&tail[tail.len().saturating_sub(80)..])
+    );
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
+/// Another local user can create any name in `/tmp`. A helper's control
+/// socket must live where only root can, or that user can block the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_sockets_cannot_be_blocked_by_other_users() {
+    use reliaburger::bun::task_executor::TaskRunner;
+    use reliaburger::grill::Grill;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-socket-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let first = runner
+        .run(
+            &shell_task(&template, 0, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
+        .instance_id
+        .clone();
+    wait_until("idle eviction retires the executor", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+    // What an unprivileged user could have done: claim the old, predictable name.
+    let squatted = std::path::Path::new("/tmp").join(format!(
+        "rbhx-{}",
+        hex::encode(Sha256::digest(id.0.as_bytes()))
+    ));
+    std::fs::write(&squatted, b"").unwrap();
+    std::os::unix::fs::lchown(&squatted, Some(65534), Some(65534)).unwrap();
+    let second = runner
+        .run(
+            &shell_task(&template, 1, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    std::fs::remove_file(&squatted).unwrap();
+    assert!(second.outcome.succeeded(), "{second:?}");
+    let directory = std::fs::symlink_metadata("/run/reliaburger/host-executors").unwrap();
+    assert!(directory.is_dir());
+    assert_eq!(directory.uid(), 0);
+    assert_eq!(directory.permissions().mode() & 0o7777, 0o711);
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
+/// Callers waiting inside a reusable pool for a slot or admission aren't
+/// running anything; advertising them as slots inflates the leader's grants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_array_node::{
+            ArrayAssignment, ControlVersion, HeldChunk, NodeRunner, NodeSyncRequest, TaskArrayNode,
+            TaskArrayNodeConfig,
+        },
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::{
+        config::process_workloads::ProcessWorkloadsConfig,
+        grill::{AnyGrill, ProcessGrill},
+        meat::{
+            Resources,
+            task_array::{ChunkId, TaskArraySpec},
+        },
+    };
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-slots-")
+        .tempdir()
+        .unwrap();
+    let runtime =
+        ProcessGrill::with_owner(root.path().join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    // Exactly two executors: 100m/32 MiB each plus 10m/8 MiB for the helper.
+    let capacity = Resources::new(220, 80 << 20, 0);
+    let budget = ExecutionBudget::new(capacity);
+    let template: reliaburger::config::job::JobSpec = toml::from_str(
+        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-slots'\ncpu='100m'\nmemory='32Mi'",
+    )
+    .unwrap();
+    let mut config = TaskArrayNodeConfig::for_data_dir(
+        root.path(),
+        ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/sh".into()],
+            mount_isolation: false,
+            script_dir: root.path().join("scripts"),
+        },
+    );
+    config.default_concurrency = 32;
+    let node = TaskArrayNode::new(
+        config,
+        NodeRunner::Owned(Box::new(
+            OwnedRunner::for_data_dir(AnyGrill::Process(runtime), root.path()).unwrap(),
+        )),
+    )
+    .with_budget(budget.clone());
+    let mut spec = TaskArraySpec::with_count(64);
+    spec.chunk_size = 64;
+    spec.max_attempts = 1;
+    let assignment = |stopping| NodeSyncRequest {
+        version: ControlVersion {
+            index: 1,
+            ..Default::default()
+        },
+        known: vec![1],
+        arrays: vec![ArrayAssignment {
+            template: Some(Box::new(template.clone())),
+            resources: Resources::new(100, 32 << 20, 0),
+            batch_id: 1,
+            spec: spec.clone(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 2".into()],
+            env: vec![],
+            held: vec![HeldChunk {
+                chunk: ChunkId(0),
+                attempt: 1,
+            }],
+            stopping,
+            replay_unknown: true,
+        }],
+    };
+    // Wait until both executors are busy and the other callers are queued.
+    let progress = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let progress = node.sync(&assignment(false)).await.arrays.remove(0);
+            if progress.counters.active_commands == Some(2) && progress.counters.running > 2 {
+                break progress;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("two native commands never started");
+    assert!(
+        progress.slots <= 2,
+        "advertised {} slots with {} callers but room for two executors",
+        progress.slots,
+        progress.counters.running
+    );
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while node.sync(&assignment(true)).await.arrays[0]
+            .finished
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the stopped array never finished");
+    drop(node);
+    let mut retired = false;
+    for _ in 0..300 {
+        if budget.available() == capacity {
+            retired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(retired, "executors never returned their reservations");
+}
+
+/// A slot counts as busy from checkout, before the helper confirms the start,
+/// so millisecond commands that start and exit between samples still count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts() {
+    use nix::sys::signal::{Signal, kill};
+    use reliaburger::bun::task_executor::TaskRunner;
+    use reliaburger::grill::Grill;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-busy-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut warm = shell_task(&template, 0, "true");
+    warm.run = Some(reliaburger::bun::task_executor::RunIdentity {
+        batch_id: 9,
+        task_count: 2,
+        job_name: None,
+    });
+    let first = runner.run(&warm, Duration::from_secs(10), &cancel).await;
+    assert!(first.outcome.succeeded(), "{first:?}");
+    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
+        .instance_id
+        .clone();
+    let helper = nix::unistd::Pid::from_raw(runtime.pid(&id).await.unwrap().unwrap() as i32);
+    // A stopped helper never confirms the start, but the slot is checked out.
+    kill(helper, Signal::SIGSTOP).unwrap();
+    let second = reliaburger::bun::task_executor::TaskInvocation {
+        index: 1,
+        ..warm.clone()
+    };
+    let held = runner.run(&second, Duration::from_secs(10), &cancel);
+    let sample = async {
+        wait_until_async(|| async { runner.busy_slots(9, Some(&template)).await == Some(1) }).await;
+        let active = runner.active_commands(9, Some(&template)).await;
+        kill(helper, Signal::SIGCONT).unwrap();
+        active
+    };
+    let (outcome, active) = tokio::join!(held, sample);
+    assert_eq!(active, Some(0), "the command hadn't started yet");
+    assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    assert_eq!(runner.busy_slots(9, Some(&template)).await, Some(0));
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
+async fn wait_until_async<F: std::future::Future<Output = bool>>(mut ready: impl FnMut() -> F) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ready().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("condition never held");
+}
+
+/// A command whose output streams are both at EOF when its exit is seen must
+/// not wait out the post-exit drain poll; that 10 ms per command cut native
+/// throughput to a third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_adds_no_drain_wait_to_quiet_commands() {
+    use reliaburger::bun::task_executor::TaskRunner;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-latency-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, _) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let warm = runner
+        .run(
+            &shell_task(&template, 0, "true"),
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+    assert!(warm.outcome.succeeded(), "{warm:?}");
+    let started = std::time::Instant::now();
+    for index in 1..=200 {
+        let outcome = runner
+            .run(
+                &shell_task(&template, index, "true"),
+                Duration::from_secs(10),
+                &cancel,
+            )
+            .await;
+        assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    }
+    let elapsed = started.elapsed();
+    eprintln!("200 sequential quiet commands took {elapsed:?}");
+    // A 10 ms wait per command alone would take 2 seconds.
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
 }

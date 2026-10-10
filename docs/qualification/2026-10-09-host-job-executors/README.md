@@ -1,5 +1,10 @@
 # Native host executors and current job throughput
 
+The tree keeps this record's READMEs, reports, matrices, manifests, binary
+hashes and build boundaries. The raw samples, logs and casts (about 11 MB) were
+removed to keep the repository small; they're still in the repository history
+at [006aca5f](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-09-host-job-executors).
+
 The frozen current implementation is `ed87f20b5f73b754fce0427261a03c14705d1cfe`.
 [Binaries and hashes](current-build/build-boundary.json), [node boundary](current-build/measurement-boundary.json)
 and [experiment order](current-build/sequence-boundary.json) identify the runs.
@@ -71,7 +76,7 @@ the fully warmed worker rates. Cold startup, conservative mean-based lookahead,
 live namespace supervision and the public control path remain part of this
 contract; these reports do not assign the whole gap to any one cause.
 
-The [complete four-part recording](current-build/three-tiers/jobs.cast) retains
+The [complete four-part recording](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-09-host-job-executors/current-build/three-tiers/jobs.cast) retains
 one monotonic clock, actual pauses, indexed first/middle/last checks, rates,
 backlog, retries and service probes. [Its report](current-build/three-tiers/report.json)
 is copied byte-for-byte to the landing page, as is the cast.

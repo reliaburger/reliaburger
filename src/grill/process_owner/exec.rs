@@ -82,8 +82,11 @@ impl Execution {
                 .ok_or_else(|| io::Error::other("kernel boot identity unavailable"))?,
             nonce: hex::encode(nonce),
             command,
-            // Process exec has always inherited Bun's host environment.
-            environment: BTreeMap::new(),
+            // An exec runs inside its workload, as `docker exec` does, so it
+            // gets the workload's complete recorded environment: Bun's
+            // allowlisted variables plus the workload's own. The gate clears
+            // everything else.
+            environment: parent_record.environment.clone(),
             phase: OwnerPhase::Prepared,
             launch,
         };

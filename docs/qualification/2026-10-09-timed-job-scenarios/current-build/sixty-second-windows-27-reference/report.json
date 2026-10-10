@@ -112,7 +112,7 @@
       "logical_cpus": 4,
       "workload_sha256": "2c9b26d6a705c987dba4e1eb67ccee81bc658081897d04376607ba76d53fb6fc",
       "command_prefix": [
-        "/Users/miko/github/reliaburger/target/host-executor-v4-release/relish"
+        "$HOST_HOME/github/reliaburger/target/host-executor-v4-release/relish"
       ],
       "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
       "last_accepted_sample_seconds": 59.79834439093247,
@@ -606,7 +606,7 @@
       "logical_cpus": 4,
       "workload_sha256": "c90cd3a0a544bd80ef815ba680471fb53ec653e7954e74077fc048caabeb14a7",
       "command_prefix": [
-        "/Users/miko/github/reliaburger/target/host-executor-v4-release/relish"
+        "$HOST_HOME/github/reliaburger/target/host-executor-v4-release/relish"
       ],
       "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
       "last_accepted_sample_seconds": 59.732088728109375,
@@ -1100,7 +1100,7 @@
       "logical_cpus": 4,
       "workload_sha256": "38cc6a08574ff090464f388c2c09143be2b8560bd6bd35f358f1a24c704c6862",
       "command_prefix": [
-        "/Users/miko/github/reliaburger/target/host-executor-v4-release/relish"
+        "$HOST_HOME/github/reliaburger/target/host-executor-v4-release/relish"
       ],
       "timing": "Monotonic measurement window; active work is cancelled after the cutoff",
       "last_accepted_sample_seconds": 59.98222319711931,

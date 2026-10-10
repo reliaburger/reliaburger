@@ -924,775 +924,882 @@ don't establish 100m accepted successes/day.
 
 The roadmap's milestone for this phase reads: port mapping uses O(1) nftables maps, images download from multiple peers in parallel, logs compress 5× with random-access reads. All true. The truer summary: the paths those words describe now actually exist, end to end, with tests standing on each one.
 
-### Amortising container setup without keeping the application process
-
-A short command can finish before its container has finished starting. Caching
-image layers helps, but it doesn't remove namespace, network and runtime-owner
-setup. `runtime = "shared-runc"` keeps that setup around for compatible
-commands. It's an explicit choice. Ordinary jobs still get a fresh container.
-
-The compatibility key binds the pinned image, namespace, live credentials and
-resource ranges. Commands and indexes don't belong in that key: two commands
-can share the same trusted environment. A credential rotation or a different
-memory limit needs another executor. The pool has at most 32 containers, each
-with one active command. A chunk of a thousand indexes remains a queue.
-
-Bun embeds a small static PID-1 helper, so the image doesn't need another worker
-framework or a particular libc. Rust owns admission, credentials, outcomes and
-retirement. The private Unix connection carries bounded, sequence-bound command
-receipts. Bun verifies the socket peer against the original runtime owner and
-its container init, rather than trusting a PID supplied in a message.
-
-Linux `clone3(CLONE_INTO_CGROUP)` puts a child in its task cgroup at birth. That
-avoids a fork-then-move window in which the command could run outside its limits.
-The helper occupies a sibling cgroup and a separate internal uid. Commands lose
-its capabilities and descriptors, get private mount and IPC namespaces, and
-start with fresh scratch filesystems and explicit environment values. The image
-root stays read-only. PID and network namespaces are shared, which is why this
-mode remains a conscious isolation trade-off.
-
-An exit receipt isn't enough to reuse a slot. The verified container PID 1
-kills and reaps its remaining descendants, then acknowledges cleanup. Bun
-proves the task cgroup empty before reuse. Cancellation or a missing receipt
-retires the entire owned container. Recovery keeps that obligation in the
-original launch intent, including the sibling task cgroup, before another grant
-may replay the work.
-
-Concurrent cold starts found another boundary: runc tried to create a file
-mountpoint for the helper in the shared unpacked image. Two initialisations
-could race, leaving the first jobs failed with `file exists`. The helper now
-executes from an already-populated private bootstrap-directory bind. Runc can
-stat that public static executable before granting its process capabilities;
-the control directory keeps its separate protected uid and mode 0700. The image
-doesn't need a shared helper-file mountpoint. The thousand-command
-common API regression uses zero retries so a startup failure remains visible.
-
-The memory regression found another misleading success. A command allocated
-128 MiB under a 32 MiB `memory.max` and still exited successfully: the VM had
-swap. That limit bounds resident memory, not RAM plus swap. Memory-limited image
-jobs now set `memory.swap.max = 0` in both fresh and reused paths. The per-task
-OOM regression requires a real `memory.events` kill counter, then verifies the
-next command can reuse the surviving helper. This trades swap-assisted survival
-for predictable memory and disk costs, which matters when thousands of tiny
-jobs share capacity with a latency-sensitive service.
-
-There is also a scheduling cost to keeping a container warm. Its profile request
-plus the helper's 10 millicores and 8 MiB stays reserved while idle. The outer
-attempt pool skips its own reservation for this mode, avoiding double charging.
-Idle executors expire after a second and yield when the shared admission queue
-has waiters. Otherwise a busy stream of tiny jobs could keep a large request
-waiting forever while the containers appeared to have no idle cost.
-
-Queueing isn't command execution time. A real regression queued eight 300 ms
-commands for one fitting profile, each with a one-second timeout. Only three
-succeeded when the timer started before borrowing a compatible slot. The timer
-now starts after slot/admission waiting, just as on the fresh path; cold image
-and executor preparation still counts once its profile is reserved. The
-regression requires all eight successes with one attempt each.
-
-Rootful Linux host `exec` and `script` jobs borrow bounded native executors.
-Each command starts a fresh process directly inside its limited task cgroup.
-The executor keeps its durable owner across commands, charges helper overhead
-and retires descendants before accepting the next command. Other platforms
-retain the original owned process backend and refuse explicit CPU/memory limits.
-The qualification harness discloses that contract. Reusing an executor doesn't
-keep a model resident: each command still starts a process and loads its own
-model. That is the separate #641 path.
-
-The [qualification plan](../plans/2026-10-07-plan-reusable-executors-and-throughput.md)
-requires matched launch, durability and dispatch measurements, service latency,
-bounded storage, and a real 24-hour run before claiming 100 million successes
-per day. A fast helper loop can identify overhead. It cannot establish that
-cluster result. The live pool bound also doesn't bound all historical metadata:
-slot identities include the tenant namespace. Rotating through new namespaces
-leaves retired runtime and routing journals to account for. Qualification must
-measure that growth across restarts and prove safe collection, rather than
-multiply the live slot count by one container's footprint.
-
-#### Admission after we retained a container
-
-A warm helper already owns its command request and helper overhead. Dividing
-only unreserved memory by the command request made a fully occupied node
-advertise zero capacity even though its compatible helper was idle. Conversely,
-ignoring the helper's extra 8 MiB let another node advertise three slots where
-only two complete profiles fitted. Worker offers now count compatible idle
-helpers separately, include overhead for new helpers, and stop at the pool's
-32-context bound. These offers guide placement; the shared ledger still decides
-whether a command can actually start.
-
-The immediate executor reservation also has to respect queued owners. Checking
-for waiters and reserving in separate operations leaves a race. Our new budget
-method does both under the same mutex. A regression queues a large owner while
-a smaller reservation would fit, checks that the executor cannot overtake it,
-then cancels the owner and proves the available reservation wasn't leaked.
-The application supervisor retains its existing immediate admission policy;
-this change prevents new executors from jumping already-queued work.
-
-Secrets exposed another boundary. We decrypted a queued command's environment,
-then waited for a compatible helper. The namespace's old key was retired during
-that wait, but the plaintext snapshot still let the command run. The real Linux
-test reproduced exactly that sequence. Encrypted commands now resolve the
-original template against live keys again after queueing and preparation,
-before submitting a command to the helper. The result must still match the
-helper's compatibility key. Failure retires that helper and launches no command.
-Fresh containers also check live decryption before starting their payload.
-Plain environments take the existing direct path.
-
-We share one resolver rather than maintaining separate decryption rules for
-capacity offers and execution. The reusable path receives a closure: a small
-function which borrows the runner and original template and returns the future
-for a fresh resolution. Rust's `Fn` bound means it can be called without
-consuming those borrowed inputs; the `Future` bound makes the result awaitable.
-No plaintext enters the replicated template or the worker's durable ledger.
-
-#### When cleanup killed the next command
-
-The real Linux regression ran two commands through one executor. The first
-finished successfully. The second died with SIGKILL before it could do its
-work. Our cleanup had written `1` to `cgroup.kill`, then reused the empty task
-cgroup. An empty cgroup looked safe. The kernel remembered something we couldn't
-see. We observed it on Ubuntu's `6.8.0-139-generic` kernel with rootful
-runc 1.4.0. Those are the tested versions, not an exhaustive affected range.
-
-Linux uses an internal `kill_seq` counter to catch children born during a
-`cgroup.kill` sweep. On affected kernels, `clone3(CLONE_INTO_CGROUP)` snapshots
-the parent's counter before resolving the destination cgroup, then compares it
-with the destination's counter after the fork. Killing our task cgroup changed
-only one of those counters. Later children could therefore receive SIGKILL even
-though no cleanup raced with their birth. Emptying the group didn't reset the
-counter.
-
-The [upstream fix, `8e3599202166`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/tip/tip/+/8e359920216689b3b79e0fe8961a77fe312a511f),
-committed on 31 August 2026, snapshots the resolved destination's counter. We
-can't assume every deployment has that fix or a distribution backport. A kernel
-version string alone wouldn't establish that either.
-
-Normal reuse now asks our authenticated container PID 1 to call
-`kill(-1, SIGKILL)` inside its verified private PID namespace. Linux excludes
-PID 1 itself; the helper's namespace-local signalling capability covers the
-command's descendants, including a background child which changed its process
-group. The helper reaps them with `waitpid`, acknowledges the matching command
-sequence, and Bun checks `cgroup.events` for `populated 0` before releasing the
-slot. We keep atomic cgroup placement at birth and the independent resource
-limits.
-
-Timeouts, cancellation and uncertain cleanup retire the entire owned container.
-That final retirement may use `cgroup.kill`, but removes the task cgroup before
-any replacement can run. We never reuse a group killed that way. The real
-regression checks that the next command succeeds through the same owned
-container, alongside scratch cleanup and resource limits. A mocked launch
-wouldn't have caught this.
-
-### Selecting the runtime per workload
-
-A mixed node can run host commands alongside containers. Jobs first validate
-an explicit `runtime` against their fields: process jobs require `exec` or
-`script` and refuse an image; runc jobs require an image and refuse host fields.
-OCI construction then supplies the internal `host_process` discriminator used
-by the adapter. Routing never interprets an image name as a host path and never
-falls back after a failed container launch. Both backends use the node's
-existing scheduling budget.
-
-The `MixedGrill<C, H>` adapter is generic over the two concrete runtime types.
-Rust monomorphises that type for runc and ProcessGrill in production; portable
-tests use two independent mocks. Its private route journal records the original
-backend before creation. A file lock serialises changes across both backends.
-The adapter moves that lock into a spawned operation, so dropping its caller's
-future does not release authority while a runtime operation can still finish.
-Status and recovery consult the original journal rather than guessing from a
-PID. Changing backend requires positive retirement, including withdrawal of
-any retained container address. Missing or conflicting evidence refuses work.
-A missing route isn't permission to recreate: both original runtime inventories
-must prove the identity absent or positively retired before the adapter writes
-a new selection. The regression deletes that journal while an original owner
-is running and tries all four source/destination combinations. An inventory
-entry whose state is unavailable also refuses replacement.
-
-Host commands still run with the Bun account's authority. The existing allowlist
-and mount-isolation admission rules apply, and explicit CPU or memory limits
-are refused: reserving scheduler capacity does not make ProcessGrill enforce a
-cgroup limit. A mixed node's container capabilities must never be reported as
-isolation or resource enforcement for one of its host workloads.
-
-### Counting commands instead of callers
-
-A task-pool caller can be pulling an image or waiting for resources. Counting it
-as a running command makes a large submission look busier than it is. Reusable
-slots now record the run identity only after the helper's authenticated start
-receipt. They clear it after positive task cleanup or whole-container retirement;
-dropping a future leaves an uncertain slot quarantined and counted. This needs
-only one optional run ID per bounded slot, with no metric label for every index.
-
-The node reports that count alongside its existing in-flight callers. The API
-aggregates known counts; a backend without command-level receipts makes the
-aggregate unknown. That includes fresh containers, whose launcher PID alone
-doesn't prove that the application command started. `relish batch watch` shows
-the mode, verified commands, other in-flight attempts, and the interval of its
-recent accepted-success rate. A chunk-report burst is visible as an observation,
-not silently presented as a sustained rate.
-
-The since-admission rate uses the existing replicated terminal timestamp, so
-reading an old completed run doesn't keep changing its average. Those UTC
-timestamps have one-second precision. Benchmark evidence still needs an
-independent monotonic timer beginning before submission and ending after the
-coordinator has accepted all unique successes.
-
-### The restart that refused our own source bindings
-
-A real Bun crash exposed a handoff we had missed in the isolated executor tests.
-The test ran two reusable resource profiles beside a live application, waited
-for partial accepted completion and verified command activity, then killed Bun.
-The replacement refused startup with `kernel source entries have no original
-ownership`. Application adoption checked the kernel namespace map against its
-application policy journal. Delegated jobs publish a namespace ancestor into the
-same map, with their authority in `batch-namespaces.json`. The application
-preflight did not consult that second journal.
-
-The fix preserves the refusal for unknown sources. Before mutating runtime
-owners, startup reads the delegated journal, validates its bounded namespace
-names and boot identity, and checks that every recorded namespace still names
-its original cgroup inode. The observed kernel namespace value must match that
-namespace. Those keys can explain namespace-only map entries; they cannot
-explain application firewall allow rules. They are also kept out of the
-application reconciler's key set, so an application update cannot accidentally
-erase a delegated binding.
-
-Only after startup has positively retired the old delegated runtime owners may
-`TaskNamespacePolicy::recover` remove their bindings and admit new command
-processes. Recognising a journal is not permission to clear its map entries or
-replay its work. The pure source-authority test checks matching and changed
-inodes, missing paths, prior boots, malformed boot IDs and duplicated inode
-claims. The real crash fixture supplies the behaviour those isolated checks
-could not establish: persistent cluster state, an original live application,
-partially completed worker ledgers and surviving owned runtime helpers.
-
-### An inventory read queued behind every container
-
-The first matched public fresh-container run failed to finish 1,000 commands
-within ten minutes. Its concurrent service stayed available, but Bun repeatedly
-reported `consumer runtime inventory timed out`. Its application loop spent
-roughly half a second per snapshot. The direct fresh runner was already costly;
-the mixed-runtime wrapper added another problem.
-
-An inventory operation is a read, but we had routed every entry through the
-same exclusive lifecycle claim used by create, start and retirement. A live
-container mutation could therefore make a read wait. That claim deliberately
-outlives an abandoned caller, because cancelling an HTTP request must not drop
-a mutation's ownership. Using it for a snapshot meant timed-out inventory reads
-could continue queueing work as new snapshots arrived.
-
-The regression holds a known owner's lifecycle operation open and asks for its
-inventory. It must return the validated original backend and generation without
-waiting for that mutation. Matching routes can be read from their atomically
-published durable files in one blocking worker. They do not change the route or
-retire an owner. A different backend still needs the original exclusive claim
-and positive retirement proof before its old entry can be omitted. All actual
-runtime mutations keep their original claim. A snapshot is observation;
-changing execution authority needs the stronger fence.
-
-
-### What the complete-path measurements actually showed
-
-The longer process floor ran 100,000 identical BusyBox commands in 6.27 seconds.
-Retaining containers clearly helped: 1,000 optimised direct commands took 4.87
-seconds, and the same volume with worker-ledger durability took 5.24 seconds.
-Public dispatch includes persistent coordination and live namespace supervision;
-its 1,000-command run took 13.05 seconds. You cannot subtract the entire
-bare-process gap and call it scheduler overhead. Isolation has work to do too.
-
-At a larger volume, the same public path accepted 50,000 successes in 100.73
-seconds, without retries or failures, beside the original application. That is
-the standalone recording before installation on the landing page. Every pause
-is real. The final chunk can show a recent rate much higher than the whole-run
-rate because accepted outcomes arrive in chunks; the recording displays both.
-Selected indexed outcomes make the completion claim checkable without listing
-50,000 jobs. This was ordinary BusyBox work, not a model-throughput benchmark.
-
-The fresh paths still reported startup failures, and every whole-directory disk
-observation exhausted its bounded scan. Both facts stay in the evidence. A live
-pool bound doesn't collect years of retired ownership journals. Before claiming
-100 million daily successes, we need measured scaling and headroom, retirement-
-authorised collection and a real 24-hour run with apps and failures. The [raw
-reports and reproduction commands](../qualification/2026-10-08-job-measurements/README.md)
-make those limits visible alongside the result.
-
-### A mixed runtime still has a container backend
-
-The final Linux gate found one more seam. Our public secrets/configuration
-catalogue skipped all three real-container probes on a node running runc.
-The node now called its runtime `runc+process`; the capability classifier only
-recognised `runc` and `apple`. Neither the container nor its encryption was at
-fault. The report was wrong.
-
-The classifier now recognises the container backend on a mixed node and reports
-its process backend only when the executable allowlist is configured. The
-runtime version probe also queries runc for this combined mode. A portable
-regression exercises both allowlisted and image-only mixed nodes; the real
-catalogue checks encryption, configuration mounting and cleanup through the
-public API.
-
-One distinction remains deliberate. Older `testapp` catalogue cases submit a
-placeholder image and assume a dedicated ProcessGrill. We don't reinterpret
-that image as a host executable on a mixed node. Those cases keep their
-`ProcessRuntime` gate, while explicit host commands use `exec` or `script` and
-the `ProcessWorkloads` capability. A capability must describe the contract its
-caller actually needs.
-
-
-### Choosing the runtime before interpreting the fields
-
-A job with `runtime = "process"` and an image is contradictory. We now reject
-it before admission. `JobRuntime` is a Rust enum with three alternatives:
-`Runc` (the default), `Process`, and `SharedRunc`. Serde serialises them as
-`runc`, `process`, and `shared-runc`. The selected backend defines which fields
-are valid; the presence of an image no longer chooses the backend. A host job
-needs an explicit process selection and exactly one exec or script. A container
-job needs an image and refuses those host fields. Worker admission and the
-owned runner check that same contract, so a control message cannot bypass it.
-
-Bun's own selection is a separate node policy. Explicit `--runtime runc` now
-constructs `AnyGrill::Runc`; `--runtime mixed` constructs the owned adapter for
-both backends. Auto can still detect the mixed configuration. The regression
-first demonstrated that explicit runc advertised host execution, then checked
-both policies. The job schema and stored definitions changed, so the protocol
-and durable-state generations advance together; pre-1.0 nodes require fresh
-state rather than interpreting an old definition differently.
-
-
-### A baseline and three public job paths
-
-The revised demonstration keeps four measurements separate. First, launch a
-million matching BusyBox `true` processes directly in the VM and count their
-exit statuses. Then submit 1,000 `runc` jobs, 10,000 `shared-runc` jobs and
-10,000 `process` jobs through the public API. The process tier still uses
-durable owners, admitted resources, task ledgers, accepted chunk receipts and
-indexed results. It isn't the same contract as the raw baseline.
-
-`record-job-tiers.py` uses one monotonic recording clock across preparation,
-submission, observation and verification. It retains every real pause. Each
-public tier has its own raw manifest, cast, accepted counters, service probes
-and first/middle/last indexed checks. Its aggregate report counts only the
-three public tiers as accepted job successes; the baseline is a separate row.
-The script contract test refuses reordered or missing tiers and an incomplete
-host-tier result. Synthetic test records only check the report logic.
-
-The recorder uses the normal maximum of three attempts and reports accepted
-retries separately. The initial diagnostic used one attempt; its two container
-failures remain in the evidence rather than disappearing behind the successful
-repeat. A retry can restore an accepted outcome, but it doesn't prove we fixed
-its original cause.
-
-The website player offers chapters for the VM baseline and each public tier.
-A chapter seeks the same raw cast, while faster playback changes only the
-viewer's playback speed. Neither rewrites timestamps or measured durations.
-The browser regression checks that a chapter keeps the selected speed,
-starts the selected stage and refuses invalid offsets. Each recording retains
-its own controls.
-
-The one-hour sustained driver separately records unique accepted outcomes
-while a real application serves requests. A completed hour and a qualified
-100-million-job day are separate booleans. Missing the target remains useful
-evidence; completing an hour cannot satisfy the 24-hour qualification gate.
-
-The earlier recording, before native executors, produced these actual results:
-
-| Path | Completed work | Elapsed | Rate | Accepted retries |
-|---|---:|---:|---:|---:|
-| Raw VM processes | 1,000,000 exit statuses | 63.87s | 15656.6/s | Not applicable |
-| Fresh containers | 1,000 accepted successes | 256.01s | 3.9/s | 0 |
-| Shared containers | 10,000 accepted successes | 21.76s | 459.5/s | 0 |
-| Owned host jobs | 10,000 accepted successes | 200.56s | 49.9/s | 0 |
-
-The host path's default one-CPU reservation admits fewer concurrent jobs than
-the requested 27. That reservation and the per-attempt durable owner work both
-matter when interpreting its rate. We don't lower the reservation just to make
-the recording faster. The [raw reports](../qualification/2026-10-09-job-runtime-revision/README.md)
-keep binary hashes, manifests, accepted outcomes, retries and failed diagnostics
-beside the separate sustained measurement. More throughput work remains in
-#640; these numbers don't establish 100 million successes per day.
-
-### Inventory after a backend switch
-
-The four-part experiment found another read waiting behind a mutation. An owned
-slot first ran containers, then switched to host jobs. The container journal
-still retained its original retirement receipt. Inventory correctly checked
-that receipt before omitting the old backend, but it took the mixed lifecycle
-claim first. That claim now belonged to the running host replacement. Repeating
-this for hundreds of reused slots exhausted discovery's turn deadline, even
-while the application kept serving requests.
-
-The read now asks the original backend for positive retirement without taking
-the replacement's claim. This is an observation, like a matching-route inventory
-entry; it doesn't authorise a new execution. Recovery still revalidates the
-original generation before mutation. The regression holds the replacement's
-claim and requires inventory to finish in both switch directions. It also
-refuses an old backend which is still running, or still holds an address.
-
-A separate directory race concerns unpublished intent. Registration writes a
-private `.preparing-*` directory and atomically renames it before it may launch
-anything. Inventory can enumerate that staging name just before the rename.
-Its disappearance is safe to skip because it never granted execution authority.
-An existing staging symlink, file or insecure directory still refuses, and a
-published record still uses the strict ownership reader. The focused regression
-renames the directory between enumeration and validation; it doesn't hope to
-win a probabilistic race.
-
-### What the earlier hour established
-
-Before native executors, the separate host runner completed 3600.00 seconds of continuous
-public dispatch with one active 10,000-job batch at a time. It observed
-**182,000 unique accepted successes (50.6/s)**,
-0 terminal failures and 0 accepted retries.
-The original service passed 3,490 probes with
-0 failures; p95 latency was
-0.99 ms and the maximum was
-12.49 ms. Its original process start time and
-durable generation still matched after the window. The runner cancelled only
-its own remaining batch at the cutoff, with no cleanup failure.
-
-Selected Bun RSS was 191.0 MiB at the first observation and
-202.6 MiB at the last; its recorded peak reached 229.8 MiB. This
-isn't total node/container memory. 117 bounded storage observations
-were incomplete, so this run cannot prove a global storage bound. The node
-logged 4 transient inventory-publication timeouts;
-the raw warnings remain beside the samples. No timeout was counted as a
-terminal task failure, and service probes continued, but that doesn't make
-control-loop responsiveness fully qualified.
-
-The achieved host rate remains below the 100m/day target. Both daily throughput
-and overall qualification remain false. A completed hour doesn't substitute
-for matched current-binary baselines, sustained container/cluster scaling,
-headroom, faults and bounded metadata collection. Those remain in #668.
-
-A final recovery check caught a mistake in our test rather than the executor.
-The job summary describes a logical run, which can remain active while its
-retry waits for a runtime binding. The instance status correctly says
-`pending` during that gap, with no PID. Our test read these two endpoints
-separately and treated a known pending answer as a running process missing its
-PID. A scripted pending-then-running response reproduced the failure without
-depending on scheduling. The waiter now waits through non-running states,
-but still fails immediately if a known running process has no PID; unknown
-runtime evidence still waits. We kept those three cases separate so fixing the
-fixture could not hide the earlier missing-PID reporting bug.
-
-
-### Removing the host owner's work from the command path
-
-The first landing-page experiment made the host path look ten times slower
-than commands in a shared container. It also reserved a whole CPU for each host
-job and only 100 millicores for each shared command. On the same four-CPU node,
-the two paths could admit different numbers of commands. That wasn't a matched
-comparison. A separate serial launch experiment still exposed repeated owner
-startup, durable intent publication and polling in the host path.
-
-We reuse the existing bounded pool for native host commands. Its key retains
-the namespace, credentials, environment and complete resource profile, while
-removing the command. Different allowlisted binaries can share a compatible
-slot. Linux starts each child with `CLONE_INTO_CGROUP`, so CPU, memory, swap and
-PID limits apply before user code runs. The helper has its own charged cgroup;
-it doesn't consume the command's memory allowance. Host commands retain Bun's
-user and host filesystem access. This is trusted host execution, with resource
-controls, rather than a container sandbox.
-
-The native helper connects through a short socket address under `/tmp`. Its
-peer credentials and the owner's unreaped process identity authenticate the
-connection. We use this fixed directory because a private `TMPDIR` can become
-inaccessible after the helper drops its credentials; the regression test also
-runs with a root-only temporary directory.
-
-A durable owner holds the helper and its complete subtree for the lifetime of
-the slot. The existing group-commit task ledger records command outcomes. We
-don't need to launch a new owner or publish another owner record for each
-command. Losing Bun's connection makes the helper retire its children before
-exiting; recovery still requires positive retirement of the original owner
-before creating a replacement. An unreadable owner record remains uncertainty.
-Only an absent owner directory establishes that no owner was published; a
-missing record inside an existing directory is an error.
-
-Container helpers can retire their PID namespace. Native helpers cannot signal
-all host processes. Instead, a single-threaded subreaper retains each original
-child's unreaped identity, opens its pidfd and signals through that descriptor.
-It repeats for adopted grandchildren, including children which call `setsid`.
-Only after reaping every owned descendant and observing an empty task cgroup
-does it send the exact-sequence cleanup receipt. We retain the Linux 6.8
-clone/kill workaround described above: ordinary command completion avoids
-`cgroup.kill`. Cancellation destroys the executor rather than risking reuse.
-
-Admission, cold setup, command execution and cleanup each have a fixed-size
-histogram. Rust's `AtomicU64` lets concurrent slots record samples without
-holding a pool lock. A small guard records elapsed time in its `Drop` method,
-including error returns. Its lifetime covers one phase, so waiting for a slot
-isn't silently included in command execution time. These counters have sixteen
-buckets, independent of completed job count. They complement public accepted
-outcome rates; they don't replace durability measurements.
-
-The measurement example now includes raw processes with the same CPU, memory,
-swap and PID limits as native and shared commands. It applies those limits
-before `exec`, keeps the same indexed environment and executable, and fixes
-concurrency independently of job count. Cold runs include executor setup; warm
-runs record their warmup separately. Direct exits, owned outcomes, worker-ledger
-completion and public Raft acceptance remain separate measurements. Rotating
-through new namespaces still creates historical ownership and routing records;
-a fixed live pool doesn't prove that history is bounded.
-
-The first native measurements exposed another limit. Durable worker completion
-reached 9,295/s, but 100,000 public jobs took about 101 seconds. The controller
-kept two 1,000-task chunks queued. It accepted their receipts on one tick and
-delivered the newly committed grants on the next. A fast worker spent most of
-that two-second cycle waiting.
-
-We keep the one-second control interval and learn a bounded lookahead from the
-verified final-attempt duration histogram. Each bucket's upper bound gives a
-conservative duration estimate. Two control rounds of work are enough to bridge
-receipt acceptance and grant delivery; learned grant depth stops at sixteen chunks.
-No samples, slow commands or an unbounded overflow bucket retain the original
-window. The existing two-round concurrency floor still applies to tiny chunks.
-The calculation uses `u128` intermediates so multiplying counters cannot
-truncate the estimate. This is pure planning from committed state, with no new
-wire or durable fields.
-
-Queued grants don't reserve sixteen thousand simultaneous processes. Every
-command still waits for the existing concurrency and CPU/memory admission gates.
-The cost is ownership: more granted work may need reconciliation or explicit
-replay after worker loss. That window is bounded, and stale attempts keep their
-existing fences. We retain the first measurement rather than relabelling it as
-evidence for the revised dispatch policy.
-
-
-### Measuring the native path
-
-The [new evidence](../qualification/2026-10-09-host-job-executors/README.md)
-pins the native implementation and dispatch policy to `ed87f20b`. Every limited
-command uses the same 100m CPU request, one-core limit and 32 MiB memory profile.
-Helper overhead is reserved too. At concurrency 27, after 100,000 warmup
-commands, an identical 10,000-command measurement produced:
-
-| Path | Verified successes/s |
-|---|---:|
-| Raw exits | 16,192.9 |
-| Raw exits with limits before exec | 3,906.2 |
-| Owned native host | 11,553.2 |
-| Owned shared container | 8,251.3 |
-| Native host with worker ledger | 9,309.3 |
-| Shared container with worker ledger | 7,239.2 |
-
-No executor started during those timed owned phases. The resource-limited raw
-path moves a child into its cgroup before exec, from a large Rust parent. The
-native path clones directly from its small helper. That's why a limited raw
-process isn't a universal floor, and why subtracting these rates doesn't give
-pure scheduler overhead.
-
-The serial comparison matters too. With concurrency one, the same 1,000 commands
-and four-command warmup produced 1,023.5/s on the host and 1,179.5/s in a shared
-container. Adding worker durability gave 869.7/s and 950.6/s. The large host
-mismatch is gone; a smaller serial difference remains. The host command phase
-averaged 789.3 µs and cleanup 130.5 µs; shared commands averaged 662.8 µs and
-cleanup 120.1 µs. We calculate these from sample and total-time deltas, not by
-subtracting lifetime maxima.
-
-Public dispatch has more work than direct worker completion. Initially cold,
-equal 100,000-command pilots at concurrency 27 accepted host work at 4,267.2/s
-and shared work at 1,285.3/s, without failures or retries. That host rate is
-about 4.3 times the first native build's 991.6/s control-window ceiling. The
-remaining gap includes cold setup, live namespace checks and the public control
-path. Conservative duration averages include long startup outliers. These
-results don't assign the whole gap to one cause.
-
-The re-recorded demo then accepted 500,000 host jobs in 90.44 seconds (5,528.7/s),
-after its raw-million, thousand-fresh-container and ten-thousand-shared-container
-stages. All 511,000 public outcomes succeeded without retries. The raw million
-counts only exits. The demo preserves its 427.80-second clock and actual pauses;
-its resource profiles and concurrency now match across public runtimes.
-
-The first attempt to repeat the direct matrix omitted its private hostname
-wrapper. Direct runc setup collided with the live node identity, producing a
-thousand startup failures and no command samples. Restoring the original mount
-namespace wrapper produced a separate successful 62-case matrix. We keep the
-failed record and the successful rerun. Neither private credentials nor a
-synthetic executor rate is published as throughput evidence.
-
-
-### A continuous hour on the native path
-
-The new native host path completed **18,103,000 unique
-accepted successes in 3600.00 seconds (5,028.6/s)**,
-with zero terminal failures or accepted retries, beside the original container
-application. All 3,490 service probes succeeded; p95 latency was
-1.32 ms and the maximum 12.82 ms.
-It used one active 500,000-job submission, concurrency 27 and the same
-100m CPU / one-core limit / 32-MiB profile. The original Bun and service process
-start times and application generation matched after the hour. Cancellation of
-the remaining submission and final original-owner/kernel retirement passed.
-
-Largest sampled Bun RSS was 247.7 MiB; its last lifetime
-high-water mark was 258.1 MiB. All 117 bounded
-storage scans were incomplete, so they don't establish a global storage bound.
-No inventory timeout appeared across the fixture lifetime. The
-[raw hour, resource observations and positive cleanup proofs](../qualification/2026-10-09-host-job-executors/README.md)
-retain these limits. This completed hour does not qualify 100m/day; 24-hour,
-fault and historical namespace/profile/cardinality work remains in #668.
-
-### Comparing equal windows
-
-A fixed million processes and a fixed thousand containers take different lengths
-of time. The demonstration now gives each path sixty seconds instead. The raw
-runner records each child's completion instant, stops creating children at the
-deadline, and drains its remaining children without counting their late exits.
-The public harness credits only accepted summary responses received before the
-cutoff. Its final sample is conservative: a completion accepted after that sample
-earns no credit. Submission time belongs inside the public window; image
-preparation and cancellation stay visible outside it.
-
-All paths use the same BusyBox executable and concurrency. Fresh containers buy
-independent isolation, shared containers amortise startup for repeatable trusted
-tasks, and host commands trade isolation for speed. Raw exits provide a measured
-VM reference without resource enforcement or durable outcomes. Multiplying a
-minute count by 1,440 produces a daily projection, not a daily observation.
-We then run each path for one hour at its admitted capacity, probing the same
-application and tracking resource growth, to look for saturation problems.
-
-The first equal-window run exposed the difference between completed commands
-and accepted receipts. Fresh containers couldn't finish a thousand-job receipt
-chunk in a minute, so the leader reported zero accepted successes despite real
-worker progress. The repaired recording uses one-job chunks for fresh containers
-and thousand-job chunks for fast paths. This is a disclosed receipt-amortisation
-choice, not a change to resource requests or execution concurrency. One active
-submission caps each public mode at 27 commands; a large queued count keeps it
-busy. Empty accepted windows now fail the harness. We retain the first recording
-and interrupted raw soak instead of presenting them as completed qualification.
-
-The repaired minute windows accepted 213 fresh-container jobs, 58,000 shared-
-container jobs and 294,000 host jobs, all without failures or retries. The raw
-reference completed 993,718 successful exits. The fresh stage now reports real
-progress. One active submission makes total concurrency comparable; the
-recording uses the packaged CLI rather than repeated CLI subprocesses. These are cold
-executor/public acceptance measurements, not the fully warmed direct runner.
-The landing page shows daily projections explicitly and keeps the raw guarantees
-separate. The [timed record](../qualification/2026-10-09-timed-job-scenarios/README.md)
-retains both attempts and the interrupted first soak.
-
-### Four hours at admitted speed
-
-The packaged hour runs completed 55,407,709 raw exits, 14,199 fresh-container
-jobs, 11,799,000 shared-container jobs and 19,145,000 host jobs. Every path used
-concurrency 27. The public modes kept the same resource profile and BusyBox bytes,
-and the original application served all 14,361 probes successfully. Fresh
-containers recorded four recovered retries; no path recorded a terminal failure.
-The [hourly evidence](../qualification/2026-10-09-timed-job-scenarios/README.md#hourly-sequence)
-retains the complete reports and positive owner retirement.
-
-The host hour also exercised renewal. Its first 16-million-task submission
-finished inside the window; Relish credited its accepted total, verified drain
-and submitted the next owner. At the deadline, it cancelled that owner's remaining
-work and verified zero held tasks and active commands. One active owner at a time
-kept the total cap at 27 across the transition. Submission and renewal costs
-remain inside the measured hour.
-
-The hour explains why the cold minute needs its own label. Shared containers
-accepted 966.7 jobs/s in the recording's first minute and averaged 3,277.5/s over
-the hour. Native host jobs averaged 5,318.1/s. Aggregate VM CPU busy was about
-60.2% for shared and 54.1% for host, compared with 91.2% for the raw baseline.
-These sampled VM counters include unrelated retained workloads. They leave
-room to investigate work supply and receipt acceptance; raising concurrency
-alone didn't remove that gap in the sweep.
-
-Storage is the unfinished part. Free VM disk fell to a sampled 209.6 MiB by
-the end of the host hour. The last bounded fixture scan observed at least
-2.35 GiB of allocated data, but every scan was incomplete. A sampled Bun RSS
-range of 175.5–234.1 MiB across public hours doesn't prove historical memory or
-storage bounds. We retained the data throughout measurement, positively retired
-only the original fixture's runtime/network/kernel owners, then privately archived
-its inactive state. Complete accounting, collection and daily fault qualification
+## Short jobs without fresh containers
+
+What does a job that runs for five milliseconds cost? Until now, a whole
+container. Bun pulled or found the image, created namespaces, wrote an OCI
+bundle, started runc, waited for the payload and tore everything down again.
+Caching image layers takes care of the pull. It doesn't touch the rest. For a
+nightly backup that runs for an hour, nobody notices. For an array of a million
+tiny commands, the setup *is* the job.
+
+How big is the gap? On one four-vCPU VM, in the same sixty seconds, fresh
+containers finished a couple of hundred BusyBox `true` jobs. Native host
+executors finished about a quarter of a million. That's the one throughput
+comparison this section quotes; the rest live in the
+[timed-scenario record](../qualification/2026-10-09-timed-job-scenarios/README.md),
+next to what they do and don't prove.
+
+The fix isn't one trick. It's two cheaper runtimes, an explicit way to choose
+between them, and a lot of care about when a reused process is really safe to
+reuse. The [plan](../plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+sets out the qualification we still owe before claiming 100 million successes
+a day.
+
+### Choosing the runtime per job
+
+A job now names its runtime:
+
+```toml
+[job.prepare-record]
+image = "registry.example.com/dataset-tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+runtime = "shared-runc"
+command = ["/usr/local/bin/prepare-record", "{index}"]
+cpu = "100m-500m"
+memory = "64Mi-256Mi"
+```
+
+There are three choices. `runc` (the default) gives every attempt a fresh
+container. `shared-runc` runs each command as a new process inside a container
+that's kept warm for compatible commands. `process` runs an allowlisted host
+binary or script with no image at all. In Rust they're the three variants of a
+`JobRuntime` enum, and `#[serde(rename_all = "kebab-case")]` turns `SharedRunc`
+into the `shared-runc` you write in TOML.
+
+Our first version guessed the runtime from the fields: an image meant a
+container, `exec` or `script` meant a host process. That's convenient right up
+until a job has both, or a node quietly interprets an image name as a host path.
+Now the runtime is chosen first, and it decides which fields are legal:
+
+```rust
+pub fn is_host(&self) -> bool {
+    self.runtime == JobRuntime::Process || self.exec.is_some() || self.script.is_some()
+}
+
+pub fn validate_runtime(&self) -> Result<(), &'static str> {
+    match self.runtime {
+        JobRuntime::Process if self.image.is_some() => {
+            Err("runtime=process refuses image; use exec or script")
+        }
+        JobRuntime::Process if self.exec.is_some() == self.script.is_some() => {
+            Err("runtime=process requires exactly one of exec or script")
+        }
+        JobRuntime::Runc | JobRuntime::SharedRunc if self.image.is_none() => Err(
+            "runtime=runc/shared-runc requires an image; host exec/script requires runtime=process",
+        ),
+        // ... a container runtime also refuses exec and script
+        _ => Ok(()),
+    }
+}
+```
+
+Two bits of syntax are new here. The `if` after a pattern is a *match guard*:
+the arm only matches when the pattern fits *and* the condition holds, so one
+variant can have several arms, tried top to bottom. `A | B` matches either
+variant. The error type, `&'static str`, is a borrowed string that lives for
+the whole program, which a string literal always does. It's fine for a fixed
+message; callers wrap it in their own error type.
+
+`exec.is_some() == script.is_some()` is a compact "exactly one of": it's true
+when both are set or neither is. And `is_host` is deliberately broader than the
+validated rule. An unvalidated spec that names a host command anywhere still
+counts as host, so routing and the `host-exec` permission check can never treat
+a host command as a container, whichever order the checks run in.
+
+Worker admission and the owned runner check the same contract, so a control
+message can't bypass the API. The job schema and stored definitions changed,
+so the protocol and state generations in `src/compatibility.rs` advanced
+together. Before 1.0, an old cluster starts fresh rather than reading an old
+definition differently.
+
+**One node, two backends.** A node that runs both containers and host commands
+uses `bun --runtime mixed`, which builds a `MixedGrill<C, H>`. The type is
+generic over its container backend `C` and host backend `H`. Rust
+*monomorphises* generics: it compiles a separate copy of the type for each
+concrete pair, so production gets a `MixedGrill<RuncGrill, ProcessGrill>` with
+no dynamic dispatch, and the portable tests get one built from two mocks.
+`--runtime runc` stays container-only and refuses host jobs. The adapter never
+falls back to the other backend after a failed launch.
+
+The adapter keeps a small route journal recording which backend owns each
+instance, written before creation. Status and recovery read that journal rather
+than guessing from a PID. Switching an instance to the other backend needs
+positive proof that the original owner retired. A missing route isn't
+permission to recreate: both backends' inventories must prove the identity
+absent first.
+
+A file lock serialises route changes, and the adapter moves that lock into a
+spawned task. If the caller's future is dropped mid-create, the lock stays held
+until the runtime operation really finishes. That's right for create and stop.
+It was wrong for `exec`. `relish exec app -- sleep 3600` held the lock for an
+hour: the agent's 300-second timeout dropped the caller's future, the spawned
+task kept going, and `stop` waited behind it. `exec` doesn't change a route, so
+it now reads the route without the lock and awaits the backend in the caller's
+own future. Dropping that future drops the backend call.
+
+Inventory snapshots had the same disease. We had routed them through the
+exclusive lifecycle claim used by create, start and retirement, so a read could
+queue behind a mutation. A public run of a thousand fresh containers never
+finished, because every snapshot timed out behind live container work. Later,
+after a slot switched from containers to host jobs, inventory waited on the
+claim now held by the running host replacement. Reads now take no claim. They
+read the atomically published route files, or ask the original backend for its
+retirement receipt, and change nothing. Anything that changes execution
+authority keeps the stronger fence. A snapshot is observation.
+
+Lock-free reading has its own trap. Route files are replaced the safe way:
+write a temporary file, then `rename` it over the old one, so a reader sees the
+old route or the new one, never half of each. The reader opens the file, then
+checks it's a private file with exactly one link, the guard against someone
+planting a hard link to a file they control. But a reader that opens the old
+file a moment before the rename is left holding a file that has just lost its
+only name, and its link count reads zero. Our check called that tampering, and
+the orchestrator logged "state unavailable" for an executor about once a run.
+A planted hard link has *two or more* links; zero means "replaced while you
+were looking". `read_bounded` now opens the path again in that case, a bounded
+number of times, and the test reproduces the exact interleaving: open, rename,
+validate.
+
+A mixed node also has to describe itself honestly. It reported its runtime as
+`runc+process`, which the capability classifier didn't recognise, so the
+secrets catalogue skipped all its container tests. Now the classifier sees the
+container backend on a mixed node, and reports the host backend only when the
+executable allowlist is configured. Host commands run with Bun's own authority.
+A container capability on the same node must never be read as isolation for a
+host workload.
+
+### Keeping a container warm
+
+`shared-runc` keeps the expensive part of a container (its namespaces, network,
+mounts and runtime owner) and throws away the cheap part (the process). Which
+commands may share one container? Ones that would have got an identical
+container anyway. That's the *compatibility key*: a SHA-256 hash of the job
+template with the per-command fields removed.
+
+`ExecutorKey::new` clones the template, clears `command`, `exec`, `script`,
+`schedule` and `run_before`, fills in the default namespace and resource
+ranges, serialises the result to JSON and hashes it. What's left is the pinned
+image digest, the namespace, the environment and the CPU and memory ranges. Two
+different commands with the same image and limits share a key. A different
+memory limit or a rotated credential gets a different container. The key also
+refuses an image that isn't pinned by digest: `myimage:latest` can move under a
+warm container, and then "compatible" would be a lie.
+
+A pool holds at most 32 of these containers per node, each running one command
+at a time. A chunk of a thousand indexes is still a queue, not a thousand
+processes. Here's the checkout:
+
+```rust
+async fn slot(
+    &self,
+    key: ExecutorKey,
+    reservation: crate::meat::Resources,
+    holder: Option<u64>,
+    cancel: &CancellationToken,
+) -> Option<(usize, Option<Context>, Option<ResourceLease>)> {
+    loop {
+        let changed = self.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        // ... return None if already cancelled
+        let mut slots = self.slots.lock().await;
+        let warm = (!self.budget.has_waiters())
+            .then(|| {
+                slots.iter().position(|slot| {
+                    !slot.busy
+                        && slot
+                            .context
+                            .as_ref()
+                            .is_some_and(|context| context.key == key)
+                })
+            })
+            .flatten();
+        let selected = warm.or_else(|| slots.iter().position(|slot| !slot.busy));
+        if let Some(index) = selected {
+            // ... charge the budget for an empty slot before any image I/O
+            slots[index].busy = true;
+            if lease.is_some() || slots[index].context.is_some() {
+                slots[index].holder = holder;
+            }
+            slots[index].key = Some(key);
+            return Some((index, slots[index].context.take(), lease));
+        }
+        drop(slots);
+        tokio::select! { biased; () = cancel.cancelled() => return None, () = changed => {} }
+    }
+}
+```
+
+The function prefers a free slot whose container already has our key. Failing
+that, it takes any free slot, which may hold an incompatible container to
+retire. If nothing's free, it waits for a change and tries again.
+
+`holder` records which run has the slot, but only once there are resources
+behind it: a reservation charged right here, or a container that already holds
+one. A node reports its busy slots plus the ones that still fit as its
+capacity. So a caller that got a slot but is still queued for resources must
+not count. If it did, the node would advertise a slot it can't run anything on,
+and the leader would send work there instead of to a free peer. Such a caller
+becomes the holder only when `admit` charges its reservation. A caller that
+retires another profile's container drops back out until its own reservation
+is charged. Our first version recorded every caller at checkout, and #654's
+author found the phantom slot in review.
+
+A few Rust details carry weight. `bool::then` turns `true` into `Some(value)`
+and `false` into `None`, and `.flatten()` collapses the resulting
+`Option<Option<usize>>`. So the whole `warm` expression reads: "only if nobody
+is queued for resources, find a compatible idle slot". That condition matters.
+Without it, a steady stream of tiny jobs could keep reusing warm containers
+forever while a large job waited for capacity that never came free.
+
+`Option::take` moves the container context out of the slot and leaves `None`
+behind. The caller now owns it. If the caller's future is dropped halfway
+through a command, the slot is still `busy` with no context, and stays
+quarantined rather than being handed to someone else.
+
+The waiting is the subtle part. `Notify::notified()` creates a future, and
+`enable()` registers it *before* we look at the slots. Without that, a slot
+could be released between our check and our wait, and we'd sleep through the
+notification. `tokio::pin!` fixes the future in place on the stack, which
+`enable` needs. `tokio::select!` waits for whichever finishes first, and
+`biased;` makes it check cancellation first rather than picking at random.
+
+**The helper.** Inside each warm container, PID 1 is a small static C program.
+Rust keeps admission, credentials, outcomes and retirement; the helper only
+forks commands and reports on them. Static linking means the image doesn't need
+a particular libc or a worker framework of its own. Bun ships the helper inside
+its own binary, and that's the first time we've compiled C into the Rust build.
+
+A *build script* is a `build.rs` file at the crate root. Cargo compiles and
+runs it before compiling the crate, and anything it prints as `cargo:...` is an
+instruction back to Cargo. Ours compiles `helper.c` twice:
+
+```rust
+fn compile_executor() {
+    println!("cargo:rerun-if-changed=src/bun/reusable_executor/helper.c");
+    // ... choose the compiler from CC_<target>, CC or plain `cc`
+    for (name, host) in [
+        ("rb-executor-helper", false),
+        ("rb-host-executor-helper", true),
+    ] {
+        let output =
+            std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output directory"))
+                .join(name);
+        let mut command = Command::new(&compiler);
+        command.args(["-O2", "-static", "-std=c11", "-Wall", "-Wextra", "-Werror"]);
+        if host {
+            command.arg("-DRB_EXECUTOR_HOST");
+        }
+        let result = command
+            .arg("src/bun/reusable_executor/helper.c")
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("failed to execute static Linux C compiler");
+        assert!(
+            result.success(),
+            "static executor helper compilation failed"
+        );
+    }
+}
+```
+
+`OUT_DIR` is a scratch directory Cargo gives each build script, so generated
+files never land in the source tree. `for (name, host) in [...]` destructures
+each tuple in the array as it loops, like Python's `for name, host in ...`.
+`main` only calls this when `CARGO_CFG_TARGET_OS` is `linux`, the target being
+built for rather than the machine doing the building. And yes, that's
+`expect` and `assert!`. Panicking is how a build script says "this build
+failed", so the no-panics rule for production code doesn't apply here.
+
+The pool then embeds both executables:
+
+```rust
+const HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rb-executor-helper"));
+const HOST_HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rb-host-executor-helper"));
+```
+
+All three macros run at compile time. `env!` reads an environment variable
+while compiling (Cargo sets `OUT_DIR`), `concat!` glues string literals, and
+`include_bytes!` copies the file into the binary as a fixed-size byte array,
+which the `&[u8]` constant borrows for the life of the program. At run
+time Bun writes those bytes into the container's private bootstrap directory.
+There's no install step and no chance of a helper from a different build.
+
+That bootstrap directory came from a bug. Our first version bind-mounted the
+helper as a file into the shared unpacked image, which made runc create a file
+mountpoint there. Two containers starting at once raced to create it, and the
+first jobs failed with `file exists`. The helper now runs from a private
+directory bind, and the image needs no mountpoint at all.
+
+**What a command gets.** The helper starts each command in a sibling task
+cgroup, as a separate uid, without the helper's capabilities or descriptors,
+with private mount and IPC namespaces, fresh scratch filesystems and an
+explicit environment. The image root stays read-only. The PID and network
+namespaces are shared between commands in the same container. That's the
+isolation trade-off you opt into with `shared-runc`, and why it's not the
+default.
+
+Bun talks to the helper over a private Unix socket. It authenticates the peer
+against the container's real init process, rather than trusting a PID written
+in a message. Every command carries a sequence number. Each message back
+(started, output, exited, cleaned up) repeats it, and Bun refuses any message
+whose sequence doesn't match the command it's waiting for, so a late message
+from one command can never be read as news about the next.
+
+**Positive retirement.** When is a slot safe to reuse? Not when the command
+exits. It may have left a background child running, and that child would share
+the next command's cgroup and limits. Bun asks for cleanup; the helper kills and
+reaps every remaining descendant and replies with a cleanup receipt for the same
+sequence; Bun then checks the task cgroup's `cgroup.events` says
+`populated 0`. Only then is the slot free. We call this *positive* retirement:
+we act on proof that something is gone, never on the absence of news. A
+timeout, a cancellation or a missing receipt retires the whole container
+instead. Recovery after a Bun restart carries the same obligation, including
+the sibling task cgroup, before any work is replayed.
+
+Retirement can't wait forever either. A process stuck in an uninterruptible
+kernel wait, say on a hung NFS mount, ignores `SIGKILL` until the kernel lets
+go. `RETIREMENT_DEADLINE` gives up after ten seconds: the caller gets its
+timeout back, while the slot and its resource reservation stay quarantined. The
+eviction loop keeps retrying and frees both once the cgroup finally empties.
+
+Our first version of that deadline was a loop that checked the clock between
+attempts. #654's author pointed out in review that this bounds nothing if one
+attempt never comes back. Each attempt awaits the runtime's `state` and `kill`,
+and runc's lifecycle lock can make either wait indefinitely. So the deadline
+now wraps the whole operation, every attempt and the final file removal
+included:
+
+```rust
+let retired = tokio::time::timeout(budget, async {
+    while !self.retirement_step(context).await {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    self.remove_files(context).await
+})
+.await
+.unwrap_or(false);
+```
+
+In Rust, a timeout cancels a future by dropping it, at whichever `.await` it
+happens to be paused. Nothing inside gets a chance to clean up. Go has no
+equivalent: a goroutine only stops if it checks its `context`. Python's
+`asyncio.wait_for` is closer, but it at least raises `CancelledError` inside
+the task. So everything under the timeout has to be *cancel-safe*: dropping it
+halfway must leave nothing inconsistent. Two pieces weren't.
+
+The first was the runtime calls themselves. If an abandoned `kill` were simply
+started again on the next attempt, a runtime that hangs would collect one stuck
+call per retry. The `state`-then-`kill` probe now runs as its own spawned task,
+and the context keeps its `JoinHandle`. Awaiting a `&mut JoinHandle` doesn't
+consume it, so a cancelled attempt leaves the handle in place. The next attempt
+waits on that same probe instead of starting another. The second was releasing
+the executor's namespace binding. That takes a lock and then decrements a
+counter, and cutting it off in between would leak the binding. It now runs in
+its own task, once retirement is proven.
+
+The eviction loop had the same flaw one level up: it retired executors one
+after another, so a single stuck one held up all the rest. Each executor now
+gets one second per eviction tick, and if it hasn't retired by then, it goes
+back into quarantine and the loop moves on. The tests use a fake runtime whose
+`kill` never returns. With the old loop, both tests hang until their guard
+fires.
+
+**What the real Linux tests found.** Most of the bugs in this path were
+invisible to mocks:
+
+- A command allocated 128 MiB under a 32 MiB `memory.max` and still succeeded,
+  because the VM had swap. `memory.max` limits resident memory, not memory plus
+  swap. Memory-limited image jobs now also set `memory.swap.max = 0`, and the
+  test demands a real OOM kill in `memory.events`.
+- Eight 300 ms commands with one-second timeouts shared one slot. Three
+  succeeded, because the timer started while they were still queueing for the
+  slot. The timeout now starts once a command is admitted.
+- A warm container's 10 millicores and 8 MiB of helper overhead stay reserved
+  while it's idle. Ignoring that let a node advertise three slots where two
+  fitted, while ignoring idle compatible helpers made a busy node advertise
+  none. Offers now count both. Idle containers retire after a second, and
+  sooner if someone is queued for resources.
+- A queued command's encrypted environment was decrypted *before* it waited
+  for a slot. When the namespace's key was retired during the wait, the
+  plaintext still ran. Encrypted values are now resolved against live keys
+  again after the wait, and must still match the container's compatibility
+  key. The pool receives this as a closure, a small function that borrows the
+  runner and template and returns a future. Its `Fn` bound means it can be
+  called repeatedly without consuming what it borrows. No plaintext ever
+  reaches the replicated template or the worker's ledger.
+- A Bun crash beside a running application left the replacement refusing to
+  start: `kernel source entries have no original ownership`. Delegated jobs
+  publish their namespace into the same kernel map as applications, but
+  startup only consulted the application journal. Startup now also validates
+  the delegated journal (names, boot identity, cgroup inodes). Recognising an
+  entry still isn't permission to clear it: that waits until the old runtime
+  owners have positively retired.
+
+### When cleanup killed the next command
+
+The real Linux regression ran two commands through one warm container. The
+first succeeded. The second died with `SIGKILL` before it did any work.
+
+Our first cleanup wrote `1` to the task cgroup's `cgroup.kill` file, which
+kills everything in the group in one go, then waited for the group to empty and
+reused it. An empty cgroup looked safe. The kernel remembered something we
+couldn't see. We saw this on Ubuntu's 6.8 kernel with runc 1.4; that's what we
+tested, not the full list of affected versions.
+
+To follow it, you need two pieces of Linux. The first is how the helper starts
+a command. The classic way is `fork()`, then write the child's PID into the
+target cgroup's `cgroup.procs`. For a moment, the child runs outside its
+limits. `clone3` with `CLONE_INTO_CGROUP` closes that gap: you pass an open
+descriptor for the destination cgroup directory, and the child is born there.
+It needs no capability, only write access to that cgroup's `cgroup.procs`.
+That's cgroup v2 *delegation*: Bun creates the task cgroup and `chown`s its
+`cgroup.procs` to the helper's uid, so the helper can place children there and
+nowhere else.
+
+The second piece is how `cgroup.kill` catches a child that's being forked
+while the kill sweeps through. Each cgroup has an internal counter, `kill_seq`,
+which goes up on every kill. A fork compares the counter before and after; if
+it moved, the new child is killed too. On affected kernels,
+`CLONE_INTO_CGROUP` read the *parent's* counter (the helper's cgroup) before
+the fork and the *destination's* counter after it. Our kill bumped only the
+destination's. Every later child into that cgroup saw a mismatch and was
+killed at birth, even with no kill anywhere near it. Emptying the group didn't
+reset the counter.
+
+There's an [upstream fix](https://kernel.googlesource.com/pub/scm/linux/kernel/git/tip/tip/+/8e359920216689b3b79e0fe8961a77fe312a511f)
+that reads the destination's counter both times. We can't assume every node
+has it, or a distribution backport, and a version string can't tell us. So
+ordinary cleanup no longer touches `cgroup.kill`:
+
+```c
+static pid_t launch(int directory) {
+    struct clone_args arguments = {.flags = CLONE_INTO_CGROUP, .exit_signal = SIGCHLD,
+                                   .cgroup = (uint64_t)directory};
+    return (pid_t)syscall(SYS_clone3, &arguments, sizeof(arguments));
+}
+
+static int cleanup(int fd, uint64_t sequence) {
+    unsigned char receipt[9];
+    if (all(fd, receipt, sizeof(receipt), 0) || receipt[0] != 'C' ||
+        decode64(receipt + 1) != sequence) return -1;
+#ifdef RB_EXECUTOR_HOST
+    if (retire_owned_children()) return -1;
+#else
+    if (kill(-1, SIGKILL) && errno != ESRCH) return -1;
+#endif
+    int status;
+    while (waitpid(-1, &status, 0) > 0 || errno == EINTR) errno = 0;
+    if (errno != ECHILD) return -1;
+    return event(fd, 4, sequence);
+}
+```
+
+(We've trimmed a test-fixture branch that uses plain `fork()` off Linux.)
+`launch` calls `clone3` through `syscall`, because older C libraries have no
+wrapper for it. `cleanup` first checks that Bun's request carries the sequence
+of the command that just ran. In a container, `kill(-1, SIGKILL)` signals every
+process in the helper's PID namespace except PID 1 itself, which covers a
+background child that changed its process group or its uid. The `waitpid` loop
+reaps them all until the kernel says `ECHILD`, no children left. Only then does
+the helper send event 4, the cleanup receipt, and Bun checks the cgroup is
+empty.
+
+`cgroup.kill` still has a job: retiring a whole executor after a timeout,
+cancellation or uncertain cleanup. Then the killed task cgroup must never run
+another command. Our first version intended that but didn't enforce it. It
+ignored a failed `rmdir`, and the next executor's `create_dir_all` quietly
+adopted the surviving directory, poisoned counter and all. Now retirement
+doesn't count until the task cgroup is really gone, and setup creates it with
+`create_dir`, which fails rather than adopting an existing one. A root-gated
+test plants a killed cgroup at the next executor's path and checks the command
+runs in a fresh directory. A mocked launch would never have found any of this.
+
+### Native host executors
+
+Shared containers fixed the container setup. Host jobs still paid for their
+own: each attempt launched a new durable owner, published its ownership record
+and polled for the outcome. On rootful Linux, host `exec` and `script` jobs now
+borrow the same bounded pool, with a host build of the same helper
+(`-DRB_EXECUTOR_HOST`). The compatibility key drops the image and keeps the
+namespace, environment and resource profile, so different allowlisted binaries
+can share a slot.
+
+The resource story is the same. Each command is born into its limited task
+cgroup with `CLONE_INTO_CGROUP`, so CPU, memory, swap and PID limits apply
+before user code runs. The helper lives in its own charged cgroup and doesn't
+eat the command's allowance. A durable owner holds the helper for the life of
+the slot, and the existing group-commit task ledger records each command's
+outcome, so there's no new owner record per command. Other platforms keep the
+original one-owner-per-attempt backend and refuse explicit CPU or memory
+limits, since they can't enforce them.
+
+What's different is that this is *trusted* host execution with resource
+controls, not a sandbox. Commands run as Bun's user, with the host filesystem.
+That made us look hard at what the helper itself is allowed to do, and the
+answer was "too much" in three places:
+
+- **Capabilities.** The container helper keeps `CAP_SYS_ADMIN` and
+  `CAP_SETPCAP` to give each command private mounts. Inside a user namespace
+  those are harmless. Our first host helper kept them too, and on the host
+  they're real: `CAP_SYS_ADMIN` alone lets you mount filesystems. The host
+  helper now keeps only `CAP_SETUID`, `CAP_SETGID` (to switch to Bun's user)
+  and `CAP_KILL` (to clean up). The gated test reads `CapEff` and `CapPrm` from
+  `/proc/<pid>/status` and expects exactly those three bits.
+- **Environment.** The helper `exec`s with exactly the environment it's sent.
+  Our first version sent only the job's own variables, so `/usr/bin/env`
+  printed nothing on Linux, while the same job on macOS inherited everything
+  Bun had, cloud credentials included. Every host backend now calls one
+  function, `host_environment`, which keeps a short allowlist of Bun's
+  variables (`PATH`, `HOME`, the locale and a few more) and lays the job's
+  `env` over it. The in-process backend calls `Command::env_clear()` first,
+  because Rust's `std::process::Command`, like `subprocess` in Python,
+  otherwise inherits the parent's whole environment. Clearing has a cost if
+  you miss a caller, and we did: the owner's exec gate now cleared its
+  environment too, but `relish exec` built its owner record with an empty map,
+  so an exec'd `/usr/bin/env` printed nothing. #654's author caught it in
+  review. Exec now copies the workload's own recorded environment, the
+  in-memory backend's exec applies the same function, and tests run a command
+  found only on the workload's custom `PATH`.
+- **The socket.** The helper's socket used to live in `/tmp` under a
+  predictable name. Authentication stopped impersonation, but not another user
+  creating that name first, which made Bun refuse the slot forever: a cheap
+  denial of service. Sockets now live in `/run/reliaburger/host-executors`
+  (mode 0711), where only root can create names. The test plants a file at
+  the old `/tmp` name, owned by `nobody`, and checks the next command starts.
+
+Cleanup is harder without a PID namespace. `kill(-1, SIGKILL)` on the host
+would signal every process Bun's user owns. So the host helper makes itself a
+*subreaper* with `prctl(PR_SET_CHILD_SUBREAPER)`: orphaned descendants are
+re-parented to it rather than to init, even after a `setsid`. Its
+`retire_owned_children` reads its own children from
+`/proc/self/task/<pid>/children`, opens a *pidfd* (a file descriptor that
+refers to one specific process) for each and signals through it, then reaps
+and repeats until none are left. A pidfd can't be fooled by PID reuse, and
+because the helper is single-threaded and hasn't reaped the child yet, the PID
+it read is still that child. Then the same cleanup receipt and empty-cgroup
+check apply. Losing Bun's connection makes the helper retire its children
+before it exits.
+
+One more host bug was about output. The helper relays stdout and stderr with
+`poll`, at most sixteen 4 KiB reads per stream per pass, so a flooding command
+can't starve the exit check. After the command exited, our first version made
+just one more pass. A pipe holds 64 KiB by default, so that looked like plenty,
+but a command can grow its pipe to a megabyte with `fcntl(F_SETPIPE_SZ)`. One
+that wrote 500,000 bytes and exited lost most of them, and still reported
+success. Now the helper reads each stream to end-of-file after exit. If a
+background descendant still holds the pipe open, it stops once that's been
+quiet for 10 ms or after 16 MiB, and appends a visible
+`[reliaburger: output written after exit truncated]` line. The test makes the
+race deterministic: it sends `SIGSTOP` to the helper while the command fills
+its pipe and exits.
+
+That fix had a bug of its own, and only a benchmark found it. Each loop pass
+reads the pipes and then checks whether the command has exited. For a quiet
+command both pipes are already at end-of-file in the pass that sees the exit,
+but the "both streams closed" check ran only after the next `poll`. With the
+command gone, that `poll` waits its full 10 ms. Ten milliseconds sounds
+harmless, but a `busybox true` takes well under one, so every command now cost
+about 11 ms. Host jobs fell from the roughly 4,000 a second we'd measured
+before to 1,233 a second, the same in every round. The check now runs before
+polling. A gated test times 200 quiet commands on one warm executor: 2.35
+seconds with the bug, 0.17 seconds without, against a two-second limit.
+
+None of this keeps a *model* loaded. Each command is still a new process that
+loads whatever it loads. Keeping a model resident between requests is a
+separate piece of work, #641.
+
+### Feeding fast workers
+
+With commands this cheap, the bottleneck moved. Workers finished their durable
+completions fast, but public jobs crawled. The cause was the leader's grant
+loop. Recall that a node holds a couple of granted chunks at a time and asks
+for more as it finishes. Each one-second control tick, the leader accepted the
+node's receipts, and only on the *next* tick did it deliver the grants that
+replaced them. A fast worker emptied its chunks and spent most of each
+two-second cycle waiting.
+
+The fix is *grant lookahead*: give fast nodes enough queued work to cover the
+gap. How much is enough? That depends on how long commands take, so the leader
+learns it from the final-attempt duration histogram the nodes already report.
+Bucket `i` counts commands that took up to `2^i` ms. Using the upper bound of
+each bucket gives a conservative estimate of throughput: slots × two seconds ÷
+average duration. Learned depth is capped at sixteen chunks.
+
+That's the idea. The edges took four more fixes:
+
+- **A slow start mustn't stick.** The last bucket has no upper bound, and our
+  first version fell back to the small window if it held a single sample. One
+  cold image pull switched lookahead off for the rest of the array, and since
+  the counts only grew, it was never forgotten. The planner now uses a second,
+  *decaying* histogram, and falls back only when more than one in sixteen
+  recent samples overflowed.
+- **The tail must be shared, by capacity.** `plan_grants` tops up the
+  emptiest node first. Near the end of an array, the first fast node could
+  take sixteen of the last twenty chunks while another sat idle. Our first
+  cap split what was left evenly, and #654's author showed in review that this
+  is wrong too. With 27 slots on one node and 8 on the other, the last twenty
+  chunks went 10/10, so the bigger node finished early and the smaller one
+  owned half the tail. The cap is now each node's share of every outstanding
+  chunk, queued or already held, in proportion to its slots: 15/5 in that
+  example. Counting held chunks means a node still working through a big
+  grant doesn't get more on top. Rounding each share up would hand out more
+  chunks than exist, and rounding down would strand some. So the whole parts
+  go out first, and the leftover chunks go to the largest fractions (the
+  *largest remainder* method that some countries use to share out
+  parliamentary seats). The baseline window still applies, so even a node
+  with a thousandth of the capacity gets two chunks.
+- **Lookahead needs automatic replay.** If a node dies, every chunk it held
+  has an unknown outcome. Arrays that replay automatically don't mind. Arrays
+  that need an operator to acknowledge and replay would turn sixteen chunks
+  into manual work. Those keep the baseline window, and the leader passes the
+  run's policy to `plan_grants` as a plain `bool`.
+- **The durations must be honest.** The executor used to time the whole
+  `runner.run` call, which for a pool includes waiting for a slot and, on a
+  cold start, an image pull. A 5 ms command queued behind 256 callers reported
+  50 to 200 ms. `Attempt` now carries `ran: Option<Duration>`, filled from the
+  helper's start receipt to its exit receipt. `None` says "this runner can't
+  tell", which is not the same thing as zero and doesn't look like a very fast
+  command. Fresh containers keep the old clock: starting the container is part
+  of their cost.
+
+The decay is the part with a distributed-systems twist:
+
+```rust
+while self.recent_duration_counts.iter().sum::<u64>() > RECENT_DURATION_SAMPLES {
+    for recent in &mut self.recent_duration_counts {
+        *recent /= 2;
+    }
+}
+```
+
+Once the recent histogram holds more than 4,096 samples, every bucket is
+halved. That's exponential decay, the same thing an exponentially weighted
+average does with a factor like 0.9. Why not use a float? Because this state
+lives in Raft. Every replica applies the same receipts and must end up with
+byte-identical state, and integer division gives the same answer on every CPU
+and compiler. Floating-point rounding mostly would, but "mostly" isn't a word
+you want near a replicated state machine. `&mut self.recent_duration_counts`
+iterates over mutable references to the array's elements, and `*recent`
+dereferences each to update it in place. The planner's arithmetic then runs in
+`u128`, so multiplying sixteen `u64` counts by durations can't overflow. This
+is pure planning from committed state. The decaying histogram is the one new
+durable field, so it rode on this release's existing state-format bump.
+
+Lookahead only works if nodes advertise honest capacity, since queued grants
+still wait for the node's concurrency and CPU/memory admission. Our first
+version counted every caller inside `runner.run` as running, including callers
+still waiting for a pool slot. A node whose budget fitted two executors
+advertised 32 slots.
+
+The first fix swung too far the other way. It counted commands between the
+helper's start and exit receipts. A `busybox true` lives for about a
+millisecond, so a node running 27 executors flat out would sample only the few
+commands caught mid-flight, and advertise far less than it was doing. (We first
+blamed this for a benchmark plateau; the drain bug above was the real cause, but
+the under-count is real too.) The right count sits between the two. Each
+pool slot records which run's caller holds it, from the moment resources are
+charged to it until release, setup and cleanup included. A caller waiting for
+a slot or for admission doesn't count, and a millisecond command does. One regression fills a two-executor budget with 64
+two-second commands and checks the node advertises two. Another stops the
+helper with `SIGSTOP` so a submitted command holds its slot without starting,
+and checks the slot counts as busy while no command counts as started.
+
+The started-command count still has a job: it feeds `relish batch watch`,
+which shows verified commands beside other attempts. A backend without start
+receipts, including fresh containers, reports it as unknown rather than
+guessing from a launcher PID.
+
+The price of lookahead is ownership. More granted work may need reconciliation
+or replay after a worker is lost. That window is bounded, and stale attempts
+keep their existing fences.
+
+### What the measurements do and don't show
+
+Measuring this turned out to be as instructive as building it, mostly because
+of the measurements that lied. The numbers live in two records: the
+[earlier matched and one-hour runs](../qualification/2026-10-09-host-job-executors/README.md)
+and the [current equal-minute scenarios and concurrency sweep](../qualification/2026-10-09-timed-job-scenarios/README.md).
+Here's what we learned reading them.
+
+**Compare like with like.** The first landing-page experiment made host jobs
+look ten times slower than shared containers. It also reserved a whole CPU for
+each host job and a tenth of one for each shared command, so on a four-CPU node
+the two paths ran different numbers of commands at once. Every path now uses
+the same CPU request, limit, memory and concurrency.
+
+**Equal counts aren't equal work.** A million raw processes and a thousand
+fresh containers take wildly different times, so the totals can't be lined up.
+The demonstration now gives every path the same sixty seconds and credits only
+outcomes the leader accepted before the cutoff. A minute's count times 1,440 is
+a daily *projection*, and we label it as one.
+
+**Receipts have a granularity.** The first equal-minute run reported zero
+fresh-container successes despite real progress. Fresh containers couldn't
+finish a thousand-job receipt chunk inside a minute, and an unfinished chunk
+earns nothing. Fresh runs now use one-job chunks; fast paths keep a thousand.
+That changes reporting, not resources. An empty accepted window now fails the
+harness instead of quietly printing zero.
+
+**Cold and warm are different questions.** Each concurrency point starts with
+cold executors and a warm image, then measures a cold minute and a warm minute
+in the same submission, subtracting the counters at the boundary so no job is
+counted twice.
+
+**The raw baseline isn't a floor.** Raw `fork` and `exec` in the VM have no
+limits, durability or outcomes. Adding the same cgroup limits to the raw path
+made it *slower* than our native executor, because the raw runner moves each
+child into its cgroup from a large Rust parent, while the helper clones
+straight into it from a tiny one. So you can't subtract one rate from another
+and call the difference "scheduler overhead". Isolation and durability have
+real work to do.
+
+**A no-op measures overhead.** Every run used BusyBox `true`. That isolates
+per-job cost, which is exactly what this work attacked, but it says nothing
+about a command that does real work. Size a real workload with real commands
+on your own hardware.
+
+**More concurrency isn't always faster.** Twenty-seven slots came from
+admission arithmetic: what fits in the VM's job budget. The sweep from 1 to 64
+showed host jobs plateau from 8 and fall off past 32, while shared containers
+liked 27 once warm. We keep 27 as a common comparison point because it makes
+the comparison fair, not because it's the best setting for each runtime. The
+host plateau also says the next limit is work supply through grants and
+receipts, not process creation.
+
+**A minute isn't an hour.** Each path then ran for an hour at admitted speed,
+one after another, beside the same live application. No path had a terminal
+failure and the application answered every probe. The hours also showed how
+much a cold minute understates a warm pool: shared containers averaged more
+than three times their first-minute rate over the hour. And the VM's CPU was
+only a little over half busy for the public paths, against more than 90% for
+raw processes, so the next limit is feeding work and accepting receipts, not
+starting processes.
+
+**An hour is not a day.** Storage is the unfinished part. Free disk in the VM
+fell to about 200 MiB by the end of the host hour, and every bounded storage
+scan was incomplete, so none of this proves storage stays bounded. A fixed pool
+of 32 live slots doesn't bound history either: slot identities include the
+namespace, so rotating through new namespaces leaves retired ownership and
+routing journals behind. The fresh-container hour also recorded four retries
+that later succeeded, and we couldn't say why: a bulk success record keeps the
+final outcome and the attempt count, not the earlier failure's reason. At this
+volume you want bounded summaries of failure causes, not millions of log lines
+for successful jobs. A real daily run, faults and collection of that history
 remain in #668.
 
-There is also a diagnostic lesson in the four recovered retries. A bulk success
-record keeps the final outcome and attempt count; it doesn't keep an earlier
-failed attempt's reason. Later normal runc retirement records can't recover that
-missing evidence. We cannot assign those retries to the documented kernel bug.
-High throughput needs bounded failure-cause summaries, not millions of successful
-job log lines; that operational follow-up belongs with #668.
+**Benchmark your own fixes.** The review that hardened this code was checked
+by rerunning the benchmarks on the fixed build, and the reruns found three
+regressions in the fixes themselves. One was the 10 ms drain wait above. The
+second was a single line. Bounding retirement had made the "is the task group
+empty?" check async, and the read moved to `tokio::fs::read_to_string`. Tokio's
+file functions hand each call to a pool of blocking threads, because ordinary
+file I/O can stall a thread. That's the right default for a disk. But
+`cgroup.events` lives in cgroupfs, which, like `/proc`, is answered from kernel
+memory and never waits. The read happens once per command, and the thread hop
+cost about 3% of host-job throughput. It's a plain synchronous read again,
+with a comment saying why.
 
-### Find the concurrency knee
+The third was memory. Bun's resident memory after five minutes of host jobs
+moved by up to 170 MiB between builds, with changes that had nothing to do
+with memory. Reverting them one at a time never brought it back to #654's
+figure. The cause was glibc's allocator. To avoid lock contention, glibc gives
+busy threads their own *arenas*, up to eight per core, and keeps freed memory
+in each arena for reuse rather than returning it to the kernel. Tokio's worker
+and blocking threads all count. So resident memory tracked how many threads
+had ever been busy, not how much data Bun held. Go and Python manage their own
+heaps, so you meet this mostly in C, and in Rust, which uses the system
+allocator by default. Setting `MALLOC_ARENA_MAX=2` brought the same run down to
+about 190 MiB. Bun now does it for itself, before the runtime starts any
+threads:
 
-Twenty-seven slots came from admission arithmetic: the VM has a 3,000m job
-budget, and each native/shared context reserves 100m for the command plus 10m
-for its helper. That tells us what fits. It doesn't tell us what's fastest.
-More concurrent children can raise throughput until CPU, filesystem operations
-or the receipt path saturate. Beyond that point, queueing and context switching
-can make the result worse.
+```rust
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // SAFETY: mallopt only tunes the allocator, and runs here before Bun
+    // starts any other thread. A value glibc rejects is reported by the return
+    // value, which we can ignore: the default arenas simply stay in place.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+```
 
-The wider sweep uses 1, 4, 8, 16, 27, 32, 48 and 64 as configured caps. Every
-public mode uses the same 25m request, one-core burst limit and 32 MiB memory,
-so admission can exceed 27. Native and shared pools still admit at most 32
-contexts. We report that limit separately from the configured cap and sampled
-active commands. A task that lives for a millisecond can disappear between
-node-sync samples; those samples aren't a count of every concurrent child.
+`#[cfg(...)]` compiles the function only on Linux with glibc. musl and macOS
+have different allocators and no such knob. Calling a C function is `unsafe`
+in Rust because the compiler can't check what C does. The `// SAFETY:` comment
+records why this call is fine, and an operator's own `MALLOC_ARENA_MAX` still
+wins. Bun now ends the same run at 165 MiB, against 587 MiB for #654, and
+accepts at least as many jobs: its hot paths wait on I/O, not on the allocator.
 
-Each point starts with cold executors and a warm image. One submission spans a
-60-second cold window and a second 60-second warm window. The second window
-subtracts its initial accepted counters, so it can't count the first window's
-jobs again. Cancellation, task drain and idle-context retirement finish before
-we change the next cap. Keep the full curve and repeat close candidates before
-choosing the recorded comparison's common cap.
+**Keep the failures.** One rerun of the direct matrix forgot its private
+hostname wrapper, collided with the live node and produced a thousand startup
+failures. The record keeps it beside the successful rerun. Runs use the normal
+three attempts and report accepted retries separately, because a retry that
+succeeds hides its cause rather than fixing it.
 
-The rig is a local Lima VM on an Apple M2 Max machine with 12 physical cores and
-32 GiB host RAM. We allocate four vCPUs and 8 GiB to Ubuntu 24.04 aarch64, running
-Linux 6.8 and runc 1.4. Four guest cores are the relevant capacity here, not all
-twelve host cores. BusyBox `true` measures dispatch and process overhead; use
-your own hardware and representative commands when sizing a real workload.
+**Put the experiment in the tool.** Reproducing a benchmark shouldn't mean
+remembering a dozen paths from someone's temporary directory, so the four
+scenarios are now part of Relish. `relish bench --scenario
+jobs-shared-containers` runs with sensible defaults; there are scenarios for
+fresh containers, host processes and the raw baseline too. The runner counts
+through an `AcceptedCounts` value that refuses a counter going backwards or a
+changed total, so polling twice can't turn one success into two. The active
+submission is an `Option`: `None` means we may submit, `Some` means we must
+keep watching the work we own. Ctrl-C triggers a `CancellationToken` that stops
+submission and observation without skipping cleanup. The raw baseline keeps its
+child waiters in a Tokio `JoinSet`, a set of spawned tasks you can await as
+they finish, and drains exits after the deadline without crediting them.
 
-The curve didn't produce one winner for every runtime. Native public throughput
-reached 5,333 accepted jobs/s at 8, 16, 27 and 32, then fell at configured caps 48
-and 64. Eight is enough for that host-job plateau. Shared containers benefited
-from 27 in their second minute, winning both-order repeats, while 8–16 often
-started faster in their cold minute. Fresh containers gained little beyond 16.
-We keep 27 as a common comparison point across all four paths, and publish the
-whole [curve and repeated candidates](../qualification/2026-10-09-timed-job-scenarios/README.md#concurrency-review).
-A common cap makes the comparison fair; it isn't a universal tuning recommendation.
-The host plateau also points to work supply through bounded grants and accepted
-receipts, rather than raw process creation, as the next throughput constraint.
+Adding the benchmark's flags taught a Rust lesson of its own. Clap's derive
+macro generates the parser from the command enum, and with every benchmark
+option inline the generated code overflowed the test threads' default stack,
+in tests for unrelated commands too. A Rust enum is as large as its largest
+variant, and that size lands on the stack wherever the value is built. The
+options moved into their own `#[derive(clap::Args)]` struct, held as
+`Bench(Box<BenchOptions>)`. `Box<T>` puts the value on the heap and stores only
+a pointer, so every variant shrank back to a few words. When you add a
+specialised command, keep running the ordinary command tests: generated code
+can change their stack use too.
 
-### Put the experiment in the tool
+Inside each pool, admission, cold setup, command execution and cleanup each
+record into a fixed sixteen-bucket histogram of `AtomicU64` counters, so
+concurrent slots record without taking a lock. A small guard records the
+elapsed time in its `Drop` implementation, Rust's destructor, which runs on
+every exit path, error returns included. Its lifetime spans exactly one phase,
+so waiting for a slot can't leak into execution time.
 
-A benchmark isn't very useful if reproducing it means remembering a dozen paths
-from the developer's temporary directory. We moved the four timed scenarios
-into Relish: `relish bench --scenario jobs-shared-containers` needs no duration
-or concurrency arguments. Its defaults are 60 seconds, concurrency 27 and the
-same 25m–1000m / 32 MiB job profile used by the curve. Fresh containers, trusted
-host processes and the local Linux raw baseline have separate scenario names;
-the ordinary `relish bench` suite still works without `--scenario`.
+### Lessons from short jobs
 
-The new flags also found a Rust parser problem. Putting all benchmark options
-inline in the command enum made the generated Clap parser overflow the standard
-test-thread stack, including tests for unrelated commands. We split the options
-into their own `#[derive(clap::Args)]` struct and used `Bench(Box<BenchOptions>)`.
-`Box<T>` owns a value on the heap; the enum stores its pointer rather than the
-whole argument structure. The normal parser tests then passed without increasing
-thread stack limits. Keep testing the ordinary commands when adding a specialised
-one: generated code can change their stack use too.
+**Reuse needs proof, not hope.** Every reuse bug in this section had the same
+shape: a slot looked empty, so we reused it. An exit code isn't proof the
+command's children are gone. An empty cgroup isn't proof the kernel has
+forgotten it was killed. A missing directory record isn't proof nothing was
+published. Positive retirement, acting only on a receipt or an observed empty
+state, is slower to write and much faster to debug.
 
-The public runner submits a single compact manifest, reads bounded summaries
-and cancels only the identities it owns. `AcceptedCounts` holds the submission
-identity, total and previous accepted counters. It rejects regressions or a
-changed total, so polling twice can't turn one success into two. An `Option`
-represents the active submission: `None` means we can submit new work; `Some`
-means we must keep observing that owner. A monotonic deadline decides whether a
-complete API response earns credit. Cancellation and its positive drain proof
-happen afterwards, without changing the count.
+**Mocks can't see the kernel.** The `kill_seq` bug, the swap that let a
+memory-limited command survive, the racing image mountpoint and the oversized
+pipe all needed a real Linux node. Mocks were still the right tool for the
+state machines around them. They just can't fail the way a kernel does.
 
-`CancellationToken` lets Ctrl-C stop submission and observation without dropping
-the cleanup path. We don't abort an in-flight submission merely because Ctrl-C
-arrived: its response is how we learn which identity to cancel. If that response
-is lost, we keep the unique benchmark name and fail the cleanup claim. An error
-is evidence too. Mock API tests delay a response past the cutoff, fail reads and
-cancellation, and interrupt a running submission; each checks the final count
-and ownership cleanup rather than just checking a request's spelling.
+**Reads shouldn't wait behind writes.** Twice, an inventory snapshot queued
+behind a mutation's lock and starved a control loop. A lock that deliberately
+outlives an abandoned caller is the right fence for changing authority, and the
+wrong one for looking.
 
-The baseline owns a bounded set of child waiters in a Tokio `JoinSet`. Each
-waiter returns its exit status and completion instant. Exits after the deadline
-are drained but don't earn credit. By default the baseline extracts the pinned
-BusyBox image into the user's cache before measuring, so no Bun path or fixture
-is needed. An explicit BusyBox path supports a preverified byte-identical host
-copy. Host execution still needs the node's allowlist; the benchmark cannot
-relax it. Run the baseline inside the same Linux VM as the public jobs, not on
-the laptop outside it, and verify the remote host executable's hash yourself.
+**Distinguish "pending" from "broken".** A recovery test failed because it
+read a logical run as active while its retry was still waiting for a runtime
+binding, then treated the `pending` instance with no PID as a running process
+missing one. The waiter now waits through non-running states but still fails
+at once if a known running process has no PID. We kept the cases separate, so
+fixing the test couldn't hide the real missing-PID bug it was written to catch.
+
+**Measure the thing you claim.** The most misleading numbers here weren't
+wrong. They measured something else: unequal reservations, unequal counts,
+receipt chunks bigger than the window, a no-op instead of real work. Writing
+down what a number *doesn't* show turned out to be most of the work.

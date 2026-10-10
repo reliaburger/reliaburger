@@ -297,8 +297,8 @@ migration and no feature gate
   adds bounded native/shared executors and a four-part VM/process/container demonstration
   ([raw results](qualification/2026-10-09-timed-job-scenarios/README.md)); it doesn't
   qualify the daily target. Reusable executors
-  [#639](https://github.com/reliaburger/reliaburger/issues/639) are implemented in
-  #654, pending merge, alongside the reproducible throughput demo
+  [#639](https://github.com/reliaburger/reliaburger/issues/639) are implemented,
+  alongside the reproducible throughput demo
   [#640](https://github.com/reliaburger/reliaburger/issues/640). Sustained daily and
   storage-bound qualification [#668](https://github.com/reliaburger/reliaburger/issues/668)
   and resident model workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.

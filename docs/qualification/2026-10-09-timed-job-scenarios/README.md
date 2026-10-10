@@ -1,5 +1,10 @@
 # Equal-minute job demonstrations and hourly saturation runs
 
+The tree keeps this record's READMEs, reports, manifests, binary hashes and
+build boundaries. The raw samples, logs, casts, patches and copied tooling
+(about 39 MB) were removed to keep the repository small; they're still in the
+repository history at [006aca5f](https://github.com/reliaburger/reliaburger/tree/006aca5f9157a3b9432752470d507ca6ecb7e0d5/docs/qualification/2026-10-09-timed-job-scenarios).
+
 The repaired recording measures four genuine 60-second windows on one four-vCPU,
 8 GiB Ubuntu 24.04 aarch64 Lima VM (Linux 6.8.0-139, runc 1.4), running locally
 on an Apple M2 Max host with 12 physical cores and 32 GiB RAM. The VM receives
@@ -236,6 +241,92 @@ The owned submission positively drained, job contexts retired, and the original
 Bun/application identities and HTTP service remained healthy. See
 `current-build/interrupted-fresh-hour-checkpoint.json` and
 `current-build/hours/runc-interrupted-checkpoint`. The packaged recording and all four new hours are complete as recorded above.
+
+## Independent five-round rerun
+
+A second rig repeated the four packaged scenarios to check these figures,
+on #654 as submitted (`006aca5f`) and on the final head of the review fixes
+(`fix/654-review`). Each build ran on a fresh single-node cluster beside the
+same 500m BusyBox application. Each round ran every scenario once for 60
+seconds, and the order rotated from round to round. Settings matched the record
+above: `relish bench` defaults, concurrency 27, 25m CPU request, one-core
+limit, 32 MiB memory, and the same pinned image and BusyBox executable
+(`f1947045…`). Images were warm and executors started cold in every window.
+
+The rig was a Lima VM with 4 vCPU and 8 GiB (Ubuntu 24.04 aarch64, Linux
+6.8.0-142, runc 1.5.2) on an Apple M1 Max host with 10 cores and 64 GiB. Other
+host processes kept running. No builds or tests ran during the rounds.
+
+| Scenario | Recording above (other rig, one run) | #654, median (range) of five | Review fixes, median (range) of five |
+|---|---:|---:|---:|
+| Raw VM processes | 16,562/s | 14,278/s (11,623–14,494) | 12,750/s (10,798–13,232) |
+| Host jobs | 4,900/s | 3,767/s (3,567–4,450) | 3,767/s (3,767–4,033) |
+| Shared containers | 966.7/s | 1,667/s (1,233–2,333) | 2,483/s (2,317–2,700) |
+| Fresh containers | 3.55/s | 10.7/s (10.5–10.7) | 10.8/s (10.4–10.9) |
+
+No round had a terminal failure or an accepted retry. On this rig, raw and host
+rates came out 14–23% below the recording, and the container paths 1.7 to 3
+times above it. A newer runc is one plausible reason for the container gap; this
+record doesn't establish it. The raw baseline runs the same executable for both
+builds, yet its median differs by 11% between the two sessions, so differences
+of that size aren't meaningful on a laptop VM. Host-job counts arrive in
+1,000-job receipts, which is why most rounds report exactly 3,766.7/s. The shared
+container median is about half as high again on the fixed build, with the
+ranges barely overlapping; host jobs and fresh containers are level.
+
+Every headline rate is per-job overhead for a command that does nothing. To
+see how much of that gap survives real work, three interleaved rounds ran 3,000
+copies of a BusyBox shell loop (`i=0; while [ $i -lt 10000 ]; do
+i=$((i+1)); done`, about 13 ms of CPU each) with the same profile, on an
+earlier build of the fixes. Each run was timed from submission until
+`relish batch-status --wait` returned, so public times include that command's
+polling:
+
+| Path | Median time | Rate | Share of raw |
+|---|---:|---:|---:|
+| Raw processes (`xargs -P 27`) | 10.58 s | 284/s | 100% |
+| Host jobs | 14.41 s | 208/s | 73% |
+| Shared containers | 18.81 s | 159/s | 56% |
+| Fresh containers (200 tasks) | 23.5 s | 8.5/s | not comparable |
+
+With no work, host jobs reach about a quarter of the raw rate; with 13 ms of
+work per task, about three quarters. Measure representative commands before
+sizing a cluster.
+
+One continuous hour of host jobs ran on an earlier build of the fixes, before
+the arena cap below, with the 100m CPU request of the earlier native-only hour,
+beside the same application. Bun and the application were probed throughout:
+
+- **Jobs:** 14,324,000 unique accepted successes in 3,600 seconds (3,978.9/s),
+  with no terminal failures or accepted retries, and verified cleanup.
+- **Application:** all 3,572 once-a-second probes were answered, with latency
+  median 0.58 ms, p95 1.46 ms and maximum 39.35 ms. Bun and the application
+  kept their original process IDs.
+- **Bun memory:** RSS went from 837.7 MiB to 852.9 MiB over the hour, with a
+  high-water mark of 869.9 MiB, flat rather than growing.
+
+That memory was mostly glibc keeping freed memory in per-thread arenas, not
+live data, and it moved by up to 170 MiB between builds for unrelated reasons.
+Bun now caps glibc at two arenas unless `MALLOC_ARENA_MAX` is set. Five
+minutes of host jobs on a fresh cluster, final build against #654:
+
+| Build | Bun RSS after five minutes | Jobs accepted |
+|---|---:|---:|
+| #654 (`006aca5f`) | 587 MiB | 1.229M–1.271M |
+| Review fixes, final head | 165 MiB | 1.302M |
+
+Benchmarking the fixes found three regressions in them, all fixed before the
+table above was measured:
+- the output drain waited one extra 10 ms poll after quiet commands exited, so
+  host jobs ran at exactly 1,233.3/s and shared containers at 900/s in every
+  round (a gated timing test now guards it);
+- a once-per-command read of `cgroup.events` went through Tokio's blocking pool,
+  which cost about 3% of host-job throughput;
+- the extra blocking-pool threads raised Bun's resident memory through glibc's
+  arenas, which the cap above removes.
+
+Final-head binaries: Bun `aa4d45b9…`, relish `19509900…`. #654: Bun
+`f90e7cd0…`, relish `cad90260…`.
 
 ## Final validation
 

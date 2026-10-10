@@ -579,13 +579,10 @@ fn command(spec: &OciSpec) -> Vec<String> {
     }
 }
 
+/// Recorded in full so the exec gate needs nothing from its own environment,
+/// which it inherits from whichever Bun started the owner.
 fn environment(spec: &OciSpec) -> std::collections::BTreeMap<String, String> {
-    spec.process
-        .env
-        .iter()
-        .filter_map(|value| value.split_once('='))
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
+    super::process::host_environment(&spec.process.env)
 }
 
 fn create_parent_directories(path: &Path) -> io::Result<()> {
@@ -810,6 +807,25 @@ mod tests {
             },
             port_mapping: None,
         }
+    }
+
+    #[tokio::test]
+    async fn owner_records_the_complete_host_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), "/unused".into());
+        let id = InstanceId("env-0".into());
+        let mut spec = spec();
+        spec.process.env = vec!["JOB=1".into()];
+        control.prepare(&id, &spec).await.unwrap();
+        let environment = control.load(&id).unwrap().environment;
+        assert_eq!(environment.get("JOB").map(String::as_str), Some("1"));
+        assert_eq!(environment.get("PATH"), std::env::var("PATH").ok().as_ref());
+        assert!(
+            environment
+                .keys()
+                .all(|key| key == "JOB" || super::super::process::inherited_by_host_commands(key)),
+            "{environment:?}"
+        );
     }
 
     /// A live owner that hangs up on its first clients without answering, the

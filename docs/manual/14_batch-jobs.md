@@ -1,7 +1,7 @@
 # Batch jobs
 
 Development preview for 0.2.0. Build matching development binaries and start a
-fresh cluster: protocol 50 and state 67 change control messages and durable
+fresh cluster: protocol 51 and state 68 change control messages and durable
 state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.
@@ -94,7 +94,12 @@ nodes; each node starts tasks as CPU and memory become available. A chunk of
 completions can raise queued lookahead to sixteen chunks to bridge control-report
 rounds. This changes queued ownership, not running concurrency or per-command
 resource admission. More granted work may require reconciliation or acknowledged
-replay after worker loss; unknown and slow durations retain the small window. Applications and
+replay after worker loss. Lookahead learns from roughly the last 4,096
+completions; arrays without samples, with slow recent work, or with more than
+one in sixteen recent tasks over 16 seconds keep the small window, and so do
+runs without automatic replay of unknown outcomes. Near the end of an array no
+node takes more than its share of the remaining chunks, weighted by how many
+tasks it can run at once and counting the chunks it already holds. Applications and
 batch attempts share the same node resource accounting. Existing app commitments
 remain reserved while an app starts, runs or retires.
 
@@ -234,9 +239,10 @@ On Linux, `bun --runtime mixed` enables both owned backends. `--runtime auto`
 can detect both when runc is available. Explicit `--runtime runc` is
 container-only and refuses host jobs; `--runtime process` is host-only.
 Host commands still need the executable allowlist and
-`mount_isolation = false`. Rootful Linux process jobs use native executors and
-enforce CPU/memory limits before execution. Other platforms retain the original
-owned process backend and refuse explicit limits. Containers and native jobs
+`mount_isolation = false`. On rootful Linux, process batches (`relish run
+--batch`) use native executors and enforce CPU/memory limits before execution.
+Ordinary `[job]` host commands, and every host command on other platforms, use
+the original owned process backend and refuse explicit limits. Containers and native jobs
 keep separate execution capabilities.
 
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
@@ -318,7 +324,14 @@ allowlisted binary (or `/bin/sh` for scripts) and disabled mount isolation.
 Rootful Linux process jobs use bounded native executors and accept explicit
 CPU/memory ranges. Each fresh command is born inside its limited task cgroup;
 helper overhead stays reserved while its executor is idle. Commands retain
-Bun's user and host filesystem access, so use trusted allowlisted workloads.
+Bun's user, privileges and host filesystem access: under a root Bun they run
+as root with every capability, and nothing sets `no_new_privs`. Use trusted
+allowlisted workloads.
+Every host command, on every backend, starts with only `PATH`, `HOME`, `LANG`,
+`LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun's
+environment, then the job's own `env`. Other Bun variables, such as cloud
+credentials, never reach a command. `relish exec` into a host workload gets
+that workload's environment, as `docker exec` would.
 Other platforms retain the original owned process backend and refuse explicit
 resource ranges. This change applies to jobs; host applications keep their
 existing runtime contract. GPU jobs remain refused;
@@ -654,6 +667,13 @@ processes start cold, and one active submission caps total concurrency at 27.
 Fresh receipt chunks contain one job; fast paths use 1,000 jobs. This reporting
 choice makes slow progress visible and amortises fast outcomes, so the rate gap
 also includes receipt granularity. Chunk size never decides how many jobs fit.
+
+An independent rerun on an older M1 Max laptop VM (five interleaved rounds per
+build) measured raw and host-job rates 14–23% lower and the container paths 1.7
+to 3 times higher. With about 13 ms of real CPU work per task, host jobs
+reached about three quarters of the raw-process rate, against about a quarter
+with the no-op command. See the
+[qualification record](../qualification/2026-10-09-timed-job-scenarios/README.md#independent-five-round-rerun).
 
 Daily projections multiply the minute count by 1,440. Raw exits omit admission,
 limits, durable ownership and task ledgers. The measured baseline is a reference

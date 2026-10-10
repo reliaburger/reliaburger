@@ -723,9 +723,9 @@ pub fn generate_job_oci_spec(
 
     OciSpec {
         reusable_executor: false,
-        host_process: spec.exec.is_some() || spec.script.is_some(),
+        host_process: spec.is_host(),
         root: OciRoot {
-            path: if spec.exec.is_some() || spec.script.is_some() {
+            path: if spec.is_host() {
                 "proc-grill:host".to_string()
             } else {
                 spec.image.clone().unwrap_or_else(|| {

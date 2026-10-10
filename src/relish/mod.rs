@@ -90,9 +90,6 @@ impl CommandOutcome {
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RelishError {
-    /// The requested runtime contract cannot be represented by Kubernetes.
-    #[error("Kubernetes export refused: {reason}")]
-    UnsupportedExport { reason: String },
     /// Configuration parse or validation failure.
     #[error("{0}")]
     Config(#[from] ConfigError),
