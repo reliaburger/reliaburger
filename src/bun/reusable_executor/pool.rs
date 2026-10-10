@@ -717,18 +717,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 options: vec!["bind".into(), "ro".into(), "nosuid".into(), "nodev".into()],
             });
         }
-        spec.mounts.push(crate::grill::oci::OciMount {
-            destination: "/dev/shm".into(),
-            source: None,
-            mount_type: Some("tmpfs".into()),
-            options: vec![
-                "nosuid".into(),
-                "nodev".into(),
-                "noexec".into(),
-                "mode=1777".into(),
-                "size=16m".into(),
-            ],
-        });
+        spec.mounts.extend(scratch_mounts());
         self.lifecycle.create(&context.id, &spec).await?;
         self.lifecycle.start(&context.id).await?;
         let (mut connection, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
@@ -1143,6 +1132,31 @@ async fn install_helper(path: PathBuf, bytes: &'static [u8]) -> Result<(), Execu
 /// fixed path keeps sockets within the 108-byte `sun_path` limit.
 const HOST_SOCKET_DIRECTORY: &str = "/run/reliaburger/host-executors";
 
+/// The scratch filesystems a shared executor container declares.
+///
+/// The helper mounts a fresh tmpfs over `/tmp` and `/dev/shm` for every
+/// command, which needs both directories to exist. The root is read-only,
+/// so declaring them here is what makes runc create the mount points in
+/// images that ship without them (`FROM scratch` and static images).
+fn scratch_mounts() -> [crate::grill::oci::OciMount; 2] {
+    let tmpfs = |destination: &str, mut options: Vec<String>| {
+        options.extend(["mode=1777".into(), "size=16m".into()]);
+        crate::grill::oci::OciMount {
+            destination: destination.into(),
+            source: None,
+            mount_type: Some("tmpfs".into()),
+            options,
+        }
+    };
+    [
+        tmpfs("/tmp", vec!["nosuid".into(), "nodev".into()]),
+        tmpfs(
+            "/dev/shm",
+            vec!["nosuid".into(), "nodev".into(), "noexec".into()],
+        ),
+    ]
+}
+
 fn host_socket_directory() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let directory = PathBuf::from(HOST_SOCKET_DIRECTORY);
@@ -1472,6 +1486,25 @@ mod tests {
             cleanup: None,
             #[cfg(feature = "ebpf")]
             namespace: None,
+        }
+    }
+
+    #[test]
+    fn executor_declares_tmp_and_shm_so_images_without_them_still_run() {
+        let mounts = scratch_mounts();
+        for destination in ["/tmp", "/dev/shm"] {
+            let mount = mounts
+                .iter()
+                .find(|mount| mount.destination == Path::new(destination))
+                .unwrap_or_else(|| panic!("{destination} is not declared"));
+            assert_eq!(mount.mount_type.as_deref(), Some("tmpfs"));
+            assert!(mount.source.is_none());
+            for option in ["nosuid", "nodev", "mode=1777", "size=16m"] {
+                assert!(
+                    mount.options.iter().any(|o| o == option),
+                    "{destination}: {option}"
+                );
+            }
         }
     }
 
