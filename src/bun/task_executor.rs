@@ -521,6 +521,11 @@ pub struct PoolCounters {
     pub failed: AtomicU64,
     /// Retries (attempts after the first).
     pub retried: AtomicU64,
+    /// Start lag of pooled commands: from the pool taking the attempt to the
+    /// command starting, in the same power-of-two millisecond buckets as the
+    /// final-attempt durations. Only runners that time their command (the
+    /// reusable executors) contribute.
+    pub start_lag_counts: [AtomicU64; 16],
     /// An ambiguous attempt is waiting for an operator decision.
     pub unknown: std::sync::atomic::AtomicBool,
 }
@@ -730,9 +735,7 @@ fn summarise<'a>(work: &ChunkWork, records: impl Iterator<Item = &'a TaskRecord>
             TaskFinal::NotRun => result.not_run += 1,
         }
         if record.outcome != TaskFinal::NotRun {
-            let bucket =
-                (32 - record.run_ms.max(1).saturating_sub(1).leading_zeros()).min(15) as usize;
-            result.duration_counts[bucket] += 1;
+            result.duration_counts[millisecond_bucket(record.run_ms)] += 1;
         }
         let retried = record.attempts.saturating_sub(1);
         result.retried += u32::from(retried);
@@ -741,6 +744,11 @@ fn summarise<'a>(work: &ChunkWork, records: impl Iterator<Item = &'a TaskRecord>
         result.retry_causes.unrecorded += u64::from(retried).saturating_sub(known);
     }
     result
+}
+
+/// The power-of-two bucket (1, 2, 4, ... 16384 ms, then +Inf) holding `ms`.
+pub fn millisecond_bucket(ms: u32) -> usize {
+    (32 - ms.max(1).saturating_sub(1).leading_zeros()).min(15) as usize
 }
 
 /// Count why a failed attempt is about to be retried.
@@ -835,6 +843,12 @@ impl<R: TaskRunner> TaskAttempts<R> {
             self.counters.running.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
             let result = self.runner.run(&invocation, timeout, &self.cancel).await;
+            if let Some(ran) = result.ran {
+                let lag = started.elapsed().saturating_sub(ran);
+                let lag_ms = u32::try_from(lag.as_millis()).unwrap_or(u32::MAX);
+                self.counters.start_lag_counts[millisecond_bucket(lag_ms)]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             // A pool-run task waits for its slot and admission inside `run`, so
             // prefer the runner's own measurement of the command.
             let ran = result.ran.unwrap_or_else(|| started.elapsed());
@@ -1187,6 +1201,62 @@ mod tests {
             .run_chunk(&work(1, 1, 0), &CancellationToken::new())
             .await;
         assert_eq!(result.records[0].run_ms, 5);
+    }
+
+    #[tokio::test]
+    async fn start_lag_counts_the_wait_before_a_pooled_command_starts() {
+        struct Queued;
+        impl TaskRunner for Queued {
+            fn owns_admission(&self, _: &TaskInvocation) -> bool {
+                true
+            }
+            async fn run(&self, _: &TaskInvocation, _: Duration, _: &CancellationToken) -> Attempt {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 0 },
+                    output: CapturedOutput::default(),
+                    ran: Some(Duration::from_millis(5)),
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(Queued), fast(1));
+        pool.run_chunk(&work(1, 1, 0), &CancellationToken::new())
+            .await;
+        let counts: Vec<u64> = pool
+            .counters()
+            .start_lag_counts
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
+        // About 195 ms of waiting lands in the 129-256 ms bucket.
+        assert_eq!(counts[8], 1, "{counts:?}");
+        assert_eq!(counts.iter().sum::<u64>(), 1);
+
+        // A runner that doesn't time its command contributes nothing.
+        let unmeasured = TaskPool::new(Arc::new(FakeRunner::always_succeeds()), fast(1));
+        unmeasured
+            .run_chunk(&work(4, 4, 0), &CancellationToken::new())
+            .await;
+        assert!(
+            unmeasured
+                .counters()
+                .start_lag_counts
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 0)
+        );
+    }
+
+    #[test]
+    fn millisecond_buckets_match_the_published_bounds() {
+        assert_eq!(millisecond_bucket(0), 0);
+        assert_eq!(millisecond_bucket(1), 0);
+        assert_eq!(millisecond_bucket(2), 1);
+        assert_eq!(millisecond_bucket(3), 2);
+        assert_eq!(millisecond_bucket(256), 8);
+        assert_eq!(millisecond_bucket(257), 9);
+        assert_eq!(millisecond_bucket(16_384), 14);
+        assert_eq!(millisecond_bucket(16_385), 15);
+        assert_eq!(millisecond_bucket(u32::MAX), 15);
     }
 
     #[tokio::test]

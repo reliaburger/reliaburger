@@ -718,6 +718,16 @@ pub async fn manifest_summary(
         "active_commands":active,"other_in_flight_attempts":other,"elapsed_seconds":elapsed,"whole_run_successes_per_second":(elapsed>0).then(||succeeded as f64/elapsed as f64),"activity_semantics":"last_node_sync_verified_start_to_positive_cleanup","cohorts":cohorts,"duration_final_attempt_ms":{"bounds":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null],"counts":durations},"rates":service.rates(batch_id,(succeeded,failed)).await,"details_retention_seconds":crate::meat::task_array_store::TERMINAL_RETENTION_SECS,"execution_semantics":if manifest.common_jobs {"acknowledged_unknown_replay"} else {"at_least_once"} })
 }
 
+/// Bytes of replicated Raft state a run's chunk bookkeeping occupies, as the
+/// JSON the council stores. Serialising costs time, so only a single run's
+/// summary reports it, never the list of every run.
+pub fn state_bytes<'a>(records: impl IntoIterator<Item = &'a TaskArrayRecord>) -> Option<usize> {
+    records.into_iter().try_fold(0usize, |total, record| {
+        let bytes = serde_json::to_vec(&record.state).ok()?.len();
+        total.checked_add(bytes)
+    })
+}
+
 /// `POST /v1/batch/array/sync`: the leader's once-a-second call.
 pub async fn sync_handler(
     State(state): State<ApiState>,
@@ -1494,6 +1504,15 @@ mod tests {
             summary["failed_indices"],
             serde_json::json!([[2, 3], [7, 7]])
         );
+    }
+
+    #[test]
+    fn state_bytes_counts_the_replicated_json_of_every_cohort() {
+        let record = record_with_failures(&[2, 3, 7]);
+        let one = serde_json::to_vec(&record.state).unwrap().len();
+        assert_eq!(state_bytes([&record]), Some(one));
+        assert_eq!(state_bytes([&record, &record]), Some(2 * one));
+        assert_eq!(state_bytes([]), Some(0));
     }
 
     #[test]

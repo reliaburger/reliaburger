@@ -118,6 +118,10 @@ pub struct NodeArrayCounters {
     pub failed: u64,
     /// Retries.
     pub retried: u64,
+    /// Start-lag histogram of pooled commands, in the summary's
+    /// power-of-two millisecond buckets.
+    #[serde(default)]
+    pub start_lag_ms_counts: [u64; 16],
 }
 
 /// A node's answer about one array.
@@ -846,6 +850,9 @@ impl TaskArrayNode {
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
                 failed: counters.failed.load(Ordering::Relaxed),
                 retried: counters.retried.load(Ordering::Relaxed),
+                start_lag_ms_counts: std::array::from_fn(|bucket| {
+                    counters.start_lag_counts[bucket].load(Ordering::Relaxed)
+                }),
             },
         }
     }

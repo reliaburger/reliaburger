@@ -7,7 +7,9 @@
 //! syncs all three nodes over HTTP. Partway through, one follower is
 //! killed while it holds chunks: the leader must take them back after the
 //! silence timeout and the array must still finish with every task
-//! counted exactly once.
+//! counted exactly once. A second test kills the leader itself while it
+//! holds chunks: the new leader's silence clock must take them back and
+//! the array must still count every task exactly once.
 //!
 //! Gated behind `RELIABURGER_CLUSTER_TESTS=1` like the other multi-node
 //! suites. Run via `make test-cluster`, or
@@ -69,6 +71,7 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
 }
 
 async fn start_node(
+    base: u16,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
@@ -76,7 +79,7 @@ async fn start_node(
 ) -> WiredNode {
     start_wired_node(WiredNodeOptions {
         name: format!("ta{index}"),
-        gossip_port: BASE_PORT + (index as u16) * 10,
+        gossip_port: base + (index as u16) * 10,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-task-arrays",
@@ -152,9 +155,18 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_node(0, vec![], &root, data[0].path()).await];
+    let mut nodes = vec![start_node(BASE_PORT, 0, vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(start_node(index, vec![local(BASE_PORT)], &root, directory.path()).await);
+        nodes.push(
+            start_node(
+                BASE_PORT,
+                index,
+                vec![local(BASE_PORT)],
+                &root,
+                directory.path(),
+            )
+            .await,
+        );
     }
     // Killing a node before the voter set settles could leave the others
     // on a joint configuration that still needs it.
@@ -312,6 +324,205 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
         },
     )
     .await;
+    root.cancel();
+}
+
+/// Ports for the leader-loss test, clear of the other tests' blocks.
+const LEADER_LOSS_BASE_PORT: u16 = BASE_PORT + 200;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    let root = CancellationToken::new();
+    let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = vec![start_node(LEADER_LOSS_BASE_PORT, 0, vec![], &root, data[0].path()).await];
+    for (index, directory) in data.iter().enumerate().skip(1) {
+        nodes.push(
+            start_node(
+                LEADER_LOSS_BASE_PORT,
+                index,
+                vec![local(LEADER_LOSS_BASE_PORT)],
+                &root,
+                directory.path(),
+            )
+            .await,
+        );
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&nodes).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    wait_until(
+        "gossip sees everyone",
+        Duration::from_secs(60),
+        async || {
+            for node in &nodes {
+                if node.membership_table.read().await.len() < 3 {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    let mut leader = None;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.council.is_leader().await {
+            leader = Some(index);
+        }
+    }
+    let leader = leader.expect("a leader");
+    let survivors = [(leader + 1) % 3, (leader + 2) % 3];
+    let http = reqwest::Client::new();
+    let answer: Value = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/batch/array",
+            nodes[survivors[0]].api_port
+        ))
+        .json(&json!({
+            "name": "leader-loss",
+            "template": { "runtime":"process","exec": BINARY, "command": ["{index}"] },
+            "spec": { "count": TASKS },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let batch_id = answer["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{answer}"));
+
+    // The leader is a worker too: kill it once it is running its own share.
+    let leader_name = format!("ta{leader}");
+    wait_until(
+        "the leader holds work",
+        Duration::from_secs(60),
+        async || {
+            status(&http, &nodes[leader], batch_id)
+                .await
+                .is_some_and(|summary| {
+                    summary["nodes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|node| {
+                            node["node"] == leader_name.as_str()
+                                && node["counters"]["succeeded"].as_u64().unwrap_or(0) > 0
+                        })
+                })
+        },
+    )
+    .await;
+    nodes[leader].shutdown.cancel();
+
+    // The new leader starts its silence clock at its election, so for the
+    // first few seconds its view still shows what the old leader held.
+    let mut new_leader = None;
+    wait_until("a new leader", Duration::from_secs(30), async || {
+        for index in survivors {
+            if nodes[index].council.is_leader().await {
+                new_leader = Some(index);
+            }
+        }
+        new_leader.is_some()
+    })
+    .await;
+    let new_leader = new_leader.unwrap();
+    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    let held_at_loss = nodes[new_leader]
+        .council
+        .desired_state()
+        .await
+        .task_arrays
+        .get(batch_id)
+        .and_then(|record| record.state.held_by(&lost).cloned())
+        .unwrap_or_default();
+    let raft_before = nodes[new_leader]
+        .metrics_rx
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+
+    let mut last = Value::Null;
+    wait_until(
+        "the array finishes under the new leader",
+        Duration::from_secs(180),
+        async || match status(&http, &nodes[new_leader], batch_id).await {
+            Some(summary) => {
+                let done = summary["done"] == true;
+                last = summary;
+                done
+            }
+            None => false,
+        },
+    )
+    .await;
+    // Nothing lost, nothing counted twice: the dead leader's commands may
+    // have finished, but no report of theirs can be accepted any more.
+    assert_eq!(last["status"], "Succeeded", "{last}");
+    assert_eq!(last["succeeded"], TASKS, "{last}");
+    assert_eq!(last["failed"], 0, "{last}");
+    assert_eq!(last["not_run"], 0, "{last}");
+    assert_eq!(
+        last["retried"],
+        TASKS / 500,
+        "exactly one accepted retry per flaky index: {last}"
+    );
+    assert_eq!(last["retry_causes"]["exit_code"], TASKS / 500, "{last}");
+
+    // Bounded replay: only the chunks the dead leader held run again, each
+    // at a later grant attempt on a survivor.
+    let record = nodes[new_leader]
+        .council
+        .desired_state()
+        .await
+        .task_arrays
+        .get(batch_id)
+        .unwrap()
+        .clone();
+    let chunks = record.state.spec.chunk_count();
+    assert_eq!(record.state.done().len(), u64::from(chunks));
+    let mut replayed = 0u64;
+    for chunk in 0..chunks {
+        let (owner, attempt) = record
+            .state
+            .accepted_grant(reliaburger::meat::task_array::ChunkId(chunk))
+            .expect("every chunk has one accepted grant");
+        assert_ne!(
+            owner, lost,
+            "chunk {chunk} was accepted from the dead leader"
+        );
+        if attempt > 1 {
+            replayed += 1;
+            assert!(
+                held_at_loss.contains(chunk),
+                "chunk {chunk} replayed at attempt {attempt} but the dead leader didn't hold it"
+            );
+        }
+    }
+    assert!(
+        replayed <= held_at_loss.len(),
+        "{replayed} chunks replayed, {} held by the dead leader",
+        held_at_loss.len()
+    );
+    let entries = nodes[new_leader]
+        .metrics_rx
+        .borrow()
+        .last_log_index
+        .unwrap_or(0)
+        - raft_before;
+    eprintln!(
+        "cluster_task_arrays: leader lost mid-run; {} chunks held at loss, {replayed} replayed, {entries} Raft entries afterwards",
+        held_at_loss.len()
+    );
     root.cancel();
 }
 
