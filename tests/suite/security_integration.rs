@@ -473,3 +473,88 @@ async fn incompatible_member_never_receives_the_join_token() {
         let _ = server.await;
     }
 }
+
+/// A dashboard session made from the service token is read-only. It used
+/// to carry the service principal's name, which was all the node-to-node
+/// gate checked, so a stolen cookie could run arbitrary jobs on a node.
+#[tokio::test]
+async fn service_token_cookie_cannot_run_a_batch_on_a_node() {
+    use tower::ServiceExt;
+
+    let service_token = format!("rbrg_{}", "5".repeat(64));
+    let user = reliaburger::sesame::token::create_token(
+        "operator",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let store = reliaburger::sesame::auth::new_token_store();
+    store.write().await.push(user.token);
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+    let app = reliaburger::bun::api::router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(store),
+        Some(service_token.clone()),
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+
+    // Log in to the dashboard with the service token, as a browser would.
+    let login = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/ui/session")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(axum::body::Body::from(format!("token={service_token}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .expect("the service token opens a dashboard session")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let run = serde_json::json!({
+        "batch_id": 1,
+        "callback_base_url": null,
+        "jobs": [{
+            "name": "stolen",
+            "namespace": "default",
+            "spec": { "image": "busybox", "command": ["true"] },
+        }],
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/batch/run")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(run.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // 403, not 401: the cookie is a live session, just not a cluster node.
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "the node's agent received work from a read-only session"
+    );
+}

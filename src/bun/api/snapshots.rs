@@ -249,6 +249,18 @@ pub(super) async fn snapshot_create_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    // Under a `[permission]` block, changing an app's volumes is a deploy.
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let Json(body) = body.unwrap_or_default();
     let request = ForwardedSnapshot {
         namespace: &namespace,
@@ -331,6 +343,18 @@ pub(super) async fn snapshot_restore_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    // Under a `[permission]` block, changing an app's volumes is a deploy.
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let request = ForwardedSnapshot {
         namespace: &namespace,
         app: &app,
@@ -374,6 +398,18 @@ pub(super) async fn snapshot_delete_handler(
         return resp;
     }
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    // Under a `[permission]` block, changing an app's volumes is a deploy.
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
     let request = ForwardedSnapshot {

@@ -82,6 +82,7 @@ impl TestScenario {
                 host: "web.example.test".into(),
                 path: "/".into(),
                 app_name: "web".into(),
+                namespace: "default".into(),
                 healthy_backends: if matches!(self, Self::DegradedApp) {
                     1
                 } else {

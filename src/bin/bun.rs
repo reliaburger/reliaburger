@@ -3244,13 +3244,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let pickle_acceptor = match (&api_identity, registry_over_tls) {
         (Some(identity), true) => {
             let crl = crl_refresh.clone().unwrap_or_default();
-            match reliaburger::sesame::mtls::build_live_api_server_config(identity, crl) {
-                Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
-                Err(e) => {
-                    eprintln!("bun: failed to build registry TLS config, serving plaintext: {e}");
-                    None
-                }
-            }
+            // Fail closed, as the API does: a registry that silently fell
+            // back to plaintext would carry tokens and images in the clear.
+            let cfg = reliaburger::sesame::mtls::build_live_api_server_config(identity, crl)
+                .map_err(|e| anyhow::anyhow!("failed to build registry TLS config: {e}"))?;
+            Some(tokio_rustls::TlsAcceptor::from(cfg))
         }
         _ => None,
     };

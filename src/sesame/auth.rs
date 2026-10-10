@@ -490,7 +490,7 @@ pub async fn auth_middleware(
 /// The originating token's **scope** is preserved (C3): a token confined to one
 /// app/namespace stays confined when it rides a session cookie, so exchanging
 /// it at `/ui/session` cannot widen it to cluster-wide reads.
-fn readonly_session_context(identity: &super::session::SessionIdentity) -> AuthContext {
+pub(crate) fn readonly_session_context(identity: &super::session::SessionIdentity) -> AuthContext {
     AuthContext {
         token_name: identity.token_name.clone(),
         principal_id: format!("session:{}", identity.token_name),
@@ -762,17 +762,28 @@ pub fn require_unscoped(ctx: Option<&AuthContext>) -> Result<(), Response> {
 /// pass through on `None`: a request that arrives with no authenticated
 /// context (including the bootstrap window) is refused, because these routes
 /// are never part of first-run setup — they exist only once a cluster, and its
-/// service token, exist.
+/// service token, exist. A dashboard session made from the service token is
+/// refused as well (see [`is_system_principal`]): it is read-only.
 #[allow(clippy::result_large_err)]
 pub fn require_system(ctx: Option<&AuthContext>) -> Result<(), Response> {
     match ctx {
-        Some(ctx) if ctx.token_name == SYSTEM_PRINCIPAL => Ok(()),
+        Some(ctx) if is_system_principal(ctx) => Ok(()),
         _ => Err((
             StatusCode::FORBIDDEN,
             "internal endpoint: cluster node identity required",
         )
             .into_response()),
     }
+}
+
+/// Whether `ctx` is the internal system principal itself: a caller that
+/// presented the service token as a bearer.
+///
+/// Both fields must match. A browser session made from the service token
+/// keeps its *name* (`token_name == SYSTEM_PRINCIPAL`) but has a `session:`
+/// principal id and a read-only role, so it never counts as a cluster node.
+pub fn is_system_principal(ctx: &AuthContext) -> bool {
+    ctx.token_name == SYSTEM_PRINCIPAL && ctx.principal_id == SYSTEM_PRINCIPAL
 }
 
 /// Build a GET request builder, attaching a `Bearer` token when present.
@@ -1103,6 +1114,24 @@ mod tests {
         // The bootstrap window (no context) is refused too — internal
         // endpoints are never part of first-run setup.
         assert!(require_system(None).is_err());
+    }
+
+    /// The dashboard accepts the service token at `/ui/session`, and the
+    /// session it makes carries the service principal's *name*. That cookie is
+    /// read-only, so it must never pass a node-to-node gate: `require_system`
+    /// once checked only the name, and a stolen cookie could run jobs.
+    #[test]
+    fn require_system_refuses_a_session_made_from_the_service_token() {
+        let identity = super::super::session::SessionIdentity {
+            token_name: SYSTEM_PRINCIPAL.to_string(),
+            principal_id: SYSTEM_PRINCIPAL.to_string(),
+            scope: TokenScope::default(),
+        };
+        let session = readonly_session_context(&identity);
+        assert_eq!(session.token_name, SYSTEM_PRINCIPAL);
+        assert!(require_system(Some(&session)).is_err());
+        assert!(is_system_principal(&system_context()));
+        assert!(!is_system_principal(&session));
     }
 
     #[tokio::test]

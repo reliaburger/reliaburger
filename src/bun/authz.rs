@@ -22,9 +22,14 @@
 //! There is a third question, too: what must the caller's `[permission]`
 //! spec grant? Role and scope say who may read logs at all; a spec can narrow
 //! a principal further, to named actions on named apps (B18). Every route that
-//! reads logs or metrics, changes secrets, or performs administration records
+//! reads logs or metrics, changes secrets, snapshots or builds an app, injects
+//! or clears a fault, takes a test lease, or performs administration records
 //! the action it needs in [`Route::permission`], and the tests below prove
 //! each such handler checks it.
+//!
+//! The principal column is tested from the outside too:
+//! `api::permission_tests::every_route_refuses_callers_below_its_principal`
+//! sends every row a request as each caller ranked below it.
 
 /// The principal class a route requires.
 ///
@@ -121,6 +126,7 @@ use RoutePrincipal::{Admin, AnyToken, Deployer, Public, System};
 const ADMIN: PermissionAction = PermissionAction::Admin;
 const DEPLOY: PermissionAction = PermissionAction::Deploy;
 const EXEC: PermissionAction = PermissionAction::Exec;
+const FAULT: PermissionAction = PermissionAction::Fault;
 const LOGS: PermissionAction = PermissionAction::Logs;
 const METRICS: PermissionAction = PermissionAction::Metrics;
 const SCALE: PermissionAction = PermissionAction::Scale;
@@ -207,10 +213,12 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/diagnostics", AnyToken),
     route(Get, "/v1/diagnostics/apps", AnyToken),
     route(Post, "/v1/path", AnyToken),
-    route(Post, "/v1/test/leases", Deployer),
+    // A lease provisions isolated test namespaces or node jobs for the whole
+    // cluster, so under a `[permission]` block it needs `admin` everywhere.
+    gated(Post, "/v1/test/leases", Deployer, Cluster(ADMIN)),
     route(Get, "/v1/test/leases/{id}", AnyToken),
-    route(Post, "/v1/test/leases/{id}/renew", Deployer),
-    route(Delete, "/v1/test/leases/{id}", Deployer),
+    gated(Post, "/v1/test/leases/{id}/renew", Deployer, Cluster(ADMIN)),
+    gated(Delete, "/v1/test/leases/{id}", Deployer, Cluster(ADMIN)),
     route(Get, "/v1/cluster/nodes", AnyToken),
     // The relay only authenticates; the target node applies the forwarded
     // route's own requirement to the caller's credential.
@@ -233,19 +241,39 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/chaos/fence", System),
     route(Get, "/v1/chaos/status", AnyToken),
     // Snapshots. Reads need any token, mutations a Deployer; both are
-    // additionally held to the token's app/namespace scope in the handlers.
+    // additionally held to the token's app/namespace scope in the handlers,
+    // and a mutation needs `deploy` on the app under a `[permission]` block.
     route(Get, "/v1/snapshots/{namespace}/{app}", AnyToken),
-    route(Post, "/v1/snapshots/{namespace}/{app}", Deployer),
-    route(Post, "/v1/snapshots/{namespace}/{app}/restore", Deployer),
-    route(Delete, "/v1/snapshots/{namespace}/{app}/{name}", Deployer),
-    // Fault injection.
-    route(Post, "/v1/fault", Deployer),
-    route(Delete, "/v1/fault", Deployer),
+    gated(
+        Post,
+        "/v1/snapshots/{namespace}/{app}",
+        Deployer,
+        App(DEPLOY),
+    ),
+    gated(
+        Post,
+        "/v1/snapshots/{namespace}/{app}/restore",
+        Deployer,
+        App(DEPLOY),
+    ),
+    gated(
+        Delete,
+        "/v1/snapshots/{namespace}/{app}/{name}",
+        Deployer,
+        App(DEPLOY),
+    ),
+    // Fault injection. The body (or the query, or the fault an id names)
+    // says which service a fault targets; a node fault names none, so it
+    // needs `fault` across the whole cluster. The list is scope-filtered.
+    gated(Post, "/v1/fault", Deployer, Body(FAULT)),
+    gated(Delete, "/v1/fault", Deployer, Body(FAULT)),
     route(Get, "/v1/fault", AnyToken),
-    route(Delete, "/v1/fault/{id}", Deployer),
+    gated(Delete, "/v1/fault/{id}", Deployer, Body(FAULT)),
     // Discovery + routing.
     route(Post, "/v1/discovery/retire", System),
     route(Post, "/v1/discovery/withdrawn", System),
+    // Discovery reads are scope-filtered: a scoped token (a workload's JWT
+    // too) sees only the services and routes of its own apps.
     route(Get, "/v1/resolve", AnyToken),
     route(Get, "/v1/resolve/{name}", AnyToken),
     route(Get, "/v1/routes", AnyToken),
@@ -286,7 +314,9 @@ pub const ROUTE_MATRIX: &[Route] = &[
         Deployer,
         App(DEPLOY),
     ),
-    route(Get, "/v1/placements/{node_id}", AnyToken),
+    // Reconcilers poll their placements with the service token. A cluster
+    // with no credentials at all (development) also answers without one.
+    route(Get, "/v1/placements/{node_id}", System),
     route(Post, "/v1/test/leases/retired", System),
     gated(Post, "/v1/nodes/decommission", Admin, Cluster(ADMIN)),
     route(Get, "/v1/images", AnyToken),
@@ -306,13 +336,17 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/batch/{id}/cancel", Deployer),
     route(Get, "/v1/batch/{id}/results", AnyToken),
     route(Get, "/v1/batch/{id}/tasks/{index}/logs", AnyToken),
-    route(Post, "/v1/build", Deployer),
+    // The destination repository names the app and namespace that need
+    // `deploy`.
+    gated(Post, "/v1/build", Deployer, Body(DEPLOY)),
     route(Post, "/v1/build/run", System),
     route(Post, "/v1/build/track", System),
     route(Post, "/v1/build/sign", System),
+    // Scope-checked against the build's destination repository.
     route(Get, "/v1/build/{id}", AnyToken),
-    // GitOps + identity + tokens + secrets.
-    route(Post, "/v1/gitops/webhook", AnyToken),
+    // GitOps + identity + tokens + secrets. The webhook is mounted public:
+    // providers sign the body, they never carry a bearer token.
+    route(Post, "/v1/gitops/webhook", Public),
     // Operator-only (Admin). The service principal is refused here (AUTH4),
     // so despite being a signing route it isn't a node-to-node one.
     gated(Post, "/v1/identity/sign", Admin, Cluster(ADMIN)),
@@ -396,6 +430,49 @@ mod tests {
                 "{path} must be a node-to-node route"
             );
         }
+    }
+
+    /// Every `System` row's handler must call `require_system`, or the
+    /// row is only a label. The router test in `api::permission_tests`
+    /// drives most of them with real requests; this covers the ones whose
+    /// internal message type it doesn't build.
+    #[test]
+    fn every_system_route_requires_the_system_principal() {
+        let sources = [
+            include_str!("api.rs"),
+            include_str!("batch.rs"),
+            include_str!("build_runner.rs"),
+        ];
+        let mut unchecked = Vec::new();
+        let mut checked = 0;
+        for row in ROUTE_MATRIX
+            .iter()
+            .filter(|row| row.principal == RoutePrincipal::System)
+        {
+            for source in sources {
+                for (path, handlers) in mounted_route_method_handlers(source) {
+                    if path != row.path {
+                        continue;
+                    }
+                    for (method, handler) in handlers {
+                        if method != row.method {
+                            continue;
+                        }
+                        let body = mounted_handler_body(source, &handler)
+                            .unwrap_or_else(|| panic!("{path} dispatches to missing {handler}"));
+                        checked += 1;
+                        if !body.contains("require_system") {
+                            unchecked.push(format!("{path} → {handler}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 15, "only found {checked} System handlers");
+        assert!(
+            unchecked.is_empty(),
+            "System routes whose handler never calls require_system: {unchecked:?}"
+        );
     }
 
     #[test]
@@ -490,6 +567,20 @@ mod tests {
     /// to, by reading the `get(...)`/`post(...)`/`delete(...)` calls in the
     /// same `.route(...)` fragment.
     fn mounted_route_handlers(source: &str) -> Vec<(String, Vec<String>)> {
+        mounted_route_method_handlers(source)
+            .into_iter()
+            .map(|(path, handlers)| {
+                (
+                    path,
+                    handlers.into_iter().map(|(_, handler)| handler).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Like [`mounted_route_handlers`], with the method each handler is
+    /// mounted under, so a `GET` and a `POST` on one path stay apart.
+    fn mounted_route_method_handlers(source: &str) -> Vec<(String, Vec<(Method, String)>)> {
         let mut routes = Vec::new();
         for fragment in source.split(".route(").skip(1) {
             let Some(open) = fragment.find('"') else {
@@ -506,14 +597,18 @@ mod tests {
             // the same fragment isn't mistaken for a route handler.
             let args = &rest[close..];
             let mut handlers = Vec::new();
-            for pattern in ["get(", "post(", "delete("] {
+            for (pattern, method) in [
+                ("get(", Method::Get),
+                ("post(", Method::Post),
+                ("delete(", Method::Delete),
+            ] {
                 for (index, _) in args.match_indices(pattern) {
                     let ident: String = args[index + pattern.len()..]
                         .chars()
                         .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
                         .collect();
                     if ident.ends_with("_handler") {
-                        handlers.push(ident);
+                        handlers.push((method, ident));
                     }
                 }
             }
@@ -564,6 +659,15 @@ mod tests {
         let ident = ident.strip_prefix("super::").unwrap_or(ident);
         if let Some(ident) = ident.strip_prefix("job_api::") {
             return handler_body(include_str!("job_api.rs"), ident);
+        }
+        if let Some(ident) = ident.strip_prefix("build_runner::") {
+            return handler_body(include_str!("build_runner.rs"), ident);
+        }
+        if let Some(ident) = ident.strip_prefix("batch::") {
+            return handler_body(include_str!("batch.rs"), ident);
+        }
+        if let Some(ident) = ident.strip_prefix("task_array_api::") {
+            return handler_body(include_str!("task_array_api.rs"), ident);
         }
         std::iter::once(source)
             .chain(API_ROUTE_MODULES.iter().copied())
@@ -856,11 +960,12 @@ mod tests {
             let handlers: Vec<(&str, String)> = sources
                 .iter()
                 .flat_map(|source| {
-                    mounted_route_handlers(source)
+                    mounted_route_method_handlers(source)
                         .into_iter()
                         .filter(|(path, _)| path == row.path)
                         .flat_map(|(_, handlers)| handlers)
-                        .map(move |handler| (*source, handler))
+                        .filter(|(method, _)| *method == row.method)
+                        .map(move |(_, handler)| (*source, handler))
                 })
                 .collect();
             assert!(!handlers.is_empty(), "no handler found for {}", row.path);

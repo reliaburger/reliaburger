@@ -141,6 +141,7 @@ const KNOWN_PERMISSION_ACTIONS: &[&str] = &[
     "metrics",
     "exec",
     "host-exec",
+    "fault",
     "admin",
     "secret-read",
     "secret-write",
@@ -1725,6 +1726,19 @@ exec = "/usr/bin/python3""#,
             matches!(err, ConfigError::Validation { ref field, .. } if field == "actions"),
             "unknown permission action must be rejected: {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_permission_accepts_the_fault_action() {
+        let config = Config::parse(
+            r#"
+            [permission.chaos]
+            actions = ["fault"]
+            apps = ["web"]
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
     }
 
     #[test]

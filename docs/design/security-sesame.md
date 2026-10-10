@@ -905,7 +905,15 @@ registry applies the same scope to repositories: a scoped token may push and
 namespace and app it covers, over Bearer and Basic alike; bare names such as
 `api` are refused to it, and `/v1/build` destinations meet the same rule. The
 internal service token and unscoped tokens are unaffected. See
-`registry-pickle.md` §1.2 for the exact rule.
+`registry-pickle.md` §1.2 for the exact rule. The discovery and chaos reads
+filter to the scope as well: `/v1/resolve` and `/v1/resolve/{name}` list only
+in-scope services, `/v1/routes` only in-scope ingress routes (`RouteInfo`
+carries the route's namespace), `GET /v1/fault` only workload faults on
+in-scope apps (`FaultSummary` carries the fault's namespace), and
+`GET /v1/build/{id}` answers only for a build whose destination repository
+(`BuildRecord::repository`) is in scope. `GET /v1/fault?cluster=true` refuses a
+scoped caller, since node faults belong to no tenant. A workload's JWT is a
+scoped read-only token, so these are the rules a compromised container meets.
 
 **Permission specs (shipped):** A `[permission.<token-name>]` block
 (`config::PermissionSpec`, replicated as `DesiredState.permissions`) is an
@@ -918,9 +926,9 @@ session carries its token's name, so it rides the same spec. The route matrix in
 
 | Gate | Check | Routes |
 |------|-------|--------|
-| `App(action)` | `authorize_permission` on the path's app and namespace | logs (SSE, entries, cross-node query, WebSocket) → `logs`; app metrics and charts → `metrics`; delete, rollback → `deploy`; stop → `scale`; exec → `exec` |
-| `Body(action)` | the same, per app the body names | apply (`deploy`, plus `host-exec` for host commands), deploy cancel (`deploy`) |
-| `Cluster(action)` | `authorize_cluster_permission`: the action with `apps = ["*"]` and no `namespaces` | `/v1/logs/sql` → `logs`; `/v1/metrics*` store, rollups and cluster queries, `/v1/alerts`, the alerts fragment → `metrics`; secret rotation → `secret-write`; tokens, join tokens, upgrades, elections, decommission, image signing, log export, `[permission]`/`[namespace]` declarations and test-lease overrides → `admin` |
+| `App(action)` | `authorize_permission` on the path's app and namespace | logs (SSE, entries, cross-node query, WebSocket) → `logs`; app metrics and charts → `metrics`; delete, rollback, snapshot create, restore and delete → `deploy`; stop → `scale`; exec → `exec` |
+| `Body(action)` | the same, per app the body names | apply (`deploy`, plus `host-exec` for host commands), deploy cancel (`deploy`); `/v1/build` → `deploy` on the destination repository's app, or cluster-wide for a destination with no namespace; fault inject and clear → `fault` on the target service, cluster-wide for a node fault or a clear that spans tenants, judged against the stored fault for a clear by id |
+| `Cluster(action)` | `authorize_cluster_permission`: the action with `apps = ["*"]` and no `namespaces` | `/v1/logs/sql` → `logs`; `/v1/metrics*` store, rollups and cluster queries, `/v1/alerts`, the alerts fragment → `metrics`; secret rotation → `secret-write`; tokens, join tokens, upgrades, elections, decommission, image signing, log export, `[permission]`/`[namespace]` declarations and test leases (create, renew, release) → `admin` |
 | `Filtered(action)` | the route answers without the parts the spec doesn't grant | `/v1/top` rows → `metrics` per app; dashboard alert panel → cluster `metrics`; app page charts → `metrics` on that app |
 
 `admin` is a super-grant covering every other action. `secret-read` gates no
@@ -930,7 +938,30 @@ keep the matrix honest: `every_gated_route_checks_its_permission_action`
 statically finds each gated handler's check, and the table test in
 `src/bun/api/permission_tests.rs` drives a real request per gated route and per
 principal (every role, grant shape, session, scope, system and bootstrap),
-asserting 403 exactly where the spec doesn't grant the action.
+asserting 403 exactly where the spec doesn't grant the action. Snapshots,
+builds, faults and test leases joined the gated set in 0.2.0 (decision D5 in
+[#674](https://github.com/reliaburger/reliaburger/issues/674)), with the new
+`fault` action.
+
+**The principal column (0.2.0):** each matrix row also names the least
+principal it admits (`Public`, `AnyToken`, `Deployer`, `Admin`, `System`).
+`every_route_refuses_callers_below_its_principal` drives every row as seven
+callers (a read-only token, a user session, a service-token session, a scoped
+Deployer, a Deployer, an Admin and the system principal) and requires a 401 or
+403 from every caller ranked below the row, plus entry for a read-only token
+on every `AnyToken` row; a second router with a real token store checks that
+only `Public` rows answer a request with no credentials. Node-to-node routes
+whose JSON message the probe doesn't build are listed exactly and covered by
+`every_system_route_requires_the_system_principal`, a source check that their
+handlers call `require_system`.
+
+**Sessions and the system principal:** a dashboard session is always
+read-only. One opened with the service token keeps the token name `__system`
+but has the principal id `session:__system`, and
+`sesame::auth::is_system_principal` requires both the name and the id to be
+`__system`. `require_system` uses it, so a session never passes a node-to-node
+route, whatever token it came from. The session cookie is `HttpOnly`,
+`SameSite=Strict` and, when the API serves TLS, `Secure`.
 
 **Bootstrap boundary (shipped):** An empty user-token store leaves protected
 API routes open long enough to create the first cluster token. Bun contains

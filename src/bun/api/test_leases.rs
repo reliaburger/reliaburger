@@ -78,6 +78,13 @@ pub(super) async fn test_lease_create_handler(
             Ok(auth) => auth,
             Err(response) => return response,
         };
+    // A lease provisions cluster resources for tests, so under a
+    // `[permission]` block it needs `admin` across the cluster (D5).
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
+        return response;
+    }
     if let Err(response) = test_operation_authorisation(&state, auth) {
         return response;
     }
@@ -284,6 +291,13 @@ pub(super) async fn test_lease_renew_handler(
             Ok(auth) => auth,
             Err(response) => return response,
         };
+    // A lease provisions cluster resources for tests, so under a
+    // `[permission]` block it needs `admin` across the cluster (D5).
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
+        return response;
+    }
     if let Err(response) = test_operation_authorisation(&state, auth) {
         return response;
     }
@@ -357,6 +371,13 @@ pub(super) async fn test_lease_release_handler(
             Ok(auth) => auth,
             Err(response) => return response,
         };
+    // A lease provisions cluster resources for tests, so under a
+    // `[permission]` block it needs `admin` across the cluster (D5).
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
+        return response;
+    }
     if let Some(council) = &state.council
         && !is_node_job_lease(&lease_id)
         && !council.is_leader().await

@@ -92,6 +92,13 @@ pub(super) const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// The per-node reads `relish wtf`, `relish inspect`, `relish path` and
 /// `relish test` make, and nothing else. The relay is a reachability aid, not a general proxy.
 pub(super) fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
+    // The relay builds a URL from `path`, and a URL normalises `.` and `..`
+    // segments away: `v1/exec/../apply` would leave as `POST /v1/apply`. So
+    // a path with a dot segment, even a percent-encoded one, is refused
+    // before any allowlist match.
+    if path.split('/').any(is_dot_segment) {
+        return false;
+    }
     const READS: &[&str] = &[
         "v1/health",
         "v1/status",
@@ -114,6 +121,13 @@ pub(super) fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         axum::http::Method::POST => path == "v1/path" || is_exec_path(path),
         _ => false,
     }
+}
+
+/// Whether a path segment is one a URL resolves away: `.` or `..`, written
+/// plainly or percent-encoded (`%2e`, `%2E`).
+fn is_dot_segment(segment: &str) -> bool {
+    let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+    decoded == "." || decoded == ".."
 }
 
 /// `v1/deploys/history/{app}` and nothing longer (the namespace is a query).
@@ -239,5 +253,30 @@ pub(super) async fn council_handler(State(state): State<ApiState>) -> Response {
     match ask_agent(&state.cmd_tx, |response| AgentCommand::Council { response }).await {
         Ok(council) => Json(serde_json::json!(council)).into_response(),
         Err(response) => response,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_refuses_dot_segments() {
+        let post = axum::http::Method::POST;
+        let get = axum::http::Method::GET;
+        assert!(relay_allows(&post, "v1/exec/web/default"));
+        assert!(relay_allows(&get, "v1/deploys/history/web"));
+        for path in [
+            "v1/exec/../apply",
+            "v1/exec/web/..",
+            "v1/exec/./default",
+            "v1/exec/%2e%2e/apply",
+            "v1/exec/%2E./apply",
+        ] {
+            assert!(!relay_allows(&post, path), "relayed POST /{path}");
+        }
+        for path in ["v1/deploys/history/..", "v1/deploys/history/%2e%2e"] {
+            assert!(!relay_allows(&get, path), "relayed GET /{path}");
+        }
     }
 }

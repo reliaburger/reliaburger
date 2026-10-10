@@ -1145,6 +1145,17 @@ pub async fn batch_status_handler(
 
     match get_batch(&state, batch_id).await {
         Some(record) => {
+            // A scoped caller may read a batch only if every job in it is
+            // within its scope, as for task arrays below.
+            for job in &record.jobs {
+                if let Err(response) = crate::sesame::auth::authorize_scoped(
+                    auth.as_deref(),
+                    &job.name,
+                    &job.namespace,
+                ) {
+                    return response;
+                }
+            }
             if !record.is_terminal() {
                 spawn_batch_watcher(&state, batch_id);
             }

@@ -85,6 +85,7 @@ fn summary_of(id: u64, request: &FaultRequest) -> FaultSummary {
         id,
         fault_type: request.fault_type.to_string(),
         target_service: request.target_service.clone(),
+        namespace: request.namespace.clone(),
         target_instance: request.target_instance.clone(),
         target_node: request.target_node.clone(),
         remaining_secs: 60,

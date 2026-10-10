@@ -284,6 +284,7 @@ impl RoutingTable {
                     host: host.clone(),
                     path: route.path_prefix.clone(),
                     app_name: route.app_name.clone(),
+                    namespace: route.namespace.clone(),
                     healthy_backends: route.healthy_count(),
                     total_backends: route.backends.len(),
                     websocket: route.websocket,
