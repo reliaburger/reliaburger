@@ -824,9 +824,9 @@ impl TaskArrayNode {
                         u32::MAX
                     });
                 // A pool-run caller counts as running while it still waits
-                // for a slot or admission; only a checked-out slot is in use.
-                // Started commands alone would miss millisecond commands
-                // that begin and end between samples.
+                // for a slot or admission; only a slot with resources charged
+                // is in use. Started commands alone would miss millisecond
+                // commands that begin and end between samples.
                 let busy = match (reusable, busy_slots) {
                     (Some(_), Some(held)) => held,
                     _ => counters.running.load(Ordering::Relaxed),

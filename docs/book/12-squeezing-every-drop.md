@@ -1118,7 +1118,9 @@ async fn slot(
         if let Some(index) = selected {
             // ... charge the budget for an empty slot before any image I/O
             slots[index].busy = true;
-            slots[index].holder = holder;
+            if lease.is_some() || slots[index].context.is_some() {
+                slots[index].holder = holder;
+            }
             slots[index].key = Some(key);
             return Some((index, slots[index].context.take(), lease));
         }
@@ -1130,9 +1132,18 @@ async fn slot(
 
 The function prefers a free slot whose container already has our key. Failing
 that, it takes any free slot, which may hold an incompatible container to
-retire. If nothing's free, it waits for a change and tries again. `holder`
-records which run checked the slot out; we'll need it when nodes report their
-capacity.
+retire. If nothing's free, it waits for a change and tries again.
+
+`holder` records which run has the slot, but only once there are resources
+behind it: a reservation charged right here, or a container that already holds
+one. A node reports its busy slots plus the ones that still fit as its
+capacity. So a caller that got a slot but is still queued for resources must
+not count. If it did, the node would advertise a slot it can't run anything on,
+and the leader would send work there instead of to a free peer. Such a caller
+becomes the holder only when `admit` charges its reservation. A caller that
+retires another profile's container drops back out until its own reservation
+is charged. Our first version recorded every caller at checkout, and #654's
+author found the phantom slot in review.
 
 A few Rust details carry weight. `bool::then` turns `true` into `Some(value)`
 and `false` into `None`, and `.flatten()` collapses the resulting

@@ -57,8 +57,9 @@ pub(crate) struct CommandReporting<'a> {
 
 struct Slot {
     busy: bool,
-    /// The run whose caller has this slot checked out, from checkout to
-    /// release, including setup and cleanup.
+    /// The run whose caller has this slot checked out with resources behind
+    /// it (a charged executor, or an admitted reservation), until release.
+    /// A caller still waiting for admission holds nothing, so isn't counted.
     holder: Option<u64>,
     active_run: Option<u64>,
     key: Option<ExecutorKey>,
@@ -230,7 +231,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         slots[index].active_run = None;
         self.changed.notify_waiters();
     }
-    /// Slots this run's callers have checked out. Unlike
+    /// Slots this run's callers hold with resources charged. Unlike
     /// [`Self::active_commands`], it doesn't miss commands that start and exit
     /// between samples, and unlike the executor's own running count, it leaves
     /// out callers still waiting for a slot or for admission.
@@ -323,13 +324,40 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     None
                 };
                 slots[index].busy = true;
-                slots[index].holder = holder;
+                if lease.is_some() || slots[index].context.is_some() {
+                    slots[index].holder = holder;
+                }
                 slots[index].key = Some(key);
                 return Some((index, slots[index].context.take(), lease));
             }
             drop(slots);
             tokio::select! { biased; () = cancel.cancelled() => return None, () = changed => {} }
         }
+    }
+    /// Retire the incompatible executor a caller found in its slot, or
+    /// quarantine it. Its reservation goes with it, so the slot stops counting
+    /// towards [`Self::busy_slots`] until the caller's own is admitted.
+    async fn retire_previous(&self, index: usize, mut old: Context) -> bool {
+        if !self.retire(&mut old, RETIREMENT_DEADLINE).await {
+            self.quarantine(index, old, RETIREMENT_DEADLINE).await;
+            return false;
+        }
+        self.slots.lock().await[index].holder = None;
+        true
+    }
+    /// Wait for the reservation of a slot checked out without one. The slot
+    /// counts towards [`Self::busy_slots`] only from here: until admission
+    /// its caller holds nothing a command could run on.
+    async fn admit(
+        &self,
+        index: usize,
+        holder: Option<u64>,
+        reservation: crate::meat::Resources,
+        cancel: &CancellationToken,
+    ) -> Option<ResourceLease> {
+        let lease = self.budget.acquire(reservation, cancel).await?;
+        self.slots.lock().await[index].holder = holder;
+        Some(lease)
     }
     /// One retirement attempt: true once the helper has stopped and its task
     /// group is empty. Cancel-safe: an unfinished probe stays in the context.
@@ -759,9 +787,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             };
         };
         let mut context = match existing {
-            Some(mut old) if old.key != key || self.budget.has_waiters() => {
-                if !self.retire(&mut old, RETIREMENT_DEADLINE).await {
-                    self.quarantine(index, old, RETIREMENT_DEADLINE).await;
+            Some(old) if old.key != key || self.budget.has_waiters() => {
+                if !self.retire_previous(index, old).await {
                     return failed(ExecutorError::Configuration(
                         "the slot's previous executor has not retired",
                     ));
@@ -777,7 +804,15 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         if context.is_none() {
             let lease = match reservation {
                 Some(lease) => Some(lease),
-                None => self.budget.acquire(profile.reservation, cancel).await,
+                None => {
+                    self.admit(
+                        index,
+                        task.run.as_ref().map(|run| run.batch_id),
+                        profile.reservation,
+                        cancel,
+                    )
+                    .await
+                }
             };
             let Some(lease) = lease else {
                 self.release(index, None).await;
@@ -1480,5 +1515,105 @@ mod tests {
         assert!(!slots[1].busy, "the retired executor's slot stayed busy");
         drop(slots);
         process.kill(&id).await.unwrap();
+    }
+
+    fn key(byte: u8) -> ExecutorKey {
+        ExecutorKey([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn a_slot_waiting_for_admission_counts_as_busy_only_once_admitted() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let app = budget.try_acquire(budget.capacity()).unwrap();
+        let cancel = CancellationToken::new();
+        let (index, existing, lease) = pool
+            .slot(key(1), reservation(), Some(7), &cancel)
+            .await
+            .unwrap();
+        assert!(existing.is_none() && lease.is_none());
+        assert_eq!(pool.busy_slots(7).await, 0, "counted before admission");
+        let admitted = tokio::spawn({
+            let pool = pool.clone();
+            let cancel = cancel.clone();
+            async move { pool.admit(index, Some(7), reservation(), &cancel).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.busy_slots(7).await, 0, "counted while queued");
+        drop(app);
+        let lease = tokio::time::timeout(Duration::from_secs(5), admitted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lease.is_some());
+        assert_eq!(pool.busy_slots(7).await, 1);
+        pool.release(index, None).await;
+        assert_eq!(pool.busy_slots(7).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_admission_never_counts_as_busy() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let _app = budget.try_acquire(budget.capacity()).unwrap();
+        let cancel = CancellationToken::new();
+        let (index, _, _) = pool
+            .slot(key(1), reservation(), Some(7), &cancel)
+            .await
+            .unwrap();
+        cancel.cancel();
+        assert!(
+            pool.admit(index, Some(7), reservation(), &cancel)
+                .await
+                .is_none()
+        );
+        assert_eq!(pool.busy_slots(7).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_slot_admitted_at_checkout_counts_before_its_executor_starts() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let cancel = CancellationToken::new();
+        let (_, existing, lease) = pool
+            .slot(key(1), reservation(), Some(7), &cancel)
+            .await
+            .unwrap();
+        assert!(existing.is_none() && lease.is_some());
+        assert_eq!(pool.busy_slots(7).await, 1);
+    }
+
+    #[tokio::test]
+    async fn retiring_another_profiles_executor_stops_the_slot_counting_until_admitted() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        // An idle executor of another profile, already exited, holds the slot's
+        // reservation; an app holds everything else.
+        let mut old = context(&budget, InstanceId("rbtest-gone".into()), root.path());
+        old.key = key(2);
+        pool.release(0, Some(old)).await;
+        let app = budget.try_acquire(budget.available()).unwrap();
+        let cancel = CancellationToken::new();
+        let (index, existing, lease) = pool
+            .slot(key(1), reservation(), Some(7), &cancel)
+            .await
+            .unwrap();
+        assert!(lease.is_none());
+        assert_eq!(
+            pool.busy_slots(7).await,
+            1,
+            "the old executor is still charged"
+        );
+        assert!(pool.retire_previous(index, existing.unwrap()).await);
+        assert_eq!(pool.busy_slots(7).await, 0, "counted with nothing charged");
+        // Only the retired executor's reservation is free, which is all it needs.
+        drop(app);
+        assert!(
+            pool.admit(index, Some(7), reservation(), &cancel)
+                .await
+                .is_some()
+        );
+        assert_eq!(pool.busy_slots(7).await, 1);
     }
 }
