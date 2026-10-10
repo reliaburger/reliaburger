@@ -167,6 +167,50 @@ mod tests {
         assert_eq!(std::io::read_to_string(current).unwrap(), "new");
     }
 
+    /// Reading again only follows an atomic replacement. The file it finds
+    /// still has to pass every check a first open would.
+    #[test]
+    fn a_replacement_read_again_is_still_refused_when_unsafe() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("route.json");
+        let write = |name: &str, body: &str, mode: u32| {
+            let file = dir.path().join(name);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&file)
+                .unwrap();
+            std::fs::write(&file, body).unwrap();
+            file
+        };
+        let replaced_by = |replacement: &Path| {
+            std::fs::rename(write("old", "1", 0o600), &path).unwrap();
+            let opened = super::open_record(&path).unwrap();
+            std::fs::rename(replacement, &path).unwrap();
+            super::reopen_if_replaced(opened, &path).and_then(|file| {
+                super::validate_file(&file, super::Access::Exclusive).map(|_| file)
+            })
+        };
+        let symlink = dir.path().join("symlink");
+        std::os::unix::fs::symlink(write("target", "1", 0o600), &symlink).unwrap();
+        assert!(replaced_by(&symlink).is_err(), "followed a symlink");
+        let linked = write("linked", "1", 0o600);
+        std::fs::hard_link(&linked, dir.path().join("second-link")).unwrap();
+        assert!(replaced_by(&linked).is_err(), "accepted a hard link");
+        let shared = write("shared", "1", 0o644);
+        assert!(replaced_by(&shared).is_err(), "accepted mode 0644");
+        let corrupt = replaced_by(&write("corrupt", "{not json", 0o600)).unwrap();
+        assert!(serde_json::from_reader::<_, u32>(corrupt).is_err());
+        // Removed without a replacement: the record is gone, not tampered with.
+        std::fs::rename(write("removed", "1", 0o600), &path).unwrap();
+        let opened = super::open_record(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let error = super::reopen_if_replaced(opened, &path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
     use super::*;
 
     fn write(path: &Path, bytes: &[u8], mode: u32) {
