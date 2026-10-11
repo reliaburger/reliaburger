@@ -7,6 +7,9 @@ use std::time::Duration;
 use reliaburger::grill::runc::RuncGrill;
 use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, OciSpec};
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
+
 #[tokio::test]
 #[ignore = "requires an unprivileged Linux user and runc in PATH; run with make test-rootless-runc"]
 async fn rootless_cluster_refuses_before_ownership_recovery_for_every_selection() {
@@ -154,9 +157,10 @@ async fn rootless_port_and_launcher_survive_recovery_and_helper_replacement() {
     let data = root.path().join("long-data-path-".repeat(12));
     std::fs::create_dir(&data).unwrap();
     let id = InstanceId("rootless-port".into());
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // Slirp binds this on every helper start. A `bind(0)` port would come
+    // from the ephemeral range other tests' Bun processes rebind from (#734).
+    let host_port = bun_process::reserve_port_block_lease(1);
+    let port = host_port.base;
     let mut spec = specification(
         &data,
         "printf launch >> /work/launches; exec /bin/busybox httpd -f -p 8080 -h /work",
@@ -248,9 +252,10 @@ async fn start_published_with_wrapper(
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // Slirp binds this on every helper start. A `bind(0)` port would come
+    // from the ephemeral range other tests' Bun processes rebind from (#734).
+    let host_port = bun_process::reserve_port_block_lease(1);
+    let port = host_port.base;
     let mut spec = specification(data, "exec /bin/busybox httpd -f -p 8080 -h /work");
     spec.port_mapping = Some(PortMapping {
         host_port: port,
