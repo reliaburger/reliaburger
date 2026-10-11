@@ -153,8 +153,8 @@ impl Drop for RootCleanup {
     }
 }
 
-/// SIGKILL every process whose command line names a path under the root:
-/// Bun, its detached owners and the Runc commands they were running.
+/// SIGKILL every process whose command line or open files name a path under
+/// the root: Bun, its detached owners and the Runc commands they were running.
 /// Returns the processes it signalled.
 fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
     use nix::sys::signal::{Signal, kill, killpg};
@@ -175,10 +175,17 @@ fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
         else {
             continue;
         };
-        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
+        // The test itself may hold a file under the root as it unwinds.
+        if pid == std::process::id() as i32 {
             continue;
-        };
-        if !command.windows(needle.len()).any(|part| part == needle) {
+        }
+        let names_root = |bytes: &[u8]| bytes.windows(needle.len()).any(|part| part == needle);
+        // A process already in exit has dropped its memory, so its command
+        // line reads empty, but it keeps its files (the kernel ownership lock
+        // among them) until a moment later. Its open files still name the
+        // root, so match on those too and wait for the exact lock owner (#673).
+        let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if !names_root(&command) && !holds_file_under(&entry.path(), &names_root) {
             continue;
         }
         let pid = Pid::from_raw(pid);
@@ -196,6 +203,17 @@ fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
         killed.push(pid);
     }
     killed
+}
+
+/// Does the process at `/proc/<pid>` hold an open file whose path matches?
+fn holds_file_under(process: &Path, matches: &dyn Fn(&[u8]) -> bool) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::read_dir(process.join("fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .any(|target| matches(target.as_os_str().as_bytes()))
 }
 
 /// Wait up to ten seconds for every process to exit. A zombie counts: it
