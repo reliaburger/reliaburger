@@ -7971,6 +7971,33 @@
       ]
     },
     {
+      "id": "issue-680-hung_worker_api_does_not_stall_other_nodes_arrays",
+      "issue": 680,
+      "promise": "One leader tick commits one Raft entry for every running array, and a worker whose API hangs delays only its own grants.",
+      "supported_paths": [
+        "Task-array dispatch on a real three-node council with many concurrent arrays."
+      ],
+      "refused_paths": [
+        "A hung worker's chunks stay with it until the silence timeout, then go to other nodes at the next attempt."
+      ],
+      "boundaries": [
+        "Real multi-node consensus in the declared gate is required; synthetic evidence cannot qualify the dispatch cadence."
+      ],
+      "cases": [
+        {
+          "id": "dispatch-hung_worker_api_does_not_stall_other_nodes_arrays",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "hung_worker_api_does_not_stall_other_nodes_arrays",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-638-losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt",
       "issue": 638,
       "promise": "Lost singleton owners remain unknown until exact acknowledged replay.",

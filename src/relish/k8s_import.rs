@@ -1470,6 +1470,10 @@ fn pod_to_jobspec(
         script: None,
         firewall: None,
         egress: None,
+        max_attempts: None,
+        task_timeout_secs: None,
+        overlap: None,
+        replay_unknown: false,
     }
 }
 

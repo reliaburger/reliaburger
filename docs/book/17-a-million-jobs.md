@@ -106,7 +106,7 @@ A block cut short by a crash at the very end is truncated before new records are
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
 
-### Wiring it in: one Raft entry per array per tick
+### Wiring it in: one Raft entry per tick
 
 Those 422 ticks become Raft entries once the pieces are wired, so the shape of the entry matters. We gave task arrays exactly one new `RaftRequest` variant:
 
@@ -115,7 +115,7 @@ Those 422 ticks become Raft entries once the pieces are wired, so the shape of t
 TaskArray(Box<crate::meat::task_array_store::TaskArrayWrite>),
 ```
 
-`TaskArrayWrite` is its own enum with registration, sync, cancellation and requeue variants, plus atomic mixed-manifest registration and cancellation, and the rules for applying each one live beside the data in `meat::task_array_store`, where they're plain functions with plain unit tests. The state machine's part is six lines. Why the `Box`? A Rust enum is as large as its largest variant, because every value has to fit in the same slot. A `Sync` carries two vectors and a `Register` carries a whole `JobSpec`, and without the box every `RaftRequest` in the log (including the humble `Noop`) would pay for that space. `Box<T>` puts the payload on the heap and leaves a pointer behind. It's the same reason the other big variants in that enum are boxed.
+`TaskArrayWrite` is its own enum with registration, sync, cancellation, requeue and tick variants, plus atomic mixed-manifest registration and cancellation, and the rules for applying each one live beside the data in `meat::task_array_store`, where they're plain functions with plain unit tests. The state machine's part is six lines. Why the `Box`? A Rust enum is as large as its largest variant, because every value has to fit in the same slot. A `Sync` carries two vectors and a `Register` carries a whole `JobSpec`, and without the box every `RaftRequest` in the log (including the humble `Noop`) would pay for that space. `Box<T>` puts the payload on the heap and leaves a pointer behind. It's the same reason the other big variants in that enum are boxed.
 
 Arrays take their ids from the same counter as ordinary batches, so `relish batch-status 12` names one thing. The apply function borrows the counter as a closure:
 
@@ -129,7 +129,7 @@ pub fn apply(
 
 `FnMut` permits several calls: a mixed manifest takes one parent ID and one ID per resource profile. Validation happens before any allocation, so an invalid profile rejects the whole submission without consuming IDs. The call site still says `|| batch_state.allocate_id()` without `TaskArrays` knowing about the counter.
 
-The leader runs one loop, on every node, which does nothing unless the node leads. Once a second it reads the replicated arrays and sends each node its share: the chunks it holds, each with its grant attempt. The node's answer is its free slots and the chunks it has finished. For each running array the leader then writes a single `Sync` entry holding both the finished chunks and the next grants. To plan grants that account for the chunks being retired in the same entry, the leader clones the state, applies the results to the clone and plans against that. A node that finished a chunk gets its replacement in the same entry, and `apply` re-checks everything anyway. A holder that hasn't answered for 30 seconds gets a `Requeue`, and the fence from earlier makes its late reports harmless.
+The leader runs one loop, on every node, which does nothing unless the node leads. Once a second it reads the replicated arrays and sends each node its share: the chunks it holds, each with its grant attempt. The node's answer is its free slots and the chunks it has finished. For each running array the leader then plans a `Sync` holding both the finished chunks and the next grants, and it commits every array's `Sync` together as one `Tick` entry (the section on dispatch at scale, below, explains why it isn't one entry per array). To plan grants that account for the chunks being retired in the same entry, the leader applies the results to a copy of the array's state and plans against that. A node that finished a chunk gets its replacement in the same entry, and `apply` re-checks everything anyway. A holder that hasn't answered for 30 seconds gets a `Requeue` in the same tick, and the fence from earlier makes its late reports harmless.
 
 The node persists the highest recovery/term/index control version and the highest grant generation per chunk. It reconstructs work from the next valid snapshot: every sync tells it what it holds, and it starts what it isn't running, cancels what it no longer holds, and keeps reporting a finished chunk until the leader stops listing it. That makes a restarted leader and a restarted node the same case as a normal tick. There was one trap. Finished results sat in a map keyed by chunk id, with the attempt stored beside the result. If the leader takes a chunk back and later re-grants it to the same node at the next attempt, the old run (cancelled, but still finishing) could land after the new one and overwrite it, and the chunk would never be reported again. Keying the map by `(chunk, attempt)` makes that impossible, rather than unlikely.
 
@@ -301,6 +301,173 @@ and state formats, so it needs matching binaries and a fresh cluster
 qualification and resident model workers remain separate issues; these semantics
 don't establish 100m accepted successes/day.
 
+### A contract you can retry, and can't misspell
+
+The run identities above were only half the story. The server read an
+`Idempotency-Key` header on array admission and minted a random one when it was
+missing. No `relish` command ever sent one. So the manual's advice, "reuse the
+same key after a timeout", was advice nobody could follow: a person whose
+`relish run --batch --count 16000000` timed out had no key to reuse, and a retry
+admitted a second sixteen-million-task array. The mixed-profile manifest route
+had no request identity at all.
+
+The fix starts in the client. Every submitting command now chooses its key
+before it sends anything and prints it on stderr, so a timeout leaves you
+holding the one thing that makes the retry safe:
+
+```rust
+pub fn submission_key(
+    explicit: Option<String>,
+    err: &mut dyn std::io::Write,
+) -> Result<String, RelishError> {
+    let key = match explicit {
+        Some(key) => { /* 1–128 printable ASCII bytes, or refuse */ key }
+        None => format!("{:032x}", rand::random::<u128>()),
+    };
+    let _ = writeln!(
+        err,
+        "idempotency key {key}; if this submission times out, retry with --idempotency-key {key}"
+    );
+    Ok(key)
+}
+```
+
+`&mut dyn std::io::Write` is a *trait object*: a mutable borrow of some value
+that implements `Write`, with the concrete type chosen at run time through a
+vtable, much like a Go interface value. Production passes `std::io::stderr()`;
+the unit tests pass a `Vec<u8>`, which implements `Write` too, and then read
+back what was "printed". `let _ =` discards the `Result` of the write on
+purpose. Rust warns when you silently drop a `Result`, and a closed stderr is
+no reason to refuse a submission, so we say so out loud.
+
+Why stderr? Scripts parse `relish --output json batch submit` from stdout, and
+the key line would break every one of them. Diagnostics already go to stderr,
+and the key is exactly the kind of thing you want to see even when stdout is
+piped into `jq`.
+
+On the server, `TaskArrayWrite::RegisterManifest` gained a `request_id`. The
+manifest's receipt already had a slot for `(request_id, digest)`, used by finite
+job groups, so the store hashes the name, namespace and cohorts and looks for a
+retained receipt with the same key. Same key and same digest returns the
+original parent id; same key and a different digest is refused rather than
+merged. The same check runs in `registration_ids`, which tells the leader how
+many batch ids a write will consume: a replay consumes none, so a retry still
+succeeds when the shared id counter has run dry.
+
+The second gap was quieter. `ManifestCohort` looked like this:
+
+```rust
+pub struct ManifestCohort {
+    pub name: String,
+    #[serde(flatten)]
+    pub spec: TaskArraySpec,
+    pub template: JobSpec,
+}
+```
+
+`#[serde(flatten)]` lets a person write `count` and `max_attempts` beside
+`name` instead of in a nested table. It also switches off unknown-field
+checking: serde can't combine `flatten` with `deny_unknown_fields`, because the
+outer struct has to pass every key it doesn't recognise down to the inner one.
+`TaskArraySpec` didn't deny unknown fields either. So `task_timeout = 30` (the
+real name is `task_timeout_secs`) was silently ignored, the task got the
+600-second default, and `relish batch submit --dry-run` cheerfully printed
+"valid manifest".
+
+We kept the flat format people already write and moved the strictness to a
+private wire type:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "CohortWire", into = "CohortWire")]
+pub struct ManifestCohort { /* name, spec, template */ }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortWire {
+    name: String,
+    count: u32,
+    chunk_size: u32,
+    // ... one field per TaskArraySpec field, with the same defaults
+    template: JobSpec,
+}
+```
+
+`from` and `into` tell serde to deserialise a `CohortWire` and convert it with
+the `From` impl, and to convert back before serialising. The rest of the code
+keeps using `cohort.spec`. Spelling the fields out twice is the price, and the
+`From<ManifestCohort> for CohortWire` impl destructures `TaskArraySpec` without
+a `..` rest pattern. Add a field to the spec and that line stops compiling until
+the wire type carries it too, which is the cheapest drift check there is.
+`TaskArraySpec` itself now has `deny_unknown_fields`, which covers the JSON
+`tasks` object of a job definition as well.
+
+### Policies for TOML jobs
+
+A TOML job couldn't set any of this. `JobDefinition::from_spec` hard-coded four
+attempts and no deadline (one attempt and 600 seconds for a hook), and cron
+overlap was always `forbid`. A hung nightly job therefore ran for ever, and with
+overlap forbidden it blocked every later night too.
+
+`JobSpec` now has the manifest's field names: `max_attempts`,
+`task_timeout_secs`, `overlap` and `replay_unknown`. The first three are
+`Option`s, because "not set" has to mean "use today's default", which differs
+between hooks and ordinary jobs. `from_spec` moves them out of the template:
+
+```rust
+tasks.task_timeout_secs = template
+    .task_timeout_secs
+    .take()
+    .unwrap_or(if hook { 600 } else { 0 });
+let replay_unknown = std::mem::take(&mut template.replay_unknown);
+```
+
+`Option::take` returns the value and leaves `None` behind; `std::mem::take`
+does the same for any type with a `Default`, here leaving `false`. Both mutate
+in place through a `&mut`, so the template that reaches the definition carries
+no policy, and `validate_template` can refuse policy fields on array templates,
+where they'd otherwise be silently shadowed by the array's own spec.
+Validation reuses the array limits by building the definition and calling
+`tasks.validate()`, so `relish lint` and the API refuse the same values. Hooks
+still refuse `replay_unknown = true`, and `overlap` needs a `schedule`.
+
+The hung-job test found the subtle part. A timed-out attempt in a run without
+`replay_unknown` doesn't count as failed: Bun stops the command, but whatever it
+was doing may have half happened, so the run waits for `relish batch replay`
+like any other unknown outcome. That's the right default for a migration and
+the wrong one for an idempotent cleanup, which is exactly what
+`replay_unknown = true` is for. The test in `tests/suite/relish_cli.rs` drives
+the compiled `relish` binary against an in-process node with the real executor and checks both: a repeatable
+job fails after one second, and a conservative one stops its command and
+reports an unknown owner.
+
+### The cron dialect
+
+People copy schedules from Kubernetes CronJobs, so the parser now reads them
+the same way. Three differences went away. `5/15` meant "minute 5 only"; it now
+means 5, 20, 35 and 50, as in the `robfig/cron` parser Kubernetes uses. A day
+field written `*/2` restricted the values but also switched on the old
+"day-of-month OR day-of-week" rule; now any field starting with `*` counts as
+unrestricted for that rule. And month and weekday names plus the `@hourly` to
+`@yearly` macros work, while `@reboot` and `@every` are refused with an error
+that lists what is supported. Each parsed field records whether it started with
+a star, instead of a separate "any" case, so matching is one set lookup.
+
+### A recovery probe a user can run
+
+`scripts/demo/verify-job-recovery.py` crashes a qualification Bun mid-run and
+checks the replacement finishes. Its last step posted a stale control message to
+`/v1/batch/array/sync`, a node-to-node route only the system principal may call,
+using the ordinary token the manual told people to set. It could only ever get a
+403. Nobody had recorded a real run, which is how it survived.
+
+There's no user-visible way to send a stale control version, by design. So the
+probe now checks what a user can see after recovery (no worker reports a
+refusal, no owner is left unknown) and leaves the fence itself to
+`task_array_recovery::stale_control_cannot_delete_ledgers_after_a_restart`,
+which runs in the portable suite. A CI test reads the system-only routes out of
+`src/bun/authz.rs` and fails if the probe ever names one again.
+
 ### Network policy for jobs
 
 Jobs are the 0.2.0 headline workload, and for most of the release they couldn't say where they were allowed to connect. An app could carry `[egress] allow = [...]` and `[firewall] allow_from = [...]`; a `JobSpec` had neither, so a million crawler tasks ran with the network wide open. Decision D26 gave jobs both, with the same types and the same validation as apps (`validate_network_policy` now checks either kind: every egress entry parses without a DNS lookup, every `allow_from` source is `app` or `namespace/app`).
@@ -456,6 +623,148 @@ every active run, a cron fire uses the reserved headroom, a refused one is
 recorded as skipped, daily named arrays keep working past the definition cap,
 and on a real three-node cluster a cron job fires while other tenants fill
 every bulk slot.
+
+### Dispatch at scale: sixty-four arrays and a node that won't answer
+
+Every throughput number so far came from one array. The leader's tick had
+three costs that stayed invisible until there were many (issue #680). It wrote
+one Raft entry per running array, one after another, each waiting for its own
+fsync. It waited for every node's answer before planning anything. And it
+copied more than it needed to: the whole desired state, every tick, plus a
+record of accepted chunks with no size limit.
+
+Take the first. With sixty-four busy arrays a tick awaited sixty-four
+commits in a row. At a few milliseconds of fsync each, a tick could outlast its
+one-second slot, and `MissedTickBehavior::Skip` then dropped the next one.
+Every array slowed down together, and the two-second lookahead window, which
+assumes a report round of about a second, stopped covering it. The fix is a new
+write:
+
+```rust
+/// One leader tick's progress for every array, in one entry.
+Tick { writes: Vec<TaskArrayWrite> },
+```
+
+A `Tick` carries the tick's `Sync`, `Requeue`, `Unknown` and `QuotaBlocked`
+writes, at most 1,024 of them, and the state machine applies each on its own.
+Each of those writes checks everything before it changes anything, so a refused
+one (an array pruned since the leader planned, say) leaves its array as it was
+and the rest still apply. The applied result lists the refusals by array, and
+the leader logs them. Anything else inside a `Tick`, a registration or another
+`Tick`, refuses the whole entry before any of it applies. The test
+`tick_writes_one_raft_entry_for_many_arrays` plans three nodes' answers about
+sixty-four arrays and checks they come out as one entry. On a real three-node
+cluster, `hung_worker_api_does_not_stall_other_nodes_arrays` runs sixteen
+arrays and counts Raft entries: no more than one per tick.
+
+Applying a `Tick` means `apply` calling itself, and our first version didn't
+compile:
+
+```text
+error: reached the recursion limit while instantiating `TaskArrays::apply::<{closure}>`
+```
+
+`apply` is generic over its `allocate_id` closure, and Rust compiles a separate
+copy of a generic function for each type it's called with
+(*monomorphisation*). Every closure has its own type, and a closure written
+inside a generic function is a new type for each copy of that function. So
+`apply::<A>` called `apply::<B>`, which called `apply::<C>`, and so on for ever.
+The fix is a plain function pointer, whose type is the same everywhere:
+
+```rust
+let no_ids: fn() -> u64 = || 0;
+if let Err(error) = self.apply(write, no_ids) {
+```
+
+A closure that captures nothing coerces to a `fn` pointer, so `apply::<fn() ->
+u64>` calls `apply::<fn() -> u64>`, and there's only one copy to build.
+
+The second cost was a grey failure. Gossip still lists a node whose API hangs
+(a stuck disk, a wedged process), and the leader's tick waited up to three
+seconds for the request and three more for the body, every tick, for every
+array. A node that's permanently slow but alive never gets dropped at all. Now
+each tick has a deadline, half the sync interval, and plans from the answers
+that arrived by then. A call that misses it isn't abandoned; it's carried into
+the next tick, and the node isn't called again until it answers:
+
+```rust
+pub struct SyncCalls {
+    pending: FuturesUnordered<BoxFuture<'static, SyncAnswer>>,
+    waiting_on: HashSet<NodeId>,
+}
+```
+
+`FuturesUnordered` (Chapter 9 used it for boots) yields futures as they finish,
+in whatever order. `BoxFuture<'static, T>` is shorthand for
+`Pin<Box<dyn Future<Output = T> + Send + 'static>>`: a future on the heap, behind
+a pointer, so calls of different concrete types can share one collection, and
+pinned, because a future that's been polled may hold pointers into itself and
+mustn't move. `gather_until` polls the set with `tokio::time::timeout_at` until
+the deadline or until nothing's left, and whatever's still running stays in the
+set for the next tick. The node that missed the deadline keeps its chunks and
+counts towards the 30-second silence timeout as before. Production spawns each
+call as its own task, so it keeps making progress between ticks, and wraps the
+handle in the box.
+
+`slow_node_does_not_delay_grants_to_other_nodes` drives this with tokio's paused
+clock: one call answers in 20 ms, the other in 4.2 s. The tick ends at exactly
+half the interval, the fast node gets its grants, and the slow call is collected
+five ticks later without being repeated. The cluster test hangs a real worker
+by swapping its control fence file for a FIFO with no writer, so its next sync
+blocks reading it, then checks that the leader still hears from the healthy
+node several times a second and that every array still finishes with each task
+counted once.
+
+The third cost was copying. `desired_state()` clones the whole replicated
+state, apps and all, and the leader called it four times a tick. The tick now
+reads through `read_control`, which runs a closure against the state under its
+read lock and returns only what the closure builds: the sync requests first,
+then the planned writes. Planning used to clone each array's state to preview
+the finished chunks; now it only copies when there's something to preview:
+
+```rust
+let mut preview = std::borrow::Cow::Borrowed(&record.state);
+// ...
+preview.to_mut().complete(node, result)
+```
+
+`Cow` (clone on write) holds either a borrow or an owned value. `to_mut` turns
+a borrow into an owned copy the first time it's called and hands back a mutable
+reference after that, so an array with nothing finished this tick costs no copy.
+`mark_terminal` had a quieter clone of its own: it copied a whole array's state
+just to read it while changing the run's `unknown_owners`. Destructuring `self`
+into `let Self { arrays, jobs, .. } = self;` splits the borrow by field, as in
+the fairness section above, so the record stays readable while the run changes.
+
+What's left is the accepted record itself. A chunk's accepted owner and attempt
+are kept so results and logs can be fetched from the node that ran it. With
+one-task chunks spread over ten nodes, each node's set splits into a range per
+chunk: the test `accepted_state_stays_bounded_with_one_task_chunks_on_ten_nodes`
+runs 65,536 such chunks finishing out of order, with a node lost partway, and
+the state reached 875 KiB before the fix. Every replica keeps that, and
+snapshots carry it. Past 4,096 ranges the per-node record now folds into one
+record keyed only by attempt, and the same chunks merge back into a few ranges.
+The worst shape now stays under 60 KiB.
+
+Folding forgets owners, which sounds like it breaks results. It doesn't,
+because a chunk at a given attempt is granted to exactly one node: re-granting
+always bumps the attempt. So `(chunk, attempt)` still picks the right result row
+from whichever node offers it, and `accepted_grant` now returns
+`owner: Option<NodeId>` beside the attempt. When the owner is gone, the results
+page and the logs endpoint ask every node for that grant instead of one.
+`compaction_keeps_accepted_grant_answers_correct` checks every chunk's answer
+after a round trip through JSON: the attempt always survives, and the owner is
+either right or absent.
+
+The Criterion suite now has a `leader_tick` group, so the cost is a number,
+not a hunch (`make bench-task-arrays`): one tick for sixty-four arrays on three
+nodes, and one for a single array of one-task chunks on ten nodes, planned,
+batched and applied. Both write one Raft entry. On the development laptop
+(Apple silicon, release build) the sixty-four-array tick took about 1.1 ms and
+the one-task-chunk tick about 160 µs, against a one-second budget; the fsync of
+the one entry now dominates. With the tick at one entry a
+second plus a cron observation a minute, the leader stays inside the 0.2.0
+budget of three Raft entries a second (#668).
 
 ## Short jobs without fresh containers
 
@@ -1520,7 +1829,7 @@ should shrink to nothing before the release ships.
 **Store the shape, not the instances.** A million tasks fit in a few hundred
 bytes of request and one range pair of progress because nothing ever writes
 down a task individually unless it did something unusual. Ranges, chunks and
-one Raft entry per array per tick all follow from the same refusal: the
+one Raft entry per tick all follow from the same refusal: the
 control plane's cost should grow with decisions, not with work.
 
 
@@ -1552,6 +1861,12 @@ fixing the test couldn't hide the real missing-PID bug it was written to catch.
 wrong. They measured something else: unequal reservations, unequal counts,
 receipt chunks bigger than the window, a no-op instead of real work. Writing
 down what a number *doesn't* show turned out to be most of the work.
+
+**A server feature no client uses isn't a feature.** The cluster had
+idempotent admission for months, and the manual described it. Because `relish`
+never sent the header, the protection existed only for people who wrote their
+own HTTP clients. Test the contract from the command a person types, not from
+the route it eventually reaches.
 
 **Durable identity before durable work.** Replaying a lost admission must
 return the original run, and a new leader mustn't revive a cron occurrence the
