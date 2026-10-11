@@ -742,6 +742,11 @@ fn node_error(error: TaskArrayNodeError) -> Response {
         TaskArrayNodeError::UnknownArray { .. } | TaskArrayNodeError::NoOutput { .. } => {
             self::error(StatusCode::NOT_FOUND, error.to_string())
         }
+        // Gone, not missing: the task failed, but its chunk had already
+        // kept its share of failure output.
+        TaskArrayNodeError::OutputNotKept { .. } => {
+            self::error(StatusCode::GONE, error.to_string())
+        }
         other => self::error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }
@@ -1117,12 +1122,15 @@ pub async fn logs_handler(
     let mut unavailable = false;
     for (_, url) in candidates {
         match task_output(&state, url.as_deref(), batch_id, index, grant).await {
-            Ok(Some(bytes)) => {
+            TaskOutput::Kept(bytes) => {
                 output = Some(bytes);
                 break;
             }
-            Ok(None) => {}
-            Err(()) => unavailable = true,
+            TaskOutput::NotKept => {
+                return node_error(TaskArrayNodeError::OutputNotKept { index });
+            }
+            TaskOutput::Missing => {}
+            TaskOutput::Unavailable => unavailable = true,
         }
     }
     if output.is_none() && unavailable {
@@ -1142,28 +1150,45 @@ pub async fn logs_handler(
     )
 }
 
-/// One node's kept output for a task at `grant`: `Ok(None)` when it kept
-/// none, `Err` when it couldn't be asked.
+/// What one node kept of a task's output at one grant.
+enum TaskOutput {
+    /// The output.
+    Kept(Vec<u8>),
+    /// Nothing for this task at this grant.
+    Missing,
+    /// The node ran it but, by policy, didn't keep its output.
+    NotKept,
+    /// The node couldn't be asked.
+    Unavailable,
+}
+
+/// Ask one node (`url`, or this node for `None`) for a task's output at `grant`.
 async fn task_output(
     state: &ApiState,
     url: Option<&str>,
     batch_id: u64,
     index: u32,
     grant: u64,
-) -> Result<Option<Vec<u8>>, ()> {
+) -> TaskOutput {
     let Some(url) = url else {
-        return Ok(match &state.task_arrays.node {
-            Some(node) => node.task_output_grant(batch_id, index, grant).await.ok(),
-            None => None,
-        });
+        return match &state.task_arrays.node {
+            Some(node) => match node.task_output_grant(batch_id, index, grant).await {
+                Ok(bytes) => TaskOutput::Kept(bytes),
+                Err(TaskArrayNodeError::OutputNotKept { .. }) => TaskOutput::NotKept,
+                Err(_) => TaskOutput::Missing,
+            },
+            None => TaskOutput::Missing,
+        };
     };
     let url = format!("{url}/v1/batch/array/{batch_id}/local/tasks/{index}/logs?grant={grant}");
     match fetch_from_node(state, &url).await {
-        Ok(response) if response.status().is_success() => {
-            Ok(response.bytes().await.ok().map(|bytes| bytes.to_vec()))
-        }
-        Ok(response) if response.status() == StatusCode::NOT_FOUND => Ok(None),
-        _ => Err(()),
+        Ok(response) if response.status().is_success() => match response.bytes().await {
+            Ok(bytes) => TaskOutput::Kept(bytes.to_vec()),
+            Err(_) => TaskOutput::Missing,
+        },
+        Ok(response) if response.status() == StatusCode::NOT_FOUND => TaskOutput::Missing,
+        Ok(response) if response.status() == StatusCode::GONE => TaskOutput::NotKept,
+        _ => TaskOutput::Unavailable,
     }
 }
 
@@ -1251,6 +1276,8 @@ mod tests {
             namespace: None,
             exec: Some("/usr/bin/true".into()),
             script: None,
+            firewall: None,
+            egress: None,
         }
     }
 

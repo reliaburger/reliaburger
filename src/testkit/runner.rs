@@ -1145,6 +1145,7 @@ mod tests {
             id,
             fault_type: request.fault_type.to_string(),
             target_service: request.target_service,
+            namespace: request.namespace.clone(),
             target_instance: request.target_instance,
             target_node: request.target_node,
             remaining_secs: request.duration.as_secs(),

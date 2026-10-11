@@ -110,6 +110,25 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             namespace_policy: None,
         }
     }
+    /// Whether this runner can hold `template`'s network policy. An egress
+    /// allowlist or `allow_from` needs a container in its own cgroup and the
+    /// eBPF namespace policy; a host command has neither, so it can't carry
+    /// one. A template without a policy runs anywhere.
+    pub fn enforces_network_policy(&self, template: &crate::config::job::JobSpec) -> bool {
+        let wants_policy = !egress_allow(template).is_empty()
+            || allow_from(template).is_some_and(|sources| !sources.is_empty());
+        if !wants_policy {
+            return true;
+        }
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        {
+            template.runtime != crate::config::job::JobRuntime::Process
+                && self.namespace_policy.is_some()
+                && self.runtime.honours_cgroup_path()
+        }
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+        false
+    }
     async fn resolve_template(
         &self,
         template: &crate::config::job::JobSpec,
@@ -302,6 +321,47 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         self.log_sink = sink;
         self.capture_offsets = offsets;
         self
+    }
+
+    /// Forget the metadata of this node's retired executor identities, and of
+    /// runtime routes no launch owns, so a restart reclaims what an
+    /// interrupted retirement kept (#678). Call it before the first task:
+    /// anything unretired or live is skipped and kept. Returns how many
+    /// identities were forgotten.
+    pub async fn forget_retired_executors(&self) -> usize {
+        let app = format!("executor-{}", self.prefix);
+        let ours = |id: &crate::grill::InstanceId| {
+            crate::grill::InstanceIdentity::parse(&id.0).is_some_and(|identity| {
+                identity.app == app
+                    || identity
+                        .app
+                        .strip_prefix(app.as_str())
+                        .is_some_and(|rest| rest.starts_with('-'))
+            })
+        };
+        let mut candidates: Vec<_> = match self.runtime.launch_inventory().await {
+            Ok(launches) => launches
+                .unwrap_or_default()
+                .into_iter()
+                .map(|launch| launch.instance_id)
+                .filter(|id| ours(id))
+                .collect(),
+            Err(error) => {
+                eprintln!("bun: executor metadata sweep: inventory unavailable: {error}");
+                Vec::new()
+            }
+        };
+        match self.runtime.unlaunched_metadata().await {
+            Ok(ids) => candidates.extend(ids),
+            Err(error) => eprintln!("bun: executor metadata sweep: routes unavailable: {error}"),
+        }
+        let mut forgotten = 0;
+        for id in candidates {
+            if self.runtime.forget_retired(&id).await.is_ok() {
+                forgotten += 1;
+            }
+        }
+        forgotten
     }
 
     /// Resolve an active singleton without exposing a reusable slot as its public identity.
@@ -520,6 +580,15 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 ran: None,
             };
         }
+        if !self.enforces_network_policy(&resolved) {
+            return Attempt {
+                outcome: AttemptOutcome::SpawnFailed {
+                    reason: NETWORK_POLICY_UNENFORCEABLE.into(),
+                },
+                output: CapturedOutput::default(),
+                ran: None,
+            };
+        }
         if resolved.runtime == crate::config::job::JobRuntime::SharedRunc
             || (resolved.runtime == crate::config::job::JobRuntime::Process
                 && self.supports_host_limits())
@@ -714,6 +783,25 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         })?);
                 }
                 self.runtime.create(&id, &oci).await?;
+                // The task's allowlist and address ownership go in before
+                // its process runs, while runc holds it at create.
+                #[cfg(all(feature = "ebpf", target_os = "linux"))]
+                if let Some(lease) = namespace_lease.as_mut() {
+                    let failed = |error: std::io::Error| crate::grill::GrillError::StartFailed {
+                        instance: id.clone(),
+                        reason: error.to_string(),
+                    };
+                    lease
+                        .enforce_egress(&cgroup, egress_allow(template))
+                        .await
+                        .map_err(failed)?;
+                    if let Some(address) = self.runtime.container_ip(&id).await {
+                        lease
+                            .publish_address(address, &id.0, allow_from(template))
+                            .await
+                            .map_err(failed)?;
+                    }
+                }
                 if let Some(stem) = self.runtime.log_stem(&id).await {
                     tokio::task::spawn_blocking(move || reset_captures(&stem))
                         .await
@@ -933,6 +1021,12 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         if let Some(run) = run_id {
             self.retire_singleton(run).await;
         }
+        // The generation has retired and its output and followers are done,
+        // so its journal and routing files own nothing. Keeping them would
+        // leave a slot's worth per namespace that ever ran a job (#678).
+        if let Err(error) = self.runtime.forget_retired(&id).await {
+            eprintln!("batch executor {id}: metadata kept: {error}");
+        }
         self.return_slot(slot);
         Attempt {
             outcome,
@@ -958,6 +1052,25 @@ fn reset_captures(stem: &std::path::Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Why a template's network policy can't run on this node.
+pub(crate) const NETWORK_POLICY_UNENFORCEABLE: &str = "egress and allow_from need a container task on rootful Linux runc with [ebpf] enabled; host commands can't carry them";
+
+/// A template's egress allowlist; empty when it declares none.
+pub(crate) fn egress_allow(template: &crate::config::job::JobSpec) -> &[String] {
+    template
+        .egress
+        .as_ref()
+        .map_or(&[][..], |policy| policy.allow.as_slice())
+}
+
+/// The sources a template's `allow_from` admits from other namespaces.
+pub(crate) fn allow_from(template: &crate::config::job::JobSpec) -> Option<Vec<String>> {
+    template
+        .firewall
+        .as_ref()
+        .map(|firewall| firewall.allow_from.clone())
 }
 
 fn decrypt_template(
@@ -1033,10 +1146,11 @@ mod tests {
         let result = work.await.unwrap();
         assert_eq!(result.outcome, AttemptOutcome::Cancelled);
         assert!(runner.singleton_instance(42).is_none());
-        assert_eq!(
-            runner.runtime.state(&id).await.unwrap(),
-            ContainerState::Stopped
-        );
+        // Retired and then forgotten: the slot identity keeps no metadata.
+        assert!(matches!(
+            runner.runtime.state(&id).await,
+            Err(crate::grill::GrillError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

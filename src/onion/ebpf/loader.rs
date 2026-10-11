@@ -11,10 +11,11 @@ use super::super::types::OnionError;
 /// Every map the loaded `onion_connect.bpf.o` object must define. A
 /// missing map used to surface as a panic at first use, deep inside the
 /// agent (NET8); now the load fails up front with the full list.
-pub const REQUIRED_MAPS: [&str; 10] = [
+pub const REQUIRED_MAPS: [&str; 11] = [
     "backend_map",
     "firewall_map",
     "cgroup_namespace_map",
+    "destination_map",
     "egress_map",
     "egress6_map",
     "egress_cidr4_map",
