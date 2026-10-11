@@ -2348,6 +2348,9 @@ mod tests {
         rows
     }
 
+    /// How many query shapes [`property_sql`] knows.
+    const QUERY_SHAPES: usize = 10;
+
     /// The query shapes the pruning has to survive: ranges, strict bounds,
     /// names, IN lists, disjunctions, negations and an aggregate.
     fn property_sql(shape: usize, a: u64, b: u64, name: &str, other: &str) -> String {
@@ -2379,13 +2382,18 @@ mod tests {
     }
 
     proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+        // #751: every flush makes several durable syncs, and on macOS each
+        // one is an F_FULLFSYNC that waits for the drive cache. The syncs
+        // are the cost, not the queries, so each case builds its files once
+        // and asks every query shape of them, instead of one query per case.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
 
         /// #377: whatever the files hold and whatever the query asks, the
         /// streamed, pruned scan returns exactly the rows the eager reader
         /// did. Pruning may only skip data no answer could contain. Files are
         /// small and timestamps dense, so bounds often land exactly on a
-        /// file's first or last sample, where an off-by-one would show.
+        /// file's first or last sample, where an off-by-one would show. Every
+        /// case runs all ten query shapes, each with its own bounds and names.
         #[test]
         fn streamed_reads_match_the_eager_reader(
             files in proptest::collection::vec(
@@ -2393,11 +2401,10 @@ mod tests {
                 0..8,
             ),
             buffer in proptest::collection::vec((0usize..4, 0u64..16, 0usize..2), 0..4),
-            shape in 0usize..10,
-            a in 0u64..18,
-            b in 0u64..18,
-            name in 0usize..4,
-            other in 0usize..4,
+            queries in proptest::collection::vec(
+                (0u64..18, 0u64..18, 0usize..4, 0usize..4),
+                QUERY_SHAPES,
+            ),
         ) {
             let names = ["alpha", "beta", "delta", "gamma"];
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2418,13 +2425,15 @@ mod tests {
                 }
                 insert(&mut store, &buffer);
 
-                let sql = property_sql(shape, a, b, names[name], names[other]);
-                let streamed = store.query_sql(&sql).await.unwrap();
-                let eager = eager_rows(&store, &sql).await;
-                assert_eq!(canonical(&streamed), canonical(&eager), "{sql}");
-                if shape == 0 {
-                    let floored = store.query_sql_since(&sql, a).await.unwrap();
-                    assert_eq!(canonical(&floored), canonical(&eager), "{sql} since {a}");
+                for (shape, (a, b, name, other)) in queries.iter().copied().enumerate() {
+                    let sql = property_sql(shape, a, b, names[name], names[other]);
+                    let streamed = store.query_sql(&sql).await.unwrap();
+                    let eager = eager_rows(&store, &sql).await;
+                    assert_eq!(canonical(&streamed), canonical(&eager), "{sql}");
+                    if shape == 0 {
+                        let floored = store.query_sql_since(&sql, a).await.unwrap();
+                        assert_eq!(canonical(&floored), canonical(&eager), "{sql} since {a}");
+                    }
                 }
             });
         }

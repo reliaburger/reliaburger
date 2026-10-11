@@ -144,6 +144,194 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
     assert_eq!(budget.available(), Resources::new(1000, 128 << 20, 0));
 }
 
+/// Runc whose next executor starts report the failure #759 saw in CI: a
+/// runtime command past its five-second bound. The real start runs first,
+/// so the pool holds a live executor it was told failed to start.
+#[derive(Clone)]
+struct StartMissesItsBound {
+    runtime: RuncGrill,
+    failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StartMissesItsBound {
+    fn starts(&self) -> usize {
+        self.starts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Grill for StartMissesItsBound {
+    async fn create(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+        spec: &reliaburger::grill::OciSpec,
+    ) -> Result<(), reliaburger::grill::GrillError> {
+        self.runtime.create(id, spec).await
+    }
+    async fn start(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<(), reliaburger::grill::GrillError> {
+        use std::sync::atomic::Ordering;
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.runtime.start(id).await?;
+        // Only this test's one slot starts executors, so the check and the
+        // decrement never race.
+        if self.failures.load(Ordering::SeqCst) > 0 {
+            self.failures.fetch_sub(1, Ordering::SeqCst);
+            return Err(reliaburger::grill::GrillError::StateUnavailable {
+                instance: id.clone(),
+                reason: "runtime command CommandId(injected) did not finish within 5s".into(),
+            });
+        }
+        Ok(())
+    }
+    async fn stop(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<(), reliaburger::grill::GrillError> {
+        self.runtime.stop(id).await
+    }
+    async fn kill(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<(), reliaburger::grill::GrillError> {
+        self.runtime.kill(id).await
+    }
+    async fn state(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<ContainerState, reliaburger::grill::GrillError> {
+        self.runtime.state(id).await
+    }
+    async fn forget_retired(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<(), reliaburger::grill::GrillError> {
+        self.runtime.forget_retired(id).await
+    }
+    async fn launch_inventory(
+        &self,
+    ) -> Result<Option<Vec<reliaburger::grill::RuntimeLaunch>>, reliaburger::grill::GrillError>
+    {
+        self.runtime.launch_inventory().await
+    }
+    async fn container_ip(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Option<std::net::Ipv4Addr> {
+        self.runtime.container_ip(id).await
+    }
+    fn runtime_kind(&self) -> reliaburger::grill::records::RuntimeKind {
+        self.runtime.runtime_kind()
+    }
+    fn honours_cgroup_path(&self) -> bool {
+        self.runtime.honours_cgroup_path()
+    }
+    fn reusable_runtime(&self) -> Option<RuncGrill> {
+        self.runtime.reusable_runtime()
+    }
+}
+
+/// An executor start that misses a runtime command's bound costs the
+/// command nothing: the pool retires that executor and runs the command
+/// once on a fresh one. A start that keeps failing still fails the command,
+/// after one retry, with nothing held (#759).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor() {
+    use reliaburger::bun::execution_budget::ExecutionBudget;
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
+    use reliaburger::bun::task_runtime::OwnedRunner;
+    use reliaburger::meat::Resources;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-759-start-")
+        .tempdir()
+        .unwrap();
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.path().join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = StartMissesItsBound {
+        runtime: RuncGrill::new(
+            root.path().join("bundles"),
+            images,
+            false,
+            root.path().join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap(),
+        failures: Arc::new(AtomicUsize::new(1)),
+        starts: Arc::new(AtomicUsize::new(0)),
+    };
+    let budget = ExecutionBudget::new(Resources::new(1000, 256 << 20, 0));
+    let runner = OwnedRunner::with_slot_count(runtime.clone(), 1).with_budget(budget.clone());
+    let cancel = CancellationToken::new();
+    let task = |cpu: &str, script: &str| {
+        TaskInvocation {
+        template: Some(Box::new(
+            toml::from_str(&format!(
+                "image='{image}'\nnamespace='rbtest-start'\nruntime='shared-runc'\ncpu='{cpu}'\nmemory='32Mi'"
+            ))
+            .unwrap(),
+        )),
+        index: 0,
+        attempt: 1,
+        program: "/unused".into(),
+        args: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        env: vec![],
+        run: None,
+    }
+    };
+    // The command never reached the first executor; the second runs it.
+    let ran = runner
+        .run(
+            &task("100m", "printf ran"),
+            Duration::from_secs(60),
+            &cancel,
+        )
+        .await;
+    assert_eq!(ran.outcome, AttemptOutcome::Exited { code: 0 }, "{ran:?}");
+    assert_eq!(ran.output.head, b"ran", "{ran:?}");
+    assert_eq!(runtime.starts(), 2, "the failed start was not retried");
+    // Every later start fails: a different profile replaces the warm
+    // executor, tries twice and gives up with the runtime's reason.
+    runtime.failures.store(usize::MAX, Ordering::SeqCst);
+    let refused = runner
+        .run(
+            &task("200m", "printf ran"),
+            Duration::from_secs(60),
+            &cancel,
+        )
+        .await;
+    match &refused.outcome {
+        AttemptOutcome::SpawnFailed { reason } => {
+            assert!(reason.contains("did not finish within 5s"), "{reason}")
+        }
+        other => panic!("a start that keeps failing was not refused: {other:?}"),
+    }
+    assert_eq!(runtime.starts(), 4, "the retry was not bounded");
+    // Nothing is held once the refused command returns.
+    assert_eq!(budget.available(), budget.capacity());
+    let executors = runtime
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .filter(|launch| launch.instance_id.0.contains("__executor-"))
+        .map(|launch| launch.instance_id)
+        .collect::<Vec<_>>();
+    for id in &executors {
+        assert_retired(&runtime, id).await;
+    }
+}
+
 /// Delegated sources inherit their tenant before their first connect; losing
 /// that live binding retires the process tree instead of running unguarded.
 #[cfg(feature = "ebpf")]
