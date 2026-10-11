@@ -283,6 +283,23 @@ fits its namespace quota is never displaced by that namespace's jobs. A chunk
 costs up to one node's slots at once, so set `--concurrency` (per-node
 concurrency) low enough for one node's share to fit the quota.
 
+The leader syncs every node once a second and writes one Raft entry per tick
+for all running arrays together, however many there are. It waits for the
+nodes' answers for half a second at most. A node that's slow or hung (still in
+gossip, but its API doesn't answer) delays only its own grants: the others are
+planned from the answers that arrived, and the slow node's call carries over
+into later ticks rather than being repeated. Its chunks stay with it until it
+has been silent for 30 seconds, then go to other nodes at the next attempt, as
+for a node that left.
+
+Small chunks spread across many nodes are safe for the replicated state. The
+leader records which node and grant finished each chunk, and once that record
+passes 4,096 ranges it keeps only the grant, which is enough to pick the right
+result. An array of 65,536 one-task chunks on ten nodes stays under 60 KiB of
+state. For a compacted chunk, `relish batch results` and `relish batch logs`
+ask every node rather than the one that ran it, so a page contacts more
+workers. Larger chunks still cost less dispatch per task.
+
 Explicit bulk execution is at least once. Ordinary jobs and hooks use
 acknowledged replay for unknown outcomes. A lost worker or a crash before a durable outcome
 can rerun a task, so external effects need a stable business idempotency key.
