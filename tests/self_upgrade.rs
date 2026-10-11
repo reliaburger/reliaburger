@@ -22,21 +22,6 @@ mod bun_process;
 /// How long to wait for slow conditions (binary boots, verification).
 const WAIT: Duration = Duration::from_secs(30);
 
-/// `gossip_rejoin_secs` for the fixture: how long a replacement in cluster
-/// mode waits for a peer before it reverts. Only the cluster fixture has a
-/// gossip transport; a standalone node skips the rejoin check.
-///
-/// The isolated-replacement test has to see the replacement on v0.2.0, wait
-/// past the two-second boot grace and find the marker still there, all
-/// before this deadline reverts it. The replacement's first `/v1/version`
-/// answer hashes the running binary (about 580 MB in a debug build). On an
-/// Apple-silicon Mac that answer arrived 2.7 s into the window when quiet,
-/// and up to 8.3 s in at a load average of 150, where the hash alone took
-/// up to 7.2 s. With a five-second window the test saw the replacement too
-/// late to check the marker, or never saw it at all (#771). Twenty seconds
-/// is about twice the worst observation plus the grace wait.
-const GOSSIP_REJOIN: Duration = Duration::from_secs(20);
-
 /// These tests spawn the real compiled binary under a supervisor loop and
 /// take minutes; they'd blow the default CI test job's timeout. Gated
 /// behind `RELIABURGER_UPGRADE_TESTS=1` (like the runc/eBPF suites), run
@@ -113,7 +98,7 @@ binary_dir = "{bin}"
 external_signing_key = "{external}"
 release_keys_override = ["{release}"]
 boot_grace_secs = 2
-gossip_rejoin_secs = {rejoin}
+gossip_rejoin_secs = 5
 max_boot_attempts = 2
 retain_versions = 3
 "#,
@@ -122,7 +107,6 @@ retain_versions = 3
                 bin = bin_dir.display(),
                 external = encode_public_key(&external_public),
                 release = encode_public_key(&release_public),
-                rejoin = GOSSIP_REJOIN.as_secs(),
             ),
         )
         .unwrap();
@@ -217,11 +201,7 @@ retain_versions = 3
     }
 
     async fn wait_for_version(&self, expected: &str) {
-        self.wait_for_version_within(expected, WAIT).await;
-    }
-
-    async fn wait_for_version_within(&self, expected: &str, timeout: Duration) {
-        wait_for(&format!("version {expected}"), timeout, || async {
+        wait_for(&format!("version {expected}"), WAIT, || async {
             self.version().await.as_deref() == Some(expected)
         })
         .await;
@@ -745,17 +725,12 @@ async fn isolated_replacement_reverts_without_restarting_its_workload() {
     );
     harness.wait_for_version("v0.2.0").await;
     harness.wait_healthy().await;
-    // Past the two-second boot grace, which started before the replacement
-    // could answer, but well inside the rejoin deadline.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
         harness.data_dir.join("upgrade/marker.json").exists(),
         "local health and boot grace must not commit without a peer"
     );
-    // The revert waits out the rest of the rejoin deadline first.
-    harness
-        .wait_for_version_within("v0.1.0", GOSSIP_REJOIN + WAIT)
-        .await;
+    harness.wait_for_version("v0.1.0").await;
     harness.wait_upgrade_settled().await;
     assert_eq!(harness.workload_pid("rejoin").await, Some(pid));
     assert_eq!(
