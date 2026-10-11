@@ -221,10 +221,27 @@ A small fresh script waits in the same queue.
 A fixture that times a subprocess therefore pays the first launch outside its deadline.
 `tests/support/first_launch.rs` runs each executable once, all at the same time, with a
 45-second bound that names the phase if the queue never drains, and remembers which paths
-it has launched in this test process. A fixture that needs the same script in several
-directories writes it once, launches it, and hard-links it: a hard link shares the
-already-assessed file, a copy is a new file that gets assessed again. The behavioural
-deadline then measures only the program it was written for.
+it has launched in this test process. The behavioural deadline then measures only the
+program it was written for.
+
+Fake tools are the bigger source. nextest runs every test in its own process, so a script
+each test writes for itself is a new file every time, and six lifecycle tests starting
+together each queued a fresh `limactl` behind the others
+([#582](https://github.com/reliaburger/reliaburger/issues/582)). Fixtures install scripts
+with `install_script(path, body)` instead of `std::fs::write`. It keeps one read-only copy
+of each distinct body, named by its SHA-256, in a directory only the current user can
+write (`reliaburger-fixture-scripts-<uid>` under the system temporary directory), launches
+it once with `--reliaburger-first-launch` (a line the helper adds, so the body doesn't
+run), and hard-links it to `path`. A hard link shares the already-assessed file; a copy is
+a new file that gets assessed again. Per-test state goes beside the link, and the script
+finds it through `${0%/*}`, the directory of the name it was started as, so one body
+serves every test. Library unit tests reach the same file through
+`#[cfg(all(test, unix))] #[path = "../tests/support/first_launch.rs"] mod first_launch;`
+in `src/lib.rs`.
+
+The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: the
+`warm-executables` step that [#722](https://github.com/reliaburger/reliaburger/issues/722)
+adds runs each of them once before the suite.
 
 ## Benchmarks and coverage
 

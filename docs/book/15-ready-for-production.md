@@ -5775,6 +5775,26 @@ together and waits for both, with its own 45-second bound that says what it was
 waiting for. The 15 seconds now measure `relish`, which is what they were
 written for.
 
+The managed-status test wasn't alone. Six `relish local` lifecycle tests,
+an owned-launch cancellation test and a handful of others all wrote a fake tool
+of their own just before timing it
+([#582](https://github.com/reliaburger/reliaburger/issues/582)). nextest runs
+every test in a separate process, so "write it once" can't mean once per
+process. Under the same launcher, with fresh binaries alongside, the six
+lifecycle tests failed their five-second Lima deadline in every one of ten runs,
+and the cancellation test missed its 15-second wrapper marker in nine.
+
+So the helper keeps one copy of each distinct script for the whole machine.
+`install_script(path, body)` names the copy after the SHA-256 of its body, puts
+it in a directory only you can write, launches it once with an argument that
+makes it exit straight away, and hard-links it to `path`. The fake `limactl`
+used to have its log and state paths baked in, which made every test's body
+different. Now it starts with `dir=${0%/*}`: the shell's `$0` is the name it was
+started as, so `${0%/*}` (strip the shortest suffix matching `/*`) is the test's
+own directory, and one body serves every test. The shared copy is read-only, and
+the helper checks its bytes against the digest each time, so a test that wrote
+through its link would fail loudly instead of changing everyone else's tool.
+
 The helper remembers what it has launched in a process-wide set:
 
 ```rust
