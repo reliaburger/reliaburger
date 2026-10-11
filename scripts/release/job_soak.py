@@ -3,6 +3,13 @@
 
 Only the release harness starts this on its disposable cluster. Work is admitted
 through the common API with stable request IDs. No runtime PID is signalled here.
+
+Two loads: `calibration` (the V02 release soak's conservative mix) and `target`
+(#668 and D18-C: the shared and host short runs become 1,048,576-task arrays
+sized for at least 1,158 accepted successes a second plus headroom, and the
+campaign fails unless its accepted rate meets the target). Either load writes
+jobs/report.json with the accepted rate, retry causes, audited effects and the
+September plan's M8 measurements, which are recorded, never gated.
 """
 import argparse
 import copy
@@ -31,6 +38,20 @@ PURPOSES = ("audit", "failure", "timeout", "limit", "cancel")
 REQUIRED = (*PURPOSES, "reuse", "profiles", "unknown", "cron", "hook", "published-job", "drain")
 MAX_RUNS = 256
 MAX_RESPONSE = 2 << 20
+# 100 million accepted successes a day is 1,157.4 a second (#668).
+TARGET_FLOOR = 1158
+# The floor plus 20% headroom: the default #668 rate.
+DEFAULT_TARGET_RATE = 1390
+# Starting per-node caps for the target load; calibrate on the rig. Fresh
+# containers can't approach the target, so their runs keep the calibration mix.
+TARGET_CAPS = {"shared-runc": 8, "process": 16}
+MILLION = 1 << 20
+CAUSES = ("exit_code", "signal", "timeout", "unknown", "unrecorded")
+FAULT_KINDS = ("leader-kill", "follower-kill", "power-off")
+# Node-level faults the job qualification adds (#686, D19-B).
+NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
+# Final-attempt and start-lag bucket upper bounds in milliseconds; None is +Inf.
+BUCKETS = [1 << i for i in range(15)] + [None]
 
 
 class InvalidEvidence(ValueError):
@@ -74,11 +95,18 @@ def validate_summary(value, previous=None, concurrency=None):
     active = value.get("active_commands")
     if active is not None and (type(active) is not int or not 0 <= active <= counts["held"]):
         raise InvalidEvidence("invalid verified active commands")
+    causes = value.get("retry_causes")
+    if causes is not None:
+        if not isinstance(causes, dict) or sum(number(causes, key) for key in CAUSES) != counts["retried"]:
+            raise InvalidEvidence("retry causes do not sum to accepted retries")
     if previous:
         if value["batch_id"] != previous["batch_id"] or value["total"] != previous["total"]:
             raise InvalidEvidence("run identity or total changed")
         if any(value[key] < previous[key] for key in ("succeeded", "failed", "not_run", "retried")):
             raise InvalidEvidence("accepted counters regressed")
+        before = previous.get("retry_causes")
+        if causes is not None and before is not None and any(causes[key] < before[key] for key in CAUSES):
+            raise InvalidEvidence("retry causes regressed")
         if previous["done"] and not value["done"]:
             raise InvalidEvidence("terminal run became active")
     if value.get("nodes_truncated"):
@@ -239,7 +267,11 @@ def serve(path, token, address, port):
 
 
 class Campaign:
-    def __init__(self, directory, api, auditors, token, ledger_reader=None, activity_reader=None):
+    def __init__(self, directory, api, auditors, token, ledger_reader=None, activity_reader=None,
+                 load="calibration", target_rate=None):
+        if load not in ("calibration", "target"): raise InvalidEvidence("unknown job load")
+        if load == "target" and (target_rate is None or target_rate < TARGET_FLOOR):
+            raise InvalidEvidence("the target load needs a rate of at least %d/s" % TARGET_FLOOR)
         self.directory, self.api, self.auditors, self.token = Path(directory), api, auditors, token
         self.ledger_reader = ledger_reader
         self.activity_reader = activity_reader
@@ -247,7 +279,8 @@ class Campaign:
         self.path = self.directory / "state.json"
         if self.path.exists():
             self.state = json.loads(self.path.read_text())
-            if self.state["auditors"] != auditors or self.state.get("schema") != 2 or self.state.get("cluster") != getattr(api,"identity","test") or self.state.get("verifier") != hashlib.sha256(token.encode()).hexdigest():
+            if self.state["auditors"] != auditors or self.state.get("schema") != 2 or self.state.get("cluster") != getattr(api,"identity","test") or self.state.get("verifier") != hashlib.sha256(token.encode()).hexdigest() \
+                    or self.state.get("load","calibration") != load or self.state.get("target_rate") != target_rate:
                 raise InvalidEvidence("campaign configuration changed on resume")
             if self.state.get("stopped"): raise InvalidEvidence("cannot resume a drained job campaign")
             self.state["resume_grace_until"] = int(time.time())+180
@@ -255,7 +288,9 @@ class Campaign:
             self.state = dict(schema=2, cluster=getattr(api,"identity","test"), verifier=hashlib.sha256(token.encode()).hexdigest(), campaign=uuid.uuid4().hex[:12], auditors=auditors,
                               sequence=0, active={}, coverage={m:{} for m in MODES},
                               progress={m:{"succeeded":0,"retried":0,"last_progress":int(time.time())} for m in MODES},
-                              errors=[], totals={}, stopped=False, cron_registered=False, discovered={}, fault_offset=0)
+                              errors=[], totals={}, stopped=False, cron_registered=False, discovered={}, fault_offset=0,
+                              load=load, target_rate=target_rate, started=int(time.time()),
+                              metrics=dict(million_wall_seconds=[], start_lag_ms_counts=[0]*16, state_bytes_max=0, raft=None))
             self.save()
     def save(self): atomic(self.path, self.state)
     def error(self, message):
@@ -272,6 +307,10 @@ class Campaign:
                       request_id=f'{self.state["campaign"]}:{self.state["sequence"]}', id=None, previous=None)
         self.state["active"][key] = intent; self.save()
         return intent
+    def targeted(self, intent):
+        """Whether this intent is a target-load throughput run."""
+        return (self.state.get("load") == "target" and intent["mode"] in TARGET_CAPS
+                and intent["profile"] == "short" and intent["purpose"] == "work")
     def body(self, intent):
         mode, profile, purpose = (intent[key] for key in ("mode", "profile", "purpose"))
         count = 512 if profile == "long" else 262144
@@ -280,6 +319,11 @@ class Campaign:
         template = dict(runtime=mode, cpu="25m-1", memory="64Mi" if profile == "long" else "32Mi", namespace="default")
         tasks = dict(count=count, chunk_size=chunk, max_attempts=3, task_timeout_secs=60,
                      per_node_concurrency=CAPS[mode]-1 if profile == "long" else 1)
+        if self.targeted(intent):
+            # The bench's no-op command, in million-task arrays: the wall time
+            # of each one is an M8 measurement.
+            script = "true"
+            tasks.update(count=MILLION, chunk_size=1000, per_node_concurrency=TARGET_CAPS[mode])
         if purpose != "work":
             count = 8 if purpose in ("audit", "cancel") else 1
             tasks.update(count=count,chunk_size=1,max_attempts=1,per_node_concurrency=1)
@@ -341,6 +385,8 @@ class Campaign:
         atomic(self.directory / "snapshot.json",dict(heartbeat=now,errors=self.state["errors"],
                active=list(self.state["active"].values()),progress=self.state["progress"],coverage=self.state["coverage"],
                totals=self.state["totals"],stopped=self.state["stopped"],fault_window=fault,
+               load=self.state.get("load","calibration"),target_rate=self.state.get("target_rate"),
+               started=self.state.get("started"),metrics=self.state.get("metrics",{}),
                fresh_activity=self.state.get("fresh_activity",[]),discovered=self.state["discovered"],stop_requested_at=self.state.get("stop_requested_at"),last_fault=self.state.get("last_fault",0),resume_grace_until=self.state.get("resume_grace_until",0)))
     def step(self, now, fault=False, stop=False):
         if fault: self.state["last_fault"]=now
@@ -394,6 +440,10 @@ class Campaign:
                 delta=value["succeeded"]-(old["succeeded"] if old else 0)
                 progress["succeeded"]+=delta
                 progress["retried"]+=value["retried"]-(old["retried"] if old else 0)
+                if value.get("retry_causes") is not None:
+                    before=(old or {}).get("retry_causes") or {}
+                    totals=progress.setdefault("retry_causes",{key:0 for key in CAUSES})
+                    for key in CAUSES: totals[key]+=value["retry_causes"][key]-before.get(key,0)
                 if delta:
                     progress.setdefault("first_progress",now)
                     progress["latest_success"]=now
@@ -411,6 +461,7 @@ class Campaign:
                     self.acknowledge(intent["id"],owner,"known replay-safe long fixture, two identical fenced observations",now)
                     self.state["coverage"][intent["mode"]]["unknown"]=True
                 if not drained(value): continue
+                self.record_metrics(value)
                 rows=[]
                 if intent["purpose"] in ("failure","timeout","limit") and not stop:
                     page=self.api.request("GET",f'/v1/batch/{intent["id"]}/results?limit=1&index=0')
@@ -438,6 +489,27 @@ class Campaign:
             except (InvalidEvidence,KeyError,TypeError) as error: self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): {error}')
         self.save(); self.publish(int(time.time()),fault)
         return not self.state["active"]
+    def record_metrics(self, value):
+        """Fold one drained run's M8 measurements into the bounded campaign record."""
+        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
+        if value["total"]==MILLION and value["succeeded"]==MILLION and type(value.get("elapsed_seconds")) is int:
+            metrics["million_wall_seconds"]=(metrics["million_wall_seconds"]+[value["elapsed_seconds"]])[-64:]
+        for node in value.get("nodes",[]):
+            counts=node.get("counters",{}).get("start_lag_ms_counts")
+            if isinstance(counts,list) and len(counts)==16 and all(type(c) is int and c>=0 for c in counts):
+                metrics["start_lag_ms_counts"]=[a+b for a,b in zip(metrics["start_lag_ms_counts"],counts)]
+        if type(value.get("state_bytes")) is int:
+            metrics["state_bytes_max"]=max(metrics["state_bytes_max"],value["state_bytes"])
+    def sample_raft(self, council, now):
+        """Keep the first and latest Raft log index the cluster reported."""
+        index=council.get("last_log_index") if isinstance(council,dict) else None
+        if type(index) is not int: return
+        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
+        raft=metrics.get("raft") or dict(first=[now,index],leaders=[])
+        raft["last"]=[now,index]
+        leader=council.get("leader")
+        if leader and leader not in raft["leaders"]: raft["leaders"]=(raft["leaders"]+[leader])[-16:]
+        metrics["raft"]=raft
     def attempt(self, callback, intent):
         try: return callback(intent)
         except Unavailable: return None
@@ -473,7 +545,61 @@ def findings(snapshot, now, fault_window):
     return problems
 
 
-def coverage_failures(snapshot, nodes=()):
+def percentile(counts, fraction):
+    """Upper bound of the bucket holding the given fraction; None if empty or +Inf."""
+    total=sum(counts)
+    if not total: return None
+    seen=0
+    for bound,count in zip(BUCKETS,counts):
+        seen+=count
+        if seen>=fraction*total: return bound
+    return None
+
+
+def report(snapshot):
+    """The job qualification report: rates, retry causes, audited effects and M8 metrics.
+
+    M8 measurements are recorded, never gated (D18-C). The accepted rate gates
+    only the target load."""
+    if not isinstance(snapshot,dict): return dict(schema=1,complete=False)
+    progress=snapshot.get("progress",{})
+    started=snapshot.get("started") or snapshot.get("heartbeat",0)
+    ended=snapshot.get("stop_requested_at") or snapshot.get("heartbeat",started)
+    elapsed=max(1,ended-started)
+    accepted={mode:progress.get(mode,{}).get("succeeded",0) for mode in MODES}
+    retries={mode:progress.get(mode,{}).get("retried",0) for mode in MODES}
+    causes={mode:progress.get(mode,{}).get("retry_causes") for mode in MODES}
+    totals=snapshot.get("totals",{})
+    metrics=snapshot.get("metrics") or {}
+    raft=metrics.get("raft") or {}
+    raft_rate=None
+    if raft.get("first") and raft.get("last") and raft["last"][0]>raft["first"][0]:
+        raft_rate=(raft["last"][1]-raft["first"][1])/(raft["last"][0]-raft["first"][0])
+    lag=metrics.get("start_lag_ms_counts") or [0]*16
+    rate=sum(accepted.values())/elapsed
+    target=snapshot.get("target_rate")
+    walls=metrics.get("million_wall_seconds") or []
+    return dict(schema=1,complete=snapshot.get("stopped") is True,load=snapshot.get("load","calibration"),
+        target_rate=target,elapsed_seconds=elapsed,accepted_successes=accepted,
+        accepted_successes_per_second=rate,target_met=None if target is None else rate>=target,
+        retries=retries,retry_causes=causes,
+        audited_attempts=totals.get("audit_attempts",0),
+        operator_replay_decisions=totals.get("operator_replay_decisions",0),
+        fault_markers=totals.get("fault_markers",0),errors=list(snapshot.get("errors",[])),
+        m8=dict(
+            million_task_array_wall_seconds=dict(runs=len(walls),max=max(walls) if walls else None,
+                                                 median=sorted(walls)[len(walls)//2] if walls else None),
+            p99_start_lag_ms=percentile(lag,0.99),start_lag_samples=sum(lag),
+            raft_entries_per_second=raft_rate,raft_leaders=raft.get("leaders",[]),
+            raft_state_bytes_max=metrics.get("state_bytes_max") or None,
+            targets=dict(million_task_array_wall_seconds=600,p99_start_lag_ms=1000,
+                         raft_entries_per_second="3 per second of batch runtime, plus 1",
+                         raft_state_bytes_per_million_tasks=256*1024,leader_rss_growth_mib=64,
+                         leader_cpu_cores=1,executor_overhead_cores_per_node=0.5,
+                         node_ledger_mib_per_million_tasks=16,retained_log_mb=50)))
+
+
+def coverage_failures(snapshot, nodes=(), kinds=FAULT_KINDS):
     if not isinstance(snapshot,dict): return ["job qualification evidence missing"]
     problems=list(snapshot.get("errors",[]))
     for mode in MODES:
@@ -481,11 +607,15 @@ def coverage_failures(snapshot, nodes=()):
         missing=[item for item in REQUIRED if not coverage.get(item)]
         for node in nodes:
             if not coverage.get("fault:"+node): missing.append("active fault overlap on "+node)
-        for kind in ("leader-kill","follower-kill","power-off"):
+        for kind in kinds:
             if not coverage.get("fault-kind:"+kind): missing.append("active "+kind+" overlap")
         if missing: problems.append(mode+" missing coverage: "+", ".join(missing))
     if snapshot.get("stopped") is not True or snapshot.get("active"):
         problems.append("job campaign did not positively drain before teardown")
+    if snapshot.get("load")=="target":
+        result=report(snapshot)
+        if not result["target_met"]:
+            problems.append("accepted rate %.1f/s is below the %s/s target" % (result["accepted_successes_per_second"],result["target_rate"]))
     return problems
 
 
@@ -553,7 +683,9 @@ def run(options):
             return json.loads(result.stdout)
         with ThreadPoolExecutor(max_workers=3) as workers: samples=list(workers.map(read,nodes))
         return match_activity([s for s in samples if s],int(time.time()))
-    campaign=Campaign(evidence/"jobs",api,urls,evidence.joinpath("jobs/.token").read_text().strip(),receipts,activity)
+    target_rate=(options.target_rate or DEFAULT_TARGET_RATE) if options.load=="target" else None
+    campaign=Campaign(evidence/"jobs",api,urls,evidence.joinpath("jobs/.token").read_text().strip(),receipts,activity,
+                      options.load,target_rate)
     stop_signal=False
     def stop(*_):
         nonlocal stop_signal
@@ -563,6 +695,7 @@ def run(options):
     while True:
         now=int(time.time())
         metadata=json.loads(evidence.joinpath("metadata.json").read_text())
+        kinds=FAULT_KINDS+(NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())
         scheduled_stop=metadata.get("job_stop_at")
         stop_requested=stop_signal or evidence.joinpath("jobs/stop").exists() or scheduled_stop is not None and now>=scheduled_stop
         if stop_requested and deadline is None:
@@ -579,6 +712,8 @@ def run(options):
                 # be admitted between the scan and disabling its definition.
                 if stop_requested:
                     for mode in MODES: api.request("POST",f"/v1/jobs/definitions/soak-job-cron-{mode}/default/disable")
+                try: campaign.sample_raft(api.request("GET","/v1/cluster/council"),now)
+                except InvalidEvidence: pass
                 rows=api.request("GET","/v1/batch/summaries")["batches"]
                 for value in rows:
                     label=value.get("name","")
@@ -619,7 +754,9 @@ def run(options):
                 last_scan=now
             if stop_requested and finished:
                 campaign.state["stopped"]=True; campaign.save(); campaign.publish(now,fault)
-                return 1 if coverage_failures(json.loads(campaign.directory.joinpath("snapshot.json").read_text()),[n["name"] for n in nodes]) else 0
+                final=json.loads(campaign.directory.joinpath("snapshot.json").read_text())
+                atomic(campaign.directory/"report.json",report(final))
+                return 1 if coverage_failures(final,[n["name"] for n in nodes],kinds) else 0
         except (Unavailable,OSError,ValueError,KeyError,TypeError) as error:
             if not isinstance(error,(Unavailable,OSError,json.JSONDecodeError)): campaign.error(str(error))
             campaign.publish(int(time.time()))
@@ -634,6 +771,8 @@ def main():
     controller=commands.add_parser("run")
     controller.add_argument("--evidence",type=Path,required=True); controller.add_argument("--api-port",type=int,required=True)
     controller.add_argument("--ca",type=Path,required=True); controller.add_argument("--limactl",required=True)
+    controller.add_argument("--load",choices=("calibration","target"),default="calibration")
+    controller.add_argument("--target-rate",type=float,help="accepted successes a second for --load target (default %d)" % DEFAULT_TARGET_RATE)
     server=commands.add_parser("serve")
     server.add_argument("--database",type=Path,required=True); server.add_argument("--token-file",type=Path,required=True)
     server.add_argument("--address",required=True); server.add_argument("--port",type=int,default=8189)

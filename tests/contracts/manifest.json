@@ -8477,6 +8477,56 @@
       "boundaries": [
         "The executor's cgroup includes its helper, so the sample carries the helper's small overhead."
       ]
+    },
+    {
+      "id": "issue-686-leader-loss-mid-array",
+      "issue": 686,
+      "promise": "An array whose leader is lost while that leader runs its own share finishes with every task accepted once, replaying only the chunks the lost leader held.",
+      "supported_paths": [
+        "Three-node councils with fake runners at a hundred thousand tasks",
+        "Three in-process nodes with real shared-runc and cgroup host executors on rootful Linux"
+      ],
+      "cases": [
+        {
+          "id": "leader-loss-a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "leader-loss-leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "leader-loss-leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A report from the lost leader's still-running executor is never accepted once its chunks are taken back."
+      ],
+      "boundaries": [
+        "The in-process leader stops its control plane rather than receiving SIGKILL; the release job qualification (qualify-jobs-sustained.sh) SIGKILLs Bun on real VMs."
+      ]
     }
   ]
 }

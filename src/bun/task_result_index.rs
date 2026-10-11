@@ -227,6 +227,7 @@ mod tests {
             exit_code: Some(i32::from(outcome == TaskFinal::Failed)),
             run_ms: 7,
             output: None,
+            retry_causes: Default::default(),
         }
     }
 
