@@ -1662,11 +1662,14 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        matches!(result.outcome, AttemptOutcome::SpawnFailed { .. }),
-        "queued command used a revoked decryption snapshot: {result:?}"
-    );
-    assert_eq!(result.output.total_bytes, 0);
+    let AttemptOutcome::SpawnFailed { reason } = &result.outcome else {
+        panic!("queued command used a revoked decryption snapshot: {result:?}");
+    };
+    // The command never ran: its only output is the refusal (#786), never
+    // anything the revoked secret's command printed.
+    let output = String::from_utf8_lossy(&result.output.head);
+    assert_eq!(output, format!("{reason}\n"));
+    assert!(!output.contains("revoked-secret-launched"), "{output}");
     tokio::time::timeout(Duration::from_secs(10), async {
         while budget.available() != capacity {
             tokio::time::sleep(Duration::from_millis(20)).await
