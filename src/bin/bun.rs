@@ -2665,36 +2665,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             None
         };
 
-    // A freshly swapped-in version must prove itself: after the boot grace
-    // period, ask the agent to verify that every pre-upgrade workload
-    // survived, then commit (or flag revert and exit).
-    // Gossip proof is independent of local API health and restored membership.
-    if let Some(marker) = upgrade_verify.take() {
-        let verify_tx = cmd_tx.clone();
-        let grace_secs = config.upgrades.boot_grace_secs;
-        let rejoin_secs = config.upgrades.gossip_rejoin_secs;
-        tokio::spawn(async move {
-            let (_, rejoin) = tokio::join!(
-                tokio::time::sleep(std::time::Duration::from_secs(grace_secs)),
-                reliaburger::upgrade::rejoin::wait_for_rejoin(
-                    upgrade_rejoin_rx,
-                    std::time::Duration::from_secs(rejoin_secs),
-                ),
-            );
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if verify_tx
-                .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
-                    marker,
-                    rejoin,
-                    response: tx,
-                })
-                .await
-                .is_ok()
-            {
-                let _ = rx.await;
-            }
-        });
-    }
+    // The upgrade verification below starts after the API task, by which
+    // point `cmd_tx` has moved into the API state. Only a replacement that
+    // has something to verify keeps a sender for it.
+    let upgrade_verify_tx = upgrade_verify.as_ref().map(|_| cmd_tx.clone());
 
     // Cluster apps live in Raft; jobs always belong to the receiving node.
     let local_lease_file = if api_council.is_some() {
@@ -3048,6 +3022,47 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
         },
     );
+
+    // A freshly swapped-in version must prove itself: after the boot grace
+    // period, ask the agent to verify that every pre-upgrade workload
+    // survived, then commit (or flag revert and exit).
+    // Gossip proof is independent of local API health and restored membership.
+    // Both clocks start once the replacement can answer for itself: its API
+    // task is spawned above, and `/v1/version` reports the binary hash the
+    // boot task is still computing. A debug Bun's hash took longer than the
+    // whole rejoin deadline under load, so nobody could see the replacement
+    // before it reverted (#771).
+    if let (Some(marker), Some(verify_tx)) = (upgrade_verify.take(), upgrade_verify_tx) {
+        let grace = std::time::Duration::from_secs(config.upgrades.boot_grace_secs);
+        let rejoin_timeout = std::time::Duration::from_secs(config.upgrades.gossip_rejoin_secs);
+        let answering_manager = upgrade_manager.clone();
+        tokio::spawn(async move {
+            let answerable = async move {
+                if let Some(manager) = answering_manager {
+                    manager.running_binary_sha256().await;
+                }
+            };
+            let rejoin = reliaburger::upgrade::rejoin::verify_after_answerable(
+                answerable,
+                grace,
+                upgrade_rejoin_rx,
+                rejoin_timeout,
+            )
+            .await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if verify_tx
+                .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
+                    marker,
+                    rejoin,
+                    response: tx,
+                })
+                .await
+                .is_ok()
+            {
+                let _ = rx.await;
+            }
+        });
+    }
 
     // Spawn alert evaluation + webhook dispatch task
     if let Some(ref alert_evaluator) = alerts {
