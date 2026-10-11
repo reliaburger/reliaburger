@@ -19,7 +19,8 @@ run it.
 | Lint and format | Clippy with warnings as errors, all features and none; the macOS job runs the all-features pass only, because that one holds the macOS-only code | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
 | Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) | `make audit` |
-| CI scripts | Job selection, ignored-test owners and JUnit keeping, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
+| CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
+| Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
 
 `make ci` runs the portable set locally, the same way CI does: formatting,
@@ -68,7 +69,7 @@ ignored by default and run by their own targets and CI jobs
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
 | Standard registry clients | `crane` logs in, pushes and pulls through Pickle's TLS listener | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (needs `crane`) |
-| Benchmarks | Gossip convergence from 5 to 1,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` |
+| Benchmarks | Gossip convergence from 5 to 1,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
 ### Who runs an ignored test
 
@@ -106,14 +107,34 @@ namespace. Their exact identities and the worker-loss cluster case are recorded
 in the finite inventory. A repository check verifies complete ignored-test
 bindings and current fingerprints for the retained OCI aliases.
 
-Gates CI can't run are manual, so the evidence check skips them:
+Gates CI can't run are manual, so the evidence check skips them. No workflow
+runs these; the maintainer runs each one on the release candidate, and the
+record goes in [`qualification/`](qualification):
 
-| Gate | Needs |
-|---|---|
-| `make test-apple` | Apple silicon with Apple Container |
-| `make test-gpu` | An NVIDIA GPU and `nvidia-smi` |
-| `make test-s3` | AWS credentials and `RELIABURGER_TEST_S3_URL=s3://bucket/prefix` |
-| `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh`, `qualify-storage-power-cut.sh` | A disposable VM that can be rebooted or powered off ([below](#pulling-the-plug)) |
+| Gate | Needs | Who runs it, and when |
+|---|---|---|
+| `make test-apple` | Apple silicon with Apple Container | The maintainer, before any release that touches the Apple Container runtime (`src/grill/apple.rs`) |
+| `make test-gpu` | An NVIDIA GPU and `nvidia-smi` | The maintainer, before any release that touches GPU detection (`src/bun/gpu.rs`) |
+| `make test-s3` | AWS credentials and `RELIABURGER_TEST_S3_URL=s3://bucket/prefix` | The maintainer, before any release that touches log export or the S3 object-store client (`src/ketchup/export.rs`, `src/object_storage.rs`) |
+| `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh`, `qualify-storage-power-cut.sh` | A disposable VM that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
+
+### Benchmarks in CI
+
+The `benchmarks` job in [`ci.yml`](../.github/workflows/ci.yml) runs `make
+bench` and `make bench-large`, and the `task-array benchmarks` job runs `make
+bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
+request runs the first when it touches the gossip protocol or its benchmarks,
+and the second when it touches what `benches/task_arrays.rs` measures: the
+task-array leader and node pool, the executor, range sets or the benchmark
+itself ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). The gossip numbers
+gate nothing. The task-array job compares each benchmark's mean with the
+baseline the last `main` run saved, and fails only when one is more than twice
+as slow ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)): hosted
+runners differ by tens of per cent from run to run, so a tighter bound would
+be a flake source. Its Criterion output and baseline are kept as the
+`criterion-task-arrays` artefact for 90 days, the cost trend #668 reads.
+`test_every_benchmark_target_is_run_by_a_workflow` fails if a `bench` target
+in the `Makefile` isn't run by any workflow.
 
 ### Which jobs a pull request runs
 
@@ -220,10 +241,12 @@ check that everything acknowledged is still there.
 
 | Fixture | Driver | Record |
 |---|---|---|
-| Log and metrics exporters, council backups, lease stores | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-09-25](qualification/2026-09-25-v02-power-cut.md) |
+| Log and metrics exporters, council backups, lease stores | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-11](qualification/2026-10-11-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md)) |
 | Container and network ownership across a reboot | [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh) | same |
 
-The first run of these found two real data-loss bugs, both now fixed.
+The first run of these found two real data-loss bugs, both now fixed. They need
+a VM that can lose power, so no workflow runs them; they are step 5 of the
+[release gate](releasing.md#staging-a-candidate) instead.
 
 ## Before a release
 
