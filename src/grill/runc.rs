@@ -573,6 +573,15 @@ impl super::Grill for RuncGrill {
         self.owned_inventory().await
     }
 
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        self.owned_forget_retired(instance)
+            .await
+            .map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })
+    }
+
     async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
         self.owned_log_stem(instance).await.ok().flatten()
     }
