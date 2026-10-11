@@ -1518,7 +1518,7 @@ join = ["10.0.1.5:9443"]
 
 **What happens:** The new binary fails to start after the upgrade exec.
 
-**Detection:** The new Bun exits within 30 seconds, or fails to rejoin gossip within 60 seconds.
+**Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)).
 
 **Impact:** This node is temporarily unable to accept new work. Running containers are unaffected (containerd manages them independently).
 
