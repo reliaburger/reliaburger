@@ -45,6 +45,11 @@ pub const MAX_RESULT_ROWS: usize = 1000;
 /// Tasks examined by a detail page, even when its failure filter returns no rows.
 pub const RESULT_PAGE_SPAN: u32 = 4096;
 
+/// Largest leader sync call a node accepts. Every active run's template
+/// rides in it, so it must cover the active-run cap at the largest template
+/// (`control_state_stays_within_budget_at_the_global_cap` checks that).
+pub const MAX_SYNC_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
 /// One chunk the leader says this node holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldChunk {

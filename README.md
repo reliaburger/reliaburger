@@ -303,6 +303,9 @@ Apps and job attempts share each node's CPU and memory budget, and app
 placement counts what jobs hold, so a replica never lands on a node jobs have
 filled. Committed grants and accepted outcomes survive leader changes; retired
 nodes receive no new work.
+Namespace quotas bound job attempts as well as apps, each namespace has its own
+caps on active runs and job definitions, and cron fires and deployment hooks
+keep reserved headroom, so one tenant can't starve another.
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
