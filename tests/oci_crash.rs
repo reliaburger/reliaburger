@@ -140,9 +140,20 @@ struct RootCleanup(PathBuf);
 
 impl Drop for RootCleanup {
     fn drop(&mut self) {
+        // Rootless network helpers name their generation's directory, not
+        // the root, so read where they live before killing anything.
+        let mut needles = vec![path_needle(&self.0)];
+        let helper_directories: Vec<String> = node_roots(&self.0)
+            .iter()
+            .flat_map(|node| rootless_helper_directories(node))
+            .collect();
+        needles.extend(helper_directories.iter().map(|d| d.as_bytes().to_vec()));
         // The kernel ownership lock is released only once Bun has exited, and
         // SIGKILL doesn't wait for that.
-        wait_for_exit(&kill_root_processes(&self.0));
+        wait_for_exit(&kill_processes(&processes_naming(&needles)));
+        for directory in &helper_directories {
+            let _ = std::fs::remove_dir_all(directory);
+        }
         for node in node_roots(&self.0) {
             delete_runc_containers(&node.join("data/instances/runc/state"));
             #[cfg(feature = "ebpf")]
@@ -157,35 +168,63 @@ impl Drop for RootCleanup {
     }
 }
 
-/// SIGKILL every process whose command line names a path under the root:
-/// Bun, its detached owners and the Runc commands they were running.
-/// Returns the processes it signalled.
-fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
-    use nix::sys::signal::{Signal, kill, killpg};
-    use nix::unistd::{Pid, getpgid, getpgrp};
+/// `path` with a trailing separator, which stops one root matching another
+/// it prefixes.
+fn path_needle(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
-    // The trailing separator stops one root matching another it prefixes.
-    let mut needle = root.as_os_str().as_bytes().to_vec();
+    let mut needle = path.as_os_str().as_bytes().to_vec();
     needle.push(b'/');
-    let mut killed = Vec::new();
+    needle
+}
+
+/// The private directories this node's rootless network helpers use,
+/// `/tmp/rbr-<uid>-<generation>/` (`grill::runc::owned_rootless`), read from
+/// the generations its runtime intents record.
+///
+/// A helper execs `slirp4netns`, whose command line names only that
+/// directory. Matching the root alone leaked one when a rootless test failed,
+/// and the leaked helper kept every fd it inherited open, including a lock
+/// the test host's other users were queued on (#734).
+fn rootless_helper_directories(node: &Path) -> Vec<String> {
+    let uid = nix::unistd::geteuid();
+    std::fs::read_dir(node.join("data/instances/runc/bundles/.intents/records"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|record| std::fs::read(record.path().join("intent.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter_map(|intent| {
+            intent["generation"]
+                .as_str()
+                .map(|generation| format!("/tmp/rbr-{uid}-{generation}/"))
+        })
+        .collect()
+}
+
+/// Every process whose command line contains one of `needles`.
+fn processes_naming(needles: &[Vec<u8>]) -> Vec<nix::unistd::Pid> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return killed;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if !command.windows(needle.len()).any(|part| part == needle) {
-            continue;
-        }
-        let pid = Pid::from_raw(pid);
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+            let command = std::fs::read(entry.path().join("cmdline")).ok()?;
+            needles
+                .iter()
+                .any(|needle| command.windows(needle.len()).any(|part| part == needle))
+                .then(|| nix::unistd::Pid::from_raw(pid))
+        })
+        .collect()
+}
+
+/// SIGKILL these processes: Bun, its detached owners, the Runc commands they
+/// were running and their rootless network helpers. Returns them.
+fn kill_processes(processes: &[nix::unistd::Pid]) -> Vec<nix::unistd::Pid> {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::{getpgid, getpgrp};
+    for &pid in processes {
         // An owner leads its own group, so killing the group takes the Runc
         // child it is waiting on too. Bun shares the test's group, and
         // signalling that group would kill the test binary itself.
@@ -197,9 +236,8 @@ fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
                 let _ = kill(pid, Signal::SIGKILL);
             }
         }
-        killed.push(pid);
     }
-    killed
+    processes.to_vec()
 }
 
 /// Wait up to ten seconds for every process to exit. A zombie counts: it
@@ -1230,6 +1268,43 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
             .unwrap();
     assert!(journal.inventory().services.is_empty());
     assert!(reqwest::get(&url).await.is_err());
+}
+
+/// A failing rootless test unwinds with Bun dead and its owners' network
+/// helpers still running. Cleanup must find those helpers through the root's
+/// runtime intents, since their command lines don't name the root (#734).
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox; run with make test-rootless-runc"]
+async fn normal_rootless_bun_cleanup_leaves_no_network_helper_behind() {
+    assert!(!nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap().keep();
+    let cleanup = RootCleanup(root.clone());
+    durable_fixture(&root);
+    let config = std::fs::read_to_string(root.join("node.toml")).unwrap();
+    std::fs::write(
+        root.join("node.toml"),
+        config.replace("enabled = true", "enabled = false"),
+    )
+    .unwrap();
+    let mut node = Node::start(&root).await;
+    let name = root_app_name("rootless-helper", &root);
+    node.client.apply(&durable_app(&name)).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let needles: Vec<Vec<u8>> = rootless_helper_directories(&root)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    assert!(!needles.is_empty(), "no rootless runtime intent recorded");
+    assert!(
+        !processes_naming(&needles).is_empty(),
+        "no rootless network helper is running"
+    );
+    // Fail the way a panicking test does: Bun dies, its owners don't.
+    node.crash().await;
+    drop(cleanup);
+    let left = processes_naming(&needles);
+    assert!(left.is_empty(), "cleanup left rootless helpers {left:?}");
 }
 
 #[cfg(feature = "ebpf")]
