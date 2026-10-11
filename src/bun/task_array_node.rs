@@ -297,6 +297,9 @@ pub struct TaskArrayNodeConfig {
     pub backoff: (Duration, Duration),
     /// Ledger group-commit policy.
     pub group_commit: GroupCommit,
+    /// The node's audit log (`<data>/audit`), which counts towards
+    /// task-data pressure alongside `root`. `None` counts task data alone.
+    pub audit_dir: Option<PathBuf>,
 }
 
 impl TaskArrayNodeConfig {
@@ -312,6 +315,7 @@ impl TaskArrayNodeConfig {
             default_concurrency: u32::try_from(safety_cap).unwrap_or(u32::MAX),
             backoff: (defaults.backoff_base, defaults.backoff_cap),
             group_commit: GroupCommit::default(),
+            audit_dir: Some(data_dir.join(crate::bun::audit::AUDIT_DIRECTORY)),
         }
     }
 }
@@ -430,9 +434,9 @@ impl TaskArrayNode {
         self.output_syncs.load(Ordering::Relaxed)
     }
 
-    /// Whether task data, or the filesystem holding it, is too full to
-    /// take new grants. Blocking I/O.
-    fn task_data_pressured(root: &Path) -> bool {
+    /// Whether task data and the audit log, or the filesystem holding them,
+    /// are too full to take new grants. Blocking I/O.
+    fn task_data_pressured(root: &Path, audit_dir: Option<&Path>) -> bool {
         let usage = match super::disk_pressure::FilesystemUsage::of(root) {
             Ok(usage) => usage,
             Err(error) => {
@@ -440,7 +444,7 @@ impl TaskArrayNode {
                 return true;
             }
         };
-        let bytes = super::disk_pressure::dir_total_size(root);
+        let bytes = super::disk_pressure::node_data_bytes(root, audit_dir);
         super::disk_pressure::task_data_pressured(
             bytes,
             usage,
@@ -555,9 +559,12 @@ impl TaskArrayNode {
         self.delete_unknown(&request.known).await;
         self.telemetry.retain_runs(|id| running.contains(&id));
         let root = self.config.root.clone();
-        let pressured = tokio::task::spawn_blocking(move || Self::task_data_pressured(&root))
-            .await
-            .unwrap_or(true);
+        let audit_dir = self.config.audit_dir.clone();
+        let pressured = tokio::task::spawn_blocking(move || {
+            Self::task_data_pressured(&root, audit_dir.as_deref())
+        })
+        .await
+        .unwrap_or(true);
 
         let mut response = NodeSyncResponse::default();
         for assignment in &request.arrays {
@@ -1367,6 +1374,18 @@ fn render_output(output: &CapturedOutput) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_task_data_pressure_counts_the_audit_log() {
+        let config = TaskArrayNodeConfig::for_data_dir(
+            Path::new("/var/lib/reliaburger"),
+            ProcessWorkloadsConfig::default(),
+        );
+        assert_eq!(
+            config.audit_dir.as_deref(),
+            Some(Path::new("/var/lib/reliaburger/audit"))
+        );
+    }
     use crate::bun::task_executor::AttemptOutcome;
     use crate::meat::index_set::IndexRangeSet;
 
@@ -1403,6 +1422,7 @@ mod tests {
                 interval: Duration::from_millis(5),
                 max_records: 4096,
             },
+            audit_dir: None,
         }
     }
 

@@ -674,6 +674,12 @@ One more thing has to be true before a node counts as *done*, and it's easy to m
 
 The leader's check isn't the only one. The upgraded node itself decides whether to commit its new binary or revert, so it needs its own proof. It removes its upgrade marker only after it has survived `boot_grace_secs` *and* its own gossip transport has received a direct acknowledgement from a peer within `gossip_rejoin_secs`. Membership restored from disk or a configured seed list doesn't count. The observation lives in a `watch::Receiver<bool>` that starts at `false` and is never saved, and `tokio::join!` waits on the grace timer and the gossip deadline at the same time, so a long grace period can't stretch the rejoin deadline. If either fails, the node writes `RevertPending` and exits, and the supervisor brings back the old binary, which adopts the same workloads.
 
+When do those two clocks start? At first they started as soon as the new binary had recovered its marker, before its API answered anything. That measured the wrong thing (#771). `/v1/version` reports the hash of the running binary, so a replacement can't say what it runs until that hash is ready. A debug `bun` is 581 MB. On a Mac at a load average of 150, hashing it took up to 7.2 seconds, longer than the whole five-second rejoin window that the isolated-node test uses. The replacement spent its window unable to answer, then reverted before anyone could see it. The deadline wasn't measuring the node's time to rejoin. It was mostly measuring the hash.
+
+So the verification task now starts after the API task, and `upgrade::rejoin::verify_after_answerable` waits for the replacement to become answerable before it starts either clock. Bun passes the hash itself as that future: `running_binary_sha256()` awaits the `OnceCell` that the boot task is filling. The function is generic over any `F: Future`, which lets the unit tests pass `tokio::time::sleep` or `std::future::pending()` in its place and check the timing under paused time. A peer's acknowledgement that arrives during the hash still counts, because the `watch` receiver keeps the latest value. And a hash that never finishes (a hung disk, say) can only delay the clocks by one `gossip_rejoin_secs`, so the node still reaches a verdict instead of leaving its marker in flight forever.
+
+We could instead have made `/v1/version` answer at once and report the digest as pending. That would change what every reader of `binary_sha256` has to handle: the leader's same-version gate, the orchestrator's re-check when a node reaches the target, and `relish`. They'd all need a third state, and a "pending" that slipped through would be read as "unknown bytes", which the gate refuses. Moving when the clock starts changes one task and nothing on the wire. The cost is that a slow hash lengthens a replacement's total verification time, by at most one rejoin period.
+
 ### The leader goes last — in place
 
 The original design called for the leader to *transfer* leadership to an already-upgraded member, then upgrade as a follower. We built that, and it failed the integration test in an instructive way. openraft 0.9 has no `transfer_leader`; the closest primitive is `Raft::trigger().elect()`, "call an election on yourself". So the old leader asked an upgraded member to campaign — and it never won. Raft has an *anti-disruption* rule (leader-stickiness): a follower that's recently heard the leader's heartbeat refuses to vote for a challenger, precisely so a flaky node can't unseat a healthy leader. A live leader replicating happily is unseatable this way by design.
@@ -1748,3 +1754,45 @@ The cluster test's assertions stay as they were. (Its harness now strips local s
 We didn't stop a node from campaigning while it prepares a swap. Switching its elections off (`raft.runtime_config().elect(false)`) would hide this symptom, but the cause was a starved runtime, and a starved runtime also delays the node's API answers and gossip. Moving the blocking work off the workers fixes all three.
 
 We didn't lengthen the election timeout either. One to two seconds is what lets the cluster notice a dead leader quickly, and a node that blocks its own workers for ten seconds would still outlast any sensible value.
+
+### The stalls the first fix left behind
+
+The new test then failed in CI, twice, but only in the coverage run: "prepare held the runtime for 291 ms of its 3.28 s" ([#794](https://github.com/reliaburger/reliaburger/issues/794)). Coverage instrumentation makes everything slower, so it's tempting to call that noise and raise the bound. But the ticker doesn't measure how slow `prepare` is. It measures how long the worker went without running anything else, and the hashing and staging were already elsewhere. So something else was still on the worker.
+
+We reproduced it on a Mac by running the test 200 times under `cargo llvm-cov nextest --stress-count 200` while two loops wrote and synced 512 MB files and four more spun the CPU, with other agents' builds running beside them (load average 55 to 70 on 12 cores). Four runs failed, with stalls of 251 to 416 ms. Recording a timestamp at each step and lining the timestamps up against the ticker's gaps found three culprits, none of them hashing:
+
+- **The marker's syncs.** `UpgradeMarker::store` writes the `Staged` marker, syncs it, renames it and syncs the directory. That's a few hundred bytes, but a sync waits for the disk, and on a disk that has just taken 96 MB of staged binary it waited up to 516 ms.
+- **The probe's delete.** The compatibility probe runs a private copy of the candidate. That copy is a `tempfile::TempPath`, which deletes its file when it's dropped, and it was dropped at the end of `check_binary`, on the worker. Deleting a 96 MB file frees every page of it: up to 230 ms.
+- **The copy of the bytes.** `check_binary` took its own `Vec<u8>`, so `fetch_verified` called `bytes.clone()` on the worker, a 96 MB allocation and copy.
+
+The second one is worth a moment, because it's the Rust one. `Drop` is Rust's destructor: a type can implement it, and the compiler calls it wherever a value goes out of scope, with nothing in the source to mark the spot. That's what makes `TempPath` tidy (you can't forget to delete the file), and it's also why blocking work can hide behind a closing brace. In async code, ask where the drop happens, not just where the work starts.
+
+The fix moves each of the three to the blocking pool. The verification closure now writes the probe's copy too, from the bytes it has just checked, so there's no second copy at all:
+
+```rust
+let (bytes, probe) = tokio::task::spawn_blocking(move || {
+    let probe = signing::verify_binary(
+        &bytes,
+        &checked,
+        &release_keys,
+        external_key.as_ref(),
+        is_network,
+    )
+    .and_then(|()| super::compatibility::write_probe(&bytes, &probe_directory));
+    (bytes, probe)
+})
+.await
+.map_err(std::io::Error::other)?;
+```
+
+`Result::and_then` runs its closure only when the result is `Ok`, so a candidate that fails its signature check is never written anywhere executable. The closure's parameter is `()`, the unit value an `Ok(())` carries, written as a pattern. `write_probe` returns a `Probe`, a newtype around the `TempPath`, and `query_probe` takes it by value, launches it, and hands it to the blocking pool to be deleted:
+
+```rust
+let answer = query(&probe.0).await;
+let _ = tokio::task::spawn_blocking(move || probe.0.close()).await;
+answer
+```
+
+Taking `Probe` by value means the caller can't keep it, so the delete can only happen in one place. `close()` is `TempPath`'s explicit delete. It returns the I/O error that `Drop` would have swallowed, and we ignore it the same way: the answer is what the caller needs, and a stray temporary file doesn't change it. Staging got the marker. The manager builds the `UpgradeMarker` first, moves it into the staging closure, and the closure stores it after the binary and hands it back, as the verification closure hands back the bytes. The rollback path had the same delete and the same syncs on its worker, so it got the same treatment.
+
+How we measured mattered too. The first timestamps went out with `eprintln!`, and on the loaded Mac a line to the log file sometimes took 270 ms by itself, which looked like yet another stall. The fixture's own `upgrade-fixture phase=...` lines do the same under `--no-capture`. Pushing the timestamps onto an in-memory list and printing it once at the end gave clean readings. (CI captures each test's output through a pipe, so it doesn't pay this; the timestamps did.) Two control tests, a ticker beside a bare two-second sleep and a ticker beside a blocking-pool hash of 96 MB, never saw more than 25 ms on the same loaded machine. So the bound wasn't too tight for the machine, and it stayed at 250 ms. After the fix the same 200-run loop, under the same load, passed 200 times out of 200.

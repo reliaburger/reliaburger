@@ -109,6 +109,9 @@ pub enum EventKind {
     /// An operator changed the cluster: apply, delete, exec, upgrade,
     /// snapshot, job submission and the other audited actions.
     Operation,
+    /// The API refused a request to an audited route, or summarises the
+    /// refusals it suppressed (#798).
+    Refusal,
 }
 
 /// Importance of an event.

@@ -69,6 +69,7 @@ impl TestHarness {
         let runner = agent.delegated_task_runner(jobs.path()).unwrap();
         let node = reliaburger::bun::task_array_node::TaskArrayNode::new(
             reliaburger::bun::task_array_node::TaskArrayNodeConfig {
+                audit_dir: None,
                 root: jobs.path().join("tasks"),
                 policy: reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                     allowed_binaries: ["/bin/echo", "/bin/false", "/bin/sh", "/usr/bin/true"]

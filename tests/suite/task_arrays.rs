@@ -152,6 +152,7 @@ impl Harness {
 
         let node = TaskArrayNode::new(
             TaskArrayNodeConfig {
+                audit_dir: None,
                 root: data.path().join("task-arrays"),
                 policy: ProcessWorkloadsConfig {
                     allowed_binaries: options.allowed.iter().map(PathBuf::from).collect(),

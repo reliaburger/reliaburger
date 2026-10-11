@@ -145,7 +145,6 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
 
 /// Mutating routes whose handlers record their own audit events, with the
 /// fault id, token name or rotation stage only they know.
-#[cfg(test)]
 pub(crate) const HANDLER_AUDITED_ROUTES: &[(RouteMethod, &str)] = &[
     (Post, "/v1/fault"),
     (Delete, "/v1/fault"),
@@ -277,15 +276,15 @@ pub(crate) fn audited_route(
 /// [`AUDITED_ROUTES`] request that succeeds, synced to disk before the
 /// response leaves.
 ///
-/// Only successes are recorded: the log answers "who changed what", and a
-/// refused request changed nothing.
+/// A refused request isn't recorded here: a request with no valid
+/// credential never gets this far. Instead this layer marks a refusal with
+/// who the caller was ([`RefusedCaller`]), and [`refusal_layer`], outside
+/// the auth layer, records every refusal.
 pub(super) async fn audit_layer(
     State(state): State<ApiState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    use axum::extract::FromRequestParts;
-
     let caller = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -294,30 +293,330 @@ pub(super) async fn audit_layer(
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .and_then(|matched| audited_route(request.method(), matched.as_str()));
-    let Some(route) = route else {
-        let (response, _) = crate::bun::audit::scope_request(caller, next.run(request)).await;
-        return response;
-    };
     let auth = request
         .extensions()
         .get::<crate::sesame::auth::AuthContext>()
         .cloned();
+    let Some(route) = route else {
+        let (mut response, note) =
+            crate::bun::audit::scope_request(caller, next.run(request)).await;
+        mark_refusal(&mut response, auth.as_ref(), note);
+        return response;
+    };
     let (mut parts, body) = request.into_parts();
-    let parameters: Vec<(String, String)> =
-        match axum::extract::RawPathParams::from_request_parts(&mut parts, &()).await {
-            Ok(raw) => raw
-                .iter()
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+    let parameters = path_parameters(&mut parts).await;
     let request = axum::extract::Request::from_parts(parts, body);
-    let (response, note) = crate::bun::audit::scope_request(caller, next.run(request)).await;
+    let (mut response, note) = crate::bun::audit::scope_request(caller, next.run(request)).await;
     if response.status().is_success() {
         let record = record_route(&state, auth.as_ref(), route, parameters, note);
         let _ = crate::bun::audit::scope_request(caller, record).await;
+    } else {
+        mark_refusal(&mut response, auth.as_ref(), note);
     }
     response
+}
+
+/// The request's path parameters, in order. Empty when it has none.
+async fn path_parameters(parts: &mut axum::http::request::Parts) -> Vec<(String, String)> {
+    use axum::extract::FromRequestParts;
+
+    match axum::extract::RawPathParams::from_request_parts(parts, &()).await {
+        Ok(raw) => raw
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Who an authenticated, refused request came from, and what the handler
+/// had learnt of its target before refusing. The audit layer attaches it to
+/// a 401 or 403 response for [`refusal_layer`]; it never leaves the server.
+#[derive(Debug, Clone)]
+struct RefusedCaller {
+    principal: String,
+    token_name: String,
+    app: Option<String>,
+    namespace: Option<String>,
+}
+
+/// Attach a [`RefusedCaller`] to `response` if it refuses the request.
+fn mark_refusal(
+    response: &mut Response,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    note: AuditNote,
+) {
+    if !matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        return;
+    }
+    let (principal, token_name) = audit_principal(auth);
+    response.extensions_mut().insert(RefusedCaller {
+        principal,
+        token_name,
+        app: note.app,
+        namespace: note.namespace,
+    });
+}
+
+/// A route whose refusals are recorded: every route whose success is.
+struct RefusedRoute {
+    /// The action a success would have recorded, when the layer records it.
+    attempted: Option<&'static str>,
+    /// The path parameter that names the app.
+    app_parameter: &'static str,
+}
+
+fn refused_route(method: &axum::http::Method, path: &str) -> Option<RefusedRoute> {
+    if let Some(route) = audited_route(method, path) {
+        return Some(RefusedRoute {
+            attempted: Some(route.action),
+            app_parameter: route.app_parameter,
+        });
+    }
+    let method = match *method {
+        axum::http::Method::POST => Post,
+        axum::http::Method::DELETE => Delete,
+        _ => return None,
+    };
+    HANDLER_AUDITED_ROUTES
+        .iter()
+        .any(|(audited_method, audited_path)| *audited_method == method && *audited_path == path)
+        .then_some(RefusedRoute {
+            attempted: None,
+            app_parameter: "app",
+        })
+}
+
+/// The layer outside the auth layer that records refused requests to
+/// audited routes (#798): a missing or unknown credential (401), or a role,
+/// `[permission]` or scope refusal (403).
+///
+/// Each record names the principal (or `anonymous`), the source address,
+/// the route, the app and namespace when known, and the reason. It never
+/// holds the credential or the request body. A [`RefusalLimiter`] keeps a
+/// flood from filling the bounded log: past a few refusals a minute from one
+/// source, they are counted, and one summary record says how many.
+///
+/// [`RefusalLimiter`]: crate::bun::audit::refusals::RefusalLimiter
+pub(super) async fn refusal_layer(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .and_then(|matched| {
+            refused_route(request.method(), matched.as_str())
+                .map(|route| (route, format!("{} {}", request.method(), matched.as_str())))
+        });
+    let Some((route, route_name)) = route else {
+        return next.run(request).await;
+    };
+    let caller = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0);
+    let (mut parts, body) = request.into_parts();
+    let parameters = path_parameters(&mut parts).await;
+    let mut response = next
+        .run(axum::extract::Request::from_parts(parts, body))
+        .await;
+    use crate::sesame::auth::RefusalReason;
+    let reason = match response.status() {
+        StatusCode::UNAUTHORIZED => RefusalReason::Unauthenticated,
+        StatusCode::FORBIDDEN => response
+            .extensions()
+            .get::<RefusalReason>()
+            .copied()
+            .unwrap_or(RefusalReason::Forbidden),
+        _ => return response,
+    };
+    let refused = response.extensions_mut().remove::<RefusedCaller>();
+    record_refusal(
+        &state,
+        Refusal {
+            route,
+            route_name,
+            caller,
+            parameters,
+            reason,
+            refused,
+        },
+    )
+    .await;
+    response
+}
+
+/// One refused request, as [`refusal_layer`] saw it.
+struct Refusal {
+    route: RefusedRoute,
+    route_name: String,
+    caller: Option<std::net::SocketAddr>,
+    parameters: Vec<(String, String)>,
+    reason: crate::sesame::auth::RefusalReason,
+    refused: Option<RefusedCaller>,
+}
+
+/// The principal a refusal by a caller with no valid credential names.
+const ANONYMOUS: &str = "anonymous";
+
+/// Record `refusal` if the limiter lets it through, and any summaries of
+/// suppressed refusals that are due.
+async fn record_refusal(state: &ApiState, refusal: Refusal) {
+    if state.events.is_none() {
+        return;
+    }
+    let Refusal {
+        route,
+        route_name,
+        caller,
+        parameters,
+        reason,
+        refused,
+    } = refusal;
+    let mut app = None;
+    let mut namespace = None;
+    for (key, value) in parameters {
+        if key == route.app_parameter {
+            app = Some(value);
+        } else if key == "namespace" {
+            namespace = Some(value);
+        }
+    }
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("route".to_string(), route_name.clone());
+    details.insert("reason".to_string(), reason.as_str().to_string());
+    if let Some(attempted) = route.attempted {
+        details.insert("attempted".to_string(), attempted.to_string());
+    }
+    let principal = match refused {
+        Some(refused) => {
+            app = refused.app.or(app);
+            namespace = refused.namespace.or(namespace);
+            details.insert("token_name".to_string(), refused.token_name);
+            refused.principal
+        }
+        None => ANONYMOUS.to_string(),
+    };
+    let now = unix_now_seconds();
+    let verdict = state.refusals.lock().await.admit(
+        crate::bun::audit::refusals::RefusalSource::Caller {
+            address: caller.map(|address| address.ip()),
+            principal: principal.clone(),
+        },
+        now,
+    );
+    write_suppressed_refusals(state, verdict.summaries, now).await;
+    if !verdict.record {
+        return;
+    }
+    let from = caller.map_or_else(String::new, |address| format!(" from {}", address.ip()));
+    let message = format!(
+        "refused {route_name} for {principal}{from}: {}",
+        reason.as_str()
+    );
+    write_audit(
+        state,
+        crate::bun::events::AuditEvent {
+            timestamp: now,
+            kind: EventKind::Refusal,
+            severity: crate::bun::events::EventSeverity::Warning,
+            action: "api.refused".to_string(),
+            principal,
+            app,
+            namespace,
+            node: Some(local_node_name(state)),
+            source_address: caller,
+            details,
+            message,
+        },
+    )
+    .await;
+}
+
+/// The audit event that says how many refusals from one source a closed
+/// window suppressed.
+pub(super) fn suppressed_refusals_event(
+    summary: crate::bun::audit::refusals::SuppressedRefusals,
+    node: String,
+    now: u64,
+) -> crate::bun::events::AuditEvent {
+    use crate::bun::audit::refusals::{REFUSAL_WINDOW_SECONDS, RefusalSource};
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("suppressed".to_string(), summary.suppressed.to_string());
+    details.insert("window_start".to_string(), summary.window_start.to_string());
+    details.insert(
+        "window_seconds".to_string(),
+        REFUSAL_WINDOW_SECONDS.to_string(),
+    );
+    let (principal, from) = match summary.source {
+        RefusalSource::Caller { address, principal } => {
+            let from = match address {
+                Some(address) => {
+                    details.insert("source".to_string(), address.to_string());
+                    format!("{principal} from {address}")
+                }
+                None => principal.clone(),
+            };
+            (principal, from)
+        }
+        RefusalSource::Overflow => ("*".to_string(), "other sources".to_string()),
+    };
+    crate::bun::events::AuditEvent {
+        timestamp: now,
+        kind: EventKind::Refusal,
+        severity: crate::bun::events::EventSeverity::Warning,
+        action: "api.refusals_suppressed".to_string(),
+        principal,
+        app: None,
+        namespace: None,
+        node: Some(node),
+        source_address: None,
+        details,
+        message: format!(
+            "{} more refused requests by {from} suppressed",
+            summary.suppressed
+        ),
+    }
+}
+
+/// Record a summary for each window in `summaries`.
+async fn write_suppressed_refusals(
+    state: &ApiState,
+    summaries: Vec<crate::bun::audit::refusals::SuppressedRefusals>,
+    now: u64,
+) {
+    for summary in summaries {
+        let event = suppressed_refusals_event(summary, local_node_name(state), now);
+        write_audit(state, event).await;
+    }
+}
+
+/// How often the summaries of closed refusal windows are written when no
+/// new refusal arrives to carry them.
+const REFUSAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Write the summary of every closed refusal window, every
+/// [`REFUSAL_SWEEP_INTERVAL`], until the agent's command channel closes.
+/// Without it a burst that stops would never be summarised.
+pub(super) fn spawn_refusal_sweeper(state: ApiState) {
+    if state.events.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REFUSAL_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! { _ = state.cmd_tx.closed() => return, _ = interval.tick() => {} }
+            let now = unix_now_seconds();
+            let summaries = state.refusals.lock().await.sweep(now);
+            write_suppressed_refusals(&state, summaries, now).await;
+        }
+    });
 }
 
 /// Write the record for one successful audited request.
