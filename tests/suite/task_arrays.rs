@@ -137,7 +137,6 @@ impl Harness {
                 tokio::select! {
                     () = agent_shutdown.cancelled() => return,
                     command = cmd_rx.recv() => match command {
-                        Some(reliaburger::bun::agent::AgentCommand::BatchOwnedExecutions { response, .. }) => { let _ = response.send(Default::default()); }
                         Some(reliaburger::bun::agent::AgentCommand::CurrentResources { response }) => { let _ = response.send(Vec::new()); }
                         Some(reliaburger::bun::agent::AgentCommand::Status { response }) => { let _ = response.send(Vec::new()); }
                         Some(reliaburger::bun::agent::AgentCommand::DeployOperations { response }) => { let _ = response.send(reliaburger::bun::deploy_operations::DeployOperationSnapshot { active_deploys: Vec::new(), history: Vec::new() }); }

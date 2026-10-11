@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 /// Keep a readable Bun log unchanged, or expose only the failed read's kind.
 /// Error text and paths can contain sensitive fixture data and are omitted.
-fn bun_log_diagnostic(log_path: &Path) -> String {
+pub fn bun_log_diagnostic(log_path: &Path) -> String {
     match std::fs::read_to_string(log_path) {
         Ok(log) => log,
         Err(error) => format!("bun log-read-error kind={:?}", error.kind()),

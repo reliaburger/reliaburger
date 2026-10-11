@@ -616,8 +616,8 @@ async fn logs_json_field_filters_structured_lines() {
 async fn logs_follow_returns_output_for_completed_job() {
     let harness = TestHarness::start().await;
 
-    // Deploy a job (not an app) — the agent's check_jobs loop detects
-    // process exit and updates state, which lets follow_logs terminate.
+    // Deploy a job (not an app). Its run finishes on the common job
+    // lifecycle, which lets the follow terminate.
     let config = Config::parse(
         r#"
         [job.echoer2]

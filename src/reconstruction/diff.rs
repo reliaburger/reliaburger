@@ -166,6 +166,8 @@ mod tests {
                     cached_specs: vec![],
                     resource_usage: ResourceUsage::default(),
                     event_log: vec![],
+                    job_reservations: Default::default(),
+                    capacity_refusals: Vec::new(),
                 },
             );
         }

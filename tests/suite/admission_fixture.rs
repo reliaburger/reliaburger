@@ -1,7 +1,6 @@
 //! Seed whole-pass admission entries the way a planner commits them.
 //!
-//! `BatchRegister` and `SchedulingDecisions` carry the Raft log id their plan
-//! was made against, and the state machine refuses the entry with "admission
+//! `SchedulingDecisions` carries the Raft log id its plan was made against, and the state machine refuses the entry with "admission
 //! revision changed" if any other entry was applied in between. That is the
 //! designed contract: the ordinary scheduler replans from committed state on
 //! its next tick. Tests that seed these entries beside a running API share the
@@ -30,10 +29,6 @@ pub(crate) async fn write_admission_fixture(
         plans += 1;
         let previous = council.desired_state().await.last_applied_log;
         let planned = match request.clone() {
-            RaftRequest::BatchRegister { batch, .. } => RaftRequest::BatchRegister {
-                expected_log_id: previous,
-                batch,
-            },
             RaftRequest::SchedulingDecision(decision) => RaftRequest::SchedulingDecisions {
                 expected_log_id: previous,
                 decisions: vec![decision],

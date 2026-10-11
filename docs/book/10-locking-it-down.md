@@ -838,7 +838,7 @@ pub fn is_system_principal(ctx: &AuthContext) -> bool {
 }
 ```
 
-Only a bearer that matched the service token gets both fields. A session's principal id always starts `session:`, so it can never pass, whatever token it came from. The token-list handler already had exactly this check inline; now both use the helper. The regression, `require_system_refuses_a_session_made_from_the_service_token`, builds the session context with the middleware's own function rather than by hand, so a later change to what a session looks like can't quietly make the test pass. `service_token_cookie_cannot_run_a_batch_on_a_node` in the integration suite does the whole thing from the outside: log in with the service token, take the cookie, post a batch, get a 403, and check the agent never heard about it.
+Only a bearer that matched the service token gets both fields. A session's principal id always starts `session:`, so it can never pass, whatever token it came from. The token-list handler already had exactly this check inline; now both use the helper. The regression, `require_system_refuses_a_session_made_from_the_service_token`, builds the session context with the middleware's own function rather than by hand, so a later change to what a session looks like can't quietly make the test pass. `service_token_cookie_cannot_run_a_batch_on_a_node` in the integration suite does the whole thing from the outside: log in with the service token, take the cookie, post the leader's task sync, get a 403, and check the agent never heard about it.
 
 ### Every row, every caller
 

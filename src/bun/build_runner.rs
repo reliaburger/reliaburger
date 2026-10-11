@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::meat::batch_tracker::epoch_now_secs;
+use crate::meat::batch_ids::epoch_now_secs;
 
 use super::api::ApiState;
 
@@ -2389,6 +2389,8 @@ mod tests {
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
             has_buildah,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 

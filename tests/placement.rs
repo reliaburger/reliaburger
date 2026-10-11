@@ -195,6 +195,7 @@ async fn start_node_with(
         labels,
         keep_data_dir,
         task_arrays: None,
+        task_arrays_on_agent_budget: None,
     })
     .await;
 

@@ -836,17 +836,11 @@ mod tests {
         mut request: crate::council::RaftRequest,
     ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
         let previous = council.desired_state().await.last_applied_log;
-        match &mut request {
-            crate::council::RaftRequest::BatchRegister {
-                expected_log_id, ..
-            } => *expected_log_id = previous,
-            crate::council::RaftRequest::SchedulingDecision(decision) => {
-                request = crate::council::RaftRequest::SchedulingDecisions {
-                    expected_log_id: previous,
-                    decisions: vec![decision.clone()],
-                }
+        if let crate::council::RaftRequest::SchedulingDecision(decision) = &request {
+            request = crate::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
             }
-            _ => {}
         }
         council.write(request).await
     }

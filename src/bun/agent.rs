@@ -61,10 +61,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::config::app::AppSpec;
-use crate::config::job::JobSpec;
 use crate::council::node::CouncilNode;
 use crate::council::types::CouncilNodeInfo;
-use crate::grill::oci::generate_job_oci_spec;
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
 use crate::grill::{Grill, InstanceId};
@@ -80,9 +78,6 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
-mod batch_jobs;
-mod cluster_jobs;
-pub use cluster_jobs::{ClusterJobReceipt, ClusterJobSettlement};
 mod commands;
 mod consumer;
 mod council_requests;
@@ -98,10 +93,7 @@ mod follow_ups;
 mod health_checks;
 mod identity;
 mod identity_signing;
-mod job_runs;
 mod launch;
-#[cfg(test)]
-pub(crate) use cluster_jobs::ClusterJobExecution;
 mod launch_evidence;
 mod logs;
 mod networking;
@@ -131,7 +123,6 @@ use discovery_ownership::{DiscoveryOwnership, JournalReference};
 use faults::{InstalledNetworkFaults, NodeFaultFence};
 use health_checks::wait_instance_healthy;
 pub use identity::workload_spiffe_uri;
-use job_runs::ScheduledJob;
 use restarts::RestartRotation;
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 pub use status::{
@@ -157,10 +148,10 @@ const INIT_TIMEOUT_SECS: u64 = 300;
 /// in its last line or two, so a short tail says why without flooding logs.
 const INIT_FAILURE_STDERR_BYTES: u64 = 400;
 
-/// Maximum time a `run_before` prerequisite job may run before the gated
-/// deploy is aborted. Migrations are the classic case; a hung one must not
-/// wedge the deploy forever.
-const RUN_BEFORE_TIMEOUT_SECS: u64 = 600;
+/// How long a capacity refusal stays in this node's state reports. A
+/// failing deploy refreshes it on every retry; a deploy that succeeds, or a
+/// leader that moved the app away, lets it lapse.
+const CAPACITY_REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How many event-loop ticks (~1s each) between attempts to provision an
 /// identity for a running instance that has none — frequent enough to heal
@@ -381,9 +372,6 @@ enum LoopStall {
     /// A pre-start's DNS lookups for an egress allowlist. Whoever prepares
     /// the start does them now, off the loop (#419).
     EgressDns,
-    /// Validating and serialising the whole job inventory, off the loop
-    /// but awaited by it.
-    JobInventoryEncode,
     /// Reading the runtime's launch inventory: the runc intent journal,
     /// one file per launch, which after a restart comes off a cold disk.
     /// Only counted; `MockGrill::set_inventory_delay` makes it slow.
@@ -676,15 +664,15 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Apps whose last fresh deploy here failed because the execution
+    /// budget had no room (job leases may hold it), keyed by (app_name,
+    /// namespace), with when that happened. State reports carry recent ones
+    /// so the leader places the replicas elsewhere instead of holding them.
+    capacity_refusals: std::collections::HashMap<(String, String), tokio::time::Instant>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; reservations advance beyond both this counter and all restored owners.
     next_deploy_gen: u64,
-    /// Jobs carrying a `schedule`, registered on apply and fired by the cron
-    /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
-    scheduled_jobs: std::collections::HashMap<(String, String), ScheduledJob>,
-    /// A failed or cancelled write must be resolved by reloading at startup.
-    scheduled_jobs_store_uncertain: bool,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -711,9 +699,6 @@ pub struct BunAgent<G: Grill> {
     /// crash restart or a self-upgrade exec) can adopt them instead of
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
-    recorded_jobs: BTreeMap<String, super::jobs::RecordedJob>,
-    retired_batch_executions: BTreeMap<String, super::jobs::RetiredBatchExecution>,
-    job_store_uncertain: bool,
     /// Self-upgrade manager. `None` when upgrades are not configured
     /// (upgrade commands then answer with an error).
     upgrade: Option<crate::upgrade::manager::UpgradeManager>,
@@ -913,9 +898,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             next_deploy_gen: 1,
-            scheduled_jobs: std::collections::HashMap::new(),
-            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             capture_offsets: Arc::default(),
             events: None,
@@ -924,9 +908,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             signature_source: None,
             records_dir: None,
-            recorded_jobs: BTreeMap::new(),
-            retired_batch_executions: BTreeMap::new(),
-            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -1074,9 +1055,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             next_deploy_gen: 1,
-            scheduled_jobs: std::collections::HashMap::new(),
-            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             capture_offsets: Arc::default(),
             events: None,
@@ -1085,9 +1065,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             signature_source: None,
             records_dir: None,
-            recorded_jobs: BTreeMap::new(),
-            retired_batch_executions: BTreeMap::new(),
-            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -1437,7 +1414,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let grill = self.supervisor.grill().clone();
         let id = instance_id.clone();
-        let app = self.logical_execution_name(instance_id, app_name);
+        let app = app_name.to_string();
         let namespace = namespace.to_string();
 
         let (line_tx, mut line_rx) = mpsc::channel::<crate::ketchup::types::CapturedLine>(256);
@@ -1653,7 +1630,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// The loop's periodic work: health probes, restarts, retirements, jobs,
+    /// The loop's periodic work: health probes, restarts, retirements,
     /// fault expiry, firewall reconciliation and identity rotation.
     async fn run_health_tick(&mut self) {
         self.reopen_uncertain_discovery().await;
@@ -1664,7 +1641,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.drive_deferred_retirements().await;
         self.refresh_egress_readiness().await;
         self.run_health_checks().await;
-        self.fire_due_jobs().await;
         self.begin_state_sweep();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
