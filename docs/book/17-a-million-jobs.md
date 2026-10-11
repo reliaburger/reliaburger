@@ -106,6 +106,8 @@ A block cut short by a crash at the very end is truncated before new records are
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
 
+A benchmark nobody runs measures nothing, and for a while nothing ran this one. CI now does, every night on `main` and on any pull request that touches the leader, the pool, the executor or the benchmark itself. Each run's Criterion output is kept for 90 days, so a cost claim can point at a trend rather than one good afternoon on a laptop. The job fails only when a benchmark gets more than twice as slow as the last baseline `main` saved: a hosted runner's speed wanders by tens of per cent, and we'd rather miss a 30% regression in CI (the trend shows it) than teach everyone to re-run a red benchmark.
+
 ### Wiring it in: one Raft entry per tick
 
 Those 422 ticks become Raft entries once the pieces are wired, so the shape of the entry matters. We gave task arrays exactly one new `RaftRequest` variant:
@@ -623,6 +625,111 @@ every active run, a cron fire uses the reserved headroom, a refused one is
 recorded as skipped, daily named arrays keep working past the definition cap,
 and on a real three-node cluster a cron job fires while other tenants fill
 every bulk slot.
+
+### Watching a million jobs
+
+Here's the question that started issue #684: did last night's cron job
+succeed? At 08:00 the answer was usually "who knows". Finished runs were kept
+for an hour and at most twenty across the whole cluster, so a per-minute cron
+in another namespace pushed the 03:00 failure out before anyone had coffee. No
+event recorded it, no metric counted it, no webhook fired. And `relish top`
+didn't list array tasks at all, because they run in the task executor, not
+under the supervisor that `top` asks.
+
+The fix has four parts, and each one is about *where* a fact should live.
+
+**Outcomes live with the definition.** A run's detail (results, logs, failed
+index ranges) is big and belongs to the run. Its outcome is small. So
+`DefinitionRecord` gained a `history: Vec<RunOutcome>` of at most ten entries,
+each a fixed handful of numbers: run id, start and finish time, terminal
+status, succeeded, failed and not-run counts, and the lowest failed index.
+`mark_terminal`, the one place every write path goes through when a run ends,
+appends to it. Pruning then can't lose it, because pruning never touches
+definitions it doesn't expire. Retention itself became per namespace: twenty
+finished runs each, twenty-four in all, and when the cluster is over, the
+namespace keeping the most gives up its oldest. That's a few lines in
+`retention_evictions`:
+
+```rust
+let Some(units) = kept.values_mut().rev().max_by_key(|units| units.len()) else {
+    break;
+};
+```
+
+`let ... else` binds the pattern or runs the `else` block, which must leave the
+scope (`break`, `return`, `continue`). It's the early return Go programmers
+write by hand, without an extra level of nesting. The `rev()` is for
+determinism: `max_by_key` keeps the *last* maximum it sees, so walking the
+`BTreeMap` backwards makes ties go to the first namespace by name. Every Raft
+replica prunes the same runs, or their snapshots disagree.
+
+**Counters live on the node that ran the attempts.** The leader already
+computed accepted rates, but in memory: they reset whenever leadership moved.
+So each node's executor now feeds a `JobTelemetry` on every sync, with each
+run's live counters, and Bun's collection loop exports the totals as
+`job_attempts_started_total`, `job_tasks_failed_total` and friends, plus a
+cumulative duration histogram. The labels are fixed: namespace, definition,
+profile, node. We considered labelling by batch id, as the September plan
+sketched, and decided against it: every one-off run would mint a new series,
+and a daily `render-$DATE` would grow the store for ever. A test checks that
+no other label ever appears, and that a node never keeps more than 1,024
+label sets however many definitions come and go.
+
+The telemetry is shared by async tasks and synchronous code, so it sits behind
+a `std::sync::Mutex`, not a tokio one. That's allowed here because no critical
+section contains an `.await`: each is a few map operations. Holding a std mutex
+across an `.await` would block the whole worker thread while the future slept,
+which is why the project rule says tokio mutexes by default.
+
+Counters only go up. A node that restarts reopens its runs with counters at
+zero, so `observe` treats a counter that went backwards as "everything here is
+new" rather than subtracting into a huge unsigned number:
+
+```rust
+let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
+```
+
+**Events come from replicated state, not from tasks.** The leader keeps a
+`JobEventTracker` and, at the start of each tick, compares the committed job
+state with what it has announced. A run that reached a terminal state gets one
+event (`job-completed`, `job-failed` or `job-cancelled`); a run that gained an
+unknown owner gets `job-unknown`. Failed and unknown runs also go to the alert
+webhook, dressed as an ordinary `AlertTransition`, so Slack and PagerDuty get
+their usual payloads with no new code. Because the tracker reads runs, not
+results, a million-task run is one event, and there's a test that says so.
+
+What happens when leadership moves? The new leader's first look is silent: it
+records what's already finished and announces nothing. Otherwise every leader
+change would re-send every retained failure to PagerDuty. The cost is a small
+window: a run finishing in the second before the change may go unannounced.
+We could close it with a durable "announced" marker per run, one more Raft
+write each, and decided the definition's history was a good enough safety net
+for now.
+
+**Usage comes from cgroups.** On Linux every attempt already runs inside a
+cgroup: the reusable executor's, or a fresh runtime's. So the runner reports
+*where* to measure, and the collection loop reads `cpu.stat` and
+`memory.current` there. For fresh runtimes the runner has to remember which
+attempts are running, and an attempt can end through a dozen early returns.
+Rather than remember to clean up at each one, it holds a guard:
+
+```rust
+let _listing = task
+    .run
+    .as_ref()
+    .map(|run| AttemptListing::new(&self.attempts, run.batch_id, id.clone(), cgroup.clone()));
+```
+
+`AttemptListing::new` adds the attempt to the map, and its `Drop`
+implementation removes it. Rust runs `drop` when the value goes out of scope,
+however the function returns, including on `?`. It's Go's `defer`, attached to
+a value instead of a statement. The leading underscore matters: `let _ = ...`
+would drop the guard immediately, while `let _listing` keeps it alive to the
+end of the function and only tells the compiler we won't read it.
+
+`relish top` then shows one row per definition and profile on each node, with
+`tasks:27` where a PID would be. A singleton run already had its own `run-N`
+row, so its usage fills that row instead of adding a second one.
 
 ### Dispatch at scale: sixty-four arrays and a node that won't answer
 
@@ -1836,11 +1943,6 @@ should shrink to nothing before the release ships.
   reserve CPU and memory in each node's own budget, which the leader's app
   scheduler can't see. It can place a replica on a node that jobs have already
   filled.
-- **Job history and events**
-  ([#684](https://github.com/reliaburger/reliaburger/issues/684)). Finished
-  runs are pruned within the hour, there are no job metrics or events, and
-  array tasks don't show in `relish top`. You can't yet answer "did last
-  night's cron job succeed?" the next morning.
 
 ## Lessons
 

@@ -1286,6 +1286,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
             }],
             stopping: false,
             replay_unknown: true,
+            labels: Default::default(),
         }],
     };
     let progress = tokio::time::timeout(Duration::from_secs(20), async {
@@ -2229,6 +2230,7 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
             }],
             stopping,
             replay_unknown: true,
+            labels: Default::default(),
         }],
     };
     // Wait until both executors are busy and the other callers are queued.
@@ -2484,4 +2486,155 @@ async fn runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_r
     assert_eq!(runner.forget_retired_executors().await, 0);
     drop(runner);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A running shared-runc profile is measured from its executor's cgroup:
+/// `relish top` and Mayo get CPU and memory for array tasks, which run
+/// outside the app supervisor and its per-process samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc and pinned images; run with make test-linux"]
+async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_array_node::{
+            ArrayAssignment, ControlVersion, HeldChunk, NodeRunner, NodeSyncRequest, TaskArrayNode,
+            TaskArrayNodeConfig,
+        },
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
+    use reliaburger::grill::AnyGrill;
+    use reliaburger::mayo::collector::SystemCollector;
+    use reliaburger::mayo::job_metrics::{CgroupCpu, JobLabels, UsageTarget};
+    use reliaburger::meat::{
+        Resources,
+        task_array::{ChunkId, TaskArraySpec},
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-684-usage-")
+        .tempdir()
+        .unwrap();
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.path().join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = RuncGrill::new(
+        root.path().join("bundles"),
+        images,
+        false,
+        root.path().join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let budget = ExecutionBudget::new(Resources::new(1000, 256 << 20, 0));
+    let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+        "image='{image}'\nnamespace='rbtest-usage'\nruntime='shared-runc'\ncpu='200m'\nmemory='32Mi'"
+    ))
+    .unwrap();
+    let node = TaskArrayNode::new(
+        TaskArrayNodeConfig::for_data_dir(
+            root.path(),
+            ProcessWorkloadsConfig {
+                allowed_binaries: Vec::new(),
+                mount_isolation: false,
+                script_dir: root.path().join("scripts"),
+            },
+        ),
+        NodeRunner::Owned(Box::new(
+            OwnedRunner::for_data_dir(AnyGrill::Runc(runtime), root.path()).unwrap(),
+        )),
+    )
+    .with_budget(budget.clone());
+    let labels = JobLabels {
+        namespace: "rbtest-usage".into(),
+        definition: "burn".into(),
+        profile: "default".into(),
+    };
+    let mut spec = TaskArraySpec::with_count(2);
+    spec.chunk_size = 2;
+    spec.max_attempts = 1;
+    let request = |stopping| NodeSyncRequest {
+        version: ControlVersion {
+            index: 1,
+            ..Default::default()
+        },
+        known: vec![1],
+        arrays: vec![ArrayAssignment {
+            template: Some(Box::new(template.clone())),
+            resources: Resources::new(200, 32 << 20, 0),
+            batch_id: 1,
+            spec: spec.clone(),
+            program: "/unused".into(),
+            // Busy for a while, so there is CPU to see.
+            args: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "end=$(($(date +%s)+8)); while [ $(date +%s) -lt $end ]; do :; done".into(),
+            ],
+            env: vec![],
+            held: vec![HeldChunk {
+                chunk: ChunkId(0),
+                attempt: 1,
+            }],
+            stopping,
+            replay_unknown: true,
+            labels: labels.clone(),
+        }],
+    };
+    let telemetry = node.telemetry().clone();
+    let mut last = None;
+    let found = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            last = Some(node.sync(&request(false)).await);
+            let targets = telemetry.usage_targets();
+            if targets.get(&labels).is_some_and(|(_, targets)| {
+                targets
+                    .iter()
+                    .any(|target| matches!(target, UsageTarget::Cgroup(_)))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "the shared-runc executor never reported a cgroup; last sync {last:?}, targets {:?}",
+        telemetry.usage_targets()
+    );
+
+    let mut collector = SystemCollector::new();
+    let mut cgroups = CgroupCpu::default();
+    collector.refresh();
+    telemetry.sample_usage(&collector, &mut cgroups, "node-a");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node.sync(&request(false)).await;
+    collector.refresh();
+    let samples = telemetry.sample_usage(&collector, &mut cgroups, "node-a");
+    let value = |name: &str| {
+        samples
+            .iter()
+            .find(|sample| sample.key.name.as_str() == name)
+            .map(|sample| sample.value)
+    };
+    let memory = value("job_memory_bytes").expect("no memory sample");
+    let cpu = value("job_cpu_percent").expect("no cpu sample");
+    assert!(memory > 0.0, "memory {memory}");
+    assert!(cpu > 1.0, "cpu {cpu}");
+    let usage = telemetry.usage()[&labels];
+    assert!(usage.running >= 1, "{usage:?}");
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while node.sync(&request(true)).await.arrays[0]
+            .finished
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the stopped array never finished");
 }

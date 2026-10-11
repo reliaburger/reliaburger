@@ -282,6 +282,17 @@ Note: `node_memory_usage_percent` and `node_disk_usage_percent` (which the built
 
 Instances without a PID are skipped. There are no counters here, no restart/OOM/throttle metrics, and no cgroup-derived limits.
 
+**Job metrics: implemented (#684).** Array tasks and job singletons run in the task executor, outside the supervisor, so they have no instance status and no `process_*` samples. Instead each node's executor feeds a `JobTelemetry` (`src/mayo/job_metrics.rs`) every time the leader syncs it, with each run's live counters on that node, and the collection loop exports it. Labels are fixed: `namespace`, `definition` (job or array name), `profile` (a manifest's resource profile, `default` otherwise) and `node`, plus `le` on histogram buckets. A task index or run id is never a label, and a node keeps at most 1,024 label sets (the longest-idle set without running attempts goes first). The counters live on the node that ran the attempts, so a leader change doesn't reset them; a node restart does, like any Prometheus counter.
+
+| Metric | Kind |
+|--------|------|
+| `job_attempts_started_total`, `job_tasks_succeeded_total`, `job_tasks_failed_total`, `job_task_retries_total` | Counters |
+| `job_tasks_running` | Gauge: attempts holding a slot (busy executor slots for reusable runtimes) |
+| `job_task_duration_ms_bucket{le}`, `job_task_duration_ms_count` | Cumulative final-attempt duration buckets, 1 ms to 16,384 ms plus `+Inf` |
+| `job_cpu_percent`, `job_memory_bytes` | Gauges for the running attempts: each reusable executor's cgroup and each fresh runtime's cgroup on Linux (`cpu.stat` `usage_usec` deltas, `memory.current`); the process via `sysinfo` where the runtime has no cgroup |
+
+An executor's cgroup holds its helper as well as its task groups, so the sample includes the helper's small overhead. `relish top` reads the same telemetry for its job rows.
+
 **GPU metrics: none.** There is no `nvidia-smi` collection; no `*_gpu_*` metric is emitted.
 
 **Ingress metrics: implemented (counters), planned (durations).** The Wrapper proxy maintains a process-global `IngressMetrics` and Bun's collection loop emits `ingress_requests_total`, `ingress_responses_1xx`..`5xx`, and `ingress_requests_in_flight`. Per-route breakdowns and `ingress_request_duration_seconds` histograms remain **planned -- not yet implemented**.
@@ -362,6 +373,8 @@ Note the real shape: `severity`/`status` are lowercase strings; `value` is the n
 **Signing:** when a destination has a `secret`, the body is signed HMAC-SHA256 and the digest is sent as `X-Mayo-Signature-256: sha256=<hex>`. For PagerDuty the `secret` doubles as the routing key.
 
 **Retry policy:** failed deliveries are retried 3 times with backoff (1s, 5s, 25s); after that the delivery is dropped with a log. There is no `mayo_alert_notification_failed_total` counter. Failure logs redact the URL to scheme+host so a Slack webhook path (which carries the secret) is never written to disk.
+
+**Job runs (#684).** The leader also sends a built-in notification through the same dispatcher for every job run that ends with a failed task (`job_run_failed`) or whose outcome becomes unknown after its owner went quiet (`job_run_unknown_outcome`). It's a critical, firing-only alert with labels `job`, `namespace` and `run`, so each run is its own PagerDuty incident; nothing resolves it. The leader derives these from the replicated job state, not from task results (`src/bun/job_events.rs`), so a million-task run sends one. A new leader takes a silent first snapshot, so a leader change never re-announces retained runs; a run that finishes in the second before the change can go unannounced, and its outcome stays in the definition's history.
 
 **HTTPS enforcement / `--allow-insecure-webhooks`: Status: planned -- not yet implemented.** HTTP webhook URLs are accepted; there is no scheme validation and no insecure-override flag.
 
