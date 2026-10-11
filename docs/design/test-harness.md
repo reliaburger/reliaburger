@@ -347,11 +347,13 @@ The same rule covers any port a process gives up and binds again: a crash fixtur
 restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
 new binary binds the configured ports once it starts. Never choose such a port with
 `bind("127.0.0.1:0")` and release it. That port comes from the ephemeral range, and in the
-gap any other test's `bind(0)`, outgoing `connect()` or slirp forward can take it. #734 was
-exactly this: `oci_crash`'s upgrade fixture released its API port, a parallel
+gap any other test's `bind(0)`, outgoing `connect()` or slirp forward can take it. That was
+one of #734's two causes: `oci_crash`'s upgrade fixture released its API port, a parallel
 `owned_rootless` test could draw the same number for a slirp forward, and the exec'd Bun
 exited with "Address already in use". Nothing restarts Bun in that fixture, so the walk
-reported only "owned runtime never settled on v0.1.0" after 45 seconds. The upgrade
+reported only "owned runtime never settled on v0.1.0" after 45 seconds. (The other cause
+was in the product: adoption after an exec refused while the old process's last `runc`
+command was still finishing; see chapter 15.) The upgrade
 fixtures in `oci_crash`, `self_upgrade` and `self_upgrade_cluster`, and the slirp host
 ports in `owned_rootless`, now lease their ports for the whole test. The settle wait also
 fails at once with the node log when the Bun it watches exits.
