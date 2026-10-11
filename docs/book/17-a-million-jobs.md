@@ -520,6 +520,8 @@ self.file.write_all_at(&slot(raw), offset)?;
 
 A million tasks now cost 22.4 bytes of ledger and 25.0 of index on APFS, about 45 MiB. That still isn't the plan's 16 MiB per million (the ledger alone is over it), so we recorded the measured bound instead, 50 bytes a task (some headroom for filesystem block rounding), and `make bench-task-arrays` fails above it.
 
+That headroom isn't decoration, as the unit test found out a day later. It had also asserted at most 23 allocated bytes a task for the ledger, and it failed about one run in twenty on a Mac (#717). Nothing in the file had changed. Its logical length was 22,079,408 bytes every single time: the 8-byte magic, 245 block headers and a million 22-byte records. What changed was the allocation. APFS keeps up to about 1 MiB allocated past the end of a file that grows by fsynced appends, and how much it keeps varies from run to run, from 8 KiB to 1,000 KiB in forty runs of the same test. Write the same records as one big block and the slack disappears, which is why the test keeps production-sized 4,096-record blocks: a worker's disk pays that slack too. So the test now checks the two things it can know exactly, the logical length of each file to the byte, and leaves allocated bytes to the one bound that allows for the filesystem's choices, 50 a task for the pair. The worst of those forty runs was 47.6.
+
 Bytes per task only matter if they eventually go away. Workers already deleted a run's directory once the leader stopped listing it, but the leader only forgot a finished run when someone *submitted* something: pruning lived in the registration path. An idle cluster, or one running the same long array all day, kept everything. The fix is a new replicated write:
 
 ```rust
@@ -837,6 +839,24 @@ by swapping its control fence file for a FIFO with no writer, so its next sync
 blocks reading it, then checks that the leader still hears from the healthy
 node several times a second and that every array still finishes with each task
 counted once.
+
+That test passed on Linux and hung on macOS, and the hang wasn't in Reliaburger.
+Each sync the leader gives up on drops its HTTP request, the worker's handler
+is dropped with it, and the blocking thread reading the FIFO carries on. The
+next sync then blocks on the FIFO too, so by the time the test lets go, two
+threads are stuck there. The test released them by opening the FIFO's write end
+once and closing it. On Linux that wakes every reader and each read sees end of
+file. On macOS a reader could stay blocked in `read` for ever. A small Python
+script reproduces it: one reader was always freed, but with two readers one
+open and close freed both in only 11 runs out of 20. Dropping a tokio runtime
+waits for its blocking threads to return, so the test's assertions all passed in
+about 65 seconds, and then the process never exited until nextest killed it at
+120 seconds. Now the test renames the
+FIFO aside first, so the worker's next sync finds no fence file. Then it keeps
+opening and closing the write end until opening without blocking fails with
+`ENXIO`, which means no reader holds the FIFO any more. The arrays also shrank
+from 6,000 tasks to 4,000. Twenty milliseconds a task on 48 slots still takes at
+least 27 seconds, three times longer than the hung window needs work running.
 
 The third cost was copying. `desired_state()` clones the whole replicated
 state, apps and all, and the leader called it four times a tick. The tick now
