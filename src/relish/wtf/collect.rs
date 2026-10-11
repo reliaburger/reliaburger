@@ -1416,6 +1416,8 @@ mod tests {
             version: "v0.1.1".into(),
             commit: Some("3fcb1fd".into()),
             binary_sha256: Some("aaaa".into()),
+            platform: None,
+            compatibility: None,
         };
         let collected = [
             ("node-1", Ok(answered)),
