@@ -193,6 +193,7 @@ pub async fn submit_handler(
             missed: Default::default(),
         }),
         replay_unknown: true,
+        hook: false,
     };
     if let Err(response) = super::job_api::admit_definition(
         &state,
@@ -298,6 +299,7 @@ pub async fn manifest_handler(
             tasks: cohort.spec.clone(),
             cron: None,
             replay_unknown: true,
+            hook: false,
         };
         if let Err(response) = super::job_api::admit_definition(
             &state,
@@ -344,10 +346,12 @@ pub(crate) async fn admit_template_image(
         let mut config = crate::config::Config::default();
         config.job.insert("task".into(), template.clone());
         super::api::bind_images(state, binder, &mut config).await?;
-        *template = config
-            .job
-            .remove("task")
-            .expect("binder retains job template");
+        *template = config.job.remove("task").ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image binding lost the job template",
+            )
+        })?;
     }
     pin_template_image(state, template)
         .await
@@ -406,10 +410,12 @@ async fn pin_template_image(
         )
         .map_err(|e| e.to_string())?
         {
-            template.image = Some(crate::meat::scheduler::pin_image_reference(
-                template.image.as_deref().expect("image checked"),
-                &digest,
-            ));
+            let image = template
+                .image
+                .as_deref()
+                .ok_or("signature check returned a digest for a job without an image")?;
+            let pinned = crate::meat::scheduler::pin_image_reference(image, &digest);
+            template.image = Some(pinned);
         }
     }
     Ok(())
@@ -576,6 +582,8 @@ pub fn array_summary(
             super::reusable_executor::ExecutorProfile::new(&record.template).ok().map(|profile| serde_json::json!({"cpu_millicores":profile.reservation.cpu_millicores,"memory_bytes":profile.reservation.memory_bytes}))
         } else { None },
         "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
+        "quota_blocked": record.quota_blocked,
+        "quota_blocked_reason": record.quota_blocked.as_ref().map(ToString::to_string),
     })
 }
 
@@ -736,6 +744,11 @@ fn node_error(error: TaskArrayNodeError) -> Response {
     match error {
         TaskArrayNodeError::UnknownArray { .. } | TaskArrayNodeError::NoOutput { .. } => {
             self::error(StatusCode::NOT_FOUND, error.to_string())
+        }
+        // Gone, not missing: the task failed, but its chunk had already
+        // kept its share of failure output.
+        TaskArrayNodeError::OutputNotKept { .. } => {
+            self::error(StatusCode::GONE, error.to_string())
         }
         other => self::error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
@@ -1070,13 +1083,12 @@ pub async fn logs_handler(
         let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
         return forward_get_to_leader(&state, council, &path, &headers).await;
     }
-    if index >= record.state.spec.count {
+    let Some(chunk) = record.state.spec.chunk_of(index) else {
         return error(
             StatusCode::NOT_FOUND,
             format!("task array {batch_id} has no task {index}"),
         );
-    }
-    let chunk = record.state.spec.chunk_of(index).expect("validated index");
+    };
     let Some((owner, grant)) = record.state.accepted_grant(chunk) else {
         return error(StatusCode::NOT_FOUND, "task has no accepted outcome yet");
     };
@@ -1092,7 +1104,13 @@ pub async fn logs_handler(
     };
     let output = match url {
         None => match &state.task_arrays.node {
-            Some(node) => node.task_output_grant(batch_id, index, grant).await.ok(),
+            Some(node) => match node.task_output_grant(batch_id, index, grant).await {
+                Ok(bytes) => Some(bytes),
+                Err(error @ TaskArrayNodeError::OutputNotKept { .. }) => {
+                    return node_error(error);
+                }
+                Err(_) => None,
+            },
             None => None,
         },
         Some(url) => {
@@ -1103,6 +1121,9 @@ pub async fn logs_handler(
                     response.bytes().await.ok().map(|bytes| bytes.to_vec())
                 }
                 Ok(response) if response.status() == StatusCode::NOT_FOUND => None,
+                Ok(response) if response.status() == StatusCode::GONE => {
+                    return node_error(TaskArrayNodeError::OutputNotKept { index });
+                }
                 _ => {
                     return error(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1170,6 +1191,7 @@ pub async fn summaries(
             serde_json::json!({"kind":"schedule", "name":name, "namespace":namespace,
             "status":"Scheduled", "batch_id":null, "revision":record.revision,
             "cron":cron, "last_observed_minute":record.last_observed_minute,
+            "skipped":record.skipped, "skipped_count":record.skipped_count,
             "total":record.definition.tasks.count}),
         );
     }
@@ -1256,6 +1278,7 @@ mod tests {
             template: template(),
             state,
             terminal_at_epoch_secs: Some(1),
+            quota_blocked: None,
         };
         let (start, end, owners) = result_window(&record, &ResultsQuery::default());
         assert_eq!((start, end, owners.len()), (0, 8, 8));
@@ -1367,6 +1390,7 @@ mod tests {
             .unwrap();
         TaskArrayRecord {
             terminal_at_epoch_secs: None,
+            quota_blocked: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: template(),

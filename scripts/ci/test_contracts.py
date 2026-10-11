@@ -48,7 +48,7 @@ class Contracts(unittest.TestCase):
                  for contract in manifest['contracts'] for case in contract['cases']}
         for name in (
             'cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles',
-            'cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller',
+            'cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart',
         ):
             self.assertEqual(cases.get(('reliaburger::owned_task_arrays', name)),
                              ['linux-root-storage'], name)

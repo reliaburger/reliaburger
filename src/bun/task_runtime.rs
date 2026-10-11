@@ -82,8 +82,12 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         Self::with_prefix(runtime, format!("{:032x}", rand::random::<u128>()))
     }
     fn with_prefix(runtime: G, prefix: String) -> Self {
+        // A kernel the host helper can't run on gets no host pool, so host
+        // jobs take the fresh path instead of leaking executor slots.
         #[cfg(target_os = "linux")]
-        let host_runtime = runtime.host_executor_runtime();
+        let host_runtime = runtime
+            .host_executor_runtime()
+            .filter(|_| crate::grill::kernel::executor_support().host());
         Self {
             runtime,
             #[cfg(target_os = "linux")]
@@ -154,6 +158,14 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         }
         .map(|pool| pool.timings())
     }
+    /// The runtime shared-runc executors use here: none when the runtime
+    /// can't own them or the kernel is too old for the executor helper.
+    #[cfg(target_os = "linux")]
+    fn reusable_runtime(&self) -> Option<crate::grill::runc::RuncGrill> {
+        self.runtime
+            .reusable_runtime()
+            .filter(|_| crate::grill::kernel::executor_support().shared_runc())
+    }
     /// The reusable pool that runs `template`: `Some(None)` before that pool
     /// exists, `None` when the template doesn't run through a pool here.
     #[cfg(target_os = "linux")]
@@ -162,7 +174,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         template: &crate::config::job::JobSpec,
     ) -> Option<Option<&std::sync::Arc<super::reusable_executor::ReusablePool<G>>>> {
         use crate::config::job::JobRuntime;
-        if template.runtime == JobRuntime::SharedRunc && self.runtime.reusable_runtime().is_some() {
+        if template.runtime == JobRuntime::SharedRunc && self.reusable_runtime().is_some() {
             Some(self.reusable.get())
         } else if template.runtime == JobRuntime::Process && self.supports_host_limits() {
             Some(self.host.get())
@@ -227,7 +239,11 @@ impl<G: Grill + Clone> OwnedRunner<G> {
     /// A smaller executor pool for constrained nodes and real-runtime tests.
     pub fn with_slot_count(runtime: G, slots: u32) -> Self {
         let runner = Self::new(runtime);
-        *runner.slots.lock().expect("executor slots poisoned") = (0..slots.clamp(1, 256)).collect();
+        *runner
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (0..slots.clamp(1, 256)).collect();
         runner
     }
     /// Persist a private executor identity so each namespace reuses its bounded
@@ -286,6 +302,47 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         self.log_sink = sink;
         self.capture_offsets = offsets;
         self
+    }
+
+    /// Forget the metadata of this node's retired executor identities, and of
+    /// runtime routes no launch owns, so a restart reclaims what an
+    /// interrupted retirement kept (#678). Call it before the first task:
+    /// anything unretired or live is skipped and kept. Returns how many
+    /// identities were forgotten.
+    pub async fn forget_retired_executors(&self) -> usize {
+        let app = format!("executor-{}", self.prefix);
+        let ours = |id: &crate::grill::InstanceId| {
+            crate::grill::InstanceIdentity::parse(&id.0).is_some_and(|identity| {
+                identity.app == app
+                    || identity
+                        .app
+                        .strip_prefix(app.as_str())
+                        .is_some_and(|rest| rest.starts_with('-'))
+            })
+        };
+        let mut candidates: Vec<_> = match self.runtime.launch_inventory().await {
+            Ok(launches) => launches
+                .unwrap_or_default()
+                .into_iter()
+                .map(|launch| launch.instance_id)
+                .filter(|id| ours(id))
+                .collect(),
+            Err(error) => {
+                eprintln!("bun: executor metadata sweep: inventory unavailable: {error}");
+                Vec::new()
+            }
+        };
+        match self.runtime.unlaunched_metadata().await {
+            Ok(ids) => candidates.extend(ids),
+            Err(error) => eprintln!("bun: executor metadata sweep: routes unavailable: {error}"),
+        }
+        let mut forgotten = 0;
+        for id in candidates {
+            if self.runtime.forget_retired(&id).await.is_ok() {
+                forgotten += 1;
+            }
+        }
+        forgotten
     }
 
     /// Resolve an active singleton without exposing a reusable slot as its public identity.
@@ -353,6 +410,14 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             .remove(&run);
     }
 
+    fn return_slot(&self, slot: u32) {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(slot);
+        self.available.notify_one();
+    }
+
     async fn slot(&self, cancel: &CancellationToken) -> Option<u32> {
         loop {
             let available = self.available.notified();
@@ -364,7 +429,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             if let Some(id) = self
                 .slots
                 .lock()
-                .expect("executor slots poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop_front()
             {
                 return Some(id);
@@ -528,7 +593,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         })
                     })
                 } else {
-                    self.runtime.reusable_runtime().map(|runtime| {
+                    self.reusable_runtime().map(|runtime| {
                         self.reusable.get_or_init(|| {
                             super::reusable_executor::ReusablePool::new(
                                 runtime,
@@ -567,7 +632,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             }
             return Attempt {
                 outcome: AttemptOutcome::SpawnFailed {
-                    reason: "shared-runc requires the owned rootful Linux runtime".into(),
+                    reason:
+                        "shared-runc requires the owned rootful Linux runtime on Linux 5.8 or later"
+                            .into(),
                 },
                 output: CapturedOutput::default(),
                 ran: None,
@@ -619,17 +686,30 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     limit: 64 << 20,
                 });
         }
+        // The identity is built from a validated namespace and a hex prefix,
+        // so this only fails if those checks are ever loosened.
         let cgroup = crate::grill::cgroup::instance_cgroup_path(
             namespace,
             &format!("executor-{}", self.prefix),
             &id,
         )
-        .expect("validated executor identity");
+        .ok()
+        .filter(|cgroup| cgroup.to_str().is_some());
+        let Some(cgroup) = cgroup else {
+            self.return_slot(slot);
+            return Attempt {
+                outcome: AttemptOutcome::SpawnFailed {
+                    reason: format!("executor {id} has no valid UTF-8 cgroup path"),
+                },
+                output: CapturedOutput::default(),
+                ran: None,
+            };
+        };
         let mut oci = crate::grill::oci::generate_job_oci_spec(
             "task",
             namespace,
             &spec,
-            cgroup.to_str().expect("executor cgroup is UTF-8"),
+            &cgroup.to_string_lossy(),
             None,
         );
         if template.image.is_some() && !singleton {
@@ -894,11 +974,13 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         if let Some(run) = run_id {
             self.retire_singleton(run).await;
         }
-        self.slots
-            .lock()
-            .expect("executor slots poisoned")
-            .push_back(slot);
-        self.available.notify_one();
+        // The generation has retired and its output and followers are done,
+        // so its journal and routing files own nothing. Keeping them would
+        // leave a slot's worth per namespace that ever ran a job (#678).
+        if let Err(error) = self.runtime.forget_retired(&id).await {
+            eprintln!("batch executor {id}: metadata kept: {error}");
+        }
+        self.return_slot(slot);
         Attempt {
             outcome,
             output,
@@ -998,10 +1080,11 @@ mod tests {
         let result = work.await.unwrap();
         assert_eq!(result.outcome, AttemptOutcome::Cancelled);
         assert!(runner.singleton_instance(42).is_none());
-        assert_eq!(
-            runner.runtime.state(&id).await.unwrap(),
-            ContainerState::Stopped
-        );
+        // Retired and then forgotten: the slot identity keeps no metadata.
+        assert!(matches!(
+            runner.runtime.state(&id).await,
+            Err(crate::grill::GrillError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
