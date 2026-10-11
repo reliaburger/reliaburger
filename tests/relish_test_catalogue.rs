@@ -126,7 +126,7 @@ fn start_secure_process_node(root: &std::path::Path) -> SecureNode {
 fn qualify_process_catalogue(group: &str) {
     let root = tempfile::tempdir().unwrap();
     let secure = start_secure_process_node(root.path());
-    let _bun = secure.bun;
+    let bun = secure.bun;
     let endpoint = secure.endpoint;
     let ca = secure.ca.to_str().unwrap();
     let token = secure.token.as_str();
@@ -155,7 +155,17 @@ fn qualify_process_catalogue(group: &str) {
             )
         });
     if group == "jobs" {
-        assert_success(&output, "qualify jobs catalogue");
+        if !output.status.success() {
+            // The report says what timed out; Bun's log says why.
+            let log = bun_process::bun_log_diagnostic(&bun.log_path);
+            let tail: Vec<&str> = log.lines().rev().take(200).collect();
+            panic!(
+                "qualify jobs catalogue failed\nstdout={}\nstderr={}\nbun log (last 200 lines):\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+        }
         let results = report["results"].as_array().unwrap();
         assert_eq!(results.len(), 3, "{report}");
         for case in results {
