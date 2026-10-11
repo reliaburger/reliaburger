@@ -95,27 +95,36 @@ Stopped.
 
 ### Jobs and cron
 
-Jobs record execution intent and their three-retry budget before launching, and
-Bun replacement restores that budget. An observed failure can retry after
-confirmed cleanup. An unknown exit status stays `unknown`, including across
-further restarts, and ordinary apply won't repeat it. After checking the job's
-external effects, explicitly request a new run on the same node:
+Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
+definition, a run with a trigger identity, and indexed tasks the leader hands to
+workers with room for them. A TOML job sets its policy with the manifest's field
+names: `max_attempts` (default 4, or 1 for a hook), `task_timeout_secs` (default
+no deadline, or 600 seconds for a hook), `overlap` for cron and
+`replay_unknown`. An observed failure can retry after confirmed cleanup. An
+unknown outcome stays `unknown` across restarts and is never replayed
+automatically unless the job set `replay_unknown = true`. After checking the
+job's external effects, acknowledge the exact grant:
 
 ```sh
-relish apply jobs.toml --rerun-jobs
+relish batch replay 42 --node worker-2 --grant-digest DIGEST --acknowledge-side-effects
 ```
 
-The manifest must contain only non-scheduled jobs. The API requires user
-deployment authority and workload scope; internal service credentials can't
-authorise a rerun. Explicit stop cancels pending retries but keeps an unknown
-outcome.
+`relish apply jobs.toml --rerun-jobs` only starts a fresh apply operation, so
+succeeded jobs run again; it doesn't clear an unknown outcome. The replay API
+requires user deployment authority and workload scope; internal service
+credentials can't authorise it.
 
-Cron registrations and their latest claimed UTC minute persist before apply,
-stop or launch is acknowledged, and Bun restores them before serving the API.
-Missed minutes are skipped, and a crash between recording a firing and launching
-it can skip that occurrence too. There's no catch-up and no exactly-once
-promise. If a cron checkpoint write fails, Bun fences further cron changes and
-firings until it restarts and reloads its state.
+Cron schedules are UTC and use the Kubernetes CronJob dialect, including names
+and `@daily`-style macros. Cluster and standalone apply both register them, and
+the leader claims each matching minute durably. Missed minutes are skipped;
+there's no catch-up and no exactly-once promise. A job with an unknown outcome
+skips later occurrences until it's settled.
+
+`relish run --batch`, `relish batch FILE` and `relish batch submit` print an
+idempotency key before sending. If a submission times out, retry with
+`--idempotency-key KEY` and the cluster returns the runs it already admitted.
+Manifests and JSON `tasks` refuse unknown fields, so a typo fails at
+`--dry-run` rather than falling back to defaults.
 
 Each job definition keeps its last ten run outcomes after a run's own detail
 is pruned (`relish jobs --definitions`, and the dashboard's job card). The
@@ -128,11 +137,7 @@ tasks. See [job history, metrics and events](manual/14_batch-jobs.md#job-history
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations; keep using the same node endpoint for a
 lease's lifetime. Creation needs an unscoped credential and the server's
-isolated-workload test grant. Ordinary cluster apply forwards jobs to the
-leader and reserves their identities until positive terminal settlement;
-there is no ordinary job placement across workers. Leased test work stays on
-the receiving node. Cluster apply refuses recurring schedules; register cron
-on a standalone node.
+isolated-workload test grant. Leased test work stays on the receiving node.
 
 Apply `run_before` migrations and their dependent apps together in the same
 namespace. The cluster records ownership before execution and publishes app
@@ -1088,7 +1093,7 @@ path = "/import"
 source = "/srv/import"              # host path: never chowned by Bun
 ```
 
-A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning.
+A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning. A node mounts a host path only under a prefix in its `[storage] allowed_host_paths` (empty by default, so every host path is refused) and never its own storage or security directories; a token with a `[permission]` block also needs `host-exec` to deploy one.
 
 A managed volume stays on its node, and so does its app: restarting Bun, rebooting or losing the node from gossip never moves it to a node with an empty volume. While its node is away the app waits, `relish status` and `relish inspect` name the node, and `relish wtf` reports it as critical. `relish decommission-node <node> --workloads-stopped --reason <why>` (or new `placement.required` labels) is the explicit way to move it, onto a new, empty volume.
 

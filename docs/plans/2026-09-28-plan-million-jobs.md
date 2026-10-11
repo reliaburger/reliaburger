@@ -446,6 +446,20 @@ combining new grants and finished chunks (`TaskArraySync`), plus
 `TaskArrayRegister` at submit and `TaskArrayCancel`/`TaskArrayRequeue` when
 they happen. That's the "few entries a second" in the demo sentence.
 
+> **Update (#680, 10 October 2026):** per array became per tick. A
+> `TaskArrayWrite::Tick` carries every array's sync, requeue and quota
+> writes in one entry, so the dispatch loop writes **one Raft entry per
+> second however many arrays run**, plus a cron observation a minute. Each
+> tick waits at most half the interval for answers; a slow node's call
+> carries over instead of stalling the others. Measured: the leader tick
+> plans, batches and applies 64 concurrent arrays on three nodes as one
+> entry (`make bench-task-arrays`, `leader_tick` group: about 1.1 ms of
+> leader CPU per tick on the development laptop, release build; one array of
+> 65,536 one-task chunks on ten nodes, about 160 µs; both one entry), and the
+> three-node cluster test
+> `hung_worker_api_does_not_stall_other_nodes_arrays` counts at most one
+> entry per tick with sixteen busy arrays while one worker's API hangs.
+
 A node that doesn't answer sync for 30 s, or that gossip marks dead, gets
 `TaskArrayRequeue`. When it comes back, its stale completions are fenced by
 the attempt number.

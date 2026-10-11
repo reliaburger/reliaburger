@@ -295,7 +295,9 @@ pub(super) async fn apply_handler(
 
     // Check every workload before any Raft write or agent command. A job in
     // a mixed manifest must not bypass admission after its apps have committed.
-    // Host execution includes both explicit binaries and inline scripts.
+    // Host execution includes explicit binaries, inline scripts and, for
+    // apps, host-path volume or config-file sources: a bind-mounted host
+    // path reaches past the namespace just as a host binary does.
     let permissions = permission_map(&state).await;
     let targets = config
         .app
@@ -304,7 +306,7 @@ pub(super) async fn apply_handler(
             (
                 name.as_str(),
                 spec.namespace.as_deref().unwrap_or("default"),
-                spec.script.is_some() || spec.exec.is_some(),
+                spec.needs_host_access(),
             )
         })
         .chain(config.job.iter().map(|(name, spec)| {
@@ -500,14 +502,15 @@ pub(super) async fn apply_handler(
         None
     };
 
-    // Room for the binding lines, which go out before the agent's events.
-    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32 + bindings.len());
-    for binding in &bindings {
-        let _ = agent_event_tx
-            .send(ApplyEvent::Progress {
-                message: binding.to_string(),
-            })
-            .await;
+    // Room for the host-path notes and binding lines, which go out before
+    // the agent's events.
+    let notes: Vec<String> = host_path_notes(&config)
+        .into_iter()
+        .chain(bindings.iter().map(ToString::to_string))
+        .collect();
+    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32 + notes.len());
+    for message in notes {
+        let _ = agent_event_tx.send(ApplyEvent::Progress { message }).await;
     }
     let command = if rerun_jobs {
         AgentCommand::RerunJobs {
@@ -569,6 +572,24 @@ pub(super) async fn apply_handler(
     });
 
     Sse::new(stream).into_response()
+}
+
+/// One progress line per host-path `source` in `config`: the API can't see
+/// any node's `[storage] allowed_host_paths`, so it says what the node needs.
+pub(crate) fn host_path_notes(config: &Config) -> Vec<String> {
+    config
+        .app
+        .iter()
+        .flat_map(|(name, spec)| {
+            spec.host_path_sources().map(move |source| {
+                format!(
+                    "app.{name}: host path {} is mounted only on a node whose \
+                     [storage] allowed_host_paths lists a prefix covering it",
+                    source.display()
+                )
+            })
+        })
+        .collect()
 }
 
 /// Apply a config in cluster mode: propose each app spec to Raft.
@@ -732,6 +753,9 @@ pub(super) async fn cluster_apply(
     let cmd_tx = state.cmd_tx.clone();
     tokio::spawn(async move {
         let mut config = config;
+        for message in host_path_notes(&config) {
+            let _ = event_tx.send(ApplyEvent::Progress { message }).await;
+        }
         // Bind inside the stream, so a slow registry shows as a wait in
         // `relish apply` rather than as a follower's forward timing out.
         if let Some(binder) = &binder {
@@ -884,6 +908,7 @@ async fn cluster_prerequisite_apply(
         .is_some_and(|value| value.as_bytes() == b"acknowledged");
     use crate::bun::deploy_operations::DeployOperationOutcome;
     use crate::council::{CouncilResponse, RaftRequest};
+    let notes = host_path_notes(&config);
     let term = council.current_term();
     let (response, answer) = oneshot::channel();
     let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -931,6 +956,9 @@ async fn cluster_prerequisite_apply(
     }
     let (events, event_rx) = mpsc::channel::<ApplyEvent>(32);
     tokio::spawn(async move {
+        for message in notes {
+            let _ = events.send(ApplyEvent::Progress { message }).await;
+        }
         for binding in bindings {
             let _ = events
                 .send(ApplyEvent::Progress {

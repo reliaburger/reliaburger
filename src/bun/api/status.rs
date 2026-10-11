@@ -329,7 +329,8 @@ pub(super) async fn common_local_statuses(state: &ApiState) -> Vec<InstanceStatu
             || record
                 .state
                 .accepted_grant(ChunkId(0))
-                .is_some_and(|(owner, _)| owner == local);
+                .and_then(|grant| grant.owner)
+                .is_some_and(|owner| owner == local);
         if state.council.is_some() && !owned {
             continue;
         }

@@ -5,6 +5,9 @@
 /// - range-set operations the leader does per chunk;
 /// - the leader's whole control-plane cost for a 1M-task array (no
 ///   processes), with 3 and 200 nodes, and the JSON snapshot of it;
+/// - one leader tick (plan every array's writes, batch them, apply the
+///   entry) with 64 concurrent arrays on 3 nodes, and with one array of
+///   one-task chunks on 10 nodes, the shape that splits state the most;
 /// - the node pool's overhead per task with a zero-cost fake runner (the
 ///   ceiling a real process can't beat);
 /// - the fork/exec floor of this machine: `/usr/bin/true` through the
@@ -14,12 +17,16 @@
 ///   `STORAGE_BYTES_PER_TASK`.
 ///
 /// Every benchmark reports tasks (or elements) per second.
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use reliaburger::bun::task_array_node::STORAGE_BYTES_PER_TASK;
+use reliaburger::bun::task_array_leader::{TickInputs, plan_tick, tick_entries};
+use reliaburger::bun::task_array_node::{
+    ArrayProgress, NodeArrayCounters, NodeSyncResponse, STORAGE_BYTES_PER_TASK,
+};
 use reliaburger::bun::task_executor::{
     AttemptOutcome, ChunkWork, FakeRunner, PoolConfig, ProcessRunner, TaskFinal, TaskPool,
     TaskRecord, TaskRunner,
@@ -29,6 +36,7 @@ use reliaburger::meat::NodeId;
 use reliaburger::meat::index_set::IndexRangeSet;
 use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
 use reliaburger::meat::task_array_state::{ChunkResult, NodeSlots, TaskArrayState, plan_grants};
+use reliaburger::meat::task_array_store::{TaskArrayWrite, TaskArrays};
 use tokio_util::sync::CancellationToken;
 
 const MILLION: u32 = 1_000_000;
@@ -121,6 +129,135 @@ fn bench_leader(c: &mut Criterion) {
     group.bench_function("json_encode_1m", |b| {
         b.iter(|| serde_json::to_vec(&finished).map(|bytes| bytes.len()))
     });
+    group.finish();
+}
+
+/// `count` registered arrays of `tasks` tasks in `chunk_size`-task chunks.
+fn running_arrays(count: u64, tasks: u32, chunk_size: u32) -> TaskArrays {
+    let mut arrays = TaskArrays::default();
+    for id in 1..=count {
+        let register = TaskArrayWrite::Register {
+            name: format!("bench-{id}"),
+            namespace: format!("team-{}", id % 4),
+            template: Box::new(
+                toml::from_str("runtime = 'process'\nexec = '/usr/bin/true'").unwrap(),
+            ),
+            spec: TaskArraySpec {
+                chunk_size,
+                ..TaskArraySpec::with_count(tasks)
+            },
+            submitted_at_epoch_secs: 1,
+        };
+        arrays.apply(&register, || id).unwrap();
+    }
+    arrays
+}
+
+/// Every node's answer: 16 free slots per array, and every chunk it holds
+/// finished except the lowest, so completions land out of order.
+fn answers(arrays: &TaskArrays, nodes: usize) -> Vec<(NodeId, NodeSyncResponse)> {
+    (0..nodes)
+        .map(|i| {
+            let node = NodeId::new(format!("n{i:02}"));
+            let response = NodeSyncResponse {
+                arrays: arrays
+                    .active()
+                    .map(|(batch_id, record)| ArrayProgress {
+                        batch_id,
+                        slots: 16,
+                        refused: None,
+                        finished: record
+                            .state
+                            .held_by(&node)
+                            .into_iter()
+                            .flat_map(|held| held.iter().skip(1))
+                            .map(|chunk| {
+                                let range = record.state.spec.chunk_range(ChunkId(chunk)).unwrap();
+                                let mut result = ChunkResult {
+                                    duration_counts: [0; 16],
+                                    chunk: ChunkId(chunk),
+                                    attempt: record.state.attempt_of(ChunkId(chunk)),
+                                    succeeded: range.end() - range.start() + 1,
+                                    failed_count: 0,
+                                    failed_indices: IndexRangeSet::new(),
+                                    not_run: 0,
+                                    retried: 0,
+                                };
+                                result.duration_counts[0] = u64::from(result.succeeded);
+                                result
+                            })
+                            .collect(),
+                        counters: NodeArrayCounters::default(),
+                    })
+                    .collect(),
+            };
+            (node, response)
+        })
+        .collect()
+}
+
+/// One leader tick against `arrays`: plan, batch, apply. Returns the
+/// number of Raft entries it wrote.
+fn tick(arrays: &mut TaskArrays, answers: &[(NodeId, NodeSyncResponse)]) -> usize {
+    let now = Instant::now();
+    let heard = HashMap::new();
+    let inputs = TickInputs {
+        answers,
+        last_heard: &heard,
+        since: now,
+        now,
+        silence: Duration::from_secs(30),
+        now_epoch_secs: 2,
+    };
+    let entries = tick_entries(plan_tick(arrays, None, &inputs));
+    for entry in &entries {
+        let _ = arrays.apply(entry, || 0);
+    }
+    entries.len()
+}
+
+/// Run `ticks` ticks so the arrays are mid-run, with nodes holding work.
+fn warmed(mut arrays: TaskArrays, nodes: usize, ticks: usize) -> TaskArrays {
+    for _ in 0..ticks {
+        let answers = answers(&arrays, nodes);
+        tick(&mut arrays, &answers);
+    }
+    arrays
+}
+
+fn bench_tick(c: &mut Criterion) {
+    let mut group = c.benchmark_group("leader_tick");
+    group.sample_size(20);
+    let shapes = [
+        (
+            "64_arrays_3_nodes",
+            warmed(running_arrays(64, 100_000, 1024), 3, 2),
+            3,
+        ),
+        (
+            "one_task_chunks_10_nodes",
+            warmed(running_arrays(1, 1 << 16, 1), 10, 100),
+            10,
+        ),
+    ];
+    for (name, arrays, nodes) in shapes {
+        let answers = answers(&arrays, nodes);
+        let mut probe = arrays.clone();
+        let entries = tick(&mut probe, &answers);
+        assert_eq!(entries, 1, "{name}: the arrays must still be running");
+        let bytes = serde_json::to_vec(&arrays).map_or(0, |bytes| bytes.len());
+        eprintln!(
+            "leader_tick/{name}: {entries} Raft entry per tick, {bytes} bytes of array state"
+        );
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || arrays.clone(),
+                |mut arrays| tick(&mut arrays, &answers),
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
     group.finish();
 }
 
@@ -253,6 +390,7 @@ criterion_group!(
     benches,
     bench_index_set,
     bench_leader,
+    bench_tick,
     bench_executor,
     bench_storage
 );
