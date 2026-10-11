@@ -62,13 +62,17 @@ impl NodeFaultAuth {
     }
 }
 
-/// Cut `node` off from `peers` on the gossip and Raft transports.
+/// Cut `node` off from `peers` on the gossip and Raft transports, sending
+/// the request to `node` itself. Retries (bounded) only the leader's exact
+/// "stable current council membership" refusal, in case the self-healing
+/// loop moves membership between the caller's wait and the request.
 async fn partition(
     node: &Node,
     peers: &[String],
 ) -> Result<reliaburger::smoker::types::FaultSummary, reliaburger::relish::RelishError> {
-    node.client
-        .inject_fault(&reliaburger::smoker::types::FaultRequest {
+    inject_node_fault_once_council_settles(
+        node,
+        &reliaburger::smoker::types::FaultRequest {
             fault_type: reliaburger::smoker::types::FaultType::CouncilPartition {
                 peers: peers.to_vec(),
             },
@@ -82,8 +86,9 @@ async fn partition(
             include_leader: true,
             override_safety: false,
             acknowledged: true,
-        })
-        .await
+        },
+    )
+    .await
 }
 
 async fn start_node(
@@ -1035,24 +1040,26 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     })
     .await;
     assert!(ready, "no leader elected");
-    // Wait for the council to actually grow to 3 voters. The self-healing
-    // reconciler admits members one action per tick with a stability
-    // window, so growth takes several ticks rather than one.
+    // Wait until every node has applied the same uniform three-voter
+    // config. The self-healing reconciler admits members one action per
+    // tick, and each node's quorum rail reads its own Raft metrics: the
+    // first partition goes through a follower, which may not have appended
+    // the promotion yet and would still count two voters (max allowed 0).
     let grown = wait_until(Duration::from_secs(60), || {
-        nodes.iter().any(|n| {
-            n.handle.council.as_ref().is_some_and(|c| {
-                c.metrics()
-                    .borrow()
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .count()
-                    >= 3
-            })
-        })
+        council_membership_settled(&nodes, 3)
     })
     .await;
-    assert!(grown, "council did not grow to 3 voters");
+    assert!(
+        grown,
+        "council never settled on a uniform three-voter membership"
+    );
+    // The rail also subtracts the voters missing from the serving node's
+    // API membership table, so wait until every node's table lists all
+    // three; otherwise a late join reads as one voter already down.
+    assert!(
+        wait_until_api_views_list_all(&nodes, Duration::from_secs(30)).await,
+        "not every node's API membership listed all three members"
+    );
 
     let leader = nodes
         .iter()
@@ -1224,6 +1231,32 @@ async fn inject_node_fault_once_council_settles(
             }
             result => return result,
         }
+    }
+}
+
+/// Wait until every node's API membership table (what the fault safety
+/// rails read) lists every node in `nodes`.
+async fn wait_until_api_views_list_all(nodes: &[&Node], timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let mut all_listed = true;
+        for observer in nodes {
+            let table = observer.membership_table.read().await;
+            if !nodes
+                .iter()
+                .all(|node| table.iter().any(|member| member.node_id.0 == node.name))
+            {
+                all_listed = false;
+                break;
+            }
+        }
+        if all_listed {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 

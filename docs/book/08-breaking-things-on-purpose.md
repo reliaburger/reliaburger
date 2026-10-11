@@ -853,6 +853,18 @@ config, and retries that one refusal (and only that one, word for word) for a
 bounded 30 seconds in case the self-healing loop moves membership again in
 between. Anything else still fails the test.
 
+The partition test that proves the quorum rail fell into the same trap from the
+other side ([#801](https://github.com/reliaburger/reliaburger/issues/801)). It
+waited until *any* node's metrics listed three voters, then sent the first
+partition to a follower. The rail runs on the node that serves the request and
+reads that node's own Raft metrics and membership table. On a loaded CI runner
+that follower evidently hadn't appended the promotion yet. It still counted two
+voters and worked out a budget of `(2-1)/2 = 0`: "max allowed is 0". The refusal was
+right for what that node knew, and it errs on the safe side; a user who hits
+it retries a heartbeat later. The test now waits on the views the rail reads:
+every node on the same applied, uniform three-voter config, and every node's
+membership table listing all three members.
+
 ## Process workloads
 
 Not everything runs in a container. Monitoring agents, log shippers, custom exporters — these are host binaries that need to run alongside your containerised apps. Until now, you'd manage them separately with systemd or supervisord. Process workloads make them first-class citizens.
