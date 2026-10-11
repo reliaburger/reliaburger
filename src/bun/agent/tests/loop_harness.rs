@@ -1432,15 +1432,55 @@ async fn the_tick_waits_out_a_startup_retirement_whose_inventory_is_slow() {
 /// Counting the writes per tick makes that independent of the disk.
 #[tokio::test]
 async fn a_startup_retirement_journals_at_most_two_writes_a_tick() {
+    let writes_per_tick = startup_retirement_writes_per_tick(std::time::Duration::ZERO).await;
+    assert_at_most_two_writes_a_tick(&writes_per_tick);
+}
+
+/// The same promise when the leader answers the producer release only after
+/// the first turn's deadline, as a loaded machine makes even a local leader
+/// do (#761). The ticks that follow find the request still in flight and
+/// return at once; the retirement finishes once a later tick collects the
+/// answer, and still journals at most two writes a tick.
+#[tokio::test]
+async fn a_startup_retirement_whose_leader_answers_after_the_turn_journals_at_most_two_writes_a_tick()
+ {
+    let writes_per_tick =
+        startup_retirement_writes_per_tick(TURN_RUNTIME_BUDGET + TURN_RUNTIME_BUDGET / 2).await;
+    assert_at_most_two_writes_a_tick(&writes_per_tick);
+}
+
+/// The gap a scenario leaves between the ticks it drives by hand. The loop
+/// spaces its health ticks [`HEALTH_TICK_INTERVAL`] apart, and in-flight
+/// work (a leader's answer, a disk cleanup) runs in the gap. Back-to-back
+/// ticks would leave it none: ten of them could pass while the leader's
+/// answer was still on its way (#761).
+const BETWEEN_TICKS: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a scenario that drives ticks by hand waits for the work to
+/// finish. Far past any delay a scenario sets, so only work that never
+/// finishes runs out of it.
+const TICKS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Drive a startup retirement tick by tick, with the leader answering its
+/// producer release after `leader_delay`, and count each tick's journal
+/// writes. Ticks are spaced like the loop's, and counted by tick rather than
+/// by time, so a loaded machine changes how many ticks it takes but not
+/// what each tick journals.
+async fn startup_retirement_writes_per_tick(leader_delay: std::time::Duration) -> Vec<usize> {
     let (mut agent, _grill, _root, _host_port, confirmation) =
         restarted_with_a_startup_retirement().await;
-    let (client, server) =
-        crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation).await;
+    let (client, server) = crate::cluster::producer::test_delayed_fixture(
+        axum::http::StatusCode::OK,
+        confirmation,
+        leader_delay,
+    )
+    .await;
     agent.set_producer_release_client(client);
     let mut writes_per_tick = Vec::new();
-    for _ in 0..10 {
-        if !agent.startup_cleanup_pending {
-            break;
+    let patience = tokio::time::Instant::now() + TICKS_PATIENCE;
+    while agent.startup_cleanup_pending && tokio::time::Instant::now() < patience {
+        if !writes_per_tick.is_empty() {
+            tokio::time::sleep(BETWEEN_TICKS).await;
         }
         let before = agent.loop_stalls.reached(LoopStall::Persist);
         agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
@@ -1448,10 +1488,17 @@ async fn a_startup_retirement_journals_at_most_two_writes_a_tick() {
         agent.turn_deadline = None;
         writes_per_tick.push(agent.loop_stalls.reached(LoopStall::Persist) - before);
     }
+    server.abort();
     assert!(
         !agent.startup_cleanup_pending,
         "the startup retirement never finished: {writes_per_tick:?}"
     );
+    writes_per_tick
+}
+
+/// A finished startup retirement journalled its four writes, at most two in
+/// any one tick.
+fn assert_at_most_two_writes_a_tick(writes_per_tick: &[usize]) {
     assert_eq!(
         writes_per_tick.iter().sum::<usize>(),
         4,
@@ -1461,7 +1508,6 @@ async fn a_startup_retirement_journals_at_most_two_writes_a_tick() {
         writes_per_tick.iter().all(|writes| *writes <= 2),
         "a tick journalled more than two writes: {writes_per_tick:?}"
     );
-    server.abort();
 }
 
 /// Completing a startup retirement journals it: the network reference's
