@@ -53,6 +53,12 @@ zero (both default to 0, and memory stops at 90%). Clearing needs the same role
 and grant, but no acknowledgement. Bun takes the audit identity from the
 authenticated credential, not `$USER` or the request body.
 
+Every injection, clear and expiry is in the audit log: `relish audit --action
+'fault.*'` lists them. `fault.injected` names the namespace, and its
+`include_leader` and `override_safety` details say whether you overrode a
+safety rail; an injection that did is recorded as critical. When a fault runs
+out its duration, the node that held it records `fault.expired` as `system`.
+
 A token with a `[permission]` block (see `security`) also needs the `fault`
 action. On one app it covers injecting and clearing that app's faults. A node
 fault targets no app, and `relish fault clear` with no service reaches every

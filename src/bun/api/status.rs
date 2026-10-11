@@ -294,11 +294,20 @@ pub(super) async fn local_top_rows(
         }
         None => std::collections::HashMap::new(),
     };
-    Ok(crate::bun::top::node_rows(
-        &local_node_name(state),
-        statuses,
-        &usage,
-    ))
+    let node = local_node_name(state);
+    let mut rows = crate::bun::top::node_rows(&node, statuses, &usage);
+    // Array tasks run outside the supervisor, so they have no instance
+    // status; the executor's telemetry says what runs here and what it uses.
+    if let Some(executor) = &state.task_arrays.node {
+        let telemetry = executor.telemetry();
+        let running = telemetry
+            .usage_targets()
+            .into_iter()
+            .map(|(labels, (running, _))| (labels, running))
+            .collect();
+        crate::bun::top::add_job_rows(&node, &mut rows, running, &telemetry.usage());
+    }
+    Ok(rows)
 }
 
 /// Singleton runs retain the ordinary status view without expanding indexed jobs.

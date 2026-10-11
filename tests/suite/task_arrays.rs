@@ -139,6 +139,7 @@ impl Harness {
                     command = cmd_rx.recv() => match command {
                         Some(reliaburger::bun::agent::AgentCommand::BatchOwnedExecutions { response, .. }) => { let _ = response.send(Default::default()); }
                         Some(reliaburger::bun::agent::AgentCommand::CurrentResources { response }) => { let _ = response.send(Vec::new()); }
+                        Some(reliaburger::bun::agent::AgentCommand::Status { response }) => { let _ = response.send(Vec::new()); }
                         Some(reliaburger::bun::agent::AgentCommand::DeployOperations { response }) => { let _ = response.send(reliaburger::bun::deploy_operations::DeployOperationSnapshot { active_deploys: Vec::new(), history: Vec::new() }); }
                         Some(_) => {}, None => return,
                     },
@@ -1221,6 +1222,93 @@ async fn daily_named_arrays_keep_working_past_the_definition_cap() {
         held < reliaburger::meat::job::MAX_JOB_DEFINITIONS_PER_NAMESPACE,
         "{held} definitions still held"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobs_definitions_shows_last_outcome_after_pruning() {
+    let harness = Harness::start(Options::processes(false)).await;
+    // A nightly schedule, run once now; its only task fails.
+    let response = harness
+        .http
+        .post(format!("{}/v1/jobs/runs", harness.base_url))
+        .json(&json!({
+            "name": "nightly",
+            "request_id": "run-now",
+            "definition": {
+                "template": { "runtime":"process","exec": SHELL, "command": ["-c", "exit 3"] },
+                "cron": { "expression": "0 3 * * *" },
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202);
+    let nightly = response.json::<Value>().await.unwrap()["batch_id"]
+        .as_u64()
+        .unwrap();
+    let summary = harness.wait_done(nightly, 60).await;
+    assert_eq!(summary["failed"], 1, "{summary}");
+
+    // Enough newer runs in the same namespace to push its details out.
+    for day in 0..=reliaburger::meat::task_array_store::MAX_TERMINAL_PER_NAMESPACE {
+        let mut array = shell_array(1, 1, "exit 0");
+        array["name"] = json!(format!("render-{day}"));
+        let id = harness.submit_ok(array).await;
+        harness.wait_done(id, 60).await;
+    }
+    let (status, _) = harness.get(&format!("/v1/batch/{nightly}")).await;
+    assert_eq!(status, 404, "the failed run's details were not pruned");
+
+    let (status, body) = harness.get("/v1/jobs/definitions").await;
+    assert_eq!(status, 200);
+    let definitions: Value = serde_json::from_slice(&body).unwrap();
+    let definition = definitions["definitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "nightly")
+        .unwrap_or_else(|| panic!("nightly lost: {definitions}"));
+    let last = &definition["history"][0];
+    assert_eq!(last["run"], nightly, "{definition}");
+    assert_eq!(last["status"], "CompletedWithFailures", "{definition}");
+    assert_eq!(last["failed"], 1, "{definition}");
+    assert_eq!(last["first_failed_index"], 0, "{definition}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relish_top_lists_running_array_tasks() {
+    let harness = Harness::start(Options::processes(false)).await;
+    let batch_id = harness.submit_ok(shell_array(4, 1, "sleep 30")).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let row = loop {
+        let (status, body) = harness.get("/v1/top").await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let rows: Value = serde_json::from_slice(&body).unwrap();
+        if let Some(row) = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["app_name"] == "render" && row["tasks"].as_u64() > Some(0))
+        {
+            break row.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no job row in top: {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(row["namespace"], "default");
+    assert_eq!(row["node"], NODE);
+    assert_eq!(row["id"], "tasks");
+    assert!(row["tasks"].as_u64().unwrap() <= 4, "{row}");
+    let cancel = harness
+        .http
+        .post(format!("{}/v1/batch/{batch_id}/cancel", harness.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
