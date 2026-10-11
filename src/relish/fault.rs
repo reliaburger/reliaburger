@@ -671,6 +671,7 @@ mod tests {
             id,
             fault_type: "kill".to_string(),
             target_service: service.to_string(),
+            namespace: Some("default".to_string()),
             target_instance: None,
             target_node: Some(node.to_string()),
             remaining_secs: 0,

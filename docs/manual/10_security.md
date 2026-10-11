@@ -178,23 +178,29 @@ do only what the block lists:
 
 | Action | What it covers |
 |--------|----------------|
-| `deploy` | apply, delete and roll back the listed apps, cancel their deploys |
+| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
 | `host-exec` | jobs and process workloads that run host commands |
+| `fault` | `relish fault` inject and clear on the listed apps; node faults and clearing every fault need it with `apps = ["*"]` and no `namespaces` |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
 | `secret-write` | `relish secret rotate`, for the cluster or one namespace (needs `apps = ["*"]` and no `namespaces`) |
-| `admin` | every action above, plus tokens, join tokens, upgrades, elections, node decommissioning, image signing, log export and `[permission]`/`[namespace]` declarations |
+| `admin` | every action above, plus tokens, join tokens, upgrades, elections, node decommissioning, image signing, log export, test leases (`relish test`) and `[permission]`/`[namespace]` declarations |
 | `secret-read` | nothing yet: no API route returns a decrypted secret |
 
 Some reads span every app: `/v1/logs/sql`, the raw metric store, the cluster
 metric rollups and alerts. They need the action granted with `apps = ["*"]` and
-no `namespaces` list. So do the admin routes. A block that grants `metrics` on
+no `namespaces` list. So do the admin routes, test leases among them. A build
+whose destination names no namespace (`pickle://web:v1`) could belong to
+anyone, so it needs `deploy` granted the same way. A block that grants `metrics` on
 one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
-A browser session keeps its token's permissions. Nodes talking to each other
+A browser session keeps its token's permissions, and it's always read-only:
+a cookie can read the dashboard but never change anything. That holds for a
+session opened with the cluster's service token too. It reads everything, but
+it isn't a node, so the node-to-node routes refuse it. Nodes talking to each other
 use the cluster's internal identity, which no block can restrict, so
 `relish logs` and `relish top` still gather every node's answer; the
 node you asked filters it. `relish wtf` reads health, membership and
@@ -437,7 +443,13 @@ Usually that's one of each, but while a Workload CA rotation is in progress it
 holds the old CA and the new one, so verify peers against the whole file, not
 just its first certificate.
 The JWT also works as a bearer token against the Reliaburger API, as a
-read-only credential confined to the workload's own app and namespace.
+read-only credential confined to the workload's own app and namespace. With it
+a workload can read its own status, logs, metrics, snapshots, batches and
+builds. The cluster-wide lists filter themselves to that app: `/v1/resolve`
+shows only its own service, `/v1/routes` only its own ingress routes, and
+`/v1/fault` only the faults on it. The routes that span every tenant refuse it
+outright: events, `/v1/logs/sql`, the raw metric store and
+`/v1/fault?cluster=true`, which also lists node faults.
 
 ## Signed images
 

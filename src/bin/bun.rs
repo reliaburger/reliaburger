@@ -934,6 +934,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    // Log and metric caps must fit the disk they bound (#678).
+    let data_filesystem =
+        reliaburger::bun::disk_pressure::FilesystemUsage::of(&config.storage.data)
+            .with_context(|| format!("cannot measure {}", config.storage.data.display()))?;
+    config
+        .validate_storage_caps(data_filesystem.total_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // Create port allocator from config
     let port_allocator = PortAllocator::new(
@@ -1423,6 +1430,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Durable kernel ownership requires all hooks before recovery. A load
     // failure must not start an agent that can forget original policy owners.
     agent.set_ebpf_sweep_interval(config.ebpf.sweep_interval_secs);
+    // Egress allowlists always permit the resolver workloads use, so a
+    // workload can resolve the names on its list.
+    if let Some(bound) = &bound_dns
+        && let std::net::SocketAddr::V4(resolver) = bound.local_addr()?
+    {
+        agent.set_workload_dns(*resolver.ip());
+    }
     // Observed, not configured: `enabled = true` with a failed load means no
     // enforcement, and a capability report must say so.
     // `mut` only matters on an `ebpf` build — the assignment below lives
@@ -1892,11 +1906,20 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
     agent.adopt_recorded_instances().await?;
     let task_runner = agent.delegated_task_runner(&data_base)?;
+    let forgotten = task_runner.forget_retired_executors().await;
+    if forgotten > 0 {
+        eprintln!("bun: forgot {forgotten} retired executor identities");
+    }
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     let task_runner = if let Some(kernel) = agent.delegated_namespace_kernel() {
         task_runner.with_namespace_policy(
-            reliaburger::bun::task_namespace::TaskNamespacePolicy::recover(kernel, &data_base)
-                .await?,
+            reliaburger::bun::task_namespace::TaskNamespacePolicy::recover(
+                kernel,
+                &data_base,
+                agent.delegated_network(),
+                agent.workload_dns(),
+            )
+            .await?,
         )
     } else {
         task_runner
@@ -3269,13 +3292,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let pickle_acceptor = match (&api_identity, registry_over_tls) {
         (Some(identity), true) => {
             let crl = crl_refresh.clone().unwrap_or_default();
-            match reliaburger::sesame::mtls::build_live_api_server_config(identity, crl) {
-                Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
-                Err(e) => {
-                    eprintln!("bun: failed to build registry TLS config, serving plaintext: {e}");
-                    None
-                }
-            }
+            // Fail closed, as the API does: a registry that silently fell
+            // back to plaintext would carry tokens and images in the clear.
+            let cfg = reliaburger::sesame::mtls::build_live_api_server_config(identity, crl)
+                .map_err(|e| anyhow::anyhow!("failed to build registry TLS config: {e}"))?;
+            Some(tokio_rustls::TlsAcceptor::from(cfg))
         }
         _ => None,
     };

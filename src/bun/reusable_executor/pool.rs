@@ -407,7 +407,17 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             while !self.retirement_step(context).await {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            self.remove_files(context).await
+            if !self.remove_files(context).await {
+                return false;
+            }
+            // Retirement is proven, so the identity's journal and routing
+            // files own nothing. Without this, every namespace that ever ran
+            // a job leaves them behind (#678). A failure only leaves metadata
+            // for the startup sweep; it never holds capacity.
+            if let Err(error) = self.lifecycle.forget_retired(&context.id).await {
+                eprintln!("executor {}: metadata kept: {error}", context.id.0);
+            }
+            true
         })
         .await
         .unwrap_or(false);
@@ -582,7 +592,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 .into_owned(),
         ];
         spec.process.overrides = None;
-        let mut connection = self.launch(&context.id, &spec, &listener, stop).await?;
+        let mut connection = self.launch(context, &spec, &listener, stop, None).await?;
         let peer = connection.peer_cred()?;
         let peer_pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
         let Runtime::Host(runtime) = &self.runtime else {
@@ -617,22 +627,36 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     /// Create and start the helper, then wait for it to connect. `stop`
     /// is checked between runtime calls, never during one, and interrupts
     /// the wait for the connection.
+    /// Create and start the executor container. Between the two, while
+    /// runc holds it, its address joins its namespace with the template's
+    /// `allow_from`.
     async fn launch(
         &self,
-        id: &InstanceId,
+        context: &mut Context,
         spec: &crate::grill::oci::OciSpec,
         listener: &UnixListener,
         stop: &CancellationToken,
+        allow_from: Option<Vec<String>>,
     ) -> Result<UnixStream, ExecutorError> {
         let interrupted = || ExecutorError::Configuration("executor preparation interrupted");
         if stop.is_cancelled() {
             return Err(interrupted());
         }
-        self.lifecycle.create(id, spec).await?;
+        self.lifecycle.create(&context.id, spec).await?;
+        #[cfg(feature = "ebpf")]
+        if let Some(address) = self.lifecycle.container_ip(&context.id).await
+            && let Some(lease) = context.namespace.as_mut()
+        {
+            lease
+                .publish_address(address, &context.id.0, allow_from)
+                .await?;
+        }
+        #[cfg(not(feature = "ebpf"))]
+        let _ = allow_from;
         if stop.is_cancelled() {
             return Err(interrupted());
         }
-        self.lifecycle.start(id).await?;
+        self.lifecycle.start(&context.id).await?;
         tokio::select! { biased;
             () = stop.cancelled() => Err(interrupted()),
             accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()) => {
@@ -717,6 +741,17 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         let base = context.base.clone();
         blocking(move || prepare_cgroups(&base, profile)).await?;
+        // Every command this executor runs lands in `task`, so the
+        // allowlist the profile key carries goes there before any does.
+        #[cfg(feature = "ebpf")]
+        if let Some(lease) = context.namespace.as_mut() {
+            lease
+                .enforce_egress(
+                    &context.base.join("task"),
+                    crate::bun::task_runtime::egress_allow(template),
+                )
+                .await?;
+        }
         let path = context.base.join("helper");
         let mut spec = crate::grill::oci::generate_job_oci_spec(
             "executor",
@@ -776,7 +811,15 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             });
         }
         spec.mounts.extend(scratch_mounts());
-        let mut connection = self.launch(&context.id, &spec, &listener, stop).await?;
+        let mut connection = self
+            .launch(
+                context,
+                &spec,
+                &listener,
+                stop,
+                crate::bun::task_runtime::allow_from(template),
+            )
+            .await?;
         let peer = connection.peer_cred()?;
         if peer.uid() != crate::grill::userns::EXECUTOR_HOST_UID {
             return Err(ExecutorError::Protocol(
@@ -1645,6 +1688,75 @@ mod tests {
         async fn state(&self, _: &InstanceId) -> Result<ContainerState, GrillError> {
             Ok(ContainerState::Running)
         }
+    }
+
+    /// A runtime whose instances have all stopped, recording what it forgets.
+    #[derive(Clone, Default)]
+    struct Forgetting {
+        forgotten: Arc<std::sync::Mutex<Vec<InstanceId>>>,
+    }
+    impl Grill for Forgetting {
+        async fn create(&self, _: &InstanceId, _: &OciSpec) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn start(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn kill(&self, _: &InstanceId) -> Result<(), GrillError> {
+            Ok(())
+        }
+        async fn state(&self, _: &InstanceId) -> Result<ContainerState, GrillError> {
+            Ok(ContainerState::Stopped)
+        }
+        async fn forget_retired(&self, id: &InstanceId) -> Result<(), GrillError> {
+            self.forgotten.lock().unwrap().push(id.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_executor_identity_and_journal_are_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let lifecycle = Forgetting::default();
+        let pool = pool_with(
+            &ProcessGrill::new(),
+            lifecycle.clone(),
+            &budget,
+            GroupKill::CgroupKill,
+            2,
+        );
+        let id = InstanceId("tenant-a__executor-rbtest-host-0".into());
+        let mut old = context(&budget, id.clone(), root.path());
+        std::fs::create_dir(&old.directory).unwrap();
+        // The runtime has no such instance: its retirement is proven.
+        assert!(pool.retire(&mut old, Duration::from_secs(5)).await);
+        assert!(!old.directory.exists(), "executor directory kept");
+        assert_eq!(*lifecycle.forgotten.lock().unwrap(), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn an_executor_that_has_not_retired_keeps_its_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let process = ProcessGrill::new();
+        let lifecycle = Forgetting::default();
+        let pool = pool_with(
+            &process,
+            lifecycle.clone(),
+            &budget,
+            GroupKill::CgroupKill,
+            2,
+        );
+        let id = running(&process, "tenant-b__executor-rbtest-host-0").await;
+        let mut old = context(&budget, id, root.path());
+        // `kill` on the lifecycle is a no-op, so the helper keeps running.
+        assert!(!pool.retire(&mut old, Duration::from_millis(200)).await);
+        assert!(lifecycle.forgotten.lock().unwrap().is_empty());
+        process.kill(&old.id).await.unwrap();
     }
 
     fn reservation() -> Resources {

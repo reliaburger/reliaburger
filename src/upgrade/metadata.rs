@@ -30,6 +30,11 @@ pub struct ReleaseMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Release {
     pub version: BinaryVersion,
+    /// The cluster formats this release speaks. A node rolls in place only
+    /// onto a release with its own pair; any other needs a fresh cluster
+    /// until 1.0. Absent in metadata published before 0.2.0.
+    #[serde(default)]
+    pub compatibility: Option<crate::compatibility::Compatibility>,
     /// Keyed by `{os}-{arch}` (`linux-x86_64`, `macos-aarch64`, ...).
     pub platforms: BTreeMap<String, PlatformArtifact>,
 }
@@ -60,17 +65,20 @@ impl ReleaseMetadata {
         })
     }
 
+    /// The release entry for `version`, if published.
+    pub fn release(&self, version: &BinaryVersion) -> Option<&Release> {
+        self.releases
+            .iter()
+            .find(|release| release.version == *version)
+    }
+
     /// The artefact for `version` on `platform`, if released.
     pub fn artifact_for(
         &self,
         version: &BinaryVersion,
         platform: &str,
     ) -> Option<&PlatformArtifact> {
-        self.releases
-            .iter()
-            .find(|release| release.version == *version)?
-            .platforms
-            .get(platform)
+        self.release(version)?.platforms.get(platform)
     }
 }
 
@@ -112,6 +120,7 @@ mod tests {
         "releases": [
             {
                 "version": "v0.2.0",
+                "compatibility": {"protocol": 51, "state": 68},
                 "platforms": {
                     "linux-x86_64": {
                         "url": "https://releases.example/bun-v0.2.0-linux-x86_64",
@@ -144,6 +153,26 @@ mod tests {
             .artifact_for(&"v0.2.0".parse().unwrap(), "macos-aarch64")
             .unwrap();
         assert_eq!(mac.external_signature.as_deref(), Some("ZXh0"));
+    }
+
+    #[test]
+    fn a_release_names_its_cluster_formats() {
+        let metadata = ReleaseMetadata::parse(FIXTURE).unwrap();
+        let release = metadata.release(&"v0.2.0".parse().unwrap()).unwrap();
+        assert_eq!(
+            release.compatibility,
+            Some(crate::compatibility::Compatibility {
+                protocol: 51,
+                state: 68
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_without_formats_still_parses() {
+        let older = FIXTURE.replace(r#""compatibility": {"protocol": 51, "state": 68},"#, "");
+        let metadata = ReleaseMetadata::parse(&older).unwrap();
+        assert_eq!(metadata.releases[0].compatibility, None);
     }
 
     #[test]

@@ -536,11 +536,15 @@ lease ownership must also be unscoped, for both inspection and cleanup.
 configuration; no security switch needs hand-editing:
 
 ```sh
-target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
 sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
-The output directory is created if it doesn't exist. Leave Bun running and,
+The output directory is created if it doesn't exist. As root on Linux with
+`runc` installed, `relish init` also turns on `[ebpf]` and `[dns]`, so
+namespace isolation is enforced from the first deploy (build Bun with
+`--features ebpf`; it refuses to start a rootful runc node without the data
+path). Leave Bun running and,
 from another terminal, mint the first administrator token over the generated
 cluster CA before doing anything else:
 
@@ -727,16 +731,23 @@ Requirements:
 - **Signatures.** Network upgrades need two Ed25519 signatures over the
   binary: one from the release key set compiled into the running binary, and
   one from the operator key configured as `upgrades.external_signing_key` in
-  node.toml (generate one with `relish dev keygen`). Air-gapped
+  node.toml (generate one with `relish dev keygen`). Published metadata
+  carries only the release signature, so `relish upgrade start <version>`
+  countersigns each download with `--external-key` (or takes a countersigned
+  `--sig`), picking the build for the platform each node reports. Air-gapped
   `upgrade start --binary` needs only the release signature (expects
   `{binary}.sig` alongside the file — see `relish dev sign-binary`).
 - **A versioned binary directory** (default: the directory of the running
   executable): `bun` is a symlink to `bun-vX.Y.Z`; previous versions are
   retained for rollback (`upgrades.retain_versions`, default 3).
-- **Matching formats.** The leader runs `bun --compatibility` on a verified
-  candidate before recording a cluster upgrade and refuses one with a different
-  protocol or state format; a cluster rollback is refused when a node's binary
-  directory lacks the target (`installed_versions` in `GET /v1/version`).
+- **Matching formats.** Until 1.0 a rolling upgrade works only between builds
+  with the same protocol and state format, and every release so far changed
+  one, so moving between releases means a fresh cluster. `relish upgrade check`
+  reads each release's pair from the metadata and says so. The leader runs
+  `bun --compatibility` on a verified candidate before recording a cluster
+  upgrade and refuses one with a different protocol or state format; a cluster
+  rollback is refused when a node's binary directory lacks the target
+  (`installed_versions` in `GET /v1/version`).
 
 The release private key must live outside any repository. The project key's
 public half is compiled into `src/upgrade/keys.rs`; rotating it means shipping
@@ -952,6 +963,7 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
+| [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
 
 ### Images, the pull-through cache, and cluster registries (Phase 12)
 

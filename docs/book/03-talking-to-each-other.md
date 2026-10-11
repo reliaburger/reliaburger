@@ -385,7 +385,7 @@ On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in
 
 ### The BPF maps
 
-The eBPF programs don't call back to Bun. They read from kernel-resident hash maps that Bun populates. Three maps (plus a supplementary one for namespace isolation):
+The eBPF programs don't call back to Bun. They read from kernel-resident hash maps that Bun populates. Three maps, plus two supplementary ones for namespace isolation:
 
 **`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string, value is a 4-byte IPv4 address in network byte order. It's a leftover from the abandoned in-kernel DNS design (see "Why userspace DNS" below) — the userspace responder resolves names straight from the `ServiceMap` instead, so this map isn't on the resolution path today.
 
@@ -395,7 +395,9 @@ The eBPF programs don't call back to Bun. They read from kernel-resident hash ma
 
 **`cgroup_namespace_map`**: The supplementary map — `cgroup_id → namespace_id`. It's the quiet load-bearing one. The connect hook only runs the isolation check when it can find the *source's* namespace here; if the lookup misses, it lets the connection through. So an empty `cgroup_namespace_map` doesn't fail safe, it fails *open* — every cross-namespace connection is allowed. Populating it is what turns isolation on, and `firewall_map` then carries the explicit exceptions. We learned this the hard way: for a while the resolver that computed these entries had no production caller at all (the same "parsed but never wired" trap we hit with port mappings in Chapter 1). Both maps were empty in every running cluster, so namespace isolation was advertised but inert. The fix is a reconcile in Bun that, on every deploy, redeploy and stop, rebuilds both maps from the live service map and the running instances' cgroup ids — writing what should exist and deleting what shouldn't, so a departed workload's isolation identity can't linger on a cgroup id the kernel later reuses.
 
-All four are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
+**`destination_map`**: The second supplementary map, `(ip, port) → (app_id, namespace_id)`. It names who owns a *real* destination, so the isolation check runs on the addresses behind a VIP too. "Isolation on real addresses" below explains why it had to exist.
+
+All five are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
 
 ```rust
 #[repr(C)]
@@ -734,6 +736,43 @@ Every health tick checks that both hooks are still attached and the enforcement 
 One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goes through *connect6* with a "v4-mapped" address, `::ffff:a.b.c.d`. The connect6 hook has to spot that pattern and judge the connection against the IPv4 policy, or the mapped form becomes yet another bypass. The kernel also insists that `user_ip6` is read in 32-bit chunks — the verifier rejects byte-wise loads from that context field.
 
 While we were in there, we fixed how a defective object file fails. The map handles used to be fetched lazily, deep inside the agent, with `.unwrap()` — a `.bpf.o` missing a map would panic Bun at the first write, minutes or hours after startup. Now the loader validates every required map and program against a single list the moment the object loads, and refuses with the full roster of what's missing. One clear error at load time beats nine scattered panics at use time.
+
+### Isolation on real addresses
+
+Here's a question an audit asked us, and it's worth asking of any isolation story: what does `relish resolve db` print? A VIP, and then the backends: `10.88.0.5:5432` on this node, `192.168.0.2:31001` on another. So what stops a workload in the `shop` namespace from skipping the VIP and dialling `192.168.0.2:31001` directly?
+
+For a long time, nothing. The namespace check lived inside the VIP branch of the connect hook. A connect to anything outside `127.128.0.0/16` went straight to the egress check and, for an app without an allowlist, through. "Cross-namespace traffic is blocked by default" was true for anyone polite enough to use the VIP.
+
+The fix (decision D3-B in the 0.2.0 audit) is a map from real destination to owner. `destination_map` holds three kinds of entry, all rebuilt by the same reconcile that writes `cgroup_namespace_map` and `firewall_map`:
+
+- each backend in the merged service view, at the address the VIP rewrites to: a local container's address and port, or a remote node's address and published host port;
+- each backend the replicated catalogue lists on *any* node, this one included, at its node address and host port. That's the DNAT target another node's workload would dial;
+- port 0, meaning every port, of each local container address, jobs and delegated task containers included.
+
+The hook now looks up a non-VIP destination, exact port first, then port 0, and runs the same namespace check the VIP path runs. We pulled that check out into two small `static __always_inline` helpers, `source_namespace` and `isolation_denies`, so the VIP path and the real-address path can't drift apart. The same helper runs in `sendmsg4`, and in `connect6` and `sendmsg6` for v4-mapped addresses, because otherwise UDP and dual-stack sockets would each be a new door. (We've learned to count the doors.)
+
+A service's real addresses carry the service's own `app_id`, the same identity its VIP carries. That keeps `allow_from` simple: one grant covers both paths. A job publishes no service, so it gets an identity of its own, `0x8000_0000 | hash(namespace/name)`. VIP identities are `127.128.x.x` read as a `u32`, which is always below `0x8000_0000`, so the two ranges can't collide.
+
+What if two owners claim one address? It can happen for a moment: a catalogue entry naming a host port on another node that the node has since reused. Guessing would be a security decision made by accident. Instead, the reconcile marks the address *contested*, with a namespace id of `0xFFFFFFFF`. No source has that namespace, so every namespaced caller is refused until the owners agree. In Rust that's one call to the entry API:
+
+```rust
+entries
+    .entry(key)
+    .and_modify(|current: &mut DestinationValue| {
+        if *current != value {
+            *current = DestinationValue { app_id: 0, namespace_id: NAMESPACE_CONTESTED };
+        }
+    })
+    .or_insert(value);
+```
+
+`BTreeMap::entry` hands back a view of the slot for `key`, present or not. `and_modify` runs only when something's there; `or_insert` only when nothing is. One lookup, no `if let Some(...) = map.get_mut(...)` dance, and the borrow checker is happy because the closure borrows the slot, not the map.
+
+Socket hooks only see sockets, though. A container with `CAP_NET_RAW` can hand-craft packets, and a container dialling *any* address at a published host port gets forwarded by the portmap DNAT to whichever container owns that port, after the connect hook has already looked at the pre-DNAT address. So there's a second layer on the forward path: an nftables table, `reliaburger_isolation`, that keeps each local workload address in a per-namespace set and drops a packet from one host veth to another workload's address unless the namespaces match, `allow_from` granted the pair, or it answers an allowed connection. Bun rebuilds the whole table in one `nft -f` transaction whenever the reconcile's answer changes, off the agent loop.
+
+Host `exec` and `script` workloads needed one more piece. They never ran in a cgroup of their own, so the hook couldn't tell which namespace they belonged to, and they bypassed isolation entirely. Now the owned process runtime's execution gate writes `0` to `cgroup.procs` of the workload's cgroup just before it `exec`s the command (writing `0` moves the writer), and the agent binds that cgroup before start, exactly as it does for a container. Be clear about what this buys: a host command running as root can write itself into another cgroup. Isolation keeps honest host commands in bounds; it doesn't contain hostile root code. Processes outside Reliaburger's cgroups (sshd, cron, Bun itself) were never inside the policy and still aren't.
+
+The Lima tests prove each path with a listener on a loopback address of its own, so a test's map entries can't touch another test's traffic: `cross_namespace_connect_to_container_ip_is_denied`, `cross_namespace_connect_to_node_host_port_is_denied`, `allow_from_opens_the_real_address_path_too` and `exec_workload_is_held_to_its_namespace`. One kernel can't host two Buns (only one may own the root cgroup's hooks), so the cross-node case is a catalogue entry naming a "remote" node at its own loopback address.
 
 ### Running Linux tests from a MacBook
 
