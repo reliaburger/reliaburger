@@ -285,36 +285,50 @@ migration and no feature gate
   [full](qualification/2026-10-06-v0.1.6-soak-full.md) soaks and the
   [8-hour final tier](qualification/2026-10-06-v0.1.6-sustained-v02-final.md),
   where the V02 gate passed.
-- [x] **0.2.0: "A million jobs", foundation and common lifecycle implemented**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/3)). The
-  compact task-array foundation landed in [#266](https://github.com/reliaburger/reliaburger/pull/266)
-  and resolved #588. [#642](https://github.com/reliaburger/reliaburger/pull/642)
-  implements [#638](https://github.com/reliaburger/reliaburger/issues/638):
-  singleton jobs, arrays, cron and deployment hooks share durable runs, resource
-  admission and accepted outcomes ([plan](plans/2026-10-07-plan-common-job-lifecycle.md),
-  [qualification](qualification/2026-10-07-common-jobs/README.md)). This tick
-  records implementation; 0.2.0 isn't released. [#654](https://github.com/reliaburger/reliaburger/pull/654)
-  adds bounded native/shared executors and a four-part VM/process/container demonstration
-  ([raw results](qualification/2026-10-09-timed-job-scenarios/README.md)); it doesn't
-  qualify the daily target. Reusable executors
-  [#639](https://github.com/reliaburger/reliaburger/issues/639) are implemented,
-  alongside the reproducible throughput demo
-  [#640](https://github.com/reliaburger/reliaburger/issues/640). Sustained daily and
-  storage-bound qualification [#668](https://github.com/reliaburger/reliaburger/issues/668)
-  and resident model workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
-  **Exit gate (decision D18-C, audit [#674](https://github.com/reliaburger/reliaburger/issues/674)):**
-  #668's list, on at least three nodes: 24 hours at 1,158 accepted successes a
-  second or more (100 million a day) plus headroom, with concurrent apps,
-  several resource profiles, worker and leader loss, delayed messages and disk
-  faults. `scripts/release/qualify-jobs-sustained.sh --tier final` runs it
-  ([#686](https://github.com/reliaburger/reliaburger/issues/686)); bounded job
-  storage ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has
-  to pass first. Every run records the September plan's measurements (wall
-  time of a million-task array, p99 start lag, Raft entries a second and
-  state, leader memory and CPU, executor overhead, ledger bytes, retained
-  logs) without gating on them; that plan is
-  [archived](plans/archive/2026-09-28-plan-million-jobs.md).
+- [x] **0.2.0: "A million jobs".** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0)
+  on RELEASE_DATE_0_2_0
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/3), merge
+  train [#725](https://github.com/reliaburger/reliaburger/pull/725), audit
+  [#674](https://github.com/reliaburger/reliaburger/issues/674)). One-off jobs,
+  cron, deployment hooks and task arrays share one durable lifecycle, with
+  resource admission beside apps and accepted outcomes that survive a leader
+  change:
+  - [x] compact task arrays, a template and a count rather than a record per
+    task ([#266](https://github.com/reliaburger/reliaburger/pull/266), #588);
+  - [x] the common job lifecycle (#638, [#642](https://github.com/reliaburger/reliaburger/pull/642),
+    [plan](plans/2026-10-07-plan-common-job-lifecycle.md),
+    [qualification](qualification/2026-10-07-common-jobs/README.md));
+  - [x] fresh, shared and host executors, and the timed throughput scenarios in
+    `relish bench` ([#654](https://github.com/reliaburger/reliaburger/pull/654),
+    #639, #640, [raw results](qualification/2026-10-09-timed-job-scenarios/README.md));
+  - [x] the audit's 0.2.0 findings (#675 to #691): API authorisation holes
+    closed, host-path sources gated, namespaces isolated by default with egress
+    allowlists, bounded job storage, fair shares across namespaces, leader
+    dispatch at scale, job leases counted in app placement, per-definition job
+    history, job metrics and failure alerts, a durable audit log
+    (`relish audit`) and a signed upgrade path; and every known flake fixed;
+  - [x] the exit gate (decision D18-C): #668's list, on at least three nodes,
+    24 hours at 1,158 accepted successes a second or more (100 million a day)
+    plus headroom, with concurrent apps, several resource profiles, worker and
+    leader loss, delayed messages and disk faults, run by
+    `scripts/release/qualify-jobs-sustained.sh --tier final`
+    ([#686](https://github.com/reliaburger/reliaburger/issues/686)).
+    QUALIFICATION_RECORDS_0_2_0
+
+  Resident model workers ([#641](https://github.com/reliaburger/reliaburger/issues/641))
+  follow later. 0.2.0 changes the cluster's formats (jobs live in the
+  council), so a 0.1.6 cluster can't roll to it: recreate the cluster
+  ([upgrading from 0.1.6](releasing.md#upgrading-from-016)). The September
+  plan is [archived](plans/archive/2026-09-28-plan-million-jobs.md).
   [Chapter 17](book/17-a-million-jobs.md).
+- [ ] **0.2.1: cluster safety**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/16)). The
+  bug-fix release after 0.2.0, as 0.1.5 was: the data-loss and availability
+  bugs the 10 October audit found that predate jobs.
+- [ ] **0.2.2: UX polish**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/15)). The
+  CLI review pass ([#522](https://github.com/reliaburger/reliaburger/issues/522)),
+  Kubernetes import and export fidelity, demos, examples and doc fixes.
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
@@ -329,7 +343,7 @@ migration and no feature gate
   ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
   ten Dell Wyse 3040s from power-on to a cluster.
   Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
-  which waits for 0.1.6.
+  which waits for the 0.2.x patch releases.
 - [ ] **0.4.0 and 0.4.1: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [plan](plans/2026-10-09-plan-container-migration.md),
@@ -394,10 +408,11 @@ what's shipped and what's scheduled.
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
   F06, F09, F11, and the rest of F03–F05).
-- **Known bugs and flakes.** The open one, the `oci_crash` flake
-  ([#526](https://github.com/reliaburger/reliaburger/issues/526)), is in
-  [0.2.0](https://github.com/reliaburger/reliaburger/milestone/3); the open
-  flakes are also in the [known flakes register](flakes.md)
+- **Known bugs and flakes.** The bugs the 10 October audit
+  ([#674](https://github.com/reliaburger/reliaburger/issues/674)) found outside
+  jobs are in [0.2.1](https://github.com/reliaburger/reliaburger/milestone/16)
+  and [0.2.2](https://github.com/reliaburger/reliaburger/milestone/15); any open
+  flake is in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
 
 ## How we got to 0.1.0

@@ -25,9 +25,6 @@
 #       2 s), then play the setup step SETUP_SPEEDUP (4) times faster. Setup
 #       redraws its timers several times a second, so idle trimming alone
 #       would leave a minute and a half of VM boots. Both are said on screen.
-#   ... --jobs
-#       Include the development batch preview and verify its real outcomes
-#       alongside the application serving orders.
 #   ... [--api-port PORT] [--ingress-port PORT] [--registry-port PORT]
 #       Give the tour's cluster these host ports instead of the defaults
 #       (19117, 18080, 15050), so it can run beside another laptop cluster.
@@ -55,9 +52,7 @@ BURGER_ORDER="http://burger.localhost:18080/order"
 IDLE_LIMIT=2
 SETUP_SPEEDUP=4
 
-JOBS=0
 BATCH_ID=""
-SMALL_ID=""
 MODE="run"
 SETUP_BINARIES=""
 INSTALL_VERSION=""
@@ -71,7 +66,6 @@ port_number() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --check) MODE="check"; shift ;;
-        --jobs) JOBS=1; shift ;;
         --setup) SETUP_BINARIES="${2:?--setup needs a directory}"; shift 2 ;;
         --install) INSTALL_VERSION="${2:?--install needs a version, such as v0.1.1}"; shift 2 ;;
         --record) MODE="record"; CAST="${2:?--record needs a file}"; shift 2 ;;
@@ -85,9 +79,6 @@ done
 if [[ -n "${SETUP_BINARIES}" && -n "${INSTALL_VERSION}" ]]; then
     echo "--install and --setup are alternatives; pass one" >&2
     exit 64
-fi
-if [[ "${JOBS}" == 1 && -n "${INSTALL_VERSION}" ]]; then
-    echo "--jobs requires development binaries" >&2; exit 64
 fi
 INGRESS="http://podinfo.localhost:${INGRESS_PORT}"
 BURGER_ORDER_SENT="http://burger.localhost:${INGRESS_PORT}/order"
@@ -116,10 +107,9 @@ known_command() {
         | "relish images" \
         | "relish apply burger/burger.toml" \
         | "curl ${BURGER_ORDER}" \
-        | "relish --output json batch submit burger/jobs.toml" \
+        | "relish batch submit burger/jobs.toml" \
         | "relish batch watch 1" \
-        | "relish batch results 2 --failed --limit 20" \
-        | "relish manual batch" \
+        | "relish jobs" \
         | "relish path frontend --to redis" \
         | "relish metrics frontend" \
         | "relish fault delay redis 300ms --from frontend --duration 2m --acknowledge" \
@@ -163,7 +153,6 @@ if [[ "${MODE}" == "record" ]]; then
         inner="${inner} --install ${INSTALL_VERSION}"
     fi
     inner="${inner}${SETUP_PORTS}"
-    if [[ "${JOBS}" == 1 ]]; then inner="${inner} --jobs"; fi
     # The title names the release the recording installed, so
     # tests/suite/website.rs can check it against install.sh's default.
     TITLE_VERSION="development build"
@@ -406,7 +395,7 @@ while IFS= read -r command <&3; do
             esac
             ;;
         "${BURGER_FETCH}")
-            if [[ "${JOBS}" != 1 ]] && curl -fsSI "${BURGER_URL}" >/dev/null 2>&1; then
+            if curl -fsSI "${BURGER_URL}" >/dev/null 2>&1; then
                 show_in_work "${command}"
             else
                 say "${BURGER_URL} is published with the site; until then,"
@@ -414,43 +403,36 @@ while IFS= read -r command <&3; do
                 show_in_work "cp -R examples/demo/burger ."
             fi
             ;;
-        "relish --output json batch submit burger/jobs.toml")
-            if [[ "${JOBS}" != 1 ]]; then say "Batch preview needs development binaries; use --jobs to include it."; continue; fi
+        "relish batch submit burger/jobs.toml")
+            # The page's later commands name manifest 1, as on a fresh
+            # cluster; the script reads the number submit really printed.
             type_command "${command}"
-            (cd "${BURGER_WORK}" && relish --output json batch submit burger/jobs.toml) >"${BURGER_WORK}/batch.json"
-            cat "${BURGER_WORK}/batch.json"
-            BATCH_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["batch_id"])' "${BURGER_WORK}/batch.json")
+            (cd "${BURGER_WORK}" && relish batch submit burger/jobs.toml) | tee "${BURGER_WORK}/submit.log"
+            BATCH_ID=$(sed -n 's/^manifest \([0-9][0-9]*\) submitted.*/\1/p' "${BURGER_WORK}/submit.log")
+            [[ -n "${BATCH_ID}" ]] || { echo "batch submit printed no manifest number" >&2; exit 1; }
+            printf '\n'
+            sleep 1.5
             ;;
         "relish batch watch 1")
-            [[ "${JOBS}" == 1 ]] || continue
             type_command "relish batch watch ${BATCH_ID}"
-            relish batch watch "${BATCH_ID}" >"${BURGER_WORK}/watch.log" 2>&1 &
+            # watch prints a summary a second, live; meanwhile the script
+            # checks that the burger app keeps taking orders.
+            relish batch watch "${BATCH_ID}" &
             WATCH_PID=$!
             while kill -0 "${WATCH_PID}" 2>/dev/null; do
                 if ! burger_takes_orders; then
                     kill -TERM "${WATCH_PID}" 2>/dev/null || true
                     wait "${WATCH_PID}" 2>/dev/null || true
-                    cat "${BURGER_WORK}/watch.log"
                     echo "burger stopped serving during the batch" >&2; exit 1
                 fi
                 sleep 1
             done
             wait "${WATCH_PID}"
-            cat "${BURGER_WORK}/watch.log"
             relish --output json batch-status "${BATCH_ID}" >"${BURGER_WORK}/summary.json"
-            SMALL_ID=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert s["done"] and s["succeeded"]==1064 and s["failed"]==0 and s["not_run"]==0, s; print(next(c["batch_id"] for c in s["cohorts"] if c["profile"]=="small"))' "${BURGER_WORK}/summary.json")
+            python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert s["done"] and s["succeeded"]==1064 and s["failed"]==0 and s["not_run"]==0, s' "${BURGER_WORK}/summary.json"
             say "All 1,064 tasks succeeded; the burger app kept serving orders."
-            ;;
-        "relish batch results 2 --failed --limit 20")
-            [[ "${JOBS}" == 1 ]] || continue
-            type_command "relish batch results ${SMALL_ID} --failed --limit 20"
-            relish batch results "${SMALL_ID}" --failed --limit 20
-            ;;
-        "relish manual batch")
-            [[ "${JOBS}" == 1 ]] || continue
-            type_command "${command}"
-            say "The batch manual is embedded in relish; press q to leave its reader."
-            say "This recording keeps going; its source is docs/manual/14_batch-jobs.md."
+            printf '\n'
+            sleep 1.5
             ;;
         "relish build burger/burger.toml" | "relish apply burger/burger.toml")
             show_in_work "${command}"

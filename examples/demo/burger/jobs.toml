@@ -1,4 +1,5 @@
-# Development preview: PR #266 / 0.2.0, on rootful Linux nodes.
+# The five-minute tour's jobs step: relish batch submit burger/jobs.toml.
+# Image jobs need rootful Linux nodes, as the laptop quickstart's VMs are.
 # A chunk queues indexes; CPU and memory requests govern actual concurrency.
 name = "burger-orders"
 namespace = "default"

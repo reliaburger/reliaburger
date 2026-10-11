@@ -1,8 +1,8 @@
 # Batch jobs
 
-Development preview: 0.2.0, not in 0.1.6. Build matching development binaries
-and start a fresh cluster, because 0.2.0 changes the control messages and the
-durable state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
+This lifecycle arrived in 0.2.0, which changed the control messages and the
+durable state: a cluster made with an earlier release can't roll to it, so start
+a fresh one (`operations` explains why). A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.
 

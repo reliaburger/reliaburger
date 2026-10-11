@@ -27,7 +27,7 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.1.6 PROTOTYPE</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.0 PROTOTYPE</div>
           <h1 id="title">One binary.<br>A container platform with nothing to assemble.</h1>
           <p class="lede">Kubernetes gave us container orchestration, and gave every team an accidental
             platform engineering department. Reliaburger compiles the platform into one Rust agent:
@@ -35,7 +35,7 @@
             It’s a prototype. Try it on a laptop cluster, on macOS or on Linux with KVM; five
             minutes from install to cluster is the target.</p>
           <div class="intro-links">
-            <a class="primary-link" href="#install">Install 0.1.6 <span aria-hidden="true">↓</span></a>
+            <a class="primary-link" href="#install">Install 0.2.0 <span aria-hidden="true">↓</span></a>
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
             <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
               <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf" aria-label="The whitepaper as a PDF">PDF</a></span>
@@ -73,7 +73,7 @@
               and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
-              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">Release notes <span aria-hidden="true">↗</span></a></p>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
         </div>
       </section>
@@ -81,23 +81,23 @@
       <!-- Release cards use the roadmap's release names (docs/roadmap.md); a date
            appears only where the roadmap states one. tests/suite/website.rs checks both. -->
       <aside class="status" aria-label="Release status: what the installer fetches">
-        <strong>0.1.6: Operations security</strong>
-        <p>The prototype you install today, released on 7 October 2026. Images bound to a
-          digest when you apply them, CA backup and intermediate rotation, tokens that expire
-          and rotate, and per-namespace secret keys. Signed binaries for Linux and macOS, and a
-          one-line installer that builds a laptop cluster from them. The documentation lists
-          what 0.1.6 doesn’t do yet.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">Release notes <span aria-hidden="true">↗</span></a>
+        <strong>0.2.0: A million jobs</strong>
+        <p>The prototype you install today, released on RELEASE_DATE_0_2_0. One-off jobs, cron,
+          deployment hooks and task arrays (a template and a count, not a record per task)
+          share one durable lifecycle, packed onto nodes beside your apps. Each job picks
+          its isolation: a fresh container, a reused container or an allowlisted host
+          command. Signed binaries for Linux and macOS, and a one-line installer that
+          builds a laptop cluster from them. The documentation lists what 0.2.0 doesn’t
+          do yet.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
-      <aside class="status" aria-label="Release status: in development">
-        <strong>0.2.0: A million jobs</strong>
-        <p>In development, not released. One-off jobs, cron, deployment hooks and task arrays
-          (a template and a count, not a record per task) share one durable lifecycle,
-          packed onto nodes beside your apps. Each job picks its isolation: a fresh
-          container, a reused container or an allowlisted host command. The million-task gate and the sustained daily rate are
-          still being qualified.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/3">Milestone <span aria-hidden="true">↗</span></a>
+      <aside class="status" aria-label="Release status: next">
+        <strong>0.2.1: Cluster safety</strong>
+        <p>Next. The bug-fix release after 0.2.0: the data-loss and availability bugs
+          an audit found in rollouts, GitOps, council recovery, backups, the registry
+          and networking.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/16">Milestone <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status: planned">
@@ -124,8 +124,8 @@
         </div>
         <div class="tour">
           <p class="tour-note">Install, then put the cluster through its paces: a real
-            Kubernetes app, a network fault, a killed replica and a lost node. Same
-            prerequisites as the install line.</p>
+            Kubernetes app, an app of your own, a thousand jobs, a network fault, a killed
+            replica and a lost node. Same prerequisites as the install line.</p>
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
                figure nears the viewport. -->
@@ -137,7 +137,7 @@
             <figcaption>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                against the published 0.1.4 install.
+                against the published 0.2.0 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
                 says how long it really took.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -189,6 +189,17 @@
                   <code>linux/amd64</code> and <code>linux/arm64</code>: <code>images</code> lists
                   <code>burger:v1</code> once, with its platforms. Each order names the podinfo
                   backend that cooked it, found by its service name.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish batch submit burger/jobs.toml</code>
+<code data-tour>relish batch watch 1</code>
+<code data-tour>relish jobs</code></pre>
+                <p>Then a thousand jobs beside it: 1,000 small and 64 larger hashing tasks from
+                  the same image, in two resource profiles. Each profile is stored as a template
+                  and a count, not a record per task, and its tasks are packed around the apps
+                  already running. <code>watch</code> takes the number <code>submit</code>
+                  printed and shows the rate and how long tasks take; <code>jobs</code> lists
+                  the finished run. The burger keeps taking orders throughout.</p>
               </li>
               <li>
                 <pre><code data-tour>relish path frontend --to redis</code></pre>
@@ -262,21 +273,19 @@
       <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">03 /</span>
-          <h2 id="job-throughput-title">Coming in 0.2.0: a million jobs, your choice of isolation
+          <h2 id="job-throughput-title">A million jobs, your choice of isolation
             <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
         </div>
         <div class="tour">
-        <p class="tour-note">Everything in this section is 0.2.0, not in 0.1.6: a development
-          build, not what the installer fetches yet. It runs the same command four ways,
-          on the same VM with the same concurrency, so you can see what each kind of
-          isolation costs.</p>
+        <p class="tour-note">The same command, run four ways on the same VM with the same
+          concurrency, so you can see what each kind of isolation costs.</p>
         <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:258.78089525790324">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
             with <code>asciinema play job-throughput.cast</code>.</p></noscript>
           <figcaption>
-            <span>0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers,
+            <span>Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers,
               shared containers and host jobs. Chapter jumps and playback speed
               change only your view; preparation and cleanup stay visible.</span>
             <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
@@ -292,10 +301,9 @@
         </figure>
         <details class="tour-commands" id="job-throughput-commands">
           <summary>Show the commands <span class="tour-commands-note">run the four scenarios on your own setup</span></summary>
-          <p>These commands are 0.2.0, not in 0.1.6: they need the development build shown
-            above, and the installer doesn’t fetch it yet. Each defaults to 60 seconds and
-            concurrency 27 per node. The public scenarios use your configured
-            cluster endpoint, token and CA. They submit real work, so use a test cluster.</p>
+          <p>Each scenario defaults to 60 seconds and concurrency 27 per node. The public
+            scenarios use your configured cluster endpoint, token and CA. They submit real
+            work, so use a test cluster.</p>
           <ol class="tour-steps">
             <li>
               <pre><code>relish bench --scenario jobs-vm-baseline</code></pre>
@@ -400,7 +408,7 @@
               <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
               an isolated container or a multi-node cluster.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.1.6.</p>
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.0.</p>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
           </div>
           <div class="terminal">
@@ -459,7 +467,7 @@ target/debug/relish</code></pre>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.1.6 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <p>What’s implemented, what 0.2.0 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:

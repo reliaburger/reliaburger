@@ -307,7 +307,6 @@ skipped. The policy fields (`max_attempts`, `task_timeout_secs`, `overlap` and
 
 ## Task arrays
 
-Development preview for 0.2.0: use matching PR #266 binaries and a fresh cluster.
 When the same program needs to run thousands or millions of times, submit one
 template and a count, with `{index}` wherever the task's number goes.
 
