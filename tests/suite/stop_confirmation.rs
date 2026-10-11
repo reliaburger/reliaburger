@@ -8,6 +8,8 @@ use reliaburger::{bun, config, council, meat, mustard};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::admission_fixture::write_admission_fixture;
+
 fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
     let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
     spec.replicas = Replicas::Fixed(replicas);
@@ -166,24 +168,4 @@ async fn delete_reports_an_accepted_request_not_completed_cleanup() {
     leader.shutdown().await.unwrap();
     assert_eq!(code, reqwest::StatusCode::ACCEPTED);
     assert_eq!(body["status"], "deleting");
-}
-
-async fn write_admission_fixture(
-    council: &reliaburger::council::CouncilNode,
-    mut request: reliaburger::council::RaftRequest,
-) -> Result<reliaburger::council::CouncilResponse, reliaburger::council::CouncilError> {
-    let previous = council.desired_state().await.last_applied_log;
-    match &mut request {
-        reliaburger::council::RaftRequest::BatchRegister {
-            expected_log_id, ..
-        } => *expected_log_id = previous,
-        reliaburger::council::RaftRequest::SchedulingDecision(decision) => {
-            request = reliaburger::council::RaftRequest::SchedulingDecisions {
-                expected_log_id: previous,
-                decisions: vec![decision.clone()],
-            }
-        }
-        _ => {}
-    }
-    council.write(request).await
 }
