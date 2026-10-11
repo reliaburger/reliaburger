@@ -208,3 +208,35 @@ smoke check with `sudo python3 scripts/release/job_soak_linux.py --bun
 The normal staged fast/final runs still need an integrated candidate, including
 #669's correctness fixes. Do not treat a local smoke result as that evidence.
 The global retained-storage bound and 24-hour qualification remain #668.
+
+## Job qualification tiers (#686, decision D18-C)
+
+The audit (#674) made #668's list the 0.2.0 exit gate, on at least three
+nodes, and decided (D19-B) that its faults stay node-level: nothing in 0.2.0
+targets an individual job. Rather than a second harness, the same controller
+and soak gain three options, and `scripts/release/qualify-jobs-sustained.sh`
+fixes them per tier:
+
+- `--job-load target` turns the shared and host short runs into
+  1,048,576-task arrays of `true` at higher per-node caps (fresh containers
+  keep the calibration mix: they can't approach the rate). The record fails
+  unless accepted successes average `--target-rate` (default 1,390 a second:
+  the 1,158 of 100 million a day, plus 20% headroom) over the campaign,
+  faults included.
+- `--node-faults` adds a node fault to every cycle in rotation: 200 ms of
+  netem delay towards a peer, a disk filled to 64 MiB free, and Bun's own
+  writes throttled to 20 IOPS. Every job runtime must overlap each kind.
+- Every run writes `<record>.jobs.json` beside the record: accepted rates,
+  per-runtime retry causes (now counted by the nodes), audited effects, and
+  the September plan's M8 measurements. Those are recorded, never gated:
+  million-task wall time, p99 start lag from the pooled executors' new
+  histogram, Raft entries a second and the largest run state, Bun memory
+  and CPU, executor-helper CPU, task-array storage per million accepted
+  tasks, and retained logs.
+
+`--tier fast` is the compressed 90-minute schedule (nine node faults, each
+kind on each node once); `--tier final` is the full schedule for 24 hours,
+the run #668 needs on the final candidate after #678, #679 and #680. `--plan`
+prints either schedule without touching a cluster, which the CI script tests
+use. Until #678 bounds job storage, a disk-full fault is expected to fail
+the run: the worker stops taking grants until it is restarted.

@@ -1057,6 +1057,57 @@ signal succeeds while the process runs or exits and fails only on a real
 permission refusal. Retirement still lists every group member before it writes
 `Retiring`, so accepting the refusal can't publish a false absence.
 
+That fix stayed in the exec owner, and the same refusal turned up later in the
+process runtime's own `stop` and `kill` ([#723](https://github.com/reliaburger/reliaburger/issues/723)).
+Now and then on a loaded Mac, a log-capture test failed with
+`StopFailed … Operation not permitted` while killing a `printf` child. Both
+calls work in two steps. First `try_wait` asks whether the child has already
+exited; if so there's nothing to signal. Otherwise they signal its group with
+`kill(-pid, signal)`, treating `ESRCH` ("no such process") as "already gone".
+A `printf` lives for about a millisecond, so once in a while it exited between
+those two steps. It was a zombie when the signal went out, and macOS refused a
+group of zombies with `EPERM`, not `ESRCH`.
+
+`nix` hands back the C `errno` as a Rust enum, `nix::errno::Errno`, so each
+error code is a variant we can `match` on, not a magic integer. The arm that
+handles the refusal has the same shape as the exec owner's:
+
+```rust
+match nix::sys::signal::kill(group, signal) {
+    Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+    #[cfg(target_os = "macos")]
+    Err(nix::errno::Errno::EPERM) => {
+        observe_child_exit(entry)?;
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    Err(error) => Err(error.into()),
+}
+```
+
+Ignoring `EPERM` outright would have been one line, and it would hide a real
+refusal, such as a group member running as another user. Instead the refusal
+makes us look again. If `try_wait` now reports the exit, we record the exit
+code and the stop has nothing left to do. If the child still hasn't exited, we
+signal it directly, which succeeds while it runs or exits, so an error from
+that second `kill` really is a permission problem and goes back to the caller.
+On Linux the arm doesn't exist: `#[cfg(target_os = "macos")]` removes it at
+compile time, and a Linux `EPERM` still fails the stop as before.
+
+The window between the two steps lasts microseconds, far too short to aim a
+test at through `stop` itself. So the regression,
+`signalling_a_child_that_exited_after_the_exit_check_is_not_an_error`, builds
+the race's end state directly. It starts a child that exits at once, waits
+with `waitid(…, WNOWAIT)` until the exit is visible *without* reaping it, then
+runs the signalling step that `stop` and `kill` share. Before the fix it failed
+on every run on macOS with `Operation not permitted`; afterwards the original
+test passed 400 loaded iterations in a row.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill

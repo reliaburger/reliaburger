@@ -263,3 +263,111 @@ class UnexpectedFailure(unittest.TestCase):
             intent=c.prepare("process","short","work",100); intent.update(id=7,name="fixture")
             self.assertFalse(c.step(101,stop=True))
             self.assertTrue(any("unexpected terminal failure" in error for error in c.state["errors"]))
+
+
+class TargetLoad(unittest.TestCase):
+    """#686: the #668 throughput target, retry causes and the M8 report."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.path=Path(self.temp.name)/"jobs"; self.api=FakeAPI()
+    def campaign(self, load="target", rate=jobs.DEFAULT_TARGET_RATE):
+        return jobs.Campaign(self.path,self.api,[],"token",load=load,target_rate=rate)
+
+    def test_target_load_turns_fast_short_runs_into_million_task_arrays(self):
+        c=self.campaign()
+        for mode in ("shared-runc","process"):
+            tasks=c.body(c.prepare(mode,"short","work",100))["definition"]["tasks"]
+            self.assertEqual((tasks["count"],tasks["chunk_size"]),(jobs.MILLION,1000))
+            self.assertEqual(tasks["per_node_concurrency"],jobs.TARGET_CAPS[mode])
+        # Fresh containers can't approach the rate, so they keep the soak mix.
+        self.assertEqual(c.body(c.prepare("runc","short","work",100))["definition"]["tasks"]["count"],262144)
+        # Probes and long runs are unchanged.
+        self.assertEqual(c.body(c.prepare("process","long","work",100))["definition"]["tasks"]["count"],512)
+        calibration=jobs.Campaign(Path(self.temp.name)/"other",self.api,[],"token")
+        self.assertEqual(calibration.body(calibration.prepare("process","short","work",100))["definition"]["tasks"]["count"],262144)
+
+    def test_target_load_refuses_a_rate_below_the_daily_floor(self):
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(rate=1000)
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(rate=None)
+
+    def test_resume_refuses_a_changed_load_or_rate(self):
+        self.campaign()
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(load="calibration",rate=None)
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(rate=2000)
+        self.campaign()
+
+    def test_retry_causes_must_sum_to_retries_and_never_regress(self):
+        causes=dict(exit_code=1,signal=1,timeout=0,unknown=0,unrecorded=0)
+        jobs.validate_summary(summary(4,retried=2,retry_causes=causes))
+        with self.assertRaises(jobs.InvalidEvidence):
+            jobs.validate_summary(summary(4,retried=3,retry_causes=causes))
+        old=summary(4,retried=2,retry_causes=dict(causes,signal=1))
+        with self.assertRaises(jobs.InvalidEvidence):
+            jobs.validate_summary(summary(4,retried=2,retry_causes=dict(causes,signal=0,exit_code=2)),old)
+
+    def test_retry_causes_accumulate_per_runtime_across_polls(self):
+        class API(FakeAPI):
+            def __init__(self): super().__init__(); self.polls={}
+            def request(self,method,path,body=None):
+                if path=="/v1/jobs/runs": return super().request(method,path,body)
+                identity=int(path.split("/")[3])
+                request=next(v for v in self.posts if self.runs[(v["name"],v["request_id"])]==identity)
+                retried=self.polls[identity]=self.polls.get(identity,0)+1
+                template=request["definition"]["template"]
+                return summary(identity,total=request["definition"]["tasks"]["count"],succeeded=retried,retried=retried,
+                               retry_causes=dict(exit_code=retried,signal=0,timeout=0,unknown=0,unrecorded=0),
+                               name=request["name"],runtime=template["runtime"],cpu_request_millicores=25,
+                               memory_request_bytes=int(template["memory"][:-2])<<20)
+        api=API(); c=jobs.Campaign(self.path,api,[],"token",load="target",target_rate=jobs.DEFAULT_TARGET_RATE)
+        for now in (100,101,102,103): c.step(now)
+        self.assertFalse(c.state["errors"])
+        # Both process runs reach three retries over three polls.
+        self.assertEqual(c.state["progress"]["process"]["retried"],6)
+        self.assertEqual(c.state["progress"]["process"]["retry_causes"]["exit_code"],6)
+        self.assertEqual(c.state["progress"]["process"]["retry_causes"]["signal"],0)
+
+    def test_report_records_m8_metrics_and_gates_only_the_target_rate(self):
+        c=self.campaign()
+        c.state["started"]=1000
+        for mode in jobs.MODES: c.state["progress"][mode]["succeeded"]=0
+        c.state["progress"]["process"]["succeeded"]=1390*3600
+        lag=[0]*16; lag[3]=990; lag[9]=10
+        c.record_metrics(dict(total=jobs.MILLION,succeeded=jobs.MILLION,elapsed_seconds=540,state_bytes=1200,
+                              nodes=[dict(counters=dict(start_lag_ms_counts=lag))]))
+        c.sample_raft(dict(last_log_index=100,leader="a"),1000)
+        c.sample_raft(dict(last_log_index=3700,leader="b"),4600)
+        c.state.update(stopped=True,stop_requested_at=4600); c.publish(4600)
+        snapshot=json.loads((self.path/"snapshot.json").read_text())
+        result=jobs.report(snapshot)
+        self.assertEqual(result["accepted_successes_per_second"],1390)
+        self.assertTrue(result["target_met"])
+        m8=result["m8"]
+        self.assertEqual(m8["million_task_array_wall_seconds"]["max"],540)
+        self.assertEqual(m8["p99_start_lag_ms"],8)
+        self.assertEqual(m8["raft_entries_per_second"],1.0)
+        self.assertEqual(m8["raft_leaders"],["a","b"])
+        self.assertEqual(m8["raft_state_bytes_max"],1200)
+        self.assertNotIn("accepted rate",";".join(jobs.coverage_failures(snapshot)))
+        snapshot["progress"]["process"]["succeeded"]=1000*3600
+        self.assertFalse(jobs.report(snapshot)["target_met"])
+        self.assertIn("below the 1390/s target",";".join(jobs.coverage_failures(snapshot)))
+        # The calibration load records the same metrics but never gates the rate.
+        snapshot.update(load="calibration",target_rate=None)
+        self.assertIsNone(jobs.report(snapshot)["target_met"])
+        self.assertNotIn("accepted rate",";".join(jobs.coverage_failures(snapshot)))
+
+    def test_node_fault_kinds_are_required_only_when_enabled(self):
+        coverage={m:{**{item:True for item in jobs.REQUIRED},**{"fault-kind:"+k:True for k in jobs.FAULT_KINDS}} for m in jobs.MODES}
+        snapshot=dict(stopped=True,active=[],errors=[],coverage=coverage)
+        self.assertEqual(jobs.coverage_failures(snapshot),[])
+        missing=jobs.coverage_failures(snapshot,(),jobs.FAULT_KINDS+jobs.NODE_FAULT_KINDS)
+        self.assertEqual(len(missing),3)
+        self.assertIn("active disk-full overlap",missing[0])
+
+    def test_percentile_reports_the_bucket_upper_bound(self):
+        self.assertIsNone(jobs.percentile([0]*16,0.99))
+        counts=[0]*16; counts[15]=1
+        self.assertIsNone(jobs.percentile(counts,0.99))
+        counts=[0]*16; counts[0]=99; counts[10]=1
+        self.assertEqual(jobs.percentile(counts,0.99),1)
+        self.assertEqual(jobs.percentile(counts,1.0),1024)
