@@ -495,6 +495,14 @@ impl MockGrill {
 }
 
 impl super::Grill for MockGrill {
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("forget_retired".to_string(), instance.clone()));
+        Ok(())
+    }
+
     async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
         let delay = *self.inventory_delay.lock().unwrap();
         if let Some(delay) = delay {
