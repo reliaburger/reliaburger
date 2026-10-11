@@ -145,6 +145,7 @@ impl TestScenario {
                     node: None,
                     action: None,
                     principal: None,
+                    source_address: None,
                     details: std::collections::BTreeMap::new(),
                     message: format!("fixture event {}", index + 1),
                 });

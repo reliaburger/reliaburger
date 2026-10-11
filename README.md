@@ -109,7 +109,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish batch logs --index <INDEX> <ID>`: Print a task's retained output (the first and last 2 KiB): any singleton's, or a failed task's in a larger array
 - `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
 - `relish batch-status <ID>`: Show the progress of a submitted batch
-- `relish jobs`: List bounded job run summaries and rates, or durable schedule definitions
+- `relish jobs`: List bounded job run summaries and rates, or durable definitions with their last outcomes
 
 **Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
 
@@ -180,6 +180,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
+- `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
@@ -258,6 +259,8 @@ cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
 Every apply binds image tags to digests, so a moved tag can't change what runs,
 and node config can limit which upstream registries images may come from.
+Each node keeps a durable, bounded audit log of who applied, deleted, exec'd,
+upgraded or broke what, from where (`relish audit`).
 
 **A registry on every node.** Pickle is an OCI registry built into the cluster.
 Push once and nodes pull layers from each other. It also caches upstream
@@ -265,7 +268,9 @@ registries, and `relish build` builds images from your config straight into it.
 
 **Metrics, logs and alerts, nothing to install.** Each node scrapes its own
 workloads, including anything with `prometheus.io` annotations. Alert rules
-evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
+evaluate in the agent and call webhooks, optionally HMAC-signed. Jobs report
+one event per run, page through the same webhooks when a run fails, and keep
+their recent outcomes after the details are pruned. Logs are
 captured on each node, streamed cluster-wide with `relish logs -f`, and
 exported as Parquet to disk or object storage, where SQL can query them.
 
@@ -328,7 +333,10 @@ the data plane.
 (60 seconds at concurrency 27 by default), with fresh-container, host-process
 and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
 it measures per-job overhead rather than real work; see the batch manual for
-prerequisites and resource profiles.
+prerequisites and resource profiles. `--compare OLD.json` checks a scenario
+against an earlier report of the same scenario and fails on a drop beyond
+`--tolerance` (10% by default). The 100-million-a-day claim itself needs the
+24-hour job qualification (`scripts/release/qualify-jobs-sustained.sh`).
 
 **Tested like it has to survive a bad day.** Beyond thousands of unit, property
 and snapshot tests, there are crash-recovery suites that kill the agent at every

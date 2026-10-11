@@ -593,6 +593,48 @@ the real `curl … | sh` install against it on every host we advertise.
    a mode. A local smoke check is not staged fast/final acceptance, and global
    storage bounds and the 24-hour job qualification remain #668.
 
+   **The 0.2.0 job gate (decision D18-C).** A release that claims sustained
+   job throughput also needs the job qualification: #668's list on at least
+   three nodes, which is 24 hours at 1,158 accepted successes a second or
+   more (100 million a day) plus headroom, with concurrent apps, several
+   resource profiles, worker and leader loss, delayed messages and disk
+   faults. `qualify-jobs-sustained.sh` runs it through the same soak, with the
+   job campaign at the target load and a node-level fault in every cycle
+   (inter-node delay, a full disk, slow fsync). Faults stay node-level in
+   0.2.0 (D19-B): nothing targets an individual job.
+
+   ```sh
+   # About 90 minutes, compressed: every fault kind on every node.
+   scripts/release/qualify-jobs-sustained.sh --tier fast \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST
+   # 24 hours on the full schedule: the #668 run, on the final candidate.
+   scripts/release/qualify-jobs-sustained.sh --tier final \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
+     --record docs/qualification/DATE-job-qualification.md
+   ```
+
+   `--target-rate` raises the rate above the default 1,390 a second (the
+   floor plus 20%); `--plan` prints the schedule without touching anything.
+   The record fails if any job runtime misses a fault kind, loses or
+   double-counts an accepted outcome, or averages less than the target rate.
+   Beside it, `DATE-job-qualification.jobs.json` holds the accepted rates,
+   per-runtime retry causes and the September plan's measurements: wall time
+   of a 1,048,576-task array, p99 start lag, Raft entries a second and run
+   state, Bun memory and CPU, executor overhead, task-array storage per
+   million tasks and retained logs. Those are recorded in every run and never
+   gate it. Commit both files. Bounded job storage
+   ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
+   pass before the 24-hour run: until it does, a full disk stops a worker
+   taking grants and fails the run.
+
+   Before release, re-record the published throughput table on the candidate
+   with `relish bench --scenario … --report FILE` on the same rig, and
+   compare it with the committed reports
+   (`relish bench --scenario jobs-host-processes --compare docs/qualification/…/r1-jobs-host-processes.json`);
+   `--compare` fails on a drop larger than `--tolerance` (10% by default).
+
    Either tier also fails on a slow agent loop. Every settle and heavy check
    reads each node's `bun_agent_loop_turn_seconds` histogram from
    `/v1/metrics`, and the checker fails the tier (`agent-loop-turn`) on any
@@ -621,24 +663,56 @@ the real `curl … | sh` install against it on every host we advertise.
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
-5. **Record it.** Copy each host's record into
+5. **Pull the plug.** Killing a process isn't a power cut: page-cache writes
+   survive one and not the other. Run the power-cut and reboot qualifications
+   ([what they prove](testing.md#pulling-the-plug)) on the candidate's commit,
+   against a disposable Lima VM. Never use the development VM; the drivers
+   refuse `reliaburger-test` by name. Create it from that VM's template with
+   4 vCPUs, 6 GiB of memory, 6 GiB of swap (so the linker isn't killed) and
+   only the checkout mounted, read-only. Then, from that checkout:
+
+   ```sh
+   for fixture in exporter leases backups; do
+     scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_VM \
+       --fixture "$fixture" --iterations 10 --record "power-cut-$fixture.md"
+   done
+   for i in $(seq 10); do scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_VM; done
+   for i in $(seq 10); do scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_VM; done
+   ```
+
+   Every iteration must pass. A row marked `PASS (VM start retried)` is the
+   known Lima start failure straight after a forced stop, not a product
+   failure; any other failure is a release blocker. Record the commit, the
+   VM, each lane's runs and its rule-of-three bound in
+   `docs/qualification/DATE-power-cut-reboot.md`, as the
+   [11 October record](qualification/2026-10-11-power-cut-reboot.md) does.
+   Ten clean runs only rule out failure rates above 30%, so this catches a
+   regression, not a rare race; a release that changes storage, locking or
+   ownership (as #613 did) runs 25.
+
+   Also link the candidate commit's `task-array benchmarks` run from the gate
+   issue. It runs nightly on `main` and fails only on a regression of more
+   than 2x against main's last baseline; its `criterion-task-arrays` artefact
+   is the cost evidence for bounded-cost claims such as 0.2.0's (#668).
+
+6. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest, and link them from the release's milestone or
    gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
 
-6. **Clean up the staging pre-releases.** Delete them before promotion so the
+7. **Clean up the staging pre-releases.** Delete them before promotion so the
    release page and the release notes' "previous tag" don't pick them up:
 
    ```sh
    gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
    ```
 
-7. **Promote** as described above, with the same run ID and digest. The
+8. **Promote** as described above, with the same run ID and digest. The
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
 
-8. **Update the docs** once the release is public: the release date in the
+9. **Update the docs** once the release is public: the release date in the
    [roadmap](roadmap.md) (tick the release) and the homepage
    (`docs/website/index.html`), and the bootstrap's default version if it
    changed. Grep for the previous version to find the other "current

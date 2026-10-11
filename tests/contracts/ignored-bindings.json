@@ -1237,6 +1237,12 @@
   },
   {
     "source": "tests/placement.rs",
+    "function": "cluster_audit_query_merges_every_node",
+    "binary": "reliaburger::placement",
+    "test": "cluster_audit_query_merges_every_node"
+  },
+  {
+    "source": "tests/placement.rs",
     "function": "follower_apply_preserves_user_authority_for_administrative_manifests",
     "binary": "reliaburger::placement",
     "test": "follower_apply_preserves_user_authority_for_administrative_manifests"
@@ -1588,5 +1594,29 @@
     "function": "runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted",
     "binary": "reliaburger",
     "test": "bun::supervisor::tests::runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_shared_profile_reports_cgroup_cpu_and_memory",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_shared_profile_reports_cgroup_cpu_and_memory"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors"
   }
 ]

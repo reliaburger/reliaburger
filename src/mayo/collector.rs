@@ -201,6 +201,14 @@ impl SystemCollector {
         self.collect_instance_metrics(&instances, node)
     }
 
+    /// CPU (percent of one core) and resident memory of one process, or
+    /// `None` when it isn't running. CPU is `None` until the collector has
+    /// seen the process across two refreshes.
+    pub fn process_usage(&self, pid: u32) -> Option<(Option<f64>, u64)> {
+        let process = self.system.process(Pid::from_u32(pid))?;
+        Some((Some(f64::from(process.cpu_usage())), process.memory()))
+    }
+
     /// Collect per-process metrics for a given PID.
     ///
     /// Returns an empty vec if the process doesn't exist.

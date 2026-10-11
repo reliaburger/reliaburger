@@ -96,6 +96,9 @@ pub struct ArrayAssignment {
     pub stopping: bool,
     /// Whether a missing outcome may be executed again after worker restart.
     pub replay_unknown: bool,
+    /// Labels for this node's job metrics: never a task index or run id.
+    #[serde(default)]
+    pub labels: crate::mayo::job_metrics::JobLabels,
 }
 
 /// Orders cluster recovery, leadership and committed assignment revisions.
@@ -137,6 +140,10 @@ pub struct NodeArrayCounters {
     pub failed: u64,
     /// Retries.
     pub retried: u64,
+    /// Start-lag histogram of pooled commands, in the summary's
+    /// power-of-two millisecond buckets.
+    #[serde(default)]
+    pub start_lag_ms_counts: [u64; 16],
 }
 
 /// A node's answer about one array.
@@ -216,6 +223,21 @@ pub enum NodeRunner {
     Process(ProcessRunner),
     /// Compute outcomes without processes (tests and benchmarks).
     Fake(FakeRunner),
+}
+
+impl NodeRunner {
+    /// Where to measure the CPU and memory of this run's attempts on this
+    /// node right now. Empty for runners with nothing to measure.
+    async fn usage_targets(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Vec<crate::mayo::job_metrics::UsageTarget> {
+        match self {
+            Self::Owned(runner) => runner.usage_targets(batch_id, template).await,
+            Self::Process(_) | Self::Fake(_) => Vec::new(),
+        }
+    }
 }
 
 impl TaskRunner for NodeRunner {
@@ -318,6 +340,7 @@ pub struct TaskArrayNode {
     slots: Arc<Semaphore>,
     budget: Arc<super::execution_budget::ExecutionBudget>,
     indexes: Mutex<HashMap<u64, Arc<super::task_result_index::TaskResultIndex>>>,
+    telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
     output_syncs: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -338,6 +361,7 @@ impl TaskArrayNode {
             slots,
             budget,
             indexes: Mutex::new(HashMap::new()),
+            telemetry: Default::default(),
             output_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
@@ -354,6 +378,21 @@ impl TaskArrayNode {
             NodeRunner::Owned(runner) => runner.executor_timings(runtime),
             _ => None,
         }
+    }
+
+    /// Count this node's attempts into a telemetry shared with its metrics
+    /// collection and `relish top`.
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
+    ) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// Job counters, running gauges and the latest usage on this node.
+    pub fn telemetry(&self) -> &Arc<crate::mayo::job_metrics::JobTelemetry> {
+        &self.telemetry
     }
 
     /// Use the exact admission ledger the node's supervisor uses for apps.
@@ -508,6 +547,7 @@ impl TaskArrayNode {
             }
         }
         self.delete_unknown(&request.known).await;
+        self.telemetry.retain_runs(|id| running.contains(&id));
         let root = self.config.root.clone();
         let pressured = tokio::task::spawn_blocking(move || Self::task_data_pressured(&root))
             .await
@@ -855,6 +895,7 @@ impl TaskArrayNode {
                 work,
                 resumed,
                 cancel,
+                (Arc::clone(&self.telemetry), assignment.labels.clone()),
             ));
         }
 
@@ -873,6 +914,24 @@ impl TaskArrayNode {
             .runner
             .busy_slots(assignment.batch_id, assignment.template.as_deref())
             .await;
+        let usage_targets = self
+            .runner
+            .usage_targets(assignment.batch_id, assignment.template.as_deref())
+            .await;
+        self.telemetry.observe(
+            assignment.batch_id,
+            &assignment.labels,
+            crate::mayo::job_metrics::AttemptCounts {
+                started: counters.attempts_started.load(Ordering::Relaxed),
+                succeeded: counters.succeeded.load(Ordering::Relaxed),
+                failed: counters.failed.load(Ordering::Relaxed),
+                retried: counters.retried.load(Ordering::Relaxed),
+            },
+            busy_slots
+                .or(active_commands)
+                .unwrap_or_else(|| counters.running.load(Ordering::Relaxed)),
+            usage_targets,
+        );
         ArrayProgress {
             batch_id: assignment.batch_id,
             slots: {
@@ -922,6 +981,9 @@ impl TaskArrayNode {
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
                 failed: counters.failed.load(Ordering::Relaxed),
                 retried: counters.retried.load(Ordering::Relaxed),
+                start_lag_ms_counts: std::array::from_fn(|bucket| {
+                    counters.start_lag_counts[bucket].load(Ordering::Relaxed)
+                }),
             },
         }
     }
@@ -1141,6 +1203,10 @@ async fn run_chunk(
     work: ChunkWork,
     resumed: Vec<TaskRecord>,
     cancel: CancellationToken,
+    (telemetry, labels): (
+        Arc<crate::mayo::job_metrics::JobTelemetry>,
+        crate::mayo::job_metrics::JobLabels,
+    ),
 ) {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<TaskRecord>(1024);
     let stream_work = async {
@@ -1212,6 +1278,7 @@ async fn run_chunk(
         );
         return;
     }
+    telemetry.record_durations(&labels, &outcome.result.duration_counts);
     // Keyed by attempt too: a taken-back run finishing late mustn't
     // overwrite the result of the chunk's newer grant on this node.
     finished
@@ -1317,6 +1384,11 @@ mod tests {
                 .collect(),
             stopping: false,
             replay_unknown: true,
+            labels: crate::mayo::job_metrics::JobLabels {
+                namespace: "default".into(),
+                definition: "render".into(),
+                profile: "default".into(),
+            },
         }
     }
 
@@ -1524,6 +1596,32 @@ mod tests {
         assert!(later.refused.unwrap().contains("grant fence"));
         assert!(later.finished.is_empty());
         assert_eq!(later.counters.attempts_started, 0);
+    }
+
+    #[tokio::test]
+    async fn a_node_counts_its_attempts_into_job_telemetry() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let sync = request(vec![assignment(1, 25, &[(0, 1), (2, 3)])]);
+        sync_until_finished(&node, &sync, 2).await;
+        // The counters in the response lag the finished chunks by one sync.
+        node.sync(&sync).await;
+        let samples = node.telemetry().samples("node-a");
+        let value = |name: &str| {
+            samples
+                .iter()
+                .find(|sample| sample.key.name.as_str() == name)
+                .map(|sample| sample.value)
+        };
+        assert_eq!(value("job_tasks_succeeded_total"), Some(15.0));
+        assert_eq!(value("job_task_duration_ms_count"), Some(15.0));
+        let labels = &samples[0].key.labels;
+        assert_eq!(labels.get("definition").map(String::as_str), Some("render"));
+        assert_eq!(labels.get("node").map(String::as_str), Some("node-a"));
+
+        // Once the leader stops listing the run, nothing of it is running.
+        node.sync(&request(Vec::new())).await;
+        assert!(node.telemetry().usage_targets().is_empty());
     }
 
     #[tokio::test]

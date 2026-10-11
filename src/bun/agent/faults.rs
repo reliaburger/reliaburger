@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// The principal a fault's automatic expiry is recorded under.
+pub const FAULT_EXPIRY_PRINCIPAL: &str = "system";
+
 /// What fencing a node fault left for a task to finish.
 pub(super) enum NodeFaultFence {
     /// Nothing: the grant is fenced and its slot free.
@@ -1006,6 +1009,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // the process frozen and an expired resource fault left its cap in
             // place (CHAOS1).
             self.reverse_fault(rule).await;
+            self.record_fault_expired(rule).await;
             expired_dns |= matches!(
                 rule.fault_type,
                 crate::smoker::types::FaultType::DnsNxdomain
@@ -1025,6 +1029,54 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // helper was killed, so a transient removal failure doesn't leave the
         // controller permanently refusing new pressure faults.
         self.retry_node_pressure_cleanup();
+    }
+
+    /// Audit a fault's automatic reversal (design §8.1: every reversal is
+    /// recorded). The cluster itself acts here, so the principal is
+    /// `system`, and nothing waits for the disk: the agent loop must not.
+    pub(super) async fn record_fault_expired(&self, rule: &crate::smoker::types::FaultRule) {
+        let Some(events) = &self.events else { return };
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let fault_type = serde_json::to_value(&rule.fault_type)
+            .ok()
+            .and_then(|value| value.get("type")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| rule.fault_type.to_string());
+        let mut details = std::collections::BTreeMap::from([
+            ("fault_id".to_string(), rule.id.to_string()),
+            ("fault_type".to_string(), fault_type.clone()),
+            ("injected_by".to_string(), rule.injected_by.clone()),
+            (
+                "duration_seconds".to_string(),
+                (rule.duration_ns / 1_000_000_000).to_string(),
+            ),
+        ]);
+        if let Some(instance) = &rule.target_instance {
+            details.insert("target_instance".to_string(), instance.clone());
+        }
+        let node = self
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.local_node_id.0.clone())
+            .or_else(|| rule.target_node.clone());
+        let _receipt = events
+            .write()
+            .await
+            .record_audit(crate::bun::events::AuditEvent {
+                timestamp,
+                kind: crate::bun::events::EventKind::Fault,
+                severity: crate::bun::events::EventSeverity::Info,
+                action: "fault.expired".to_string(),
+                principal: FAULT_EXPIRY_PRINCIPAL.to_string(),
+                app: (!rule.target_service.is_empty()).then(|| rule.target_service.clone()),
+                namespace: rule.namespace.clone(),
+                node,
+                source_address: None,
+                details,
+                message: format!("fault {} ({fault_type}) expired and was reversed", rule.id),
+            });
     }
 
     /// Local instances that may call a faulted service.

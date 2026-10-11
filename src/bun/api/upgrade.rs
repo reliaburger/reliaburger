@@ -361,6 +361,21 @@ pub(super) async fn upgrade_start_handler(
         )
             .into_response();
     }
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        details: std::collections::BTreeMap::from([
+            (
+                "target_version".to_string(),
+                request.target_version.to_string(),
+            ),
+            ("nodes".to_string(), request.nodes.len().to_string()),
+            ("platforms".to_string(), request.binaries.len().to_string()),
+            (
+                "allow_downgrade".to_string(),
+                request.allow_downgrade.to_string(),
+            ),
+        ]),
+        ..crate::bun::audit::AuditNote::default()
+    });
 
     // Derive each node's authoritative role + address server-side from
     // gossip membership and the Raft voter set, then validate the client's
