@@ -9,6 +9,10 @@ use reliaburger::config::Config;
 use reliaburger::grill::{ContainerState, Grill, ImageStore, runc::RuncGrill};
 use reliaburger::relish::client::BunClient;
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
+use bun_process::PortBlockReservation;
+
 struct Node {
     child: tokio::process::Child,
     client: BunClient,
@@ -136,9 +140,20 @@ struct RootCleanup(PathBuf);
 
 impl Drop for RootCleanup {
     fn drop(&mut self) {
+        // Rootless network helpers name their generation's directory, not
+        // the root, so read where they live before killing anything.
+        let mut needles = vec![path_needle(&self.0)];
+        let helper_directories: Vec<String> = node_roots(&self.0)
+            .iter()
+            .flat_map(|node| rootless_helper_directories(node))
+            .collect();
+        needles.extend(helper_directories.iter().map(|d| d.as_bytes().to_vec()));
         // The kernel ownership lock is released only once Bun has exited, and
         // SIGKILL doesn't wait for that.
-        wait_for_exit(&kill_root_processes(&self.0));
+        wait_for_exit(&kill_processes(&processes_naming(&needles)));
+        for directory in &helper_directories {
+            let _ = std::fs::remove_dir_all(directory);
+        }
         for node in node_roots(&self.0) {
             delete_runc_containers(&node.join("data/instances/runc/state"));
             #[cfg(feature = "ebpf")]
@@ -153,35 +168,63 @@ impl Drop for RootCleanup {
     }
 }
 
-/// SIGKILL every process whose command line names a path under the root:
-/// Bun, its detached owners and the Runc commands they were running.
-/// Returns the processes it signalled.
-fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
-    use nix::sys::signal::{Signal, kill, killpg};
-    use nix::unistd::{Pid, getpgid, getpgrp};
+/// `path` with a trailing separator, which stops one root matching another
+/// it prefixes.
+fn path_needle(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
-    // The trailing separator stops one root matching another it prefixes.
-    let mut needle = root.as_os_str().as_bytes().to_vec();
+    let mut needle = path.as_os_str().as_bytes().to_vec();
     needle.push(b'/');
-    let mut killed = Vec::new();
+    needle
+}
+
+/// The private directories this node's rootless network helpers use,
+/// `/tmp/rbr-<uid>-<generation>/` (`grill::runc::owned_rootless`), read from
+/// the generations its runtime intents record.
+///
+/// A helper execs `slirp4netns`, whose command line names only that
+/// directory. Matching the root alone leaked one when a rootless test failed,
+/// and the leaked helper kept every fd it inherited open, including a lock
+/// the test host's other users were queued on (#734).
+fn rootless_helper_directories(node: &Path) -> Vec<String> {
+    let uid = nix::unistd::geteuid();
+    std::fs::read_dir(node.join("data/instances/runc/bundles/.intents/records"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|record| std::fs::read(record.path().join("intent.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter_map(|intent| {
+            intent["generation"]
+                .as_str()
+                .map(|generation| format!("/tmp/rbr-{uid}-{generation}/"))
+        })
+        .collect()
+}
+
+/// Every process whose command line contains one of `needles`.
+fn processes_naming(needles: &[Vec<u8>]) -> Vec<nix::unistd::Pid> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return killed;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if !command.windows(needle.len()).any(|part| part == needle) {
-            continue;
-        }
-        let pid = Pid::from_raw(pid);
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+            let command = std::fs::read(entry.path().join("cmdline")).ok()?;
+            needles
+                .iter()
+                .any(|needle| command.windows(needle.len()).any(|part| part == needle))
+                .then(|| nix::unistd::Pid::from_raw(pid))
+        })
+        .collect()
+}
+
+/// SIGKILL these processes: Bun, its detached owners, the Runc commands they
+/// were running and their rootless network helpers. Returns them.
+fn kill_processes(processes: &[nix::unistd::Pid]) -> Vec<nix::unistd::Pid> {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::{getpgid, getpgrp};
+    for &pid in processes {
         // An owner leads its own group, so killing the group takes the Runc
         // child it is waiting on too. Bun shares the test's group, and
         // signalling that group would kill the test binary itself.
@@ -193,9 +236,8 @@ fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
                 let _ = kill(pid, Signal::SIGKILL);
             }
         }
-        killed.push(pid);
     }
-    killed
+    processes.to_vec()
 }
 
 /// Wait up to ten seconds for every process to exit. A zombie counts: it
@@ -954,8 +996,16 @@ async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_succ
     retire_kernel(&root);
 }
 
+/// The signing key a test's upgrades use, plus the fixed ports its Bun
+/// rebinds after every exec, held until the test ends.
 #[cfg(feature = "ebpf")]
-fn upgrade_fixture(root: &Path) -> Vec<u8> {
+struct UpgradeFixture {
+    key: Vec<u8>,
+    _held_ports: Vec<PortBlockReservation>,
+}
+
+#[cfg(feature = "ebpf")]
+fn upgrade_fixture(root: &Path) -> UpgradeFixture {
     use reliaburger::upgrade::signing;
     let directory = root.join("upgrade-bin");
     std::fs::create_dir(&directory).unwrap();
@@ -975,13 +1025,47 @@ fn upgrade_fixture(root: &Path) -> Vec<u8> {
     config.upgrades.release_keys_override = Some(vec![signing::encode_public_key(&public)]);
     config.upgrades.boot_grace_secs = 2;
     std::fs::write(root.join("node.toml"), toml::to_string(&config).unwrap()).unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    UpgradeFixture {
+        key,
+        _held_ports: vec![reserve_fixed_api_port(root)],
+    }
+}
+
+/// Give Bun a fixed API address under `root`, leased until the returned
+/// guard drops.
+///
+/// Bun closes its API socket at every upgrade exec and binds the same port
+/// again once the new binary starts, so the port must stay out of every
+/// other test's reach while nothing listens on it: the shared allocator's
+/// range lies below the ephemeral one, and its file lease keeps other
+/// fixtures off it.
+fn reserve_fixed_api_port(root: &Path) -> PortBlockReservation {
+    let reservation = bun_process::reserve_port_block_lease(1);
     std::fs::write(
         root.join("listen"),
-        listener.local_addr().unwrap().to_string(),
+        format!("127.0.0.1:{}", reservation.base),
     )
     .unwrap();
-    key
+    reservation
+}
+
+/// Bun gives up its fixed API port on every upgrade exec and rebinds it once
+/// the new binary starts. A port drawn with `bind(0)` comes from the
+/// ephemeral range, where any other test's `bind(0)`, `connect()` or slirp
+/// forward can take it in that gap. Bun then exits with EADDRINUSE and the
+/// upgrade walk never settles (#734).
+#[test]
+fn a_fixed_api_port_stays_out_of_reach_of_other_tests_while_bun_is_offline() {
+    let root = tempfile::tempdir().unwrap();
+    let reservation = reserve_fixed_api_port(root.path());
+    let listen: std::net::SocketAddr = std::fs::read_to_string(root.path().join("listen"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(listen.port(), reservation.base);
+    // Linux hands out ephemeral ports from 32768 up.
+    assert!(listen.port() < 32768, "{listen} is an ephemeral port");
+    assert!(PortBlockReservation::try_reserve(listen.port(), 1).is_none());
 }
 
 #[cfg(feature = "ebpf")]
@@ -1044,7 +1128,7 @@ async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) 
 }
 
 #[cfg(feature = "ebpf")]
-async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
+async fn upgrade_and_rollback(root: &Path, node: &mut Node, key: &[u8]) {
     let original = instance_with_pid(&node.client).await;
     let directive = owned_upgrade_directive(root, key);
     for version in ["v0.2.0", "v0.1.0"] {
@@ -1061,11 +1145,23 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
                 {
                     break;
                 }
+                // Nothing restarts this Bun, so an exit can never settle.
+                if let Some(exit) = node.child.try_wait().unwrap() {
+                    panic!(
+                        "Bun exited ({exit}) on its way to {version}: {}",
+                        std::fs::read_to_string(root.join("bun.log")).unwrap_or_default()
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("owned runtime never settled on {version}"));
+        .unwrap_or_else(|_| {
+            panic!(
+                "owned runtime never settled on {version}: {}",
+                std::fs::read_to_string(root.join("bun.log")).unwrap_or_default()
+            )
+        });
         let adopted = instance_with_pid(&node.client).await;
         assert_eq!(adopted.id, original.id);
         assert_eq!(adopted.pid, original.pid);
@@ -1088,14 +1184,14 @@ async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
-    let key = upgrade_fixture(&root);
+    let fixture = upgrade_fixture(&root);
     let name = root_app_name("upgrade-owned", &root);
     let mut node = Node::start(&root).await;
     node.client.apply(&durable_app(&name)).await.unwrap();
     wait_file(&root.join("shared/main")).await;
     let original = kernel_manifest(&root);
-    upgrade_and_rollback(&root, &node, &key).await;
-    failed_owned_upgrade_reverts(&root, &mut node, &key).await;
+    upgrade_and_rollback(&root, &mut node, &fixture.key).await;
+    failed_owned_upgrade_reverts(&root, &mut node, &fixture.key).await;
     assert_eq!(kernel_manifest(&root), original);
     node.client.stop(&name, "default").await.unwrap();
     node.crash().await;
@@ -1121,7 +1217,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         config.replace("enabled = true", "enabled = false"),
     )
     .unwrap();
-    let key = upgrade_fixture(&root);
+    let fixture = upgrade_fixture(&root);
     let mut node = Node::start(&root).await;
     let active = root.join("data/discovery/discovery.json").exists();
     if !active {
@@ -1159,8 +1255,8 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         std::fs::read_to_string(root.join("shared/main")).unwrap(),
         "main\n"
     );
-    upgrade_and_rollback(&root, &recovered, &key).await;
-    failed_owned_upgrade_reverts(&root, &mut recovered, &key).await;
+    upgrade_and_rollback(&root, &mut recovered, &fixture.key).await;
+    failed_owned_upgrade_reverts(&root, &mut recovered, &fixture.key).await;
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
         "owned"
@@ -1172,6 +1268,43 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
             .unwrap();
     assert!(journal.inventory().services.is_empty());
     assert!(reqwest::get(&url).await.is_err());
+}
+
+/// A failing rootless test unwinds with Bun dead and its owners' network
+/// helpers still running. Cleanup must find those helpers through the root's
+/// runtime intents, since their command lines don't name the root (#734).
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox; run with make test-rootless-runc"]
+async fn normal_rootless_bun_cleanup_leaves_no_network_helper_behind() {
+    assert!(!nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap().keep();
+    let cleanup = RootCleanup(root.clone());
+    durable_fixture(&root);
+    let config = std::fs::read_to_string(root.join("node.toml")).unwrap();
+    std::fs::write(
+        root.join("node.toml"),
+        config.replace("enabled = true", "enabled = false"),
+    )
+    .unwrap();
+    let mut node = Node::start(&root).await;
+    let name = root_app_name("rootless-helper", &root);
+    node.client.apply(&durable_app(&name)).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let needles: Vec<Vec<u8>> = rootless_helper_directories(&root)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    assert!(!needles.is_empty(), "no rootless runtime intent recorded");
+    assert!(
+        !processes_naming(&needles).is_empty(),
+        "no rootless network helper is running"
+    );
+    // Fail the way a panicking test does: Bun dies, its owners don't.
+    node.crash().await;
+    drop(cleanup);
+    let left = processes_naming(&needles);
+    assert!(left.is_empty(), "cleanup left rootless helpers {left:?}");
 }
 
 #[cfg(feature = "ebpf")]
@@ -1193,15 +1326,13 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     // host can't all bind the gateway's port 53.
     config.dns = base.dns;
     config.network.advertise_address = Some("127.0.0.1".into());
-    let gossip = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let reporting = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    config.cluster.gossip_port = gossip.local_addr().unwrap().port();
-    config.cluster.raft_port = raft.local_addr().unwrap().port();
-    config.cluster.reporting_port = reporting.local_addr().unwrap().port();
+    // The restart below rebinds these, so they stay leased until the end.
+    let cluster_ports = bun_process::reserve_port_block_lease(3);
+    config.cluster.gossip_port = cluster_ports.base;
+    config.cluster.raft_port = cluster_ports.base + 1;
+    config.cluster.reporting_port = cluster_ports.base + 2;
     std::fs::write(root.join("node.toml"), toml::to_string(&config).unwrap()).unwrap();
     std::fs::write(root.join("cluster"), "enrolled").unwrap();
-    drop((gossip, raft, reporting));
     let identity = reliaburger::sesame::identity_store::load(&root.join("identity"))
         .unwrap()
         .unwrap();
@@ -1370,7 +1501,7 @@ async fn enrolled_upgrade_fixture(
     root: &Path,
     name: &str,
     seed: Option<(&Path, &Node)>,
-) -> (Node, Vec<u8>) {
+) -> (Node, UpgradeFixture) {
     use reliaburger::config::node::NodeConfig;
     durable_fixture(root);
     let base = NodeConfig::from_file(&root.join("node.toml")).unwrap();
@@ -1437,29 +1568,17 @@ async fn enrolled_upgrade_fixture(
     // host can't all bind the gateway's port 53.
     config.dns = base.dns;
     config.network.advertise_address = Some("127.0.0.1".into());
-    // Council discovery requires the same gossip-to-Raft offset on every node.
-    let (gossip, raft, reporting) = loop {
-        let gossip = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = gossip.local_addr().unwrap().port();
-        let Some(reporting_port) = port.checked_add(2) else {
-            continue;
-        };
-        let Ok(raft) = std::net::TcpListener::bind(("127.0.0.1", port + 1)) else {
-            continue;
-        };
-        let Ok(reporting) = std::net::TcpListener::bind(("127.0.0.1", reporting_port)) else {
-            continue;
-        };
-        break (gossip, raft, reporting);
-    };
-    config.cluster.gossip_port = gossip.local_addr().unwrap().port();
-    config.cluster.raft_port = raft.local_addr().unwrap().port();
-    config.cluster.reporting_port = reporting.local_addr().unwrap().port();
+    // Council discovery requires the same gossip-to-Raft offset on every
+    // node. Each upgrade exec rebinds all three, like the API port.
+    let cluster_ports = bun_process::reserve_port_block_lease(3);
+    config.cluster.gossip_port = cluster_ports.base;
+    config.cluster.raft_port = cluster_ports.base + 1;
+    config.cluster.reporting_port = cluster_ports.base + 2;
     std::fs::write(root.join("node.toml"), toml::to_string(&config).unwrap()).unwrap();
     std::fs::write(root.join("cluster"), "enrolled").unwrap();
-    let key = upgrade_fixture(root);
-    drop((gossip, raft, reporting));
-    (Node::start(root).await, key)
+    let mut fixture = upgrade_fixture(root);
+    fixture._held_ports.push(cluster_ports);
+    (Node::start(root).await, fixture)
 }
 
 /// The last lines of each node's `bun.log`, for a failure message.
@@ -1491,19 +1610,19 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
         })
         .collect();
     let mut nodes = Vec::new();
-    let mut keys = Vec::new();
-    let (node, key) = enrolled_upgrade_fixture(&roots[0], "rolling-0", None).await;
+    let mut fixtures = Vec::new();
+    let (node, fixture) = enrolled_upgrade_fixture(&roots[0], "rolling-0", None).await;
     nodes.push(node);
-    keys.push(key);
+    fixtures.push(fixture);
     for (i, node_root) in roots.iter().enumerate().skip(1) {
-        let (node, key) = enrolled_upgrade_fixture(
+        let (node, fixture) = enrolled_upgrade_fixture(
             node_root,
             &format!("rolling-{i}"),
             Some((&roots[0], &nodes[0])),
         )
         .await;
         nodes.push(node);
-        keys.push(key);
+        fixtures.push(fixture);
     }
     let mut last_views = vec![];
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -1554,7 +1673,7 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
             let answer = if version == "v0.2.0" {
                 nodes[i]
                     .client
-                    .upgrade_apply(&owned_upgrade_directive(&roots[i], &keys[i]))
+                    .upgrade_apply(&owned_upgrade_directive(&roots[i], &fixtures[i].key))
                     .await
                     .map(drop)
             } else {

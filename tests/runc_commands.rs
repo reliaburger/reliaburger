@@ -258,6 +258,62 @@ async fn killed_caller_cannot_leave_a_late_mutation_after_recovered_cleanup() {
     );
 }
 
+/// Bun execs into a new binary while a state read it started is still running
+/// under its independent owner. The new process adopts at once and must wait
+/// for that read to retire rather than refuse to start (#734).
+#[tokio::test]
+async fn the_next_process_waits_for_a_mutation_its_predecessor_left_running() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "runtime_command_fixture", "--nocapture"])
+        .env("RELIABURGER_COMMAND_FIXTURE", root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&root.path().join("ready")).await;
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    let journal = journal(root.path());
+    let id = instance();
+    let generation = journal.observe(&id).await.unwrap();
+    let commands = journal
+        .claim(&id, generation)
+        .await
+        .unwrap()
+        .supervise_commands(bun())
+        .unwrap();
+    let release = root.path().join("release");
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(release, "continue").unwrap();
+    });
+    let environment = BTreeMap::from([("ROOT".into(), root.path().display().to_string())]);
+    let (commands, output) = commands
+        .run(
+            Path::new("/bin/sh"),
+            &["-c".into(), "test -f \"$ROOT/late-mutation\"".into()],
+            &environment,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the predecessor's finishing mutation refused admission");
+    assert_eq!(
+        output.exit_code,
+        Some(0),
+        "the next mutation overtook its predecessor"
+    );
+    releaser.await.unwrap();
+    commands
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn runtime_command_fixture() {
     let Some(root) = std::env::var_os("RELIABURGER_COMMAND_FIXTURE") else {
