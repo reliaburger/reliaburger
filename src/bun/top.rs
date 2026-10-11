@@ -33,6 +33,11 @@ pub struct TopRow {
     pub cpu_percent: Option<f64>,
     /// Latest resident memory in bytes; `None` before the first sample.
     pub memory_bytes: Option<u64>,
+    /// For a job row: how many of its tasks run on this node now. A job
+    /// row stands for every running attempt of one definition and profile
+    /// on the node, never one row per task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<u64>,
 }
 
 /// Every node's rows, plus one message per node that didn't answer.
@@ -108,9 +113,60 @@ pub fn node_rows(
                 instance,
                 cpu_percent: sample.cpu_percent,
                 memory_bytes: sample.memory_bytes,
+                tasks: None,
             }
         })
         .collect()
+}
+
+/// Add one row per running job definition and profile on this node, from
+/// the node's job telemetry. A singleton run already has its own `run-N`
+/// row, so its usage fills that row instead of adding a second one.
+pub fn add_job_rows(
+    node: &str,
+    rows: &mut Vec<TopRow>,
+    running: BTreeMap<crate::mayo::job_metrics::JobLabels, u64>,
+    usage: &BTreeMap<crate::mayo::job_metrics::JobLabels, crate::mayo::job_metrics::JobUsage>,
+) {
+    for (labels, tasks) in running {
+        if tasks == 0 {
+            continue;
+        }
+        let sample = usage.get(&labels).copied().unwrap_or_default();
+        if let Some(singleton) = rows.iter_mut().find(|row| {
+            row.tasks.is_none()
+                && row.instance.id.starts_with("run-")
+                && row.instance.app_name == labels.definition
+                && row.instance.namespace == labels.namespace
+        }) {
+            singleton.cpu_percent = singleton.cpu_percent.or(sample.cpu_percent);
+            singleton.memory_bytes = singleton.memory_bytes.or(sample.memory_bytes);
+            continue;
+        }
+        let id = if labels.profile == crate::bun::task_array_leader::DEFAULT_PROFILE {
+            "tasks".to_string()
+        } else {
+            format!("tasks/{}", labels.profile)
+        };
+        rows.push(TopRow {
+            node: node.to_string(),
+            instance: InstanceStatus {
+                id,
+                app_name: labels.definition,
+                namespace: labels.namespace,
+                state: "running".to_string(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: None,
+                pid: None,
+                runtime_unknown: false,
+                status_age_ms: None,
+            },
+            cpu_percent: sample.cpu_percent,
+            memory_bytes: sample.memory_bytes,
+            tasks: Some(tasks),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +219,79 @@ mod tests {
             }
         );
         assert_eq!(usage.len(), 1);
+    }
+
+    fn job(definition: &str, profile: &str) -> crate::mayo::job_metrics::JobLabels {
+        crate::mayo::job_metrics::JobLabels {
+            namespace: "default".into(),
+            definition: definition.into(),
+            profile: profile.into(),
+        }
+    }
+
+    #[test]
+    fn running_tasks_get_one_row_per_definition_and_profile() {
+        let mut rows = node_rows(
+            "node-2",
+            vec![status("default__web-0", Some(7))],
+            &HashMap::new(),
+        );
+        let usage = BTreeMap::from([(
+            job("render", "default"),
+            crate::mayo::job_metrics::JobUsage {
+                running: 12,
+                cpu_percent: Some(310.0),
+                memory_bytes: Some(4 << 20),
+            },
+        )]);
+        add_job_rows(
+            "node-2",
+            &mut rows,
+            BTreeMap::from([
+                (job("render", "default"), 12),
+                (job("train", "gpu-heavy"), 3),
+                (job("idle", "default"), 0),
+            ]),
+            &usage,
+        );
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let render = rows
+            .iter()
+            .find(|row| row.instance.app_name == "render")
+            .unwrap();
+        assert_eq!(render.tasks, Some(12));
+        assert_eq!(render.cpu_percent, Some(310.0));
+        assert_eq!(render.instance.id, "tasks");
+        let train = rows
+            .iter()
+            .find(|row| row.instance.app_name == "train")
+            .unwrap();
+        assert_eq!(train.instance.id, "tasks/gpu-heavy");
+        assert_eq!(train.cpu_percent, None, "not measured yet");
+    }
+
+    #[test]
+    fn a_singleton_run_keeps_its_row_and_gains_its_usage() {
+        let mut singleton = status("run-9", None);
+        singleton.app_name = "migrate".into();
+        let mut rows = node_rows("node-2", vec![singleton], &HashMap::new());
+        let usage = BTreeMap::from([(
+            job("migrate", "default"),
+            crate::mayo::job_metrics::JobUsage {
+                running: 1,
+                cpu_percent: Some(5.0),
+                memory_bytes: Some(1024),
+            },
+        )]);
+        add_job_rows(
+            "node-2",
+            &mut rows,
+            BTreeMap::from([(job("migrate", "default"), 1)]),
+            &usage,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].memory_bytes, Some(1024));
+        assert_eq!(rows[0].tasks, None);
     }
 
     #[test]

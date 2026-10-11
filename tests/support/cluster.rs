@@ -24,6 +24,7 @@
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -230,6 +231,88 @@ pub async fn initial_voter_leader_index(nodes: &[Arc<CouncilNode>]) -> Option<us
 }
 
 // ---------------------------------------------------------------------------
+// Fixture directories
+// ---------------------------------------------------------------------------
+
+/// Remove a fixture directory and everything beneath it, so the next node
+/// to use the path starts empty.
+///
+/// On Linux any mount beneath the directory is unmounted first: a node that
+/// ran as root and was killed keeps its workload identity tmpfs
+/// (`reliaburger-identity`) mounted, and `remove_dir_all` can't remove a
+/// mount point. A directory that is already gone is fine. Any other failure
+/// is returned, because a fixture that carried on would inherit the
+/// leftover state.
+pub fn clear_fixture_dir(path: &Path) -> std::io::Result<()> {
+    unmount_beneath(path)?;
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_beneath(path: &Path) -> std::io::Result<()> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+    for mount in mounts_beneath(&mountinfo, path) {
+        let status = std::process::Command::new("umount").arg(&mount).status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "umount {} failed ({status})",
+                mount.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmount_beneath(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The mount points in `mountinfo` (the `/proc/self/mountinfo` format) at or
+/// beneath `root`, deepest first so each can be unmounted in turn.
+pub fn mounts_beneath(mountinfo: &str, root: &Path) -> Vec<PathBuf> {
+    let mut mounts: Vec<PathBuf> = mountinfo
+        .lines()
+        // The fifth field is the mount point, with spaces, tabs, newlines
+        // and backslashes written as octal escapes.
+        .filter_map(|line| line.split(' ').nth(4))
+        .map(|field| PathBuf::from(unescape_mount_path(field)))
+        .filter(|mount| mount.starts_with(root))
+        .collect();
+    // A stable sort keeps mountinfo's order among mounts of equal depth.
+    mounts.sort_by_key(|mount| std::cmp::Reverse(mount.components().count()));
+    mounts
+}
+
+/// Undo mountinfo's `\ooo` octal escapes.
+fn unescape_mount_path(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(position) = rest.find('\\') {
+        out.push_str(&rest[..position]);
+        let byte = rest
+            .get(position + 1..position + 4)
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        match byte {
+            Some(byte) => {
+                out.push(char::from(byte));
+                rest = &rest[position + 4..];
+            }
+            None => {
+                out.push('\\');
+                rest = &rest[position + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Fully wired node
 // ---------------------------------------------------------------------------
 
@@ -251,7 +334,13 @@ pub struct WiredNodeOptions {
     /// Cancelling this token stops the node.
     pub shutdown: CancellationToken,
     /// Prefix of the node's temp data directory, unique per test binary.
+    /// Ignored when `data_root` is set.
     pub data_dir_prefix: &'static str,
+    /// A directory the test owns (a fresh temporary directory per test).
+    /// The node keeps its data in `data_root/name`, so no other test or
+    /// earlier run shares it. `None` uses
+    /// `$TMPDIR/{data_dir_prefix}-{name}-{gossip_port}`.
+    pub data_root: Option<PathBuf>,
     pub stale_report_timeout_secs: u64,
     /// `Some(interval)` gives the node a Mayo store with rollups at that
     /// interval, and runs the autoscaler alongside the scheduler.
@@ -314,6 +403,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         seeds,
         shutdown,
         data_dir_prefix,
+        data_root,
         stale_report_timeout_secs,
         metrics_rollup,
         scheduler,
@@ -330,9 +420,17 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     let reporting_port = gossip_port + 2;
     let api_port = gossip_port + 3;
 
-    let data_dir = std::env::temp_dir().join(format!("{data_dir_prefix}-{name}-{gossip_port}"));
-    if !keep_data_dir {
-        let _ = std::fs::remove_dir_all(&data_dir);
+    let data_dir = match &data_root {
+        Some(root) => root.join(&name),
+        None => std::env::temp_dir().join(format!("{data_dir_prefix}-{name}-{gossip_port}")),
+    };
+    if !keep_data_dir && let Err(error) = clear_fixture_dir(&data_dir) {
+        // Starting on whatever is left would hand this node an earlier
+        // run's state, and the test would fail somewhere unrelated (#721).
+        panic!(
+            "cannot clear wired-node data directory {}: {error}",
+            data_dir.display()
+        );
     }
     let reconciler_state_dir = data_dir.clone();
 
@@ -406,7 +504,16 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // The API answers status from the loop's published snapshot, and reads
     // the agent's event ring and deploy history, as Bun does.
     let status_reader = agent.status_reader();
-    let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
+    let mut events = reliaburger::bun::events::EventStore::new();
+    // Each node keeps its own durable audit log under its data directory.
+    events.set_audit_log(
+        reliaburger::bun::audit::AuditLog::open(
+            reconciler_state_dir.join(reliaburger::bun::audit::AUDIT_DIRECTORY),
+            reliaburger::bun::audit::AuditLimits::from_total(1 << 20),
+        )
+        .expect("open the node's audit log"),
+    );
+    let event_store = Arc::new(RwLock::new(events));
     agent.set_event_store(Arc::clone(&event_store));
     let deploy_history = agent.deploy_history_handle();
     let agent_task = reliaburger::bun::readiness::spawn_owned(
