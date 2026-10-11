@@ -1382,6 +1382,18 @@ async fn reconcile_council_once(
         return;
     }
 
+    // A bounded operation that timed out between openraft's two membership
+    // steps, or a leader that failed over between them, leaves a committed
+    // joint config that nothing else finishes. Finish it before planning, or
+    // the change-in-flight gate below holds every later change forever (#673).
+    if change_in_flight && council.unfinished_membership_change().is_some() {
+        let result = tokio::time::timeout(config.op_timeout, council.finish_membership_change())
+            .await
+            .map(|finished| finished.map(drop));
+        log_membership_op("finish membership change", result);
+        return;
+    }
+
     // An operator's committed fence does not need SWIM's failure timeout.
     // The membership write still passes the shared fault/decommission guard.
     if !change_in_flight {
@@ -1577,6 +1589,86 @@ mod tests {
         let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
         initialise_bootstrap(&council, members, None).await.unwrap();
         council
+    }
+
+    #[tokio::test]
+    async fn reconciler_finishes_a_promotion_its_bounded_operation_abandoned() {
+        // #673: the reconciler's five-second bound dropped a promotion after
+        // its joint step was proposed. The joint step committed later, the
+        // uniform step was never proposed, and every later tick saw a change
+        // "in flight" and planned nothing, so the third node never joined.
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        let fast = CouncilConfig {
+            heartbeat_interval_ms: 50,
+            election_timeout_min_ms: 200,
+            election_timeout_max_ms: 400,
+            ..CouncilConfig::default()
+        };
+        let router = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        for id in 1..=2 {
+            let council = CouncilNode::new(
+                id,
+                fast.clone(),
+                InMemoryRaftNetworkFactory::new(id, router.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, council.raft().clone()).await;
+            nodes.push(council);
+        }
+        initialise_bootstrap(&nodes[0], BTreeMap::from([(1, info("node-1", 9001))]), None)
+            .await
+            .unwrap();
+        nodes[0].add_learner(2, info("node-2", 9002)).await.unwrap();
+        router.partition(1, 2).await;
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(500),
+            nodes[0].change_membership(BTreeSet::from([1, 2])),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the promotion should still be pending");
+        router.heal().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while nodes[0].unfinished_membership_change().is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the abandoned joint step committed");
+
+        let (_membership_tx, membership_rx) = watch::channel(Vec::new());
+        let config = CouncilReconcilerConfig::default();
+        let mut tracker = HealthTracker::default();
+        let mut throttle = DepositionThrottle::default();
+        reconcile_council_once(
+            &nodes[0],
+            &membership_rx,
+            1,
+            1,
+            &info("node-1", 9001),
+            &config,
+            &mut tracker,
+            &mut throttle,
+            &BTreeSet::new(),
+        )
+        .await;
+
+        let configs = nodes[0]
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .clone();
+        assert_eq!(configs, vec![BTreeSet::from([1, 2])]);
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
