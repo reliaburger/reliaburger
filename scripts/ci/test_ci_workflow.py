@@ -306,6 +306,46 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("sha256sum --check", install)
 
 
+class BenchmarkTests(unittest.TestCase):
+    def setUp(self):
+        self.ci = (WORKFLOWS / "ci.yml").read_text()
+        self.jobs = jobs(self.ci)
+
+    def test_bench_task_arrays_is_run_by_a_workflow(self):
+        job = self.jobs["task-array-benchmarks"]
+        # select-jobs.sh sets task_arrays on schedules, so it runs nightly.
+        self.assertIn("needs.changes.outputs.task_arrays == 'true'", job)
+        self.assertIn("task_arrays: ${{ steps.select.outputs.task_arrays }}",
+                      self.jobs["changes"])
+        self.assertIn("run: make bench-task-arrays", job)
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertIn("--max-ratio", compare)
+
+    def test_only_main_saves_the_task_array_baseline(self):
+        job = self.jobs["task-array-benchmarks"]
+        restore = next(step for step in steps(job) if "actions/cache/restore@" in step)
+        self.assertIn("restore-keys: task-array-bench-", restore)
+        for marker in ("bench_baseline.py save", "actions/cache/save@"):
+            step = next(step for step in steps(job) if marker in step)
+            self.assertIn("if: github.ref == 'refs/heads/main'", step)
+
+    def test_the_task_array_criterion_output_is_kept_as_an_artefact(self):
+        job = self.jobs["task-array-benchmarks"]
+        upload = next(step for step in steps(job) if "actions/upload-artifact@" in step)
+        self.assertIn("if: always()", upload)
+        self.assertIn("target/criterion", upload)
+        self.assertIn("name: criterion-task-arrays", upload)
+
+    def test_every_benchmark_target_is_run_by_a_workflow(self):
+        makefile = (REPO / "Makefile").read_text()
+        targets = re.findall(r"(?m)^(bench[a-z-]*):", makefile)
+        self.assertIn("bench-task-arrays", targets)
+        workflows = "\n".join(path.read_text() for path in WORKFLOWS.glob("*.yml"))
+        for target in targets:
+            with self.subTest(target=target):
+                self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+
+
 class RetargetTests(unittest.TestCase):
     def setUp(self):
         self.ci = (WORKFLOWS / "ci.yml").read_text()
