@@ -170,9 +170,12 @@ After success, one Raft entry checks the complete manifest again and publishes
 its desired writes atomically. If ordinary jobs remain, their identities stay
 reserved until exact namespace, spec and generation receipts establish positive
 terminal outcomes. A startup acknowledgment or an empty receipt cannot release
-that ownership. Registered cron work has no finite execution receipt: cluster
-apply refuses recurring schedules before creating claims or launching work.
-Standalone cron registration remains supported.
+that ownership. Registered cron work has no finite execution receipt, so this
+chapter's first version of cluster apply refused recurring schedules outright.
+In 0.2.0 that refusal went away: once the apps publish, the same Raft
+transaction that admits ordinary jobs registers each schedule as a durable
+definition, and the leader claims every matching UTC minute itself. Chapter 17
+tells that story.
 
 Migration cancellation also needs a boundary after the job settles. An accepted cancellation remains meaningful when the child subsequently exits zero: check it after settlement and immediately before proposing the desired-state transaction. A proposal already submitted to Raft can still commit; cancellation cannot roll that transaction back. Each replicated ownership write has a five-second caller deadline. A timeout does not tell us whether Raft committed, so we keep the uncertain fence and report an error. This is why the terminal job watcher ends without inventing a release when its settlement write stalls.
 
@@ -1240,7 +1243,7 @@ pub(super) enum JobPhase {
 
 (`pub(super)` makes the enum visible to the parent module, `bun`, and nowhere else; it's finer-grained than Go's upper-case export rule.) After a restart, bun adopts a job that's still running. A job that has gone, with an exit code the runtime can still report, becomes `Exited`. Anything else caught in `Preparing` or `Launching` becomes `Unknown`, and stays that way. Bun never guesses "probably failed, let's retry".
 
-`relish apply` refuses to start a job whose previous outcome is unknown, and says why: `previous outcome is unknown; use apply --rerun-jobs for an explicit rerun`. `--rerun-jobs` is the human saying "I've checked, run it again". The API accepts it only from a user with the Deployer role, and only for a file containing nothing but non-scheduled jobs. GitOps and the reconciler never set it. Cron jobs are the one exception: once bun has confirmed the old run's container is gone, the next scheduled occurrence runs normally. That's a new occurrence, not a replay of the uncertain one. Chapter 8 covers the retry budget and the crash tests behind this.
+`relish apply` refuses to start a job whose previous outcome is unknown. Our first answer was `--rerun-jobs`, the human saying "I've checked, run it again". In 0.2.0 that flag lost its recovery role. It now only mints a fresh apply operation, so jobs that already succeeded run again; a run that still has an unknown owner refuses the new admission with "acknowledge replay before another admission". The way out is `relish batch replay ID --node NODE --grant-digest DIGEST --acknowledge-side-effects`, which names the exact grant the operator checked, so an old acknowledgement can't authorise a later unknown attempt. The API accepts it only from a user with the Deployer role; GitOps, the reconciler and the service principal never can. Cron gets no exception any more either: while a definition has an unknown owner, the leader skips its occurrences, even with `overlap = "allow"`, because a new occurrence could repeat the uncertain one's side effects. Chapter 8 covers the retry budget and the crash tests behind the first version, and chapter 17 the replay that replaced it.
 
 ### One workload grant rule at both submission routes
 

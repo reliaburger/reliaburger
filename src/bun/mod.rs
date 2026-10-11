@@ -20,6 +20,7 @@ pub mod events;
 pub mod execution_budget;
 pub mod gpu;
 pub mod health;
+pub mod host_paths;
 pub mod loop_meter;
 pub mod namespace_keys;
 pub mod probe;

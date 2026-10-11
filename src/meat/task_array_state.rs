@@ -25,6 +25,12 @@ use super::types::NodeId;
 pub const MAX_FAILED_RANGES: usize = 10_000;
 /// Bound sparse failures in each worker control report.
 pub const MAX_CHUNK_FAILED_RANGES: usize = 256;
+/// Most ranges the per-node accepted record may hold before it is folded
+/// into the owner-free record (see [`TaskArrayState::accepted_grant`]).
+/// About 60 KiB of JSON; friendly shapes (big chunks, few nodes) never
+/// reach it, and one-task chunks on many nodes fold every few thousand
+/// completions.
+pub const MAX_ACCEPTED_RANGES: usize = 4096;
 
 /// Fewest chunks the grant policy keeps queued on a node, so a node that
 /// finishes one chunk always has the next one ready.
@@ -95,6 +101,15 @@ pub struct ChunkResult {
     pub not_run: u32,
     /// Extra attempts spent on retries across the chunk.
     pub retried: u32,
+}
+
+/// The grant whose report retired a chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedGrant {
+    /// The node that ran it, unless the record was compacted since.
+    pub owner: Option<NodeId>,
+    /// The grant attempt it ran at.
+    pub attempt: u64,
 }
 
 /// Outcome of a valid chunk completion.
@@ -179,6 +194,10 @@ pub struct TaskArrayState {
     done: IndexRangeSet,
     /// Accepted terminal grant per chunk; cancelled unstarted chunks have none.
     accepted: BTreeMap<NodeId, BTreeMap<u64, IndexRangeSet>>,
+    /// Accepted chunks whose owner was folded away to bound the state, by
+    /// attempt. Past [`MAX_ACCEPTED_RANGES`], `accepted` moves here whole.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    accepted_folded: BTreeMap<u64, IndexRangeSet>,
     /// Indices that failed for good, up to [`MAX_FAILED_RANGES`] ranges.
     failed_indices: IndexRangeSet,
     /// Failed indices not stored because the range cap was reached.
@@ -237,7 +256,11 @@ impl TaskArrayState {
             return Err("invalid grant attempt".into());
         }
         let mut accepted = IndexRangeSet::new();
-        for grants in self.accepted.values() {
+        for grants in self
+            .accepted
+            .values()
+            .chain(std::iter::once(&self.accepted_folded))
+        {
             for (attempt, ranges) in grants {
                 if *attempt == 0
                     || ranges.is_empty()
@@ -301,6 +324,7 @@ impl TaskArrayState {
             attempts: BTreeMap::new(),
             done: IndexRangeSet::new(),
             accepted: BTreeMap::new(),
+            accepted_folded: BTreeMap::new(),
             failed_indices: IndexRangeSet::new(),
             failed_overflow: 0,
             succeeded: 0,
@@ -323,14 +347,56 @@ impl TaskArrayState {
         &self.done
     }
 
-    /// Grant whose terminal report was accepted for this chunk.
-    pub fn accepted_grant(&self, chunk: ChunkId) -> Option<(NodeId, u64)> {
-        self.accepted.iter().find_map(|(node, generations)| {
-            generations
-                .iter()
-                .find(|(_, chunks)| chunks.contains(chunk.0))
-                .map(|(grant, _)| (node.clone(), *grant))
-        })
+    /// Grant whose terminal report was accepted for this chunk. The owner
+    /// is `None` once the record was folded to stay within
+    /// [`MAX_ACCEPTED_RANGES`]; the attempt is always kept. The attempt is
+    /// enough to fence a result: each attempt of a chunk is granted to
+    /// exactly one node, so only the owner's routing hint is lost.
+    pub fn accepted_grant(&self, chunk: ChunkId) -> Option<AcceptedGrant> {
+        self.accepted
+            .iter()
+            .find_map(|(node, generations)| {
+                generations
+                    .iter()
+                    .find(|(_, chunks)| chunks.contains(chunk.0))
+                    .map(|(attempt, _)| AcceptedGrant {
+                        owner: Some(node.clone()),
+                        attempt: *attempt,
+                    })
+            })
+            .or_else(|| {
+                self.accepted_folded
+                    .iter()
+                    .find(|(_, chunks)| chunks.contains(chunk.0))
+                    .map(|(attempt, _)| AcceptedGrant {
+                        owner: None,
+                        attempt: *attempt,
+                    })
+            })
+    }
+
+    /// Fold the per-node accepted record into the owner-free one once it
+    /// passes [`MAX_ACCEPTED_RANGES`]. One-task chunks spread over many
+    /// nodes split each node's record into a range per chunk; folded by
+    /// attempt alone, the same chunks merge back into a few ranges.
+    fn fold_accepted_when_full(&mut self) {
+        let ranges: usize = self
+            .accepted
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(IndexRangeSet::range_count)
+            .sum();
+        if ranges <= MAX_ACCEPTED_RANGES {
+            return;
+        }
+        for generations in std::mem::take(&mut self.accepted).into_values() {
+            for (attempt, chunks) in generations {
+                self.accepted_folded
+                    .entry(attempt)
+                    .or_default()
+                    .extend_from(&chunks);
+            }
+        }
     }
 
     /// Mergeable terminal-attempt duration distribution for accepted chunks.
@@ -463,6 +529,7 @@ impl TaskArrayState {
             .entry(result.attempt)
             .or_default()
             .insert(chunk);
+        self.fold_accepted_when_full();
         for (total, count) in self.duration_counts.iter_mut().zip(result.duration_counts) {
             *total += count;
         }
@@ -1237,6 +1304,93 @@ mod tests {
         assert!(rounds <= 977u64.div_ceil(per_round) + 2, "{rounds} rounds");
         let bytes = serde_json::to_vec(&state).unwrap().len();
         assert!(bytes <= 256 * 1024, "state is {bytes} bytes");
+    }
+
+    /// Run the worst shape for the accepted-range record: the most chunks
+    /// an array may have, one task each, on ten nodes that take two chunks
+    /// at a time and finish them out of order. `truth` collects who
+    /// finished each chunk at which attempt; a node is lost partway, so
+    /// some chunks are finished at attempt 2. Returns the largest
+    /// serialised size seen.
+    fn run_one_task_chunks_on_ten_nodes(
+        state: &mut TaskArrayState,
+        truth: &mut BTreeMap<u32, (NodeId, u64)>,
+    ) -> usize {
+        let names: Vec<String> = (0..10).map(|i| format!("node-{i}")).collect();
+        let entries: Vec<(&str, u32)> = names.iter().map(|name| (name.as_str(), 1)).collect();
+        let nodes = slots(&entries);
+        let mut largest = 0;
+        let mut round = 0u32;
+        while !state.status().is_terminal() {
+            round += 1;
+            if round == 200 {
+                state.requeue_node(&node("node-3"));
+            }
+            let holders: Vec<NodeId> = state.holders().cloned().collect();
+            for holder in holders {
+                // Finish the highest chunk held, leaving the lower one
+                // behind: completions land out of order across nodes.
+                let Some(chunk) = state.held_by(&holder).and_then(|held| held.iter().last()) else {
+                    continue;
+                };
+                let result = all_ok(state, chunk);
+                truth.insert(chunk, (holder.clone(), result.attempt));
+                state.complete(&holder, &result).unwrap();
+            }
+            let plan = plan_grants(state, &nodes, false);
+            apply(state, &plan);
+            if round.is_multiple_of(64) {
+                largest = largest.max(serde_json::to_vec(&*state).unwrap().len());
+            }
+            assert!(round < 100_000, "the array must finish");
+        }
+        largest.max(serde_json::to_vec(&*state).unwrap().len())
+    }
+
+    #[test]
+    fn accepted_state_stays_bounded_with_one_task_chunks_on_ten_nodes() {
+        let mut state =
+            TaskArrayState::new(spec(super::super::task_array::MAX_CHUNKS, 1), 1).unwrap();
+        let largest = run_one_task_chunks_on_ten_nodes(&mut state, &mut BTreeMap::new());
+        assert_eq!(state.status(), TaskArrayStatus::Succeeded);
+        assert!(
+            largest <= 256 * 1024,
+            "the state reached {largest} bytes on the way"
+        );
+        state.validate_snapshot().unwrap();
+    }
+
+    #[test]
+    fn compaction_keeps_accepted_grant_answers_correct() {
+        let mut state =
+            TaskArrayState::new(spec(super::super::task_array::MAX_CHUNKS, 1), 1).unwrap();
+        let mut truth = BTreeMap::new();
+        run_one_task_chunks_on_ten_nodes(&mut state, &mut truth);
+        assert_eq!(truth.len(), 1 << 16);
+        assert!(
+            truth.values().any(|(_, attempt)| *attempt == 2),
+            "the lost node's chunks were finished again at attempt 2"
+        );
+        // Round-trip first: a follower's copy must answer the same.
+        let state: TaskArrayState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        state.validate_snapshot().unwrap();
+        let (mut kept, mut forgotten) = (0, 0);
+        for (chunk, (owner, attempt)) in &truth {
+            let accepted = state.accepted_grant(ChunkId(*chunk)).unwrap();
+            // The attempt always survives, and fences results on its own:
+            // each attempt of a chunk is granted to exactly one node.
+            assert_eq!(accepted.attempt, *attempt, "chunk {chunk}");
+            match accepted.owner {
+                Some(recorded) => {
+                    assert_eq!(&recorded, owner, "chunk {chunk}");
+                    kept += 1;
+                }
+                None => forgotten += 1,
+            }
+        }
+        assert!(forgotten > 0, "the record was compacted");
+        assert!(kept > 0, "acceptances since the last fold keep their owner");
     }
 
     fn node(name: &str) -> NodeId {

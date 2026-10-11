@@ -319,6 +319,8 @@ volume = { path = "/data", size = "10Gi" }
 
 Reliaburger enforces volume size via Btrfs subvolume quotas or loop-mounted sparse files on ext4/xfs. Built-in volume snapshots use copy-on-write filesystem snapshots with scheduled upload jobs.
 
+A volume can instead name a host directory with `source`, as a config file can name a host file. Because every rootful container on a node shares one user-namespace id range, a host path would let one tenant mount another's managed volume, so host paths are gated twice: each node refuses any `source` not under a prefix in its `[storage] allowed_host_paths` (empty by default) and always refuses its own storage and security directories, and a token with a `[permission]` block needs `host-exec` to deploy one.
+
 ### 5.6 Permission
 
 Simplified access control. Permissions define who can perform which actions.
@@ -329,7 +331,7 @@ actions = ["deploy", "scale", "logs", "metrics"]
 apps = ["web", "api"]
 ```
 
-Valid actions: `deploy`, `scale`, `logs`, `metrics`, `exec`, `host-exec`, `fault`, `admin`, `secret-read`, `secret-write`. The `host-exec` and `admin` actions are required for process workloads and cluster administration respectively. Snapshots and builds need `deploy` on their app, chaos faults need `fault`, and test leases need `admin`.
+Valid actions: `deploy`, `scale`, `logs`, `metrics`, `exec`, `host-exec`, `fault`, `admin`, `secret-read`, `secret-write`. The `host-exec` and `admin` actions are required for process workloads and cluster administration respectively; `host-exec` also covers apps that mount a host path with `source`. Snapshots and builds need `deploy` on their app, chaos faults need `fault`, and test leases need `admin`.
 
 ### 5.7 Namespace
 
@@ -675,7 +677,7 @@ auto_rollback = true       # revert on health check failure
 
 Reliaburger persists deploy state in Raft. If the leader fails mid-deploy, the new leader resumes the rolling update from the last committed step after the learning period. If you submit a new deploy while a rollout is in progress, it supersedes the in-progress rollout: in-flight instances are drained and replaced with the newest version directly, skipping the intermediate target.
 
-**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start. The target app must be in the same apply and namespace. Cluster apply records ownership before execution and publishes dependent app revisions only after positive zero exit and durable confirmation; uncertainty or leader replacement retains the fence. Recurring schedules are supported on standalone nodes and are refused by cluster apply.
+**Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start. The target app must be in the same apply and namespace. Cluster apply records ownership before execution and publishes dependent app revisions only after positive zero exit and durable confirmation; uncertainty or leader replacement retains the fence. A hook gets one attempt and a 600-second deadline unless it sets `max_attempts` or `task_timeout_secs`. Recurring schedules work on clusters and standalone nodes alike: once the apps publish, the leader registers each `schedule` as a durable definition and claims each matching UTC minute in Raft. An unknown outcome is never replayed or overtaken automatically: cron skips that job's occurrences until an operator acknowledges the exact grant with `relish batch replay`, and `--rerun-jobs` doesn't clear it.
 
 > For the deploy state machine, connection draining protocol, and autoscaling, see [design/deployments.md](design/deployments.md).
 

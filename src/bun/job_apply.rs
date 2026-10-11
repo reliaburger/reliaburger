@@ -259,6 +259,18 @@ async fn join_lease(
 
 /// A replacement leader completes durable intent using accepted results, never launch receipts.
 pub(crate) async fn settle(state: &ApiState) {
+    // The leader calls this every tick, and most ticks have nothing to
+    // settle: look before copying every array.
+    let pending = super::task_array_leader::read_control(state, |view| {
+        view.arrays
+            .deployments()
+            .any(|(_, record)| !record.completed)
+    })
+    .await
+    .unwrap_or(false);
+    if !pending {
+        return;
+    }
     let arrays = read_task_arrays(state).await;
     for (id, record) in arrays
         .deployments()

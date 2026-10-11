@@ -440,6 +440,9 @@ pub enum CouncilResponse {
     /// A task array was registered under this id, taken from the same
     /// counter as ordinary batches.
     TaskArrayRegistered { batch_id: u64 },
+    /// A leader tick's task-array writes applied; these were refused, by
+    /// array id, with the reason.
+    TaskArrayTicked { refused: Vec<(u64, String)> },
 }
 
 // ---------------------------------------------------------------------------

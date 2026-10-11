@@ -159,7 +159,7 @@ async fn owned_follow_node(
         let owner = record
             .state
             .accepted_grant(crate::meat::task_array::ChunkId(0))
-            .map(|(owner, _)| owner)
+            .and_then(|grant| grant.owner)
             .or_else(|| held.next().cloned())
             .ok_or_else(agent_unavailable)?;
         if !super::super::task_array_api::every_node(state)
@@ -399,10 +399,10 @@ pub(super) async fn follow_local_logs(
                     return;
                 };
                 if record.state.status().is_terminal() {
-                    if let Some((_, grant)) = record
+                    if let Some(accepted) = record
                         .state
                         .accepted_grant(crate::meat::task_array::ChunkId(0))
-                        && let Ok(bytes) = node.task_output_grant(id, 0, grant).await
+                        && let Ok(bytes) = node.task_output_grant(id, 0, accepted.attempt).await
                     {
                         let text = String::from_utf8_lossy(&bytes);
                         let text = tail.map_or_else(

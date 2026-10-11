@@ -234,7 +234,7 @@ size = "10Gi"                       # optional
 
 [[app.db.volumes]]
 path = "/import"
-source = "/srv/import"              # host path: mounted as it is
+source = "/srv/import"              # host path: needs a node allowlist entry
 ```
 
 A managed volume lives under the node's `[storage] volumes` directory
@@ -256,6 +256,38 @@ starts elsewhere on a new, empty volume (restore a snapshot into it if you have
 one). A bigger `cpu` or `memory` request doesn't move it, even when its node is
 now short of room. A host-path volume is never chowned: make it readable (or writable) by
 the container's mapped user yourself.
+
+### Host paths
+
+A `source` on a volume (mounted read-write) or on a `config_file` (read-only)
+reaches straight into the node's filesystem, past the app's namespace. Every
+rootful container on a node shares one user-namespace id range, so a host path
+that pointed at another app's managed volume would hand its files to your
+container. Two gates stand in the way:
+
+- **Every node refuses host paths by default.** It mounts a `source` only when
+  `[storage] allowed_host_paths` in its `node.toml` lists a prefix that covers
+  it. Prefixes match by whole path component (so `/srv/import-evil` isn't
+  under `/srv/import`), after symlinks are resolved, and a `source` with `..`
+  in it is refused outright:
+
+  ```toml
+  [storage]
+  allowed_host_paths = ["/srv/import", "/etc/ssl/certs"]
+  ```
+
+  The node's own directories are refused even under a listed prefix: the five
+  `[storage]` directories, the identity directory, the script directory and
+  the directories holding the master key and the security bootstrap. So is a
+  path that contains one of them, such as `/var/lib`. A refused app fails its
+  deploy on that node, and `relish apply` names the path and the reason.
+- **A token with a `[permission]` block needs `host-exec`** as well as
+  `deploy` for an app with any `source` (see `security`).
+
+`relish lint` and `relish apply --dry-run` accept a `source`, since they can't
+see any node's allowlist; `relish apply` prints a line for each one, reminding
+you which nodes will mount it. Managed volumes and inline `config_file`
+content need neither gate.
 
 ## Snapshots
 
