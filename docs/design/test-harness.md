@@ -404,8 +404,8 @@ directories and kills whatever names them too.
 
 Cleanup must also stop at what the test owns. The scan reads every process on the host, and
 on a CI runner that includes the runner. Until #800 it killed the whole process group of any
-match outside the test's own group, and a match could be any process with a file open under
-the root. A process the test didn't start, sitting in someone else's group, would have taken
+match outside the test's own group. From #758 on, a match could be any process with a file
+open under the root. A process the test didn't start, sitting in someone else's group, would have taken
 that group down with it. A runner killed that way loses the job and every log it had.
 That is how the privileged Linux job's OCI step failed five times on 11 October, though no
 run proved which process matched. The rule now
