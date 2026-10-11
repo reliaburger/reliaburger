@@ -8396,6 +8396,33 @@
       "boundaries": [
         "Every node in the harness runs on the test host's platform, so mixed-architecture selection is covered by the relish, orchestrator and plan unit tests."
       ]
+    },
+    {
+      "id": "issue-676-host-path-sources-need-a-node-allowlist",
+      "issue": 676,
+      "promise": "A node refuses a volume or config-file host path outside [storage] allowed_host_paths, and always refuses its own storage and security directories, before any runtime state exists.",
+      "supported_paths": [
+        "Rootful Linux runc nodes"
+      ],
+      "cases": [
+        {
+          "id": "host-path-runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted",
+          "binary": "reliaburger",
+          "test": "bun::supervisor::tests::runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/supervisor.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "An unlisted host path, and another namespace's managed volume under a listed parent, are refused with no bundle or container created."
+      ],
+      "boundaries": [
+        "This case needs runc in the Linux gate; the portable supervisor tests cover the same policy with a mock runtime."
+      ]
     }
   ]
 }
