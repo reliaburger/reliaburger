@@ -28,7 +28,7 @@ class Repository:
         self.root = Path(root)
         self.git("init", "-q", "-b", "main")
         for path in ["src/lib.rs", "src/mustard/gossip.rs", "src/bun/task_array_leader.rs",
-                     "src/bun/task_executor.rs", "benches/task_arrays.rs", "docs/roadmap.md",
+                     "src/bun/task_executor.rs", "benches/task_arrays.rs", "docs/design/gossip.md",
                      "docs/manual/intro.md", "README.md", "docs/book/07-ship-it.md"]:
             self.write(path, f"{path}\n")
         self.commit("base")
@@ -101,13 +101,21 @@ class SelectJobsTests(unittest.TestCase):
                          {"code": True, "gossip": False, "heavy": True, "task_arrays": False})
 
     def test_documentation_alone_skips_every_rust_job(self):
-        self.pull_request("docs/roadmap.md", "docs/book/07-ship-it.md")
+        self.pull_request("docs/design/gossip.md", "docs/book/07-ship-it.md")
         self.assertEqual(self.repo.select(base_sha=self.main),
                          {"code": False, "gossip": False, "heavy": False, "task_arrays": False})
 
     def test_the_website_counts_as_code_because_its_tests_read_it(self):
         self.pull_request("docs/website/assets/tour.cast")
         self.assertTrue(self.repo.select(base_sha=self.main)["code"])
+
+    def test_docs_the_website_tests_read_count_as_code(self):
+        for path in ["docs/roadmap.md", "docs/quickstart.md", "docs/releasing.md"]:
+            with self.subTest(path=path):
+                self.pull_request(path)
+                self.assertTrue(self.repo.select(base_sha=self.main)["code"])
+                self.repo.git("checkout", "-q", "main")
+                self.repo.git("branch", "-q", "-D", "feature")
 
     def test_the_manual_counts_as_code_because_relish_compiles_it_in(self):
         self.pull_request("docs/manual/intro.md")
@@ -173,14 +181,14 @@ class SelectJobsTests(unittest.TestCase):
                                          full_ci=True)["heavy"])
 
     def test_the_full_ci_label_does_not_make_documentation_heavy(self):
-        self.pull_request("docs/roadmap.md")
+        self.pull_request("docs/design/gossip.md")
         self.assertFalse(self.repo.select(base_sha=self.main, full_ci=True)["heavy"])
 
     def test_retargeting_a_stacked_pull_request_to_main_selects_the_heavy_suites(self):
         # The stacked PR changes only docs; the branch under it changed code.
         # Once GitHub retargets it to main, the diff against main carries both.
         base = self.stacked_base("src/lib.rs")
-        self.pull_request("docs/roadmap.md")
+        self.pull_request("docs/design/gossip.md")
         before = self.repo.select(base_ref="fix/base", base_sha=base)
         after = self.repo.select(base_ref="main", base_sha=self.main)
         self.assertEqual(before, {"code": False, "gossip": False, "heavy": False, "task_arrays": False})
