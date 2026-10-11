@@ -3129,6 +3129,16 @@ promotion can't skip the re-record the way 0.1.5 and 0.1.6 did. It caught
 something on its first run, too: the new 0.3.0 card on the homepage said
 `relish netboot`, a command no release has yet.
 
+The payoff came at the promotion. Flipping `install.sh` to `v0.2.0` turned
+every "0.2.0, not in 0.1.6" into an error, because a label naming the release
+before the installed one is stale, and it failed the recording check until the
+tour was re-recorded against the published 0.2.0. So the change that announced
+the release also had to put jobs back into the tour: `relish batch submit
+burger/jobs.toml`, `relish batch watch` and `relish jobs`, beside the burger
+app. The step had sat behind a `--jobs` flag in `scripts/demo/tour.sh` while
+the installer fetched a release without `batch`; now that the published
+release has it, the flag is gone and every recording runs the step.
+
 ## What 0.2.0 doesn't do yet
 
 An audit of the job path before the release

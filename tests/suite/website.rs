@@ -604,14 +604,7 @@ fn every_tour_step_is_one_command_block_then_one_paragraph() {
 
 const RELEASED_CLI: &str = "scripts/release/released-cli.tsv";
 
-/// TODO(#688): the tour was last recorded against the published 0.1.4
-/// install; 0.1.5 and 0.1.6 skipped the re-record. Re-record it against the
-/// published 0.2.0 install when 0.2.0 is promoted (docs/releasing.md, "Update
-/// the docs"), then set this to `None`. The exemption names the installer
-/// version it was granted under, so it lapses the moment the default moves.
-const TOUR_RECORDED_BEHIND: Option<(&str, &str)> = Some(("0.1.4", "v0.1.6"));
-
-/// The tag `install.sh` fetches by default, such as `v0.1.6`.
+/// The tag `install.sh` fetches by default, such as `v0.2.0`.
 fn installer_default() -> String {
     read("docs/website/install.sh")
         .split("${RELIABURGER_VERSION:-")
@@ -851,25 +844,12 @@ fn the_tour_recording_matches_the_installer_version() {
         "tour.sh no longer writes the version into the cast's title"
     );
     let installer = installer_default();
-    match TOUR_RECORDED_BEHIND {
-        None => assert_eq!(
-            format!("v{recorded}"),
-            installer,
-            "the tour was recorded against {recorded}, but install.sh installs {installer}; \
-             re-record it (docs/website/README.md, \"Re-recording the tour\")"
-        ),
-        Some((behind, granted_under)) => {
-            assert_eq!(
-                recorded, behind,
-                "the tour was re-recorded; set TOUR_RECORDED_BEHIND to None"
-            );
-            assert_eq!(
-                installer, granted_under,
-                "install.sh now installs {installer}: re-record the tour against it and set \
-                 TOUR_RECORDED_BEHIND to None"
-            );
-        }
-    }
+    assert_eq!(
+        format!("v{recorded}"),
+        installer,
+        "the tour was recorded against {recorded}, but install.sh installs {installer}; \
+         re-record it (docs/website/README.md, \"Re-recording the tour\")"
+    );
 }
 
 /// Each release in the roadmap's list with the name it gives it

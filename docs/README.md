@@ -5,11 +5,11 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.1.6 was released on 7 October 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6),
+0.2.0 was released on RELEASE_DATE_0_2_0. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.1.6 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.2.0 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 ## Scope and limits
@@ -95,9 +95,9 @@ Stopped.
 
 ### Jobs and cron
 
-This section describes 0.2.0, not in 0.1.6: build matching development binaries
-and start a fresh cluster to try it. The [job manual](manual/14_batch-jobs.md)
-covers it in full.
+0.2.0 changes the cluster's formats, so a 0.1.6 cluster can't roll to it: start a
+fresh cluster ([upgrading from 0.1.6](releasing.md#upgrading-from-016)). The
+[job manual](manual/14_batch-jobs.md) covers jobs in full.
 
 Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
 definition, a run with a trigger identity, and indexed tasks the leader hands to
@@ -271,7 +271,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.1.6, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.2.0, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -310,7 +310,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.1.6, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.2.0, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -321,7 +321,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.1.6 runtime profile.
+work; they are outside the 0.2.0 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -341,7 +341,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.1.6 contract: foreground workloads only.** The main process stays under Bun's
+**0.2.0 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -1414,7 +1414,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.1.6 while interrupted daemon-command
+Direct Apple Container is disabled for 0.2.0 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide
@@ -1499,14 +1499,13 @@ They're one part of a release's acceptance, not all of it; the
 [release runbook](releasing.md) lists the gates a candidate has to pass, and
 the [release log](release-log.md) says how each release went through them.
 
-### Running jobs on a development build
+### Running jobs beside apps
 
-The job lifecycle here is 0.2.0, not in 0.1.6. [Batch jobs](manual/14_batch-jobs.md)
+[Batch jobs](manual/14_batch-jobs.md)
 explains it: one-off jobs, cron, deployment hooks and task arrays, how they share
 resources with apps, namespace quotas and caps, retries, watching a run, and
 reading its results. The [burger manifest](../examples/demo/burger/jobs.toml)
-gives you mixed-size work to run beside a service. 0.2.0 changes the cluster's
-formats, so build matching development binaries and start a fresh cluster.
+gives you mixed-size work to run beside a service.
 
 Apps and jobs share each node's execution budget. State reports carry what a
 node's task attempts and executors hold, and the leader counts it when it

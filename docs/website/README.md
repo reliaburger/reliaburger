@@ -57,7 +57,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.1.6
+  --record docs/website/assets/tour.cast --install v0.2.0
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -85,17 +85,14 @@ the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` when the
 tarball isn't published yet. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.1.4 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
+`--install v0.2.0 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
 beside a laptop cluster on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.1.4: the five-minute tour`), and the caption under the player names it too.
+0.2.0: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
-promotion that forgets the re-record fails CI. The recording is behind for now:
-0.1.5 and 0.1.6 skipped it, and the test carries a dated exemption
-(`TOUR_RECORDED_BEHIND`, #688) that lapses when the installer's default moves
-to 0.2.0.
+promotion that forgets the re-record fails CI.
 
 The "Try it in five minutes" section keeps its heading and the recording in
 plain view; people didn't notice it when the whole section sat in one collapsed
@@ -144,7 +141,7 @@ written from the published binary's own help by
 `tests/suite/website.rs` checks every `relish …` command on this page, in the
 README and in the tour chapter against it. The tour may only use released
 commands. Anything else has to say which release adds it, in the words
-"0.2.0, not in 0.1.6" (the build's version, then the installer's), in the
+"0.3.0, not in 0.2.0" (the build's version, then the installer's), in the
 same paragraph, `<details>` or section. The README's generated command list
 labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
@@ -159,7 +156,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.1.6` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.0` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
