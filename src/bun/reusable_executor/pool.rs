@@ -46,6 +46,18 @@ const IDLE: Duration = Duration::from_secs(1);
 /// lease stay quarantined while the eviction loop keeps retrying, and the
 /// caller gets its own outcome back.
 const RETIREMENT_DEADLINE: Duration = Duration::from_secs(10);
+/// Executors one cold start may try before failing the command. A runtime
+/// call can miss its own bound on a loaded host, as a `runc state` did in
+/// #759, and the command never reached that executor, so a second, fresh
+/// one runs it at most once. Both share the command's deadline.
+const STARTUP_ATTEMPTS: u32 = 2;
+/// How one try at starting a cold executor ended.
+enum Startup {
+    Started,
+    Failed(ExecutorError),
+    /// Cancellation or the deadline stopped it, with this outcome.
+    Interrupted(AttemptOutcome),
+}
 /// How long one eviction tick spends on each executor, so one that won't
 /// retire can't hold up the others behind it.
 const EVICTION_BUDGET: Duration = Duration::from_secs(1);
@@ -917,8 +929,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         // not command run time. Cold preparation starts its clock only once the
         // complete profile is charged; warm work starts after borrowing its slot.
         let mut deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
-        if checkout.context.is_none() {
-            let lease = match reservation {
+        let mut reservation = reservation;
+        let mut image = None;
+        let mut startup_attempt = 1;
+        while checkout.context.is_none() {
+            let lease = match reservation.take() {
                 Some(lease) => Some(lease),
                 None => {
                     self.admit(
@@ -938,7 +953,10 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     ran: None,
                 };
             };
-            deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
+            // A retried start keeps the clock the first one started.
+            if startup_attempt == 1 {
+                deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
+            }
             drop(admission_timer.take());
             let startup_timer = self.timings.start(Phase::Startup);
             // Cold preparation can take as long as an image pull, so cancel
@@ -949,36 +967,35 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     () = crate::bun::task_executor::wait_deadline(deadline) => AttemptOutcome::TimedOut,
                 }
             };
-            let image = match &self.runtime {
-                Runtime::Host(_) => None,
-                Runtime::Container(runtime) => {
-                    // The pull runs as its own task, so an interrupted attempt
-                    // leaves it to finish filling the image cache instead of
-                    // dropping it halfway through unpacking a layer.
-                    let store = runtime.image_store().clone();
-                    let reference = template.image.clone().unwrap_or_default();
-                    let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
-                    let pulled = tokio::select! { biased;
-                        outcome = interrupted() => Err(Attempt {
-                            outcome,
-                            output: CapturedOutput::default(),
-                            ran: None,
-                        }),
-                        pulled = pull => match pulled {
-                            Ok(Ok(image)) => Ok(image),
-                            Ok(Err(error)) => Err(failed(ExecutorError::Protocol(error.to_string()))),
-                            Err(error) => Err(failed(ExecutorError::Protocol(error.to_string()))),
-                        },
-                    };
-                    match pulled {
-                        Ok(image) => Some(image),
-                        Err(attempt) => {
-                            checkout.release().await;
-                            return attempt;
-                        }
+            if image.is_none()
+                && let Runtime::Container(runtime) = &self.runtime
+            {
+                // The pull runs as its own task, so an interrupted attempt
+                // leaves it to finish filling the image cache instead of
+                // dropping it halfway through unpacking a layer.
+                let store = runtime.image_store().clone();
+                let reference = template.image.clone().unwrap_or_default();
+                let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+                let pulled = tokio::select! { biased;
+                    outcome = interrupted() => Err(Attempt {
+                        outcome,
+                        output: CapturedOutput::default(),
+                        ran: None,
+                    }),
+                    pulled = pull => match pulled {
+                        Ok(Ok(image)) => Ok(image),
+                        Ok(Err(error)) => Err(failed(ExecutorError::Protocol(error.to_string()))),
+                        Err(error) => Err(failed(ExecutorError::Protocol(error.to_string()))),
+                    },
+                };
+                match pulled {
+                    Ok(pulled) => image = Some(pulled),
+                    Err(attempt) => {
+                        checkout.release().await;
+                        return attempt;
                     }
                 }
-            };
+            }
             let namespace = template.namespace.as_deref().unwrap_or("default");
             let app = format!(
                 "executor-{}-{}",
@@ -1005,7 +1022,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 directory,
                 id,
                 base,
-                image,
+                image: image.clone(),
                 socket_path: None,
                 connection: None,
                 lease: lease.quarantine_on_drop(),
@@ -1020,23 +1037,53 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             // abandons a runtime call halfway, so retirement sees whatever
             // that call left behind.
             let stop = CancellationToken::new();
-            let stopped = {
+            let startup = {
                 let started = self.start(new, &template, profile, &stop);
                 tokio::pin!(started);
                 tokio::select! { biased;
                     outcome = interrupted() => {
                         stop.cancel();
                         let _ = (&mut started).await;
-                        Some(Attempt { outcome, output: CapturedOutput::default(), ran: None })
+                        Startup::Interrupted(outcome)
                     }
-                    result = &mut started => result.err().map(failed),
+                    result = &mut started => match result {
+                        Ok(()) => Startup::Started,
+                        Err(error) => Startup::Failed(error),
+                    },
                 }
             };
-            if let Some(attempt) = stopped {
-                checkout.retire().await;
-                return attempt;
-            }
             drop(startup_timer);
+            let error = match startup {
+                Startup::Started => break,
+                Startup::Failed(error) => error,
+                Startup::Interrupted(outcome) => {
+                    checkout.retire().await;
+                    return Attempt {
+                        outcome,
+                        output: CapturedOutput::default(),
+                        ran: None,
+                    };
+                }
+            };
+            // The command never reached this executor, so a fresh one can
+            // run it without running it twice. Only a positively retired
+            // executor frees its slot for that (#759).
+            if startup_attempt < STARTUP_ATTEMPTS && error.is_transient() {
+                eprintln!(
+                    "executor {}: start failed, retrying on a fresh executor: {error}",
+                    checkout
+                        .context
+                        .as_ref()
+                        .map_or("unknown", |context| context.id.0.as_str())
+                );
+                startup_attempt += 1;
+                if checkout.retire_previous().await {
+                    continue;
+                }
+                return failed(error);
+            }
+            checkout.retire().await;
+            return failed(error);
         }
         drop(admission_timer.take());
         let Some(context) = checkout.context.as_mut() else {

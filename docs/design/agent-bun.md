@@ -1531,6 +1531,16 @@ join = ["10.0.1.5:9443"]
 
 **Recovery:** Automatic restart with backoff. Once the `memory.events` watch lands, the OOM event will be logged with full memory state (current usage, limit, peak) and surfaced via `relish wtf`; today an OOM kill looks like any other unexpected exit.
 
+### 7.9 Reusable Executor Fails to Start
+
+**What happens:** A cold reusable executor (shared-runc or native host) fails while starting, before its helper connects: a runtime command misses its five-second bound on a loaded host, an I/O call fails, or the helper never connects. The job's command hasn't been sent anywhere yet.
+
+**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O and helper failures from refusals about the job itself.
+
+**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second failure, or any refusal, fails the attempt with the runtime's reason as `SpawnFailed`.
+
+**Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
+
 ---
 
 ## 8. Security Considerations
