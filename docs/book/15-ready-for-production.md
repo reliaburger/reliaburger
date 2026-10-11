@@ -5785,3 +5785,48 @@ parsed profile after passthrough flags. The owner predicts that observed order
 exactly, including the manifest and instrumented target directory. A recorded
 command fixture checks the prediction; changing or omitting a selector still
 fails before discovery or execution.
+
+### The first launch belongs to the host
+
+`managed_status_fails_for_missing_stopped_and_unreachable_nodes` runs
+`relish local status` three times against a fake `limactl` and gives each run
+15 seconds. Under parallel load on macOS it sometimes ran out of time before
+`relish` had printed a byte, and the fake Lima had never been called. Alone it
+passed. The register said "cause unconfirmed" for a week, which was honest
+([#573](https://github.com/reliaburger/reliaburger/issues/573)).
+
+The cause turned out to be outside our code. On macOS the first `exec` of a
+newly written executable waits while `syspolicyd` assesses it. Your terminal
+probably has the Developer Tools permission, which skips the check, so you'll
+never see it there. A CI runner or an agent's shell has no such exemption. We
+reproduced that context with a short C launcher that starts the test through
+`posix_spawn` with `responsibility_spawnattrs_setdisclaim`, the call that makes
+the child responsible for itself. Two details matter. The wait happens in the
+child after `posix_spawn` has already returned, so it counts against whatever
+deadline the test set. And the host assesses one file at a time: a freshly
+linked 490 MB debug `relish` took 4 to 8 seconds alone, and with two other fresh
+binaries starting at the same moment the first status run failed its deadline
+15 times in 20.
+
+The test also wrote a new `limactl` script for each of its three runs, so each
+run queued once more. Now it writes the script once and hard-links it into each
+run's directory. A hard link is a second name for the same file, which the host
+has already assessed; a copy would be a new file. Before any deadline starts,
+`tests/support/first_launch.rs` launches `relish --version` and the script
+together and waits for both, with its own 45-second bound that says what it was
+waiting for. The 15 seconds now measure `relish`, which is what they were
+written for.
+
+The helper remembers what it has launched in a process-wide set:
+
+```rust
+static LAUNCHED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+```
+
+A Rust `static` is one value for the whole program, like a C global, but its
+initialiser must be something the compiler can evaluate at build time: a
+`const fn`. `Mutex::new` and `BTreeSet::new` are both `const fn`. `HashSet::new`
+isn't, because it seeds its hasher with random keys when it runs, so the
+compiler refuses it and suggests `LazyLock`. A sorted set needs no seed, and it
+was the shorter fix. The mutex is `std::sync::Mutex`, held only for a lookup in
+a synchronous helper and never across an `.await`.

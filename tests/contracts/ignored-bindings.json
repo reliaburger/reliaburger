@@ -1128,6 +1128,12 @@
     "test": "restart_after_unit_cgroup_stop_recovers_a_retiring_generation"
   },
   {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor"
+  },
+  {
     "source": "tests/placement.rs",
     "function": "apply_on_any_node_places_across_the_cluster",
     "binary": "reliaburger::placement",

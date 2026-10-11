@@ -7043,6 +7043,33 @@
       ]
     },
     {
+      "id": "issue-759-executor-start-retries-on-a-fresh-executor",
+      "issue": 759,
+      "promise": "An executor start that misses a runtime command's bound retires that executor and runs the command once on a fresh one, within the command's deadline.",
+      "supported_paths": [
+        "Rootful Linux shared-runc executors"
+      ],
+      "cases": [
+        {
+          "id": "executor-start-runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A start that fails again is refused after one retry, and an executor that has not positively retired is never replaced."
+      ],
+      "boundaries": [
+        "The runtime failure is injected after a real start; a configuration refusal is never retried."
+      ]
+    },
+    {
       "id": "issue-678-runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
       "issue": 678,
       "promise": "Retired shared-runc executors across namespaces leave no runtime journals, identities or route files behind.",

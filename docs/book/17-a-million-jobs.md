@@ -1328,6 +1328,69 @@ back. The same change moved the start-up filesystem work (creating
 directories, permissions, `chown`, preparing cgroups) onto the blocking pool
 with `spawn_blocking`, off the async worker threads.
 
+**Retrying a cold start that failed.** On 11 October a privileged CI run failed
+one task out of six with `container rbtest-batch__executor-…-1 state
+unavailable: runtime command … did not finish within 5s`. Every runc call the
+owned runtime makes runs under its own durable owner process and gets five
+seconds to finish. Starting an executor polls `runc state` until the
+container's init is running, and on that loaded runner one poll missed the
+bound. The pool reported the failed start as `SpawnFailed`, the outcome for a
+binary that doesn't exist, so the task pool never retried it. Yet the user's
+command hadn't run anywhere: it's only sent once the helper connects.
+
+We tried to reproduce the slow call in the Lima VM first, as root, with
+eighteen busy loops on six CPUs and then twelve busy loops plus four writers
+doing `dd conv=fsync` in a loop. In 27 runs of the test, no runtime command
+took over a second. So the five-second bound has plenty of headroom, and
+raising it would only move the edge. What the failure showed was a real gap:
+a transient failure of *our* machinery cost a task one of its attempts, or
+all of them with `max_attempts = 1`.
+
+Now a cold start that fails on a runtime, I/O or helper error retires that
+executor and starts one fresh one, at most twice in all
+(`STARTUP_ATTEMPTS`). Both share the command's deadline, and the retry happens
+only once the first executor has positively retired. One that hasn't stays
+quarantined with its slot, exactly as before. A refusal about the job itself,
+such as an unpinned image, isn't retried: a second executor would refuse it
+too. `ExecutorError::is_transient` makes that split.
+
+The loop hit a borrow-checker lesson on the way. `tokio::pin!(started)` pins
+the start future on the stack, and that future holds a mutable borrow of the
+slot's context until it's dropped. Our first version matched on the result
+in the same scope and then called `checkout.retire()`, and the compiler
+refused: `checkout` was still borrowed by a future we'd finished with. The
+fix is to give the future a smaller scope that ends in a value:
+
+```rust
+let startup = {
+    let started = self.start(new, &template, profile, &stop);
+    tokio::pin!(started);
+    tokio::select! { biased;
+        outcome = interrupted() => {
+            stop.cancel();
+            let _ = (&mut started).await;
+            Startup::Interrupted(outcome)
+        }
+        result = &mut started => match result {
+            Ok(()) => Startup::Started,
+            Err(error) => Startup::Failed(error),
+        },
+    }
+};
+```
+
+The block's closing brace drops `started`, the borrow ends with it, and the
+`Startup` enum carries out everything we need to decide what's next. In C you
+could keep using the struct here and hope the future was done with it. Rust
+makes you say so.
+
+`runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor` wraps
+the real runc runtime and reports the CI error after a real start. The first
+command succeeds on the second executor; when every start fails, the command
+gets the runtime's reason after exactly two starts, with the budget returned
+and nothing left running. Against the old pool it fails with the same
+`SpawnFailed` CI saw.
+
 Retirement can't wait forever either. A process stuck in an uninterruptible
 kernel wait, say on a hung NFS mount, ignores `SIGKILL` until the kernel lets
 go. `RETIREMENT_DEADLINE` gives up after ten seconds: the caller gets its
