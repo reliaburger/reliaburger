@@ -208,6 +208,25 @@ directories and keep every resource scoped so worktrees and nextest processes ca
 concurrently. A listener that must come back on the same port after a restart or an
 upgrade exec is the exception: it leases its port instead (see the cluster fixtures below).
 
+## A new executable's first launch
+
+On macOS the first `exec` of a newly written executable waits for `syspolicyd` to assess
+it. Terminals with the Developer Tools permission are exempt, so a test can pass every
+time on a developer's laptop and still time out on a CI runner or in an agent's shell. The
+wait happens in the child after `posix_spawn` has returned, so it lands inside any deadline
+the test put around the child, and assessments queue host-wide: a freshly linked debug
+`relish` (about 490 MB) took 4 to 8 seconds alone and over 15 seconds while two other fresh
+binaries were being assessed ([#573](https://github.com/reliaburger/reliaburger/issues/573)).
+A small fresh script waits in the same queue.
+
+A fixture that times a subprocess therefore pays the first launch outside its deadline.
+`tests/support/first_launch.rs` runs each executable once, all at the same time, with a
+45-second bound that names the phase if the queue never drains, and remembers which paths
+it has launched in this test process. A fixture that needs the same script in several
+directories writes it once, launches it, and hard-links it: a hard link shares the
+already-assessed file, a copy is a new file that gets assessed again. The behavioural
+deadline then measures only the program it was written for.
+
 ## Benchmarks and coverage
 
 Correctness tests use small deterministic inputs and assert exact output. A 100 MB P2P pull
