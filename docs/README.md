@@ -1470,8 +1470,9 @@ machines.
   both modes; compiler overrides require a separate audit. Each of its three
   test binaries gets 420 s: one still running then gets SIGTERM, and SIGKILL
   30 s later, so a hung test fails the run with its log kept. In CI the step
-  also has its own 25-minute limit, and a failure lists the processes left
-  running with their kernel stacks
+  also has its own 25-minute limit. A watcher records free disk and memory
+  while it runs, and the step after it prints the low-water marks and, when
+  the step didn't pass, every process left running with its kernel stacks
   ([#800](https://github.com/reliaburger/reliaburger/issues/800)).
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
