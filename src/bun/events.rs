@@ -92,6 +92,10 @@ pub enum EventKind {
     JobFailed,
     /// A cron occurrence was claimed but not run: no active-run slot was free.
     JobSkipped,
+    /// A job run was cancelled.
+    JobCancelled,
+    /// A node holding a job run's work went quiet; the outcome is unknown.
+    JobUnknown,
     /// An alert changed state.
     Alert,
     /// A fault was injected or cleared.

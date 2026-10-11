@@ -2109,8 +2109,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let collection_cmd_tx = cmd_tx.clone();
     let collection_node = node_name.clone();
     let collection_loop_meter = Arc::clone(&loop_meter);
+    // Job counters and usage for the attempts this node runs, shared by the
+    // task-array executor (which counts), this loop (which exports and
+    // measures) and `relish top` (which reads the latest usage).
+    let job_telemetry = Arc::new(reliaburger::mayo::job_metrics::JobTelemetry::default());
+    let collection_jobs = Arc::clone(&job_telemetry);
     feeder_handles.push(tokio::spawn(async move {
         let mut collector = SystemCollector::new();
+        let mut job_cgroups = reliaburger::mayo::job_metrics::CgroupCpu::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
         let mut flush_counter = 0u64;
         loop {
@@ -2132,6 +2138,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             .collect_agent_instance_metrics(&collection_cmd_tx, &collection_node)
                             .await,
                     );
+
+                    // Job counters and histograms for the attempts this node
+                    // ran, and CPU and memory for the ones running now,
+                    // labelled by namespace, definition, profile and node only.
+                    samples.extend(collection_jobs.samples(&collection_node));
+                    samples.extend(collection_jobs.sample_usage(
+                        &collector,
+                        &mut job_cgroups,
+                        &collection_node,
+                    ));
 
                     // Ingress metrics (E): fold the wrapper's process-global
                     // request counters into the same time series.
@@ -2885,8 +2901,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     ),
                     reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
                 )
-                .with_budget(execution_budget),
+                .with_budget(execution_budget)
+                .with_telemetry(Arc::clone(&job_telemetry)),
             )))
+            .with_job_notifier(WebhookDispatcher::new(
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_default(),
+                config.alerts.destinations.clone(),
+                config.cluster.name.clone(),
+            ))
             .with_trust_policy(config.images.trust_policy.clone())
             .with_signature_source(signature_source.clone())
             .with_storage(&data_base)

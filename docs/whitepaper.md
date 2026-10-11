@@ -266,7 +266,11 @@ unknown outcome owned until a user acknowledges replay; bulk work can opt into
 at-least-once retry. Neither policy promises exactly-once external effects.
 Encrypted templates and authorised scripts retain namespace and host-execution
 checks. Bounded summaries, accepted rates, backlog, duration histograms and
-selected result pages replace listing millions of jobs. The daily throughput
+selected result pages replace listing millions of jobs. Each definition keeps
+its last ten outcomes after the runs' detail is pruned, every node exports job
+counters and duration histograms labelled only by namespace, definition,
+profile and node, and the leader records one event per run (never per task),
+sending failed and unknown-outcome runs to the alert webhooks. The daily throughput
 claim still needs sustained qualification, including container launch cost,
 resource demand, storage and service quality. See the [job manual](manual/14_batch-jobs.md).
 
@@ -734,7 +738,7 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 
 Reliaburger includes a complete observability stack with zero configuration:
 
-**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box (CPU throttle, OOM, memory pressure, disk filling, CPU idle).
+**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box (CPU throttle, OOM, memory pressure, disk filling, CPU idle).
 
 **Logs (Ketchup):** Captures stdout/stderr from every container. Structured storage with timestamp-based indexing, JSON auto-detection for field queries, and zstd compression. Export to S3 or external destinations on a schedule.
 
@@ -763,7 +767,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
 | `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
-| `relish top` | Workload state, PID and restart counts (not live CPU/memory) | `kubectl top` (requires metrics-server) |
+| `relish top` | Workloads with their latest CPU and memory, running array tasks included | `kubectl top` (requires metrics-server) |
 | `relish wtf` | Automated health check | (none — requires runbooks + Prometheus alerts) |
 | `relish exec` | Run a command inside a running container | `kubectl exec` |
 | `relish exec --debug` *(planned)* | Debug container (separate identity) | `kubectl debug` |
@@ -803,6 +807,12 @@ What the current binary actually enforces is a policy layer, not a sandbox:
 - **Signed-commit gating.** Inline scripts applied via Lettuce require signed commits (Section 14). When applied directly via `relish apply`, TOML files containing `script` fields require `host-exec` permission.
 
 On rootful Linux, process batches use a bounded native executor pool. Each command starts as a fresh host process inside its resource-profile cgroup, with CPU, memory, swap and PID limits applied before execution. A durable owner holds the executor subtree until retirement. These jobs run as Bun's user and retain access to the host; they are trusted workloads, not a security sandbox. Every host backend passes only a short allowlist of Bun's environment (`PATH`, `HOME`, locale and a few more) plus the job's own variables.
+
+Process apps get the supervisor's per-process CPU and memory samples. Process
+batch tasks don't run under the supervisor, so each node measures their
+executor cgroups (or, without cgroups, their processes) per job definition and
+profile instead: Mayo stores those as job series and `relish top` shows one
+row per definition with its running task count.
 
 Process applications, ordinary process jobs and every host workload on platforms without the native backend still use the process owner directly. Explicit job resource limits are refused when that backend cannot enforce them. **Status: further kernel isolation is planned.** There is no dedicated `burger` user, seccomp profile or network/PID/mount namespace for host workloads. Mount-namespace isolation is explicitly refused when `mount_isolation` is requested.
 

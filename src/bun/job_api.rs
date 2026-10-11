@@ -271,7 +271,7 @@ pub async fn definitions_handler(
     let rows: Vec<_> = arrays.jobs().definitions().filter_map(|(key, record)| {
         let (namespace, name) = key.split_once('/')?;
         crate::sesame::auth::authorize_scoped(auth.as_deref(), name, namespace).ok()?;
-        Some(serde_json::json!({"name":name,"namespace":namespace,"revision":record.revision,"count":record.definition.tasks.count,"cron":record.definition.cron,"last_observed_minute":record.last_observed_minute,"skipped":record.skipped,"skipped_count":record.skipped_count}))
+        Some(serde_json::json!({"name":name,"namespace":namespace,"revision":record.revision,"count":record.definition.tasks.count,"cron":record.definition.cron,"last_observed_minute":record.last_observed_minute,"skipped":record.skipped,"skipped_count":record.skipped_count,"history":record.history}))
     }).collect();
     Json(serde_json::json!({"definitions":rows})).into_response()
 }

@@ -1594,5 +1594,11 @@
     "function": "runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted",
     "binary": "reliaburger",
     "test": "bun::supervisor::tests::runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_shared_profile_reports_cgroup_cpu_and_memory",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_shared_profile_reports_cgroup_cpu_and_memory"
   }
 ]

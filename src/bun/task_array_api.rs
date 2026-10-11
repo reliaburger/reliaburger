@@ -1259,7 +1259,7 @@ pub async fn summaries(
             "status":"Scheduled", "batch_id":null, "revision":record.revision,
             "cron":cron, "last_observed_minute":record.last_observed_minute,
             "skipped":record.skipped, "skipped_count":record.skipped_count,
-            "total":record.definition.tasks.count}),
+            "history":record.history, "total":record.definition.tasks.count}),
         );
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r["batch_id"].as_u64().unwrap_or(0)));

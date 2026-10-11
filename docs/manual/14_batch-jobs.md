@@ -207,7 +207,8 @@ and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
 `relish batch watch ID` polls once per second. Status and the dashboard show
 counts, backlog, retries, resource profiles and accepted success rates. Rates
 count unique outcomes accepted by the cluster, rather than attempts started.
-They begin as unknown and reset after leadership changes or stale samples.
+They begin as unknown and reset after leadership changes or stale samples
+(the Mayo job counters below don't; each node keeps its own).
 Accepted counts arrive when chunks are acknowledged, so a one-second rate can
 alternate between zero and a burst. Use a sustained interval for capacity planning.
 Duration histograms merge across workers; watch displays p50, p95 and p99 bucket
@@ -239,12 +240,15 @@ missing detail as success. A missing or corrupt result index is an explicit
 error; rebuilding it is worker recovery, rather than an unbounded page read.
 Use the child array ID for results and logs.
 
-Detail remains on the worker disk for one hour **after completion**, and the
-cluster keeps at most the newest 20 terminal submissions. The leader checks
-every second and prunes expired runs with one replicated write, whether or not
-anyone submits new work; workers then delete the run's ledger, index and kept
-output on their next sync. For a mixed manifest,
+Detail remains on the worker disk for one hour **after completion**. Each
+namespace keeps its newest 20 finished submissions, and the cluster keeps 24
+in all: when more finish, the namespace keeping the most loses its oldest
+first, so a per-minute cron in one namespace can't push out another
+namespace's runs. The leader checks every second and prunes expired runs with
+one replicated write, whether or not anyone submits new work; workers then
+delete the run's ledger, index and kept output on their next sync. For a mixed manifest,
 the clock starts when its last profile finishes; profiles are pruned together.
+A run's outcome outlives its detail: see [Job history](#job-history-metrics-and-events).
 Permanent worker or disk loss can lose
 individual results even when accepted aggregate counts remain replicated.
 Export needed results before retention expires. Cancelling counts never-started and interrupted
@@ -252,6 +256,59 @@ tasks as not run, separately from terminal failures and drains active runtime ow
 capacity. An abandoned attempt quarantines its capacity until startup recovery;
 a dropped future cannot free an uncertain execution's request. Retries release
 capacity during backoff.
+
+## Job history, metrics and events
+
+Did last night's cron job succeed? A run's detail goes after an hour, but its
+outcome stays with its definition. Each definition remembers its last 10
+finished runs: run ID, when it started and finished, how it ended, how many
+tasks succeeded, failed or never ran, and the lowest failed task index, which
+is where to start reading failure output:
+
+```sh
+relish jobs --definitions
+```
+
+```text
+ops/nightly revision 2: 1 tasks, UTC schedule 0 3 * * *
+  run 41 finished 2026-10-11 03:00 UTC: CompletedWithFailures, 0 succeeded, 1 failed; first failure: task 0
+  run 40 finished 2026-10-10 03:00 UTC: Succeeded, 1 succeeded, 0 failed
+```
+
+The dashboard's job card shows a schedule's last five outcomes beside it.
+History lives with the definition, so schedules and deployment hooks keep it
+until you stop or delete them; a one-off definition and its history expire
+with its last run. Manifest profiles have no definition and keep no history.
+
+Every node exports Mayo series for the attempts it ran itself, so they survive
+a leader change. Each carries only `namespace`, `definition` (the job or array
+name), `profile` (a manifest's resource profile, `default` otherwise) and
+`node`, never a task index or run ID. A node keeps at most 1,024 label sets.
+
+| Series | Meaning |
+|--------|---------|
+| `job_attempts_started_total` | Attempts started, retries included |
+| `job_tasks_succeeded_total`, `job_tasks_failed_total` | Tasks that ended either way |
+| `job_task_retries_total` | Extra attempts spent on retries |
+| `job_tasks_running` | Attempts holding a slot now |
+| `job_task_duration_ms_bucket{le}`, `job_task_duration_ms_count` | Final-attempt durations, cumulative buckets from 1 ms to 16,384 ms and `+Inf` |
+| `job_cpu_percent`, `job_memory_bytes` | Usage of the running attempts, from their cgroups on Linux |
+
+Counters start at zero when a node restarts, as Prometheus counters do.
+
+The leader records one event per run, never one per task: `job-completed`
+when every task succeeded, `job-failed` when any failed for good,
+`job-cancelled`, and `job-unknown` when a node holding the run's work went
+quiet and nobody knows whether its tasks ran. `job-failed` and `job-unknown`
+also go to every alert destination (`[[alerts.destinations]]`) as a critical
+`job_run_failed` or `job_run_unknown_outcome` alert, labelled with `job`,
+`namespace` and `run`. A new leader doesn't announce runs that finished
+before it took over, so a run finishing in the second before a leader change
+can go unannounced; its outcome is still in the definition's history.
+
+`relish top` lists running array tasks as one row per definition and profile
+on each node, with the number of tasks in the PID column (`tasks:27`) and
+their CPU and memory. A singleton run keeps its own `run-ID` row.
 
 ## Execution and capacity limits
 
@@ -265,6 +322,9 @@ Every namespace shares the cluster, so no namespace may take all of it:
 | Job definitions per namespace | 64 | Refused; one-off definitions expire with their last run |
 | Job definitions, whole cluster | 1,024 | Refused |
 | Retained run receipts, whole cluster | 2,048 | Retention keeps it below this backstop |
+| Finished submissions kept per namespace | 20 | The namespace's oldest detail is pruned |
+| Finished submissions kept, whole cluster | 24 | The namespace keeping the most loses its oldest |
+| Outcomes remembered per definition | 10 | The oldest outcome is dropped |
 | Named jobs in one finite batch | 64 | Refused |
 
 Cron fires and deployment hooks never compete with bulk work for their

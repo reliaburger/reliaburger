@@ -126,6 +126,14 @@ idempotency key before sending. If a submission times out, retry with
 Manifests and JSON `tasks` refuse unknown fields, so a typo fails at
 `--dry-run` rather than falling back to defaults.
 
+Each job definition keeps its last ten run outcomes after a run's own detail
+is pruned (`relish jobs --definitions`, and the dashboard's job card). The
+leader records one event per run, never per task, and sends failed and
+unknown-outcome runs to the alert webhooks. Every node exports `job_*`
+counters, a duration histogram and task CPU and memory, labelled only by
+namespace, definition, profile and node, and `relish top` lists running array
+tasks. See [job history, metrics and events](manual/14_batch-jobs.md#job-history-metrics-and-events).
+
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations; keep using the same node endpoint for a
 lease's lifetime. Creation needs an unscoped credential and the server's

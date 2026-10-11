@@ -95,8 +95,11 @@ The TUI and the web dashboard (Brioche) chart live CPU and memory. The CLI
 `relish top` is a one-shot table of every workload on every node: node, app,
 namespace, state, PID, restarts, and the latest CPU and memory sample each
 node's collector took (`process_cpu_percent`, `process_memory_bytes`). A `-`
-means no sample yet. A node that doesn't answer becomes a
-`warning:` line rather than an error:
+means no sample yet. Array tasks run outside the app supervisor, so they get
+one row per job definition and profile on each node instead: the PID column
+shows how many tasks run there (`tasks:27`), and CPU and memory come from the
+tasks' cgroups on Linux (`job_cpu_percent`, `job_memory_bytes`). A node that
+doesn't answer becomes a `warning:` line rather than an error:
 
 ```sh
 relish top                       # every node's workloads, with CPU and memory
@@ -192,6 +195,13 @@ severity = ["critical"]           # empty: every severity
 secret = "shared-hmac-secret"     # optional
 ```
 
+The same destinations get a built-in critical alert for every job run that
+fails (`job_run_failed`) or whose outcome becomes unknown because a node
+holding its work went quiet (`job_run_unknown_outcome`). The leader sends one
+per run, never one per task, labelled with `job`, `namespace` and `run`. The
+[batch jobs chapter](14_batch-jobs.md#job-history-metrics-and-events) lists
+the job metrics.
+
 Council members hold cluster-wide rollups, so one node can answer for the
 fleet.
 
@@ -214,6 +224,11 @@ the others sent and adds a yellow `incomplete: node … timed out` line, so a
 short list never passes for a complete one. On the web dashboard, a node's
 page lists that node's apps (or says it didn't answer) and charts CPU and
 memory only on the node's own dashboard.
+
+Each job run records one event on the leader when it ends (`job-completed`,
+`job-failed`, `job-cancelled`), when its outcome becomes unknown
+(`job-unknown`) or when a cron occurrence is skipped for want of capacity
+(`job-skipped`), however many tasks it has.
 
 Besides deploys, restarts, health, jobs, alerts and faults, the events record
 who changed trust: creating or revoking an API token (`token.created`,
