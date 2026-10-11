@@ -180,10 +180,11 @@ fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
             continue;
         }
         let names_root = |bytes: &[u8]| bytes.windows(needle.len()).any(|part| part == needle);
-        // A process already in exit has dropped its memory, so its command
-        // line reads empty, but it keeps its files (the kernel ownership lock
-        // among them) until a moment later. Its open files still name the
-        // root, so match on those too and wait for the exact lock owner (#673).
+        // A Bun already dying from its `Child`'s kill-on-drop has dropped its
+        // memory, so its command line reads empty, but its threads keep its
+        // files (the kernel ownership lock among them) a moment longer. Those
+        // files still name the root, so match on them too and wait for the
+        // exact lock owner (#673).
         let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
         if !names_root(&command) && !holds_file_under(&entry.path(), &names_root) {
             continue;
@@ -205,28 +206,45 @@ fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
     killed
 }
 
-/// Does the process at `/proc/<pid>` hold an open file whose path matches?
+/// Does any thread of the process at `/proc/<pid>` hold an open file whose
+/// path matches? Threads share one file table, but once the main thread has
+/// exited only the others still show it.
 fn holds_file_under(process: &Path, matches: &dyn Fn(&[u8]) -> bool) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    std::fs::read_dir(process.join("fd"))
+    std::fs::read_dir(process.join("task"))
         .into_iter()
         .flatten()
+        .flatten()
+        .flat_map(|thread| {
+            std::fs::read_dir(thread.path().join("fd"))
+                .into_iter()
+                .flatten()
+        })
         .flatten()
         .filter_map(|fd| std::fs::read_link(fd.path()).ok())
         .any(|target| matches(target.as_os_str().as_bytes()))
 }
 
-/// Wait up to ten seconds for every process to exit. A zombie counts: it
-/// has already closed its files and released its locks, and Bun stays one
-/// until the test's runtime reaps it.
+/// Wait up to ten seconds for every process to exit. A zombie whose threads
+/// have all gone counts: it has closed its files and released its locks, and
+/// Bun stays one until the test's runtime reaps it.
+///
+/// The main thread alone isn't enough (#673). SIGKILL takes Bun's threads
+/// down one by one, and the main thread can already read as a zombie while
+/// a Tokio worker still holds the shared file table, and with it the
+/// kernel ownership lock.
 fn wait_for_exit(processes: &[nix::unistd::Pid]) {
     let exited = |pid: &nix::unistd::Pid| {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return true;
         };
         // The state follows the command name, which may itself hold ") ".
-        stat.rsplit_once(") ")
-            .is_none_or(|(_, rest)| rest.starts_with('Z'))
+        let zombie = stat
+            .rsplit_once(") ")
+            .is_none_or(|(_, rest)| rest.starts_with('Z'));
+        let threads =
+            std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |entries| entries.count());
+        zombie && threads <= 1
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !processes.iter().all(exited) {
