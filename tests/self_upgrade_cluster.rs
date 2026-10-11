@@ -138,13 +138,16 @@ impl ClusterHarness {
     async fn start_with_keyless(count: usize, keyless: &[usize]) -> Self {
         let root = tempfile::tempdir().unwrap();
         // The registry deliberately caps each upload at 512 MiB. Debug symbols
-        // can exceed that on CI; remove them from this private fixture only,
-        // before copying, hashing or signing any candidate. Cargo's executable
-        // stays intact for backtraces in the other suites.
+        // can exceed that on CI, and a macOS debug build's local symbols alone
+        // took it to 540 MB in October 2026 (#783); remove both from this
+        // private fixture only, before copying, hashing or signing any
+        // candidate. Cargo's executable stays intact for backtraces in the
+        // other suites.
         let source = root.path().join("bun-fixture");
         std::fs::copy(env!("CARGO_BIN_EXE_bun"), &source).unwrap();
         let stripped = std::process::Command::new("strip")
             .arg("-S")
+            .arg("-x")
             .arg(&source)
             .output()
             .expect("strip must be installed for cluster-upgrade acceptance");
