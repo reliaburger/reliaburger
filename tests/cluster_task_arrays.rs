@@ -492,12 +492,15 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     assert_eq!(record.state.done().len(), u64::from(chunks));
     let mut replayed = 0u64;
     for chunk in 0..chunks {
-        let (owner, attempt) = record
+        let grant = record
             .state
             .accepted_grant(reliaburger::meat::task_array::ChunkId(chunk))
             .expect("every chunk has one accepted grant");
+        let attempt = grant.attempt;
+        // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
         assert_ne!(
-            owner, lost,
+            grant.owner,
+            Some(lost.clone()),
             "chunk {chunk} was accepted from the dead leader"
         );
         if attempt > 1 {
@@ -989,9 +992,281 @@ async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another
             .state
             .accepted_grant(reliaburger::meat::task_array::ChunkId(0))
             .unwrap()
-            .0
+            .owner
+            .unwrap()
             .0,
         owner
     );
+    root.cancel();
+}
+
+const HUNG_BASE_PORT: u16 = BASE_PORT + 300;
+const HUNG_ARRAYS: usize = 16;
+const HUNG_TASKS: u32 = 6_000;
+const HUNG_SYNC_INTERVAL: Duration = Duration::from_millis(200);
+
+async fn start_hung_node(
+    index: usize,
+    seeds: Vec<std::net::SocketAddr>,
+    root: &CancellationToken,
+    data: &std::path::Path,
+) -> WiredNode {
+    let executor = TaskArrayNode::new(
+        TaskArrayNodeConfig {
+            root: data.join("task-arrays"),
+            policy: ProcessWorkloadsConfig {
+                allowed_binaries: vec![PathBuf::from(BINARY)],
+                mount_isolation: false,
+                ..ProcessWorkloadsConfig::default()
+            },
+            default_concurrency: 16,
+            backoff: (Duration::from_millis(1), Duration::from_millis(5)),
+            group_commit: GroupCommit {
+                interval: Duration::from_millis(20),
+                max_records: 4096,
+            },
+        },
+        // Slow enough that sixteen arrays are all still running while one
+        // worker hangs.
+        NodeRunner::Fake(FakeRunner::new(Duration::from_millis(20), |_| {
+            AttemptOutcome::Exited { code: 0 }
+        })),
+    );
+    start_wired_node(WiredNodeOptions {
+        name: format!("hung{index}"),
+        gossip_port: HUNG_BASE_PORT + (index as u16) * 10,
+        seeds,
+        shutdown: root.child_token(),
+        data_dir_prefix: "rb-hung-worker",
+        stale_report_timeout_secs: 10,
+        metrics_rollup: None,
+        scheduler: None,
+        lease_reaper: false,
+        membership: MembershipSource::Gossip,
+        service_identity: Some(SERVICE_TOKEN.into()),
+        operator_token: None,
+        fault_injection: false,
+        labels: Default::default(),
+        keep_data_dir: false,
+        task_arrays: Some(Arc::new(TaskArrayService::with_timings(
+            Some(Arc::new(executor)),
+            HUNG_SYNC_INTERVAL,
+            Duration::from_secs(3),
+        ))),
+    })
+    .await
+}
+
+/// Hang a worker's sync API without stopping its gossip: swap its control
+/// fence file for a FIFO with no writer, so its next sync blocks reading it
+/// (as on a stuck disk). Retries if a sync in flight renames a fresh fence
+/// over the FIFO.
+async fn hang_sync(control: &std::path::Path) {
+    use std::os::unix::fs::FileTypeExt;
+    for _ in 0..50 {
+        let _ = std::fs::remove_file(control);
+        nix::unistd::mkfifo(control, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if std::fs::metadata(control).is_ok_and(|meta| meta.file_type().is_fifo()) {
+            return;
+        }
+    }
+    panic!("the worker kept replacing its fence file");
+}
+
+/// Release the hung sync: open the FIFO's write end (which lets the blocked
+/// reader's open finish), remove it, then close it so the read sees end of
+/// file. The node's next sync finds no fence file and carries on.
+async fn release_sync(control: std::path::PathBuf) {
+    use std::os::unix::fs::OpenOptionsExt;
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..100 {
+            if let Ok(writer) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+                .open(&control)
+            {
+                std::fs::remove_file(&control).unwrap();
+                drop(writer);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("nothing was blocked on the FIFO");
+    })
+    .await
+    .unwrap();
+}
+
+/// Successful tasks the leader has heard about from `node`, in a status.
+fn node_succeeded(summary: &Value, node: &str) -> Option<u64> {
+    summary["nodes"]
+        .as_array()?
+        .iter()
+        .find(|view| view["node"] == node)?["counters"]["succeeded"]
+        .as_u64()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    let root = CancellationToken::new();
+    let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = vec![start_hung_node(0, vec![], &root, data[0].path()).await];
+    for (index, directory) in data.iter().enumerate().skip(1) {
+        nodes.push(
+            start_hung_node(index, vec![local(HUNG_BASE_PORT)], &root, directory.path()).await,
+        );
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&nodes).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    wait_until(
+        "gossip sees everyone",
+        Duration::from_secs(60),
+        async || {
+            for node in &nodes {
+                if node.membership_table.read().await.len() < 3 {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    let mut leader = None;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.council.is_leader().await {
+            leader = Some(index);
+        }
+    }
+    let leader = leader.expect("a leader");
+    let healthy = format!("hung{}", (leader + 1) % 3);
+    let victim = (leader + 2) % 3;
+    let victim_name = format!("hung{victim}");
+
+    let http = reqwest::Client::new();
+    let mut batches = Vec::new();
+    for i in 0..HUNG_ARRAYS {
+        let answer: Value = http
+            .post(format!(
+                "http://127.0.0.1:{}/v1/batch/array",
+                nodes[leader].api_port
+            ))
+            .json(&json!({
+                "name": format!("busy-{i}"),
+                "template": { "runtime":"process","exec": BINARY, "command": ["{index}"] },
+                "spec": { "count": HUNG_TASKS, "chunk_size": 64 },
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        batches.push(
+            answer["batch_id"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{answer}")),
+        );
+    }
+    wait_until(
+        "every node runs work",
+        Duration::from_secs(60),
+        async || match status(&http, &nodes[leader], batches[0]).await {
+            Some(summary) => [healthy.as_str(), victim_name.as_str()]
+                .iter()
+                .all(|node| node_succeeded(&summary, node).is_some_and(|count| count > 0)),
+            None => false,
+        },
+    )
+    .await;
+
+    // Sixteen busy arrays, one Raft entry per tick between them.
+    let window = Duration::from_secs(2);
+    let before = nodes[leader]
+        .metrics_rx
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+    tokio::time::sleep(window).await;
+    let after = nodes[leader]
+        .metrics_rx
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+    let ticks = window.as_millis() / HUNG_SYNC_INTERVAL.as_millis();
+    let entries = u128::from(after - before);
+    eprintln!(
+        "hung_worker: {HUNG_ARRAYS} arrays, {entries} Raft entries in {window:?} ({ticks} ticks)"
+    );
+    assert!(
+        entries <= ticks + 2,
+        "{entries} Raft entries in {ticks} ticks for {HUNG_ARRAYS} arrays"
+    );
+
+    let control = data[victim].path().join("task-arrays/control.json");
+    hang_sync(&control).await;
+
+    // While the victim's API hangs, the leader still hears from the healthy
+    // node every tick: what it has run, summed over every array, keeps
+    // moving several times a second, not once per sync timeout.
+    let mut seen = BTreeSet::new();
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        let mut total = 0;
+        for batch_id in &batches {
+            total += status(&http, &nodes[leader], *batch_id)
+                .await
+                .and_then(|summary| node_succeeded(&summary, &healthy))
+                .unwrap_or(0);
+        }
+        seen.insert(total);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let listed = nodes[leader].membership_table.read().await.len();
+    // Release before asserting: a reader still blocked on the FIFO would
+    // keep the test's runtime from shutting down after a failure.
+    release_sync(control).await;
+    eprintln!(
+        "hung_worker: the healthy node's view changed {} times in 4 s",
+        seen.len()
+    );
+    // Waiting on the hung node's 3 s sync timeout every tick would allow at
+    // most two fresh readings in 4 s. The healthy node's own syncs can be
+    // slow on a busy host (each fsyncs its control fence), so don't demand
+    // all twenty ticks.
+    assert!(
+        seen.len() >= 5,
+        "the healthy node was heard {} times in 4 s",
+        seen.len()
+    );
+    assert_eq!(listed, 3, "gossip still lists the hung node");
+
+    for batch_id in batches {
+        let mut last = Value::Null;
+        wait_until(
+            "every array finishes",
+            Duration::from_secs(180),
+            async || match status(&http, &nodes[leader], batch_id).await {
+                Some(summary) => {
+                    let done = summary["done"] == true;
+                    last = summary;
+                    done
+                }
+                None => false,
+            },
+        )
+        .await;
+        assert_eq!(last["status"], "Succeeded", "{last}");
+        assert_eq!(last["succeeded"], HUNG_TASKS, "{last}");
+    }
     root.cancel();
 }

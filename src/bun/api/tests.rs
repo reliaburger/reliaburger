@@ -4571,6 +4571,94 @@ async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and
     council.shutdown().await.unwrap();
 }
 
+/// Apply `manifest` as the `ci` deployer, whose permission block grants
+/// `actions` on every app, and return the status.
+async fn apply_under_permission_block(tag: &str, actions: &[&str], manifest: &str) -> StatusCode {
+    let (app, council, _commands) = workload_admission_fixture(tag).await;
+    council
+        .write(crate::council::RaftRequest::PermissionSpec {
+            name: "ci".into(),
+            spec: Box::new(crate::config::PermissionSpec {
+                actions: actions.iter().map(|action| action.to_string()).collect(),
+                apps: vec!["*".into()],
+                namespaces: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let status = apply_as_context(&app, deployer_context(), manifest).await;
+    if status == StatusCode::FORBIDDEN {
+        assert!(council.desired_state().await.apps.is_empty());
+    }
+    council.shutdown().await.unwrap();
+    status
+}
+
+const HOST_PATH_VOLUME: &str = "[app.thief]\nimage = \"test:v1\"\n\
+    [[app.thief.volumes]]\npath = \"/steal\"\n\
+    source = \"/var/lib/reliaburger/volumes/team-b/db\"\n";
+
+const HOST_PATH_CONFIG_FILE: &str = "[app.reader]\nimage = \"test:v1\"\n\
+    [[app.reader.config_file]]\npath = \"/etc/shadow-copy\"\nsource = \"/etc/shadow\"\n";
+
+#[tokio::test]
+async fn host_path_volume_needs_host_exec_under_a_permission_block() {
+    assert_eq!(
+        apply_under_permission_block("host-volume-deploy", &["deploy"], HOST_PATH_VOLUME).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_ne!(
+        apply_under_permission_block(
+            "host-volume-host-exec",
+            &["deploy", "host-exec"],
+            HOST_PATH_VOLUME
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn host_path_config_file_needs_host_exec_under_a_permission_block() {
+    assert_eq!(
+        apply_under_permission_block("host-config-deploy", &["deploy"], HOST_PATH_CONFIG_FILE)
+            .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_ne!(
+        apply_under_permission_block(
+            "host-config-host-exec",
+            &["deploy", "host-exec"],
+            HOST_PATH_CONFIG_FILE
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn managed_volume_needs_only_deploy() {
+    let manifest = "[app.db]\nimage = \"test:v1\"\n[[app.db.volumes]]\npath = \"/data\"\n";
+    assert_ne!(
+        apply_under_permission_block("managed-volume-deploy", &["deploy"], manifest).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[test]
+fn apply_notes_each_host_path_source_needs_a_node_allowlist_entry() {
+    let config = crate::config::Config::parse(HOST_PATH_VOLUME).unwrap();
+    let notes = super::apply::host_path_notes(&config);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].contains("app.thief"), "{notes:?}");
+    assert!(notes[0].contains("allowed_host_paths"), "{notes:?}");
+    let managed = crate::config::Config::parse(
+        "[app.db]\nimage = \"test:v1\"\n[[app.db.volumes]]\npath = \"/data\"\n",
+    )
+    .unwrap();
+    assert!(super::apply::host_path_notes(&managed).is_empty());
+}
+
 /// A completed history entry for `web` in the `default` namespace; tests
 /// override the fields they care about.
 fn sample_history_entry(image: &str) -> DeployHistoryEntry {

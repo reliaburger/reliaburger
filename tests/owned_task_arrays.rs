@@ -2718,12 +2718,15 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
     let chunks = record.state.spec.chunk_count();
     let mut replayed = 0u64;
     for chunk in 0..chunks {
-        let (owner, attempt) = record
+        let grant = record
             .state
             .accepted_grant(ChunkId(chunk))
             .expect("every chunk has one accepted grant");
+        let attempt = grant.attempt;
+        // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
         assert_ne!(
-            owner, lost,
+            grant.owner,
+            Some(lost.clone()),
             "chunk {chunk} was accepted from the lost leader"
         );
         if attempt > 1 {

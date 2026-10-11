@@ -1,0 +1,143 @@
+---
+source: src/bin/relish.rs
+expression: help
+---
+=== relish run ===
+Run a resource-aware task array from an image or allowlisted host binary.
+
+Every task runs the same command with `{index}` in its arguments replaced by its own index, from 0 to COUNT-1, and gets RELIABURGER_TASK_INDEX, RELIABURGER_TASK_COUNT, RELIABURGER_TASK_ATTEMPT and RELIABURGER_BATCH_ID in its environment. With --image, the tasks run in containers; with --runtime process --exec, the binary must be in the nodes' [process_workloads] allowed_binaries.
+
+Tasks run at least once, not exactly once: a task that finished just before its node crashed can run again. Make tasks safe to repeat.
+
+Each submission prints an idempotency key before it is sent. If the submission times out, retry with --idempotency-key KEY: the cluster returns the run it already admitted rather than starting a second.
+
+Usage: run [OPTIONS] --batch <NAME> [-- <ARGS>...]
+
+Arguments:
+  [ARGS]...
+          Arguments after `--`; `{index}` becomes the task's index
+
+Options:
+      --batch <NAME>
+          Name for the array (required: task arrays are the only kind of run so far)
+
+      --count <COUNT>
+          Number of tasks; one uses the same indexed executor
+          
+          [default: 1]
+
+      --schedule <SCHEDULE>
+          Register a durable UTC cron schedule (five fields, or a macro such as @daily) instead of running now
+
+      --exec <EXEC>
+          Host binary every task runs
+
+      --image <IMAGE>
+          OCI image executed by the owned Linux runtime
+
+      --runtime <RUNTIME>
+          Job backend: runc (default), process (requires --exec), or shared-runc
+
+          Possible values:
+          - runc:        A new owned container generation for each attempt
+          - process:     An explicitly allowlisted host process, without a container image
+          - shared-runc: A separate command process inside a compatible reusable container
+          
+          [default: runc]
+
+      --cpu <CPU>
+          CPU request-limit range, such as 250m-500m
+
+      --memory <MEMORY>
+          Memory request-limit range, such as 64Mi-128Mi
+
+      --chunk <CHUNK>
+          Tasks per chunk: the unit the cluster hands to nodes
+          
+          [default: 1024]
+
+      --max-attempts <MAX_ATTEMPTS>
+          Attempts per task before it counts as failed
+          
+          [default: 3]
+
+      --max-failed <MAX_FAILED>
+          Stop the whole array once more than this many tasks have failed
+
+      --timeout <TIMEOUT>
+          Per-attempt timeout, in seconds; 0 means no deadline
+          
+          [default: 600]
+
+      --concurrency <CONCURRENCY>
+          Most tasks one node runs at once (default: 256, bounded by requests)
+
+  -n, --namespace <NAMESPACE>
+          Namespace the array belongs to
+          
+          [default: default]
+
+      --env <KEY=VALUE>
+          An environment variable for every task (repeatable)
+
+      --idempotency-key <KEY>
+          Reuse the key printed by an earlier submission that timed out
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+=== relish batch-status ===
+Show the progress of a submitted batch
+
+Usage: batch-status [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Batch id from `relish batch`
+
+Options:
+      --wait
+          Poll until the batch reaches a terminal state
+
+      --timeout <TIMEOUT>
+          Give up waiting after this many seconds. This only bounds the wait: the run keeps going, under its own per-attempt timeout
+          
+          [default: 3660]
+
+  -h, --help
+          Print help
+
+=== relish batch logs ===
+Print a task's retained output (the first and last 2 KiB): any singleton's, or a failed task's in a larger array
+
+Usage: logs --index <INDEX> <ID>
+
+Arguments:
+  <ID>
+          Batch id from `relish run --batch`
+
+Options:
+      --index <INDEX>
+          The task's index
+
+  -h, --help
+          Print help
+
+=== relish batch submit ===
+Submit a compact TOML manifest containing mixed resource profiles
+
+Usage: submit [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>
+          
+
+Options:
+      --dry-run
+          Validate the manifest locally without submitting work
+
+      --idempotency-key <KEY>
+          Reuse the key printed by an earlier submission that timed out, so the retry returns its runs instead of admitting the manifest again
+
+  -h, --help
+          Print help

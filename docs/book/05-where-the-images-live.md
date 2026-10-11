@@ -260,6 +260,73 @@ Host-path volumes (`source = "/srv/import"`) get none of this. They're the opera
 
 The proof is a gated test that runs the real Redis image with `--appendonly yes` over a managed volume: first as uid 999 directly (so no entrypoint `chown` can paper over a missing hand-over), writes a key, restarts, reads it back, then restarts as image root and reads it again.
 
+### A host path is a tenant boundary
+
+That shared id range has a sharp edge, and the 0.2.0 audit found it. Every rootful container on a node maps into the same 2,000,000,000 range: that's what keeps the unpacked image cache shareable. Managed volumes are chowned into that range. So container root in team A's app and container root in team B's database are the same host uid. Now picture a deployer whose token only reaches namespace `team-a`:
+
+```toml
+[app.thief]
+image = "busybox:1.36"
+namespace = "team-a"
+
+[[app.thief.volumes]]
+path = "/steal"
+source = "/var/lib/reliaburger/volumes/team-b/db"
+```
+
+Apply checked only `deploy` in `team-a`, which the token has. The node bind-mounted `source` exactly as written, read-write, and the files were already owned by the uid container root runs as. Team B's database was team A's to read or rewrite. The namespace boundary held everywhere except on the disk.
+
+We closed it with two gates, because each covers a different hole. The first is at apply: an app with any `source` (on a volume or a `config_file`) now counts as host access, the same as an `exec` binary or an inline `script`, so a token with a `[permission]` block needs `host-exec` as well as `deploy`. `AppSpec` grew two small methods for it:
+
+```rust
+pub fn host_path_sources(&self) -> impl Iterator<Item = &std::path::Path> {
+    self.volumes
+        .iter()
+        .filter_map(|volume| volume.source.as_deref())
+        .chain(
+            self.config_file
+                .iter()
+                .filter_map(|file| file.source.as_deref().map(std::path::Path::new)),
+        )
+}
+
+pub fn needs_host_access(&self) -> bool {
+    self.exec.is_some() || self.script.is_some() || self.host_path_sources().next().is_some()
+}
+```
+
+`impl Iterator<Item = &Path>` in return position means "some iterator type I won't name". The real type is a long nest of `Chain<FilterMap<...>>` adaptors, and the caller doesn't care. Nothing runs until somebody pulls from it, so `needs_host_access` asks for one item with `.next()` and stops: it doesn't build a list just to check whether it's empty.
+
+Permissions are opt-in, though. A token with no `[permission]` block passes `authorize_permission` untouched, so the first gate does nothing for most clusters. The real default-deny is the second gate, on the node. `[storage] allowed_host_paths` in `node.toml` lists the prefixes a `source` may come from, empty by default, the way `[process_workloads] allowed_binaries` lists the host binaries an `exec` app may run. The supervisor checks every `source` before it creates an instance, through a `HostPathPolicy` built from the node config:
+
+```rust
+pub fn admit(&self, source: &Path) -> Result<(), HostPathRefusal> {
+    // ... refuse a relative path or any `..` component first ...
+    let resolved = resolve(source);
+    if let Some(directory) = self
+        .protected
+        .iter()
+        .find(|directory| resolved.starts_with(directory) || directory.starts_with(&resolved))
+    {
+        return Err(HostPathRefusal::Protected {
+            path: source.to_path_buf(),
+            directory: directory.clone(),
+        });
+    }
+    if self.allowed.iter().any(|prefix| resolved.starts_with(prefix)) {
+        Ok(())
+    } else {
+        Err(HostPathRefusal::NotAllowed {
+            path: source.to_path_buf(),
+        })
+    }
+}
+```
+
+Three details carry the weight. `Path::starts_with` compares whole components, not bytes, so `/srv/import-evil` isn't under `/srv/import`; a string `starts_with` would have let it through, which is exactly the bug you'd write in C with `strncmp`. `resolve` canonicalises the longest part of the path that exists, so a symlink planted inside an allowed directory counts as the place it points at. And the protected check runs both ways. The node's own directories (the five `[storage]` ones, the identity and script directories, wherever the master key lives) are refused when the `source` sits under them, and also when the `source` *contains* them. An operator who lists `/var/lib` for convenience still can't hand anyone `/var/lib/reliaburger`.
+
+We didn't make the policy rewrite the mount to the resolved path, so a symlink swapped between the check and runc's mount could still slip past. That race needs write access to an allowlisted host directory, which is the operator's to guard, and the allowlist is the operator saying "I trust what's under here". The refusals that matter, another tenant's volume and the node's own secrets, don't depend on it.
+
 ## Under the hood: key patterns
 
 ### Validate at construction, not at use
