@@ -1611,13 +1611,17 @@ async fn exec_workload_is_held_to_its_namespace() {
             path = results.display()
         )
     };
-    // A run-to-completion host job, so no owned process outlives the test.
-    let script = format!("{}; {}", probe(foreign, "foreign"), probe(own, "own"));
+    // A host app the agent deploys itself (jobs run as task arrays). It
+    // probes, then idles until the test stops it.
+    let script = format!(
+        "{}; {}; exec sleep 300",
+        probe(foreign, "foreign"),
+        probe(own, "own")
+    );
     let config = Config::parse(&format!(
         r#"
-        [job.{name}]
+        [app.{name}]
         namespace = "tenant"
-        runtime = "process"
         exec = "/bin/bash"
         command = ["-c", {script:?}]
     "#
@@ -1642,6 +1646,17 @@ async fn exec_workload_is_held_to_its_namespace() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    // Stop the app before the agent, so no owned process outlives the test.
+    let (reply, stopped) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::Stop {
+            app_name: name.clone(),
+            namespace: "tenant".into(),
+            response: reply,
+        })
+        .await
+        .unwrap();
+    stopped.await.unwrap().unwrap();
     shutdown.cancel();
     {
         let mut e = ebpf.lock().await;
